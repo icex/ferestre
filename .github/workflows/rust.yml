@@ -64,6 +64,30 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # The cheap half of testing the runtime. Building it needs a 26 GB tree and an
+  # hour, so `tests/run-*.sh` cannot run per push -- but checking that the
+  # patches still apply takes a minute, and it is the check that has actually
+  # caught things: a patch exported from a dirty tree carrying its predecessor's
+  # changes (twice), and a rename leaking into a third-party project's source.
+  #
+  # Only the series whose repositories are small enough to clone here. The wine
+  # series needs the Wine tree and stays a local check; the script skips what it
+  # cannot find rather than failing.
+  patches:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the repositories the patches target
+        run: |
+          mkdir -p "$HOME/src"
+          git clone --quiet https://github.com/xodus-gaming/xodus.git "$HOME/src/xodus-cli"
+          git clone --quiet https://github.com/xodus-gaming/xgameruntime \
+            "$HOME/src/xodus-proton/wine/dlls/xgameruntime"
+
+      - name: Patches apply
+        run: scripts/check-patches.sh
+
   gui:
     runs-on: ubuntu-latest
     steps:

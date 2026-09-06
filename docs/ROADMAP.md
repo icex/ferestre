@@ -38,10 +38,25 @@ than treat it as an optional extra.
       `validate.py` refuses a capability with no way to check it. Before this,
       probing found 4 of 12 and every title carried "may not start" wording it
       did not deserve.
-- [ ] CI running the synthetic suites on every change. **Half done.** The Rust
-      workspace, `cargo fmt`, `clippy` and the AT-SPI end-to-end GUI test run on
-      every change, and so does recipe validation. `tests/xgr_tests.c` — the
-      synthetic GDK suites — still runs only by hand.
+- [x] CI, sized to what each check costs. Per push: the Rust workspace, `cargo
+      fmt`, `clippy`, the AT-SPI end-to-end GUI test, recipe validation, and
+      **`scripts/check-patches.sh`** — every patch series applied to a pristine
+      checkout of the commit it targets, and, where the repository is a build
+      tree, checked to reproduce it exactly.
+
+      The synthetic C suites (`tests/run-*.sh`) are deliberately **not** per
+      push and the roadmap should stop implying they could be: they need the
+      built Wine tree, which is 26 GB and about an hour. What they test is the
+      DLL's behaviour, which only changes when the runtime is rebuilt, so they
+      belong to the runtime's release train rather than to every launcher
+      commit.
+
+      The patch check is the cheap substitute and it has earned its place three
+      times already: two client patches exported from a dirty tree carried their
+      predecessor's changes and could not apply in order, and the Ferestre
+      rename leaked `FERESTRE_HC_TRACE` into a patch describing the
+      *xgameruntime* project's own source, where the variable is `XGDK_HC_TRACE`
+      and is not ours to rename. Nothing else would have caught that.
 
 ## Phase 1 — ship the runtime
 
