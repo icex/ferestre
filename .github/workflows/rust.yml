@@ -19,6 +19,10 @@ on:
       - 'Cargo.lock'
       - 'tests/gui_smoke.py'
       - 'titles/**'
+      # The `patches` job below is the only thing that checks these, and a
+      # patch-only commit is exactly the kind that breaks them.
+      - 'patches/**'
+      - 'scripts/check-patches.sh'
       - '.github/workflows/rust.yml'
   pull_request:
     paths:
@@ -27,6 +31,10 @@ on:
       - 'Cargo.lock'
       - 'tests/gui_smoke.py'
       - 'titles/**'
+      # The `patches` job below is the only thing that checks these, and a
+      # patch-only commit is exactly the kind that breaks them.
+      - 'patches/**'
+      - 'scripts/check-patches.sh'
       - '.github/workflows/rust.yml'
   workflow_dispatch:
 
