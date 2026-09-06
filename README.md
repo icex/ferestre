@@ -1,4 +1,4 @@
-<img src="packaging/appimage/io.github.icex.ferestre.svg" width="96" align="left" alt="">
+<img src="packaging/icons/hicolor/scalable/apps/io.github.icex.ferestre.svg" width="96" align="left" alt="">
 
 # Ferestre
 
@@ -13,6 +13,23 @@ runtime.
 > downloads *your* purchases. If you do not own a title, or your account does
 > not have a Game Pass entitlement for it, there is nothing here that will let
 > you play it — and that is deliberate.
+
+## Why
+
+My son wanted to keep playing **Minecraft** after moving his machine from
+Windows to Linux.
+
+The usual answer is the Android build under an emulator, which is a different
+game: different edition, different input, different performance, and it does not
+join the servers his friends are on. The version he already owns is the Windows
+Store one, and that is a `.msixvc` package — encrypted, licence-gated, and built
+against the Xbox GDK, none of which Wine could open.
+
+So the goal was narrow and specific: **let a kid play the Minecraft he already
+owns, on Linux, without pretending to be a phone.** That works now, servers and
+all. Everything else here — the GDK runtime, the launcher, the catalogue work —
+grew out of that one requirement, and the same machinery turned out to run other
+Store titles too.
 
 ## The name
 
@@ -30,13 +47,31 @@ Pronounced roughly *feh-RESS-treh*.
 
 ## Status
 
-Honest version, because this is early:
+Honest version, because this is early. Every row here was run on a real machine,
+not inferred from the fact that it downloaded:
 
-| Title | State |
-|---|---|
-| **Minecraft for Windows** (Bedrock, Store) | Signs in to Xbox Live, loads the profile, plays, and **joins third-party servers from the in-game list** |
-| **Clair Obscur: Expedition 33** (Store / Game Pass) | Playable — saves, video, full game |
-| **Forza Horizon 5** (Store) | Downloads, does not run: blocked by protection inside the title, not by anything here |
+| Title | Source | State |
+|---|---|---|
+| **Minecraft for Windows** (Bedrock) | Store | Playable. Signs in to Xbox Live, loads the profile, and **joins third-party servers from the in-game list** |
+| **Clair Obscur: Expedition 33** | Store / Game Pass | Playable — saves, video, full game |
+| **DREDGE** | Game Pass | Playable |
+| **Stardew Valley** | Game Pass | Installs and launches |
+| **Overthrown** | Game Pass | Installs; not played through yet |
+| **Age of Empires Definitive Edition** | Game Pass | Downloads; not played through yet |
+| **Forza Horizon 5** | Store | Downloads, does not run: blocked by protection inside the title, not by anything here |
+
+Notes worth having before you try your own library:
+
+- **Only MSIXVC packages.** That is the container Xbox GDK titles ship in.
+  Everything else in a typical Store library is UWP (`Appx`, `Msix` and their
+  bundle and encrypted variants) and this runtime cannot open it — measured on
+  one real account, that is 95 of 102 owned titles. The window holds them back
+  behind a switch that says how many there are and why, rather than mixing them
+  in. Support for them is on the roadmap and is not a small job.
+- **Game Pass lists more than any one tier grants.** The PC catalogue is
+  public — 524 titles at the time of writing — but a given subscription covers a
+  subset, and installing outside it is refused at the licence step. Those rows
+  are filtered out by default too.
 
 There is a launcher: a CLI (`ferestre`) and a GTK4 window (`ferestre-gui`) that
 signs in, lists what your account owns with real names, cover art and download

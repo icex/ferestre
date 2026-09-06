@@ -302,6 +302,52 @@ fn row_sized(explanation: &str, title: &str) -> String {
     }
 }
 
+/// The child of a bundle worth installing: the first one the catalog has
+/// answered about that this runtime can actually open.
+///
+/// `None` for a product that is not a bundle, and for one whose children have
+/// not been fetched yet -- a moment rather than a state, since the children of
+/// the rows on screen are asked for alongside their names.
+fn bundle_child<'a>(inputs: &'a Inputs, product: Option<&Product>) -> Option<&'a Product> {
+    product?
+        .bundled_ids
+        .iter()
+        .find_map(|id| inputs.catalog.get(&id.to_ascii_uppercase()))
+        .filter(|child| child.is_runnable_here() == Some(true))
+}
+
+/// What can be said about a title's download, as a phrase for a row.
+///
+/// `None` only when the catalog has not been asked yet. Everything else has an
+/// answer, and each of them is a different answer: 35 of the Game Pass titles
+/// this account can see have no size of their own, and they split into bundles
+/// whose size belongs to a child and products the catalog lists no package for
+/// at all. A row that says nothing for both is a row that looks broken for one
+/// and misleading for the other.
+fn download_note(inputs: &Inputs, product: Option<&Product>) -> Option<String> {
+    let product = product?;
+
+    if !product.bundled_ids.is_empty() {
+        return Some(match bundle_child(inputs, Some(product)) {
+            Some(child) => match child.size_label().as_str() {
+                "" => format!("bundle — install {}", child.name),
+                size => format!("bundle — install {} ({size})", child.name),
+            },
+            // The children are fetched with the page, so this is a moment
+            // rather than a state; saying how many there are beats saying
+            // nothing while it resolves.
+            None => format!("bundle of {}", plural(product.bundled_ids.len(), "title")),
+        });
+    }
+    match product.size_label() {
+        size if !size.is_empty() => Some(size),
+        _ if product.has_packages && !product.has_pc_package => Some("no PC version".into()),
+        _ if !product.has_packages => Some("the catalog lists no package for it".into()),
+        // A PC package with no size on it. Rare, and not worth a sentence.
+        _ => None,
+    }
+}
+
 /// The rows for the Game Pass section: what a subscription makes installable.
 ///
 /// Built from the public catalogue listing, not from an entitlement, and that
@@ -341,8 +387,8 @@ pub fn gamepass(
                 Some(false) => "Not in your Game Pass tier".to_string(),
                 _ => "Included with PC Game Pass".to_string(),
             }];
-            if let Some(size) = product.map(Product::size_label).filter(|s| !s.is_empty()) {
-                parts.push(size);
+            if let Some(note) = download_note(inputs, product) {
+                parts.push(note);
             }
             let action = match (installed, runnable) {
                 (true, _) => {
@@ -388,6 +434,8 @@ pub fn gamepass(
                 update: None,
                 unsupported: runnable == Some(false),
                 outside_tier: covered == Some(false),
+                install_as: bundle_child(inputs, product)
+                    .map(|c| (c.product_id.clone(), c.name.clone())),
                 action,
             }
         })
@@ -434,6 +482,13 @@ pub struct LibraryRow {
     /// says `None` for everything it does not actually know, and a row hidden
     /// on a guess is the same mistake as a row refused on one.
     pub outside_tier: bool,
+    /// The product to install for this row, when that is not the row itself,
+    /// with its name. Only a bundle sets it.
+    ///
+    /// A bundle carries no packages, so "install" on one means installing the
+    /// child that does. Without this the row could only say which child to go
+    /// and find, which is an instruction to do the launcher's job by hand.
+    pub install_as: Option<(String, String)>,
     pub action: Action,
 }
 
@@ -566,6 +621,7 @@ fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
         // says the container is.
         unsupported: false,
         outside_tier: false,
+        install_as: None,
         action,
     }
 }
@@ -632,6 +688,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
         update: None,
         unsupported: true,
         outside_tier: false,
+        install_as: None,
         action: Action::Blocked(reason),
     };
 
@@ -639,15 +696,16 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
     // answer is somewhere other than this record: a bundle carries no packages,
     // so every other check would read it as "nothing is known".
     if let Some(children) = product.map(|p| &p.bundled_ids).filter(|c| !c.is_empty()) {
-        let installable = children
-            .iter()
-            .find_map(|id| inputs.catalog.get(&id.to_ascii_uppercase()))
-            .filter(|child| child.is_runnable_here() == Some(true));
-        return match installable {
-            // Named, sized, and pointing at the thing to actually install.
-            Some(child) => unrunnable(
-                format!(
-                    "Bundle of {}  ·  install {} instead{}",
+        return match bundle_child(inputs, product) {
+            // Installable, by installing the child. The row names it, because
+            // pressing Install on "Age of Empires II: Definitive Edition" and
+            // getting a differently-named download is otherwise the launcher
+            // doing something unexplained.
+            Some(child) => LibraryRow {
+                product_id: product_id.to_string(),
+                name: name.clone(),
+                subtitle: format!(
+                    "Bundle of {}  ·  installs {}{}",
                     plural(children.len(), "title"),
                     child.name,
                     match child.size_label().as_str() {
@@ -655,11 +713,17 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
                         size => format!("  ·  {size}"),
                     }
                 ),
-                format!(
-                    "a bundle -- install {} ({}) instead",
-                    child.name, child.product_id
-                ),
-            ),
+                badge: None,
+                image: product.and_then(|p| p.image.clone()),
+                owned: true,
+                has_recipe: false,
+                installed: on_disk,
+                update: None,
+                unsupported: false,
+                outside_tier: false,
+                install_as: Some((child.product_id.clone(), child.name.clone())),
+                action: Action::Install,
+            },
             None => unrunnable(
                 format!(
                     "Bundle of {}  ·  none of them is a title this runtime opens",
@@ -699,6 +763,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
             update: None,
             unsupported: true,
             outside_tier: false,
+            install_as: None,
             action: Action::Blocked(format!(
                 "this is a {container} package; the runtime here opens MSIXVC packages"
             )),
@@ -746,6 +811,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
         update: None,
         unsupported: false,
         outside_tier: false,
+        install_as: None,
         // Install, unless it is already here -- and then Play, not "set up",
         // whenever the package names its own entry point. That is the common
         // case, and asking someone to go and find an .exe in a tree of
@@ -1459,7 +1525,7 @@ mod tests {
     /// has no package, and one of its three children is a title this launcher
     /// runs.
     #[test]
-    fn a_bundle_names_the_child_to_install() {
+    fn a_bundle_installs_the_child_that_has_the_package() {
         let bundle = Product {
             has_packages: false,
             has_pc_package: false,
@@ -1495,7 +1561,7 @@ mod tests {
             row.subtitle
         );
         assert!(
-            row.subtitle.contains("install The Playable One instead"),
+            row.subtitle.contains("installs The Playable One"),
             "{}",
             row.subtitle
         );
@@ -1504,10 +1570,14 @@ mod tests {
             "the child's size is the bundle's answer: {}",
             row.subtitle
         );
-        match &row.action {
-            Action::Blocked(why) => assert!(why.contains("9ZZTESTCHLD"), "{why}"),
-            other => panic!("a bundle is not installable itself: {other:?}"),
-        }
+        // Pressing Install works, and installs the child. Before this the row
+        // could only name the child and leave the reader to go and find it.
+        assert_eq!(row.action, Action::Install);
+        assert_eq!(
+            row.install_as,
+            Some(("9ZZTESTCHLD".to_string(), "The Playable One".to_string())),
+            "the download is the child's, under the child's name"
+        );
     }
 
     /// And says only what it knows. Before the children are fetched there is no
@@ -1995,6 +2065,7 @@ mod tests {
                 update: None,
                 unsupported: false,
                 outside_tier: false,
+                install_as: None,
                 action: Action::Adopt,
             })
             .collect()

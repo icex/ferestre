@@ -831,8 +831,13 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             let waits = matches!(row.action, Action::Install | Action::Update);
             let plays = matches!(row.action, Action::Play);
             let updating = matches!(row.action, Action::Update);
-            let product_id = row.product_id.clone();
-            let title_name = row.name.clone();
+            // A bundle installs its child, and the dialog names the child: a
+            // 23 GB download starting under a different title's name would be
+            // the launcher doing something it never explained.
+            let (product_id, title_name) = match &row.install_as {
+                Some((id, name)) => (id.clone(), name.clone()),
+                None => (row.product_id.clone(), row.name.clone()),
+            };
             button.connect_clicked(glib::clone!(
                 #[strong]
                 ui,
