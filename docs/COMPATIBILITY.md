@@ -38,8 +38,14 @@ your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 
 | Title | Store id | State | Notes | Verified |
 |---|---|---|---|---|
+| Age of Empires: Definitive Edition | `9NJWTJSVGVLJ` | Playable | Boots, starts a custom game and plays. | 2026-09-07 |
 | Clair Obscur: Expedition 33 | `9PPT8K6GQHRZ` | Playable | Playable start to finish, with working saves and video. | 2026-09-06 |
+| DOOM 64 | `9MXND4PQLK3W` | Playable | Plays. | 2026-09-06 |
+| DREDGE | `9MSVVM5NS9L6` | Playable | Plays. | 2026-09-06 |
 | Minecraft for Windows | `9NBLGGH2JHXJ` | Playable | Signs in to Xbox Live, loads the profile, plays, and joins third-party servers from the in-game list. | 2026-09-06 |
+| Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
+| Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. | 2026-09-06 |
+| Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable, with issues | Boots and plays; the online features do not work. | 2026-09-06 |
 | Forza Horizon 5 | `9NNX1VVR3KNQ` | Does not run | Downloads and decrypts; dies inside its own code protection before any runtime API is reached. Stops at: an illegal instruction (0xc000001d) at ForzaHorizon5.exe+0x53d5cec, reached through ucrtbase -- the C++ static-initialiser path -- with no GDK call made first. | 2026-09-05 |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.

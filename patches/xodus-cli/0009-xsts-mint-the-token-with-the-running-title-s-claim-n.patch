@@ -1,4 +1,4 @@
-From 78ff54eb4a9457acdd0947dff2256a8b2390e215 Mon Sep 17 00:00:00 2001
+From ca37d8485d9c5a6fea26c99a245d9af39d7f4316 Mon Sep 17 00:00:00 2001
 From: Ice <icex@users.noreply.github.com>
 Date: Sun, 6 Sep 2026 23:49:57 +0300
 Subject: [PATCH] xsts: mint the token with the running title's claim, not a
@@ -41,32 +41,30 @@ unclaimed reads first, then the claim, then a claimed read, so a failure
 is attributed instead of guessed at.
 ---
  crates/xodus-cli/src/commands.rs              |   1 +
- crates/xodus-cli/src/commands/collections.rs  |  51 +++-
- crates/xodus-cli/src/commands/xblcheck.rs     | 257 ++++++++++++++++++
+ crates/xodus-cli/src/commands/collections.rs  |  81 ++++--
+ crates/xodus-cli/src/commands/xblcheck.rs     | 267 ++++++++++++++++++
  crates/xodus-cli/src/main.rs                  |  63 ++++-
- crates/xodus-service/src/connection/xml.rs    | 152 +++++++++--
+ crates/xodus-service/src/connection/xml.rs    | 219 ++++++++++----
  crates/xodus-service/src/main.rs              |  10 +-
- crates/xodus/src/api/xbox/claims.rs           | 154 +++++++++++
+ crates/xodus/src/api/xbox/claims.rs           | 154 ++++++++++
  crates/xodus/src/api/xbox/mod.rs              |   1 +
  crates/xodus/src/auth.rs                      |  24 +-
  crates/xodus/src/models/xgameruntime/xuser.rs |  20 ++
- 10 files changed, 700 insertions(+), 33 deletions(-)
+ 10 files changed, 768 insertions(+), 72 deletions(-)
  create mode 100644 crates/xodus-cli/src/commands/xblcheck.rs
  create mode 100644 crates/xodus/src/api/xbox/claims.rs
 
 diff --git a/crates/xodus-cli/src/commands.rs b/crates/xodus-cli/src/commands.rs
-index 02cf77b..3122252 100644
+index 02cf77b..1892012 100644
 --- a/crates/xodus-cli/src/commands.rs
 +++ b/crates/xodus-cli/src/commands.rs
-@@ -9,5 +9,6 @@ pub mod login;
- pub mod logout;
- #[cfg(unix)]
+@@ -11,3 +11,4 @@ pub mod logout;
  pub mod run;
-+pub mod xblcheck;
  pub mod splicense;
  pub mod streaming;
++pub mod xblcheck;
 diff --git a/crates/xodus-cli/src/commands/collections.rs b/crates/xodus-cli/src/commands/collections.rs
-index e252a3c..656a179 100644
+index e252a3c..af56b3c 100644
 --- a/crates/xodus-cli/src/commands/collections.rs
 +++ b/crates/xodus-cli/src/commands/collections.rs
 @@ -46,6 +46,31 @@ pub(crate) async fn xsts_for(
@@ -101,7 +99,7 @@ index e252a3c..656a179 100644
  fn correlation_vector() -> String {
      // These services want an MS-CV, and it is the identifier support would ask
      // for if a call misbehaves.
-@@ -96,8 +121,22 @@ pub async fn probe(
+@@ -96,8 +121,18 @@ pub async fn probe(
      body: Option<String>,
      relying_party: String,
      headers: Vec<String>,
@@ -110,22 +108,18 @@ index e252a3c..656a179 100644
  ) -> ExitCode {
 -    let xsts = match xsts_for(client, tokens, &relying_party).await {
 +    let minted = match &title {
-+        Some((title_id, client_id)) => title_claim_xsts(
-+            client,
-+            tokens,
-+            client_id,
-+            *title_id,
-+            &relying_party,
-+        )
-+        .await
-+        .map_err(|e| format!("{e}")),
++        Some((title_id, client_id)) => {
++            title_claim_xsts(client, tokens, client_id, *title_id, &relying_party)
++                .await
++                .map_err(|e| format!("{e}"))
++        }
 +        None => xsts_for(client, tokens, &relying_party).await,
 +    };
 +    let xsts = match minted {
          Ok(xsts) => xsts,
          Err(message) => {
              eprintln!("{message}");
-@@ -111,13 +150,17 @@ pub async fn probe(
+@@ -111,13 +146,17 @@ pub async fn probe(
      let puid = tokens.get_user().map(|u| u.puid).unwrap_or_default();
      let raw_token = xsts.token.clone();
      let auth = xodus::api::xbox::get_xsts_auth_header(xsts);
@@ -146,12 +140,74 @@ index e252a3c..656a179 100644
  
      match send(client, &url, body, &auth, &headers).await {
          Ok((status, text, cv)) => {
+@@ -181,7 +220,9 @@ async fn msa_user_ticket(
+     let Ok(Token::Legacy(user_legacy)) = tokens.get_user_sts_token() else {
+         return Err("no usable user token".into());
+     };
+-    let user = tokens.get_user().map_err(|e| format!("no stored user: {e}"))?;
++    let user = tokens
++        .get_user()
++        .map_err(|e| format!("no stored user: {e}"))?;
+ 
+     let outcome = xodus::api::live::exchange_user_token(
+         client,
+@@ -208,7 +249,9 @@ async fn msa_user_ticket(
+     };
+     match token {
+         Token::Compact(ticket) => Ok(ticket),
+-        Token::Legacy(_) => Err("MSA exchange returned a legacy token, wanted a compact one".into()),
++        Token::Legacy(_) => {
++            Err("MSA exchange returned a legacy token, wanted a compact one".into())
++        }
+     }
+ }
+ 
+@@ -260,14 +303,21 @@ pub async fn query(
+             body["continuationToken"] = serde_json::Value::String(token.clone());
+         }
+ 
+-        let (status, text, cv) =
+-            match send(client, COLLECTIONS_QUERY, Some(body.to_string()), &auth, &[]).await {
+-                Ok(result) => result,
+-                Err(message) => {
+-                    eprintln!("{message}");
+-                    return ExitCode::FAILURE;
+-                }
+-            };
++        let (status, text, cv) = match send(
++            client,
++            COLLECTIONS_QUERY,
++            Some(body.to_string()),
++            &auth,
++            &[],
++        )
++        .await
++        {
++            Ok(result) => result,
++            Err(message) => {
++                eprintln!("{message}");
++                return ExitCode::FAILURE;
++            }
++        };
+         if !status.is_success() {
+             eprintln!("HTTP {status} (MS-CV {cv})");
+             println!("{text}");
+@@ -294,8 +344,7 @@ pub async fn query(
+     if !all {
+         entries.retain(|item| {
+             let field = |name: &str| item.get(name).and_then(|v| v.as_str()).unwrap_or_default();
+-            field("status") == "Active"
+-                && matches!(field("productType"), "Game" | "Application")
++            field("status") == "Active" && matches!(field("productType"), "Game" | "Application")
+         });
+     }
+ 
 diff --git a/crates/xodus-cli/src/commands/xblcheck.rs b/crates/xodus-cli/src/commands/xblcheck.rs
 new file mode 100644
-index 0000000..f7b11f2
+index 0000000..6096f9b
 --- /dev/null
 +++ b/crates/xodus-cli/src/commands/xblcheck.rs
-@@ -0,0 +1,257 @@
+@@ -0,0 +1,267 @@
 +//! Check that a title's Xbox Live calls will actually be authorised.
 +//!
 +//! A title never reports *why* an Xbox call failed. It sees a 403 and says
@@ -228,20 +284,19 @@ index 0000000..f7b11f2
 +/// decimal, which is a conversion worth doing in exactly one place.
 +pub fn identity_from_game_dir(dir: &Path) -> Result<TitleIdentity, String> {
 +    let path = dir.join("MicrosoftGame.config");
-+    let xml = std::fs::read_to_string(&path)
-+        .map_err(|e| format!("reading {}: {e}", path.display()))?;
++    let xml =
++        std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
 +    let element = |name: &str| -> Option<String> {
 +        let open = format!("<{name}>");
 +        let start = xml.find(&open)? + open.len();
 +        let len = xml[start..].find('<')?;
 +        Some(xml[start..start + len].trim().to_string())
 +    };
-+    let hex = element("TitleId")
-+        .ok_or_else(|| format!("{} has no <TitleId>", path.display()))?;
++    let hex = element("TitleId").ok_or_else(|| format!("{} has no <TitleId>", path.display()))?;
 +    let title_id = i64::from_str_radix(hex.trim_start_matches("0x"), 16)
 +        .map_err(|_| format!("<TitleId>{hex}</TitleId> is not hexadecimal"))?;
-+    let client_id = element("MSAAppId")
-+        .ok_or_else(|| format!("{} has no <MSAAppId>", path.display()))?;
++    let client_id =
++        element("MSAAppId").ok_or_else(|| format!("{} has no <MSAAppId>", path.display()))?;
 +    Ok(TitleIdentity {
 +        title_id,
 +        client_id,
@@ -299,7 +354,11 @@ index 0000000..f7b11f2
 +            println!("   ok    {}", probe.name);
 +        } else {
 +            failed += 1;
-+            println!("   FAIL  {} -- HTTP {status} {}", probe.name, first_line(&body));
++            println!(
++                "   FAIL  {} -- HTTP {status} {}",
++                probe.name,
++                first_line(&body)
++            );
 +        }
 +    }
 +    if failed > 0 {
@@ -323,7 +382,10 @@ index 0000000..f7b11f2
 +    let claimed_auth = match claimed {
 +        Ok(xsts) => xodus::api::xbox::get_xsts_auth_header(xsts),
 +        Err(message) => {
-+            eprintln!("!! could not mint a token claiming title {}: {message}", identity.title_id);
++            eprintln!(
++                "!! could not mint a token claiming title {}: {message}",
++                identity.title_id
++            );
 +            eprintln!(
 +                "   Everything scoped by title -- multiplayer, parties, presence -- will answer \
 +                 403 until this works."
@@ -341,7 +403,11 @@ index 0000000..f7b11f2
 +            continue;
 +        }
 +        failed += 1;
-+        println!("   FAIL  {} -- HTTP {status} {}", probe.name, first_line(&body));
++        println!(
++            "   FAIL  {} -- HTTP {status} {}",
++            probe.name,
++            first_line(&body)
++        );
 +
 +        // Say which of the two it is: a claim Xbox will not accept for this
 +        // service, or a service that is unhappy for some other reason. The
@@ -390,7 +456,7 @@ index 0000000..f7b11f2
 +        .expect("write");
 +        let id = identity_from_game_dir(dir.path()).expect("parsed");
 +        assert_eq!(
-+            id.title_id, 1_774_457_393,
++            id.title_id, 1_774_692_913,
 +            "the config carries the title id in hexadecimal and Xbox wants it decimal"
 +        );
 +        assert_eq!(id.client_id, "cb41e2e1-503c-48ac-98b6-55b194b4ab66");
@@ -496,10 +562,10 @@ index 75d3d59..7befc57 100644
              page_size,
              msa_target,
 diff --git a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/src/connection/xml.rs
-index d8d9123..67ba7b2 100644
+index d8d9123..b4badcc 100644
 --- a/crates/xodus-service/src/connection/xml.rs
 +++ b/crates/xodus-service/src/connection/xml.rs
-@@ -30,14 +30,71 @@ static TITLE_TOKEN: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_n
+@@ -30,14 +30,73 @@ static TITLE_TOKEN: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_n
  static ENDPOINTS: tokio::sync::OnceCell<Option<xodus::models::xbox::TitleMgtResponse>> =
      tokio::sync::OnceCell::const_new();
  
@@ -526,7 +592,9 @@ index d8d9123..67ba7b2 100644
 +/// The mutex is held across the mint so a title asking for several relying
 +/// parties at once runs SISU once rather than once per ask.
 +static SISU: std::sync::LazyLock<
-+    tokio::sync::Mutex<std::collections::HashMap<i64, Option<std::sync::Arc<xodus::auth::SisuIdentity>>>>,
++    tokio::sync::Mutex<
++        std::collections::HashMap<i64, Option<std::sync::Arc<xodus::auth::SisuIdentity>>>,
++    >,
 +> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
 +
 +/// Relying parties xsts/authorize refused a title token for.
@@ -579,7 +647,37 @@ index d8d9123..67ba7b2 100644
  
  /// The key that signs requests. It has to be the key the token was minted
  /// under, so it follows SISU when SISU supplied the tokens.
-@@ -293,7 +350,21 @@ pub async fn parse_message(
+@@ -96,12 +155,12 @@ pub async fn handle(
+     socket.write_all(&data).await
+ }
+ 
+-async fn endpoints_for(
+-    client: &reqwest::Client,
+-) -> Option<xodus::models::xbox::TitleMgtResponse> {
++async fn endpoints_for(client: &reqwest::Client) -> Option<xodus::models::xbox::TitleMgtResponse> {
+     ENDPOINTS
+         .get_or_init(|| async {
+-            xodus::api::xbox::title::get_title_management(client).await.ok()
++            xodus::api::xbox::title::get_title_management(client)
++                .await
++                .ok()
+         })
+         .await
+         .clone()
+@@ -133,7 +192,11 @@ fn sign_for_with(
+         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.body_base64)
+             .unwrap_or_default()
+     };
+-    let method = if req.method.is_empty() { "GET" } else { &req.method };
++    let method = if req.method.is_empty() {
++        "GET"
++    } else {
++        &req.method
++    };
+     signer.sign(
+         version,
+         method,
+@@ -293,7 +356,23 @@ pub async fn parse_message(
                      }
                  }
              };
@@ -593,7 +691,9 @@ index d8d9123..67ba7b2 100644
 +                Some((id, client)) => {
 +                    tracing::debug!("Relying party: {relying_party} (title {id}, client {client})")
 +                }
-+                None => tracing::debug!("Relying party: {relying_party} (no title claim asked for)"),
++                None => {
++                    tracing::debug!("Relying party: {relying_party} (no title claim asked for)")
++                }
 +            }
 +            let cache_key = format!(
 +                "{}|{relying_party}",
@@ -602,7 +702,7 @@ index d8d9123..67ba7b2 100644
  
              // Re-use a still-valid token rather than paying for the whole
              // chain again; keep a minute of headroom so one never expires in
-@@ -302,7 +373,7 @@ pub async fn parse_message(
+@@ -302,7 +381,7 @@ pub async fn parse_message(
              if let Some(hit) = XSTS_CACHE
                  .lock()
                  .ok()
@@ -611,7 +711,53 @@ index d8d9123..67ba7b2 100644
                  .filter(|c| c.expiry > now + 60)
              {
                  tracing::debug!("Re-using cached token for {relying_party}");
-@@ -357,20 +428,40 @@ pub async fn parse_message(
+@@ -332,45 +411,65 @@ pub async fn parse_message(
+             // needs the whole chain minted under one key, which is a rebuild of
+             // this path rather than an addition to it.
+             if std::env::var("XODUS_TITLE_TOKEN").is_ok_and(|v| v == "1") {
+-            TITLE_TOKEN
+-                .get_or_init(|| async {
+-                    match xodus::auth::do_sisu(
+-                        &context.client,
+-                        context.tokens(),
+-                        "0000000040159362",
+-                        896928775,
+-                    )
+-                    .await
+-                    {
+-                        Ok((_, resp, _)) => {
+-                            tracing::info!("SISU supplied a title token");
+-                            xodus::api::xbox::set_title_token(resp.title_token.token.clone());
+-                            true
+-                        }
+-                        Err(e) => {
+-                            tracing::warn!("SISU title token unavailable: {e}");
+-                            false
++                TITLE_TOKEN
++                    .get_or_init(|| async {
++                        match xodus::auth::do_sisu(
++                            &context.client,
++                            context.tokens(),
++                            "0000000040159362",
++                            896928775,
++                        )
++                        .await
++                        {
++                            Ok((_, resp, _)) => {
++                                tracing::info!("SISU supplied a title token");
++                                xodus::api::xbox::set_title_token(resp.title_token.token.clone());
++                                true
++                            }
++                            Err(e) => {
++                                tracing::warn!("SISU title token unavailable: {e}");
++                                false
++                            }
+                         }
+-                    }
+-                })
+-                .await;
++                    })
++                    .await;
              }
              let device_token = context.device_token.as_ref().unwrap().clone();
  
@@ -665,7 +811,21 @@ index d8d9123..67ba7b2 100644
  
              if let Some(id) = sisu.as_ref() {
                  let signer = xodus::api::xbox::RequestSigner::from_pkcs8(&id.key_pkcs8);
-@@ -398,7 +489,7 @@ pub async fn parse_message(
+@@ -386,7 +485,12 @@ pub async fn parse_message(
+                     Ok(xsts) => {
+                         let token = xodus::api::xbox::get_xsts_auth_header(xsts.clone());
+                         let signature = match signer.as_ref() {
+-                            Some(s) => sign_for_with(&req, &token, &endpoints_for(&context.client).await, s),
++                            Some(s) => sign_for_with(
++                                &req,
++                                &token,
++                                &endpoints_for(&context.client).await,
++                                s,
++                            ),
+                             None => String::new(),
+                         };
+                         let payload = XSTSTokenResponse {
+@@ -398,7 +502,7 @@ pub async fn parse_message(
                          };
                          if let Ok(mut cache) = XSTS_CACHE.lock() {
                              cache.insert(
@@ -674,7 +834,7 @@ index d8d9123..67ba7b2 100644
                                  CachedToken {
                                      token: payload.token.clone(),
                                      xuid: payload.xuid.clone(),
-@@ -410,7 +501,16 @@ pub async fn parse_message(
+@@ -410,7 +514,16 @@ pub async fn parse_message(
                          return Ok(quick_xml::se::to_string(&payload)?.as_bytes().to_vec());
                      }
                      Err(e) => {
@@ -692,7 +852,7 @@ index d8d9123..67ba7b2 100644
                      }
                  }
              }
-@@ -459,7 +559,7 @@ pub async fn parse_message(
+@@ -459,7 +572,7 @@ pub async fn parse_message(
              };
              if let Ok(mut cache) = XSTS_CACHE.lock() {
                  cache.insert(

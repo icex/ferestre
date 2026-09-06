@@ -396,33 +396,29 @@ These are judgement calls, not engineering ones:
 
 ## Known gaps, stated plainly
 
-- **Age of Empires Definitive Edition still crashes at startup, and the WinRT
-  work was not the reason.** `Windows.Foundation.Diagnostics.LoggingChannel` and
-  `LoggingChannelOptions` are implemented and correct now -- both activate, and
-  the title's real call, `ILoggingChannelFactory2::CreateWithOptionsAndId`,
-  arrives with the options object this runtime handed it. It then crashes
-  anyway, at the same instruction as before:
+- **Age of Empires Definitive Edition — resolved.** It now boots, opens a
+  custom game and plays. Two gaps, both the same shape: the title asks for
+  something, is handed a stand-in, and does not check what it got back.
 
-  ```text
-  mov  rbx,[rcx+0x38]      ; faults, rcx = 0xFFFFFFFFFFFFFFFF
-  test rbx,rbx
-  jz   +8
-  lock inc dword [rbx+8]   ; a COM AddRef of a member
-  ```
+  `Windows.Foundation.Diagnostics.LoggingOptions` was the missing third class.
+  The title activates LoggingChannelOptions, then LoggingChannel, then
+  LoggingOptions; the third failed, and it dereferenced the pointer it had not
+  received -- the `mov rbx,[rcx+0x38]` fault with `rcx = -1` that this section
+  used to describe as an open question. It was not a teardown path and not an
+  ABI defect; it was a class nobody had implemented.
 
-  `rcx` is -1, a sentinel rather than a null, which is what an uninitialised or
-  deliberately poisoned local looks like. Immediately before it, the title calls
-  `QueryApiImpl` (which returns S_OK), frees two heap blocks, and closes a user
-  handle -- the shape of a teardown path, which suggests the title decided
-  something had failed earlier and the crash is in how it gives up. What it
-  decided had failed is the open question.
+  Then libHttpClient's error path completed a third async block it had never
+  initialised -- observed arriving as NULL, as `0xfffffffffffffffe`, and as
+  `0x0000090b32e048a4`, that last one with result `0x80190190`, which is HTTP
+  400 as an HRESULT. Completing a block means writing into it, so the runtime
+  faulted on the first store. `XAsyncComplete` now refuses a block
+  `XAsyncBegin` never started, and says so in the log.
 
-  A 67-agent adversarial audit of the runtime confirmed twelve ABI defects and
-  flagged eight as possible causes. The three best-matching have been fixed and
-  none of them was it: the task-queue runner launched with a mismatched thread
-  signature, `XTaskQueueTerminate` not terminating, and `XAsyncGetResult`
-  returning success without writing the caller's buffer. They were real bugs
-  worth fixing on their own; they are not this one.
+  Worth recording what did *not* find this: a 67-agent adversarial audit
+  confirmed twelve ABI defects and flagged eight as possible causes. Three were
+  fixed and none was it. What found it was one line of the title's own log --
+  `Failed to find library for L"Windows.Foundation.Diagnostics.LoggingOptions"`
+  -- two lines above the fault.
 
 - **An install can fail while the client exits zero.** A title the account is
   not licensed for prints `not entitled to this content` and returns success,

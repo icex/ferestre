@@ -1,0 +1,49 @@
+diff --git a/xthreading.c b/xthreading.c
+index ad039a8..6881069 100644
+--- a/xthreading.c
++++ b/xthreading.c
+@@ -201,13 +201,29 @@ static void release_async_op( struct x_async_op *op )
+ }
+ 
+ /* Record an operation's outcome and fire the block's completion callback.
+- * Shared by XAsyncComplete and by the DoWork paths that finish inline. */
++ * Shared by XAsyncComplete and by the DoWork paths that finish inline.
++ *
++ * A block with no operation behind it is not completed, it is *refused*.
++ * XAsyncComplete only means anything for a block XAsyncBegin started here, and
++ * a caller that reaches this with anything else is holding a pointer that has
++ * stopped being an XAsyncBlock -- Age of Empires: Definitive Edition arrives
++ * with 0x0000090b32e048a4 shortly after two nested libHttpClient operations
++ * complete on two threads. Writing the result into it faults on the first
++ * dereference, inside this dll, which reads as a runtime bug rather than as
++ * what it is. */
+ static void x_threading_XAsyncComplete_helper( XAsyncBlock *async, HRESULT result, SIZE_T required_size )
+ {
+     struct x_async_op *op, *drop = NULL;
+ 
+     EnterCriticalSection( &async_ops_cs );
+-    if ((op = find_async_op( async )))
++    op = find_async_op( async );
++    if (!op)
++    {
++        LeaveCriticalSection( &async_ops_cs );
++        WARN( "no operation for asyncBlock %p; refusing to complete a block this runtime never began.\n",
++              async );
++        return;
++    }
+     {
+         if (op->completed)
+         {
+@@ -480,7 +496,11 @@ static HRESULT WINAPI x_threading_XAsyncSchedule( IXThreadingImpl *iface, XAsync
+ 
+ static void WINAPI x_threading_XAsyncComplete( IXThreadingImpl *iface, XAsyncBlock *asyncBlock, HRESULT result, SIZE_T requiredBufferSize )
+ {
+-    TRACE( "iface %p, asyncBlock %p, result %#lx, requiredBufferSize %Iu.\n", iface, asyncBlock, result, requiredBufferSize );
++    /* The caller's address distinguishes "the same call site ran twice with a
++     * stale pointer" from "a different code path", which is the whole question
++     * when a block arrives that no operation matches. */
++    TRACE( "iface %p, asyncBlock %p, result %#lx, requiredBufferSize %Iu, called from %p.\n",
++           iface, asyncBlock, result, requiredBufferSize, __builtin_return_address(0) );
+     x_threading_XAsyncComplete_helper( asyncBlock, result, requiredBufferSize );
+ }
+ 

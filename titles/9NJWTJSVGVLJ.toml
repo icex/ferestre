@@ -1,0 +1,41 @@
+# Age of Empires: Definitive Edition -- Microsoft Store / Game Pass
+#
+# Two runtime gaps stood between this title and a running match, and both had
+# the same shape: it asks for something, is handed a stand-in, and does not
+# check what it got back.
+#
+#   * It activates three WinRT logging classes in order -- LoggingChannelOptions,
+#     LoggingChannel, LoggingOptions. The third was missing, so
+#     RoGetActivationFactory failed and the title dereferenced the pointer it had
+#     not received: a fault reading 0xFFFFFFFFFFFFFFFF one instruction later.
+#   * libHttpClient's error path completes an async block it never initialised,
+#     and the runtime wrote the result into it. See
+#     xgameruntime.async-block-ownership.
+#
+# Neither is specific to this title; both are fixed in the runtime rather than
+# worked around here, which is why this recipe has nothing in it but the
+# capabilities it needs.
+
+schema = 1
+
+[title]
+product-id      = "9NJWTJSVGVLJ"
+name            = "Age of Empires: Definitive Edition"
+slug            = "age-of-empires-definitive-edition"
+publisher       = "Xbox Game Studios"
+install-size-gb = 20.0
+
+[launch]
+executable = 'AoEDE.exe'
+
+[runtime]
+requires = [
+    "loader.memfd-main-image",
+    "winrt.loggingchannel",
+    "xgameruntime.async-block-ownership",
+]
+
+[status]
+state   = "playable"
+summary = "Boots, starts a custom game and plays."
+last-verified = 2026-09-07

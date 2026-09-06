@@ -128,6 +128,27 @@ verify = [
 ]
 
 [[capability]]
+name = "xgameruntime.async-block-ownership"
+summary = "XAsyncComplete refuses a block this runtime never began, instead of writing a result into whatever the pointer happens to be."
+provided-by = ["patches/xgameruntime/0006-refuse-to-complete-an-async-block-we-never-began.patch"]
+symptom-if-missing = "a fault inside xgameruntime.dll on the first dereference of the async block -- Age of Empires: Definitive Edition dies on the way into a match"
+note = """
+libHttpClient nests two async operations per HTTP call, and its error path \
+completes a third block that it never initialised: observed arriving as NULL, \
+as 0xfffffffffffffffe, and as 0x0000090b32e048a4, the last with result \
+0x80190190 -- HTTP 400 as an HRESULT. Completing a block means writing the \
+result into it, so an uninitialised pointer faults on the first store, inside \
+this dll, which reads as a runtime bug rather than as a caller passing \
+something that was never an XAsyncBlock.
+
+The operation list is the arbiter: XAsyncComplete means nothing for a block \
+XAsyncBegin did not start, so a block with no operation behind it is refused \
+and named in the log rather than dereferenced."""
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "a block this runtime never began" },
+]
+
+[[capability]]
 name = "appmodel.package-identity"
 summary = "kernelbase reports the current process's package identity from the manifest beside the executable, so GetCurrentPackageFullName and friends succeed."
 provided-by = ["patches/wine/0002-kernelbase-current-package-identity.patch"]
