@@ -103,6 +103,23 @@ verify = [
 ]
 
 [[capability]]
+name = "xgameruntime.task-queue-lifetime"
+summary = "A task queue terminates when told to, and an async result never reports success without writing what it promised."
+provided-by = ["patches/xgameruntime/0003-task-queue-termination-and-async-results.patch"]
+symptom-if-missing = "callbacks run after the title was told none would, against objects it has already freed; and a second XAsyncGetResult returns S_OK with the caller's buffer untouched"
+note = """
+Three defects an adversarial audit of this runtime confirmed. The queue runner \
+was launched through CreateThread with a thread-pool callback's two-argument \
+signature, so the queue pointer it used was whatever the ABI left in the second \
+register. XTaskQueueTerminate drained an unrelated process-wide list and fired \
+the terminated callback immediately, leaving the queue's own callbacks to run \
+afterwards with `canceled` FALSE -- that callback is exactly the signal a title \
+acts on to free the objects those callbacks touch."""
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "completed with no payload" },
+]
+
+[[capability]]
 name = "appmodel.package-identity"
 summary = "kernelbase reports the current process's package identity from the manifest beside the executable, so GetCurrentPackageFullName and friends succeed."
 provided-by = ["patches/wine/0002-kernelbase-current-package-identity.patch"]

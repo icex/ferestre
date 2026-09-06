@@ -1,0 +1,161 @@
+diff --git a/xthreading.c b/xthreading.c
+--- a/xthreading.c
++++ b/xthreading.c
+@@ -498,10 +498,41 @@
+     op = find_async_op( asyncBlock );
+     if (!op)
+     {
++        void *payload = NULL;
++        SIZE_T size;
++
+         LeaveCriticalSection( &async_ops_cs );
+-        /* Not provider-driven: an operation this DLL satisfied itself. */
+-        if (xgr_async_completed( asyncBlock, &hr, NULL )) return hr;
+-        return E_PENDING;
++
++        /* Either an operation this DLL satisfied itself, or a provider-driven
++         * one whose result has already been taken -- the two are
++         * indistinguishable from here, because taking a result removes the op
++         * but leaves the block carrying its completion.
++         *
++         * Either way, returning the stored HRESULT without touching the
++         * caller's buffer is not an option. A success that writes nothing
++         * leaves the caller reading whatever its result variable held before
++         * the call, and a title that pre-poisons a local with -1 then calls a
++         * method on it: `mov rbx,[rcx+0x38]` with rcx = 0xFFFFFFFFFFFFFFFF.
++         * Same shape as the empty image name and the NULL struct return -- a
++         * call that "succeeded" without leaving memory as promised. */
++        if (!xgr_async_completed( asyncBlock, &hr, &payload )) return E_PENDING;
++        if (FAILED(hr)) return hr;
++
++        size = (SIZE_T)(ULONG_PTR)asyncBlock->internal[3];
++        if (bufferUsed) *bufferUsed = size;
++        if (size)
++        {
++            if (!buffer || bufferSize < size) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++            memcpy( buffer, payload, size );
++        }
++        else if (buffer && bufferSize)
++        {
++            /* Success, a buffer asked for, and nothing recorded to put in it.
++             * Saying so beats leaving the caller's memory as it found it. */
++            WARN( "async %p completed with no payload for a %Iu byte buffer.\n", asyncBlock, bufferSize );
++            return E_INVALIDARG;
++        }
++        return hr;
+     }
+     if (!op->completed)
+     {
+@@ -542,6 +573,7 @@
+     struct list pending;        /* callbacks submitted but not run yet */
+     BOOL running;               /* a runner is draining `pending` right now */
+     BOOL initialised;           /* `pending` has been list_init'd */
++    BOOL terminated;            /* XTaskQueueTerminate was called */
+ };
+ 
+ /* The GDK keeps a process-wide default task queue. Passing a null handle to an
+@@ -873,8 +905,10 @@
+     {
+         struct x_queue_work *item = NULL;
+         struct list *head;
++        BOOL canceled;
+ 
+         EnterCriticalSection( &queue_work_cs );
++        canceled = queue->terminated;
+         if (queue->initialised && (head = list_head( &queue->pending )))
+         {
+             item = LIST_ENTRY( head, struct x_queue_work, entry );
+@@ -885,11 +919,25 @@
+ 
+         if (!item) return;
+ 
+-        item->callback( item->context, FALSE );
++        /* `canceled` is the whole point of the flag: after a terminate, a
++         * callback must be told it is being cancelled rather than run down its
++         * success path against objects the title has already destroyed. */
++        item->callback( item->context, canceled );
+         free( item );
+     }
+ }
+ 
++/* A thread entry point takes one argument; a thread-pool callback takes two.
++ * Casting one to the other put the queue in `instance` and left `context` --
++ * which is what the body actually uses -- holding whatever the ABI happened to
++ * leave in the second register. The queue pointer was then garbage, and the
++ * first thing the runner does is dereference it. */
++static DWORD WINAPI queue_runner_thread( void *context )
++{
++    queue_runner( NULL, context );
++    return 0;
++}
++
+ static void kick_queue_runner( struct x_task_queue *queue )
+ {
+     BOOL start = FALSE;
+@@ -909,7 +957,7 @@
+      * callback and this one has to keep draining. */
+     WARN( "thread pool refused a queue runner; using a thread of its own.\n" );
+     {
+-        HANDLE thread = CreateThread( NULL, 0, (LPTHREAD_START_ROUTINE)queue_runner, queue, 0, NULL );
++        HANDLE thread = CreateThread( NULL, 0, queue_runner_thread, queue, 0, NULL );
+ 
+         if (thread) CloseHandle( thread );
+         else
+@@ -971,6 +1019,9 @@
+     if (!callback) return E_INVALIDARG;
+     if (!obj) obj = default_task_queue();
+     if (!obj) return E_OUTOFMEMORY;
++    /* A terminated queue takes no more work. Accepting it is how a callback
++     * ends up running after the title was told nothing more would. */
++    if (obj->terminated) return E_ABORT;
+ 
+     /* Immediate means "run it on the thread that submitted it". */
+     if ((port == XTaskQueuePort_Completion ? obj->completion_mode : obj->work_mode) == XTaskQueueDispatchMode_Immediate)
+@@ -1065,11 +1116,44 @@
+ 
+ static HRESULT WINAPI x_threading_XTaskQueueTerminate( IXThreadingImpl *iface, XTaskQueueHandle queue, BOOLEAN wait, void *callbackContext, XTaskQueueTerminatedCallback *callback )
+ {
++    struct x_task_queue *obj = (struct x_task_queue *)queue;
++
+     TRACE( "iface %p, queue %p, wait %d, callbackContext %p, callback %p.\n", iface, queue, wait, callbackContext, callback );
+ 
+-    /* Nothing is queued asynchronously, so a queue is drained as soon as its
+-     * pending completions have been delivered. Report termination straight
+-     * away -- callers block in their dispatch loop until this callback runs. */
++    if (!obj) obj = default_task_queue();
++
++    /* The terminated callback is the title's signal that nothing else will ever
++     * be called back, and it acts on that: it destroys the objects those
++     * callbacks were going to touch. So everything the queue still holds has to
++     * be dealt with *before* the callback fires, and the queue has to stop
++     * accepting work -- otherwise a callback runs its success path against
++     * memory the title has already freed.
++     *
++     * This used to drain only the process-wide completion list and report
++     * success immediately, leaving the queue's own callbacks to run afterwards
++     * on a pool thread, with `canceled` FALSE. */
++    if (obj)
++    {
++        struct x_queue_work *item;
++        struct list drained;
++
++        list_init( &drained );
++
++        EnterCriticalSection( &queue_work_cs );
++        obj->terminated = TRUE;
++        if (obj->initialised) list_move_tail( &drained, &obj->pending );
++        LeaveCriticalSection( &queue_work_cs );
++
++        /* Outside the lock: a cancelled callback may submit, close handles, or
++         * do anything else that takes it. */
++        while ((item = LIST_ENTRY( list_head( &drained ), struct x_queue_work, entry ), !list_empty( &drained )))
++        {
++            list_remove( &item->entry );
++            item->callback( item->context, TRUE );
++            free( item );
++        }
++    }
++
+     while (deliver_one_completion());
+     if (callback) callback( callbackContext );
+     return S_OK;

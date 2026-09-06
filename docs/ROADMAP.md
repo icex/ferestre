@@ -396,22 +396,33 @@ These are judgement calls, not engineering ones:
 
 ## Known gaps, stated plainly
 
-- **Age of Empires Definitive Edition asks for a WinRT class the fork does not
-  have.** Thread `0224` calls `RoGetActivationFactory` for
-  `Windows.Foundation.Diagnostics.LoggingChannelOptions`
-  (IID `{a93151da-7faf-4191-8755-5e86dc65d896}`), it fails because nothing in
-  the tree implements that namespace -- no IDL, no class -- and the very next
-  line is a page fault in the title's own code reading `0xFFFFFFFFFFFFFFFF`.
+- **Age of Empires Definitive Edition still crashes at startup, and the WinRT
+  work was not the reason.** `Windows.Foundation.Diagnostics.LoggingChannel` and
+  `LoggingChannelOptions` are implemented and correct now -- both activate, and
+  the title's real call, `ILoggingChannelFactory2::CreateWithOptionsAndId`,
+  arrives with the options object this runtime handed it. It then crashes
+  anyway, at the same instruction as before:
 
-  The fix is to host `LoggingChannel` and `LoggingChannelOptions` in an existing
-  WinRT dll and no-op the logging, the way
-  `patches/wine/0004-regionpolicyevaluator-winrt-class.patch` hosts
-  `RegionPolicyEvaluator` in `windows.system.profile.systemid`. Runtime-wide: no
-  recipe involved, and every title that asks gets it.
+  ```text
+  mov  rbx,[rcx+0x38]      ; faults, rcx = 0xFFFFFFFFFFFFFFFF
+  test rbx,rbx
+  jz   +8
+  lock inc dword [rbx+8]   ; a COM AddRef of a member
+  ```
 
-  Corroboration that the engine itself is fine under Proton: the Steam build of
-  the same game ([813780](https://www.protondb.com/app/813780)) works. That is
-  worth doing first for any title -- it splits the search space in one lookup.
+  `rcx` is -1, a sentinel rather than a null, which is what an uninitialised or
+  deliberately poisoned local looks like. Immediately before it, the title calls
+  `QueryApiImpl` (which returns S_OK), frees two heap blocks, and closes a user
+  handle -- the shape of a teardown path, which suggests the title decided
+  something had failed earlier and the crash is in how it gives up. What it
+  decided had failed is the open question.
+
+  A 67-agent adversarial audit of the runtime confirmed twelve ABI defects and
+  flagged eight as possible causes. The three best-matching have been fixed and
+  none of them was it: the task-queue runner launched with a mismatched thread
+  signature, `XTaskQueueTerminate` not terminating, and `XAsyncGetResult`
+  returning success without writing the caller's buffer. They were real bugs
+  worth fixing on their own; they are not this one.
 
 - **An install can fail while the client exits zero.** A title the account is
   not licensed for prints `not entitled to this content` and returns success,
