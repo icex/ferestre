@@ -488,7 +488,40 @@ def main():
                 f,
             )
 
-    gui = subprocess.Popen([binary], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    # The window is run from a copy, with a stub `ferestre` beside it, because
+    # that is how it picks its CLI -- a sibling first, the path second. Two
+    # things follow. The window under test can never reach the real client, so
+    # no check here can sign in, spend a download or touch an account. And the
+    # install path becomes drivable: the stub prints the progress lines the real
+    # client prints under XODUS_PROGRESS=json, which is the only way to see the
+    # bar without downloading a game to watch it.
+    bindir = os.path.join(home, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    binary_copy = os.path.join(bindir, os.path.basename(binary))
+    shutil.copy2(binary, binary_copy)
+    stub = os.path.join(bindir, "ferestre")
+    with open(stub, "w") as f:
+        f.write(
+            """#!/usr/bin/env python3
+import json, os, sys, time
+if sys.argv[1:2] != ["install"]:
+    sys.exit(0)
+if os.environ.get("XODUS_PROGRESS") != "json":
+    # The real client only emits these when asked. A window that forgets to ask
+    # would then sit on an empty bar, and this is where that gets noticed.
+    sys.exit("progress was not requested")
+total = 800_000_000
+# Four seconds of it: the estimate deliberately says nothing until it has a
+# couple of seconds to average over, so a shorter run would prove less.
+for step in range(1, 41):
+    print(json.dumps({"progress": {"done": total * step // 40, "total": total}}), flush=True)
+    time.sleep(0.1)
+print(":: done", flush=True)
+"""
+        )
+    os.chmod(stub, 0o755)
+
+    gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     deadline = time.monotonic() + TIMEOUT
     failures = []
     try:
@@ -723,6 +756,52 @@ def main():
             "and an included title offers an install",
             frame,
         )
+
+        print("a download says how far, how fast and how long")
+        select_in_list(frame, "Library")
+        wait_for(
+            frame,
+            lambda root: row_button(root, "Smoke Test Racer", "Install"),
+            "the library to come back",
+            time.monotonic() + TIMEOUT,
+        )
+        click(row_button(frame, "Smoke Test Racer", "Install"))
+        wait_for(
+            frame,
+            lambda root: any("Install Smoke Test Racer?" in t for t in texts(root)),
+            "the confirmation",
+            time.monotonic() + TIMEOUT,
+        )
+        click_named(frame, "Install", "the confirm button")
+        labels = wait_for(
+            frame,
+            lambda root: texts(root)
+            if any("Installing Smoke Test Racer" in t for t in texts(root))
+            else None,
+            "the download bar",
+            time.monotonic() + TIMEOUT,
+        )
+        check(True, "the bar says what is being installed")
+        # The three things a progress bar is for. Waited for rather than read
+        # once: the rate and the estimate deliberately say nothing until there
+        # is enough history to divide by.
+        detail = wait_for(
+            frame,
+            lambda root: next(
+                (t for t in texts(root) if " of 800 MB" in t and "left" in t), None
+            ),
+            "the byte count, the rate and the time remaining",
+            time.monotonic() + TIMEOUT,
+        )
+        check("MB/s" in detail, f"a transfer rate: {detail!r}", frame)
+        check("left" in detail, f"and a time remaining: {detail!r}", frame)
+        wait_for(
+            frame,
+            lambda root: not any("Installing Smoke Test Racer" in t for t in texts(root)),
+            "the bar to go away when the download ends",
+            time.monotonic() + TIMEOUT,
+        )
+        check(True, "and it disappears when the download finishes")
 
         print("the editor")
         select_in_list(frame, "Library")

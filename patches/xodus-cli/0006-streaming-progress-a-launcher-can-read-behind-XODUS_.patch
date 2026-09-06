@@ -1,0 +1,115 @@
+From 9a4f058fbb9ad0231493bdf12403ac50f681a2f5 Mon Sep 17 00:00:00 2001
+From: Ice <icex@users.noreply.github.com>
+Date: Sun, 6 Sep 2026 19:44:55 +0300
+Subject: [PATCH] streaming: progress a launcher can read, behind
+ XODUS_PROGRESS=json
+
+indicatif hides itself when stderr is not a terminal, which is how a GUI runs
+this -- so a front end gets a child process, no output, and a multi-gigabyte
+wait it can only draw a spinner for.
+
+One JSON object per line on stdout, only when asked for, so a terminal run is
+unchanged. Just the two numbers: rate and time remaining need smoothing to not
+jitter between four seconds and nine minutes, and that belongs in whatever draws
+the bar.
+---
+ crates/xodus-cli/src/commands/streaming.rs | 60 ++++++++++++++++++++++
+ 1 file changed, 60 insertions(+)
+
+diff --git a/crates/xodus-cli/src/commands/streaming.rs b/crates/xodus-cli/src/commands/streaming.rs
+index 6d6640c..41fb9d6 100644
+--- a/crates/xodus-cli/src/commands/streaming.rs
++++ b/crates/xodus-cli/src/commands/streaming.rs
+@@ -1,6 +1,8 @@
+ use std::collections::HashMap;
++use std::io::Write;
+ use std::path::Path;
+ use std::process::ExitCode;
++use std::time::{Duration, Instant};
+ use std::vec;
+ 
+ use fs2::available_space;
+@@ -151,6 +153,58 @@ pub async fn run(
+     ExitCode::SUCCESS
+ }
+ 
++/// Download progress another program can read.
++///
++/// `indicatif` draws to a terminal and hides itself when stderr is not one --
++/// which is exactly how a launcher runs this. The front end is then left with a
++/// child process, no output, and a multi-gigabyte wait to explain to somebody,
++/// so it can only show a spinner and hope.
++///
++/// One JSON object per line on stdout, and only when `XODUS_PROGRESS=json` asks
++/// for it, so a terminal run is byte-for-byte what it was. Deliberately just
++/// the two numbers: rate and time remaining are the reader's to work out, and a
++/// reader that draws a bar already needs its own smoothing to avoid a figure
++/// that jitters between four seconds and nine minutes.
++struct JsonProgress {
++    enabled: bool,
++    last: Instant,
++}
++
++/// Often enough to look live, rarely enough that a 45 GB download does not
++/// spend its time writing JSON: the events behind this arrive per chunk.
++const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
++
++impl JsonProgress {
++    fn from_env() -> Self {
++        JsonProgress {
++            enabled: std::env::var("XODUS_PROGRESS").is_ok_and(|v| v == "json"),
++            // So the first event is emitted rather than swallowed by the
++            // throttle: a download that shows nothing for its first quarter
++            // second is fine, one that shows nothing until the first 250 ms
++            // *after* an event is not the same thing when events are sparse.
++            last: Instant::now() - PROGRESS_INTERVAL,
++        }
++    }
++
++    fn emit(&mut self, bar: &ProgressBar, force: bool) {
++        if !self.enabled || (!force && self.last.elapsed() < PROGRESS_INTERVAL) {
++            return;
++        }
++        self.last = Instant::now();
++        // The length is not fixed -- `UpdateRemaining` extends it as the plan
++        // is walked -- so it is sent every time rather than once at the start.
++        let total = bar.length().unwrap_or(0);
++        let mut out = std::io::stdout().lock();
++        let _ = writeln!(
++            out,
++            r#"{{"progress":{{"done":{},"total":{}}}}}"#,
++            bar.position(),
++            total
++        );
++        let _ = out.flush();
++    }
++}
++
+ async fn run_cli_reader<Reader>(
+     client: &reqwest::Client,
+     tokens: &TokenManager,
+@@ -176,6 +230,7 @@ where
+ 
+         total_progess.set_message("Initializing");
+         let mut bars: HashMap<usize, ProgressBar> = HashMap::new();
++        let mut json = JsonProgress::from_env();
+ 
+         while let Some(event) = rx.recv().await {
+             match event {
+@@ -206,8 +261,13 @@ where
+                     total_progess.set_message(name);
+                 }
+             }
++            json.emit(&total_progess, false);
+         }
+ 
++        // Forced, so the last line is the finished one. Without it a download
++        // ends at whatever the throttle last let through -- 99% forever, which
++        // reads as a hang at the worst possible moment.
++        json.emit(&total_progess, true);
+         total_progess.abandon();
+     });
+     run_reader(
+-- 
+2.55.0
+

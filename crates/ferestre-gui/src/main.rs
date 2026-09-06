@@ -9,9 +9,9 @@
 //!
 //! The client is never linked: Xodus is GPL-3.0-only, and the decrypted
 //! executable has to stay a child of the process that opened it.
-
 mod editor;
 mod model;
+mod progress;
 mod state;
 
 use adw::prelude::*;
@@ -20,6 +20,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use ferestre_core::recipe::Recipe;
 use ferestre_core::{account, catalog, gamepass, steam};
@@ -49,6 +50,8 @@ struct Ui {
     /// Set while the Game Pass listing is being fetched, so opening the section
     /// twice does not ask twice.
     fetching_gamepass: Rc<RefCell<bool>>,
+    /// The bar along the bottom, and the download it is describing.
+    download: DownloadBar,
     /// Titles this window started that have not exited, by product id, each
     /// mapped to the process group to signal. Deliberately not the `busy` flag:
     /// a game runs for hours and must not hold the window's other work.
@@ -134,8 +137,14 @@ fn build_ui(app: &adw::Application) {
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&scroll));
 
+    // Below the content and outside it, because `render` empties the content
+    // box: an inline bar would be destroyed and rebuilt four times a second,
+    // taking the scroll position and the keyboard focus with it.
+    let download = DownloadBar::new();
+
     let content_view = adw::ToolbarView::new();
     content_view.add_top_bar(&content_header);
+    content_view.add_bottom_bar(&download.root);
     content_view.set_content(Some(&toasts));
 
     let split = adw::NavigationSplitView::builder()
@@ -169,6 +178,7 @@ fn build_ui(app: &adw::Application) {
         running: Rc::new(RefCell::new(BTreeMap::new())),
         asked_names: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
         fetching_gamepass: Rc::new(RefCell::new(false)),
+        download: download.clone(),
     };
 
     // Activation and selection both, because they are not the same event:
@@ -948,6 +958,186 @@ fn spawn_cli(ui: &Ui, args: &[&str]) {
 /// runtime -- as opposed to launching a game, which runs for hours and must not
 /// hold anything. Waiting is the point: an install that finishes and leaves the
 /// row saying "not recorded" looks like it failed.
+/// The bar along the bottom of the window while something is downloading.
+///
+/// Its own type because it outlives every redraw: the page is emptied and
+/// rebuilt whenever anything changes, and a progress bar that goes with it
+/// would restart its animation, lose the scroll position, and flicker four
+/// times a second for however long a 45 GB download takes.
+#[derive(Clone)]
+struct DownloadBar {
+    root: gtk::Box,
+    title: gtk::Label,
+    detail: gtk::Label,
+    bar: gtk::ProgressBar,
+    /// Written by the thread reading the client's output, read by the tick.
+    /// A mutex rather than a channel because only the newest number matters --
+    /// a queue of stale byte counts would be drained and thrown away.
+    seen: Arc<Mutex<Option<(u64, u64)>>>,
+    /// What is being downloaded, or nothing.
+    current: Rc<RefCell<Option<progress::Download>>>,
+}
+
+impl DownloadBar {
+    fn new() -> Self {
+        let root = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .margin_start(18)
+            .margin_end(18)
+            .margin_top(10)
+            .margin_bottom(12)
+            .visible(false)
+            .build();
+        let title = gtk::Label::builder()
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        title.add_css_class("heading");
+        let bar = gtk::ProgressBar::new();
+        let detail = gtk::Label::builder().xalign(0.0).build();
+        detail.add_css_class("caption");
+        detail.add_css_class("dim-label");
+        root.append(&title);
+        root.append(&bar);
+        root.append(&detail);
+        DownloadBar {
+            root,
+            title,
+            detail,
+            bar,
+            seen: Arc::new(Mutex::new(None)),
+            current: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    fn start(&self, name: &str, what: &str) {
+        let download = progress::Download::new(name, what, std::time::Instant::now());
+        *self.seen.lock().unwrap() = None;
+        self.title.set_label(&download.heading());
+        *self.current.borrow_mut() = Some(download);
+        self.detail.set_label("Starting");
+        self.bar.set_fraction(0.0);
+        self.root.set_visible(true);
+    }
+
+    fn stop(&self) {
+        *self.current.borrow_mut() = None;
+        self.root.set_visible(false);
+    }
+
+    /// Redraw from whatever the reader has seen. Called on a timer rather than
+    /// per line: the client emits four updates a second and a window does not
+    /// need to lay out text that often.
+    fn tick(&self) {
+        let mut current = self.current.borrow_mut();
+        let Some(download) = current.as_mut() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if let Some((done, total)) = *self.seen.lock().unwrap() {
+            download.observe(done, total, now);
+        }
+        match download.fraction() {
+            Some(fraction) => self.bar.set_fraction(fraction),
+            // No total yet. An indeterminate bar says "working" without
+            // claiming a position, which is the truth at that moment.
+            None => self.bar.pulse(),
+        }
+        self.detail.set_label(&download.detail(now));
+    }
+}
+
+/// Run `ferestre install`, drawing its progress.
+///
+/// Unlike [`spawn_cli_tracked`] this reads the child's output instead of
+/// inheriting it, because that output is the only thing that knows how far a
+/// download has got. The client draws a terminal progress bar which hides
+/// itself when stdout is not a terminal -- exactly this case -- so it is asked
+/// for machine-readable progress instead, and prints one JSON line per quarter
+/// second. A client too old to know about that simply prints nothing this can
+/// read, and the bar stays indeterminate rather than breaking.
+fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&str>, what: &str) {
+    if !begin(ui) {
+        ui.toasts
+            .add_toast(adw::Toast::new("Something is already running"));
+        return;
+    }
+    let program = cli_binary();
+    let mut args = vec!["install".to_string(), product_id.to_string()];
+    if let Some(dir) = dir.map(str::trim).filter(|d| !d.is_empty()) {
+        args.push(dir.to_string());
+    }
+
+    ui.download.start(name, what);
+    let seen = Arc::clone(&ui.download.seen);
+
+    // One timer for the life of the download, stopped when it ends. Attached
+    // here rather than at startup so an idle window does no work at all.
+    let ticker = ui.clone();
+    let tick = glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+        if ticker.download.current.borrow().is_none() {
+            return glib::ControlFlow::Break;
+        }
+        ticker.download.tick();
+        glib::ControlFlow::Continue
+    });
+
+    let ui = ui.clone();
+    let what = what.to_string();
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || {
+            let mut child = std::process::Command::new(&program)
+                .args(&args)
+                .env("XODUS_PROGRESS", "json")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("{}: {e}", program.display()))?;
+
+            if let Some(out) = child.stdout.take() {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                    match progress::parse_line(&line) {
+                        Some(update) => *seen.lock().unwrap() = Some(update),
+                        // Everything else on that stream is the client talking
+                        // to a terminal that is not there. Passing it through
+                        // keeps `ferestre install` debuggable from a console
+                        // that started the window.
+                        None => println!("{line}"),
+                    }
+                }
+            }
+            child
+                .wait()
+                .map_err(|e| format!("{}: {e}", program.display()))
+        })
+        .await;
+
+        tick.remove();
+        ui.download.stop();
+        finish(&ui);
+        match result {
+            Ok(Ok(status)) if status.success() => {
+                ui.model.borrow_mut().reload();
+                render(&ui);
+                ui.toasts
+                    .add_toast(adw::Toast::new(&format!("{what} finished")));
+            }
+            Ok(Ok(status)) => {
+                ui.model.borrow_mut().reload();
+                render(&ui);
+                ui.toasts
+                    .add_toast(adw::Toast::new(&format!("{what} exited {status}")));
+            }
+            Ok(Err(e)) => ui.toasts.add_toast(adw::Toast::new(&e)),
+            Err(_) => ui
+                .toasts
+                .add_toast(adw::Toast::new("The install could not be started")),
+        }
+    });
+}
+
 fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
     if !begin(ui) {
         ui.toasts
@@ -1052,17 +1242,8 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
             return;
         }
         let dir = where_to.text().to_string();
-        let dir = dir.trim();
-        let what = if updating {
-            format!("Updating {name}")
-        } else {
-            format!("Installing {name}")
-        };
-        if dir.is_empty() {
-            spawn_cli_tracked(&ui, &["install", &product_id], &what);
-        } else {
-            spawn_cli_tracked(&ui, &["install", &product_id, dir], &what);
-        }
+        let what = if updating { "Updating" } else { "Installing" };
+        spawn_install(&ui, &product_id, &name, Some(dir.trim()), what);
     });
     dialog.present(Some(&window));
 }
