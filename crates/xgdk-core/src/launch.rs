@@ -258,7 +258,10 @@ pub fn plan(recipe: &Recipe, dirs: &Dirs, options: &Options) -> Plan {
         // be enabled by an implicit layer manifest on the system, which no
         // amount of unsetting reaches. DISABLE_* wins over both.
         env_set.insert("DISABLE_VK_LAYER_VALVE_steam_overlay_1".into(), "1".into());
-        env_set.insert("DISABLE_VK_LAYER_VALVE_steam_fossilize_1".into(), "1".into());
+        env_set.insert(
+            "DISABLE_VK_LAYER_VALVE_steam_fossilize_1".into(),
+            "1".into(),
+        );
     }
 
     // gameinput.dll is behind an allow-list, and a GDK title that cannot load
@@ -392,11 +395,20 @@ summary = "Runs."
     fn the_default_plan_sets_what_every_title_needs() {
         let plan = plan(&recipe(""), &dirs(), &Options::default());
         assert_eq!(plan.get("WINE_GAMEINPUT"), Some("1"));
-        assert_eq!(plan.get("STEAM_COMPAT_DATA_PATH"), Some("/games/example-proton"));
+        assert_eq!(
+            plan.get("STEAM_COMPAT_DATA_PATH"),
+            Some("/games/example-proton")
+        );
         assert_eq!(plan.get("STEAM_COMPAT_CLIENT_INSTALL_PATH"), Some("/steam"));
         assert_eq!(plan.get("PROTON_DIR"), Some("/compat/xodus"));
-        assert_eq!(plan.get("DISABLE_VK_LAYER_VALVE_steam_overlay_1"), Some("1"));
-        assert_eq!(plan.get("DISABLE_VK_LAYER_VALVE_steam_fossilize_1"), Some("1"));
+        assert_eq!(
+            plan.get("DISABLE_VK_LAYER_VALVE_steam_overlay_1"),
+            Some("1")
+        );
+        assert_eq!(
+            plan.get("DISABLE_VK_LAYER_VALVE_steam_fossilize_1"),
+            Some("1")
+        );
     }
 
     #[test]
@@ -441,7 +453,10 @@ summary = "Runs."
             assert!(!plan.is_unset(name), "{name} should not also be unset");
         }
         for name in &plan.env_unset {
-            assert!(!plan.env_set.contains_key(name), "{name} is both set and unset");
+            assert!(
+                !plan.env_set.contains_key(name),
+                "{name} is both set and unset"
+            );
         }
     }
 
@@ -450,16 +465,26 @@ summary = "Runs."
         // A non-Steam shortcut wants the overlay, the controller configuration
         // and Remote Play, and all of those ride on the variables the default
         // strips.
-        let options = Options { steam_integration: true, ..Options::default() };
+        let options = Options {
+            steam_integration: true,
+            ..Options::default()
+        };
         let plan = plan(&recipe(""), &dirs(), &options);
 
-        assert!(plan.env_unset.is_empty(), "nothing should be stripped: {:?}", plan.env_unset);
+        assert!(
+            plan.env_unset.is_empty(),
+            "nothing should be stripped: {:?}",
+            plan.env_unset
+        );
         assert_eq!(plan.get("DISABLE_VK_LAYER_VALVE_steam_overlay_1"), None);
         assert_eq!(plan.get("DISABLE_VK_LAYER_VALVE_steam_fossilize_1"), None);
 
         // But the prefix is still ours: Steam's value points at the shortcut's
         // compatdata directory, which is not where the title is installed.
-        assert_eq!(plan.get("STEAM_COMPAT_DATA_PATH"), Some("/games/example-proton"));
+        assert_eq!(
+            plan.get("STEAM_COMPAT_DATA_PATH"),
+            Some("/games/example-proton")
+        );
         assert_eq!(plan.get("WINE_GAMEINPUT"), Some("1"));
         assert_eq!(plan.get("PROTON_DIR"), Some("/compat/xodus"));
     }
@@ -501,7 +526,10 @@ summary = "Runs."
         let without = plan(&recipe(""), &dirs(), &Options::default());
         assert_eq!(without.get("XGR_XUID"), None);
 
-        let options = Options { xuid: Some("0009abcd12345678".into()), ..Options::default() };
+        let options = Options {
+            xuid: Some("0009abcd12345678".into()),
+            ..Options::default()
+        };
         let with = plan(&recipe(""), &dirs(), &options);
         assert_eq!(with.get("XGR_XUID"), Some("0009abcd12345678"));
     }
@@ -512,7 +540,10 @@ summary = "Runs."
 
         // Default: <games>/<slug> and <games>/<slug>-proton.
         let r = recipe("");
-        assert_eq!(game_dir(&r, &d, &Options::default()), PathBuf::from("/games/example"));
+        assert_eq!(
+            game_dir(&r, &d, &Options::default()),
+            PathBuf::from("/games/example")
+        );
         assert_eq!(
             prefix_dir(&r, &d, &Options::default()),
             PathBuf::from("/games/example-proton")
@@ -522,7 +553,10 @@ summary = "Runs."
         // A recipe may move both, which is how Bedrock keeps its package one
         // level down.
         let r = recipe("[install]\ndir = \"bedrock/game\"\nprefix = \"bedrock-proton\"\n");
-        assert_eq!(game_dir(&r, &d, &Options::default()), PathBuf::from("/games/bedrock/game"));
+        assert_eq!(
+            game_dir(&r, &d, &Options::default()),
+            PathBuf::from("/games/bedrock/game")
+        );
         assert_eq!(
             prefix_dir(&r, &d, &Options::default()),
             PathBuf::from("/games/bedrock-proton")
@@ -540,7 +574,10 @@ summary = "Runs."
         };
         let plan = plan(&recipe(""), &dirs(), &options);
         assert_eq!(plan.args[3], "/mnt/big/exp33");
-        assert_eq!(plan.get("STEAM_COMPAT_DATA_PATH"), Some("/mnt/big/exp33-pfx"));
+        assert_eq!(
+            plan.get("STEAM_COMPAT_DATA_PATH"),
+            Some("/mnt/big/exp33-pfx")
+        );
         assert_eq!(plan.cwd, Some(PathBuf::from("/mnt/big/exp33")));
     }
 
@@ -548,7 +585,10 @@ summary = "Runs."
     fn the_command_carries_the_whole_plan() {
         let plan = plan(&recipe(""), &dirs(), &Options::default());
         let command = plan.to_command();
-        assert_eq!(command.get_program(), std::ffi::OsStr::new("/opt/xodus/xodus-cli"));
+        assert_eq!(
+            command.get_program(),
+            std::ffi::OsStr::new("/opt/xodus/xodus-cli")
+        );
         assert_eq!(command.get_current_dir(), Some(Path::new("/games/example")));
 
         let removed: Vec<_> = command

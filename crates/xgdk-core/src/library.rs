@@ -166,7 +166,10 @@ impl Entry {
         if self.status != EntitlementStatus::Active {
             return Some("entitlement is not active");
         }
-        if !matches!(self.product_type, ProductType::Game | ProductType::Application) {
+        if !matches!(
+            self.product_type,
+            ProductType::Game | ProductType::Application
+        ) {
             return Some("not a game or application");
         }
         None
@@ -499,8 +502,9 @@ summary = "Runs."
     #[test]
     fn a_bare_items_array_parses_too() {
         // `xodus-cli library --json | jq .items` is the obvious thing to do.
-        let entries = parse(r#"[{"productId":"9ZZTESTGAME1","productType":"Game","status":"Active"}]"#)
-            .expect("should parse");
+        let entries =
+            parse(r#"[{"productId":"9ZZTESTGAME1","productType":"Game","status":"Active"}]"#)
+                .expect("should parse");
         assert_eq!(entries.len(), 1);
     }
 
@@ -546,10 +550,7 @@ summary = "Runs."
             parse(r#"[{"productId":"9ZZTESTNEW07","productType":"Doodad","status":"Active"}]"#)
                 .unwrap();
         assert_eq!(entries[0].product_type.as_str(), "Doodad");
-        assert_eq!(
-            entries[0].skip_reason(),
-            Some("not a game or application")
-        );
+        assert_eq!(entries[0].skip_reason(), Some("not a game or application"));
     }
 
     #[test]
@@ -596,10 +597,8 @@ summary = "Runs."
         ];
 
         let rows = join(&entries, &recipes);
-        let seen: Vec<(&str, Standing)> = rows
-            .iter()
-            .map(|r| (r.product_id, r.standing()))
-            .collect();
+        let seen: Vec<(&str, Standing)> =
+            rows.iter().map(|r| (r.product_id, r.standing())).collect();
         // Sorted by product id, so this order is the contract.
         assert_eq!(
             seen,
@@ -618,7 +617,10 @@ summary = "Runs."
         assert_eq!(launchable, vec!["Test Game"]);
 
         // Without a recipe there is no name to show, only the id.
-        let app = rows.iter().find(|r| r.product_id == "9ZZTESTAPP02").unwrap();
+        let app = rows
+            .iter()
+            .find(|r| r.product_id == "9ZZTESTAPP02")
+            .unwrap();
         assert_eq!(app.name(), "9ZZTESTAPP02");
     }
 
@@ -626,8 +628,9 @@ summary = "Runs."
     fn the_join_ignores_case_in_a_product_id() {
         // Recipe::matches is already case-insensitive; a hand-written recipe
         // must not silently fail to join over the same thing.
-        let entries = parse(r#"[{"productId":"9ZZTESTGAME1","productType":"Game","status":"Active"}]"#)
-            .unwrap();
+        let entries =
+            parse(r#"[{"productId":"9ZZTESTGAME1","productType":"Game","status":"Active"}]"#)
+                .unwrap();
         let recipes = vec![recipe("9zztestgame1", "Test Game", "test-game")];
         let rows = join(&entries, &recipes);
         assert_eq!(rows.len(), 1);

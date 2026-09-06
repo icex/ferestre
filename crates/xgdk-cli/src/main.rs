@@ -181,10 +181,18 @@ fn dispatch(cli: &Cli) -> Result<ExitCode> {
     match &cli.command {
         Cmd::Doctor => cmd_doctor(cli),
         Cmd::Titles => cmd_titles(cli),
-        Cmd::Library { all, refresh, offline } => cmd_library(cli, *all, *refresh, *offline),
-        Cmd::Run { title, dry_run, force, steam, args } => {
-            cmd_run(cli, title, *dry_run, *force, *steam, args)
-        }
+        Cmd::Library {
+            all,
+            refresh,
+            offline,
+        } => cmd_library(cli, *all, *refresh, *offline),
+        Cmd::Run {
+            title,
+            dry_run,
+            force,
+            steam,
+            args,
+        } => cmd_run(cli, title, *dry_run, *force, *steam, args),
         Cmd::Install { product_id, dir } => cmd_install(cli, product_id, dir.as_deref()),
         Cmd::InstallRuntime => cmd_install_runtime(cli),
         Cmd::Env => cmd_env(cli),
@@ -214,7 +222,9 @@ fn cmd_doctor(cli: &Cli) -> Result<ExitCode> {
     // has to report that rather than exit on it.
     let checks = match Paths::from_env() {
         Ok(paths) => doctor_checks(&paths),
-        Err(err) => vec![Check::fail("host", "cannot resolve any paths").with_hint(err.to_string())],
+        Err(err) => {
+            vec![Check::fail("host", "cannot resolve any paths").with_hint(err.to_string())]
+        }
     };
     let failed = failures(&checks);
 
@@ -232,12 +242,19 @@ fn cmd_doctor(cli: &Cli) -> Result<ExitCode> {
         if failed == 0 {
             println!("{}ready.{}  next: xgdk titles", style.ok, style.off);
         } else {
-            println!("{}{failed} blocking problem(s) above.{}", style.bad, style.off);
+            println!(
+                "{}{failed} blocking problem(s) above.{}",
+                style.bad, style.off
+            );
         }
     }
 
     // The exit status is the answer, not decoration: a script can gate on it.
-    Ok(if failed == 0 { ExitCode::SUCCESS } else { ExitCode::from(EXIT_FAILURE) })
+    Ok(if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(EXIT_FAILURE)
+    })
 }
 
 fn cmd_titles(cli: &Cli) -> Result<ExitCode> {
@@ -308,7 +325,10 @@ fn cmd_library(cli: &Cli, all: bool, refresh: bool, offline: bool) -> Result<Exi
         .map(|(e, why)| (e.product_id.clone(), why))
         .collect();
     let rows = library::join(&entries, &recipes);
-    let shown: Vec<&library::Row> = rows.iter().filter(|r| all || r.entry.is_some_and(library::Entry::is_title)).collect();
+    let shown: Vec<&library::Row> = rows
+        .iter()
+        .filter(|r| all || r.entry.is_some_and(library::Entry::is_title))
+        .collect();
 
     if cli.json {
         let mut doc = library_json(&shown, &skipped);
@@ -326,7 +346,10 @@ fn cmd_library(cli: &Cli, all: bool, refresh: bool, offline: bool) -> Result<Exi
     }
     print!("{}", indent(&table(&library_table(&shown)), "  "));
     if !all && !skipped.is_empty() {
-        println!("\n{} row(s) filtered out; --all shows them with the reason", skipped.len());
+        println!(
+            "\n{} row(s) filtered out; --all shows them with the reason",
+            skipped.len()
+        );
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -350,10 +373,12 @@ fn cmd_run(
 
     let paths = Paths::from_env()?;
     let (dir, recipes) = load_recipes(cli)?;
-    let recipe = recipes
-        .iter()
-        .find(|r| r.matches(title))
-        .ok_or_else(|| anyhow!("no recipe for '{title}' in {} (see: xgdk titles)", dir.display()))?;
+    let recipe = recipes.iter().find(|r| r.matches(title)).ok_or_else(|| {
+        anyhow!(
+            "no recipe for '{title}' in {} (see: xgdk titles)",
+            dir.display()
+        )
+    })?;
 
     // Checked before anything is started, because the alternative is a title
     // that exits 1 with an empty log and someone guessing which of eleven
@@ -497,7 +522,12 @@ fn cmd_env(cli: &Cli) -> Result<ExitCode> {
     if cli.json {
         let map: serde_json::Map<String, Value> = vars
             .iter()
-            .map(|(k, v)| (k.to_string(), Value::String(env_display(k, v, cli.show_account))))
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    Value::String(env_display(k, v, cli.show_account)),
+                )
+            })
             .collect();
         print_json(&json!({ "schema": JSON_SCHEMA, "env": map }));
         return Ok(ExitCode::SUCCESS);
@@ -520,12 +550,14 @@ fn load_recipes(cli: &Cli) -> Result<(PathBuf, Vec<Recipe>)> {
         None => Paths::from_env()?
             .titles_dir()
             .ok_or_else(|| {
-                anyhow!("cannot find the title recipes; pass --titles-dir <DIR> or set XODUS_REPO_DIR")
+                anyhow!(
+                    "cannot find the title recipes; pass --titles-dir <DIR> or set XODUS_REPO_DIR"
+                )
             })?
             .to_path_buf(),
     };
-    let recipes =
-        Recipe::load_dir(&dir).with_context(|| format!("reading recipes from {}", dir.display()))?;
+    let recipes = Recipe::load_dir(&dir)
+        .with_context(|| format!("reading recipes from {}", dir.display()))?;
     Ok((dir, recipes))
 }
 
@@ -638,7 +670,10 @@ fn run_teed(mut command: Command, log: &Path) -> Result<ExitCode> {
         let _ = writeln!(f, "=== exited rc={code} ===");
     }
     if code != 0 {
-        eprintln!("-- the title exited {code}; the log is at {}", log.display());
+        eprintln!(
+            "-- the title exited {code}; the log is at {}",
+            log.display()
+        );
     }
     Ok(ExitCode::from(code))
 }
@@ -684,9 +719,10 @@ fn start_service(dirs: &launch::Dirs) -> Result<()> {
         let _ = std::fs::remove_file(socket);
     }
     let log = std::env::temp_dir().join("xodus-service.log");
-    let out = std::fs::File::create(&log)
-        .with_context(|| format!("creating {}", log.display()))?;
-    let errs = out.try_clone().context("duplicating the service log handle")?;
+    let out = std::fs::File::create(&log).with_context(|| format!("creating {}", log.display()))?;
+    let errs = out
+        .try_clone()
+        .context("duplicating the service log handle")?;
     Command::new(&binary)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
@@ -714,7 +750,13 @@ fn process_running(name: &str) -> bool {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.file_name().and_then(|n| n.to_str()).is_none_or(|n| !n.bytes().all(|b| b.is_ascii_digit())) {
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            // `Option::is_none_or` would say this better and is newer than the
+            // MSRV this workspace promises.
+            .map_or(true, |n| !n.bytes().all(|b| b.is_ascii_digit()))
+        {
             continue;
         }
         if let Ok(comm) = std::fs::read_to_string(path.join("comm")) {
@@ -736,7 +778,11 @@ fn process_running(name: &str) -> bool {
 /// action stops the launch rather than being skipped, so a recipe written for a
 /// newer build says so instead of half-working.
 fn run_setup(recipe: &Recipe, when: &str, dirs: &launch::Dirs, game_dir: &Path) -> Result<()> {
-    for step in recipe.setup.iter().filter(|s| s.when.as_deref() == Some(when)) {
+    for step in recipe
+        .setup
+        .iter()
+        .filter(|s| s.when.as_deref() == Some(when))
+    {
         let dir = match &step.dir {
             Some(sub) => game_dir.join(sub.replace('\\', "/")),
             None => game_dir.to_path_buf(),
@@ -745,7 +791,11 @@ fn run_setup(recipe: &Recipe, when: &str, dirs: &launch::Dirs, game_dir: &Path) 
             "substitute-xcurl" => {
                 let script = dirs.scripts_dir.join("fix-xcurl.sh");
                 if !script.is_file() {
-                    bail!("{} is missing, and {} needs it", script.display(), recipe.title.name);
+                    bail!(
+                        "{} is missing, and {} needs it",
+                        script.display(),
+                        recipe.title.name
+                    );
                 }
                 eprintln!(":: setup: {} ({when})", step.action);
                 let mut command = Command::new(script);
@@ -977,7 +1027,13 @@ struct Check {
 
 impl Check {
     fn new(section: &str, name: impl Into<String>, status: CheckStatus) -> Self {
-        Check { section: section.to_string(), name: name.into(), status, detail: None, hint: None }
+        Check {
+            section: section.to_string(),
+            name: name.into(),
+            status,
+            detail: None,
+            hint: None,
+        }
     }
     fn ok(section: &str, name: impl Into<String>) -> Self {
         Self::new(section, name, CheckStatus::Ok)
@@ -999,7 +1055,10 @@ impl Check {
 }
 
 fn failures(checks: &[Check]) -> usize {
-    checks.iter().filter(|c| c.status == CheckStatus::Fail).count()
+    checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::Fail)
+        .count()
 }
 
 /// Everything a launch needs, in the order it would be needed. Same checks the
@@ -1010,26 +1069,36 @@ fn doctor_checks(paths: &Paths) -> Vec<Check> {
     checks.push(if std::env::consts::ARCH == "x86_64" {
         Check::ok("host", "x86_64")
     } else {
-        Check::fail("host", format!("{}: the runtime, Proton and every supported title are x86_64 only", std::env::consts::ARCH))
+        Check::fail(
+            "host",
+            format!(
+                "{}: the runtime, Proton and every supported title are x86_64 only",
+                std::env::consts::ARCH
+            ),
+        )
     });
     if let Some(image) = std::env::var_os("APPIMAGE") {
-        checks.push(Check::ok("host", "running from an AppImage")
-            .with_detail(PathBuf::from(image).display().to_string()));
+        checks.push(
+            Check::ok("host", "running from an AppImage")
+                .with_detail(PathBuf::from(image).display().to_string()),
+        );
     }
 
     match paths.xodus_cli().filter(|p| p.is_file()) {
-        Some(path) => checks.push(Check::ok("client", "xodus-cli").with_detail(path.display().to_string())),
-        None => checks.push(
-            Check::fail("client", "no xodus-cli")
-                .with_hint("build it (cargo build --release in the xodus-cli checkout), or set XODUS_CLI_DIR"),
-        ),
+        Some(path) => {
+            checks.push(Check::ok("client", "xodus-cli").with_detail(path.display().to_string()))
+        }
+        None => checks.push(Check::fail("client", "no xodus-cli").with_hint(
+            "build it (cargo build --release in the xodus-cli checkout), or set XODUS_CLI_DIR",
+        )),
     }
     match paths.xodus_service().filter(|p| p.is_file()) {
         Some(_) => checks.push(Check::ok("client", "xodus-service")),
-        None => checks.push(
-            Check::fail("client", "no xodus-service")
-                .with_hint("the runtime's Xbox-side calls go through it; it builds beside xodus-cli"),
-        ),
+        None => {
+            checks.push(Check::fail("client", "no xodus-service").with_hint(
+                "the runtime's Xbox-side calls go through it; it builds beside xodus-cli",
+            ))
+        }
     }
 
     match InstalledRuntime::discover(paths) {
@@ -1042,8 +1111,11 @@ fn doctor_checks(paths: &Paths) -> Vec<Check> {
             } else {
                 // Without it every GDK title exits 1: Proton's run_proc()
                 // closes the fds holding the decrypted executable.
-                Check::fail("runtime", "proton closes inherited fds; every title will exit 1")
-                    .with_hint("re-run: xgdk install-runtime")
+                Check::fail(
+                    "runtime",
+                    "proton closes inherited fds; every title will exit 1",
+                )
+                .with_hint("re-run: xgdk install-runtime")
             });
             checks.push(if rt.path.join(runtime::XGAMERUNTIME_DLL).is_file() {
                 Check::ok("runtime", "xgameruntime.dll present")
@@ -1078,16 +1150,23 @@ fn doctor_checks(paths: &Paths) -> Vec<Check> {
 
     let games = paths.games_dir();
     checks.push(match writable(games) {
-        Ok(()) => Check::ok("supporting", "games directory writable").with_detail(games.display().to_string()),
-        Err(err) => Check::fail("supporting", format!("games directory not writable: {}", games.display()))
-            .with_hint(err.to_string()),
+        Ok(()) => Check::ok("supporting", "games directory writable")
+            .with_detail(games.display().to_string()),
+        Err(err) => Check::fail(
+            "supporting",
+            format!("games directory not writable: {}", games.display()),
+        )
+        .with_hint(err.to_string()),
     });
 
     checks.push(if vulkan_icd_present() {
         Check::ok("supporting", "a Vulkan driver is installed")
     } else {
-        Check::fail("supporting", "no Vulkan ICD found; the titles will not render")
-            .with_hint("install your GPU vendor's Vulkan driver package")
+        Check::fail(
+            "supporting",
+            "no Vulkan ICD found; the titles will not render",
+        )
+        .with_hint("install your GPU vendor's Vulkan driver package")
     });
 
     // The client stores account tokens in the keyring and aborts outright when
@@ -1103,8 +1182,10 @@ fn doctor_checks(paths: &Paths) -> Vec<Check> {
         Some(dir) => {
             let count = Recipe::load_dir(dir).map(|r| r.len());
             checks.push(match count {
-                Ok(n) => Check::ok("recipes", format!("{n} title recipe(s)")).with_detail(dir.display().to_string()),
-                Err(err) => Check::fail("recipes", "recipes do not parse").with_hint(first_line(&err.to_string())),
+                Ok(n) => Check::ok("recipes", format!("{n} title recipe(s)"))
+                    .with_detail(dir.display().to_string()),
+                Err(err) => Check::fail("recipes", "recipes do not parse")
+                    .with_hint(first_line(&err.to_string())),
             });
         }
         None => checks.push(
@@ -1127,15 +1208,19 @@ fn writable(dir: &Path) -> Result<()> {
 }
 
 fn vulkan_icd_present() -> bool {
-    ["/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d", "/usr/local/share/vulkan/icd.d"]
-        .iter()
-        .any(|dir| {
-            std::fs::read_dir(dir).is_ok_and(|mut entries| {
-                entries.any(|e| {
-                    e.is_ok_and(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
-                })
+    [
+        "/usr/share/vulkan/icd.d",
+        "/etc/vulkan/icd.d",
+        "/usr/local/share/vulkan/icd.d",
+    ]
+    .iter()
+    .any(|dir| {
+        std::fs::read_dir(dir).is_ok_and(|mut entries| {
+            entries.any(|e| {
+                e.is_ok_and(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
             })
         })
+    })
 }
 
 fn first_line(text: &str) -> String {
@@ -1189,11 +1274,23 @@ struct Style {
 
 impl Style {
     const fn plain() -> Self {
-        Style { ok: "", warn: "", bad: "", dim: "", off: "" }
+        Style {
+            ok: "",
+            warn: "",
+            bad: "",
+            dim: "",
+            off: "",
+        }
     }
 
     const fn colour() -> Self {
-        Style { ok: "\x1b[32m", warn: "\x1b[33m", bad: "\x1b[31m", dim: "\x1b[2m", off: "\x1b[0m" }
+        Style {
+            ok: "\x1b[32m",
+            warn: "\x1b[33m",
+            bad: "\x1b[31m",
+            dim: "\x1b[2m",
+            off: "\x1b[0m",
+        }
     }
 
     fn detect(is_terminal: bool, no_color_flag: bool) -> Self {
@@ -1254,7 +1351,12 @@ impl<'a> From<&'a Recipe> for TitleRow<'a> {
 }
 
 fn titles_table(recipes: &[Recipe]) -> Vec<Vec<String>> {
-    let mut rows = vec![vec!["PRODUCT ID".into(), "SLUG".into(), "STATE".into(), "TITLE".into()]];
+    let mut rows = vec![vec![
+        "PRODUCT ID".into(),
+        "SLUG".into(),
+        "STATE".into(),
+        "TITLE".into(),
+    ]];
     for r in recipes {
         rows.push(vec![
             r.title.product_id.clone(),
@@ -1272,13 +1374,21 @@ fn titles_table(recipes: &[Recipe]) -> Vec<Vec<String>> {
 /// enforced for the text output: something the renderer does not ask for cannot
 /// reach the terminal, whatever the client puts in the document.
 fn library_table(rows: &[&library::Row]) -> Vec<Vec<String>> {
-    let mut out = vec![vec!["PRODUCT ID".into(), "TITLE".into(), "OWNERSHIP".into(), "STATE".into()]];
+    let mut out = vec![vec![
+        "PRODUCT ID".into(),
+        "TITLE".into(),
+        "OWNERSHIP".into(),
+        "STATE".into(),
+    ]];
     for row in rows {
         out.push(vec![
             row.product_id.to_string(),
             row.name().to_string(),
             row.standing().as_str().to_string(),
-            row.recipe.map(|r| r.status.state.as_str()).unwrap_or("-").to_string(),
+            row.recipe
+                .map(|r| r.status.state.as_str())
+                .unwrap_or("-")
+                .to_string(),
         ]);
     }
     out
@@ -1370,7 +1480,13 @@ fn table(rows: &[Vec<String>]) -> String {
 
 fn indent(text: &str, prefix: &str) -> String {
     text.lines()
-        .map(|l| if l.is_empty() { String::new() } else { format!("{prefix}{l}") })
+        .map(|l| {
+            if l.is_empty() {
+                String::new()
+            } else {
+                format!("{prefix}{l}")
+            }
+        })
         .map(|l| l + "\n")
         .collect()
 }
@@ -1402,7 +1518,8 @@ fn render_plan(plan: &launch::Plan) -> String {
 /// `'\''` dance for an embedded quote.
 fn shell_quote(s: &str) -> String {
     let safe = !s.is_empty()
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || "@%+=:,./-_".contains(c));
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "@%+=:,./-_".contains(c));
     if safe {
         s.to_string()
     } else {
@@ -1446,7 +1563,10 @@ impl std::error::Error for UsageError {}
 fn print_json(value: &Value) {
     // Pretty, because a person reads this as often as a program does and jq is
     // not always installed.
-    println!("{}", serde_json::to_string_pretty(value).expect("json value serialises"));
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).expect("json value serialises")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1484,7 +1604,11 @@ summary = "Runs."
         items.iter().map(|s| s.to_string()).collect()
     }
 
-    fn assessment(missing_required: &[&str], missing_wanted: &[&str], source: CapabilitySource) -> Assessment {
+    fn assessment(
+        missing_required: &[&str],
+        missing_wanted: &[&str],
+        source: CapabilitySource,
+    ) -> Assessment {
         Assessment {
             matched: Match {
                 missing_required: names(missing_required),
@@ -1531,8 +1655,16 @@ summary = "Runs."
 
     #[test]
     fn json_works_on_either_side_of_the_subcommand() {
-        assert!(Cli::try_parse_from(["xgdk", "--json", "titles"]).unwrap().json);
-        assert!(Cli::try_parse_from(["xgdk", "titles", "--json"]).unwrap().json);
+        assert!(
+            Cli::try_parse_from(["xgdk", "--json", "titles"])
+                .unwrap()
+                .json
+        );
+        assert!(
+            Cli::try_parse_from(["xgdk", "titles", "--json"])
+                .unwrap()
+                .json
+        );
     }
 
     #[test]
@@ -1551,9 +1683,14 @@ summary = "Runs."
 
     #[test]
     fn a_missing_or_unknown_subcommand_is_a_usage_error() {
-        assert_eq!(Cli::try_parse_from(["xgdk"]).unwrap_err().exit_code(), EXIT_USAGE as i32);
         assert_eq!(
-            Cli::try_parse_from(["xgdk", "frobnicate"]).unwrap_err().exit_code(),
+            Cli::try_parse_from(["xgdk"]).unwrap_err().exit_code(),
+            EXIT_USAGE as i32
+        );
+        assert_eq!(
+            Cli::try_parse_from(["xgdk", "frobnicate"])
+                .unwrap_err()
+                .exit_code(),
             EXIT_USAGE as i32
         );
     }
@@ -1584,7 +1721,10 @@ summary = "Runs."
             source: CapabilitySource::Manifest,
         };
         let message = refusal(&a, &rt);
-        assert!(message.contains("explanation from the core assessment"), "{message}");
+        assert!(
+            message.contains("explanation from the core assessment"),
+            "{message}"
+        );
         assert!(message.contains("xodus-11.0"), "{message}");
         assert!(message.contains("--force"), "{message}");
     }
@@ -1604,7 +1744,11 @@ summary = "Runs."
 
     #[test]
     fn a_missing_want_degrades_but_does_not_refuse() {
-        let a = assessment(&[], &["winhttp.websocket-close-timeout"], CapabilitySource::List);
+        let a = assessment(
+            &[],
+            &["winhttp.websocket-close-timeout"],
+            CapabilitySource::List,
+        );
         assert_eq!(gate(&a), Gate::Degraded);
         let said = warnings(&recipe(), &a, Gate::Degraded, false).join("\n");
         assert!(said.contains("winhttp.websocket-close-timeout"), "{said}");
@@ -1624,7 +1768,10 @@ summary = "Runs."
     fn a_title_that_is_not_runnable_warns_even_on_a_perfect_runtime() {
         let text = RECIPE
             .replace("state = \"playable\"", "state = \"broken\"")
-            .replace("summary = \"Runs.\"", "summary = \"In-binary protection.\"\nblocked-by = \"title-protection\"");
+            .replace(
+                "summary = \"Runs.\"",
+                "summary = \"In-binary protection.\"\nblocked-by = \"title-protection\"",
+            );
         let broken = Recipe::parse(&text).unwrap();
         let a = assessment(&[], &[], CapabilitySource::Manifest);
         let said = warnings(&broken, &a, Gate::Ready, false).join("\n");
@@ -1709,8 +1856,16 @@ summary = "Runs."
     fn columns_line_up_and_no_line_has_trailing_space() {
         let out = table(&[
             vec!["PRODUCT ID".into(), "SLUG".into(), "TITLE".into()],
-            vec!["9NBLGGH2JHXJ".into(), "bedrock".into(), "Minecraft for Windows".into()],
-            vec!["9PPT8K6GQHRZ".into(), "fh5".into(), "Forza Horizon 5".into()],
+            vec![
+                "9NBLGGH2JHXJ".into(),
+                "bedrock".into(),
+                "Minecraft for Windows".into(),
+            ],
+            vec![
+                "9PPT8K6GQHRZ".into(),
+                "fh5".into(),
+                "Forza Horizon 5".into(),
+            ],
         ]);
         let lines: Vec<&str> = out.lines().collect();
         let slug_at = lines[0].find("SLUG").unwrap();
@@ -1725,7 +1880,10 @@ summary = "Runs."
     fn a_ragged_row_does_not_panic() {
         // Rows are built by hand in several places; a short one must not take
         // the whole command down.
-        assert_eq!(table(&[vec!["a".into()], vec!["bb".into(), "cc".into()]]), "a\nbb  cc\n");
+        assert_eq!(
+            table(&[vec!["a".into()], vec!["bb".into(), "cc".into()]]),
+            "a\nbb  cc\n"
+        );
     }
 
     #[test]
@@ -1789,7 +1947,10 @@ summary = "Runs."
         assert_eq!(doc["schema"], JSON_SCHEMA);
         assert_eq!(doc["titles"].as_array().unwrap().len(), 1);
         assert_eq!(doc["skipped"][0]["product_id"], "9NDLGGH2JHXQ");
-        assert!(doc["skipped"][0]["reason"].as_str().unwrap().contains("not a game"));
+        assert!(doc["skipped"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not a game"));
     }
 
     #[test]
@@ -1817,7 +1978,8 @@ summary = "Runs."
 
     #[test]
     fn a_doctor_check_serialises_for_a_gui() {
-        let v = serde_json::to_value(Check::warn("runtime", "publishes no capability list")).unwrap();
+        let v =
+            serde_json::to_value(Check::warn("runtime", "publishes no capability list")).unwrap();
         assert_eq!(v["section"], "runtime");
         assert_eq!(v["status"], "warn");
         // Absent, not null: a GUI should not have to distinguish the two.
@@ -1835,7 +1997,9 @@ summary = "Runs."
         let plan = launch::Plan {
             program: PathBuf::from("/opt/xodus/xodus-cli"),
             args: vec!["run".into(), "-e".into(), "Minecraft.Windows.exe".into()],
-            env_set: [("WINE_GAMEINPUT".to_string(), "1".to_string())].into_iter().collect(),
+            env_set: [("WINE_GAMEINPUT".to_string(), "1".to_string())]
+                .into_iter()
+                .collect(),
             env_unset: vec!["LD_PRELOAD".into()],
             cwd: None,
         };
@@ -1843,7 +2007,8 @@ summary = "Runs."
         assert!(out.starts_with("unset LD_PRELOAD\n"), "{out}");
         assert!(out.contains("export WINE_GAMEINPUT=1\n"), "{out}");
         assert!(
-            out.trim_end().ends_with("/opt/xodus/xodus-cli run -e Minecraft.Windows.exe"),
+            out.trim_end()
+                .ends_with("/opt/xodus/xodus-cli run -e Minecraft.Windows.exe"),
             "{out}"
         );
     }
@@ -1851,7 +2016,10 @@ summary = "Runs."
     #[test]
     fn a_path_with_a_space_survives_being_quoted() {
         assert_eq!(shell_quote("plain-value_1.2/x"), "plain-value_1.2/x");
-        assert_eq!(shell_quote("/games/Forza Horizon 5"), "'/games/Forza Horizon 5'");
+        assert_eq!(
+            shell_quote("/games/Forza Horizon 5"),
+            "'/games/Forza Horizon 5'"
+        );
         assert_eq!(shell_quote(""), "''");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
         // A value that would otherwise start a second command.
@@ -1902,7 +2070,11 @@ summary = "Runs."
         let out = table(&titles_table(&recipes));
         assert!(out.contains("PRODUCT ID"), "{out}");
         for r in &recipes {
-            assert!(out.contains(&r.title.product_id), "{} missing from:\n{out}", r.title.product_id);
+            assert!(
+                out.contains(&r.title.product_id),
+                "{} missing from:\n{out}",
+                r.title.product_id
+            );
         }
         let rows: Vec<TitleRow> = recipes.iter().map(TitleRow::from).collect();
         serde_json::to_value(&rows).expect("every recipe serialises");

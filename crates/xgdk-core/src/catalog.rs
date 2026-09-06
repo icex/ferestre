@@ -238,7 +238,9 @@ pub fn parse(json: &str) -> Result<Vec<Product>> {
                 let Some(properties) = sku.sku.as_ref().and_then(|s| s.properties.as_ref()) else {
                     continue;
                 };
-                last_update = last_update.take().or_else(|| properties.last_update.clone());
+                last_update = last_update
+                    .take()
+                    .or_else(|| properties.last_update.clone());
                 for package in &properties.packages {
                     // Every sku of a title lists the same packages -- a trial
                     // and the full sku point at one build -- so the same content
@@ -247,8 +249,9 @@ pub fn parse(json: &str) -> Result<Vec<Product>> {
                     if let Some(id) = package.content_id.clone().filter(|s| !s.is_empty()) {
                         if !content_ids.contains(&id) {
                             content_ids.push(id);
-                            download_bytes =
-                                Some(download_bytes.unwrap_or(0) + package.download_bytes.unwrap_or(0));
+                            download_bytes = Some(
+                                download_bytes.unwrap_or(0) + package.download_bytes.unwrap_or(0),
+                            );
                         }
                     }
                 }
@@ -302,7 +305,10 @@ impl Cache {
         {
             return None;
         }
-        Some(self.dir.join(format!("{}.json", product_id.to_ascii_uppercase())))
+        Some(
+            self.dir
+                .join(format!("{}.json", product_id.to_ascii_uppercase())),
+        )
     }
 
     pub fn get(&self, product_id: &str) -> Option<Product> {
@@ -402,13 +408,20 @@ mod tests {
     #[test]
     fn a_response_becomes_products() {
         let products = parse(PAYLOAD).expect("parses");
-        assert_eq!(products.len(), 2, "the nameless product is dropped, not fatal");
+        assert_eq!(
+            products.len(),
+            2,
+            "the nameless product is dropped, not fatal"
+        );
 
         let one = &products[0];
         assert_eq!(one.product_id, "9ZZTESTGAME1");
         assert_eq!(one.name, "Test Game One");
         assert_eq!(one.publisher.as_deref(), Some("Test Studios"));
-        assert_eq!(one.last_update.as_deref(), Some("2026-08-28T18:26:01.0000000Z"));
+        assert_eq!(
+            one.last_update.as_deref(),
+            Some("2026-08-28T18:26:01.0000000Z")
+        );
     }
 
     /// Every sku of a title lists the same package. Counting it once per sku
@@ -456,7 +469,10 @@ mod tests {
         let url = request_url(&ids[..2], "GB", "en-gb");
         assert!(url.starts_with(ENDPOINT), "{url}");
         assert!(url.contains("bigIds=9ZZTEST00000,9ZZTEST00001"), "{url}");
-        assert!(url.contains("market=GB") && url.contains("languages=en-gb"), "{url}");
+        assert!(
+            url.contains("market=GB") && url.contains("languages=en-gb"),
+            "{url}"
+        );
     }
 
     #[test]

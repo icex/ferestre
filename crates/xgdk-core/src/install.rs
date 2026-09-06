@@ -127,8 +127,14 @@ mod tests {
     #[test]
     fn a_new_content_id_in_the_catalog_is_an_update() {
         let installed = record(&["content-a"]);
-        assert_eq!(installed.update_available(&["content-a".into()]), Some(false));
-        assert_eq!(installed.update_available(&["content-b".into()]), Some(true));
+        assert_eq!(
+            installed.update_available(&["content-a".into()]),
+            Some(false)
+        );
+        assert_eq!(
+            installed.update_available(&["content-b".into()]),
+            Some(true)
+        );
     }
 
     /// A title split across packages is stale if any one of them was rebuilt.

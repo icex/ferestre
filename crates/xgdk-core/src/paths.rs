@@ -83,7 +83,10 @@ impl Env {
         V: Into<String>,
     {
         Env {
-            vars: vars.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
+            vars: vars
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
             exe: None,
             exists: Box::new(|_| false),
         }
@@ -207,8 +210,7 @@ impl Paths {
         // Steam gets found: it is the fourth Steam candidate but not one of the
         // three compat-tool candidates xodus-env.sh lists.
         let runtime = env.path("XODUS_PROTON_DIR").or_else(|| {
-            let mut candidates: Vec<PathBuf> =
-                steam.iter().map(|s| s.join(COMPAT_TOOL)).collect();
+            let mut candidates: Vec<PathBuf> = steam.iter().map(|s| s.join(COMPAT_TOOL)).collect();
             candidates.extend([
                 home.join(".steam/steam").join(COMPAT_TOOL),
                 home.join(".local/share/Steam").join(COMPAT_TOOL),
@@ -300,7 +302,9 @@ impl Paths {
     /// yet; the path is fixed here so the runtime and the check agree when one
     /// does.
     pub fn runtime_capabilities_file(&self) -> Option<PathBuf> {
-        self.runtime.as_ref().map(|r| r.join("xgdk-capabilities.txt"))
+        self.runtime
+            .as_ref()
+            .map(|r| r.join("xgdk-capabilities.txt"))
     }
 
     pub fn cli_dir(&self) -> Option<&Path> {
@@ -540,7 +544,10 @@ summary = "Runs."
         assert_eq!(p.runtime_dir(), Some(Path::new("/mnt/proton")));
         assert_eq!(p.cli_dir(), Some(Path::new("/mnt/cli")));
         assert_eq!(p.xodus_cli().unwrap(), Path::new("/mnt/cli/xodus-cli"));
-        assert_eq!(p.xodus_service().unwrap(), Path::new("/mnt/cli/xodus-service"));
+        assert_eq!(
+            p.xodus_service().unwrap(),
+            Path::new("/mnt/cli/xodus-service")
+        );
         assert_eq!(p.tree_dir(), Some(Path::new("/mnt/repo")));
         assert_eq!(p.scripts_dir(), Some(Path::new("/mnt/repo/scripts")));
         assert_eq!(p.state_dir(), Path::new("/mnt/state/xgdk"));
@@ -575,7 +582,10 @@ summary = "Runs."
             "/home/tester/.local/share/Steam/compatibilitytools.d/xodus",
         ]);
         let p = Paths::resolve(&e).unwrap();
-        assert_eq!(p.steam_dir(), Some(Path::new("/home/tester/.local/share/Steam")));
+        assert_eq!(
+            p.steam_dir(),
+            Some(Path::new("/home/tester/.local/share/Steam"))
+        );
         assert_eq!(
             p.runtime_dir(),
             Some(Path::new(
@@ -628,7 +638,10 @@ summary = "Runs."
         )
         .unwrap();
         assert_eq!(packaged.tree_dir(), Some(Path::new("/usr/lib/xgdk")));
-        assert_eq!(packaged.scripts_dir(), Some(Path::new("/usr/lib/xgdk/scripts")));
+        assert_eq!(
+            packaged.scripts_dir(),
+            Some(Path::new("/usr/lib/xgdk/scripts"))
+        );
         // The AUR package ships no titles/ yet; say so rather than point at it.
         assert_eq!(packaged.titles_dir(), None);
 
@@ -738,7 +751,10 @@ summary = "Runs."
                 .expect_err("{dir} should be refused")
                 .to_string();
             assert!(err.contains(dir), "error should quote the path: {err}");
-            assert!(err.contains("9NBLGGH2JHXJ"), "error should name the title: {err}");
+            assert!(
+                err.contains("9NBLGGH2JHXJ"),
+                "error should name the title: {err}"
+            );
         }
         // The prefix is data from the same file and gets the same treatment.
         let r = recipe("[install]\nprefix = \"../../elsewhere\"");

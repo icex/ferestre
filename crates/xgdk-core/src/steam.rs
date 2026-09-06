@@ -268,7 +268,11 @@ impl Shortcut {
 pub fn upsert(document: &mut Value, shortcut: &Shortcut) -> Result<bool> {
     let shortcuts = document
         .as_map()
-        .and_then(|entries| entries.iter().position(|(k, _)| k.eq_ignore_ascii_case("shortcuts")))
+        .and_then(|entries| {
+            entries
+                .iter()
+                .position(|(k, _)| k.eq_ignore_ascii_case("shortcuts"))
+        })
         .ok_or_else(|| anyhow!("no \"shortcuts\" key: not a shortcuts.vdf"))?;
     let Value::Map(root) = document else {
         unreachable!("checked above");
@@ -292,10 +296,16 @@ pub fn upsert(document: &mut Value, shortcut: &Shortcut) -> Result<bool> {
             if let Value::Map(fields) = &mut merged {
                 let ours = shortcut.to_value();
                 for (name, value) in ours.as_map().unwrap_or(&[]) {
-                    if matches!(name.as_str(), "tags" | "IsHidden" | "AllowOverlay" | "AllowDesktopConfig") {
+                    if matches!(
+                        name.as_str(),
+                        "tags" | "IsHidden" | "AllowOverlay" | "AllowDesktopConfig"
+                    ) {
                         continue;
                     }
-                    match fields.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+                    match fields
+                        .iter_mut()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    {
                         Some(slot) => slot.1 = value.clone(),
                         None => fields.push((name.clone(), value.clone())),
                     }
@@ -434,9 +444,15 @@ mod tests {
     fn nested_values_come_back_as_written() {
         let document = parse(&sample()).expect("parses");
         let entry = document.get("shortcuts").unwrap().get("0").unwrap();
-        assert_eq!(entry.get("AppName").unwrap().as_str(), Some("Someone Elses Game"));
+        assert_eq!(
+            entry.get("AppName").unwrap().as_str(),
+            Some("Someone Elses Game")
+        );
         assert_eq!(entry.get("IsHidden"), Some(&Value::Int(0)));
-        assert_eq!(entry.get("tags").unwrap().get("0").unwrap().as_str(), Some("favourite"));
+        assert_eq!(
+            entry.get("tags").unwrap().get("0").unwrap().as_str(),
+            Some("favourite")
+        );
         assert_eq!(
             entry.get("appname").unwrap().as_str(),
             Some("Someone Elses Game"),
@@ -454,18 +470,33 @@ mod tests {
             Path::new("/opt/xgdk/bin"),
             "run 9ZZTESTGAME1",
         );
-        assert!(!upsert(&mut document, &shortcut).expect("adds"), "a new entry");
+        assert!(
+            !upsert(&mut document, &shortcut).expect("adds"),
+            "a new entry"
+        );
 
         let shortcuts = document.get("shortcuts").unwrap();
         assert_eq!(shortcuts.as_map().unwrap().len(), 2);
         let theirs = shortcuts.get("0").unwrap();
-        assert_eq!(theirs.get("AppName").unwrap().as_str(), Some("Someone Elses Game"));
-        assert_eq!(theirs.get("tags").unwrap().get("0").unwrap().as_str(), Some("favourite"));
+        assert_eq!(
+            theirs.get("AppName").unwrap().as_str(),
+            Some("Someone Elses Game")
+        );
+        assert_eq!(
+            theirs.get("tags").unwrap().get("0").unwrap().as_str(),
+            Some("favourite")
+        );
 
         let ours = shortcuts.get("1").unwrap();
         assert_eq!(ours.get("AppName").unwrap().as_str(), Some("Test Title"));
-        assert_eq!(ours.get("Exe").unwrap().as_str(), Some("\"/opt/xgdk/bin/xgdk\""));
-        assert_eq!(ours.get("LaunchOptions").unwrap().as_str(), Some("run 9ZZTESTGAME1"));
+        assert_eq!(
+            ours.get("Exe").unwrap().as_str(),
+            Some("\"/opt/xgdk/bin/xgdk\"")
+        );
+        assert_eq!(
+            ours.get("LaunchOptions").unwrap().as_str(),
+            Some("run 9ZZTESTGAME1")
+        );
     }
 
     /// Adding the same title twice must update the entry, not duplicate it --
@@ -482,9 +513,15 @@ mod tests {
         assert!(!upsert(&mut document, &first).expect("adds"));
 
         // Stand in for a person turning the overlay off and tagging it.
-        let Value::Map(root) = &mut document else { unreachable!() };
-        let Value::Map(entries) = &mut root[0].1 else { unreachable!() };
-        let Value::Map(fields) = &mut entries[0].1 else { unreachable!() };
+        let Value::Map(root) = &mut document else {
+            unreachable!()
+        };
+        let Value::Map(entries) = &mut root[0].1 else {
+            unreachable!()
+        };
+        let Value::Map(fields) = &mut entries[0].1 else {
+            unreachable!()
+        };
         for (key, value) in fields.iter_mut() {
             match key.as_str() {
                 "AllowOverlay" => *value = Value::Int(0),
@@ -499,14 +536,24 @@ mod tests {
             Path::new("/new"),
             "run 9ZZTESTGAME1",
         );
-        assert!(upsert(&mut document, &moved).expect("updates"), "replaced, not added");
+        assert!(
+            upsert(&mut document, &moved).expect("updates"),
+            "replaced, not added"
+        );
 
         let shortcuts = document.get("shortcuts").unwrap();
         assert_eq!(shortcuts.as_map().unwrap().len(), 1, "not duplicated");
         let entry = shortcuts.get("0").unwrap();
         assert_eq!(entry.get("Exe").unwrap().as_str(), Some("\"/new/xgdk\""));
-        assert_eq!(entry.get("AllowOverlay"), Some(&Value::Int(0)), "their setting stands");
-        assert_eq!(entry.get("tags").unwrap().get("0").unwrap().as_str(), Some("xgdk"));
+        assert_eq!(
+            entry.get("AllowOverlay"),
+            Some(&Value::Int(0)),
+            "their setting stands"
+        );
+        assert_eq!(
+            entry.get("tags").unwrap().get("0").unwrap().as_str(),
+            Some("xgdk")
+        );
     }
 
     /// A path with a space in it is the normal case, and an unquoted one fails
@@ -529,7 +576,11 @@ mod tests {
     fn the_app_id_is_derived_the_way_steam_derives_it() {
         let id = shortcut_app_id("\"/opt/xgdk/bin/xgdk\"", "Test Title");
         assert_eq!(id & 0x8000_0000, 0x8000_0000, "the high bit is always set");
-        assert_eq!(id, shortcut_app_id("\"/opt/xgdk/bin/xgdk\"", "Test Title"), "stable");
+        assert_eq!(
+            id,
+            shortcut_app_id("\"/opt/xgdk/bin/xgdk\"", "Test Title"),
+            "stable"
+        );
         assert_ne!(id, shortcut_app_id("\"/opt/xgdk/bin/xgdk\"", "Other Title"));
     }
 
@@ -556,6 +607,11 @@ mod tests {
     fn a_missing_file_reads_as_an_empty_document() {
         let document = load(Path::new("/nonexistent/shortcuts.vdf")).expect("no file is fine");
         assert_eq!(document, empty_document());
-        assert!(document.get("shortcuts").unwrap().as_map().unwrap().is_empty());
+        assert!(document
+            .get("shortcuts")
+            .unwrap()
+            .as_map()
+            .unwrap()
+            .is_empty());
     }
 }

@@ -150,8 +150,8 @@ fn read_capabilities(dir: &Path) -> anyhow::Result<(BTreeSet<Capability>, Capabi
     if manifest.is_file() {
         let text = std::fs::read_to_string(&manifest)
             .map_err(|e| anyhow::anyhow!("{}: {e}", manifest.display()))?;
-        let names = parse_manifest(&text)
-            .map_err(|e| anyhow::anyhow!("{}: {e}", manifest.display()))?;
+        let names =
+            parse_manifest(&text).map_err(|e| anyhow::anyhow!("{}: {e}", manifest.display()))?;
         return Ok((names, CapabilitySource::Manifest));
     }
     let list = dir.join(LIST_PATH);
@@ -586,7 +586,10 @@ hangs"""
                 "#!/usr/bin/env python3\nreturn subprocess.call(args)\n"
             },
         );
-        dir.write("version", "1788593799 xodus-bleeding-edge-11.0-20260803-3-g7c0b4354\n");
+        dir.write(
+            "version",
+            "1788593799 xodus-bleeding-edge-11.0-20260803-3-g7c0b4354\n",
+        );
         if with_dll {
             dir.write(XGAMERUNTIME_DLL, "MZ not really a dll");
         }
@@ -627,15 +630,13 @@ hangs"""
 
     #[test]
     fn a_manifest_may_be_an_object_and_false_means_not_provided() {
-        let got =
-            parse_manifest(r#"{"gameinput.v2": true, "media.real-video": false}"#).unwrap();
+        let got = parse_manifest(r#"{"gameinput.v2": true, "media.real-video": false}"#).unwrap();
         assert_eq!(got, names(&["gameinput.v2"]));
     }
 
     #[test]
     fn a_manifest_may_wrap_the_list() {
-        let got =
-            parse_manifest(r#"{"schema": 1, "capabilities": ["gameinput.v2"]}"#).unwrap();
+        let got = parse_manifest(r#"{"schema": 1, "capabilities": ["gameinput.v2"]}"#).unwrap();
         assert_eq!(got, names(&["gameinput.v2"]));
     }
 
@@ -651,7 +652,8 @@ hangs"""
 
     #[test]
     fn a_plain_text_list_reads_like_the_validator_reads_it() {
-        let got = parse_list("# what this build provides\ngameinput.v2\n\n  media.real-video  # kept\n");
+        let got =
+            parse_list("# what this build provides\ngameinput.v2\n\n  media.real-video  # kept\n");
         assert_eq!(got, names(&["gameinput.v2", "media.real-video"]));
     }
 
@@ -674,7 +676,10 @@ hangs"""
         dir.write(LIST_PATH, "gameinput.v2\nxgameruntime.taskqueue\n");
         let rt = InstalledRuntime::at(dir.path()).unwrap();
         assert_eq!(rt.source, CapabilitySource::List);
-        assert_eq!(rt.provides, names(&["gameinput.v2", "xgameruntime.taskqueue"]));
+        assert_eq!(
+            rt.provides,
+            names(&["gameinput.v2", "xgameruntime.taskqueue"])
+        );
     }
 
     #[test]
@@ -682,7 +687,10 @@ hangs"""
         let dir = fake_runtime("probe", true, true);
         let rt = InstalledRuntime::at(dir.path()).unwrap();
         assert_eq!(rt.source, CapabilitySource::Probed);
-        assert!(rt.provides(MEMFD_CAPABILITY), "close_fds=False is in the script");
+        assert!(
+            rt.provides(MEMFD_CAPABILITY),
+            "close_fds=False is in the script"
+        );
         assert!(rt.provides("xgameruntime.taskqueue"));
         assert!(rt.provides("xgameruntime.gamesave"));
         // Nothing on disk shows these, so the probe must not claim them.
@@ -773,7 +781,8 @@ hangs"""
         );
         assert!(a.explanation.contains("gameinput.v2"), "{}", a.explanation);
         assert!(
-            a.explanation.contains("GameInput Runtime could not be loaded"),
+            a.explanation
+                .contains("GameInput Runtime could not be loaded"),
             "the symptom is the point of the message: {}",
             a.explanation
         );
@@ -825,7 +834,11 @@ hangs"""
         assert!(a.explanation.contains("probed"), "{}", a.explanation);
         // "may not", not "will not": the build may well have it and not say so.
         assert!(a.explanation.contains("may not start"), "{}", a.explanation);
-        assert!(!a.explanation.contains("will not start"), "{}", a.explanation);
+        assert!(
+            !a.explanation.contains("will not start"),
+            "{}",
+            a.explanation
+        );
         assert!(a.explanation.contains(MANIFEST_PATH), "{}", a.explanation);
         // No registry: still names what is missing, just without the symptom.
         assert!(a.explanation.contains("gameinput.v2"), "{}", a.explanation);
@@ -845,7 +858,11 @@ hangs"""
         let a = assess(&recipe, &rt, None);
         assert!(a.is_satisfied());
         assert!(a.matched.missing_wanted.is_empty());
-        assert!(a.explanation.contains("provides everything"), "{}", a.explanation);
+        assert!(
+            a.explanation.contains("provides everything"),
+            "{}",
+            a.explanation
+        );
     }
 
     #[test]
@@ -858,10 +875,7 @@ hangs"""
         }
         let registry = Registry::load(&path).expect("registry should parse");
         assert!(!registry.is_empty());
-        for name in XGAMERUNTIME_CAPABILITIES
-            .iter()
-            .chain([&MEMFD_CAPABILITY])
-        {
+        for name in XGAMERUNTIME_CAPABILITIES.iter().chain([&MEMFD_CAPABILITY]) {
             let entry = registry
                 .get(name)
                 .unwrap_or_else(|| panic!("{name} is probed for but not in capabilities.toml"));

@@ -106,7 +106,9 @@ impl Model {
             .as_ref()
             .and_then(Paths::titles_dir)
             .and_then(|dir| Registry::load(&dir.join("capabilities.toml")).ok());
-        let runtime = paths.as_ref().and_then(|p| InstalledRuntime::discover(p).ok());
+        let runtime = paths
+            .as_ref()
+            .and_then(|p| InstalledRuntime::discover(p).ok());
         let records = paths
             .as_ref()
             .map(|p| {
@@ -150,7 +152,12 @@ impl Model {
         };
         let icons = paths
             .as_ref()
-            .map(|p| existing_icons(&catalog::Cache::new(p.cache_dir().join("catalog")), &catalog))
+            .map(|p| {
+                existing_icons(
+                    &catalog::Cache::new(p.cache_dir().join("catalog")),
+                    &catalog,
+                )
+            })
             .unwrap_or_default();
         let avatar = paths
             .as_ref()
@@ -158,9 +165,8 @@ impl Model {
             .filter(|p| p.is_file());
 
         if problem.is_none() && recipes.is_empty() {
-            problem = Some(
-                "No title recipes found. Point XGDK_TITLES at the titles/ directory.".into(),
-            );
+            problem =
+                Some("No title recipes found. Point XGDK_TITLES at the titles/ directory.".into());
         }
 
         Model {
@@ -249,10 +255,7 @@ impl Model {
 
 /// Icons already on disk from a previous run. Nothing is fetched here: a window
 /// that waits on a hundred HTTP requests before it appears is not a window.
-fn existing_icons(
-    cache: &Cache,
-    catalog: &BTreeMap<String, Product>,
-) -> BTreeMap<String, PathBuf> {
+fn existing_icons(cache: &Cache, catalog: &BTreeMap<String, Product>) -> BTreeMap<String, PathBuf> {
     catalog
         .keys()
         .filter_map(|key| {

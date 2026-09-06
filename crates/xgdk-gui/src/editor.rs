@@ -81,7 +81,10 @@ impl Draft {
             };
             let key = key.trim();
             if key.is_empty() {
-                return Err(format!("Line {} of the environment has no name.", number + 1));
+                return Err(format!(
+                    "Line {} of the environment has no name.",
+                    number + 1
+                ));
             }
             environment.insert(key.to_string(), value.trim().to_string());
         }
@@ -122,7 +125,10 @@ pub fn present(
         .content_height(620)
         .build();
 
-    let name = adw::EntryRow::builder().title("Name").text(&draft.name).build();
+    let name = adw::EntryRow::builder()
+        .title("Name")
+        .text(&draft.name)
+        .build();
     let executable = adw::EntryRow::builder()
         .title("Executable, inside the installed title")
         .text(&draft.executable)
@@ -147,7 +153,7 @@ pub fn present(
 
     let identity = adw::PreferencesGroup::builder()
         .title("Title")
-        .description(&format!(
+        .description(format!(
             "Product {} — saved to your own titles directory, so an upgrade will not undo it",
             recipe.borrow().title.product_id
         ))
@@ -161,7 +167,10 @@ pub fn present(
         .title("Environment")
         .description("One KEY=VALUE per line, passed to the title when it starts")
         .build();
-    let env_frame = gtk::Frame::builder().height_request(140).child(&environment).build();
+    let env_frame = gtk::Frame::builder()
+        .height_request(140)
+        .child(&environment)
+        .build();
     env_group.add(&env_frame);
 
     let page = adw::PreferencesPage::new();
@@ -192,14 +201,22 @@ pub fn present(
     }
 
     save.connect_clicked(glib::clone!(
-        #[strong] dialog,
-        #[strong] recipe,
-        #[strong] toasts,
-        #[strong] name,
-        #[strong] executable,
-        #[strong] install_dir,
-        #[strong] prefix_dir,
-        #[strong] environment,
+        #[strong]
+        dialog,
+        #[strong]
+        recipe,
+        #[strong]
+        toasts,
+        #[strong]
+        name,
+        #[strong]
+        executable,
+        #[strong]
+        install_dir,
+        #[strong]
+        prefix_dir,
+        #[strong]
+        environment,
         move |_| {
             let buffer = environment.buffer();
             let draft = Draft {
@@ -246,8 +263,14 @@ mod tests {
 
         let draft = Draft::from_recipe(&recipe);
         assert_eq!(draft.executable, "Game/Test.exe");
-        assert_eq!(draft.environment, "A=1\nB=2", "sorted, so a diff is readable");
-        assert_eq!(draft.install_dir, "test-title", "the default, shown not hidden");
+        assert_eq!(
+            draft.environment, "A=1\nB=2",
+            "sorted, so a diff is readable"
+        );
+        assert_eq!(
+            draft.install_dir, "test-title",
+            "the default, shown not hidden"
+        );
 
         let mut applied = blank();
         draft.apply(&mut applied).expect("applies");
@@ -281,7 +304,10 @@ mod tests {
                 prefix_dir: String::new(),
                 environment: String::new(),
             };
-            assert!(draft.apply(&mut blank()).is_err(), "{attempt} should be refused");
+            assert!(
+                draft.apply(&mut blank()).is_err(),
+                "{attempt} should be refused"
+            );
         }
     }
 
@@ -302,7 +328,11 @@ mod tests {
             Some("has=equals"),
             "only the first = separates"
         );
-        assert_eq!(recipe.launch.env.len(), 2, "comments and blanks are not variables");
+        assert_eq!(
+            recipe.launch.env.len(),
+            2,
+            "comments and blanks are not variables"
+        );
 
         let bad = Draft {
             environment: "A=1\nnot a variable\n".into(),

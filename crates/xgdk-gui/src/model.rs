@@ -105,7 +105,6 @@ impl Ownership {
     pub fn is_known(&self) -> bool {
         matches!(self, Ownership::Known(_))
     }
-
 }
 
 pub fn state_label(state: TitleState) -> (&'static str, &'static str) {
@@ -282,7 +281,10 @@ pub fn library(inputs: &Inputs) -> Vec<LibraryRow> {
             match rows.get_mut(&key) {
                 Some(row) => row.owned = true,
                 None => {
-                    rows.insert(key.clone(), undescribed_row(inputs, &entry.product_id, &key));
+                    rows.insert(
+                        key.clone(),
+                        undescribed_row(inputs, &entry.product_id, &key),
+                    );
                 }
             }
         }
@@ -320,7 +322,9 @@ fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
 
     LibraryRow {
         product_id: recipe.title.product_id.clone(),
-        name: product.map(|p| p.name.clone()).unwrap_or_else(|| recipe.title.name.clone()),
+        name: product
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| recipe.title.name.clone()),
         subtitle: view.subtitle,
         badge: Some((view.badge, view.badge_css)),
         image: product.and_then(|p| p.image.clone()),
@@ -529,9 +533,7 @@ mod tests {
     fn entries(products: &[&str]) -> Vec<Entry> {
         let items = products
             .iter()
-            .map(|p| {
-                format!(r#"{{"productId":"{p}","productType":"Game","status":"Active"}}"#)
-            })
+            .map(|p| format!(r#"{{"productId":"{p}","productType":"Game","status":"Active"}}"#))
             .collect::<Vec<_>>()
             .join(",");
         xgdk_core::library::parse(&format!("[{items}]")).expect("fixture entries parse")
@@ -602,7 +604,10 @@ mod tests {
         let own = Ownership::Unknown;
         let rows = library(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
         assert_eq!(rows[0].action, Action::Play);
-        assert_eq!(rows[0].action.command("9ZZTESTGAME1"), Some(["run", "9ZZTESTGAME1"]));
+        assert_eq!(
+            rows[0].action.command("9ZZTESTGAME1"),
+            Some(["run", "9ZZTESTGAME1"])
+        );
         assert_eq!(rows[0].subtitle, "a summary");
     }
 
@@ -671,7 +676,11 @@ mod tests {
     /// refusal.
     #[test]
     fn a_declared_runtime_missing_a_required_capability_blocks_with_one_line() {
-        let recipes = vec![recipe("9ZZTESTGAME1", "playable", &["loader.memfd-main-image"])];
+        let recipes = vec![recipe(
+            "9ZZTESTGAME1",
+            "playable",
+            &["loader.memfd-main-image"],
+        )];
         let rt = runtime_with(&["appmodel.package-identity"], CapabilitySource::Manifest);
         let own = Ownership::Unknown;
         let rows = library(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
@@ -691,7 +700,11 @@ mod tests {
     /// stop people trying titles that in fact work -- which is the whole point.
     #[test]
     fn a_probed_runtime_cautions_instead_of_refusing() {
-        let recipes = vec![recipe("9ZZTESTGAME1", "playable", &["loader.memfd-main-image"])];
+        let recipes = vec![recipe(
+            "9ZZTESTGAME1",
+            "playable",
+            &["loader.memfd-main-image"],
+        )];
         let rt = runtime_with(&["appmodel.package-identity"], CapabilitySource::Probed);
         let own = Ownership::Unknown;
         let rows = library(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
@@ -707,7 +720,11 @@ mod tests {
     /// A satisfied runtime shows the recipe's own summary, not a caution.
     #[test]
     fn a_satisfied_runtime_shows_the_recipe_summary() {
-        let recipes = vec![recipe("9ZZTESTGAME1", "playable", &["loader.memfd-main-image"])];
+        let recipes = vec![recipe(
+            "9ZZTESTGAME1",
+            "playable",
+            &["loader.memfd-main-image"],
+        )];
         let rt = runtime_with(&["loader.memfd-main-image"], CapabilitySource::Probed);
         let own = Ownership::Unknown;
         let rows = library(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
@@ -756,7 +773,6 @@ mod tests {
         assert!(title.contains("No patched runtime"), "{title}");
     }
 
-
     // --- the library view -------------------------------------------------
 
     #[test]
@@ -801,7 +817,11 @@ mod tests {
         assert!(owned_not_described.owned && !owned_not_described.has_recipe);
         assert_eq!(owned_not_described.action, Action::Adopt);
         assert!(owned_not_described.badge.is_none(), "no state to report");
-        assert!(owned_not_described.subtitle.contains("no recipe"), "{}", owned_not_described.subtitle);
+        assert!(
+            owned_not_described.subtitle.contains("no recipe"),
+            "{}",
+            owned_not_described.subtitle
+        );
     }
 
     /// A row still showing a twelve-character code is waiting for the catalog,
@@ -921,7 +941,12 @@ mod tests {
     fn pages_describe_themselves_the_way_the_pager_reads() {
         let rows = rows_named(
             &(0..45)
-                .map(|i| ("9ZZTEST00000", Box::leak(format!("Title {i:02}").into_boxed_str()) as &str))
+                .map(|i| {
+                    (
+                        "9ZZTEST00000",
+                        Box::leak(format!("Title {i:02}").into_boxed_str()) as &str,
+                    )
+                })
                 .collect::<Vec<_>>(),
         );
         let all: Vec<&LibraryRow> = rows.iter().collect();
@@ -954,7 +979,10 @@ mod tests {
     #[test]
     fn an_empty_library_still_produces_a_sane_page() {
         let page = paginate(&[], 0, 20);
-        assert_eq!((page.pages, page.total, page.first, page.last), (1, 0, 0, 0));
+        assert_eq!(
+            (page.pages, page.total, page.first, page.last),
+            (1, 0, 0, 0)
+        );
         assert!(!page.has_previous() && !page.has_next());
         assert_eq!(page.label(), "Nothing to show");
     }

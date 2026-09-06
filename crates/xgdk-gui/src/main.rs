@@ -158,6 +158,11 @@ fn build_ui(app: &adw::Application) {
         busy: Rc::new(RefCell::new(false)),
     };
 
+    // Activation and selection both, because they are not the same event:
+    // clicking selects, but Enter and an assistive technology activate, and a
+    // sidebar that only answers the mouse is a sidebar half the people cannot
+    // use.
+    sidebar.connect_row_activated(|list, row| list.select_row(Some(row)));
     sidebar.connect_row_selected(glib::clone!(
         #[strong]
         ui,
@@ -266,7 +271,9 @@ fn render(ui: &Ui) {
 fn render_runtime(ui: &Ui, page: &adw::PreferencesPage) {
     let model = ui.model.borrow();
     let (title, subtitle) = model::runtime_summary(model.runtime.as_ref());
-    let group = adw::PreferencesGroup::builder().title("Patched Proton").build();
+    let group = adw::PreferencesGroup::builder()
+        .title("Patched Proton")
+        .build();
     let row = adw::ActionRow::builder()
         .title(&title)
         .subtitle(&subtitle)
@@ -347,7 +354,9 @@ fn draw_list(model: &Model, keep: impl Fn(&LibraryRow) -> bool) -> Drawn {
             .iter()
             .filter(|row| {
                 row.image.is_some()
-                    && !model.icons.contains_key(&row.product_id.to_ascii_uppercase())
+                    && !model
+                        .icons
+                        .contains_key(&row.product_id.to_ascii_uppercase())
             })
             .map(|row| row.product_id.clone())
             .collect(),
@@ -857,7 +866,13 @@ fn refresh_library(ui: &Ui) {
                 {
                     // Written before it is drawn, so the next launch opens on a
                     // library rather than on a button.
-                    if let Some(state_dir) = ui.model.borrow().paths.as_ref().map(|p| p.state_dir().to_owned()) {
+                    if let Some(state_dir) = ui
+                        .model
+                        .borrow()
+                        .paths
+                        .as_ref()
+                        .map(|p| p.state_dir().to_owned())
+                    {
                         let _ = xgdk_core::library::save_cache(&state_dir, &entries);
                     }
                     let mut model = ui.model.borrow_mut();

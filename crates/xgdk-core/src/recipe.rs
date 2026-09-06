@@ -121,7 +121,6 @@ pub struct Issue {
     pub log_match: Option<String>,
 }
 
-
 /// A step that has to happen around install or launch, beyond unpacking.
 ///
 /// Kept as data rather than code so a title can describe what it needs without
@@ -205,8 +204,8 @@ impl Recipe {
     /// `capabilities.toml` is the runtime registry, not a title.
     pub fn load_dir(dir: &Path) -> anyhow::Result<Vec<Recipe>> {
         let mut found = Vec::new();
-        for entry in std::fs::read_dir(dir)
-            .map_err(|e| anyhow::anyhow!("{}: {e}", dir.display()))?
+        for entry in
+            std::fs::read_dir(dir).map_err(|e| anyhow::anyhow!("{}: {e}", dir.display()))?
         {
             let path = entry?.path();
             if path.extension().and_then(|e| e.to_str()) != Some("toml") {
@@ -300,7 +299,10 @@ impl Recipe {
             anyhow::bail!("not a usable product id: {:?}", self.title.product_id);
         }
         std::fs::create_dir_all(dir)?;
-        let path = dir.join(format!("{}.toml", self.title.product_id.to_ascii_uppercase()));
+        let path = dir.join(format!(
+            "{}.toml",
+            self.title.product_id.to_ascii_uppercase()
+        ));
         std::fs::write(&path, self.to_toml()?)?;
         Ok(path)
     }
@@ -334,6 +336,32 @@ impl Recipe {
     }
 }
 
+/// A directory name for a title: lowercase, words joined by dashes, nothing
+/// that needs quoting in a shell or a path.
+///
+/// Falls back to the product id, because a name can be entirely non-ASCII and
+/// an empty slug would put the install at the root of the games directory.
+fn slugify(name: &str, product_id: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_dash = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            if pending_dash && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_dash = false;
+            slug.extend(c.to_lowercase());
+        } else {
+            pending_dash = true;
+        }
+    }
+    if slug.is_empty() {
+        product_id.to_ascii_lowercase()
+    } else {
+        slug
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,7 +369,10 @@ mod tests {
     #[test]
     fn a_blank_recipe_is_honest_about_being_blank() {
         let recipe = Recipe::blank("9zztestnew1", "Clair Obscur: Expedition 33");
-        assert_eq!(recipe.title.product_id, "9ZZTESTNEW1", "ids are stored uppercase");
+        assert_eq!(
+            recipe.title.product_id, "9ZZTESTNEW1",
+            "ids are stored uppercase"
+        );
         assert_eq!(recipe.title.slug, "clair-obscur-expedition-33");
         assert_eq!(recipe.status.state, TitleState::Untested);
         assert!(
@@ -355,8 +386,14 @@ mod tests {
     #[test]
     fn a_name_with_nothing_sluggable_falls_back_to_the_id() {
         assert_eq!(Recipe::blank("9ZZTESTNEW1", "").title.slug, "9zztestnew1");
-        assert_eq!(Recipe::blank("9ZZTESTNEW1", "  ---  ").title.slug, "9zztestnew1");
-        assert_eq!(Recipe::blank("9ZZTESTNEW1", "Halo: CE").title.slug, "halo-ce");
+        assert_eq!(
+            Recipe::blank("9ZZTESTNEW1", "  ---  ").title.slug,
+            "9zztestnew1"
+        );
+        assert_eq!(
+            Recipe::blank("9ZZTESTNEW1", "Halo: CE").title.slug,
+            "halo-ce"
+        );
     }
 
     #[test]
@@ -364,15 +401,27 @@ mod tests {
         let mut recipe = Recipe::blank("9ZZTESTNEW1", "Test Title");
         recipe.launch.executable = "Game/Test.exe".into();
         recipe.launch.env.insert("XGDK_TEST".into(), "1".into());
-        recipe.runtime.requires.push("loader.memfd-main-image".into());
+        recipe
+            .runtime
+            .requires
+            .push("loader.memfd-main-image".into());
 
         let text = recipe.to_toml().expect("serialises");
         let parsed = Recipe::parse(&text).expect("and parses back");
         assert_eq!(parsed.title.product_id, "9ZZTESTNEW1");
         assert_eq!(parsed.launch.executable, "Game/Test.exe");
-        assert_eq!(parsed.launch.env.get("XGDK_TEST").map(String::as_str), Some("1"));
-        assert_eq!(parsed.runtime.requires, vec!["loader.memfd-main-image".to_string()]);
-        assert!(text.contains("open an issue"), "the file says what to do with it");
+        assert_eq!(
+            parsed.launch.env.get("XGDK_TEST").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            parsed.runtime.requires,
+            vec!["loader.memfd-main-image".to_string()]
+        );
+        assert!(
+            text.contains("open an issue"),
+            "the file says what to do with it"
+        );
     }
 
     /// An edit is an override, not a fork: the packaged recipe stays, and the
@@ -394,12 +443,9 @@ mod tests {
         edited.launch.executable = "edited.exe".into();
         edited.save_to(&user).expect("writes");
 
-        let layered = Recipe::load_layered(&[
-            packaged.clone(),
-            root.join("does-not-exist"),
-            user.clone(),
-        ])
-        .expect("loads");
+        let layered =
+            Recipe::load_layered(&[packaged.clone(), root.join("does-not-exist"), user.clone()])
+                .expect("loads");
         assert_eq!(layered.len(), 2, "an override replaces, it does not add");
         assert_eq!(layered[0].launch.executable, "edited.exe");
         assert_eq!(layered[1].title.product_id, "9ZZTESTNEW2");
@@ -487,8 +533,7 @@ summary = "Runs."
     fn every_recipe_in_the_repository_parses() {
         // The real recipes are the contract; if the schema and the data drift
         // apart this catches it in CI rather than at someone's first launch.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../titles");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../titles");
         if !dir.exists() {
             return; // packaged crate without the repository around it
         }
@@ -498,31 +543,5 @@ summary = "Runs."
             assert!(!r.title.name.is_empty());
             assert!(!r.launch.executable.is_empty());
         }
-    }
-}
-
-/// A directory name for a title: lowercase, words joined by dashes, nothing
-/// that needs quoting in a shell or a path.
-///
-/// Falls back to the product id, because a name can be entirely non-ASCII and
-/// an empty slug would put the install at the root of the games directory.
-fn slugify(name: &str, product_id: &str) -> String {
-    let mut slug = String::new();
-    let mut pending_dash = false;
-    for c in name.chars() {
-        if c.is_ascii_alphanumeric() {
-            if pending_dash && !slug.is_empty() {
-                slug.push('-');
-            }
-            pending_dash = false;
-            slug.extend(c.to_lowercase());
-        } else {
-            pending_dash = true;
-        }
-    }
-    if slug.is_empty() {
-        product_id.to_ascii_lowercase()
-    } else {
-        slug
     }
 }

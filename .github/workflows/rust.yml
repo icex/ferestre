@@ -1,0 +1,91 @@
+# The launcher's own tests. Two jobs, because they need different things.
+#
+# `test` is the fast one: everything decided in `xgdk-core` and in the GUI's
+# `model` is pure, so it runs anywhere with a Rust toolchain -- no display, no
+# runtime, no Microsoft account, no game.
+#
+# `gui` drives the real window through AT-SPI, which needs a display server and
+# the accessibility bus. It is the only thing that can catch a row that renders
+# with the wrong label or a button wired to nothing, and it is worth the extra
+# minute of setup.
+name: Rust
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tests/gui_smoke.py'
+      - 'titles/**'
+      - '.github/workflows/rust.yml'
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tests/gui_smoke.py'
+      - 'titles/**'
+      - '.github/workflows/rust.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The GUI crate links GTK4 and libadwaita, so the workspace needs them
+      # even to type-check.
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+  gui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev libadwaita-1-dev \
+            at-spi2-core gir1.2-atspi-2.0 python3-gi \
+            xvfb dbus-x11
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the window
+        run: cargo build -p xgdk-gui
+
+      # A session bus for the accessibility bus to live on, a display for the
+      # window to map into, and then the test drives it by pressing things.
+      - name: Smoke test
+        run: |
+          xvfb-run -a --server-args='-screen 0 1280x900x24' \
+            dbus-run-session -- python3 tests/gui_smoke.py
