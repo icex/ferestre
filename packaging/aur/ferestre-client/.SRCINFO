@@ -26,12 +26,13 @@ pkgbase = ferestre-client
 	conflicts = xodus-cli
 	conflicts = xodus-cli-git
 	source = xodus::git+https://github.com/xodus-gaming/xodus.git#commit=3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
-	source = https://raw.githubusercontent.com/icex/ferestre/0a8afd00dded754555651377f479ef6383fd26be/patches/xodus-cli/0002-relying-party-device-claim-and-no-panic.patch
-	source = https://raw.githubusercontent.com/icex/ferestre/0a8afd00dded754555651377f479ef6383fd26be/patches/xodus-cli/0003-owned-title-enumeration.patch
-	source = https://raw.githubusercontent.com/icex/ferestre/0a8afd00dded754555651377f479ef6383fd26be/patches/xodus-cli/0004-account-and-probe-headers.patch
-	source = https://raw.githubusercontent.com/icex/ferestre/0a8afd00dded754555651377f479ef6383fd26be/patches/xodus-cli/0005-win32-path-for-the-mapped-main-image.patch
-	source = https://raw.githubusercontent.com/icex/ferestre/0a8afd00dded754555651377f479ef6383fd26be/patches/xodus-cli/0006-streaming-progress-a-launcher-can-read-behind-XODUS_.patch
-	source = https://raw.githubusercontent.com/icex/ferestre/0a8afd00dded754555651377f479ef6383fd26be/patches/xodus-cli/0007-streaming-report-a-failed-download-instead-of-panick.patch
+	source = https://raw.githubusercontent.com/icex/ferestre/9e9925fda3eb98e039fa40bf11bcf896b496697b/patches/xodus-cli/0002-relying-party-device-claim-and-no-panic.patch
+	source = https://raw.githubusercontent.com/icex/ferestre/9e9925fda3eb98e039fa40bf11bcf896b496697b/patches/xodus-cli/0003-owned-title-enumeration.patch
+	source = https://raw.githubusercontent.com/icex/ferestre/9e9925fda3eb98e039fa40bf11bcf896b496697b/patches/xodus-cli/0004-account-and-probe-headers.patch
+	source = https://raw.githubusercontent.com/icex/ferestre/9e9925fda3eb98e039fa40bf11bcf896b496697b/patches/xodus-cli/0005-win32-path-for-the-mapped-main-image.patch
+	source = https://raw.githubusercontent.com/icex/ferestre/9e9925fda3eb98e039fa40bf11bcf896b496697b/patches/xodus-cli/0006-streaming-progress-a-launcher-can-read-behind-XODUS_.patch
+	source = https://raw.githubusercontent.com/icex/ferestre/9e9925fda3eb98e039fa40bf11bcf896b496697b/patches/xodus-cli/0007-streaming-report-a-failed-download-instead-of-panick.patch
+	source = https://raw.githubusercontent.com/icex/ferestre/9e9925fda3eb98e039fa40bf11bcf896b496697b/patches/xodus-cli/0008-streaming-cached_len-must-mean-on-disk-not-accepted-.patch
 	sha256sums = SKIP
 	sha256sums = 20d613add707a69f488b50041e53c60f8a0096132c05338b66d594fa8963c918
 	sha256sums = c15806efefdfe7613755ada8ee0fe28784ad955ea7df26825ddeabc7be731256
@@ -39,5 +40,6 @@ pkgbase = ferestre-client
 	sha256sums = b5c9feec3aa4dba5f287609d5ae3727e5fb38aa4cf967997bfb5901d2b3a3d47
 	sha256sums = ab51b007ed0b8802785be1b000ba78185f25760850174de55e2667ed64ac4a2d
 	sha256sums = fae49957d9fb4725627c16c7c80224601c2102d772cfa54bb3dd9cb9dc996a0d
+	sha256sums = f5943458e255ec7894c92b464db214f183f5681287f3d0189d31bb8771b908c1
 
 pkgname = ferestre-client
