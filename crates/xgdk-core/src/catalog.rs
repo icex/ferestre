@@ -87,7 +87,15 @@ pub fn batches(ids: &[String]) -> impl Iterator<Item = &[String]> {
 
 /// A store image URL at a given pixel size, resized by the CDN.
 pub fn image_url(base: &str, px: u32) -> String {
-    format!("{base}?q=90&w={px}&h={px}&format=png")
+    crate::http::with_params(
+        base,
+        &[
+            ("q", "90".into()),
+            ("format", "png".into()),
+            ("w", px.to_string()),
+            ("h", px.to_string()),
+        ],
+    )
 }
 
 // The wire types. Only the fields a launcher acts on, and every one optional:
@@ -455,7 +463,7 @@ mod tests {
     fn image_urls_ask_the_cdn_for_the_size_we_draw() {
         assert_eq!(
             image_url("https://img/logo", 128),
-            "https://img/logo?q=90&w=128&h=128&format=png"
+            "https://img/logo?q=90&format=png&w=128&h=128"
         );
     }
 

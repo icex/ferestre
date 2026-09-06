@@ -17,6 +17,7 @@ pub mod account;
 pub mod capability;
 pub mod catalog;
 pub mod http;
+pub mod install;
 pub mod launch;
 pub mod library;
 pub mod paths;

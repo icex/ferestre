@@ -9,9 +9,11 @@
 //! The rules themselves come from `xgdk-core`, the same code the CLI runs, so
 //! the window and the terminal cannot disagree about what a recipe says.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use xgdk_core::catalog::Product;
+use xgdk_core::install::Record;
 use xgdk_core::library::Entry;
 use xgdk_core::recipe::{Recipe, TitleState};
 use xgdk_core::runtime::{self, InstalledRuntime, Registry};
@@ -23,6 +25,11 @@ pub enum Action {
     Play,
     /// Owned, with a recipe, but not on disk yet: `xgdk install <product>`.
     Install,
+    /// Installed, and the catalog is offering a build this one does not have.
+    Update,
+    /// Owned, but nobody has written a recipe. Opens the editor rather than
+    /// running anything: the missing piece is a description, not a download.
+    Adopt,
     /// Nothing to press. The string is shown as the tooltip and the subtitle,
     /// so it has to read as a sentence to someone who has never seen the CLI.
     Blocked(String),
@@ -33,6 +40,8 @@ impl Action {
         match self {
             Action::Play => "Play",
             Action::Install => "Install",
+            Action::Update => "Update",
+            Action::Adopt => "Set up",
             Action::Blocked(_) => "Play",
         }
     }
@@ -42,19 +51,24 @@ impl Action {
     }
 
     /// The `xgdk` arguments this action runs, or `None` when it runs nothing.
+    /// `Adopt` runs nothing on purpose -- it opens the editor -- so this being
+    /// `None` is not the same question as [`Action::is_enabled`].
     pub fn command<'a>(&self, product_id: &'a str) -> Option<[&'a str; 2]> {
         match self {
             Action::Play => Some(["run", product_id]),
-            Action::Install => Some(["install", product_id]),
-            Action::Blocked(_) => None,
+            // Updating is a reinstall today. Fetching only what changed is a
+            // separate piece of work and this is the honest version of it.
+            Action::Install | Action::Update => Some(["install", product_id]),
+            Action::Adopt | Action::Blocked(_) => None,
         }
     }
 }
 
-/// One title, ready to be drawn.
+/// One title, ready to be drawn. Internal: [`LibraryRow`] is what the window
+/// gets, and it is built from this plus what the catalog knows.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TitleView {
-    pub product_id: String,
+struct TitleView {
+    product_id: String,
     pub name: String,
     pub state: TitleState,
     /// Badge text and the libadwaita CSS class that colours it.
@@ -92,26 +106,6 @@ impl Ownership {
         matches!(self, Ownership::Known(_))
     }
 
-    /// Owned titles with no recipe: the list that says what to work on next,
-    /// and the reason someone would file an issue.
-    pub fn without_recipe(&self, recipes: &[Recipe]) -> Vec<String> {
-        let known: BTreeSet<String> = recipes
-            .iter()
-            .map(|r| r.title.product_id.to_ascii_uppercase())
-            .collect();
-        match self {
-            Ownership::Unknown => Vec::new(),
-            Ownership::Known(entries) => {
-                let mut out: BTreeSet<String> = BTreeSet::new();
-                for entry in entries.iter().filter(|e| e.is_title()) {
-                    if !known.contains(&entry.product_id.to_ascii_uppercase()) {
-                        out.insert(entry.product_id.clone());
-                    }
-                }
-                out.into_iter().collect()
-            }
-        }
-    }
 }
 
 pub fn state_label(state: TitleState) -> (&'static str, &'static str) {
@@ -131,22 +125,24 @@ pub struct Inputs<'a> {
     /// still names the missing capabilities; with it, it also names the symptom.
     pub registry: Option<&'a Registry>,
     pub ownership: &'a Ownership,
+    /// Names, art and download sizes, keyed by uppercase product id. Empty
+    /// until the catalog has been asked, which is not an error: a row falls
+    /// back to its product id.
+    pub catalog: &'a BTreeMap<String, Product>,
+    /// What the launcher recorded at install time, keyed the same way.
+    pub records: &'a BTreeMap<String, Record>,
     /// Whether the title's install directory is on disk. A closure because the
     /// answer is a filesystem probe, and keeping it out of here is what lets a
     /// test describe a half-installed machine in one line.
     pub installed: &'a dyn Fn(&Recipe) -> bool,
 }
 
-/// Work out the button and the words for every recipe.
+/// Work out the button and the words for one recipe.
 ///
 /// Order matters: the first thing that stops a launch is the thing to say. A
 /// broken title stays broken whether or not the runtime is installed, and
 /// telling someone to install a runtime for a title that will not run either
 /// way wastes their evening.
-pub fn rows(inputs: &Inputs) -> Vec<TitleView> {
-    inputs.recipes.iter().map(|r| row(inputs, r)).collect()
-}
-
 fn row(inputs: &Inputs, recipe: &Recipe) -> TitleView {
     let (badge, badge_css) = state_label(recipe.status.state);
     let (action, caution) = action_for(inputs, recipe);
@@ -197,7 +193,7 @@ fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
     let assessment = runtime::assess(recipe, runtime, inputs.registry);
     if !assessment.is_satisfied() {
         // `assess` writes a paragraph for a terminal. A row gets one line.
-        let line = first_line(&assessment.explanation).to_string();
+        let line = row_sized(&assessment.explanation, &recipe.title.name);
         // A capability list a runtime declares is authoritative, so a miss
         // against it is a refusal. A list we had to guess at by looking for
         // symbols is not: most of what a build provides is invisible to a
@@ -217,8 +213,219 @@ fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
     (action, caution)
 }
 
-fn first_line(text: &str) -> &str {
-    text.lines().next().unwrap_or("").trim()
+/// The first line of an explanation `assess` wrote for a terminal, cut down to
+/// something a row can hold.
+///
+/// It opens with the title's name, which the row already shows two centimetres
+/// to the left. Dropping it is most of the difference between a subtitle that
+/// fits and one that ends in an ellipsis.
+fn row_sized(explanation: &str, title: &str) -> String {
+    let line = explanation.lines().next().unwrap_or("").trim();
+    let trimmed = line
+        .strip_prefix(title)
+        .map(str::trim_start)
+        .unwrap_or(line);
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// One row of the library: something owned, something described, or both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryRow {
+    pub product_id: String,
+    /// The catalog's name when there is one, the product id when there is not.
+    pub name: String,
+    pub subtitle: String,
+    /// Absent for a title with no recipe: there is no state to report about
+    /// something nobody has described.
+    pub badge: Option<(&'static str, &'static str)>,
+    /// The art URL, for a caller that fetches and caches it.
+    pub image: Option<String>,
+    pub owned: bool,
+    pub has_recipe: bool,
+    pub installed: bool,
+    /// `None` means "cannot tell", which is different from "up to date" -- see
+    /// [`Record::update_available`].
+    pub update: Option<bool>,
+    pub action: Action,
+}
+
+impl LibraryRow {
+    /// Whether the catalog has been asked about this row yet. A row still
+    /// showing its product id is waiting, not broken.
+    pub fn is_named(&self) -> bool {
+        self.name != self.product_id
+    }
+}
+
+/// Every title worth a row: everything owned, plus everything described.
+///
+/// The union rather than the intersection, deliberately. A recipe for something
+/// this account does not own still belongs on screen -- it is how someone finds
+/// out the launcher supports a game before buying it -- and an owned title with
+/// no recipe is the most useful row in the list, because it is the one someone
+/// can do something about.
+pub fn library(inputs: &Inputs) -> Vec<LibraryRow> {
+    let mut rows: BTreeMap<String, LibraryRow> = BTreeMap::new();
+
+    for recipe in inputs.recipes {
+        let key = recipe.title.product_id.to_ascii_uppercase();
+        rows.insert(key.clone(), described_row(inputs, recipe, &key));
+    }
+
+    if let Ownership::Known(entries) = inputs.ownership {
+        for entry in entries.iter().filter(|e| e.is_title()) {
+            let key = entry.product_id.to_ascii_uppercase();
+            match rows.get_mut(&key) {
+                Some(row) => row.owned = true,
+                None => {
+                    rows.insert(key.clone(), undescribed_row(inputs, &entry.product_id, &key));
+                }
+            }
+        }
+    }
+
+    let mut rows: Vec<LibraryRow> = rows.into_values().collect();
+    // Named rows alphabetically, then the ones still showing a product id.
+    // Sorting them together would scatter unnamed rows through the list purely
+    // because a Store id happens to start with a digit.
+    rows.sort_by(|a, b| {
+        a.is_named()
+            .cmp(&b.is_named())
+            .reverse()
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    rows
+}
+
+fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
+    let view = row(inputs, recipe);
+    let product = inputs.catalog.get(key);
+    let installed = (inputs.installed)(recipe);
+    let update = inputs
+        .records
+        .get(key)
+        .zip(product)
+        .and_then(|(record, product)| record.update_available(&product.content_ids));
+
+    let action = match (&view.action, update) {
+        // An update is worth offering even when the runtime has doubts about
+        // the title: the download is the same either way.
+        (Action::Play, Some(true)) => Action::Update,
+        (action, _) => action.clone(),
+    };
+
+    LibraryRow {
+        product_id: recipe.title.product_id.clone(),
+        name: product.map(|p| p.name.clone()).unwrap_or_else(|| recipe.title.name.clone()),
+        subtitle: view.subtitle,
+        badge: Some((view.badge, view.badge_css)),
+        image: product.and_then(|p| p.image.clone()),
+        owned: false,
+        has_recipe: true,
+        installed,
+        update,
+        action,
+    }
+}
+
+fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
+    let product = inputs.catalog.get(key);
+    let name = product
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| product_id.to_string());
+    let subtitle = match product {
+        Some(p) => {
+            let size = p.size_label();
+            match (p.publisher.as_deref(), size.is_empty()) {
+                (Some(publisher), false) => format!("{publisher}  ·  {size}  ·  no recipe yet"),
+                (Some(publisher), true) => format!("{publisher}  ·  no recipe yet"),
+                (None, false) => format!("{size}  ·  no recipe yet"),
+                (None, true) => "No recipe yet".to_string(),
+            }
+        }
+        None => "No recipe yet".to_string(),
+    };
+    LibraryRow {
+        product_id: product_id.to_string(),
+        name,
+        subtitle,
+        badge: None,
+        image: product.and_then(|p| p.image.clone()),
+        owned: true,
+        has_recipe: false,
+        installed: false,
+        update: None,
+        action: Action::Adopt,
+    }
+}
+
+/// Rows matching a search box. Empty query matches everything.
+///
+/// Matches the product id as well as the name, because the id is what an issue
+/// report, a Store URL and a recipe filename all carry, and someone pasting one
+/// in should find the row.
+pub fn search<'a>(rows: &'a [LibraryRow], query: &str) -> Vec<&'a LibraryRow> {
+    let needle = query.trim().to_lowercase();
+    rows.iter()
+        .filter(|row| {
+            needle.is_empty()
+                || row.name.to_lowercase().contains(&needle)
+                || row.product_id.to_lowercase().contains(&needle)
+        })
+        .collect()
+}
+
+/// One page of rows, and enough to describe the pager.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page<'a> {
+    pub rows: Vec<&'a LibraryRow>,
+    /// Zero-based, and always within range: a page number that no longer exists
+    /// -- because a search shortened the list -- is clamped rather than shown
+    /// empty.
+    pub page: usize,
+    pub pages: usize,
+    pub total: usize,
+    /// One-based, inclusive, for "showing 21-40 of 108". Both zero when empty.
+    pub first: usize,
+    pub last: usize,
+}
+
+impl Page<'_> {
+    pub fn has_previous(&self) -> bool {
+        self.page > 0
+    }
+
+    pub fn has_next(&self) -> bool {
+        self.page + 1 < self.pages
+    }
+
+    pub fn label(&self) -> String {
+        if self.total == 0 {
+            return "Nothing to show".into();
+        }
+        format!("{}-{} of {}", self.first, self.last, self.total)
+    }
+}
+
+pub fn paginate<'a>(rows: &[&'a LibraryRow], page: usize, per_page: usize) -> Page<'a> {
+    let per_page = per_page.max(1);
+    let total = rows.len();
+    let pages = total.div_ceil(per_page).max(1);
+    let page = page.min(pages - 1);
+    let start = page * per_page;
+    let end = (start + per_page).min(total);
+    Page {
+        rows: rows[start..end].to_vec(),
+        page,
+        pages,
+        total,
+        first: if total == 0 { 0 } else { start + 1 },
+        last: end,
+    }
 }
 
 /// How to describe the runtime at the top of the window.
@@ -341,7 +548,47 @@ mod tests {
             runtime,
             registry: None,
             ownership,
+            catalog: empty_catalog(),
+            records: empty_records(),
             installed,
+        }
+    }
+
+    fn empty_catalog() -> &'static BTreeMap<String, Product> {
+        static EMPTY: std::sync::OnceLock<BTreeMap<String, Product>> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(BTreeMap::new)
+    }
+
+    fn empty_records() -> &'static BTreeMap<String, Record> {
+        static EMPTY: std::sync::OnceLock<BTreeMap<String, Record>> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(BTreeMap::new)
+    }
+
+    fn product(product_id: &str, name: &str, content_ids: &[&str]) -> Product {
+        Product {
+            product_id: product_id.into(),
+            name: name.into(),
+            publisher: Some("Test Studios".into()),
+            image: Some("https://img/logo".into()),
+            download_bytes: Some(2_490_064_896),
+            last_update: None,
+            content_ids: content_ids.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn catalog(products: Vec<Product>) -> BTreeMap<String, Product> {
+        products
+            .into_iter()
+            .map(|p| (p.product_id.to_ascii_uppercase(), p))
+            .collect()
+    }
+
+    fn record(product_id: &str, content_ids: &[&str]) -> Record {
+        Record {
+            product_id: product_id.into(),
+            dir: PathBuf::from("/games/test"),
+            content_ids: content_ids.iter().map(|s| s.to_string()).collect(),
+            installed_at: None,
         }
     }
 
@@ -353,7 +600,7 @@ mod tests {
         let recipes = vec![recipe("9ZZTESTGAME1", "playable", &[])];
         let rt = runtime_with(&[], CapabilitySource::Manifest);
         let own = Ownership::Unknown;
-        let rows = rows(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
+        let rows = library(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
         assert_eq!(rows[0].action, Action::Play);
         assert_eq!(rows[0].action.command("9ZZTESTGAME1"), Some(["run", "9ZZTESTGAME1"]));
         assert_eq!(rows[0].subtitle, "a summary");
@@ -364,7 +611,7 @@ mod tests {
         let recipes = vec![recipe("9ZZTESTGAME1", "playable", &[])];
         let rt = runtime_with(&[], CapabilitySource::Manifest);
         let own = Ownership::Unknown;
-        let rows = rows(&inputs(&recipes, Some(&rt), &own, NOTHING_INSTALLED));
+        let rows = library(&inputs(&recipes, Some(&rt), &own, NOTHING_INSTALLED));
         assert_eq!(rows[0].action, Action::Install);
         assert_eq!(
             rows[0].action.command("9ZZTESTGAME1"),
@@ -379,9 +626,9 @@ mod tests {
         let recipes = vec![recipe("9ZZTESTGAME1", "untested", &[])];
         let rt = runtime_with(&[], CapabilitySource::Manifest);
         let own = Ownership::Unknown;
-        let rows = rows(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
+        let rows = library(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
         assert_eq!(rows[0].action, Action::Play);
-        assert_eq!(rows[0].badge, "Untested");
+        assert_eq!(rows[0].badge.map(|b| b.0), Some("Untested"));
     }
 
     #[test]
@@ -389,7 +636,7 @@ mod tests {
         let recipes = vec![broken_recipe()];
         let rt = runtime_with(&[], CapabilitySource::Manifest);
         let own = Ownership::Unknown;
-        let rows = rows(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
+        let rows = library(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
         assert_eq!(
             rows[0].action,
             Action::Blocked("does not run here: title-protection".into())
@@ -405,7 +652,7 @@ mod tests {
     fn broken_beats_a_missing_runtime() {
         let recipes = vec![broken_recipe()];
         let own = Ownership::Unknown;
-        let rows = rows(&inputs(&recipes, None, &own, ALL_INSTALLED));
+        let rows = library(&inputs(&recipes, None, &own, ALL_INSTALLED));
         assert!(matches!(&rows[0].action, Action::Blocked(w) if w.contains("title-protection")));
     }
 
@@ -413,7 +660,7 @@ mod tests {
     fn without_a_runtime_nothing_launches() {
         let recipes = vec![recipe("9ZZTESTGAME1", "playable", &[])];
         let own = Ownership::Unknown;
-        let rows = rows(&inputs(&recipes, None, &own, ALL_INSTALLED));
+        let rows = library(&inputs(&recipes, None, &own, ALL_INSTALLED));
         assert_eq!(
             rows[0].action,
             Action::Blocked("install the patched runtime first".into())
@@ -427,12 +674,16 @@ mod tests {
         let recipes = vec![recipe("9ZZTESTGAME1", "playable", &["loader.memfd-main-image"])];
         let rt = runtime_with(&["appmodel.package-identity"], CapabilitySource::Manifest);
         let own = Ownership::Unknown;
-        let rows = rows(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
+        let rows = library(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
         let Action::Blocked(why) = &rows[0].action else {
             panic!("expected a block, got {:?}", rows[0].action);
         };
         assert!(!why.contains('\n'), "a row gets one line, got {why:?}");
-        assert!(why.contains("will not"), "{why}");
+        assert!(
+            !why.contains("Test Title"),
+            "the row already shows the name; repeating it is what makes the subtitle overflow: {why}"
+        );
+        assert!(why.starts_with("Will not"), "reads as a sentence: {why}");
     }
 
     /// A probe sees almost nothing of what a build provides, so a miss there
@@ -443,7 +694,7 @@ mod tests {
         let recipes = vec![recipe("9ZZTESTGAME1", "playable", &["loader.memfd-main-image"])];
         let rt = runtime_with(&["appmodel.package-identity"], CapabilitySource::Probed);
         let own = Ownership::Unknown;
-        let rows = rows(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
+        let rows = library(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
         assert_eq!(rows[0].action, Action::Play);
         assert!(
             rows[0].subtitle.contains("could not be found"),
@@ -459,7 +710,7 @@ mod tests {
         let recipes = vec![recipe("9ZZTESTGAME1", "playable", &["loader.memfd-main-image"])];
         let rt = runtime_with(&["loader.memfd-main-image"], CapabilitySource::Probed);
         let own = Ownership::Unknown;
-        let rows = rows(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
+        let rows = library(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
         assert_eq!(rows[0].action, Action::Play);
         assert_eq!(rows[0].subtitle, "a summary");
     }
@@ -472,34 +723,22 @@ mod tests {
 
         let unknown = Ownership::Unknown;
         assert_eq!(
-            rows(&inputs(&recipes, Some(&rt), &unknown, ALL_INSTALLED))[0].action,
+            library(&inputs(&recipes, Some(&rt), &unknown, ALL_INSTALLED))[0].action,
             Action::Play
         );
 
         let elsewhere = Ownership::Known(entries(&["9ZZTESTOTHR"]));
         assert_eq!(
-            rows(&inputs(&recipes, Some(&rt), &elsewhere, ALL_INSTALLED))[0].action,
+            library(&inputs(&recipes, Some(&rt), &elsewhere, ALL_INSTALLED))[0].action,
             Action::Blocked("this account does not own it".into())
         );
 
         let owned = Ownership::Known(entries(&["9zztestgame1"]));
         assert_eq!(
-            rows(&inputs(&recipes, Some(&rt), &owned, ALL_INSTALLED))[0].action,
+            library(&inputs(&recipes, Some(&rt), &owned, ALL_INSTALLED))[0].action,
             Action::Play,
             "the join is case-insensitive, as it is in the CLI"
         );
-    }
-
-    #[test]
-    fn owned_titles_with_no_recipe_are_listed_for_reporting() {
-        let recipes = vec![recipe("9ZZTESTGAME1", "playable", &[])];
-        let own = Ownership::Known(entries(&["9ZZTESTGAME1", "9ZZTESTNEW2", "9ZZTESTNEW1"]));
-        assert_eq!(
-            own.without_recipe(&recipes),
-            vec!["9ZZTESTNEW1".to_string(), "9ZZTESTNEW2".to_string()],
-            "sorted, and the one with a recipe is not in the list"
-        );
-        assert!(Ownership::Unknown.without_recipe(&recipes).is_empty());
     }
 
     #[test]
@@ -515,6 +754,209 @@ mod tests {
 
         let (title, _) = runtime_summary(None);
         assert!(title.contains("No patched runtime"), "{title}");
+    }
+
+
+    // --- the library view -------------------------------------------------
+
+    #[test]
+    fn the_library_is_the_union_of_what_is_owned_and_what_is_described() {
+        let recipes = vec![
+            recipe("9ZZTESTGAME1", "playable", &[]),
+            recipe("9ZZTESTGAME2", "playable", &[]),
+        ];
+        let rt = runtime_with(&[], CapabilitySource::Manifest);
+        let own = Ownership::Known(entries(&["9ZZTESTGAME1", "9ZZTESTNEW3"]));
+        let cat = catalog(vec![
+            product("9ZZTESTGAME1", "Aardvark", &[]),
+            product("9ZZTESTNEW3", "Zebra", &[]),
+        ]);
+        let recs = BTreeMap::new();
+        let rows = library(&Inputs {
+            recipes: &recipes,
+            runtime: Some(&rt),
+            registry: None,
+            ownership: &own,
+            catalog: &cat,
+            records: &recs,
+            installed: ALL_INSTALLED,
+        });
+
+        let by_id: BTreeMap<&str, &LibraryRow> =
+            rows.iter().map(|r| (r.product_id.as_str(), r)).collect();
+        assert_eq!(by_id.len(), 3, "owned, described, and both");
+
+        let owned_and_described = by_id["9ZZTESTGAME1"];
+        assert!(owned_and_described.owned && owned_and_described.has_recipe);
+        assert_eq!(owned_and_described.name, "Aardvark", "the catalog names it");
+
+        let described_not_owned = by_id["9ZZTESTGAME2"];
+        assert!(!described_not_owned.owned && described_not_owned.has_recipe);
+        assert!(
+            !matches!(described_not_owned.action, Action::Adopt),
+            "a recipe for something unowned still belongs on screen"
+        );
+
+        let owned_not_described = by_id["9ZZTESTNEW3"];
+        assert!(owned_not_described.owned && !owned_not_described.has_recipe);
+        assert_eq!(owned_not_described.action, Action::Adopt);
+        assert!(owned_not_described.badge.is_none(), "no state to report");
+        assert!(owned_not_described.subtitle.contains("no recipe"), "{}", owned_not_described.subtitle);
+    }
+
+    /// A row still showing a twelve-character code is waiting for the catalog,
+    /// and burying it among the named ones just because a Store id starts with
+    /// a digit makes the list look broken.
+    #[test]
+    fn named_rows_sort_first_then_alphabetically() {
+        let recipes = vec![recipe("9ZZTESTGAME1", "playable", &[])];
+        let rt = runtime_with(&[], CapabilitySource::Manifest);
+        let own = Ownership::Known(entries(&["9ZZTESTGAME1", "9ZZTESTNEW3", "9ZZTESTNEW4"]));
+        let cat = catalog(vec![
+            product("9ZZTESTGAME1", "Zebra", &[]),
+            product("9ZZTESTNEW4", "aardvark", &[]),
+        ]);
+        let recs = BTreeMap::new();
+        let rows = library(&Inputs {
+            recipes: &recipes,
+            runtime: Some(&rt),
+            registry: None,
+            ownership: &own,
+            catalog: &cat,
+            records: &recs,
+            installed: ALL_INSTALLED,
+        });
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["aardvark", "Zebra", "9ZZTESTNEW3"]);
+    }
+
+    #[test]
+    fn a_rebuilt_package_turns_play_into_update() {
+        let recipes = vec![recipe("9ZZTESTGAME1", "playable", &[])];
+        let rt = runtime_with(&[], CapabilitySource::Manifest);
+        let own = Ownership::Unknown;
+        let cat = catalog(vec![product("9ZZTESTGAME1", "Test Game", &["content-b"])]);
+        let recs: BTreeMap<String, Record> = [(
+            "9ZZTESTGAME1".to_string(),
+            record("9ZZTESTGAME1", &["content-a"]),
+        )]
+        .into();
+        let rows = library(&Inputs {
+            recipes: &recipes,
+            runtime: Some(&rt),
+            registry: None,
+            ownership: &own,
+            catalog: &cat,
+            records: &recs,
+            installed: ALL_INSTALLED,
+        });
+        assert_eq!(rows[0].action, Action::Update);
+        assert_eq!(rows[0].update, Some(true));
+        assert_eq!(
+            rows[0].action.command("9ZZTESTGAME1"),
+            Some(["install", "9ZZTESTGAME1"]),
+            "updating is a reinstall today, and says so"
+        );
+    }
+
+    #[test]
+    fn an_install_with_nothing_recorded_is_not_reported_either_way() {
+        let recipes = vec![recipe("9ZZTESTGAME1", "playable", &[])];
+        let rt = runtime_with(&[], CapabilitySource::Manifest);
+        let own = Ownership::Unknown;
+        let cat = catalog(vec![product("9ZZTESTGAME1", "Test Game", &["content-b"])]);
+        let recs = BTreeMap::new();
+        let rows = library(&Inputs {
+            recipes: &recipes,
+            runtime: Some(&rt),
+            registry: None,
+            ownership: &own,
+            catalog: &cat,
+            records: &recs,
+            installed: ALL_INSTALLED,
+        });
+        assert_eq!(rows[0].update, None);
+        assert_eq!(rows[0].action, Action::Play, "not nagged, not hidden");
+    }
+
+    // --- search and pagination --------------------------------------------
+
+    fn rows_named(names: &[(&str, &str)]) -> Vec<LibraryRow> {
+        names
+            .iter()
+            .map(|(id, name)| LibraryRow {
+                product_id: (*id).into(),
+                name: (*name).into(),
+                subtitle: String::new(),
+                badge: None,
+                image: None,
+                owned: true,
+                has_recipe: false,
+                installed: false,
+                update: None,
+                action: Action::Adopt,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn search_matches_the_name_or_the_product_id() {
+        let rows = rows_named(&[
+            ("9ZZTESTGAME1", "Minecraft for Windows"),
+            ("9ZZTESTGAME2", "Forza Horizon 5"),
+        ]);
+        assert_eq!(search(&rows, "").len(), 2, "an empty box hides nothing");
+        assert_eq!(search(&rows, "  ").len(), 2);
+        assert_eq!(search(&rows, "mine")[0].product_id, "9ZZTESTGAME1");
+        assert_eq!(search(&rows, "MINE")[0].product_id, "9ZZTESTGAME1");
+        assert_eq!(
+            search(&rows, "game2")[0].product_id,
+            "9ZZTESTGAME2",
+            "an id pasted from a Store URL or an issue should find its row"
+        );
+        assert!(search(&rows, "nothing at all").is_empty());
+    }
+
+    #[test]
+    fn pages_describe_themselves_the_way_the_pager_reads() {
+        let rows = rows_named(
+            &(0..45)
+                .map(|i| ("9ZZTEST00000", Box::leak(format!("Title {i:02}").into_boxed_str()) as &str))
+                .collect::<Vec<_>>(),
+        );
+        let all: Vec<&LibraryRow> = rows.iter().collect();
+
+        let first = paginate(&all, 0, 20);
+        assert_eq!(first.rows.len(), 20);
+        assert_eq!((first.pages, first.total), (3, 45));
+        assert_eq!(first.label(), "1-20 of 45");
+        assert!(!first.has_previous() && first.has_next());
+
+        let last = paginate(&all, 2, 20);
+        assert_eq!(last.rows.len(), 5);
+        assert_eq!(last.label(), "41-45 of 45");
+        assert!(last.has_previous() && !last.has_next());
+    }
+
+    /// Typing in the search box shortens the list under whatever page someone
+    /// was on. Showing them an empty page instead of results would read as
+    /// "no matches".
+    #[test]
+    fn a_page_past_the_end_is_clamped_not_shown_empty() {
+        let rows = rows_named(&[("9ZZTESTGAME1", "Only One")]);
+        let all: Vec<&LibraryRow> = rows.iter().collect();
+        let page = paginate(&all, 7, 20);
+        assert_eq!(page.page, 0);
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.label(), "1-1 of 1");
+    }
+
+    #[test]
+    fn an_empty_library_still_produces_a_sane_page() {
+        let page = paginate(&[], 0, 20);
+        assert_eq!((page.pages, page.total, page.first, page.last), (1, 0, 0, 0));
+        assert!(!page.has_previous() && !page.has_next());
+        assert_eq!(page.label(), "Nothing to show");
     }
 
     #[test]

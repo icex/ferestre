@@ -92,16 +92,36 @@ pub fn avatar_path(cache_dir: &Path, px: u32) -> PathBuf {
     cache_dir.join(format!("gamerpic-{px}.img"))
 }
 
+/// Sizes the gamerpic host will actually serve.
+///
+/// It is an allowlist, not a range, and anything else is answered with **400**
+/// -- 48 fails where 40 and 64 succeed. Measured against the live service,
+/// because nothing documents it, and the failure mode is an avatar that simply
+/// never appears.
+const AVATAR_SIZES: [u32; 5] = [40, 64, 100, 128, 208];
+
+/// The smallest offered size that is at least `px`, so the picture is never
+/// upscaled into a blur. Falls back to the largest when asked for more.
+pub fn supported_avatar_size(px: u32) -> u32 {
+    AVATAR_SIZES
+        .into_iter()
+        .find(|size| *size >= px)
+        .unwrap_or(AVATAR_SIZES[AVATAR_SIZES.len() - 1])
+}
+
 /// Fetch the avatar at the size it will be drawn, and say where it went.
 pub fn avatar(cache_dir: &Path, account: &Account, px: u32) -> Result<PathBuf> {
     let url = account
         .gamerpic
         .as_deref()
         .ok_or_else(|| anyhow!("no gamerpic for this account"))?;
+    let px = supported_avatar_size(px);
     let dest = avatar_path(cache_dir, px);
     // The host resizes, so a 64px avatar is a 1.7 KB download instead of the
-    // 1.6 MB the unsized URL returns.
-    crate::http::download(&format!("{url}&format=png&w={px}&h={px}"), &dest)?;
+    // 1.6 MB the unsized URL returns. The size goes on with `with_params`, not
+    // by appending: this URL already carries `format`, and a duplicate of it is
+    // answered with 400 too.
+    crate::http::download(&crate::http::sized_image(url, px), &dest)?;
     Ok(dest)
 }
 
@@ -156,6 +176,23 @@ mod tests {
     fn the_avatar_filename_names_a_size_not_a_person() {
         let path = avatar_path(Path::new("/cache"), 64);
         assert_eq!(path, PathBuf::from("/cache/gamerpic-64.img"));
+    }
+
+    /// The host serves an allowlist of sizes and answers anything else with
+    /// 400, which shows up as an avatar that silently never appears.
+    #[test]
+    fn an_unserved_size_is_rounded_up_to_one_that_is_served() {
+        assert_eq!(supported_avatar_size(48), 64, "48 is a 400; 64 is not");
+        assert_eq!(supported_avatar_size(32), 40);
+        assert_eq!(supported_avatar_size(64), 64, "an exact size is left alone");
+        assert_eq!(supported_avatar_size(1), 40);
+        assert_eq!(supported_avatar_size(4096), 208, "the largest, not a 400");
+        for px in [1, 32, 48, 64, 65, 300] {
+            assert!(
+                AVATAR_SIZES.contains(&supported_avatar_size(px)),
+                "asked for {px}"
+            );
+        }
     }
 
     #[test]

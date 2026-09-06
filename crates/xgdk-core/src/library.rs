@@ -19,17 +19,21 @@
 //! something can name the filter that removed it.
 
 use crate::recipe::Recipe;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Whether an entitlement is still good.
 ///
 /// Kept as an enum with a catch-all rather than a bool so an unfamiliar value
 /// survives into the output instead of being silently read as "not active".
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(from = "String")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+// Round-trips as the service's own string. Without `into`, the derive writes a
+// catch-all as `{"Other":"Foo"}`, which is not what `from = "String"` reads back
+// -- so a cached listing containing one unfamiliar value would fail to load.
+#[serde(from = "String", into = "String")]
 pub enum EntitlementStatus {
     Active,
     Expired,
@@ -46,6 +50,12 @@ impl From<String> for EntitlementStatus {
             "Revoked" => Self::Revoked,
             _ => Self::Other(value),
         }
+    }
+}
+
+impl From<EntitlementStatus> for String {
+    fn from(value: EntitlementStatus) -> Self {
+        value.as_str().to_string()
     }
 }
 
@@ -70,8 +80,8 @@ impl EntitlementStatus {
 /// two a launcher can install; `Durable` is an add-on and `Pass` a subscription,
 /// and an entitlement to a subscription is not an entitlement to the titles in
 /// it.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(from = "String")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(from = "String", into = "String")]
 pub enum ProductType {
     Game,
     Application,
@@ -89,6 +99,12 @@ impl From<String> for ProductType {
             "Pass" => Self::Pass,
             _ => Self::Other(value),
         }
+    }
+}
+
+impl From<ProductType> for String {
+    fn from(value: ProductType) -> Self {
+        value.as_str().to_string()
     }
 }
 
@@ -116,7 +132,7 @@ impl ProductType {
 /// recipe is our own file and a misspelled key there is a bug; this payload is
 /// Microsoft's and gains fields without warning, so refusing it on sight would
 /// break a library listing for no gain. Only what a launcher acts on is modelled.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Entry {
     /// The 12-character Store id, and the key everything joins on: it is what a
@@ -306,6 +322,33 @@ pub fn join<'a>(entries: &'a [Entry], recipes: &'a [Recipe]) -> Vec<Row<'a>> {
     }
 
     rows.into_values().collect()
+}
+
+/// Where the last listing is kept.
+///
+/// A launcher that shows an empty library every time it opens, until you
+/// remember to press a button, is not showing you your library. The listing is
+/// small, changes about as often as you buy a game, and is cheap to refresh --
+/// so it is written down and shown immediately, and the button means "check
+/// again" rather than "start".
+pub fn cache_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("library.json")
+}
+
+/// Written in the same shape the service returns, so [`parse`] reads it back
+/// and there is only one deserialiser to keep correct.
+pub fn save_cache(state_dir: &Path, entries: &[Entry]) -> anyhow::Result<()> {
+    std::fs::create_dir_all(state_dir)?;
+    let document = serde_json::json!({ "count": entries.len(), "items": entries });
+    std::fs::write(cache_path(state_dir), serde_json::to_vec_pretty(&document)?)?;
+    Ok(())
+}
+
+/// The last listing, if there is one. A missing or unreadable cache is not an
+/// error -- it only means the window opens asking rather than showing.
+pub fn load_cache(state_dir: &Path) -> Option<Vec<Entry>> {
+    let text = std::fs::read_to_string(cache_path(state_dir)).ok()?;
+    parse(&text).ok()
 }
 
 /// How to ask the client for the listing.
@@ -515,6 +558,33 @@ summary = "Runs."
         let entries = parse(r#"[{"productId":"9ZZTESTODD08"}]"#).expect("should parse");
         assert_eq!(entries.len(), 1);
         assert!(!entries[0].is_title());
+    }
+
+    /// The cache is written and read by the same code that reads the service,
+    /// so a value neither of them recognises has to survive the round trip.
+    #[test]
+    fn a_cached_listing_round_trips_including_values_we_do_not_recognise() {
+        let dir = std::env::temp_dir().join(format!("xgdk-library-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(load_cache(&dir).is_none(), "no cache is not an error");
+
+        let mut entries = parse(PAYLOAD).expect("parses");
+        entries.push(Entry {
+            product_id: "9ZZTESTODD07".into(),
+            product_type: ProductType::Other("SomethingNew".into()),
+            status: EntitlementStatus::Other("Pending".into()),
+            sku_type: None,
+            acquired_date: None,
+            ownership_type: None,
+        });
+
+        save_cache(&dir, &entries).expect("writes");
+        let read_back = load_cache(&dir).expect("reads");
+        assert_eq!(read_back, entries);
+        assert_eq!(read_back[6].product_type.as_str(), "SomethingNew");
+        assert_eq!(read_back[6].status.as_str(), "Pending");
+
+        std::fs::remove_dir_all(&dir).expect("cleans up");
     }
 
     #[test]
