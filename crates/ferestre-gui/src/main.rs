@@ -43,6 +43,10 @@ struct Ui {
     /// Set while a background task runs, so a second click cannot queue a
     /// duplicate sign-in or a duplicate library fetch.
     busy: Rc<RefCell<bool>>,
+    /// Titles this window started that have not exited, by product id, each
+    /// mapped to the process group to signal. Deliberately not the `busy` flag:
+    /// a game runs for hours and must not hold the window's other work.
+    running: Rc<RefCell<BTreeMap<String, u32>>>,
 }
 
 fn main() -> glib::ExitCode {
@@ -156,6 +160,7 @@ fn build_ui(app: &adw::Application) {
         search: search.clone(),
         spinner,
         busy: Rc::new(RefCell::new(false)),
+        running: Rc::new(RefCell::new(BTreeMap::new())),
     };
 
     // Activation and selection both, because they are not the same event:
@@ -331,7 +336,12 @@ struct Drawn {
     want_icons: Vec<String>,
 }
 
-fn draw_list(model: &Model, keep: impl Fn(&LibraryRow) -> bool) -> Drawn {
+fn draw_list(
+    model: &Model,
+    running: &BTreeMap<String, u32>,
+    keep: impl Fn(&LibraryRow) -> bool,
+) -> Drawn {
+    let running = |product_id: &str| running.contains_key(&product_id.to_ascii_uppercase());
     let installed = |r: &Recipe| model.is_installed(r);
     let installed_version = |r: &Recipe| model.installed_version(r);
     let rows: Vec<LibraryRow> = model::library(&Inputs {
@@ -346,6 +356,7 @@ fn draw_list(model: &Model, keep: impl Fn(&LibraryRow) -> bool) -> Drawn {
         available: &model.available,
         installed: &installed,
         installed_version: &installed_version,
+        running: &running,
     })
     .into_iter()
     .filter(|row| keep(row))
@@ -378,7 +389,7 @@ fn render_rows(
     keep: impl Fn(&LibraryRow) -> bool,
     empty_message: &str,
 ) {
-    let drawn = draw_list(&ui.model.borrow(), keep);
+    let drawn = draw_list(&ui.model.borrow(), &ui.running.borrow(), keep);
 
     let group = adw::PreferencesGroup::builder().build();
     if drawn.rows.is_empty() {
@@ -540,6 +551,18 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
                 move |_| open_editor(&ui, &product_id, &name)
             ));
         }
+        Action::Stop => {
+            button.set_tooltip_text(Some("Ask the title to close"));
+            button.remove_css_class("suggested-action");
+            button.add_css_class("destructive-action");
+            let product_id = row.product_id.clone();
+            let name = row.name.clone();
+            button.connect_clicked(glib::clone!(
+                #[strong]
+                ui,
+                move |_| stop_title(&ui, &product_id, &name)
+            ));
+        }
         action => {
             let args: Vec<String> = action
                 .command(&row.product_id)
@@ -552,6 +575,9 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             // window has nothing to update when it ends. Installing is not --
             // it changes what every row says about itself.
             let waits = matches!(row.action, Action::Install | Action::Update);
+            let plays = matches!(row.action, Action::Play);
+            let product_id = row.product_id.clone();
+            let title_name = row.name.clone();
             let what = match row.action {
                 Action::Update => format!("Updating {}", row.name),
                 _ => format!("Installing {}", row.name),
@@ -563,6 +589,8 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
                     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
                     if waits {
                         spawn_cli_tracked(&ui, &borrowed, &what);
+                    } else if plays {
+                        spawn_title(&ui, &product_id, &title_name);
                     } else {
                         spawn_cli(&ui, &borrowed);
                     }
@@ -630,6 +658,115 @@ fn cli_binary() -> PathBuf {
 /// Run `ferestre` and leave it running. Output goes where the CLI already sends it
 /// -- a per-title log file -- rather than into a widget nobody would read while
 /// a game is starting.
+/// Start a title and keep track of it, so the row can say it is running.
+///
+/// Its own process group: `ferestre run` is a chain -- launcher, client, Proton,
+/// then the game -- and signalling only the process this window started would
+/// leave the game running with nothing tracking it.
+fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
+    use std::os::unix::process::CommandExt;
+
+    let program = cli_binary();
+    let mut command = std::process::Command::new(&program);
+    command.arg("run").arg(product_id);
+    // Safety: setsid in the child between fork and exec. Async-signal-safe, and
+    // the only thing this closure does.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            ui.toasts
+                .add_toast(adw::Toast::new(&format!("{}: {e}", program.display())));
+            return;
+        }
+    };
+
+    let key = product_id.to_ascii_uppercase();
+    // setsid makes the child its own group leader, so the group id is its pid.
+    ui.running.borrow_mut().insert(key.clone(), child.id());
+    render(ui);
+    ui.toasts
+        .add_toast(adw::Toast::new(&format!("Starting {name}")));
+
+    // Wait off the main thread, and deliberately without the `busy` flag: a
+    // game runs for hours and must not hold up the rest of the window.
+    let ui = ui.clone();
+    let name = name.to_string();
+    glib::spawn_future_local(async move {
+        let mut child = child;
+        let status = gio::spawn_blocking(move || child.wait()).await;
+        ui.running.borrow_mut().remove(&key);
+        render(&ui);
+        match status {
+            Ok(Ok(status)) if status.success() => {}
+            Ok(Ok(status)) => ui
+                .toasts
+                .add_toast(adw::Toast::new(&format!("{name} exited {status}"))),
+            _ => ui
+                .toasts
+                .add_toast(adw::Toast::new(&format!("{name}: could not be waited on"))),
+        }
+    });
+}
+
+/// Ask a running title to close.
+///
+/// SIGTERM to the whole group, not SIGKILL: a game killed outright loses
+/// whatever it had not written, and saves are most of why these titles are run
+/// here at all. A title that ignores it keeps running and the row keeps saying
+/// so, which is honest -- the window does not pretend to have stopped it.
+fn stop_title(ui: &Ui, product_id: &str, name: &str) {
+    let key = product_id.to_ascii_uppercase();
+    let Some(pgid) = ui.running.borrow().get(&key).copied() else {
+        return;
+    };
+    // Safety: a signal to a process group this window created.
+    let sent = unsafe { libc::kill(-(pgid as i32), libc::SIGTERM) };
+    if sent != 0 {
+        ui.toasts.add_toast(adw::Toast::new(&format!(
+            "Could not signal {name}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // And Wine's own way, because the signal above does not reach the game.
+    // wineserver detaches, so the title is reparented out of the group this
+    // window created and survives it -- measured, with the row saying stopped
+    // while Minecraft was still running. `wineserver -k` ends the prefix.
+    let server = {
+        let model = ui.model.borrow();
+        model
+            .recipe_for(product_id)
+            .and_then(|recipe| model.wineserver(recipe))
+    };
+    if let Some((server, prefix)) = server {
+        if let Ok(child) = std::process::Command::new(server)
+            .env("WINEPREFIX", prefix)
+            .arg("-k")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            // Reaped, because stopping a title is something people do more than
+            // once and an unwaited child is a zombie each time.
+            glib::spawn_future_local(async move {
+                let mut child = child;
+                let _ = gio::spawn_blocking(move || child.wait()).await;
+            });
+        }
+    }
+    ui.toasts
+        .add_toast(adw::Toast::new(&format!("Asked {name} to close")));
+}
+
 fn spawn_cli(ui: &Ui, args: &[&str]) {
     let program = cli_binary();
     match std::process::Command::new(&program).args(args).spawn() {
@@ -698,10 +835,20 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
 fn open_editor(ui: &Ui, product_id: &str, name: &str) {
     let (recipe, titles_dir) = {
         let model = ui.model.borrow();
-        let recipe = model
+        let mut recipe = model
             .recipe_for(product_id)
             .cloned()
             .unwrap_or_else(|| Recipe::blank(product_id, name));
+        // Fill the executable in from the package's own manifest rather than
+        // asking someone to find an .exe in a tree of thousands. Only when the
+        // field is empty: a recipe that names something else names it because
+        // the manifest's entry point was a launcher shim, and overwriting that
+        // would undo the very thing that made the title work.
+        if recipe.launch.executable.trim().is_empty() {
+            if let Some(found) = model.detected_executable(&recipe) {
+                recipe.launch.executable = found;
+            }
+        }
         (recipe, model.user_titles_dir())
     };
     let Some(titles_dir) = titles_dir else {

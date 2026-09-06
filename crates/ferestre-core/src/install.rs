@@ -242,6 +242,48 @@ fn guid_le(b: &[u8]) -> String {
     )
 }
 
+/// The executable a package declares as its entry point.
+///
+/// From the manifest, not from guessing: `<Application Executable="...">` is
+/// what Windows itself launches, so it is right by construction. That is the
+/// difference between a launcher that asks someone to find an .exe in a tree of
+/// thousands and one that does not ask.
+///
+/// A starting point, not always the final answer. Some titles name a launcher
+/// shim here and the real binary is deeper -- Clair Obscur declares
+/// `SandFall.exe` while the recipe that works points at
+/// `Sandfall\Binaries\WinGDK\SandFall-WinGDK-Shipping.exe`. So this fills the
+/// field in and leaves it editable, rather than deciding for the person.
+pub fn executable(install_dir: &Path) -> Option<String> {
+    let manifest = ["appxmanifest.xml", "AppxManifest.xml"]
+        .iter()
+        .map(|name| install_dir.join(name))
+        .find(|path| path.is_file())?;
+    let text = std::fs::read_to_string(manifest).ok()?;
+
+    // The first <Application>: a package may declare several, and the first is
+    // the one the Store shows.
+    let start = text.find("<Application ")?;
+    let end = text[start..].find('>')? + start;
+    attribute(&text[start..end], "Executable")
+}
+
+/// One attribute out of one element, without a parser. Attribute order is not
+/// guaranteed, and assuming it is exactly the kind of thing that works on the
+/// two titles you happened to test with.
+fn attribute(element: &str, name: &str) -> Option<String> {
+    let at = element.find(&format!("{name}="))?;
+    let rest = &element[at + name.len() + 1..];
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let value = &rest[1..];
+    let close = value.find(quote)?;
+    let value = value[..close].trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 /// Build a record for a title already on disk that nothing recorded.
 ///
 /// Exact, not assumed: everything comes from the install itself. Returns `None`
@@ -347,6 +389,214 @@ mod tests {
         let mut versionless = installed.clone();
         versionless.package_version = None;
         assert_eq!(versionless.update_available(Some("1.26.4600.0")), None);
+    }
+
+    /// Hand-rolled date maths earns its tests. Vectors chosen for the cases that
+    /// break naive conversions: the epoch, a leap day, and a century that is not
+    /// a leap year on the other side of one that is.
+    #[test]
+    fn timestamps_are_rfc_3339_utc() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339(1), "1970-01-01T00:00:01Z");
+        assert_eq!(
+            rfc3339(951_782_400),
+            "2000-02-29T00:00:00Z",
+            "2000 is a leap year"
+        );
+        assert_eq!(rfc3339(1_709_164_800), "2024-02-29T00:00:00Z");
+        assert_eq!(rfc3339(1_788_690_600), "2026-09-06T10:30:00Z");
+        assert_eq!(
+            rfc3339(4_107_542_400),
+            "2100-03-01T00:00:00Z",
+            "2100 is not"
+        );
+        assert_eq!(rfc3339(86_399), "1970-01-01T23:59:59Z");
+        assert_eq!(rfc3339(86_400), "1970-01-02T00:00:00Z");
+
+        let now = now_rfc3339().expect("the clock is after 1970");
+        assert_eq!(now.len(), 20, "{now}");
+        assert!(now.ends_with('Z') && now.contains('T'), "{now}");
+    }
+
+    /// A synthetic container: the magic where the header starts and a known
+    /// GUID where VDUID sits.
+    fn container(dir: &Path, guid: &[u8; 16], magic: &[u8; 8]) {
+        let mut bytes = vec![0u8; 0x1000];
+        bytes[0x200..0x208].copy_from_slice(magic);
+        bytes[0x220..0x230].copy_from_slice(guid);
+        std::fs::write(dir.join(CONTAINER), bytes).expect("writes the container");
+    }
+
+    /// The bytes of 7792d9ce-355a-493c-afbd-768f4a77c3b0 as Microsoft stores
+    /// them -- first three fields little-endian. Taken from a real install.
+    const REAL_GUID: [u8; 16] = [
+        0xce, 0xd9, 0x92, 0x77, 0x5a, 0x35, 0x3c, 0x49, 0xaf, 0xbd, 0x76, 0x8f, 0x4a, 0x77, 0xc3,
+        0xb0,
+    ];
+
+    #[test]
+    fn the_content_id_is_read_from_the_package_header() {
+        let dir =
+            std::env::temp_dir().join(format!("ferestre-container-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("makes the dir");
+
+        container(&dir, &REAL_GUID, b"msft-xvd");
+        assert_eq!(
+            content_id(&dir).as_deref(),
+            Some("7792d9ce-355a-493c-afbd-768f4a77c3b0"),
+            "the byte order is Microsoft's, not RFC 4122's"
+        );
+
+        std::fs::remove_dir_all(&dir).expect("cleans up");
+    }
+
+    /// Every way of not knowing must produce `None`. A guess here becomes a
+    /// wrong "up to date", which is the one answer worth failing to avoid.
+    #[test]
+    fn anything_that_is_not_a_package_header_yields_nothing() {
+        let dir =
+            std::env::temp_dir().join(format!("ferestre-container-neg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("makes the dir");
+
+        assert_eq!(content_id(&dir), None, "no container at all");
+
+        container(&dir, &REAL_GUID, b"not-xvd!");
+        assert_eq!(content_id(&dir), None, "wrong magic");
+
+        std::fs::write(dir.join(CONTAINER), vec![0u8; 0x100]).expect("writes");
+        assert_eq!(content_id(&dir), None, "truncated before the header");
+
+        std::fs::write(dir.join(CONTAINER), b"").expect("writes");
+        assert_eq!(content_id(&dir), None, "empty");
+
+        std::fs::remove_dir_all(&dir).expect("cleans up");
+    }
+
+    /// Adoption is exact or it does not happen. It must never invent a content
+    /// id, and it must not claim an install date it does not know.
+    #[test]
+    fn adoption_reads_the_install_or_declines() {
+        let dir = std::env::temp_dir().join(format!("ferestre-adopt-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("makes the dir");
+
+        assert!(
+            adopt("9ZZTESTGAME1", &dir).is_none(),
+            "nothing to read, nothing to claim"
+        );
+
+        container(&dir, &REAL_GUID, b"msft-xvd");
+        std::fs::write(
+            dir.join("appxmanifest.xml"),
+            r#"<Package><Identity Name="X" Version="1.26.4501.0" /></Package>"#,
+        )
+        .expect("writes");
+
+        let adopted = adopt("9ZZTESTGAME1", &dir).expect("adopts");
+        assert_eq!(
+            adopted.content_ids,
+            vec!["7792d9ce-355a-493c-afbd-768f4a77c3b0"]
+        );
+        assert_eq!(adopted.package_version.as_deref(), Some("1.26.4501.0"));
+        assert_eq!(adopted.dir, dir);
+        assert_eq!(
+            adopted.installed_at, None,
+            "the install date is not knowable from disk, so it is not invented"
+        );
+
+        // The point of all of it: an adopted record can answer the update
+        // question, once something knows what version is on offer.
+        assert_eq!(adopted.update_available(Some("1.26.4501.0")), Some(false));
+        assert_eq!(adopted.update_available(Some("1.27.0.0")), Some(true));
+
+        std::fs::remove_dir_all(&dir).expect("cleans up");
+    }
+
+    /// Asking someone to find an .exe in a tree of thousands is what this
+    /// avoids. The manifest names it, so there is nothing to guess.
+    #[test]
+    fn the_executable_comes_from_the_manifest() {
+        let dir = std::env::temp_dir().join(format!("ferestre-exe-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("makes the dir");
+
+        let write = |body: &str| {
+            std::fs::write(dir.join("appxmanifest.xml"), body).expect("writes");
+            executable(&dir)
+        };
+
+        assert_eq!(
+            write(
+                r#"<Package><Applications><Application Id="Game" Executable="Minecraft.Windows.exe" EntryPoint="Windows.FullTrustApplication" /></Applications></Package>"#
+            ),
+            Some("Minecraft.Windows.exe".into())
+        );
+        assert_eq!(
+            write("<Package><Application Executable='Game.exe' Id=\"x\" /></Package>"),
+            Some("Game.exe".into()),
+            "attribute order and quoting are not guaranteed"
+        );
+        assert_eq!(
+            write(
+                r#"<Package><Application Executable="First.exe" /><Application Executable="Second.exe" /></Package>"#
+            ),
+            Some("First.exe".into()),
+            "several applications: the first is the one the Store shows"
+        );
+        assert_eq!(write(r#"<Package><Application Id="x" /></Package>"#), None);
+        assert_eq!(
+            write(r#"<Package><Application Executable="" /></Package>"#),
+            None
+        );
+        assert_eq!(write("not xml"), None);
+        assert_eq!(
+            write(r#"<Package><Dependency Executable="Wrong.exe" /></Package>"#),
+            None,
+            "only an <Application> names the entry point"
+        );
+
+        std::fs::remove_dir_all(&dir).expect("cleans up");
+    }
+
+    #[test]
+    fn a_directory_with_no_manifest_has_no_version() {
+        assert_eq!(package_version(Path::new("/nonexistent/game")), None);
+    }
+
+    /// A record for a directory somebody deleted must not keep the title in the
+    /// Installed list, nor offer an update for something that is not there.
+    #[test]
+    fn a_record_whose_directory_is_gone_is_stale() {
+        let dir = std::env::temp_dir().join(format!("ferestre-stale-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("makes the dir");
+
+        let mut present = record(&["content-a"]);
+        present.dir = dir.clone();
+        assert!(!present.is_stale());
+
+        std::fs::remove_dir_all(&dir).expect("removes it");
+        assert!(present.is_stale(), "the directory is gone");
+    }
+
+    /// Something updated the title outside the launcher, so the recorded content
+    /// ids describe a build that is no longer on disk.
+    #[test]
+    fn a_tree_that_changed_underneath_the_record_is_detectable() {
+        let installed = record(&["content-a"]);
+        assert_eq!(installed.matches_disk(Some("1.26.4501.0")), Some(true));
+        assert_eq!(installed.matches_disk(Some("1.27.0.0")), Some(false));
+        assert_eq!(
+            installed.matches_disk(None),
+            None,
+            "nothing to compare is not a mismatch"
+        );
+
+        let mut versionless = installed.clone();
+        versionless.package_version = None;
+        assert_eq!(versionless.matches_disk(Some("1.26.4501.0")), None);
     }
 
     #[test]

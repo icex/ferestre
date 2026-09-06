@@ -233,6 +233,26 @@ impl Model {
         install::package_version(&dir)
     }
 
+    /// Wine's own way of shutting a title down: the server for its prefix, and
+    /// the prefix. Signalling the process group this window created is not
+    /// enough on its own -- wineserver detaches, so the game is reparented and
+    /// survives, and the row would say stopped while it kept running.
+    pub fn wineserver(&self, recipe: &Recipe) -> Option<(PathBuf, PathBuf)> {
+        let paths = self.paths.as_ref()?;
+        let server = paths.runtime_dir()?.join("files/bin/wineserver");
+        if !server.is_file() {
+            return None;
+        }
+        // Proton puts the prefix one level inside STEAM_COMPAT_DATA_PATH.
+        Some((server, paths.prefix_dir(recipe).ok()?.join("pfx")))
+    }
+
+    /// The entry point the installed package declares, if it is on disk.
+    pub fn detected_executable(&self, recipe: &Recipe) -> Option<String> {
+        let dir = self.paths.as_ref()?.install_dir(recipe).ok()?;
+        install::executable(&dir)
+    }
+
     pub fn catalog_cache(&self) -> Option<Cache> {
         self.paths.as_ref().map(Paths::catalog_cache)
     }

@@ -19,3 +19,6 @@ clap = { version = "4", features = ["derive"] }
 # two callers already run these off the main thread, and an async runtime would
 # be a much larger dependency for two GETs.
 ureq = "3"
+# One call: signalling a process group, so stopping a title reaches the game
+# and not just the launcher process that started it.
+libc = "0.2"

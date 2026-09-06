@@ -30,6 +30,11 @@ pub enum Action {
     /// Owned, but nobody has written a recipe. Opens the editor rather than
     /// running anything: the missing piece is a description, not a download.
     Adopt,
+    /// This window started the title and it is still running. Pressing it asks
+    /// the title to close, politely -- a game killed outright loses whatever it
+    /// had not written yet, and saves are the whole reason people run these
+    /// titles here rather than buying them again somewhere else.
+    Stop,
     /// Nothing to press. The string is shown as the tooltip and the subtitle,
     /// so it has to read as a sentence to someone who has never seen the CLI.
     Blocked(String),
@@ -42,6 +47,7 @@ impl Action {
             Action::Install => "Install",
             Action::Update => "Update",
             Action::Adopt => "Set up",
+            Action::Stop => "Stop",
             Action::Blocked(_) => "Play",
         }
     }
@@ -59,7 +65,9 @@ impl Action {
             // Updating is a reinstall today. Fetching only what changed is a
             // separate piece of work and this is the honest version of it.
             Action::Install | Action::Update => Some(["install", product_id]),
-            Action::Adopt | Action::Blocked(_) => None,
+            // Both are handled by the window rather than by a command: `Adopt`
+            // opens the editor, `Stop` signals a process this window started.
+            Action::Adopt | Action::Stop | Action::Blocked(_) => None,
         }
     }
 }
@@ -146,6 +154,10 @@ pub struct Inputs<'a> {
     /// answer is a filesystem probe, and keeping it out of here is what lets a
     /// test describe a half-installed machine in one line.
     pub installed: &'a dyn Fn(&Recipe) -> bool,
+    /// Whether this window started the title and it has not exited. Only what
+    /// this window started: a title launched from a terminal is not tracked,
+    /// and claiming otherwise would need guessing from the process table.
+    pub running: &'a dyn Fn(&str) -> bool,
     /// The version in the package manifest on disk, when there is one. Read
     /// separately from the record because a title installed outside this
     /// launcher has a version and no record, and showing "Installed" when the
@@ -181,22 +193,41 @@ fn row(inputs: &Inputs, recipe: &Recipe) -> TitleView {
     }
 }
 
+/// Append one more piece of doubt to whatever is already there.
+fn join(existing: Option<String>, next: &str) -> String {
+    match existing {
+        Some(first) => format!("{first}  ·  {next}"),
+        None => next.to_string(),
+    }
+}
+
 /// The action, and a line of doubt to show beside it when there is one.
 fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
     let blocked = |why: String| (Action::Blocked(why), None);
 
-    // `Untested` is deliberately not blocked. The whole point of shipping the
-    // catalog is that people try titles nobody has tried and say what happened;
-    // a launcher that refuses to attempt them cannot collect that.
-    if recipe.status.state == TitleState::Broken {
-        let why = recipe
-            .status
-            .blocked_by
-            .as_deref()
-            .map(|b| format!("does not run here: {b}"))
-            .unwrap_or_else(|| format!("does not run here: {}", recipe.status.summary));
-        return blocked(why);
+    // First, because it is the only one that reports what is happening rather
+    // than what could happen. A row offering "Play" for a title that is already
+    // running is telling the person something they can see is untrue.
+    if (inputs.running)(&recipe.title.product_id) {
+        return (Action::Stop, None);
     }
+
+    // Nothing about the *title* blocks a launch -- only facts about this
+    // machine do. A title someone else found broken is a warning, not a
+    // prohibition: the catalog exists so people try things and report back,
+    // protection changes between builds, and a machine that is not the one it
+    // failed on is exactly where the next data point comes from.
+    let broken = match recipe.status.state {
+        TitleState::Broken => Some(
+            recipe
+                .status
+                .blocked_by
+                .as_deref()
+                .map(|b| format!("known not to run: {b}"))
+                .unwrap_or_else(|| format!("known not to run: {}", recipe.status.summary)),
+        ),
+        _ => None,
+    };
 
     // Absence from the library listing is a caution, not a refusal.
     //
@@ -207,10 +238,10 @@ fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
     // evidence would be the launcher calling its owner a liar and being wrong.
     // A download for something genuinely unowned fails at the licence step
     // anyway, which teaches the same lesson at the right moment.
-    let mut caution = match inputs.ownership.owns(&recipe.title.product_id) {
-        Some(false) => Some("not in this account's library listing".to_string()),
-        _ => None,
-    };
+    let mut caution = broken;
+    if inputs.ownership.owns(&recipe.title.product_id) == Some(false) {
+        caution = Some(join(caution, "not in this account's library listing"));
+    }
 
     let Some(runtime) = inputs.runtime else {
         return blocked("install the patched runtime first".into());
@@ -228,10 +259,7 @@ fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
         if assessment.source.is_published() {
             return blocked(line);
         }
-        caution = Some(match caution {
-            Some(first) => format!("{first}  ·  {line}"),
-            None => line,
-        });
+        caution = Some(join(caution, &line));
     }
 
     let action = if (inputs.installed)(recipe) {
@@ -352,6 +380,7 @@ fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
     // this, "we cannot tell" draws exactly like "up to date" -- the same row,
     // the same button -- and silence reads as reassurance.
     let subtitle = match (&action, installed) {
+        (Action::Stop, _) => format!("{}  ·  running", installed_version_or(record, product)),
         (Action::Blocked(_), _) => view.subtitle,
         (_, true) => {
             let on_disk = (inputs.installed_version)(recipe);
@@ -380,6 +409,14 @@ fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
         update,
         action,
     }
+}
+
+/// The version to show, from the record if there is one and the disk if not.
+fn installed_version_or(record: Option<&Record>, _product: Option<&Product>) -> String {
+    record
+        .and_then(|r| r.package_version.as_deref())
+        .map(|v| format!("Version {v}"))
+        .unwrap_or_else(|| "Installed".to_string())
 }
 
 /// What to say under an installed title's name.
@@ -634,6 +671,7 @@ mod tests {
             available: empty_available(),
             installed,
             installed_version: NO_VERSION_ON_DISK,
+            running: NOTHING_RUNNING,
         }
     }
 
@@ -692,6 +730,8 @@ mod tests {
     const ALL_INSTALLED: &dyn Fn(&Recipe) -> bool = &|_| true;
     /// Most tests describe machines where nothing wrote a manifest.
     const NO_VERSION_ON_DISK: &dyn Fn(&Recipe) -> Option<String> = &|_| None;
+    /// And where the window has not started anything.
+    const NOTHING_RUNNING: &dyn Fn(&str) -> bool = &|_| false;
 
     #[test]
     fn a_playable_installed_title_plays() {
@@ -737,29 +777,42 @@ mod tests {
         assert_eq!(rows[0].badge.map(|b| b.0), Some("Untested"));
     }
 
+    /// A title someone else found broken is a warning, not a prohibition. The
+    /// catalog exists so people try things and report back, and the machine it
+    /// did not fail on is where the next data point comes from.
     #[test]
-    fn a_broken_title_says_what_blocks_it_and_offers_no_button() {
+    fn a_broken_title_is_launchable_and_says_what_is_known() {
         let recipes = vec![broken_recipe()];
         let rt = runtime_with(&[], CapabilitySource::Manifest);
         let own = Ownership::Unknown;
         let rows = library(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
-        assert_eq!(
-            rows[0].action,
-            Action::Blocked("does not run here: title-protection".into())
+        assert_eq!(rows[0].action, Action::Play, "offered, not refused");
+        assert!(rows[0].action.is_enabled());
+        assert!(
+            rows[0]
+                .subtitle
+                .contains("known not to run: title-protection"),
+            "but the row says what is known: {}",
+            rows[0].subtitle
         );
-        assert!(!rows[0].action.is_enabled());
-        assert_eq!(rows[0].action.command("9ZZTESTBRK1"), None);
-        assert_eq!(rows[0].subtitle, "does not run here: title-protection");
+        assert_eq!(
+            rows[0].badge.map(|b| b.0),
+            Some("Does not run"),
+            "and the badge still says so at a glance"
+        );
     }
 
-    /// A broken title is broken whether or not a runtime is installed. Telling
-    /// someone to spend an hour building one first would be a lie.
+    /// What *does* block is a fact about this machine. With no runtime there is
+    /// nothing to run anything with, and the action is to install one.
     #[test]
-    fn broken_beats_a_missing_runtime() {
+    fn a_missing_runtime_blocks_where_a_broken_title_does_not() {
         let recipes = vec![broken_recipe()];
         let own = Ownership::Unknown;
         let rows = library(&inputs(&recipes, None, &own, ALL_INSTALLED));
-        assert!(matches!(&rows[0].action, Action::Blocked(w) if w.contains("title-protection")));
+        assert_eq!(
+            rows[0].action,
+            Action::Blocked("install the patched runtime first".into())
+        );
     }
 
     #[test]
@@ -870,6 +923,7 @@ mod tests {
             available: &avail,
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
+            running: NOTHING_RUNNING,
         });
         assert_eq!(rows[0].action, Action::Update);
         assert!(
@@ -966,6 +1020,7 @@ mod tests {
             available: &avail,
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
+            running: NOTHING_RUNNING,
         });
 
         let by_id: BTreeMap<&str, &LibraryRow> =
@@ -1018,6 +1073,7 @@ mod tests {
             available: &avail,
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
+            running: NOTHING_RUNNING,
         });
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["aardvark", "Zebra", "9ZZTESTNEW3"]);
@@ -1046,6 +1102,7 @@ mod tests {
             available: &avail,
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
+            running: NOTHING_RUNNING,
         });
         assert_eq!(rows[0].action, Action::Update);
         assert_eq!(rows[0].update, Some(true));
@@ -1074,6 +1131,7 @@ mod tests {
             available: &avail,
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
+            running: NOTHING_RUNNING,
         });
         assert_eq!(rows[0].update, None);
         assert_eq!(rows[0].action, Action::Play, "not nagged, not hidden");
@@ -1157,6 +1215,47 @@ mod tests {
         let without = installed_status(None, None, None, None);
         assert!(without.starts_with("Installed"), "{without}");
         assert!(!without.contains("Version"), "{without}");
+    }
+
+    /// A row that says "Play" for a title that is already running is telling
+    /// someone something they can see is untrue.
+    #[test]
+    fn a_running_title_offers_to_stop_rather_than_to_play() {
+        let recipes = vec![recipe("9ZZTESTGAME1", "playable", &[])];
+        let rt = runtime_with(&[], CapabilitySource::Manifest);
+        let own = Ownership::Unknown;
+        let recs: BTreeMap<String, Record> = [(
+            "9ZZTESTGAME1".to_string(),
+            record("9ZZTESTGAME1", &["content-a"]),
+        )]
+        .into();
+        let cat = BTreeMap::new();
+        let avail = BTreeMap::new();
+        let running: &dyn Fn(&str) -> bool = &|id| id == "9ZZTESTGAME1";
+        let rows = library(&Inputs {
+            recipes: &recipes,
+            runtime: Some(&rt),
+            registry: None,
+            ownership: &own,
+            catalog: &cat,
+            records: &recs,
+            available: &avail,
+            installed: ALL_INSTALLED,
+            installed_version: NO_VERSION_ON_DISK,
+            running,
+        });
+        assert_eq!(rows[0].action, Action::Stop);
+        assert_eq!(rows[0].action.label(), "Stop");
+        assert!(
+            rows[0].action.is_enabled(),
+            "stopping is something you can do"
+        );
+        assert_eq!(
+            rows[0].action.command("9ZZTESTGAME1"),
+            None,
+            "the window signals the process it started; there is no command for it"
+        );
+        assert!(rows[0].subtitle.contains("running"), "{}", rows[0].subtitle);
     }
 
     // --- search and pagination --------------------------------------------

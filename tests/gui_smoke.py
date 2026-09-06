@@ -356,8 +356,8 @@ def main():
             frame,
         )
         check(
-            any("does not run here" in label for label in labels),
-            "and it says why",
+            any("known not to run" in label for label in labels),
+            "and it says what is known about it, without refusing to run it",
             frame,
         )
 
