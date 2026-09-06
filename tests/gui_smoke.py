@@ -850,9 +850,10 @@ print(":: done", flush=True)
             f"every recipe offers an edit ({len(edit)} buttons for {recipe_count} recipes)",
             frame,
         )
+        steam = find_all(frame, role="button", name_contains="Add to Steam")
         check(
-            len(find_all(frame, role="button", name_contains="Add to Steam")) == 3,
-            "and an Add to Steam",
+            len(steam) == recipe_count,
+            f"and an Add to Steam ({len(steam)} for {recipe_count} recipes)",
             frame,
         )
         click(edit[0])

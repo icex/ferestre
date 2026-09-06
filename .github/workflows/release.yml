@@ -1,0 +1,209 @@
+# The launcher's release train: the small, frequent one.
+#
+# Three artefacts, all x86_64 Linux:
+#
+#   ferestre-<version>-x86_64.tar.zst   the tree an installed copy has, so the
+#                                       binary finds its scripts, patches and
+#                                       recipes exactly the way the AUR package
+#                                       lays them out -- usr/bin beside
+#                                       usr/lib/ferestre. Extract anywhere.
+#   Ferestre-<version>-x86_64.AppImage  one file, for people who do not want to
+#                                       extract anything.
+#   SHA256SUMS                          for both, so a download can be checked.
+#
+# The patched Proton runtime is deliberately NOT here. It is ~264 MiB
+# compressed, it versions independently, and tying a 1 MB application to a
+# 264 MB release train would mean a quarter-gigabyte download for a typo fix.
+# It has its own workflow (runtime.yml) and its own tags.
+#
+# Cutting a release:
+#
+#   git tag -a v0.1.0 -m 'what changed' && git push origin v0.1.0
+#
+# A workflow_dispatch run builds and uploads the same artefacts without
+# publishing anything, which is how to find out whether a release would build
+# before committing to a tag.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to stamp the artefacts with (default: the workspace version)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  launcher:
+    runs-on: ubuntu-latest
+    # A release that publishes has to be able to write one.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The AppImage stamps the build it came from, and a shallow clone
+          # cannot describe itself.
+          fetch-depth: 0
+
+      # GTK4 and libadwaita because the GUI links them; fuse3 because the
+      # AppImage self-test at the end of the packaging script mounts the image
+      # it just built, and a build that cannot run its own output has not been
+      # tested at all.
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev libadwaita-1-dev \
+            fuse3 libfuse3-3 zstd
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # A tag is the version, without its leading v. Otherwise the workspace
+      # says what it is, and a manual run may override that.
+      - name: Version
+        id: version
+        # Through the environment rather than interpolated into the script:
+        # a workflow_dispatch input is text somebody typed, and text somebody
+        # typed has no business being pasted into a shell.
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+              version=$INPUT_VERSION
+          elif [ "${GITHUB_REF_TYPE}" = tag ]; then
+              version=${GITHUB_REF_NAME#v}
+          else
+              version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+              version="$version+$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo ":: building $version"
+
+      # A release is not the place to discover a broken test. The same suite
+      # rust.yml runs per push, run again against the exact tree being shipped.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build
+        run: cargo build --release --workspace
+
+      # The layout an installed copy has: usr/bin/ferestre with
+      # usr/lib/ferestre beside it. paths.rs looks for its repository root at
+      # <binary>/../lib/ferestre before it looks at /usr/lib/ferestre, so this
+      # tree works extracted anywhere without being installed -- and it works
+      # through the same code path a packaged install uses, rather than a
+      # second one that only the tarball exercises.
+      - name: Stage the tree
+        id: stage
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          root="stage/ferestre-$VERSION"
+          install -d "$root/usr/bin" "$root/usr/lib/ferestre"
+          install -Dm755 target/release/ferestre     "$root/usr/bin/ferestre"
+          install -Dm755 target/release/ferestre-gui "$root/usr/bin/ferestre-gui"
+
+          # Not documentation: launch-gdk.sh is the launch path and
+          # proton-wine-shim.sh is what the client execs as its "wine".
+          # patches/ travels with them because install-xodus-proton.sh reads
+          # patches/proton out of the repository root.
+          cp -a scripts patches titles "$root/usr/lib/ferestre/"
+          find "$root/usr/lib/ferestre/scripts" -name '*.sh' -exec chmod 0755 {} +
+          printf '%s\n' "$VERSION" > "$root/usr/lib/ferestre/VERSION"
+
+          id=io.github.icex.ferestre
+          install -Dm644 "packaging/appimage/$id.desktop" \
+              "$root/usr/share/applications/$id.desktop"
+          install -Dm644 "packaging/appimage/$id.metainfo.xml" \
+              "$root/usr/share/metainfo/$id.metainfo.xml"
+          install -Dm644 "packaging/appimage/$id.png" \
+              "$root/usr/share/icons/hicolor/256x256/apps/$id.png"
+          if [ -f "packaging/icons/hicolor/scalable/apps/$id.svg" ]; then
+              install -Dm644 "packaging/icons/hicolor/scalable/apps/$id.svg" \
+                  "$root/usr/share/icons/hicolor/scalable/apps/$id.svg"
+          fi
+
+          for doc in README.md NOTICE docs/RECIPES.md docs/ROADMAP.md docs/COMPATIBILITY.md; do
+              install -Dm644 "$doc" "$root/usr/share/doc/ferestre/$(basename "$doc")"
+          done
+          for lic in LICENSE LICENSE.LGPL-2.1; do
+              # An `if`, not `[ -f ] && install`: under `set -e` a false test as
+              # the last command of a loop body ends the step, and a missing
+              # optional licence file would fail the release rather than be
+              # skipped.
+              if [ -f "$lic" ]; then
+                  install -Dm644 "$lic" "$root/usr/share/licenses/ferestre/$lic"
+              fi
+          done
+
+          mkdir -p out
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              -C stage -caf "out/ferestre-$VERSION-x86_64.tar.zst" "ferestre-$VERSION"
+          echo "tarball=out/ferestre-$VERSION-x86_64.tar.zst" >> "$GITHUB_OUTPUT"
+
+      # The script downloads its own pinned appimagetool and type-2 runtime,
+      # checks both against recorded hashes, and runs the result once before
+      # calling it built. See packaging/appimage/build-appimage.sh for why it
+      # never lets appimagetool mount itself.
+      - name: AppImage
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          packaging/appimage/build-appimage.sh \
+            --bin target/release/ferestre-gui \
+            --version "$VERSION" \
+            --out out
+
+      - name: Checksums
+        working-directory: out
+        run: |
+          sha256sum ./*.AppImage ./*.tar.zst > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferestre-${{ steps.version.outputs.version }}
+          path: out/*
+          if-no-files-found: error
+
+      # Only a tag publishes. A manual run has produced the same artefacts and
+      # attached them to the run, which is the point of being able to try.
+      - name: Publish
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/* \
+            --title "ferestre $VERSION" \
+            --generate-notes \
+            --notes "
+          ### What is in here
+
+          | File | What it is |
+          |---|---|
+          | \`Ferestre-$VERSION-x86_64.AppImage\` | One file. Make it executable and run it. |
+          | \`ferestre-$VERSION-x86_64.tar.zst\` | The same tree an installed copy has. Extract anywhere and run \`usr/bin/ferestre\`. |
+          | \`SHA256SUMS\` | Checksums for both. |
+
+          The patched Proton runtime is **not** in this release. It versions
+          separately, under the \`runtime-*\` tags, because it is ~264 MiB and
+          changes only when Wine or the GDK runtime does. Install it with
+          \`ferestre install-runtime\`, or from the \`ferestre-runtime-bin\`
+          AUR package.
+
+          You need to own the games. This downloads and runs what your own
+          Microsoft account is licensed for, and nothing else.
+          "

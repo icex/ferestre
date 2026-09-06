@@ -364,9 +364,31 @@ recipes (continuously, community-contributed).
 **CI is affordable.** Measured against the upstream Proton fork's own workflow:
 a warm-cache build completed on free public runners in ~35 minutes, and a cold
 build in ~1h12m. A self-hosted runner is a nice-to-have for a GPU smoke test,
-not a requirement to build at all. Building from forked repositories rather than
-applying a directory of loose patches removes a whole class of "the patch no
-longer applies" breakage.
+not a requirement to build at all.
+
+- [x] **The launcher's release pipeline.** `.github/workflows/release.yml`.
+      A `v*` tag runs the test suite against the exact tree being shipped, then
+      publishes three things: an AppImage, a tarball laid out the way an
+      installed copy is (`usr/bin` beside `usr/lib/ferestre`, so it exercises
+      the same path-resolution code a packaged install does rather than a
+      second one only the tarball uses), and `SHA256SUMS`. A
+      `workflow_dispatch` run builds all of it and publishes none of it, which
+      is how to find out whether a release would build before committing to a
+      tag.
+
+- [x] **The runtime's release pipeline.** `.github/workflows/runtime.yml`.
+      A `runtime-*` tag clones `xodus-gaming/Proton` **by commit, recursively**
+      -- the submodule pins carry the exact Wine and xgameruntime commits the
+      patch series targets -- applies the series, builds, re-applies the Proton
+      script patch, and writes the capability manifest *from the built tree*
+      before packaging. Two things a naive version would get wrong: a stock
+      runner has ~25 GB free and a Proton tree is ~26 GB, so it clears the
+      preinstalled toolchains first (presenting otherwise as a link error, not
+      a disk error); and the tarball's inner directory name is what
+      `ferestre-runtime-bin`'s PKGBUILD looks for.
+
+      The three sources are pinned by commit rather than branch. A runtime
+      nobody can reproduce is a binary blob with a changelog.
 
 ## Phase 4 — showing it works
 

@@ -1,0 +1,219 @@
+# The runtime's release train: the big, rare one.
+#
+# Builds the patched Proton -- Wine, the from-scratch Xbox GDK runtime
+# (xgameruntime.dll), and everything Proton wraps around them -- and publishes
+# the compatibility tool as one tarball. ~264 MiB compressed, ~35 minutes warm
+# and around an hour and a quarter cold on a free runner, which is why it is a
+# separate train from the launcher rather than a step in it.
+#
+# The three sources are all public, and all pinned by commit rather than by
+# branch. A runtime nobody can reproduce is a binary blob with a changelog:
+#
+#   xodus-gaming/Proton          the compatibility tool
+#     └─ xodus-gaming/wine       submodule, the Wine tree the patches target
+#          └─ xodus-gaming/xgameruntime   submodule, the GDK runtime
+#
+# The submodule pins carry the wine and xgameruntime commits, so only the Proton
+# ref needs stating; --recurse-submodules produces exactly the tree
+# scripts/check-patches.sh checks the series against.
+#
+# Cutting a runtime release:
+#
+#   git tag -a runtime-11.0.20260907 -m 'what changed' && git push origin runtime-11.0.20260907
+#
+# The tag's version is what packaging/aur/ferestre-runtime-bin/PKGBUILD expects
+# to find at releases/download/runtime-<pkgver>/ferestre-runtime-<pkgver>.tar.xz,
+# so it is <proton major>.<minor>.<date> -- pkgver cannot hold the hyphens in
+# Proton's own version string.
+name: Runtime
+
+on:
+  push:
+    tags:
+      - 'runtime-*'
+  workflow_dispatch:
+    inputs:
+      proton_ref:
+        description: 'Commit or branch of xodus-gaming/Proton to build'
+        required: false
+        default: '7c0b4354'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # An hour and a quarter cold, and a runner that dies at the default six
+    # hours mid-link wastes the whole build rather than reporting anything.
+    timeout-minutes: 330
+    permissions:
+      contents: write
+    steps:
+      # A Proton build tree is ~26 GB and a stock runner has about 25 GB free.
+      # The pre-installed toolchains nothing here uses are worth ~30 GB, so
+      # this is the difference between building and running out of disk two
+      # thirds of the way in -- which presents as a link error, not as a disk
+      # error.
+      - name: Make room
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/share/boost /usr/local/.ghcup \
+                      /usr/share/swift /usr/local/lib/node_modules
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          path: ferestre
+
+      - name: Resolve the Proton ref
+        id: ref
+        env:
+          INPUT_REF: ${{ inputs.proton_ref }}
+        run: |
+          # Through the environment, not interpolated: a dispatch input is text
+          # somebody typed.
+          ref=${INPUT_REF:-7c0b4354}
+          echo "proton=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Clone Proton, Wine and the GDK runtime
+        env:
+          PROTON_REF: ${{ steps.ref.outputs.proton }}
+        run: |
+          set -euo pipefail
+          git clone --quiet https://github.com/xodus-gaming/Proton.git proton
+          cd proton
+          git checkout --quiet "$PROTON_REF"
+          # The submodule pins are the whole point: they name the exact wine and
+          # xgameruntime commits the patch series was written against.
+          git submodule update --init --recursive --depth 1
+          echo ":: proton   $(git rev-parse --short HEAD)"
+          echo ":: wine     $(git -C wine rev-parse --short HEAD)"
+          echo ":: xgr      $(git -C wine/dlls/xgameruntime rev-parse --short HEAD)"
+
+      # The same series scripts/check-patches.sh verifies per push, applied for
+      # real. If one has drifted, this is where the build stops -- before an
+      # hour of compilation, not after it.
+      - name: Apply the patch series
+        run: |
+          set -euo pipefail
+          cd proton
+          for p in "$GITHUB_WORKSPACE"/ferestre/patches/wine/*.patch; do
+              echo ":: wine $(basename "$p")"
+              git -C wine apply "$p"
+          done
+          for p in "$GITHUB_WORKSPACE"/ferestre/patches/xgameruntime/*.patch; do
+              echo ":: xgameruntime $(basename "$p")"
+              git -C wine/dlls/xgameruntime apply "$p"
+          done
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          mkdir -p proton/build
+          cd proton/build
+          ../configure.sh --enable-ccache --build-name=ferestre
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          cd proton/build
+          make -j"$(nproc)" dist
+          df -h /
+
+      # The `proton` script Valve ships closes inherited descriptors before
+      # exec, and the client hands Wine a memfd holding the decrypted
+      # executable. Without this every GDK title fails to launch with exit
+      # code 1, so a runtime without it is not a runtime this launcher can use.
+      - name: Keep inherited descriptors
+        run: |
+          set -euo pipefail
+          cd proton/build/dist
+          patch -p1 < "$GITHUB_WORKSPACE/ferestre/patches/proton/0001-keep-inherited-fds-mediaconv-and-system-ffmpeg.patch"
+          grep -q close_fds=False proton
+
+      # What the runtime can do, measured against the tree that was just built
+      # rather than asserted from the patch list. The launcher reads this to
+      # decide whether a title can run at all; a runtime that ships without it
+      # makes the launcher fall back to probing, which finds a third of the
+      # capabilities and tells the user every title "may not start".
+      - name: Write the capability manifest
+        run: |
+          set -euo pipefail
+          cd ferestre
+          XODUS_PROTON_DIR="$GITHUB_WORKSPACE/proton/build/dist" \
+              scripts/write-capabilities.sh
+          cat "$GITHUB_WORKSPACE/proton/build/dist/files/share/ferestre/capabilities.json"
+
+      - name: Version
+        id: version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+              version=${GITHUB_REF_NAME#runtime-}
+          else
+              version="0.0.$(date -u +%Y%m%d)+$(git -C proton rev-parse --short HEAD)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo ":: runtime $version"
+
+      # xz rather than zstd, because ferestre-runtime-bin's PKGBUILD names a
+      # .tar.xz and makepkg unpacks by extension. The directory inside is
+      # ferestre-runtime-<version>, which that PKGBUILD checks for by name and
+      # complains about clearly when it is missing.
+      - name: Package
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p out stage
+          cp -a proton/build/dist "stage/ferestre-runtime-$VERSION"
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              -C stage -cJf "out/ferestre-runtime-$VERSION.tar.xz" \
+              "ferestre-runtime-$VERSION"
+          cd out
+          sha256sum ./*.tar.xz > SHA256SUMS
+          cat SHA256SUMS
+          ls -lh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferestre-runtime-${{ steps.version.outputs.version }}
+          path: out/*
+          if-no-files-found: error
+          # A 264 MiB artefact on every manual run adds up; a tag's copy lives
+          # on the release instead.
+          retention-days: 14
+
+      - name: Publish
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cd ferestre
+          gh release create "$GITHUB_REF_NAME" "$GITHUB_WORKSPACE"/out/* \
+            --title "runtime $VERSION" \
+            --notes "
+          The patched Proton runtime: Wine, the from-scratch Xbox GDK runtime
+          (\`xgameruntime.dll\`), and Proton around them.
+
+          Install it with \`ferestre install-runtime\`, or extract the tarball
+          into \`~/.steam/steam/compatibilitytools.d/\`. The
+          \`ferestre-runtime-bin\` AUR package fetches this file.
+
+          Built from pinned commits, not branches:
+
+          | Component | Commit |
+          |---|---|
+          | xodus-gaming/Proton | \`$(git -C "$GITHUB_WORKSPACE/proton" rev-parse HEAD)\` |
+          | xodus-gaming/wine | \`$(git -C "$GITHUB_WORKSPACE/proton/wine" rev-parse HEAD)\` |
+          | xodus-gaming/xgameruntime | \`$(git -C "$GITHUB_WORKSPACE/proton/wine/dlls/xgameruntime" rev-parse HEAD)\` |
+
+          plus the patch series in \`patches/\` at this tag. \`capabilities.json\`
+          inside the tarball says what this build actually provides, measured
+          against the built tree rather than taken from the patch list.
+          "

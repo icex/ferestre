@@ -105,6 +105,11 @@ package() {
   # which for an installed copy is /usr/lib/ferestre.
   cp -a scripts  "$pkgdir/usr/lib/ferestre/scripts"
   cp -a patches  "$pkgdir/usr/lib/ferestre/patches"
+  # The recipes, without which an installed copy knows about no titles at all:
+  # paths.rs resolves titles/ relative to the repository root, which for a
+  # packaged install is /usr/lib/ferestre. They are data the launcher reads at
+  # run time, not build inputs.
+  cp -a titles   "$pkgdir/usr/lib/ferestre/titles"
   find "$pkgdir/usr/lib/ferestre/scripts" -name '*.sh' -exec chmod 0755 {} +
 
   # The placeholder reads this as $SCRIPTS/../VERSION, so a packaged command
