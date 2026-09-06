@@ -18,7 +18,7 @@
 # they go to /usr/lib/xgdk and not /usr/share.
 
 pkgname=xgdk-launcher-git
-pkgver=0.0.0.r6.ga7175ca
+pkgver=0.0.0.r18.g88a0378
 pkgrel=1
 pkgdesc='Download and run the Microsoft Store and Xbox GDK titles you own, on Linux'
 arch=('x86_64')

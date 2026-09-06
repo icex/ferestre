@@ -26,10 +26,14 @@ pkgbase = xgdk-client
 	conflicts = xodus-cli
 	conflicts = xodus-cli-git
 	source = xodus::git+https://github.com/xodus-gaming/xodus.git#commit=3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
-	source = https://raw.githubusercontent.com/icex/xgdk-launcher/a7175ca56829611ffe2e4e4d05a1c19669319cc4/patches/xodus-cli/0002-relying-party-device-claim-and-no-panic.patch
-	source = https://raw.githubusercontent.com/icex/xgdk-launcher/a7175ca56829611ffe2e4e4d05a1c19669319cc4/patches/xodus-cli/0003-owned-title-enumeration.patch
+	source = https://raw.githubusercontent.com/icex/xgdk-launcher/88a037895996ab7db68f45cc1ca1a2a94119d79a/patches/xodus-cli/0002-relying-party-device-claim-and-no-panic.patch
+	source = https://raw.githubusercontent.com/icex/xgdk-launcher/88a037895996ab7db68f45cc1ca1a2a94119d79a/patches/xodus-cli/0003-owned-title-enumeration.patch
+	source = https://raw.githubusercontent.com/icex/xgdk-launcher/88a037895996ab7db68f45cc1ca1a2a94119d79a/patches/xodus-cli/0004-account-and-probe-headers.patch
+	source = https://raw.githubusercontent.com/icex/xgdk-launcher/88a037895996ab7db68f45cc1ca1a2a94119d79a/patches/xodus-cli/0005-win32-path-for-the-mapped-main-image.patch
 	sha256sums = SKIP
 	sha256sums = 20d613add707a69f488b50041e53c60f8a0096132c05338b66d594fa8963c918
 	sha256sums = c15806efefdfe7613755ada8ee0fe28784ad955ea7df26825ddeabc7be731256
+	sha256sums = 531c461dc6a5dcc1ba47aa039ab998ae03a1762682a4d3abe65cb56dd4a99262
+	sha256sums = b5c9feec3aa4dba5f287609d5ae3727e5fb38aa4cf967997bfb5901d2b3a3d47
 
 pkgname = xgdk-client

@@ -75,11 +75,12 @@ conflicts=('xodus-cli' 'xodus-cli-git')
 # is about. When that is settled and the fork lives in a repository of its own,
 # this becomes one git source and prepare() goes away.
 _commit=3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
-# NOTE: these URLs 404 while the launcher repository is private, and it is
-# private today. `makepkg` cannot fetch a source it cannot read, so this package
-# does not build for anyone -- including its author -- until the repository is
-# published. Nothing else here is waiting on anything.
-_patchrev=f72ac8aac74d35d4d7717a7e038560639ddd4cf4
+# _patchrev pins a commit of THIS repository, so a history rewrite invalidates
+# it: every URL below 404s permanently the moment the SHAs change. It has
+# happened once already. If the history is ever rewritten again, repin here and
+# in .SRCINFO, and regenerate the sha256sums -- the patch files themselves may
+# have changed too.
+_patchrev=88a037895996ab7db68f45cc1ca1a2a94119d79a
 _patchurl="https://raw.githubusercontent.com/icex/xgdk-launcher/$_patchrev/patches/xodus-cli"
 
 source=(
@@ -93,8 +94,8 @@ sha256sums=(
   'SKIP'
   '20d613add707a69f488b50041e53c60f8a0096132c05338b66d594fa8963c918'
   'c15806efefdfe7613755ada8ee0fe28784ad955ea7df26825ddeabc7be731256'
-  'd7ea1c7348f352e681994b04acfee0ae92a78a09e4cf3d9c60009e5b14294f18'
-  '527f2b4ffd2ecf3b8011d3cc353f60658abb0478da127c8b45cbb93cbfe5ab9d'
+  '531c461dc6a5dcc1ba47aa039ab998ae03a1762682a4d3abe65cb56dd4a99262'
+  'b5c9feec3aa4dba5f287609d5ae3727e5fb38aa4cf967997bfb5901d2b3a3d47'
 )
 
 prepare() {
