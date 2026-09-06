@@ -1,6 +1,7 @@
 
 /build/
 # build outputs
+Cargo.lock
 *.dll
 # local scratch
 *.log
@@ -10,5 +11,6 @@ out/
 *.pyc
 __pycache__/
 *.so
+target/
 tools/*.exe
 tools/winestack
