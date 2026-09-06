@@ -38,7 +38,7 @@ your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 
 | Title | Store id | State | Notes | Verified |
 |---|---|---|---|---|
-| Age of Empires: Definitive Edition | `9NJWTJSVGVLJ` | Playable | Boots, starts a custom game and plays. | 2026-09-07 |
+| Age of Empires: Definitive Edition | `9NJWTJSVGVLJ` | Playable | Boots, starts a custom game and plays. | 2026-09-06 |
 | Clair Obscur: Expedition 33 | `9PPT8K6GQHRZ` | Playable | Playable start to finish, with working saves and video. | 2026-09-06 |
 | DOOM 64 | `9MXND4PQLK3W` | Playable | Plays. | 2026-09-06 |
 | DREDGE | `9MSVVM5NS9L6` | Playable | Plays. | 2026-09-06 |

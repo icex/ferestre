@@ -293,7 +293,11 @@ def check_recipe(path, known):
         # A bare date and a date-time are different TOML types, and the latter
         # satisfies isinstance(..., datetime.date) while failing to compare.
         err("[status].last-verified: expected a bare date (YYYY-MM-DD), not a date-time")
-    elif status["last-verified"] > datetime.date.today():
+    # A day of slack, because "today" is not one date everywhere. A recipe
+    # written from a UTC+3 evening carries tomorrow's date as far as a CI runner
+    # on UTC, and rejecting that reports a timezone as a mistake in the recipe.
+    # Anything beyond a day is a typo worth catching.
+    elif status["last-verified"] > datetime.date.today() + datetime.timedelta(days=1):
         err(f"[status].last-verified: {status['last-verified']} is in the future")
     if state == "playable-with-issues" and not data.get("issues"):
         err("[status].state: 'playable-with-issues' needs at least one [[issues]] entry")

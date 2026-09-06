@@ -376,11 +376,13 @@ def main():
     with open(os.path.join(runtime, "version"), "w") as f:
         f.write("0 smoke-test-runtime\n")
     wanted = set()
+    recipe_count = 0
     for name in os.listdir(os.path.join(os.getcwd(), "titles")):
         if not name.endswith(".toml") or name == "capabilities.toml":
             continue
         with open(os.path.join(os.getcwd(), "titles", name), "rb") as f:
             recipe = tomllib.load(f)
+        recipe_count += 1
         wanted |= set(recipe.get("runtime", {}).get("requires", []))
         wanted |= set(recipe.get("runtime", {}).get("wants", []))
     with open(os.path.join(runtime, "files", "share", "ferestre", "capabilities.json"), "w") as f:
@@ -838,7 +840,16 @@ print(":: done", flush=True)
             time.monotonic() + TIMEOUT,
         )
         edit = find_all(frame, role="button", name_contains="Edit how this title launches")
-        check(len(edit) == 3, f"each of the three recipes offers an edit (found {len(edit)})", frame)
+        # One per recipe, counted from titles/ rather than written down here.
+        # This used to assert a literal 3 and went stale the moment a fourth
+        # recipe landed -- it then failed on every commit that added a title,
+        # which is exactly the commit whose author has least reason to suspect
+        # the GUI suite.
+        check(
+            len(edit) == recipe_count,
+            f"every recipe offers an edit ({len(edit)} buttons for {recipe_count} recipes)",
+            frame,
+        )
         check(
             len(find_all(frame, role="button", name_contains="Add to Steam")) == 3,
             "and an Add to Steam",

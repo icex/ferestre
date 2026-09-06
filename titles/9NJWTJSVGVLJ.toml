@@ -38,4 +38,4 @@ requires = [
 [status]
 state   = "playable"
 summary = "Boots, starts a custom game and plays."
-last-verified = 2026-09-07
+last-verified = 2026-09-06
