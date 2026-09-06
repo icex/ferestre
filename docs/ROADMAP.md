@@ -220,6 +220,22 @@ honestly marked as unproven rather than planned.
       preferences page was right for three recipes and is wrong for a library.
       Library / Installed / Updates / Runtime as sidebar sections.
 
+- [x] **A library you can find seven titles in.** Measured on the development
+      account: of 102 owned games and apps, **7** ship as MSIXVC and the other
+      95 are UWP — 31 AppxBundle, 25 MsixBundle, 20 Appx, 13 with no PC package
+      at all, and the rest Msix or encrypted variants. Listing all of them in
+      one alphabetical run is a list where the working seven cannot be found, so
+      the ones this runtime cannot open are held back behind a switch that says
+      how many there are and why. Held back, not hidden: the switch shows them,
+      each naming its own container, and a title the catalog says nothing about
+      is never held back — "we could not ask" is not "no".
+
+      Two things that went with it, both reported from real use: a paged list
+      drew product ids because nothing fetched the names of the rows the pager
+      had put on screen, and install started a download the moment it was
+      clicked. Installing now asks first, with the size, the free space, and an
+      editable destination.
+
 - [x] **Differential updates — answered.** The roadmap said not to promise this
       until two builds of one large title had settled it. That experiment turned
       out to be unnecessary: Microsoft publishes the patch plans themselves, and

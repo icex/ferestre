@@ -43,6 +43,9 @@ struct Ui {
     /// Set while a background task runs, so a second click cannot queue a
     /// duplicate sign-in or a duplicate library fetch.
     busy: Rc<RefCell<bool>>,
+    /// Product ids whose name has been looked up, so a lookup that came back
+    /// with nothing is not repeated on every redraw.
+    asked_names: Rc<RefCell<std::collections::BTreeSet<String>>>,
     /// Titles this window started that have not exited, by product id, each
     /// mapped to the process group to signal. Deliberately not the `busy` flag:
     /// a game runs for hours and must not hold the window's other work.
@@ -161,6 +164,7 @@ fn build_ui(app: &adw::Application) {
         spinner,
         busy: Rc::new(RefCell::new(false)),
         running: Rc::new(RefCell::new(BTreeMap::new())),
+        asked_names: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
     };
 
     // Activation and selection both, because they are not the same event:
@@ -257,7 +261,15 @@ fn render(ui: &Ui) {
 
     match section {
         Section::Runtime => render_runtime(ui, &page),
-        Section::Library => render_rows(ui, &page, |_| true, "Nothing here yet."),
+        Section::Library => {
+            let show_all = ui.model.borrow().show_unsupported;
+            render_rows(
+                ui,
+                &page,
+                move |row| show_all || !row.unsupported,
+                "Nothing here yet.",
+            )
+        }
         Section::Installed => render_rows(
             ui,
             &page,
@@ -334,6 +346,13 @@ struct Drawn {
     has_next: bool,
     /// Rows on this page whose art has not been fetched yet.
     want_icons: Vec<String>,
+    /// Rows on this page still showing a product id because nothing has looked
+    /// their name up.
+    want_names: Vec<String>,
+    /// How many of the owned titles ship in a package format this runtime
+    /// cannot open. Counted before the filter, so the number does not change
+    /// depending on whether they are currently being shown.
+    unsupported: usize,
 }
 
 fn draw_list(
@@ -361,12 +380,19 @@ fn draw_list(
         running: &running,
     })
     .into_iter()
-    .filter(|row| keep(row))
     .collect();
+    let unsupported = rows.iter().filter(|row| row.unsupported).count();
+    let rows: Vec<LibraryRow> = rows.into_iter().filter(|row| keep(row)).collect();
 
     let matching = model::search(&rows, &model.query);
     let view = model::paginate(&matching, model.page, PER_PAGE);
     Drawn {
+        want_names: view
+            .rows
+            .iter()
+            .filter(|row| !row.is_named())
+            .map(|row| row.product_id.clone())
+            .collect(),
         want_icons: view
             .rows
             .iter()
@@ -382,6 +408,7 @@ fn draw_list(
         has_previous: view.has_previous(),
         has_next: view.has_next(),
         rows: view.rows.into_iter().cloned().collect(),
+        unsupported,
     }
 }
 
@@ -392,8 +419,12 @@ fn render_rows(
     empty_message: &str,
 ) {
     let drawn = draw_list(&ui.model.borrow(), &ui.running.borrow(), keep);
+    let section = ui.model.borrow().section;
 
     let group = adw::PreferencesGroup::builder().build();
+    // Deliberately not an early return: an empty list is exactly when the
+    // reader most needs the switch below, because the filter may be the reason
+    // it is empty.
     if drawn.rows.is_empty() {
         let query = ui.model.borrow().query.clone();
         let message = if query.trim().is_empty() {
@@ -404,14 +435,43 @@ fn render_rows(
         let row = adw::ActionRow::builder().title(&message).build();
         row.add_css_class("dim-label");
         group.add(&row);
-        page.add(&group);
-        return;
-    }
-
-    for row in &drawn.rows {
-        group.add(&library_row(ui, row));
+    } else {
+        for row in &drawn.rows {
+            group.add(&library_row(ui, row));
+        }
     }
     page.add(&group);
+
+    // Only in the library: the other sections list installed or updatable
+    // titles, which are runnable by construction.
+    if section == Section::Library && drawn.unsupported > 0 {
+        let row = adw::SwitchRow::builder()
+            .title("Show titles Ferestre cannot run")
+            .subtitle(format!(
+                "{} of your titles ship as Appx or Msix packages. This runtime opens the \
+                 MSIXVC packages Xbox GDK titles use.",
+                drawn.unsupported
+            ))
+            .subtitle_lines(2)
+            .active(ui.model.borrow().show_unsupported)
+            .build();
+        let ui = ui.clone();
+        row.connect_active_notify(move |switch| {
+            {
+                let mut model = ui.model.borrow_mut();
+                if model.show_unsupported == switch.is_active() {
+                    return;
+                }
+                model.show_unsupported = switch.is_active();
+                // The page the reader was on does not exist in the other list.
+                model.page = 0;
+            }
+            render(&ui);
+        });
+        let group = adw::PreferencesGroup::builder().margin_top(18).build();
+        group.add(&row);
+        page.add(&group);
+    }
 
     // Only when there is more than one page: a pager under a list that already
     // fits on screen is noise.
@@ -458,6 +518,13 @@ fn render_rows(
         ui.content.append(&pager);
     }
 
+    // Names before art: a row reading "9NBLGGH18846" is unusable, a row with no
+    // picture is merely plain. Both fetch themselves rather than waiting to be
+    // asked, because "press this button to find out what your games are called"
+    // is not a thing anyone should have to know.
+    if !drawn.want_names.is_empty() {
+        fetch_names(ui, drawn.want_names);
+    }
     if !drawn.want_icons.is_empty() {
         fetch_icons(ui, drawn.want_icons);
     }
@@ -578,19 +645,16 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             // it changes what every row says about itself.
             let waits = matches!(row.action, Action::Install | Action::Update);
             let plays = matches!(row.action, Action::Play);
+            let updating = matches!(row.action, Action::Update);
             let product_id = row.product_id.clone();
             let title_name = row.name.clone();
-            let what = match row.action {
-                Action::Update => format!("Updating {}", row.name),
-                _ => format!("Installing {}", row.name),
-            };
             button.connect_clicked(glib::clone!(
                 #[strong]
                 ui,
                 move |_| {
                     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
                     if waits {
-                        spawn_cli_tracked(&ui, &borrowed, &what);
+                        confirm_install(&ui, &product_id, &title_name, updating);
                     } else if plays {
                         spawn_title(&ui, &product_id, &title_name);
                     } else {
@@ -832,6 +896,97 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
                 .add_toast(adw::Toast::new(&format!("{what}: the process crashed"))),
         }
     });
+}
+
+/// Ask before downloading, and say where it is going.
+///
+/// A download here is between a few hundred megabytes and 160 GB, so starting
+/// one on a single click -- with no size, no destination, and no way back --
+/// is not a thing to do to somebody's evening or their disk.
+fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
+    let (default_dir, size, free) = {
+        let model = ui.model.borrow();
+        let dir = model.install_destination(product_id);
+        let product = model.catalog.get(&product_id.to_ascii_uppercase());
+        let size = product.map(|p| p.size_label()).filter(|s| !s.is_empty());
+        let free = dir.as_deref().and_then(free_space_label);
+        (dir, size, free)
+    };
+    let Some(default_dir) = default_dir else {
+        ui.toasts
+            .add_toast(adw::Toast::new("Cannot work out where to put it"));
+        return;
+    };
+
+    let heading = if updating {
+        format!("Update {name}?")
+    } else {
+        format!("Install {name}?")
+    };
+    let body = match (&size, &free) {
+        (Some(size), Some(free)) => format!("{size} to download. {free}"),
+        (Some(size), None) => format!("{size} to download."),
+        (None, Some(free)) => format!("The catalog does not give a size. {free}"),
+        (None, None) => "The catalog does not give a size.".to_string(),
+    };
+
+    let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("install", if updating { "Update" } else { "Install" });
+    dialog.set_response_appearance("install", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("install"));
+    dialog.set_close_response("cancel");
+
+    // The destination is editable, because "somewhere on your smallest disk" is
+    // not a decision to make on someone's behalf for 160 GB.
+    let where_to = adw::EntryRow::builder()
+        .title("Install to")
+        .text(default_dir.to_string_lossy().as_ref())
+        .build();
+    let group = adw::PreferencesGroup::new();
+    group.add(&where_to);
+    dialog.set_extra_child(Some(&group));
+
+    let window = ui.window.clone();
+    let ui = ui.clone();
+    let product_id = product_id.to_string();
+    let name = name.to_string();
+    dialog.connect_response(None, move |_, response| {
+        if response != "install" {
+            return;
+        }
+        let dir = where_to.text().to_string();
+        let dir = dir.trim();
+        let what = if updating {
+            format!("Updating {name}")
+        } else {
+            format!("Installing {name}")
+        };
+        if dir.is_empty() {
+            spawn_cli_tracked(&ui, &["install", &product_id], &what);
+        } else {
+            spawn_cli_tracked(&ui, &["install", &product_id, dir], &what);
+        }
+    });
+    dialog.present(Some(&window));
+}
+
+/// How much room is left where a title would go, in the words a person uses.
+fn free_space_label(dir: &Path) -> Option<String> {
+    // The directory itself may not exist yet; ask about the nearest ancestor
+    // that does, which is the filesystem it will land on.
+    let mut at = dir;
+    while !at.is_dir() {
+        at = at.parent()?;
+    }
+    let path = std::ffi::CString::new(at.as_os_str().as_encoded_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // Safety: a valid C string and a stack buffer of the right type.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let free = stat.f_bavail as u64 * stat.f_frsize as u64;
+    Some(format!("{:.0} GB free there.", free as f64 / 1e9))
 }
 
 fn open_editor(ui: &Ui, product_id: &str, name: &str) {
@@ -1120,6 +1275,50 @@ fn refresh_library(ui: &Ui) {
                 .toasts
                 .add_toast(adw::Toast::new("Library: the client crashed")),
         }
+    });
+}
+
+/// Look up names for the rows currently on screen.
+///
+/// A page at a time, like the art, and each id is attempted once: a product the
+/// catalog does not answer for would otherwise be re-requested on every redraw,
+/// which is a request loop rather than a retry.
+fn fetch_names(ui: &Ui, product_ids: Vec<String>) {
+    let (cache, market, wanted) = {
+        let model = ui.model.borrow();
+        let mut asked = ui.asked_names.borrow_mut();
+        let wanted: Vec<String> = product_ids
+            .into_iter()
+            .filter(|id| asked.insert(id.to_ascii_uppercase()))
+            .collect();
+        (model.catalog_cache(), model.market(), wanted)
+    };
+    let Some(cache) = cache else { return };
+    if wanted.is_empty() {
+        return;
+    }
+
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let (market, language) = market;
+        let found = gio::spawn_blocking(move || {
+            let (products, _failures) = catalog::resolve(&cache, &wanted, &market, &language);
+            products
+        })
+        .await;
+        let Ok(found) = found else { return };
+        if found.is_empty() {
+            return;
+        }
+        {
+            let mut model = ui.model.borrow_mut();
+            for product in found {
+                model
+                    .catalog
+                    .insert(product.product_id.to_ascii_uppercase(), product);
+            }
+        }
+        render(&ui);
     });
 }
 

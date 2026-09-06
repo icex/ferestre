@@ -311,6 +311,13 @@ pub struct LibraryRow {
     /// `None` means "cannot tell", which is different from "up to date" -- see
     /// [`Record::update_available`].
     pub update: Option<bool>,
+    /// The catalog says this title's PC package is a container the runtime
+    /// cannot open, and nobody has written a recipe claiming otherwise. Of 102
+    /// titles owned on the development account, 95 are in this state -- so a
+    /// list that does not separate them is one where the seven that work are
+    /// lost among the ninety-five that do not. Never set on "we do not know":
+    /// hiding a title on no evidence is the same mistake as refusing one.
+    pub unsupported: bool,
     pub action: Action,
 }
 
@@ -411,6 +418,9 @@ fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
         has_recipe: true,
         installed,
         update,
+        // A described title is one somebody got working, whatever the catalog
+        // says the container is.
+        unsupported: false,
         action,
     }
 }
@@ -478,6 +488,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
             has_recipe: false,
             installed: false,
             update: None,
+            unsupported: true,
             action: Action::Blocked(format!(
                 "this is a {container} package; the runtime here opens MSIXVC packages"
             )),
@@ -505,6 +516,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
         has_recipe: false,
         installed: false,
         update: None,
+        unsupported: false,
         // Install, not "set up", *unless* it is already here. Nothing can
         // describe a title before it is on disk, because the executable comes
         // out of its package manifest -- and the install writes the recipe
@@ -1093,6 +1105,67 @@ mod tests {
         );
     }
 
+    /// The flag the library filter hides rows by. It exists because 95 of the
+    /// 102 titles owned on the development account are UWP packages this
+    /// runtime cannot open, so a list that mixes them in is one where the seven
+    /// that work cannot be found.
+    ///
+    /// The half that matters most is the last assertion: "we could not ask the
+    /// catalog" must never set it. Hiding a title on no evidence is the same
+    /// mistake as refusing to run one on no evidence.
+    #[test]
+    fn only_a_known_non_msixvc_package_is_marked_unsupported() {
+        let rt = runtime_with(&[], CapabilitySource::Manifest);
+        let own = Ownership::Known(entries(&["9ZZTESTUWP1", "9ZZTESTGDK2", "9ZZTESTMYST"]));
+        let uwp = Product {
+            package_format: Some("AppxBundle".into()),
+            ..product("9ZZTESTUWP1", "Candy Something", &["contentid-uwp"])
+        };
+        // 9ZZTESTMYST is owned but deliberately absent from the catalog.
+        let cat = catalog(vec![uwp, product("9ZZTESTGDK2", "A GDK Title", &["cid"])]);
+        let recs = BTreeMap::new();
+        let avail = BTreeMap::new();
+        let rows = library(&Inputs {
+            recipes: &[],
+            runtime: Some(&rt),
+            registry: None,
+            ownership: &own,
+            catalog: &cat,
+            records: &recs,
+            available: &avail,
+            installed: NOTHING_INSTALLED,
+            installed_version: NO_VERSION_ON_DISK,
+            installed_product: NOT_ON_DISK,
+            running: NOTHING_RUNNING,
+        });
+        let by_id: BTreeMap<&str, &LibraryRow> =
+            rows.iter().map(|r| (r.product_id.as_str(), r)).collect();
+
+        let uwp = by_id["9ZZTESTUWP1"];
+        assert!(uwp.unsupported, "an AppxBundle cannot be opened here");
+        assert!(matches!(uwp.action, Action::Blocked(_)));
+        assert!(
+            uwp.subtitle.contains("AppxBundle"),
+            "name the format rather than saying it failed: {}",
+            uwp.subtitle
+        );
+        assert_eq!(
+            uwp.name, "Candy Something",
+            "still a real name while hidden"
+        );
+
+        assert!(
+            !by_id["9ZZTESTGDK2"].unsupported,
+            "MSIXVC is the runnable one"
+        );
+        assert_eq!(by_id["9ZZTESTGDK2"].action, Action::Install);
+
+        assert!(
+            !by_id["9ZZTESTMYST"].unsupported,
+            "the catalog said nothing about it, which is not the same as saying no"
+        );
+    }
+
     /// A row still showing a twelve-character code is waiting for the catalog,
     /// and burying it among the named ones just because a Store id starts with
     /// a digit makes the list look broken.
@@ -1321,6 +1394,7 @@ mod tests {
                 has_recipe: false,
                 installed: false,
                 update: None,
+                unsupported: false,
                 action: Action::Adopt,
             })
             .collect()

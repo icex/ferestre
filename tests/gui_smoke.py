@@ -38,7 +38,7 @@ import gi
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="gui_smoke")
 
 gi.require_version("Atspi", "2.0")
-from gi.repository import Atspi  # noqa: E402
+from gi.repository import Atspi, GLib  # noqa: E402
 
 # Long enough for a redraw to land on a loaded machine, short enough that a
 # hang is reported as a failure rather than as a hung test run.
@@ -79,19 +79,36 @@ TREE_DEPTH = 30
 
 
 def walk(node, depth=0, limit=TREE_DEPTH):
-    """Every node in the tree, breadth of the whole window."""
+    """Every node in the tree, breadth of the whole window.
+
+    A vanished node is skipped rather than raised. The tree is live and a
+    redraw destroys widgets while this is reading them, so asking a node that
+    has just gone fails with "No such interface" -- which is the window working
+    normally, not a failed expectation. Every caller here polls, so the next
+    pass sees the tree that replaced it.
+    """
     yield node, depth
     if depth >= limit:
         return
-    for i in range(node.get_child_count()):
-        child = node.get_child_at_index(i)
+    try:
+        count = node.get_child_count()
+    except GLib.GError:
+        return
+    for i in range(count):
+        try:
+            child = node.get_child_at_index(i)
+        except GLib.GError:
+            continue
         if child is not None:
             yield from walk(child, depth + 1, limit)
 
 
 def describe(node):
-    role = node.get_role_name()
-    name = node.get_name() or ""
+    try:
+        role = node.get_role_name()
+        name = node.get_name() or ""
+    except GLib.GError:
+        return "<gone>"
     return f"{role}:{name!r}"
 
 
@@ -99,7 +116,10 @@ def texts(root):
     """Every label and name in the tree, for substring assertions."""
     found = []
     for node, _ in walk(root):
-        name = node.get_name()
+        try:
+            name = node.get_name()
+        except GLib.GError:
+            continue
         if name:
             found.append(name)
     return found
@@ -125,12 +145,15 @@ def find_all(root, role=None, name=None, name_contains=None):
     out = []
     seen = set()
     for node, _ in walk(root):
-        if node.path in seen:
+        try:
+            if node.path in seen:
+                continue
+            seen.add(node.path)
+            if role and node.get_role_name() != role:
+                continue
+            node_name = node.get_name() or ""
+        except GLib.GError:
             continue
-        seen.add(node.path)
-        if role and node.get_role_name() != role:
-            continue
-        node_name = node.get_name() or ""
         if name is not None and node_name != name:
             continue
         if name_contains is not None and name_contains not in node_name:
@@ -236,6 +259,23 @@ def select_in_list(root, name, what=None):
     raise Failure(f"no selectable row called {what or name!r}")
 
 
+def row_button(root, title, label):
+    """The button on the row for `title` that reads `label`.
+
+    Two things make this less obvious than it sounds. A row's action button
+    takes its accessible name from the row rather than from its own text, so
+    there is no button called "Install" to find -- what says Install is a label
+    inside it. And the row is only identified by its title, so the search has to
+    start there: the moment two titles are installable, "the Install button" is
+    ambiguous.
+    """
+    for button in find_all(root, role="button", name=title):
+        for node, _ in walk(button):
+            if node.get_role_name() == "label" and (node.get_name() or "") == label:
+                return button
+    return None
+
+
 def dump(root, why):
     print(f"\n--- accessibility tree ({why}) ---", file=sys.stderr)
     for node, depth in walk(root):
@@ -264,6 +304,23 @@ def main():
     binary = os.path.abspath(args.binary)
     if not os.path.isfile(binary):
         raise Failure(f"{binary} is not there; cargo build -p ferestre-gui")
+
+    # GApplication is single-instance by design -- opening the launcher twice
+    # should raise the window you already have, not give you a second one -- so
+    # a window left open from a manual test makes the run under test exit at
+    # once, having handed its arguments to that other process. The symptom is
+    # "no accessible application with pid N", which describes none of that.
+    owner = subprocess.run(
+        ["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
+         "--object-path", "/org/freedesktop/DBus",
+         "--method", "org.freedesktop.DBus.NameHasOwner", "io.github.icex.ferestre"],
+        capture_output=True, text=True,
+    )
+    if "true" in owner.stdout:
+        raise Failure(
+            "a ferestre-gui is already running and owns io.github.icex.ferestre on this "
+            "session bus; close it first, or this run exits into it instead of starting"
+        )
 
     # A throwaway HOME, so the test cannot read a real account's cached library
     # or write into one. It also means the run starts from the state a new user
@@ -317,6 +374,52 @@ def main():
     with open(os.path.join(unrecorded, "appxmanifest.xml"), "w") as f:
         f.write('<Package><Identity Name="Microsoft.MinecraftUWP" Version="9.9.9.9" /></Package>')
 
+    # An owned library, cached the way a signed-in run leaves it, because the
+    # three things this section checks are all invisible without one: names
+    # instead of product ids, the filter that keeps the unrunnable majority out
+    # of the way, and the confirmation before a download starts.
+    #
+    # The proportions are the real ones. Of 102 titles owned on the development
+    # account exactly seven ship as MSIXVC; the rest are UWP packages this
+    # runtime cannot open. A fixture with one of each would pass a filter that
+    # is useless at the size that matters.
+    state = os.path.join(home, "state", "ferestre")
+    catalog = os.path.join(home, "cache", "ferestre", "catalog")
+    os.makedirs(state, exist_ok=True)
+    os.makedirs(catalog, exist_ok=True)
+    owned = [("9ZZSMOKEGDK1", "Smoke Test Racer", "MSIXVC", 12_500_000_000)]
+    owned += [
+        (f"9ZZSMOKEUWP{n}", f"Uwp Puzzle {n}", "AppxBundle", 90_000_000) for n in range(1, 26)
+    ]
+    with open(os.path.join(state, "library.json"), "w") as f:
+        json.dump(
+            {
+                "count": len(owned),
+                "items": [
+                    {"productId": pid, "productType": "Game", "status": "Active"}
+                    for pid, _, _, _ in owned
+                ],
+            },
+            f,
+        )
+    for pid, name, package_format, size in owned:
+        with open(os.path.join(catalog, f"{pid}.json"), "w") as f:
+            json.dump(
+                {
+                    "schema": 2,
+                    "product": {
+                        "product_id": pid,
+                        "name": name,
+                        "publisher": "Smoke Test Studios",
+                        "download_bytes": size,
+                        "content_ids": [f"contentid-{pid.lower()}"],
+                        "has_packages": True,
+                        "package_format": package_format,
+                    },
+                },
+                f,
+            )
+
     gui = subprocess.Popen([binary], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     deadline = time.monotonic() + TIMEOUT
     failures = []
@@ -358,6 +461,96 @@ def main():
         check(
             any("known not to run" in label for label in labels),
             "and it says what is known about it, without refusing to run it",
+            frame,
+        )
+
+        print("the owned library")
+        labels = wait_for(
+            frame,
+            lambda root: texts(root) if any("Smoke Test Racer" in t for t in texts(root)) else None,
+            "the cached library to draw",
+            time.monotonic() + TIMEOUT,
+        )
+        # The bug this replaces: every owned row drew its twelve-character
+        # product id, because nothing ever asked the catalog for the names of
+        # the rows the pager had put on screen.
+        check(
+            not any(t.startswith("9ZZSMOKE") for t in labels),
+            f"no row is showing a raw product id: {[t for t in labels if t.startswith('9ZZSMOKE')]}",
+            frame,
+        )
+        check(
+            not any("Uwp Puzzle" in t for t in labels),
+            "the titles this runtime cannot open are kept out of the way",
+            frame,
+        )
+        check(
+            any("25 of your titles" in t for t in labels),
+            "and the count of them is stated rather than left as a silent filter",
+            frame,
+        )
+
+        print("showing them anyway")
+        # Three nodes carry this name -- the row, its label, and the switch
+        # inside it -- and only the last of them does anything, so this goes
+        # through the by-name search that skips the ones that cannot act.
+        SWITCH = "Show titles Ferestre cannot run"
+        click_named(frame, SWITCH, "the show-everything switch")
+        labels = wait_for(
+            frame,
+            lambda root: texts(root) if any("Uwp Puzzle" in t for t in texts(root)) else None,
+            "the hidden titles to appear",
+            time.monotonic() + TIMEOUT,
+        )
+        check(
+            any("AppxBundle package, not MSIXVC" in t for t in labels),
+            "each says which container it ships in, not just that it failed",
+            frame,
+        )
+        click_named(frame, SWITCH, "the show-everything switch")
+        wait_for(
+            frame,
+            lambda root: not any("Uwp Puzzle" in t for t in texts(root)),
+            "the filter to come back on",
+            time.monotonic() + TIMEOUT,
+        )
+        check(True, "and the switch turns them back off")
+
+        print("installing asks before it downloads")
+        install = row_button(frame, "Smoke Test Racer", "Install")
+        check(install is not None, "an owned MSIXVC title offers an install", frame)
+        click(install)
+        labels = wait_for(
+            frame,
+            lambda root: texts(root) if any("Install Smoke Test Racer?" in t for t in texts(root)) else None,
+            "the confirmation to open",
+            time.monotonic() + TIMEOUT,
+        )
+        # 12.5 GB is a long way to get without being asked, and the destination
+        # is a decision -- these machines have more than one disk and the
+        # default is not always the roomy one.
+        check(
+            any("12.5 GB to download" in t for t in labels),
+            f"the size is shown before the download starts: {[t for t in labels if 'GB' in t]}",
+            frame,
+        )
+        destination = next(iter(find_all(frame, role="text", name="Install to")), None)
+        check(destination is not None, "and the destination can be changed", frame)
+        check(
+            bool(Atspi.Text.get_text(destination.get_text_iface(), 0, -1).strip()),
+            "prefilled with somewhere to put it",
+            frame,
+        )
+        click_named(frame, "Cancel")
+        wait_for(
+            frame,
+            lambda root: "Install Smoke Test Racer?" not in texts(root),
+            "the confirmation to close",
+            time.monotonic() + TIMEOUT,
+        )
+        check(
+            not any("Installing" in t for t in texts(frame)),
+            "and saying no starts nothing",
             frame,
         )
 

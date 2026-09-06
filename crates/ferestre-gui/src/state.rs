@@ -87,6 +87,11 @@ pub struct Model {
     pub section: Section,
     pub query: String,
     pub page: usize,
+    /// Whether to list titles whose package this runtime cannot open. Off by
+    /// default because they are the overwhelming majority -- 95 of 102 on the
+    /// development account -- and a list where the seven that work are buried
+    /// among them is not a library, it is a haystack.
+    pub show_unsupported: bool,
 
     pub problem: Option<String>,
 }
@@ -193,6 +198,7 @@ impl Model {
             section: Section::Library,
             query: String::new(),
             page: 0,
+            show_unsupported: false,
             problem,
         }
     }
@@ -213,6 +219,7 @@ impl Model {
             section: self.section,
             query: std::mem::take(&mut self.query),
             page: self.page,
+            show_unsupported: self.show_unsupported,
             ..fresh
         };
     }
@@ -245,6 +252,18 @@ impl Model {
         }
         // Proton puts the prefix one level inside STEAM_COMPAT_DATA_PATH.
         Some((server, paths.prefix_dir(recipe).ok()?.join("pfx")))
+    }
+
+    /// Where installing this product would put it: the recipe's directory when
+    /// there is one, and games_dir/<product id> when there is not -- the same
+    /// two answers `ferestre install` gives, so the dialog cannot promise a
+    /// path the command would not use.
+    pub fn install_destination(&self, product_id: &str) -> Option<PathBuf> {
+        let paths = self.paths.as_ref()?;
+        match self.recipe_for(product_id) {
+            Some(recipe) => paths.install_dir(recipe).ok(),
+            None => Some(paths.games_dir().join(product_id.to_ascii_lowercase())),
+        }
     }
 
     /// Whether a title with no recipe is on disk, where `ferestre install`
