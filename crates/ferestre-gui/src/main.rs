@@ -737,12 +737,17 @@ fn render_rows(
 }
 
 fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
+    // A title is a name, not markup, and the flag has to be set before the text
+    // is: left as markup, "Minecraft: Java & Bedrock Edition for PC" fails to
+    // parse and the row draws with no title at all. The same goes for any
+    // subtitle that names a title, which the bundle rows do.
     let action_row = adw::ActionRow::builder()
-        .title(&row.name)
-        .subtitle(&row.subtitle)
         .subtitle_lines(2)
         .tooltip_text(&row.product_id)
         .build();
+    action_row.set_use_markup(false);
+    action_row.set_title(&row.name);
+    action_row.set_subtitle(&row.subtitle);
 
     let icon = gtk::Image::builder()
         .pixel_size(40)
