@@ -1,0 +1,13 @@
+# build outputs
+tools/winestack
+tools/*.exe
+*.o
+*.so
+*.dll
+
+# local scratch
+/build/
+/out/
+*.log
+__pycache__/
+*.pyc

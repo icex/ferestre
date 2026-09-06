@@ -1,0 +1,49 @@
+Licensing map
+=============
+
+This repository contains two kinds of material, under two licences. Which
+applies depends on the directory, because part of the work is original and part
+of it is a modification of someone else's project.
+
+MIT (see LICENSE)
+-----------------
+  docs/      notes/      scripts/      tests/      tools/
+
+  Original work: the debugging and automation tooling, the test suites, the
+  build and launch scripts, and the written notes. Reuse, modify and fork
+  freely; attribution is the only condition.
+
+LGPL-2.1-or-later (see LICENSE.LGPL-2.1)
+----------------------------------------
+  patches/
+
+  These are modifications to Wine and to Proton, distributed as plain git
+  diffs. Wine is LGPL-2.1-or-later, so a modification of it is too, and it
+  stays that way however it is redistributed. If you ship binaries built from
+  these patches you must also make the corresponding source available, as the
+  LGPL requires.
+
+  Note that tests/ and tools/ include a few Wine headers when they are built.
+  That does not change their licence, but it does mean you need a Wine source
+  tree to build them.
+
+Upstream projects
+-----------------
+  Wine            https://www.winehq.org/            LGPL-2.1-or-later
+  Proton          https://github.com/ValveSoftware/Proton
+                  Valve's own components carry the BSD-style licence in
+                  Proton's LICENSE; the Wine inside it remains LGPL.
+  Xodus           https://github.com/xodus-gaming
+                  The client that signs in, fetches a licence and downloads
+                  and decrypts a package. Not affiliated with this project,
+                  and this project's patches are not submitted upstream --
+                  Xodus operates a clean-room policy that excludes
+                  AI-assisted contributions.
+
+Trademarks
+----------
+  Xbox, Microsoft, the Microsoft Store, Minecraft and the titles named in the
+  documentation are trademarks of their respective owners. This project is not
+  affiliated with, endorsed by, or connected to Microsoft, Mojang, Valve or
+  the Xodus project. Names are used only to describe what the software is
+  compatible with.

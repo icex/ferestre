@@ -1,0 +1,273 @@
+diff --git a/dlls/windows.system.profile.systemid/classes.idl b/dlls/windows.system.profile.systemid/classes.idl
+index 1ca3293..fcb856f 100644
+--- a/dlls/windows.system.profile.systemid/classes.idl
++++ b/dlls/windows.system.profile.systemid/classes.idl
+@@ -22,7 +22,12 @@
+ #pragma winrt ns_prefix
+ 
+ import "windows.system.profile.idl";
++import "windows.internal.system.profile.idl";
+ 
+ namespace Windows.System.Profile {
+     runtimeclass SystemIdentification;
+ }
++
++namespace Windows.Internal.System.Profile {
++    runtimeclass RegionPolicyEvaluator;
++}
+diff --git a/dlls/windows.system.profile.systemid/main.c b/dlls/windows.system.profile.systemid/main.c
+index b00cbc5..6f2585d 100644
+--- a/dlls/windows.system.profile.systemid/main.c
++++ b/dlls/windows.system.profile.systemid/main.c
+@@ -303,6 +303,140 @@ static struct system_id_statics system_id_statics =
+ 
+ static IActivationFactory *system_id_factory = &system_id_statics.IActivationFactory_iface;
+ 
++/* Windows.Internal.System.Profile.RegionPolicyEvaluator: an undocumented,
++ * static-only class Store/Xbox titles consult for region gating. A title that
++ * cannot activate it throws, so it is hosted here and every policy is reported
++ * Enabled. */
++struct region_policy_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IRegionPolicyEvaluatorStatics IRegionPolicyEvaluatorStatics_iface;
++    LONG ref;
++};
++
++static inline struct region_policy_statics *region_policy_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct region_policy_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI region_policy_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct region_policy_statics *impl = region_policy_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = &impl->IActivationFactory_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
++    if (IsEqualGUID( iid, &IID_IRegionPolicyEvaluatorStatics ))
++    {
++        *out = &impl->IRegionPolicyEvaluatorStatics_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI region_policy_factory_AddRef( IActivationFactory *iface )
++{
++    struct region_policy_statics *impl = region_policy_from_IActivationFactory( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI region_policy_factory_Release( IActivationFactory *iface )
++{
++    struct region_policy_statics *impl = region_policy_from_IActivationFactory( iface );
++    return InterlockedDecrement( &impl->ref );
++}
++
++static HRESULT WINAPI region_policy_factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI region_policy_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI region_policy_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI region_policy_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    /* static-only class: there are no instances */
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl region_policy_factory_vtbl =
++{
++    region_policy_factory_QueryInterface,
++    region_policy_factory_AddRef,
++    region_policy_factory_Release,
++    /* IInspectable methods */
++    region_policy_factory_GetIids,
++    region_policy_factory_GetRuntimeClassName,
++    region_policy_factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    region_policy_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( region_policy_statics, IRegionPolicyEvaluatorStatics, struct region_policy_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI region_policy_statics_EvaluatePolicyState( IRegionPolicyEvaluatorStatics *iface, GUID policy, PolicyState *result )
++{
++    TRACE( "iface %p, policy %s, result %p.\n", iface, debugstr_guid( &policy ), result );
++    if (!result) return E_INVALIDARG;
++    *result = PolicyState_Enabled;
++    return S_OK;
++}
++
++static HRESULT WINAPI region_policy_statics_ForceEvaluatePolicyState( IRegionPolicyEvaluatorStatics *iface, GUID policy, PolicyState *result )
++{
++    TRACE( "iface %p, policy %s, result %p.\n", iface, debugstr_guid( &policy ), result );
++    if (!result) return E_INVALIDARG;
++    *result = PolicyState_Enabled;
++    return S_OK;
++}
++
++static const struct IRegionPolicyEvaluatorStaticsVtbl region_policy_statics_vtbl =
++{
++    region_policy_statics_QueryInterface,
++    region_policy_statics_AddRef,
++    region_policy_statics_Release,
++    /* IInspectable methods */
++    region_policy_statics_GetIids,
++    region_policy_statics_GetRuntimeClassName,
++    region_policy_statics_GetTrustLevel,
++    /* IRegionPolicyEvaluatorStatics methods */
++    region_policy_statics_EvaluatePolicyState,
++    region_policy_statics_ForceEvaluatePolicyState,
++};
++
++static struct region_policy_statics region_policy_statics =
++{
++    {&region_policy_factory_vtbl},
++    {&region_policy_statics_vtbl},
++    1,
++};
++
++static IActivationFactory *region_policy_factory = &region_policy_statics.IActivationFactory_iface;
++
+ HRESULT WINAPI DllGetClassObject( REFCLSID clsid, REFIID riid, void **out )
+ {
+     FIXME( "clsid %s, riid %s, out %p stub!\n", debugstr_guid( clsid ), debugstr_guid( riid ), out );
+@@ -319,6 +453,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+ 
+     if (!wcscmp( name, RuntimeClass_Windows_System_Profile_SystemIdentification ))
+         IActivationFactory_QueryInterface( system_id_factory, &IID_IActivationFactory, (void **)factory );
++    else if (!wcscmp( name, RuntimeClass_Windows_Internal_System_Profile_RegionPolicyEvaluator ))
++        IActivationFactory_QueryInterface( region_policy_factory, &IID_IActivationFactory, (void **)factory );
+ 
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+diff --git a/dlls/windows.system.profile.systemid/private.h b/dlls/windows.system.profile.systemid/private.h
+index d1bcd39..938e811 100644
+--- a/dlls/windows.system.profile.systemid/private.h
++++ b/dlls/windows.system.profile.systemid/private.h
+@@ -31,8 +31,10 @@
+ #include "wine/debug.h"
+ 
+ #define WIDL_using_Windows_System_Profile
++#define WIDL_using_Windows_Internal_System_Profile
+ #define WIDL_using_Windows_Storage_Streams
+ #include "windows.system.profile.h"
++#include "windows.internal.system.profile.h"
+ #include "windows.storage.streams.h"
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+diff --git a/include/Makefile.in b/include/Makefile.in
+index 0af6456..b6a5d11 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -941,6 +941,7 @@ SOURCES = \
+ 	windows.storage.streams.idl \
+ 	windows.system.idl \
+ 	windows.system.power.idl \
++	windows.internal.system.profile.idl \
+ 	windows.system.profile.idl \
+ 	windows.system.profile.systemmanufacturers.idl \
+ 	windows.system.threading.idl \
+diff --git a/include/windows.internal.system.profile.idl b/include/windows.internal.system.profile.idl
+new file mode 100644
+index 0000000..26296c9
+--- /dev/null
++++ b/include/windows.internal.system.profile.idl
+@@ -0,0 +1,69 @@
++/*
++ * Copyright 2026 Xodus GDK-on-Linux project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * Windows.Internal.System.Profile.RegionPolicyEvaluator
++ *
++ * An undocumented, static-only runtime class that Store/Xbox titles consult to
++ * ask whether a feature is permitted in the user's region. Its shape (one
++ * statics interface, two methods, a three-state enum) is documented by the
++ * regionpolicyevaluator-skeleton project. A title that cannot activate it
++ * throws, so we answer every policy as Enabled.
++ */
++
++#ifdef __WIDL__
++#pragma winrt ns_prefix
++#endif
++
++import "inspectable.idl";
++import "windowscontracts.idl";
++
++namespace Windows.Internal.System.Profile {
++    typedef enum PolicyState PolicyState;
++    interface IRegionPolicyEvaluatorStatics;
++    runtimeclass RegionPolicyEvaluator;
++
++    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
++    enum PolicyState
++    {
++        Unknown  = 0,
++        Enabled  = 1,
++        Disabled = 2,
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Internal.System.Profile.RegionPolicyEvaluator),
++        uuid(1ca20398-c1d9-5f12-b40a-6528206e3b5e)
++    ]
++    interface IRegionPolicyEvaluatorStatics : IInspectable
++    {
++        HRESULT EvaluatePolicyState([in] GUID policy, [out, retval] Windows.Internal.System.Profile.PolicyState *result);
++        HRESULT ForceEvaluatePolicyState([in] GUID policy, [out, retval] Windows.Internal.System.Profile.PolicyState *result);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.Internal.System.Profile.IRegionPolicyEvaluatorStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass RegionPolicyEvaluator
++    {
++    }
++}

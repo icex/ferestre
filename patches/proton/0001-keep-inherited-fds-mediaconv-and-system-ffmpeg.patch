@@ -1,0 +1,49 @@
+--- a/proton
++++ b/proton
+@@ -1224,7 +1224,17 @@
+             setup_openvr_paths()
+ 
+             # add Steam ffmpeg libraries to path
+-            prepend_to_env_str(g_session.env, ld_path_var, steamdir + "/ubuntu12_64/video/:" + steamdir + "/ubuntu12_32/video/:" + steamdir + "/steamrtarm64/video/", ":")
++            #
++            # Steam's ffmpeg is built without an H.264 decoder; Steam fetches
++            # that codec separately when a title asks for it. Because this
++            # directory goes in front, winedmo binds to it rather than to the
++            # system ffmpeg, avcodec_find_decoder(AV_CODEC_ID_H264) fails, and
++            # the title is handed MEDIACONV_BLANK_VIDEO_FILE -- the colour-bars
++            # placeholder -- in place of its own video. Outside Steam the codec
++            # download never happens, so titles launched by hand can opt out
++            # and use whatever ffmpeg the system provides.
++            if os.environ.get("PROTON_PREFER_SYSTEM_FFMPEG", "0") == "0":
++                prepend_to_env_str(g_session.env, ld_path_var, steamdir + "/ubuntu12_64/video/:" + steamdir + "/ubuntu12_32/video/:" + steamdir + "/steamrtarm64/video/", ":")
+ 
+ def comma_escaped(s):
+     escaped = False
+@@ -1590,6 +1600,16 @@
+             self.env["MEDIACONV_BLANK_VIDEO_FILE"] = g_proton.media_dir + "blank.mkv"
+         self.env["MEDIACONV_BLANK_AUDIO_FILE"] = g_proton.media_dir + "blank.ptna"
+ 
++        if os.environ.get("PROTON_NO_MEDIACONV", "0") != "0":
++            # Outside Steam there is no pre-transcoded media, so the converter
++            # falls back to MEDIACONV_BLANK_VIDEO_FILE -- a placeholder that
++            # appears in-game as a colour-bars/static stream. Drop these so
++            # decodebin uses the real demuxer and decoder for the file itself.
++            for var in ("MEDIACONV_AUDIO_DUMP_FILE", "MEDIACONV_VIDEO_DUMP_FILE",
++                        "MEDIACONV_AUDIO_TRANSCODED_FILE", "MEDIACONV_VIDEO_TRANSCODED_FILE",
++                        "MEDIACONV_BLANK_VIDEO_FILE", "MEDIACONV_BLANK_AUDIO_FILE"):
++                self.env.pop(var, None)
++
+         self.env["ESPEAK_DATA_PATH"] = g_proton.dist_dir + "share"
+ 
+         prepend_to_env_str(self.env, "PATH", g_proton.bin_dir, ":")
+@@ -2069,7 +2089,9 @@
+     def run_proc(self, args, local_env=None):
+         if local_env is None:
+             local_env = self.env
+-        return subprocess.call(args, env=local_env, stderr=self.log_file, stdout=self.log_file)
++        # close_fds=False: an image supplied through WINE_DLL_FILE_MAP lives only
++        # behind an inherited file descriptor, and the default would close it.
++        return subprocess.call(args, env=local_env, stderr=self.log_file, stdout=self.log_file, close_fds=False)
+ 
+     def run(self):
+         if shutil.which('steam-runtime-launcher-interface-0') is not None:

@@ -1,0 +1,405 @@
+diff --git a/dlls/ntdll/exception.c b/dlls/ntdll/exception.c
+index 3b524d0..16eb6f8 100644
+--- a/dlls/ntdll/exception.c
++++ b/dlls/ntdll/exception.c
+@@ -211,6 +211,30 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
+             WINE_BACKTRACE_LOG( "--- Exception %#lx at %s.\n", rec->ExceptionCode, buffer );
+         else
+             WINE_BACKTRACE_LOG( "--- Exception %#lx.\n", rec->ExceptionCode );
++
++        /* An illegal instruction is nearly always a deliberate trap -- ud2 from
++         * a failed check, or an instruction the CPU does not have -- and which
++         * one it is decides where to look next. Dump the bytes: the faulting
++         * image may exist only in memory, decrypted into a memfd with nothing
++         * on disk to disassemble, so a debugger cannot recover them later. */
++        if (rec->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION && rec->ExceptionAddress)
++        {
++            char bytes[48 * 3 + 1];
++            unsigned int i;
++
++            bytes[0] = 0;
++            __TRY
++            {
++                const BYTE *code = (const BYTE *)rec->ExceptionAddress - 32;
++                for (i = 0; i < 48; i++) sprintf( bytes + i * 3, "%02x ", code[i] );
++            }
++            __EXCEPT_ALL
++            {
++                strcpy( bytes, "<unreadable>" );
++            }
++            __ENDTRY
++            WINE_BACKTRACE_LOG( "--- Code %p-32..+16: %s\n", rec->ExceptionAddress, bytes );
++        }
+     }
+ 
+     switch (rec->ExceptionCode)
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index bbb448c..08404a6 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -1729,6 +1729,25 @@ static NTSTATUS alloc_thread_tls(void)
+ /*************************************************************************
+  *              call_tls_callbacks
+  */
++/* Set once from WINE_TRACE_TLS: a narrow, always-on trace of main-image TLS
++ * callback execution. The relay channel already traces these, but relay is far
++ * too heavy to run a whole game under; this answers only "did the callbacks
++ * run" for an image that exists solely in a memfd, which is a plain loader
++ * question, not anything protection-specific. */
++static int trace_tls_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled == -1)
++    {
++        UNICODE_STRING name, value;
++        WCHAR buf[8];
++        RtlInitUnicodeString( &name, L"WINE_TRACE_TLS" );
++        value.Buffer = buf; value.Length = 0; value.MaximumLength = sizeof(buf);
++        enabled = RtlQueryEnvironmentVariable_U( NULL, &name, &value ) ? 0 : 1;
++    }
++    return enabled;
++}
++
+ static void call_tls_callbacks( HMODULE module, UINT reason )
+ {
+     const IMAGE_TLS_DIRECTORY *dir;
+@@ -1736,7 +1755,20 @@ static void call_tls_callbacks( HMODULE module, UINT reason )
+     ULONG dirsize;
+ 
+     dir = RtlImageDirectoryEntryToData( module, TRUE, IMAGE_DIRECTORY_ENTRY_TLS, &dirsize );
+-    if (!dir || !dir->AddressOfCallBacks) return;
++    if (!dir || !dir->AddressOfCallBacks)
++    {
++        if (trace_tls_enabled() && module == NtCurrentTeb()->Peb->ImageBaseAddress)
++            MESSAGE( "wine: main image %p has no TLS callbacks (reason %u)\n", module, reason );
++        return;
++    }
++    if (trace_tls_enabled() && module == NtCurrentTeb()->Peb->ImageBaseAddress)
++    {
++        const PIMAGE_TLS_CALLBACK *c;
++        unsigned int n = 0;
++        for (c = (const PIMAGE_TLS_CALLBACK *)dir->AddressOfCallBacks; *c; c++) n++;
++        MESSAGE( "wine: running %u main-image TLS callback(s) at %p, reason %u\n",
++                 n, (void *)dir->AddressOfCallBacks, reason );
++    }
+ 
+     for (callback = (const PIMAGE_TLS_CALLBACK *)dir->AddressOfCallBacks; *callback; callback++)
+     {
+@@ -4624,6 +4656,71 @@ static void release_address_space(void)
+ #endif
+ }
+ 
++/* Apply byte patches to the main image, from WINE_IMAGE_PATCH.
++ *
++ * Format: "RVA=hexbytes[,RVA=hexbytes...]", e.g. "53d5cec=e900000000".
++ *
++ * A debugging aid for images that exist only in memory. A title decrypted into
++ * a memfd cannot be examined or corrected on disk, so there is otherwise no way
++ * to ask "would this get further if these bytes read differently". Applied
++ * before the entry point runs, so it covers static initialisers.
++ */
++static void apply_image_patches(void)
++{
++    WCHAR valueW[1024];
++    UNICODE_STRING name, value;
++    char spec[1024], *p, *entry, *next;
++    BYTE *base = (BYTE *)NtCurrentTeb()->Peb->ImageBaseAddress;
++    unsigned int i;
++
++    RtlInitUnicodeString( &name, L"WINE_IMAGE_PATCH" );
++    value.Buffer = valueW;
++    value.Length = 0;
++    value.MaximumLength = sizeof(valueW);
++    if (RtlQueryEnvironmentVariable_U( NULL, &name, &value )) return;
++
++    for (i = 0; i < value.Length / sizeof(WCHAR) && i < sizeof(spec) - 1; i++)
++        spec[i] = (char)valueW[i];
++    spec[i] = 0;
++
++    for (entry = spec; entry && *entry; entry = next)
++    {
++        BYTE bytes[64];
++        ULONG_PTR rva;
++        SIZE_T count = 0, size;
++        void *addr;
++        ULONG old;
++
++        if ((next = strchr( entry, ',' ))) *next++ = 0;
++        if (!(p = strchr( entry, '=' ))) continue;
++        *p++ = 0;
++        rva = strtoul( entry, NULL, 16 );
++        while (p[0] && p[1] && count < sizeof(bytes))
++        {
++            char pair[3];
++            pair[0] = p[0];
++            pair[1] = p[1];
++            pair[2] = 0;
++            bytes[count++] = (BYTE)strtoul( pair, NULL, 16 );
++            p += 2;
++        }
++        if (!rva || !count) continue;
++
++        addr = base + rva;
++        size = count;
++        if (NtProtectVirtualMemory( GetCurrentProcess(), &addr, &size, PAGE_EXECUTE_READWRITE, &old ))
++        {
++            ERR( "cannot unprotect image+%#Ix for patching\n", rva );
++            continue;
++        }
++        memcpy( base + rva, bytes, count );
++        addr = base + rva;
++        size = count;
++        NtProtectVirtualMemory( GetCurrentProcess(), &addr, &size, old, &old );
++        MESSAGE( "wine: patched %Iu bytes at image+%#Ix\n", count, rva );
++    }
++}
++
+ /******************************************************************
+  *		loader_init
+  *
+@@ -4760,6 +4857,7 @@ void loader_init( CONTEXT *context, void **entry )
+     if (!attach_done)  /* first time around */
+     {
+         attach_done = 1;
++        apply_image_patches();
+         if ((status = alloc_thread_tls()) != STATUS_SUCCESS)
+         {
+             ERR( "TLS init  failed when loading %s, status %lx\n",
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 2498c2a..dfb30c4 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1616,6 +1616,65 @@ static NTSTATUS open_mapped_dll_file( const UNICODE_STRING *nt_name, HANDLE *map
+ }
+ 
+ 
++/***********************************************************************
++ *           open_mapped_image_file
++ *
++ * Like open_mapped_dll_file(), but hands back a plain file handle for the
++ * mapped fd rather than an image section.
++ *
++ * Needed by get_pe_file_info() in process.c: process creation validates the
++ * executable by reading it from disk, which fails for an image that only
++ * exists behind WINE_DLL_FILE_MAP. Without this, only DLLs can be loaded
++ * from the map -- a main executable is rejected before the child process's
++ * open_main_image() ever runs.
++ */
++NTSTATUS open_mapped_image_file( const UNICODE_STRING *nt_name, HANDLE *handle )
++{
++    const char *value = getenv( "WINE_DLL_FILE_MAP" );
++    const char *entry, *sep, *end;
++    char *utf8_name;
++    unsigned int allocLen;
++    NTSTATUS status;
++
++
++    if (!value || !*value) return STATUS_DLL_NOT_FOUND;
++    if (!nt_name || !nt_name->Buffer || !nt_name->Length) return STATUS_DLL_NOT_FOUND;
++
++    if ((status = utf8_wcstombs_size( nt_name->Buffer, nt_name->Length / sizeof(WCHAR), &allocLen )))
++        return status;
++    utf8_name = alloca( allocLen );
++    if ((status = utf8_wcstombs( utf8_name, allocLen, &allocLen, nt_name->Buffer,
++                                 nt_name->Length / sizeof(WCHAR) )))
++        return status;
++
++    for (entry = value; *entry; entry = *end ? end + 1 : end)
++    {
++        size_t len;
++        int fd = 0;
++        const char *p;
++
++        end = strchr( entry, '|' );
++        if (!end) end = entry + strlen( entry );
++        if (end == entry) continue;
++
++        sep = strchr( entry, ':' );
++        if (!sep || sep >= end) continue;
++
++        for (p = entry; p < sep; p++)
++        {
++            if (*p < '0' || *p > '9') { fd = -1; break; }
++            fd = fd * 10 + (*p - '0');
++        }
++        if (fd < 0 || sep == entry || sep + 1 == end) continue;
++        len = end - sep - 1;
++        if (len != allocLen || strncmp( sep + 1, utf8_name, len )) continue;
++
++        return wine_server_fd_to_handle( fd, GENERIC_READ | SYNCHRONIZE, 0, handle );
++    }
++    return STATUS_DLL_NOT_FOUND;
++}
++
++
+ /***********************************************************************
+  *	open_dll_file
+  *
+diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
+index ef1ab96..83dc2d9 100644
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -267,12 +267,22 @@ static unsigned int get_pe_file_info( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *n
+     HANDLE mapping;
+ 
+     *handle = 0;
++    *unix_name = NULL;
++    nt_name->Buffer = NULL;
+     memset( info, 0, sizeof(*info) );
+-    if (!(status = get_nt_and_unix_names( attr, nt_name, unix_name, FILE_OPEN, FALSE )))
++
++    /* An image supplied through WINE_DLL_FILE_MAP lives only behind a file
++     * descriptor. Try it before get_nt_and_unix_names(): with FILE_OPEN that
++     * call fails outright when the leaf has no on-disk file, and even when a
++     * (still encrypted) placeholder does exist, reading it here would fail the
++     * PE validation below. This mirrors the ordering in open_main_image(). */
++    status = open_mapped_image_file( attr->ObjectName, handle );
++    if (status)
+     {
+-        status = open_unix_file( handle, *unix_name, GENERIC_READ, attr, 0,
+-                                 FILE_SHARE_READ | FILE_SHARE_DELETE,
+-                                 FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0 );
++        if (!(status = get_nt_and_unix_names( attr, nt_name, unix_name, FILE_OPEN, FALSE )))
++            status = open_unix_file( handle, *unix_name, GENERIC_READ, attr, 0,
++                                     FILE_SHARE_READ | FILE_SHARE_DELETE,
++                                     FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0 );
+     }
+     if (status)
+     {
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 2f649ca..69e50d2 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -355,6 +355,7 @@ extern NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
+ extern NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size );
+ extern void fill_vm_counters( VM_COUNTERS_EX *pvmi, int unix_pid );
+ extern NTSTATUS open_hkcu_key( const char *path, HANDLE *key );
++extern NTSTATUS open_mapped_image_file( const UNICODE_STRING *nt_name, HANDLE *handle );
+ 
+ extern NTSTATUS sync_ioctl( HANDLE file, ULONG code, void *in_buffer, ULONG in_size,
+                             void *out_buffer, ULONG out_size );
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index d536506..f91a28d 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -35,8 +35,18 @@ ULONG WINAPI RegisterAppConstrainedChangeNotification( PAPPCONSTRAIN_CHANGE_ROUT
+  */
+ ULONG WINAPI RegisterAppStateChangeNotification( PAPPSTATE_CHANGE_ROUTINE routine, void *context, PAPPSTATE_REGISTRATION *reg )
+ {
+-    FIXME( "routine %p, context %p, reg %p - stub.\n", routine, context, reg );
+-    return ERROR_CALL_NOT_IMPLEMENTED;
++    /* Placeholder registration: processes here are never suspended by an app
++     * lifetime manager, so the routine would never be invoked. Callers do treat
++     * a failure as fatal though -- XCurl aborts curl_global_init, which surfaces
++     * as "Could not initialize libcurl" during engine startup -- so report
++     * success and hand back a token that Unregister can accept. */
++    static int placeholder_registration;
++
++    FIXME( "routine %p, context %p, reg %p - semi-stub.\n", routine, context, reg );
++
++    if (!reg) return ERROR_INVALID_PARAMETER;
++    *reg = (PAPPSTATE_REGISTRATION)&placeholder_registration;
++    return ERROR_SUCCESS;
+ }
+ 
+ /***********************************************************************
+@@ -52,7 +62,8 @@ void WINAPI UnregisterAppConstrainedChangeNotification( PAPPCONSTRAIN_REGISTRATI
+  */
+ void WINAPI UnregisterAppStateChangeNotification( PAPPSTATE_REGISTRATION reg )
+ {
+-    FIXME( "reg %p - stub.\n", reg );
++    /* Nothing was registered beyond the placeholder token. */
++    TRACE( "reg %p.\n", reg );
+ }
+ 
+ HRESULT WINAPI DllGetClassObject( REFCLSID clsid, REFIID riid, void **out )
+diff --git a/dlls/winegstreamer/media-converter/lib.c b/dlls/winegstreamer/media-converter/lib.c
+index 3b0dff9..19d6f98 100644
+--- a/dlls/winegstreamer/media-converter/lib.c
++++ b/dlls/winegstreamer/media-converter/lib.c
+@@ -452,6 +452,76 @@ int discard_transcoded_streams(struct fozdb *dump_db, struct fozdb *read_db)
+ 
+ #ifndef _WINEDMO
+ 
++/* Apply GST_PLUGIN_FEATURE_RANK to the converter elements.
++ *
++ * GStreamer applies that variable at the end of gst_init(), by looking each
++ * named feature up in the registry. These elements are registered afterwards,
++ * from here, so they are never found and the documented override silently does
++ * nothing for them -- which matters because the converter outranks the real
++ * demuxer and decoder, and outside Steam (no pre-transcoded media) it serves
++ * the MEDIACONV_BLANK_VIDEO_FILE placeholder instead of the title's own video.
++ * Re-applying it after registration makes
++ * GST_PLUGIN_FEATURE_RANK=protonvideoconverter:NONE behave as expected. */
++static void media_converter_apply_rank_overrides(void)
++{
++    static const char *const names[] =
++    {
++        "protonvideoconverter",
++        "protonaudioconverter",
++        "protonaudioconverterbin",
++        "protondemuxer",
++    };
++    const char *env = getenv("GST_PLUGIN_FEATURE_RANK");
++    unsigned int i;
++    char **split;
++
++    if (!env || !*env)
++        return;
++
++    split = g_strsplit(env, ",", 0);
++    for (i = 0; split[i]; i++)
++    {
++        char **values = g_strsplit(split[i], ":", 2);
++        unsigned int j;
++
++        if (values[0] && values[1])
++        {
++            for (j = 0; j < ARRAY_SIZE(names); j++)
++            {
++                GstPluginFeature *feature;
++                long rank;
++                char *end;
++
++                if (strcmp(g_strstrip(values[0]), names[j]))
++                    continue;
++
++                if (!g_ascii_strcasecmp(values[1], "NONE")) rank = GST_RANK_NONE;
++                else if (!g_ascii_strcasecmp(values[1], "MARGINAL")) rank = GST_RANK_MARGINAL;
++                else if (!g_ascii_strcasecmp(values[1], "SECONDARY")) rank = GST_RANK_SECONDARY;
++                else if (!g_ascii_strcasecmp(values[1], "PRIMARY")) rank = GST_RANK_PRIMARY;
++                else if (!g_ascii_strcasecmp(values[1], "MAX")) rank = G_MAXINT;
++                else
++                {
++                    rank = strtol(values[1], &end, 10);
++                    if (end == values[1] || *end)
++                        break;
++                }
++
++                if ((feature = gst_registry_find_feature(gst_registry_get(), names[j],
++                        GST_TYPE_ELEMENT_FACTORY)))
++                {
++                    GST_INFO("Setting rank of %s to %ld.", names[j], rank);
++                    gst_plugin_feature_set_rank(feature, rank);
++                    gst_object_unref(feature);
++                }
++                break;
++            }
++        }
++        g_strfreev(values);
++    }
++    g_strfreev(split);
++}
++
+ bool media_converter_init(void)
+ {
+     GST_DEBUG_CATEGORY_INIT(media_converter_debug,
+@@ -481,6 +551,8 @@ bool media_converter_init(void)
+         return false;
+     }
+ 
++    media_converter_apply_rank_overrides();
++
+     return true;
+ }
+ 

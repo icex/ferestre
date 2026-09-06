@@ -1,0 +1,79 @@
+diff --git a/dlls/ws2_32/socket.c b/dlls/ws2_32/socket.c
+index 934e4fc..8f95e3f 100644
+--- a/dlls/ws2_32/socket.c
++++ b/dlls/ws2_32/socket.c
+@@ -31,6 +31,7 @@
+ #define FILE_USE_FILE_POINTER_POSITION ((LONGLONG)-2)
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(winsock);
++WINE_DECLARE_DEBUG_CHANNEL(dgram);
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+ 
+ #define TIMEOUT_INFINITE _I64_MAX
+@@ -974,6 +975,50 @@ static void WINAPI socket_apc( void *apc_user, IO_STATUS_BLOCK *io, ULONG reserv
+     func( NtStatusToWSAError( io->Status ), io->Information, (OVERLAPPED *)io, 0 );
+ }
+ 
++/* Datagram-level tracing, on the "dgram" channel.
++ *
++ * The winsock channel shows that a call happened and whether it succeeded, but
++ * not how much data moved or what it was. For a game protocol carried over UDP
++ * -- Minecraft Bedrock's RakNet among them -- that is the difference between
++ * "we are exchanging real data" and "we are trading keepalives while nothing
++ * progresses", which is exactly the question a stalled join poses. */
++static void trace_datagram( const char *what, SOCKET s, const WSABUF *buffers, DWORD count,
++                            const struct sockaddr *addr, DWORD size )
++{
++    unsigned int total = 0, i;
++    unsigned char id = 0;
++
++    if (!TRACE_ON(dgram)) return;
++    for (i = 0; i < count; i++) total += buffers[i].len;
++    if (count && buffers[0].len && buffers[0].buf) id = (unsigned char)buffers[0].buf[0];
++
++    /* The first bytes as hex, so a datagram can be decoded after the fact.
++     * RakNet's framing is in the clear even when the payload is not, and the
++     * packets that matter most -- the login and the encryption handshake --
++     * are exchanged before encryption starts, so they are readable here. */
++    {
++        static const char hex[] = "0123456789abcdef";
++        char dump[3 * 256 + 1];
++        unsigned int shown = 0, o = 0;
++
++        if (count && buffers[0].buf)
++        {
++            unsigned int avail = buffers[0].len < size ? buffers[0].len : size;
++            shown = avail < 256 ? avail : 256;
++            for (i = 0; i < shown; i++)
++            {
++                unsigned char c = (unsigned char)buffers[0].buf[i];
++                dump[o++] = hex[c >> 4];
++                dump[o++] = hex[c & 15];
++            }
++        }
++        dump[o] = 0;
++        TRACE_(dgram)( "%s sock %#Ix bytes %u/%u id %#04x peer %s data %s\n", what, s,
++                       (unsigned int)size, total, id,
++                       addr ? debugstr_sockaddr( addr ) : "(connected)", dump );
++    }
++}
++
+ static int WS2_recv_base( SOCKET s, WSABUF *buffers, DWORD buffer_count, DWORD *ret_size, DWORD *flags,
+                           struct sockaddr *addr, int *addr_len, OVERLAPPED *overlapped,
+                           LPWSAOVERLAPPED_COMPLETION_ROUTINE completion, WSABUF *control )
+@@ -1025,6 +1070,7 @@ static int WS2_recv_base( SOCKET s, WSABUF *buffers, DWORD buffer_count, DWORD *
+         status = piosb->Status;
+     }
+     if (!status && ret_size) *ret_size = piosb->Information;
++    if (!status) trace_datagram( "in ", s, buffers, buffer_count, addr, (DWORD)piosb->Information );
+     SetLastError( NtStatusToWSAError( status ) );
+     TRACE( "status %#lx.\n", status );
+     return status ? -1 : 0;
+@@ -1092,6 +1138,7 @@ static int WS2_sendto( SOCKET s, WSABUF *buffers, DWORD buffer_count, DWORD *ret
+         status = piosb->Status;
+     }
+     if (!status && ret_size) *ret_size = piosb->Information;
++    if (!status) trace_datagram( "out", s, buffers, buffer_count, addr, (DWORD)piosb->Information );
+     SetLastError( NtStatusToWSAError( status ) );
+     TRACE( "status %#lx.\n", status );
+     return status ? -1 : 0;
