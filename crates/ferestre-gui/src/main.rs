@@ -449,7 +449,10 @@ fn draw_list(
     // one: its rows come from a public catalogue listing rather than from what
     // the account owns.
     let rows: Vec<LibraryRow> = match section {
-        Section::GamePass => model::gamepass(&inputs, &model.gamepass),
+        Section::GamePass => {
+            let held: Vec<&str> = model.subscriptions.clone();
+            model::gamepass(&inputs, &model.gamepass, &model.tiers, &held)
+        }
         _ => model::library(&inputs),
     };
     let unsupported = rows.iter().filter(|row| row.unsupported).count();
@@ -1885,11 +1888,18 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
         glib::spawn_future_local(async move {
             let fetched = gio::spawn_blocking({
                 let market = market.clone();
-                move || gamepass::fetch(&market, &language)
+                move || {
+                    let ids = gamepass::fetch(&market, &language)?;
+                    // The tier map is a second request and a failure of it is
+                    // not a failure of the listing: without it the section
+                    // still works, it just cannot warn.
+                    let tiers = gamepass::fetch_tiers(&market, &language).unwrap_or_default();
+                    Ok::<_, anyhow::Error>((ids, tiers))
+                }
             })
             .await;
             ui.fetching_gamepass.replace(false);
-            let Ok(Ok(ids)) = fetched else {
+            let Ok(Ok((ids, tiers))) = fetched else {
                 // Silent on purpose when there is already a listing: a failed
                 // refresh of a public list is not worth a toast over the top of
                 // whatever someone is doing.
@@ -1902,7 +1912,13 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
             if let Some(dir) = paths {
                 let _ = gamepass::save_cache(&dir, &market, &ids);
             }
-            ui.model.borrow_mut().gamepass = ids;
+            {
+                let mut model = ui.model.borrow_mut();
+                model.gamepass = ids;
+                if !tiers.included.is_empty() {
+                    model.tiers = tiers;
+                }
+            }
             if ui.model.borrow().section == Section::GamePass {
                 render(&ui);
             }

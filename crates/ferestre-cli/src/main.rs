@@ -507,6 +507,8 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
         return Ok(ExitCode::SUCCESS);
     }
 
+    // Remembered so a failed install can put the disk back the way it found it.
+    let dest_existed = dest.is_dir();
     std::fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
     eprintln!(":: {product_id} -> {}", dest.display());
     let code = run_inherited(command)?;
@@ -532,6 +534,15 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
              the title, which for a Game Pass title means the subscription tier does not \
              include it"
         );
+        // Clean up after ourselves, but only what we made: a directory that was
+        // already there might be somebody's, and the partial container is worth
+        // keeping if a resume could use it.
+        if !dest_existed
+            && install::safe_to_remove(&dest).is_ok()
+            && std::fs::remove_dir_all(&dest).is_ok()
+        {
+            eprintln!("   removed the empty {}", dest.display());
+        }
         return Ok(ExitCode::FAILURE);
     }
 
@@ -595,7 +606,15 @@ fn cmd_uninstall(cli: &Cli, product_id: &str, keep_files: bool, yes: bool) -> Re
         None => recipes
             .iter()
             .find(|r| r.matches(&product_id))
-            .and_then(|r| paths.install_dir(r).ok()),
+            .and_then(|r| paths.install_dir(r).ok())
+            // Neither recorded nor described, but a directory may still be
+            // there: this is exactly what a failed install leaves, and refusing
+            // to touch it means the only thing that can clean it up is `rm`.
+            // The same rule `install` uses when it has no recipe to follow.
+            .or_else(|| {
+                let guess = paths.games_dir().join(product_id.to_ascii_lowercase());
+                guess.is_dir().then_some(guess)
+            }),
     };
 
     let Some(dir) = dir else {
@@ -798,20 +817,34 @@ fn cmd_env(cli: &Cli) -> Result<ExitCode> {
 
 /// The recipes, and where they came from. `--titles-dir` wins: it is how
 /// someone tests a recipe they are writing without installing it first.
+/// The recipes, packaged ones overlaid with the reader's own.
+///
+/// Layered, and that is not a detail: the window's editor writes to the user's
+/// titles directory, and the window launches by running this binary -- so while
+/// this read only the packaged directory, every edit somebody saved was
+/// silently ignored at the moment it was supposed to take effect. The same bug
+/// made a recipe written from a package manifest during `run` invisible to the
+/// `run` that had just written it.
+///
+/// `--titles-dir` still means exactly that one directory, because it exists for
+/// testing a directory in isolation.
 fn load_recipes(cli: &Cli) -> Result<(PathBuf, Vec<Recipe>)> {
-    let dir = match &cli.titles_dir {
-        Some(dir) => dir.clone(),
-        None => Paths::from_env()?
-            .titles_dir()
-            .ok_or_else(|| {
-                anyhow!(
-                    "cannot find the title recipes; pass --titles-dir <DIR> or set XODUS_REPO_DIR"
-                )
-            })?
-            .to_path_buf(),
-    };
-    let recipes = Recipe::load_dir(&dir)
-        .with_context(|| format!("reading recipes from {}", dir.display()))?;
+    if let Some(dir) = &cli.titles_dir {
+        let recipes = Recipe::load_dir(dir)
+            .with_context(|| format!("reading recipes from {}", dir.display()))?;
+        return Ok((dir.clone(), recipes));
+    }
+
+    let paths = Paths::from_env()?;
+    let dir = paths
+        .titles_dir()
+        .ok_or_else(|| {
+            anyhow!("cannot find the title recipes; pass --titles-dir <DIR> or set XODUS_REPO_DIR")
+        })?
+        .to_path_buf();
+    let dirs = paths.title_dirs();
+    let recipes =
+        Recipe::load_layered(&dirs).with_context(|| format!("reading recipes from {dirs:?}"))?;
     Ok((dir, recipes))
 }
 

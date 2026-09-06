@@ -282,8 +282,16 @@ impl Recipe {
     /// The recipe as a file, ready to write.
     pub fn to_toml(&self) -> anyhow::Result<String> {
         let body = toml::to_string_pretty(self)?;
+        // Concatenated rather than written as an indented literal: the source
+        // indentation ends up in the file, and every recipe this wrote had
+        // thirteen spaces before each comment line and before `schema = 1`.
         Ok(format!(
-            "# Written by the ferestre launcher. Edits here win over the packaged\n             # recipe of the same product id, and survive an upgrade.\n             #\n             # If this makes a title work, the most useful thing you can do with\n             # it is open an issue with this file attached.\n             {body}"
+            "{}{}{}{}{}{body}",
+            "# Written by the ferestre launcher. Edits here win over the packaged\n",
+            "# recipe of the same product id, and survive an upgrade.\n",
+            "#\n",
+            "# If this makes a title work, the most useful thing you can do with\n",
+            "# it is open an issue with this file attached.\n",
         ))
     }
 
@@ -418,6 +426,15 @@ mod tests {
             parsed.runtime.requires,
             vec!["loader.memfd-main-image".to_string()]
         );
+        // Every line is either a comment at column zero, a key at column zero,
+        // or blank. The header used to be written as an indented literal, so
+        // the source's own indentation ended up in the file.
+        for line in text.lines() {
+            assert!(
+                !line.starts_with(' '),
+                "a written recipe has no leading whitespace: {line:?}"
+            );
+        }
         assert!(
             text.contains("open an issue"),
             "the file says what to do with it"

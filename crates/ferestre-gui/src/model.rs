@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ferestre_core::catalog::Product;
+use ferestre_core::gamepass;
 use ferestre_core::install::Record;
 use ferestre_core::library::Entry;
 use ferestre_core::recipe::{Recipe, TitleState};
@@ -313,7 +314,12 @@ fn row_sized(explanation: &str, title: &str) -> String {
 /// Titles already owned outright are dropped: they are in the library, with
 /// their real state, and listing them twice under a heading that implies a
 /// subscription is needed would be worse than not listing them.
-pub fn gamepass(inputs: &Inputs, product_ids: &[String]) -> Vec<LibraryRow> {
+pub fn gamepass(
+    inputs: &Inputs,
+    product_ids: &[String],
+    tiers: &gamepass::Tiers,
+    held: &[&str],
+) -> Vec<LibraryRow> {
     let mut rows: Vec<LibraryRow> = product_ids
         .iter()
         .filter(|id| inputs.ownership.owns(id) != Some(true))
@@ -326,7 +332,15 @@ pub fn gamepass(inputs: &Inputs, product_ids: &[String]) -> Vec<LibraryRow> {
             let installed = (inputs.installed_product)(product_id);
             let runnable = product.and_then(Product::is_runnable_here);
 
-            let mut parts = vec!["Included with PC Game Pass".to_string()];
+            // Said before the download, not after it. A title outside the
+            // account's tier fails at the licence step with "not entitled to
+            // this content" -- after several minutes and a partial container --
+            // and the catalogue knew all along.
+            let covered = tiers.covered(product_id, held);
+            let mut parts = vec![match covered {
+                Some(false) => "Not in your Game Pass tier".to_string(),
+                _ => "Included with PC Game Pass".to_string(),
+            }];
             if let Some(size) = product.map(Product::size_label).filter(|s| !s.is_empty()) {
                 parts.push(size);
             }
@@ -354,6 +368,13 @@ pub fn gamepass(inputs: &Inputs, product_ids: &[String]) -> Vec<LibraryRow> {
                 // comes back to.
                 (false, _) => Action::Install,
             };
+            // A warning, never a refusal. The tier mapping is inferred rather
+            // than stated by the service, so the button stays live and the
+            // licence request remains the thing that decides -- being wrong
+            // here must cost a reader a sentence, not a title.
+            if covered == Some(false) {
+                parts.push("installing it will probably be refused".into());
+            }
 
             LibraryRow {
                 product_id: product_id.clone(),
@@ -1546,6 +1567,8 @@ mod tests {
                 running: NOTHING_RUNNING,
             },
             &listing,
+            &gamepass::Tiers::default(),
+            &[],
         );
 
         let ids: Vec<&str> = rows.iter().map(|r| r.product_id.as_str()).collect();
@@ -1657,6 +1680,65 @@ mod tests {
             Action::Adopt,
             "nothing on disk says what to start, so a person has to"
         );
+    }
+
+    /// Said before the download instead of after it. Blood Dungeon is in the PC
+    /// catalogue and not in the tier this account holds, and the only way to
+    /// find that out used to be to start the download and have the licence step
+    /// refuse it several minutes in.
+    #[test]
+    fn a_gamepass_title_outside_the_held_tier_says_so_before_the_download() {
+        let listing = vec!["9MSVBF0KZFVW".to_string(), "9MSVVM5NS9L6".to_string()];
+        let cat = catalog(vec![
+            product("9MSVBF0KZFVW", "Blood Dungeon", &["cid"]),
+            product("9MSVVM5NS9L6", "DREDGE", &["cid2"]),
+        ]);
+        let tiers = ferestre_core::gamepass::parse_tiers(
+            r#"{
+              "9MSVBF0KZFVW": {"PCSubMetadata": {"Included": true}},
+              "9MSVVM5NS9L6": {"PCSubMetadata": {"Included": true},
+                               "StandardSubMetadata": {"Included": true}}
+            }"#,
+        )
+        .expect("fixture parses");
+        let rows = gamepass(
+            &Inputs {
+                recipes: &[],
+                runtime: None,
+                registry: None,
+                ownership: &Ownership::Unknown,
+                catalog: &cat,
+                records: &BTreeMap::new(),
+                available: &BTreeMap::new(),
+                installed: NOTHING_INSTALLED,
+                installed_version: NO_VERSION_ON_DISK,
+                installed_product: NOT_ON_DISK,
+                product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+                running: NOTHING_RUNNING,
+            },
+            &listing,
+            &tiers,
+            &["Game Pass Premium"],
+        );
+        let by_id = |id: &str| rows.iter().find(|r| r.product_id == id).expect(id);
+
+        let outside = by_id("9MSVBF0KZFVW");
+        assert!(
+            outside.subtitle.contains("Not in your Game Pass tier"),
+            "{}",
+            outside.subtitle
+        );
+        // A warning, not a refusal: the tier mapping is inferred, and being
+        // wrong must cost a sentence rather than a title.
+        assert_eq!(outside.action, Action::Install);
+
+        let inside = by_id("9MSVVM5NS9L6");
+        assert!(
+            inside.subtitle.contains("Included with PC Game Pass"),
+            "{}",
+            inside.subtitle
+        );
+        assert!(!inside.subtitle.contains("refused"), "{}", inside.subtitle);
     }
 
     /// A row still showing a twelve-character code is waiting for the catalog,

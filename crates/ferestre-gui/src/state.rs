@@ -92,6 +92,9 @@ pub struct Model {
     /// first tells people they cannot install titles they can.
     pub gamepass: Vec<String>,
     pub subscriptions: Vec<&'static str>,
+    /// Which subscription tiers include which products. Joined against
+    /// `subscriptions` to warn before a download that would be refused.
+    pub tiers: gamepass::Tiers,
 
     /// Where the view is, which is state the widgets must not own -- a rebuild
     /// destroys them and the person's place in the list should survive it.
@@ -225,6 +228,7 @@ impl Model {
             avatar,
             gamepass,
             subscriptions,
+            tiers: gamepass::Tiers::default(),
             section: Section::Library,
             query: String::new(),
             page: 0,
@@ -248,6 +252,7 @@ impl Model {
             avatar: self.avatar.take(),
             gamepass: std::mem::take(&mut self.gamepass),
             subscriptions: std::mem::take(&mut self.subscriptions),
+            tiers: std::mem::take(&mut self.tiers),
             section: self.section,
             query: std::mem::take(&mut self.query),
             page: self.page,

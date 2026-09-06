@@ -121,6 +121,114 @@ pub fn url(sigl: &str, market: &str, language: &str) -> String {
     format!("{HOST}/sigls/v2?id={sigl}&language={language}&market={market}")
 }
 
+/// How to ask which subscription tiers include which products.
+pub fn subscriptions_url(market: &str, language: &str) -> String {
+    format!("{HOST}/pcsubscriptions?market={market}&language={language}")
+}
+
+/// The tier key that goes with a subscription product, where there is one.
+///
+/// This mapping is the shakiest thing in this module and is treated as such
+/// everywhere it is used. Microsoft renamed the tiers in 2025 -- Standard
+/// became Premium -- and `pcsubscriptions` still answers in the old vocabulary,
+/// so the join is by inference rather than by anything the service states.
+///
+/// It is *only* used to warn before a download, never to refuse one. The
+/// evidence it rests on is a single measured pair: on an account holding
+/// Essential and Premium, with PC Game Pass and Ultimate revoked, DREDGE
+/// (`StandardSubMetadata` + `PCSubMetadata`) installed and Blood Dungeon
+/// (`PCSubMetadata` only) was refused with "not entitled to this content".
+fn tier_key(subscription: &str) -> Option<&'static str> {
+    match subscription {
+        "Game Pass Premium" => Some("StandardSubMetadata"),
+        "Game Pass Ultimate" | "PC Game Pass" => Some("PCSubMetadata"),
+        // Essential is a lower tier than anything `pcsubscriptions` names for
+        // PC, and Console is not a PC entitlement at all. No key rather than a
+        // guess: a wrong key here would warn about titles that install fine.
+        _ => None,
+    }
+}
+
+/// Which tiers include a product, keyed by product id.
+///
+/// The listing in [`fetch`] says what the PC catalogue holds; this says who
+/// gets it. 697 products are marked as included on PC and only 529 of those are
+/// also in the Standard tier -- so 168 of them are visible to everyone and
+/// installable by a subset, and without this the only way to find out which is
+/// to start a download and have it refused.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Tiers {
+    /// Uppercase product id to the metadata keys that include it.
+    pub included: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+impl Tiers {
+    /// Whether an account holding these subscriptions is likely to be able to
+    /// install this product.
+    ///
+    /// `None` means "no opinion", and it is the answer far more often than not:
+    /// nothing known about the product, or nothing known about the tiers. Only
+    /// `Some(false)` is worth saying anything about, and even that is a warning
+    /// rather than a refusal.
+    pub fn covered(&self, product_id: &str, held: &[&str]) -> Option<bool> {
+        let keys = self.included.get(&product_id.to_ascii_uppercase())?;
+        if keys.is_empty() {
+            return None;
+        }
+        let mine: Vec<&str> = held.iter().filter_map(|s| tier_key(s)).collect();
+        if mine.is_empty() {
+            return None;
+        }
+        Some(mine.iter().any(|key| keys.iter().any(|k| k == key)))
+    }
+}
+
+/// Read the tier map out of a `pcsubscriptions` response.
+///
+/// The document is an object of product id to a bag of per-tier objects, each
+/// `{"Included": true, "EntranceDate": ...}`, mixed in with unrelated keys like
+/// `XCloudEnabled` and `RecursiveChildren`. Only the keys that end in
+/// `SubMetadata` and say `Included` are kept.
+pub fn parse_tiers(json: &str) -> Result<Tiers> {
+    let document: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| anyhow!("not JSON: {e}"))?;
+    let object = document
+        .as_object()
+        .ok_or_else(|| anyhow!("expected an object of product ids"))?;
+
+    let mut included = std::collections::BTreeMap::new();
+    for (product_id, value) in object {
+        let Some(fields) = value.as_object() else {
+            continue;
+        };
+        let keys: Vec<String> = fields
+            .iter()
+            .filter(|(key, _)| key.ends_with("SubMetadata"))
+            .filter(|(_, meta)| {
+                meta.get("Included")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        if !keys.is_empty() {
+            included.insert(product_id.to_ascii_uppercase(), keys);
+        }
+    }
+    if included.is_empty() {
+        return Err(anyhow!(
+            "no product in the document is included in any tier"
+        ));
+    }
+    Ok(Tiers { included })
+}
+
+/// The tier map, from the service.
+pub fn fetch_tiers(market: &str, language: &str) -> Result<Tiers> {
+    let body = crate::http::get_text(&subscriptions_url(market, language))?;
+    parse_tiers(&body)
+}
+
 /// The catalogue, from the service.
 pub fn fetch(market: &str, language: &str) -> Result<Vec<String>> {
     let body = crate::http::get_text(&url(ALL_PC_GAMES, market, language))?;
@@ -259,6 +367,89 @@ mod tests {
             vec!["Game Pass Premium"],
             "active only, and each named once"
         );
+    }
+
+    /// The document really is this shape: per-tier objects mixed in with
+    /// unrelated keys, and a product that is in the catalogue but in no tier.
+    const SUBSCRIPTIONS: &str = r#"{
+      "9MSVVM5NS9L6": {
+        "ConsoleSubMetadata": {"Included": true, "EntranceDate": "2025-05-06T00:00:00Z"},
+        "PCSubMetadata": {"Included": true, "EntranceDate": "2025-05-06T00:00:00Z"},
+        "StandardSubMetadata": {"Included": true, "EntranceDate": "2025-05-06T00:00:00Z"},
+        "XCloudEnabled": true
+      },
+      "9MSVBF0KZFVW": {
+        "ConsoleSubMetadata": {"Included": true, "EntranceDate": "2026-08-25T16:00:00Z"},
+        "PCSubMetadata": {"Included": true, "EntranceDate": "2026-08-25T16:00:00Z"},
+        "XCloudEnabled": true
+      },
+      "9NXP44L49SHJ": {
+        "RecursiveChildren": ["9NBLGGH2JHXJ"],
+        "PCSubMetadata": {"Included": false}
+      }
+    }"#;
+
+    #[test]
+    fn the_tier_map_keeps_only_what_a_tier_actually_includes() {
+        let tiers = parse_tiers(SUBSCRIPTIONS).expect("parses");
+        assert_eq!(
+            tiers.included.get("9MSVBF0KZFVW").map(Vec::len),
+            Some(2),
+            "the two tiers it is in, and not XCloudEnabled"
+        );
+        assert!(
+            !tiers.included.contains_key("9NXP44L49SHJ"),
+            "Included: false is not inclusion, and RecursiveChildren is not a tier"
+        );
+    }
+
+    /// The measured pair this whole mapping rests on. On an account holding
+    /// Essential and Premium, DREDGE installed and Blood Dungeon was refused
+    /// with "not entitled to this content" -- and the only difference between
+    /// them in the catalogue is `StandardSubMetadata`.
+    #[test]
+    fn a_title_outside_the_held_tier_is_flagged_and_one_inside_it_is_not() {
+        let tiers = parse_tiers(SUBSCRIPTIONS).expect("parses");
+        let held = ["Game Pass Essential", "Game Pass Premium"];
+        assert_eq!(tiers.covered("9MSVVM5NS9L6", &held), Some(true), "DREDGE");
+        assert_eq!(
+            tiers.covered("9MSVBF0KZFVW", &held),
+            Some(false),
+            "Blood Dungeon is PC-tier only"
+        );
+        // And with Ultimate, which does carry the PC catalogue, it is covered.
+        assert_eq!(
+            tiers.covered("9MSVBF0KZFVW", &["Game Pass Ultimate"]),
+            Some(true)
+        );
+    }
+
+    /// Silence wherever the answer is not actually known. Every one of these
+    /// would otherwise become a warning on a title that installs perfectly.
+    #[test]
+    fn nothing_is_claimed_without_both_halves_of_the_join() {
+        let tiers = parse_tiers(SUBSCRIPTIONS).expect("parses");
+        assert_eq!(
+            tiers.covered("9MSVVM5NS9L6", &[]),
+            None,
+            "no subscription known"
+        );
+        assert_eq!(
+            tiers.covered("9MSVVM5NS9L6", &["Xbox Game Pass for Console"]),
+            None,
+            "a console subscription says nothing about a PC install"
+        );
+        assert_eq!(
+            tiers.covered("9ZZTESTNONE", &["Game Pass Premium"]),
+            None,
+            "nothing known about the product"
+        );
+    }
+
+    #[test]
+    fn an_empty_subscription_document_is_an_error() {
+        assert!(parse_tiers("{}").is_err());
+        assert!(parse_tiers(r#"{"9ZZ": {"XCloudEnabled": true}}"#).is_err());
     }
 
     #[test]
