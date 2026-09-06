@@ -62,9 +62,8 @@ Flathub is plausible but not automatic. Heroic and mcpelauncher are both on it,
 and both install content the user already owns, so the shape is not unprecedented.
 What a submission would have to satisfy:
 
-- An application id under a domain the submitter controls. `io.github.<owner>.<app>`
-  is the usual route for a GitHub-hosted project; the placeholder below is not a
-  valid id and must be replaced.
+- An application id under a domain the submitter controls. The project uses
+  `io.github.icex.xgdk`, matching its GitHub home and the AppImage build.
 - A manifest that builds from source, with the runtime download declared as
   `extra-data` rather than fetched silently at first run.
 - No game content, no keys, no licences in the package — which is already the

@@ -1,0 +1,104 @@
+# Runtime capability registry
+#
+# A recipe says what a title needs from the runtime, never which runtime build
+# it needs. These are the names it may use. Each one is a behaviour a title can
+# observe: something it calls, or something that has to succeed before it will
+# start. A runtime that provides all of a title's `requires` can run it,
+# whichever Proton or Wine version it was built from.
+#
+# Adding a name here is a promise: the runtime must keep providing it, or drop
+# it deliberately and update every recipe that asks for it. Do not add a name
+# for a debugging aid (patches/wine/0005-datagram-tracing.patch adds a WINEDEBUG
+# channel, not a capability) -- only for something a title depends on.
+#
+# `symptom-if-missing` is what you see when the runtime does not have it. It is
+# the field that makes a failed launch diagnosable by someone who was not there
+# when it was first found.
+
+schema = 1
+
+[[capability]]
+name = "loader.memfd-main-image"
+summary = """
+Wine loads the process's main image from an inherited file descriptor named in \
+WINE_DLL_FILE_MAP, and the fd survives the exec into Proton."""
+provided-by = [
+    "patches/wine/0001-mapped-main-image-appstate-and-mediaconv-rank.patch",
+    "patches/proton/0001-keep-inherited-fds-mediaconv-and-system-ffmpeg.patch",
+]
+symptom-if-missing = "the title exits immediately with rc=1 and nothing in the log; the executable on disk is encrypted, so there is nothing to load without this"
+note = "Every GDK/MSIXVC title requires this. It is the reason a title cannot be started by any other launcher."
+
+[[capability]]
+name = "appmodel.package-identity"
+summary = "kernelbase reports the current process's package identity from the manifest beside the executable, so GetCurrentPackageFullName and friends succeed."
+provided-by = ["patches/wine/0002-kernelbase-current-package-identity.patch"]
+symptom-if-missing = "APPMODEL_ERROR_NO_PACKAGE, and a packaged title exits at once"
+
+[[capability]]
+name = "appmodel.state-change-notification"
+summary = "RegisterAppStateChangeNotification succeeds and returns a token Unregister accepts, instead of ERROR_CALL_NOT_IMPLEMENTED."
+provided-by = ["patches/wine/0001-mapped-main-image-appstate-and-mediaconv-rank.patch"]
+symptom-if-missing = "Microsoft's XCurl.dll aborts curl_global_init -- \"Could not initialize libcurl\" during startup"
+note = "Needed by any title that loads Microsoft's XCurl.dll, which is most of them."
+
+[[capability]]
+name = "gameinput.v2"
+summary = "gameinput.dll exposes IGameInput_v2 and its dispatcher, opted into with WINE_GAMEINPUT=1."
+provided-by = ["patches/wine/0003-gameinput-v2-dispatcher-opt-in.patch"]
+symptom-if-missing = "\"Critical Failure: GameInput Runtime could not be loaded\""
+
+[[capability]]
+name = "winrt.regionpolicyevaluator"
+summary = "Windows.Internal.System.Profile.RegionPolicyEvaluator is activatable, hosted in windows.system.profile.systemid.dll."
+provided-by = ["patches/wine/0004-regionpolicyevaluator-winrt-class.patch"]
+symptom-if-missing = "RoGetActivationFactory fails for that class and the title then throws on a fiber: \"frame is not in stack limits\""
+note = "A fresh prefix registers the class; an existing prefix needs its ActivatableClassId added by hand."
+
+[[capability]]
+name = "winhttp.websocket-close-timeout"
+summary = "WinHttp websockets accept and report WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT, which bounds the wait for the peer's close frame."
+provided-by = ["patches/wine/0002-winhttp-websocket-close-timeout.patch"]
+symptom-if-missing = "a websocket close waits for a peer that never answers, so shutdown or sign-out hangs"
+
+[[capability]]
+name = "media.real-video"
+summary = "The title's own video files are decoded (system ffmpeg preferred, Proton's converter elements demoted by rank) rather than replaced by the placeholder."
+provided-by = [
+    "patches/wine/0001-mapped-main-image-appstate-and-mediaconv-rank.patch",
+    "patches/proton/0001-keep-inherited-fds-mediaconv-and-system-ffmpeg.patch",
+]
+symptom-if-missing = "colour bars in place of cutscenes and loading movies"
+note = "Also needs a system ffmpeg with an H.264 decoder; Steam's has none outside Steam."
+
+[[capability]]
+name = "xgameruntime.taskqueue"
+summary = "XTaskQueue in full: composite queues, ports, waiters and monitors, and the XAsync provider framework the rest of the GDK completes through."
+provided-by = ["patches/xgameruntime/0001-taskqueue-user-networking-gamesave-package.patch"]
+symptom-if-missing = "\"Failed to Register TaskQueue Monitor\", or async work that is submitted and never completes"
+note = "Required by every GDK title; nothing else in the runtime completes without it."
+
+[[capability]]
+name = "xgameruntime.user"
+summary = "XUser sign-in against the real Microsoft account, with gamertag and XUID, through the running xodus-service."
+provided-by = ["patches/xgameruntime/0001-taskqueue-user-networking-gamesave-package.patch"]
+symptom-if-missing = "the title reports no signed-in user, or sits on its sign-in screen"
+note = "Needs xodus-service running for tokens; the launch script starts it."
+
+[[capability]]
+name = "xgameruntime.networking"
+summary = "XNetworking connectivity hints, security information for a URL, and change registrations that deliver the current value at registration time."
+provided-by = ["patches/xgameruntime/0001-taskqueue-user-networking-gamesave-package.patch"]
+symptom-if-missing = "the title believes the machine is offline: plain HTTP still works, but every WebSocket connect is refused before it is attempted"
+
+[[capability]]
+name = "xgameruntime.gamesave"
+summary = "XGameSave containers, blobs and updates over the Windows Gaming Services (wgs) on-disk layout, so Windows saves are read and written in place."
+provided-by = ["patches/xgameruntime/0001-taskqueue-user-networking-gamesave-package.patch"]
+symptom-if-missing = "no save slots are found, or new saves are written where Windows will not look for them"
+
+[[capability]]
+name = "xgameruntime.package"
+summary = "XPackage queries: the current package's mount path, identity and user locale."
+provided-by = ["patches/xgameruntime/0001-taskqueue-user-networking-gamesave-package.patch"]
+symptom-if-missing = "the title cannot locate its own installed content, or falls back to a default locale"

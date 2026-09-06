@@ -50,7 +50,7 @@ cd ~/src/xodus-proton
 git -c filter.lfs.smudge= -c filter.lfs.process= submodule update --init --force --recursive
 
 # this repo, with the patches and scripts
-git clone https://github.com/<owner>/xgdk-launcher ~/src/xgdk-launcher
+git clone https://github.com/icex/xgdk-launcher ~/src/xgdk-launcher
 
 # apply the local patches (they are plain git diffs against the fork)
 cd ~/src/xodus-proton/wine

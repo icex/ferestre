@@ -1,0 +1,76 @@
+# Minecraft for Windows (Bedrock) -- Microsoft Store
+#
+# A UWP + GDK hybrid: it wants the package identity a UWP app has *and* the GDK
+# runtime a native title has, which is why it needs more of the runtime than
+# anything else here.
+
+schema = 1
+
+[title]
+product-id       = "9NBLGGH2JHXJ"
+name             = "Minecraft for Windows"
+slug             = "bedrock"
+publisher        = "Microsoft Studios"
+package-identity = "Microsoft.MinecraftUWP"
+title-id         = "35760C07"
+install-size-gb  = 2.3
+
+[install]
+# The historic layout keeps the package one level down, so this is not the
+# default "<slug>". The env vars are what scripts/launch-bedrock.sh already
+# honours; a runner should keep accepting them.
+dir        = "bedrock/game"
+dir-env    = "BEDROCK_DIR"
+prefix     = "bedrock-proton"
+prefix-env = "BEDROCK_PREFIX"
+
+[launch]
+executable = 'Minecraft.Windows.exe'
+
+[runtime]
+requires = [
+    "loader.memfd-main-image",
+    "appmodel.package-identity",         # UWP half: APPMODEL_ERROR_NO_PACKAGE without it
+    "appmodel.state-change-notification",
+    "gameinput.v2",
+    "winrt.regionpolicyevaluator",
+    "xgameruntime.taskqueue",
+    "xgameruntime.user",                 # signs in with the real account
+    "xgameruntime.networking",           # connectivity hint gates every WebSocket
+    "xgameruntime.package",              # XPackageGetUserLocale, observed in a launch log
+]
+wants = [
+    "winhttp.websocket-close-timeout",   # libHttpClient.GDK drives WinHttp websockets
+]
+
+[[setup]]
+action  = "substitute-xcurl"
+when    = "after-install"
+because = """
+Microsoft's XCurl.dll loads under Wine but never gets a request onto the wire, \
+so sign-in, marketplace and profile retry for ever. scripts/fix-xcurl.sh checks \
+that a real Windows libcurl exports the 16 symbols this title actually imports \
+before swapping it in. An update restores Microsoft's build, so this has to run \
+again after every download."""
+
+[[saves]]
+kind    = "files"
+windows = '%APPDATA%\Minecraft Bedrock\Users\*\games\com.mojang'
+prefix  = 'drive_c/users/steamuser/AppData/Roaming/Minecraft Bedrock/Users/*/games/com.mojang'
+note    = "worlds in minecraftWorlds/, settings in minecraftpe/options.txt"
+
+[status]
+state         = "playable"
+summary       = "Signs in to Xbox Live, loads the profile, plays, and joins third-party servers from the in-game list."
+last-verified = 2026-09-06
+verified-with = "tools/auto-join.py: launch, navigate the menus, join a server from the featured list"
+
+[[issues]]
+symptom = "sign-in, marketplace and profile hang; the game opens no TCP connections at all"
+cause   = "Microsoft's XCurl.dll was restored by a re-download or an update"
+fix     = "run scripts/fix-xcurl.sh again (the substitute-xcurl setup step)"
+
+[[issues]]
+symptom = "a Windows profile copied into the prefix does not show up in game"
+cause   = "this build keeps its data under Roaming\\Minecraft Bedrock; the older UWP LocalState folder is created but unused"
+fix     = "copy into the path in [[saves]], not into Packages/Microsoft.MinecraftUWP_8wekyb3d8bbwe/LocalState"

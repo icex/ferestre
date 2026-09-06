@@ -1,0 +1,34 @@
+#!/bin/bash
+# AppDir entry point.
+#
+# This is deliberately almost empty, and that is the interesting part.
+#
+# The conventional AppRun exports LD_LIBRARY_PATH=$APPDIR/usr/lib and friends so
+# a bundled GUI toolkit is found. We must not: the launcher's whole job is to
+# start Proton, Proton has to run against the *host* graphics stack (its
+# binaries pull in 66 distinct host libraries), and every variable exported here
+# is inherited by that process tree. A bundled library that wins over the host's
+# is a rendering or audio bug three layers away from anything that looks like
+# packaging. scripts/launch-gdk.sh already unsets LD_PRELOAD and
+# LD_LIBRARY_PATH for the same reason; do not give it more to undo.
+#
+# The other thing to know: the AppImage is mounted for exactly as long as this
+# process lives. usr/lib/xgdk/scripts, including proton-wine-shim.sh which
+# xodus-cli execs as its "wine" binary, lives on that mount. So the launcher
+# must stay in the foreground for the lifetime of the game and must never
+# daemonise itself away. It execs, and waits.
+
+set -u
+
+HERE=$(dirname "$(readlink -f "$0")")
+export APPDIR="${APPDIR:-$HERE}"
+
+# Only our own binary lives here, so nothing on the host can be shadowed.
+export PATH="$APPDIR/usr/bin:$PATH"
+
+# Where the shell scripts and patches landed inside the AppDir. The placeholder
+# command falls back to its own location, so this is belt and braces for anyone
+# invoking usr/bin/xgdk directly out of an extracted AppDir.
+export XGDK_SCRIPTS_DIR="${XGDK_SCRIPTS_DIR:-$APPDIR/usr/lib/xgdk/scripts}"
+
+exec "$APPDIR/usr/bin/xgdk" "$@"

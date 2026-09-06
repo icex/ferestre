@@ -1,0 +1,74 @@
+# Clair Obscur: Expedition 33 (Xbox GDK / Game Pass build)
+#
+# A plain native GDK title -- no UWP half -- so it needs less of the runtime
+# than Minecraft does, and most of what it does need is the save layer.
+
+schema = 1
+
+[title]
+product-id       = "9PPT8K6GQHRZ"
+name             = "Clair Obscur: Expedition 33"
+slug             = "exp33"
+publisher        = "Kepler Interactive"
+package-identity = "KeplerInteractive.Expedition33"
+title-id         = "697f9ec3"
+install-size-gb  = 45.0
+
+[install]
+dir-env    = "EXP33_DIR"
+prefix-env = "EXP33_PREFIX"
+
+[launch]
+# MicrosoftGame.config declares SandFall.exe, which is a wrapper. The shipping
+# binary is the one to run; both are encrypted on disk, so neither can be
+# started without the client.
+executable = 'Sandfall\Binaries\WinGDK\SandFall-WinGDK-Shipping.exe'
+
+[runtime]
+requires = [
+    "loader.memfd-main-image",
+    "appmodel.state-change-notification",
+    "winrt.regionpolicyevaluator",
+    "xgameruntime.taskqueue",
+    "xgameruntime.user",
+    "xgameruntime.networking",
+    "xgameruntime.gamesave",             # the heaviest XGameSave user here
+]
+wants = [
+    "media.real-video",                  # without it, cutscenes are colour bars
+]
+# appmodel.package-identity is deliberately absent: this title's package family
+# is resolved by xgameruntime from MicrosoftGame.config directly, and no launch
+# log shows it going through the kernelbase path. Add it if a run proves otherwise.
+
+[[setup]]
+action  = "substitute-xcurl"
+dir     = 'Sandfall\Binaries\WinGDK'
+when    = "after-install"
+because = """
+The install this was verified on has the substitution in place, and the title \
+ships XCurl.dll next to its executable rather than at the package root. Unlike \
+Minecraft, it is not proven that this title needs it -- if you have a run that \
+works with Microsoft's build, drop this step and say so."""
+
+[[saves]]
+kind    = "wgs"
+windows = '%LOCALAPPDATA%\Packages\KeplerInteractive.Expedition33_ymj30pw7xe604\SystemAppData\wgs'
+prefix  = 'drive_c/users/steamuser/AppData/Local/Packages/KeplerInteractive.Expedition33_ymj30pw7xe604/SystemAppData/wgs'
+note    = "existing folders are matched by their SCID suffix whatever XUID prefix they carry; set XGR_XUID so new ones are named the same way and copy back to Windows"
+
+[status]
+state         = "playable"
+summary       = "Playable start to finish, with working saves and video."
+last-verified = 2026-09-06
+verified-with = "scripts/verify-gdk.sh: package identity, XGameSave containers and blobs, chosen video decoder"
+
+[[issues]]
+symptom = "cutscenes and loading movies play as colour bars"
+cause   = "Steam's ffmpeg has no H.264 decoder outside Steam, and Proton puts it first on the library path"
+fix     = "install a system ffmpeg with H.264; the launcher already sets PROTON_PREFER_SYSTEM_FFMPEG=1"
+
+[[issues]]
+symptom = "saves made here are not picked up by the Windows install"
+cause   = "new save folders are named with a different XUID prefix"
+fix     = "set XGR_XUID to the 16-hex-digit prefix of your Windows save folders before launching"

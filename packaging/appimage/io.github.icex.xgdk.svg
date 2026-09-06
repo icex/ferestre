@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Source for the AppImage icon. Deliberately abstract: a terminal prompt,
+     because a terminal is what the launcher is today. Nothing here resembles
+     an Xbox, a Microsoft mark or a Proton logo. This project is affiliated
+     with none of them and the icon should not imply otherwise. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <rect x="8" y="8" width="240" height="240" rx="52" ry="52" fill="#20242c"/>
+  <rect x="8" y="8" width="240" height="240" rx="52" ry="52" fill="none" stroke="#3a414f" stroke-width="4"/>
+  <polyline points="76,86 126,128 76,170" fill="none" stroke="#8ab4f8"
+            stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="142" y="160" width="62" height="16" rx="8" ry="8" fill="#e6e9ef"/>
+</svg>

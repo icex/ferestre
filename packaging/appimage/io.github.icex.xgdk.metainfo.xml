@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata for the AppImage.
+
+     The id must be under a domain the packager controls. It is derived here
+     from the project's own repository (github.com/icex/xgdk-launcher); a fork
+     that publishes its own builds should set XGDK_APP_ID and let
+     build-appimage.sh rewrite this file rather than shipping someone else's id.
+
+     The release version is rewritten at build time from the version the build
+     script resolved, so the value below is only the development default. -->
+<component type="desktop-application">
+  <id>io.github.icex.xgdk</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>xgdk</name>
+  <summary>Run the Microsoft Store and Xbox GDK titles you own on Linux</summary>
+
+  <developer id="io.github.icex">
+    <name>the xgdk-launcher contributors</name>
+  </developer>
+
+  <description>
+    <p>
+      xgdk downloads and launches Microsoft Store (MSIXVC) and Xbox GDK titles
+      on Linux, using a patched Proton and a from-scratch implementation of the
+      Xbox Game Development Kit runtime.
+    </p>
+    <p>
+      You must own the games. This application ships no game content, no
+      licences and no content keys. It signs in with your own Microsoft
+      account, uses your own licences, and downloads your own purchases. If
+      your account does not own or have a Game Pass entitlement for a title,
+      there is nothing here that will let you play it.
+    </p>
+    <p>Known state of the supported titles:</p>
+    <ul>
+      <li>Minecraft for Windows (Bedrock): signs in, plays, and joins third-party servers</li>
+      <li>Clair Obscur: Expedition 33: playable, including saves and video</li>
+      <li>Forza Horizon 5: downloads but does not run, blocked by protection inside the title</li>
+    </ul>
+    <p>
+      The patched Proton runtime is roughly 264 MiB compressed, versions
+      independently of this application, and is not part of this package.
+    </p>
+    <p>
+      Not affiliated with, endorsed by, or connected to Microsoft, Mojang,
+      Valve or the Xodus project.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.icex.xgdk.desktop</launchable>
+  <provides>
+    <binary>xgdk</binary>
+  </provides>
+
+  <url type="homepage">https://github.com/icex/xgdk-launcher</url>
+  <url type="bugtracker">https://github.com/icex/xgdk-launcher/issues</url>
+  <url type="help">https://github.com/icex/xgdk-launcher/blob/main/docs/RECIPES.md</url>
+
+  <categories>
+    <category>Game</category>
+  </categories>
+
+  <keywords>
+    <keyword>Xbox</keyword>
+    <keyword>GDK</keyword>
+    <keyword>MSIXVC</keyword>
+    <keyword>Proton</keyword>
+    <keyword>Wine</keyword>
+  </keywords>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.0.0" date="2026-09-06" type="development">
+      <description>
+        <p>
+          Placeholder build. The launcher binary does not exist yet; the
+          packaged command drives the repository's shell scripts so the
+          packaging itself can be tested.
+        </p>
+      </description>
+    </release>
+  </releases>
+</component>

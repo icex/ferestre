@@ -1,0 +1,14 @@
+# Blank issues stay on: build failures, patch review, packaging and everything
+# that is not a title report needs somewhere to go, and a form for each of them
+# would be worse than a paragraph of prose.
+blank_issues_enabled: true
+contact_links:
+  - name: Check the troubleshooting table first
+    url: https://github.com/icex/xgdk-launcher/blob/main/docs/RECIPES.md
+    about: Every error hit so far, with its cause and its fix. Most reports end here.
+  - name: Compatibility matrix
+    url: https://github.com/icex/xgdk-launcher/blob/main/docs/COMPATIBILITY.md
+    about: Which titles have been tried, and exactly where the ones that fail stop.
+  - name: A security problem, or a token you have already pasted somewhere
+    url: https://github.com/icex/xgdk-launcher/blob/main/.github/SECURITY.md
+    about: Do not open a public issue. Revoke the credential first, then report privately.

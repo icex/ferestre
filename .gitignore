@@ -1,13 +1,14 @@
-# build outputs
-tools/winestack
-tools/*.exe
-*.o
-*.so
-*.dll
 
-# local scratch
 /build/
-/out/
+# build outputs
+*.dll
+# local scratch
 *.log
-__pycache__/
+*.o
+/out/
+out/
 *.pyc
+__pycache__/
+*.so
+tools/*.exe
+tools/winestack

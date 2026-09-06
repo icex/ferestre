@@ -1,0 +1,47 @@
+# Forza Horizon 5 (Microsoft Store)
+#
+# Downloads and decrypts correctly and does not run. The failure is inside the
+# title's own code protection, before it calls anything this project implements,
+# so there is nothing here to fix and no capability that would change it. The
+# recipe exists so the launch path is ready if the title ever changes, and so
+# the compatibility matrix can say precisely where it stops instead of "no".
+
+schema = 1
+
+[title]
+product-id       = "9NNX1VVR3KNQ"
+name             = "Forza Horizon 5"
+slug             = "fh5"
+publisher        = "Microsoft Studios"
+package-identity = "Microsoft.624F8B84B80"
+title-id         = "7900C3C7"
+install-size-gb  = 149.0
+
+[install]
+dir-env    = "FH5_DIR"
+prefix-env = "FH5_PREFIX"
+
+[launch]
+executable = 'ForzaHorizon5.exe'
+
+[runtime]
+# Only the loader is claimed, because that is all this title has been observed
+# to reach: the client decrypts the image (its header really is MZ behind the
+# fd) and Wine maps it, then the title's own code kills the process. Whatever
+# else it would need is unknown and guessing would put untested names in the
+# matrix.
+requires = ["loader.memfd-main-image"]
+
+[status]
+state         = "broken"
+blocked-by    = "title-protection"
+summary       = "Downloads and decrypts; dies inside its own code protection before any runtime API is reached."
+stops-at      = "an illegal instruction (0xc000001d) at ForzaHorizon5.exe+0x53d5cec, reached through ucrtbase -- the C++ static-initialiser path -- with no GDK call made first"
+last-verified = 2026-09-05
+verified-with = "scripts/launch-fh5.sh with WINEDEBUG=+seh; the backtrace ends in the title's own code"
+
+[[issues]]
+symptom   = "the game exits seconds after launch with no window; the log ends in an unhandled illegal instruction inside ForzaHorizon5.exe"
+cause     = "in-binary code protection that refuses to run here; it is not a missing Windows API"
+fix       = "none known. Do not report this as a runtime gap without a trace that shows a GDK call failing first"
+log-match = "Unhandled illegal instruction at address .* \\(thread"

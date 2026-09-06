@@ -1,0 +1,42 @@
+# The compatibility matrix is generated from titles/*.toml, through
+# titles/validate.py. A hand-edited table would go stale the first time a title
+# changed state and nobody remembered the second place it was written down, so a
+# stale page fails here instead. Both steps are stdlib-only Python: no build, no
+# runtime, no game.
+name: Compatibility matrix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'titles/**'
+      - 'docs/COMPATIBILITY.md'
+      - '.github/scripts/gen-compatibility.py'
+      - '.github/workflows/compatibility-matrix.yml'
+  pull_request:
+    paths:
+      - 'titles/**'
+      - 'docs/COMPATIBILITY.md'
+      - '.github/scripts/gen-compatibility.py'
+      - '.github/workflows/compatibility-matrix.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The generator is stdlib-only, but tomllib means 3.11 or newer. Print it
+      # so a runner image change shows up as a version, not a stack trace.
+      - name: Python
+        run: python3 -c 'import sys, tomllib; print(sys.version)'
+
+      - name: Recipes validate
+        run: python3 titles/validate.py
+
+      - name: docs/COMPATIBILITY.md matches titles/*.toml
+        run: python3 .github/scripts/gen-compatibility.py --check

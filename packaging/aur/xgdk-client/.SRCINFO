@@ -1,0 +1,35 @@
+pkgbase = xgdk-client
+	pkgdesc = Xodus client for Microsoft Store titles, with the xgdk patches (sign-in, licences, MSIXVC download and decrypt)
+	pkgver = 0.1.0.r130.g3e75c9f
+	pkgrel = 1
+	url = https://github.com/xodus-gaming/xodus
+	arch = x86_64
+	license = GPL-3.0-or-later
+	makedepends = cargo
+	makedepends = git
+	makedepends = protobuf
+	depends = glibc
+	depends = gcc-libs
+	depends = webkit2gtk-4.1
+	depends = gtk3
+	depends = gdk-pixbuf2
+	depends = cairo
+	depends = glib2
+	depends = libsoup3
+	depends = dbus
+	depends = openssl
+	optdepends = gnome-keyring: Secret Service provider for the account tokens
+	optdepends = kwallet: Secret Service provider for the account tokens (KDE)
+	optdepends = xgdk-launcher-git: the front end that drives this client
+	provides = xodus-cli
+	provides = xodus-service
+	conflicts = xodus-cli
+	conflicts = xodus-cli-git
+	source = xodus::git+https://github.com/xodus-gaming/xodus.git#commit=3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
+	source = https://raw.githubusercontent.com/icex/xgdk-launcher/a7175ca56829611ffe2e4e4d05a1c19669319cc4/patches/xodus-cli/0002-relying-party-device-claim-and-no-panic.patch
+	source = https://raw.githubusercontent.com/icex/xgdk-launcher/a7175ca56829611ffe2e4e4d05a1c19669319cc4/patches/xodus-cli/0003-owned-title-enumeration.patch
+	sha256sums = SKIP
+	sha256sums = 20d613add707a69f488b50041e53c60f8a0096132c05338b66d594fa8963c918
+	sha256sums = c15806efefdfe7613755ada8ee0fe28784ad955ea7df26825ddeabc7be731256
+
+pkgname = xgdk-client

@@ -1,0 +1,151 @@
+name: "Title report: it works"
+description: A Store / GDK title that reaches gameplay on this runtime.
+title: "[works] "
+labels: ["title-report", "works"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is the report that becomes a `titles/<product id>.toml` recipe and a
+        row in [the compatibility matrix](https://github.com/icex/xgdk-launcher/blob/main/docs/COMPATIBILITY.md),
+        so the details below are the whole point of it.
+
+        ### Do not paste account identifiers, tokens or game content
+
+        A launch log contains **your gamertag, your XUID and your save-folder
+        ids**, and with verbose logging it contains Xbox Live tokens as well. A
+        token in a public issue is a live credential until it expires. Run any
+        log through this before it goes anywhere, then read the result:
+
+        ```sh
+        sed -E \
+          -e 's/\b[0-9]{16}\b/<redacted>/g' \
+          -e 's/\b[0-9a-fA-F]{16}_/<redacted>_/g' \
+          -e 's/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9._-]+/<redacted>/g' \
+          -e 's/(XBL3\.0 x=)[^;" ]*/\1<redacted>/g' \
+          -e 's/(Bearer )[A-Za-z0-9._~+\/=-]{12,}/\1<redacted>/g' \
+          -e 's/YourGamertag/<gamertag>/gI' \
+          ~/xbox-games/<title>-launch.log > /tmp/report.log
+        ```
+
+        Never attach a package, a `.msixvc`, a licence, a content key or a save
+        file. None of them can be accepted, and the issue will be deleted rather
+        than edited.
+
+  - type: input
+    id: title-name
+    attributes:
+      label: Title
+      description: As the Microsoft Store spells it.
+      placeholder: Minecraft for Windows
+    validations:
+      required: true
+
+  - type: input
+    id: product-id
+    attributes:
+      label: Store product id
+      description: >
+        The last part of the Store URL —
+        https://apps.microsoft.com/detail/9NBLGGH2JHXJ gives 9NBLGGH2JHXJ.
+        This is the recipe's file name, so a report without it cannot become one.
+      placeholder: 9NBLGGH2JHXJ
+    validations:
+      required: true
+
+  - type: dropdown
+    id: state
+    attributes:
+      label: How well does it work
+      description: Be strict. "Playable" is a claim someone else will test.
+      options:
+        - Playable — played far enough that nothing is known to be broken
+        - Playable, but only after a manual step I had to work out myself
+        - Starts and reaches a menu or gameplay, but something significant is broken
+    validations:
+      required: true
+
+  - type: textarea
+    id: how-far
+    attributes:
+      label: What you actually did
+      description: >
+        How far you got and for roughly how long. "Reached the main menu" and
+        "finished chapter two" are very different reports, and only one of them
+        is evidence. Say what you did not test as well — saves, video, online.
+      placeholder: |
+        Played about 3 hours, through the prologue. Saves load and write.
+        Cutscene video plays. Did not test multiplayer or controller input.
+    validations:
+      required: true
+
+  - type: input
+    id: executable
+    attributes:
+      label: Executable inside the package
+      description: >
+        The path handed to scripts/launch-gdk.sh, with the backslashes as they
+        appear inside the package.
+      placeholder: Sandfall\Binaries\WinGDK\SandFall-WinGDK-Shipping.exe
+    validations:
+      required: true
+
+  - type: textarea
+    id: extras
+    attributes:
+      label: Anything you had to do that is not already in RECIPES.md
+      description: >
+        DLL swaps, environment variables, registry entries, a fresh prefix, a
+        save imported by hand. Write "nothing" if it worked as documented —
+        that is a useful answer, not an empty one.
+      placeholder: Ran scripts/fix-xcurl.sh after downloading, otherwise sign-in hung.
+    validations:
+      required: true
+
+  - type: input
+    id: runtime
+    attributes:
+      label: Runtime version
+      description: 'cat "$XODUS_PROTON_DIR/version" — or the version file in compatibilitytools.d/xodus'
+      placeholder: 1788593799 xodus-bleeding-edge-11.0-20260803-3-g7c0b4354
+    validations:
+      required: true
+
+  - type: input
+    id: repo-commit
+    attributes:
+      label: xgdk-launcher commit
+      description: git rev-parse --short HEAD
+      placeholder: 35fe31c
+    validations:
+      required: true
+
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution and kernel
+      description: '. /etc/os-release; echo "$PRETTY_NAME $(uname -r)"'
+      placeholder: CachyOS 7.2.3-1-cachyos-bore
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      description: 'vulkaninfo --summary | grep -E "deviceName|driverName|driverInfo"'
+      placeholder: AMD Radeon RX 9070 XT, radv, Mesa 26.2.2
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before you submit
+      options:
+        - label: I own this title on the Microsoft account I used, or it is covered by my Game Pass entitlement.
+          required: true
+        - label: There is no gamertag, XUID, PFID, token, licence or content key anywhere in this report.
+          required: true
+        - label: I have attached no game content — no package, no .msixvc, no save file.
+          required: true

@@ -1,9 +1,8 @@
 # DRAFT — not buildable yet. The launcher it packages does not exist.
 #
-# The application id below is a placeholder. Flathub requires an id under a
-# domain the submitter controls (commonly io.github.<owner>.<App>), so it has
-# to be set by whoever submits rather than baked in here.
-id: org.xgdk.Launcher.PLACEHOLDER
+# The id matches the AppImage build and the project's GitHub home, which is what
+# Flathub wants: an id under a domain the submitter controls.
+id: io.github.icex.xgdk
 
 runtime: org.freedesktop.Platform
 runtime-version: '24.08'

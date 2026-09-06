@@ -1,0 +1,27 @@
+post_install() {
+	cat <<'EOF'
+
+  The patched Proton runtime is installed at
+
+      /usr/share/steam/compatibilitytools.d/xgdk
+
+  The xgdk scripts look for it in Steam's per-user compatibilitytools.d, not
+  here, so point them at it once:
+
+      export XODUS_PROTON_DIR=/usr/share/steam/compatibilitytools.d/xgdk
+
+  Put that in your shell profile, or in ~/.config/environment.d/ if you want
+  desktop launchers to see it too. `xgdk doctor` reports whether it took.
+
+  Steam will also offer this as a compatibility tool for Steam games, which is
+  fine. Do not force it onto a non-Steam shortcut that runs launch-gdk.sh:
+  Steam would start it inside the Steam Linux Runtime container, and the
+  decrypted executable arrives as an inherited file descriptor that does not
+  survive that container.
+
+EOF
+}
+
+post_upgrade() {
+	post_install
+}
