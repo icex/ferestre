@@ -22,6 +22,18 @@ work outside Flatpak — all of this project's testing runs Proton directly on a
 modern distribution with no Steam Runtime involved — but it has not been
 validated inside a sandbox, and it is the single largest risk in this path.
 
+How large: the binaries under the runtime's `lib/` pull in **66 distinct host
+libraries** between them. Inside a Flatpak every one of those resolves against
+the runtime's copy instead of the host's, on a graphics stack this project has
+never tested. That is why `../appimage/` is the recommended first format — it
+has no sandbox, so Proton runs exactly as it does today.
+
+There is an escape hatch, with a cost: the launcher could run the game via
+`flatpak-spawn --host`, putting Proton back on the host libraries. It needs
+`--talk-name=org.freedesktop.Flatpak`, which is effectively full host access and
+which Flathub scrutinises heavily — at which point the sandbox is providing
+little, and an AppImage is the more honest package.
+
 ## Constraints the manifest must meet
 
 | Need | Why | Permission |
