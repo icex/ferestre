@@ -143,15 +143,20 @@ honestly marked as unproven rather than planned.
       token for `http://xboxlive.com` rather than the licensing relying party
       the library uses.
 
-- [ ] **Updates. Half built, and the missing half is the one that matters.**
-      The comparison works: `ContentId` from the catalog is the key, an install
-      record holds what was installed, `Record::update_available` returns
-      `None` rather than guessing when either side is unknown, and the window
-      has an Updates section that reads from it. **But nothing writes a record**
-      — `install::save` has no caller — so no title is ever known to be
-      installed-at-a-version and the section is permanently empty. Wiring
-      `xgdk install` to record the content ids it fetched is the whole
-      remaining task, and it is small.
+- [x] **Updates.** Working end to end. The key is the catalog's `ContentId`,
+      and the installed build is read from the package header the client leaves
+      at `<install>/.xodus-streaming.msixvc` -- its VDUID *is* the ContentId, so
+      a title installed before this launcher existed is adopted exactly, from a
+      4 KiB read, with nothing assumed and nothing to ask.
+
+      Two things had to be right or it would have been worse than useless.
+      **The catalog set is filtered to `Windows.Desktop`**: most titles ship an
+      Xbox package beside the desktop one with its own content id, and comparing
+      against the union reports a permanent update that no download clears --
+      measured, that was wrong on two of the three titles installed here. And
+      **"cannot tell" is worded differently from "up to date"**, because the row
+      and the button are identical in both, so silence would read as
+      reassurance.
 
 - [x] **A recipe editor.** The catalog will list a hundred titles with three
       recipes between them, so the common case is a title nobody has described.
@@ -232,9 +237,6 @@ These are judgement calls, not engineering ones:
 
 ## Known gaps, stated plainly
 
-- **Nothing records what it installed.** See Updates above: the detection is
-  built and the writer is not, so the Updates section is empty by construction
-  rather than because everything is current.
 - **The runtime does not publish a capability list.** `files/share/xgdk/capabilities.json`
   is the manifest a build is supposed to ship; no build writes one, so the
   launcher falls back to probing, finds four of the capabilities it looks for,

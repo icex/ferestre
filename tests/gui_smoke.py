@@ -21,12 +21,14 @@ without a rerun.
 
 import argparse
 import glob
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import warnings
 
 import gi
@@ -285,6 +287,36 @@ def main():
         }
     )
 
+    # A runtime that declares it can satisfy everything the packaged recipes ask
+    # for. Without one, every title is blocked on "install the runtime first" and
+    # the test can only ever exercise that one path -- which is not the path most
+    # of the window is about.
+    runtime = os.path.join(home, "runtime")
+    os.makedirs(os.path.join(runtime, "files", "share", "xgdk"), exist_ok=True)
+    with open(os.path.join(runtime, "proton"), "w") as f:
+        f.write("#!/bin/sh\nexit 0\n")
+    with open(os.path.join(runtime, "version"), "w") as f:
+        f.write("0 smoke-test-runtime\n")
+    wanted = set()
+    for name in os.listdir(os.path.join(os.getcwd(), "titles")):
+        if not name.endswith(".toml") or name == "capabilities.toml":
+            continue
+        with open(os.path.join(os.getcwd(), "titles", name), "rb") as f:
+            recipe = tomllib.load(f)
+        wanted |= set(recipe.get("runtime", {}).get("requires", []))
+        wanted |= set(recipe.get("runtime", {}).get("wants", []))
+    with open(os.path.join(runtime, "files", "share", "xgdk", "capabilities.json"), "w") as f:
+        json.dump({"capabilities": sorted(wanted)}, f)
+
+    # A title that is installed but whose build nothing can identify: a manifest,
+    # so there is a version, and no package header, so there is no content id.
+    # This is the state the window must not draw the same as "up to date" --
+    # same row, same button, so only the words can separate them.
+    unrecorded = os.path.join(home, "games", "bedrock", "game")
+    os.makedirs(unrecorded, exist_ok=True)
+    with open(os.path.join(unrecorded, "appxmanifest.xml"), "w") as f:
+        f.write('<Package><Identity Name="Microsoft.MinecraftUWP" Version="9.9.9.9" /></Package>')
+
     gui = subprocess.Popen([binary], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     deadline = time.monotonic() + TIMEOUT
     failures = []
@@ -329,6 +361,24 @@ def main():
             frame,
         )
 
+        print("an install whose build cannot be identified")
+        unknown = [t for t in labels if "9.9.9.9" in t]
+        check(bool(unknown), "the installed version is shown", frame)
+        check(
+            all("cannot be checked" in t for t in unknown),
+            f"and it says the build is unknown rather than implying it is current: {unknown}",
+            frame,
+        )
+        check(
+            not any("up to date" in t for t in labels),
+            "nothing claims to be up to date on no evidence",
+            frame,
+        )
+        check(
+            not os.path.exists(os.path.join(home, "state", "xgdk", "installed")),
+            "and nothing was recorded, because there was no package header to read",
+        )
+
         print("runtime section")
         select_in_list(frame, "Runtime")
         check(True, "the Runtime section can be selected")
@@ -339,8 +389,8 @@ def main():
             time.monotonic() + TIMEOUT,
         )
         check(
-            any("No patched runtime installed" in t for t in labels),
-            "with no runtime it says so instead of showing an empty page",
+            any("smoke-test-runtime" in t for t in labels),
+            "the runtime it found is named",
             frame,
         )
 
@@ -348,21 +398,31 @@ def main():
         select_in_list(frame, "Installed")
         labels = wait_for(
             frame,
-            lambda root: texts(root) if any("Nothing is installed" in t for t in texts(root)) else None,
-            "the empty-installed message",
+            lambda root: texts(root) if any("9.9.9.9" in t for t in texts(root)) else None,
+            "the installed title",
             time.monotonic() + TIMEOUT,
         )
-        check(True, "an empty section explains itself")
+        check(
+            not any("Forza" in t for t in labels),
+            "the section lists only what is on disk, not every recipe",
+            frame,
+        )
 
         print("updates section")
         select_in_list(frame, "Updates")
-        wait_for(
+        labels = wait_for(
             frame,
-            lambda root: any("up to date" in t for t in texts(root)),
+            lambda root: texts(root) if any("up to date" in t for t in texts(root)) else None,
             "the empty-updates message",
             time.monotonic() + TIMEOUT,
         )
-        check(True, "nothing installed reads as nothing to update, not as an error")
+        # A title whose build cannot be identified is not an update, and must not
+        # be listed as one: "we cannot tell" is not "there is something newer".
+        check(
+            not any("9.9.9.9" in t for t in labels),
+            "a title of unknown build is not reported as needing an update",
+            frame,
+        )
 
         print("the editor")
         select_in_list(frame, "Library")

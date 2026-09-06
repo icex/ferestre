@@ -31,6 +31,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use serde_json::{json, Value};
+use xgdk_core::install;
 use xgdk_core::launch;
 use xgdk_core::library;
 use xgdk_core::paths::Paths;
@@ -483,7 +484,53 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
         let dirs = launch_dirs(&paths)?;
         run_setup(recipe, "after-install", &dirs, &dest)?;
     }
+
+    // Written last, and only on success, because a record for a download that
+    // failed halfway would claim a build is installed that is not.
+    match record_install(&paths, &product_id, &dest) {
+        Ok(record) => eprintln!("{}", installed_summary(&record)),
+        // The title is installed either way. Failing the command over the
+        // bookkeeping would be the tail wagging the dog.
+        Err(e) => eprintln!("-- installed, but could not record the version: {e}"),
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Write down what was just installed, so an update can be detected later.
+///
+/// Read from the install itself, not from the catalog: the client leaves the
+/// package header on disk and the GUID in it is the content id. That means the
+/// record describes what is actually there, needs no network, and is the same
+/// operation that adopts a title installed before this launcher existed.
+fn record_install(paths: &Paths, product_id: &str, dest: &Path) -> Result<install::Record> {
+    let mut record = install::adopt(product_id, dest).unwrap_or_else(|| install::Record {
+        product_id: product_id.to_string(),
+        dir: dest.to_path_buf(),
+        // No header to read, so no content id to claim. `update_available`
+        // reports that as "cannot tell", which is the truth.
+        content_ids: Vec::new(),
+        installed_at: None,
+        package_version: install::package_version(dest),
+    });
+    // This install we did watch happen, so the date is known rather than guessed.
+    record.installed_at = install::now_rfc3339();
+    install::save(paths.state_dir(), &record)?;
+    Ok(record)
+}
+
+fn installed_summary(record: &install::Record) -> String {
+    let version = match &record.package_version {
+        Some(v) => format!(" version {v}"),
+        None => String::new(),
+    };
+    if record.content_ids.is_empty() {
+        format!(
+            "-- recorded the install{version}, but the package header was not readable, \
+             so updates cannot be detected for it"
+        )
+    } else {
+        format!("-- recorded the install{version}; updates will be detected")
+    }
 }
 
 fn cmd_install_runtime(cli: &Cli) -> Result<ExitCode> {

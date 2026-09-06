@@ -44,18 +44,36 @@ pub struct Product {
     /// a 1080px one we then throw most of away.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
-    /// Largest package download, in bytes. What an install will actually cost.
+    /// What an install will actually cost, counting only the packages that run
+    /// on a desktop. Summing every platform's package instead reports a title
+    /// as twice its size, because most carry an Xbox build too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub download_bytes: Option<u64>,
     /// When the sku last changed, as the service spells it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_update: Option<String>,
-    /// One per package. **This is the update key**: a rebuilt package gets a
-    /// new content id, while `Version` comes back as `"0"` on the anonymous
-    /// endpoint and is worth nothing. Record it at install time and an update
-    /// is "the catalog now lists a content id we do not have".
+    /// The content ids of this title's **Windows desktop** packages, and the
+    /// update key: a rebuilt package gets a new content id, while `Version`
+    /// comes back as `"0"` on the anonymous endpoint and is worth nothing.
+    ///
+    /// Desktop only, and that filter is the whole correctness of update
+    /// detection. Most titles ship a `Windows.Xbox` package beside the desktop
+    /// one, with a different content id; comparing an install against the union
+    /// finds an id it does not have and reports an update that does not exist.
+    /// Measured against three installed titles, the union is wrong on two.
+    ///
+    /// Empty when the catalog lists no desktop package. That is a real answer,
+    /// not a failure -- some titles are Xbox-only -- and it must stay empty
+    /// rather than falling back to every platform, because
+    /// [`crate::install::Record::update_available`] reads empty as "cannot
+    /// tell", which is the truth.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content_ids: Vec<String>,
+    /// Whether the catalog listed any package at all. Lets a caller tell "no
+    /// desktop build exists" from "no packages listed", which read the same
+    /// from `content_ids` alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_packages: bool,
 }
 
 impl Product {
@@ -165,6 +183,25 @@ struct Package {
     content_id: Option<String>,
     #[serde(rename = "MaxDownloadSizeInBytes", default)]
     download_bytes: Option<u64>,
+    #[serde(rename = "PlatformDependencies", default)]
+    platforms: Vec<PlatformDependency>,
+}
+
+#[derive(Deserialize)]
+struct PlatformDependency {
+    #[serde(rename = "PlatformName", default)]
+    name: Option<String>,
+}
+
+/// The only platform whose packages this launcher can install.
+const DESKTOP: &str = "Windows.Desktop";
+
+impl Package {
+    fn is_desktop(&self) -> bool {
+        self.platforms
+            .iter()
+            .any(|p| p.name.as_deref() == Some(DESKTOP))
+    }
 }
 
 /// Purposes worth putting in a list row, best first. Square art comes first
@@ -234,6 +271,7 @@ pub fn parse(json: &str) -> Result<Vec<Product>> {
             let mut content_ids = Vec::new();
             let mut download_bytes = None;
             let mut last_update = None;
+            let mut has_packages = false;
             for sku in &raw.skus {
                 let Some(properties) = sku.sku.as_ref().and_then(|s| s.properties.as_ref()) else {
                     continue;
@@ -242,6 +280,13 @@ pub fn parse(json: &str) -> Result<Vec<Product>> {
                     .take()
                     .or_else(|| properties.last_update.clone());
                 for package in &properties.packages {
+                    has_packages = true;
+                    // Xbox packages are listed beside the desktop one and are a
+                    // different build with a different content id. Counting them
+                    // is what makes an up-to-date title report an update.
+                    if !package.is_desktop() {
+                        continue;
+                    }
                     // Every sku of a title lists the same packages -- a trial
                     // and the full sku point at one build -- so the same content
                     // id turns up repeatedly and only the distinct set means
@@ -267,9 +312,25 @@ pub fn parse(json: &str) -> Result<Vec<Product>> {
                 download_bytes: download_bytes.filter(|b| *b > 0),
                 last_update,
                 content_ids,
+                has_packages,
             })
         })
         .collect())
+}
+
+/// What the cached form of a product means.
+///
+/// Bumped whenever the meaning of a cached field changes, not just its shape.
+/// Version 2 is where `content_ids` became desktop-only: a version-1 file
+/// parses perfectly and is *wrong*, because it holds the union across platforms,
+/// which update detection reads as a permanent pending update. A cache that
+/// survives a change of meaning is worse than no cache.
+const CACHE_SCHEMA: u32 = 2;
+
+#[derive(Serialize, Deserialize)]
+struct CacheEntry {
+    schema: u32,
+    product: Product,
 }
 
 /// A catalog answer kept on disk.
@@ -314,7 +375,10 @@ impl Cache {
     pub fn get(&self, product_id: &str) -> Option<Product> {
         let path = self.entry_path(product_id)?;
         let text = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&text).ok()
+        let entry: CacheEntry = serde_json::from_str(&text).ok()?;
+        // An entry written by a different build is discarded rather than
+        // trusted; the caller treats it as a miss and fetches it again.
+        (entry.schema == CACHE_SCHEMA).then_some(entry.product)
     }
 
     pub fn put(&self, product: &Product) -> Result<()> {
@@ -322,7 +386,11 @@ impl Cache {
             .entry_path(&product.product_id)
             .ok_or_else(|| anyhow!("not a usable product id: {:?}", product.product_id))?;
         std::fs::create_dir_all(&self.dir)?;
-        std::fs::write(path, serde_json::to_vec_pretty(product)?)?;
+        let entry = CacheEntry {
+            schema: CACHE_SCHEMA,
+            product: product.clone(),
+        };
+        std::fs::write(path, serde_json::to_vec_pretty(&entry)?)?;
         Ok(())
     }
 
@@ -373,11 +441,13 @@ mod tests {
           "DisplaySkuAvailabilities": [
             {"Sku": {"SkuId": "0010", "Properties": {
               "LastUpdateDate": "2026-08-28T18:26:01.0000000Z",
-              "Packages": [{"ContentId": "content-a", "MaxDownloadSizeInBytes": 2490064896}]
+              "Packages": [{"ContentId": "content-a", "MaxDownloadSizeInBytes": 2490064896,
+                          "PlatformDependencies": [{"PlatformName": "Windows.Desktop"}]}]
             }}},
             {"Sku": {"SkuId": "0011", "Properties": {
               "LastUpdateDate": "2026-08-28T18:26:01.0000000Z",
-              "Packages": [{"ContentId": "content-a", "MaxDownloadSizeInBytes": 2490064896}]
+              "Packages": [{"ContentId": "content-a", "MaxDownloadSizeInBytes": 2490064896,
+                          "PlatformDependencies": [{"PlatformName": "Windows.Desktop"}]}]
             }}}
           ]
         },
@@ -393,8 +463,10 @@ mod tests {
           }],
           "DisplaySkuAvailabilities": [
             {"Sku": {"Properties": {"Packages": [
-              {"ContentId": "content-b", "MaxDownloadSizeInBytes": 47272595456},
-              {"ContentId": "content-c", "MaxDownloadSizeInBytes": 49074888704}
+              {"ContentId": "content-b", "MaxDownloadSizeInBytes": 47272595456,
+               "PlatformDependencies": [{"PlatformName": "Windows.Desktop"}]},
+              {"ContentId": "content-c", "MaxDownloadSizeInBytes": 49074888704,
+               "PlatformDependencies": [{"PlatformName": "Windows.Xbox"}]}
             ]}}}
           ]
         },
@@ -434,13 +506,65 @@ mod tests {
         assert_eq!(products[0].size_label(), "2.5 GB");
     }
 
-    /// A title split across packages costs the sum to install.
+    /// The case that was wrong, and the reason update detection could not work.
+    ///
+    /// Most titles list an Xbox package beside the desktop one, with its own
+    /// content id and its own size. Counting both reports a title as twice its
+    /// size and, worse, gives update detection an id the install can never have
+    /// -- a permanent "update available" that no download clears. Measured
+    /// against the three titles installed on the development machine, taking
+    /// the union is wrong on two of them.
     #[test]
-    fn several_packages_add_up() {
+    fn an_xbox_package_beside_the_desktop_one_is_not_counted() {
         let products = parse(PAYLOAD).expect("parses");
-        assert_eq!(products[1].content_ids, vec!["content-b", "content-c"]);
-        assert_eq!(products[1].download_bytes, Some(47272595456 + 49074888704));
-        assert_eq!(products[1].size_label(), "96.3 GB");
+        assert_eq!(
+            products[1].content_ids,
+            vec!["content-b"],
+            "the Windows.Xbox package is a different build and is not what gets installed"
+        );
+        assert_eq!(products[1].download_bytes, Some(47272595456));
+        assert_eq!(products[1].size_label(), "47.3 GB");
+        assert!(products[1].has_packages);
+    }
+
+    /// Some titles are Xbox-only. The honest answer is an empty set, which
+    /// update detection reads as "cannot tell" -- never a fallback to every
+    /// platform, which would resurrect the phantom update on every one of them.
+    #[test]
+    fn a_title_with_no_desktop_package_yields_nothing_rather_than_falling_back() {
+        let xbox_only = r#"{"Products":[{
+          "ProductId": "9ZZTESTXBOX1",
+          "LocalizedProperties": [{"ProductTitle": "Console Only"}],
+          "DisplaySkuAvailabilities": [{"Sku": {"Properties": {"Packages": [
+            {"ContentId": "content-x", "MaxDownloadSizeInBytes": 78400000000,
+             "PlatformDependencies": [{"PlatformName": "Windows.Xbox"}]}
+          ]}}}]
+        }]}"#;
+        let products = parse(xbox_only).expect("parses");
+        assert!(products[0].content_ids.is_empty());
+        assert_eq!(
+            products[0].download_bytes, None,
+            "no desktop package, no size"
+        );
+        assert!(
+            products[0].has_packages,
+            "packages exist, just none for this platform -- a caller can tell the two apart"
+        );
+    }
+
+    /// A package that names no platform at all is not assumed to be desktop.
+    #[test]
+    fn a_package_with_no_platform_is_not_guessed_at() {
+        let vague = r#"{"Products":[{
+          "ProductId": "9ZZTESTVAGU1",
+          "LocalizedProperties": [{"ProductTitle": "Unspecified"}],
+          "DisplaySkuAvailabilities": [{"Sku": {"Properties": {"Packages": [
+            {"ContentId": "content-v", "MaxDownloadSizeInBytes": 100}
+          ]}}}]
+        }]}"#;
+        let products = parse(vague).expect("parses");
+        assert!(products[0].content_ids.is_empty());
+        assert!(products[0].has_packages);
     }
 
     #[test]
@@ -507,6 +631,36 @@ mod tests {
             "ids are cased inconsistently between services; the key is not"
         );
         assert!(cache.image_path("../evil", 128).is_none());
+    }
+
+    /// The bug this exists to stop: `content_ids` changed meaning from "every
+    /// platform" to "desktop only". A file written before that change parses
+    /// cleanly and is wrong, and being wrong here is a permanent phantom update
+    /// on most titles.
+    #[test]
+    fn a_cache_entry_from_another_schema_is_a_miss_not_a_wrong_answer() {
+        let dir = std::env::temp_dir().join(format!("xgdk-cache-schema-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("makes the dir");
+        let cache = Cache::new(&dir);
+
+        // Exactly what the previous build wrote: a bare product, no schema.
+        std::fs::write(
+            dir.join("9ZZTESTGAME1.json"),
+            r#"{"product_id":"9ZZTESTGAME1","name":"Old","content_ids":["a","b"]}"#,
+        )
+        .expect("writes");
+        assert_eq!(cache.get("9ZZTESTGAME1"), None, "no schema, so not trusted");
+
+        // And a future one, which this build equally cannot interpret.
+        std::fs::write(
+            dir.join("9ZZTESTGAME2.json"),
+            r#"{"schema":99,"product":{"product_id":"9ZZTESTGAME2","name":"Future"}}"#,
+        )
+        .expect("writes");
+        assert_eq!(cache.get("9ZZTESTGAME2"), None);
+
+        std::fs::remove_dir_all(&dir).expect("cleans up");
     }
 
     #[test]

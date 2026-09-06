@@ -109,15 +109,19 @@ impl Model {
         let runtime = paths
             .as_ref()
             .and_then(|p| InstalledRuntime::discover(p).ok());
-        let records = paths
+        let records: BTreeMap<String, Record> = paths
             .as_ref()
             .map(|p| {
                 install::all(p.state_dir())
                     .into_iter()
+                    // A record for a directory somebody deleted would keep the
+                    // title in Installed and offer it an update.
+                    .filter(|r| !r.is_stale())
                     .map(|r| (r.product_id.to_ascii_uppercase(), r))
                     .collect()
             })
             .unwrap_or_default();
+        let records = adopt_existing(paths.as_ref(), &recipes, records);
 
         // The last listing, and whatever the catalog already knows about it.
         // Both come off disk, so the window opens showing a library instead of
@@ -130,7 +134,7 @@ impl Model {
             .unwrap_or_default();
         let catalog = match (&paths, &ownership) {
             (Some(paths), _) => {
-                let cache = catalog::Cache::new(paths.cache_dir().join("catalog"));
+                let cache = paths.catalog_cache();
                 let mut ids: Vec<String> = match &ownership {
                     Ownership::Known(entries) => entries
                         .iter()
@@ -213,10 +217,17 @@ impl Model {
             .is_some_and(|dir| dir.is_dir())
     }
 
+    /// The version in the package manifest on disk, if the title is there.
+    ///
+    /// A title installed outside this launcher has a version and no record;
+    /// reading it costs one small file and is better than showing "Installed".
+    pub fn installed_version(&self, recipe: &Recipe) -> Option<String> {
+        let dir = self.paths.as_ref()?.install_dir(recipe).ok()?;
+        install::package_version(&dir)
+    }
+
     pub fn catalog_cache(&self) -> Option<Cache> {
-        self.paths
-            .as_ref()
-            .map(|p| Cache::new(p.cache_dir().join("catalog")))
+        self.paths.as_ref().map(Paths::catalog_cache)
     }
 
     pub fn cache_dir(&self) -> Option<&Path> {
@@ -236,20 +247,14 @@ impl Model {
         self.recipes.iter().find(|r| r.matches(product_id))
     }
 
-    /// The market and language the catalog is asked in. Overridable, because a
-    /// title reads better in its own and the ids are the same either way.
+    /// The market and language the catalog is asked in.
     pub fn market(&self) -> (String, String) {
-        let var = |name: &str, fallback: &str| {
-            self.paths
-                .as_ref()
-                .and_then(|p| p.var(name))
-                .unwrap_or(fallback)
-                .to_string()
-        };
-        (
-            var("XGDK_MARKET", catalog::DEFAULT_MARKET),
-            var("XGDK_LANGUAGE", catalog::DEFAULT_LANGUAGE),
-        )
+        self.paths.as_ref().map(Paths::market).unwrap_or_else(|| {
+            (
+                catalog::DEFAULT_MARKET.to_string(),
+                catalog::DEFAULT_LANGUAGE.to_string(),
+            )
+        })
     }
 }
 
@@ -265,4 +270,38 @@ fn existing_icons(cache: &Cache, catalog: &BTreeMap<String, Product>) -> BTreeMa
                 .map(|path| (key.clone(), path))
         })
         .collect()
+}
+
+/// Record titles that are installed but were never recorded.
+///
+/// Silent and automatic, because it is exact rather than assumed: the content
+/// id comes out of the package header the client left on disk, so there is
+/// nothing to ask and nothing to get wrong. A title whose header cannot be read
+/// is left alone -- no record is better than one that answers "up to date" to a
+/// question it cannot answer.
+fn adopt_existing(
+    paths: Option<&Paths>,
+    recipes: &[Recipe],
+    mut records: BTreeMap<String, Record>,
+) -> BTreeMap<String, Record> {
+    let Some(paths) = paths else { return records };
+    for recipe in recipes {
+        let key = recipe.title.product_id.to_ascii_uppercase();
+        if records.contains_key(&key) {
+            continue;
+        }
+        let Ok(dir) = paths.install_dir(recipe) else {
+            continue;
+        };
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Some(record) = install::adopt(&recipe.title.product_id, &dir) {
+            // Best effort: an unwritable state directory costs the adoption
+            // next time, not this listing.
+            let _ = install::save(paths.state_dir(), &record);
+            records.insert(key, record);
+        }
+    }
+    records
 }

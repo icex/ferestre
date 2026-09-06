@@ -75,6 +75,11 @@ struct TitleView {
     pub badge: &'static str,
     pub badge_css: &'static str,
     pub subtitle: String,
+    /// The runtime's doubt about this title, when it has one. Kept apart from
+    /// the subtitle so a caller that has something else to say can say both --
+    /// losing "this may not start" to make room for "up to date" would be an
+    /// unfortunate trade.
+    pub caution: Option<String>,
     pub action: Action,
 }
 
@@ -134,6 +139,11 @@ pub struct Inputs<'a> {
     /// answer is a filesystem probe, and keeping it out of here is what lets a
     /// test describe a half-installed machine in one line.
     pub installed: &'a dyn Fn(&Recipe) -> bool,
+    /// The version in the package manifest on disk, when there is one. Read
+    /// separately from the record because a title installed outside this
+    /// launcher has a version and no record, and showing "Installed" when the
+    /// tree plainly says 1.26.4501.0 is throwing away an answer we have.
+    pub installed_version: &'a dyn Fn(&Recipe) -> Option<String>,
 }
 
 /// Work out the button and the words for one recipe.
@@ -145,9 +155,9 @@ pub struct Inputs<'a> {
 fn row(inputs: &Inputs, recipe: &Recipe) -> TitleView {
     let (badge, badge_css) = state_label(recipe.status.state);
     let (action, caution) = action_for(inputs, recipe);
-    let subtitle = match (&action, caution) {
+    let subtitle = match (&action, &caution) {
         (Action::Blocked(reason), _) => reason.clone(),
-        (_, Some(caution)) => caution,
+        (_, Some(caution)) => caution.clone(),
         // Not the state text: the badge already carries that, and the summary
         // is the line someone actually wants before pressing the button.
         _ => recipe.status.summary.clone(),
@@ -159,6 +169,7 @@ fn row(inputs: &Inputs, recipe: &Recipe) -> TitleView {
         badge,
         badge_css,
         subtitle,
+        caution,
         action,
     }
 }
@@ -180,15 +191,24 @@ fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
         return blocked(why);
     }
 
-    if inputs.ownership.owns(&recipe.title.product_id) == Some(false) {
-        return blocked("this account does not own it".into());
-    }
+    // Absence from the library listing is a caution, not a refusal.
+    //
+    // The listing is not exhaustive, and that is not a guess: Clair Obscur:
+    // Expedition 33 is installed, licensed and launches on this machine, and
+    // does not appear in the 124 entitlements collections returns for the
+    // account that owns it. Refusing to launch an installed title on that
+    // evidence would be the launcher calling its owner a liar and being wrong.
+    // A download for something genuinely unowned fails at the licence step
+    // anyway, which teaches the same lesson at the right moment.
+    let mut caution = match inputs.ownership.owns(&recipe.title.product_id) {
+        Some(false) => Some("not in this account's library listing".to_string()),
+        _ => None,
+    };
 
     let Some(runtime) = inputs.runtime else {
         return blocked("install the patched runtime first".into());
     };
 
-    let mut caution = None;
     let assessment = runtime::assess(recipe, runtime, inputs.registry);
     if !assessment.is_satisfied() {
         // `assess` writes a paragraph for a terminal. A row gets one line.
@@ -201,7 +221,10 @@ fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
         if assessment.source.is_published() {
             return blocked(line);
         }
-        caution = Some(line);
+        caution = Some(match caution {
+            Some(first) => format!("{first}  ·  {line}"),
+            None => line,
+        });
     }
 
     let action = if (inputs.installed)(recipe) {
@@ -307,9 +330,8 @@ fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
     let view = row(inputs, recipe);
     let product = inputs.catalog.get(key);
     let installed = (inputs.installed)(recipe);
-    let update = inputs
-        .records
-        .get(key)
+    let record = inputs.records.get(key);
+    let update = record
         .zip(product)
         .and_then(|(record, product)| record.update_available(&product.content_ids));
 
@@ -320,12 +342,30 @@ fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
         (action, _) => action.clone(),
     };
 
+    // An installed title says what it is and whether that is current. Without
+    // this, "we cannot tell" draws exactly like "up to date" -- the same row,
+    // the same button -- and silence reads as reassurance.
+    let subtitle = match (&action, installed) {
+        (Action::Blocked(_), _) => view.subtitle,
+        (_, true) => {
+            let on_disk = (inputs.installed_version)(recipe);
+            let status = installed_status(record, product, update, on_disk.as_deref());
+            // Both, not either. The caution says whether it will start; the
+            // status says whether it is current. Neither answers the other.
+            match &view.caution {
+                Some(caution) => format!("{status}  ·  {caution}"),
+                None => status,
+            }
+        }
+        _ => view.subtitle,
+    };
+
     LibraryRow {
         product_id: recipe.title.product_id.clone(),
         name: product
             .map(|p| p.name.clone())
             .unwrap_or_else(|| recipe.title.name.clone()),
-        subtitle: view.subtitle,
+        subtitle,
         badge: Some((view.badge, view.badge_css)),
         image: product.and_then(|p| p.image.clone()),
         owned: false,
@@ -333,6 +373,38 @@ fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
         installed,
         update,
         action,
+    }
+}
+
+/// What to say under an installed title's name.
+///
+/// The three states are deliberately distinguishable in words, because they are
+/// not distinguishable in the button: only "update available" changes it, and
+/// the other two must not both read as "you are fine".
+fn installed_status(
+    record: Option<&Record>,
+    product: Option<&Product>,
+    update: Option<bool>,
+    on_disk: Option<&str>,
+) -> String {
+    // The record first, because it is what the comparison is against; the disk
+    // second, because a title installed outside this launcher still has one.
+    let version = record
+        .and_then(|r| r.package_version.as_deref())
+        .or(on_disk)
+        .map(|v| format!("Version {v}"))
+        .unwrap_or_else(|| "Installed".to_string());
+
+    match update {
+        Some(true) => format!("{version}  ·  update available"),
+        Some(false) => format!("{version}  ·  up to date"),
+        None if record.is_none() => {
+            format!("{version}  ·  not recorded, so updates cannot be checked")
+        }
+        None if product.is_none() => format!("{version}  ·  check the library to see updates"),
+        // The catalog answered and listed no desktop package to compare
+        // against -- an Xbox-only title, or one no longer sold.
+        None => format!("{version}  ·  no desktop package listed, so updates cannot be checked"),
     }
 }
 
@@ -553,6 +625,7 @@ mod tests {
             catalog: empty_catalog(),
             records: empty_records(),
             installed,
+            installed_version: NO_VERSION_ON_DISK,
         }
     }
 
@@ -575,6 +648,7 @@ mod tests {
             download_bytes: Some(2_490_064_896),
             last_update: None,
             content_ids: content_ids.iter().map(|s| s.to_string()).collect(),
+            has_packages: !content_ids.is_empty(),
         }
     }
 
@@ -591,11 +665,14 @@ mod tests {
             dir: PathBuf::from("/games/test"),
             content_ids: content_ids.iter().map(|s| s.to_string()).collect(),
             installed_at: None,
+            package_version: Some("1.26.4501.0".into()),
         }
     }
 
     const NOTHING_INSTALLED: &dyn Fn(&Recipe) -> bool = &|_| false;
     const ALL_INSTALLED: &dyn Fn(&Recipe) -> bool = &|_| true;
+    /// Most tests describe machines where nothing wrote a manifest.
+    const NO_VERSION_ON_DISK: &dyn Fn(&Recipe) -> Option<String> = &|_| None;
 
     #[test]
     fn a_playable_installed_title_plays() {
@@ -608,7 +685,12 @@ mod tests {
             rows[0].action.command("9ZZTESTGAME1"),
             Some(["run", "9ZZTESTGAME1"])
         );
-        assert_eq!(rows[0].subtitle, "a summary");
+        assert!(
+            rows[0].subtitle.contains("cannot be checked"),
+            "an installed title with nothing recorded about it says so, rather than \
+             looking identical to one known to be current: {}",
+            rows[0].subtitle
+        );
     }
 
     #[test]
@@ -717,9 +799,10 @@ mod tests {
         assert!(!rows[0].subtitle.contains('\n'));
     }
 
-    /// A satisfied runtime shows the recipe's own summary, not a caution.
+    /// A satisfied runtime raises no caution, so nothing is appended to what the
+    /// row would otherwise say.
     #[test]
-    fn a_satisfied_runtime_shows_the_recipe_summary() {
+    fn a_satisfied_runtime_adds_no_caution() {
         let recipes = vec![recipe(
             "9ZZTESTGAME1",
             "playable",
@@ -729,12 +812,61 @@ mod tests {
         let own = Ownership::Unknown;
         let rows = library(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
         assert_eq!(rows[0].action, Action::Play);
+        assert!(
+            !rows[0].subtitle.contains("could not be found"),
+            "{}",
+            rows[0].subtitle
+        );
+
+        // Not installed: no version to report, so the recipe's summary shows.
+        let rows = library(&inputs(&recipes, Some(&rt), &own, NOTHING_INSTALLED));
         assert_eq!(rows[0].subtitle, "a summary");
     }
 
-    /// An unasked library must not read as "you do not own this".
+    /// An installed title can be both out of date and doubtful about starting.
+    /// Reporting one and dropping the other loses what the other cannot supply.
     #[test]
-    fn ownership_only_blocks_once_the_library_is_known() {
+    fn a_cautioned_install_reports_its_version_and_the_caution() {
+        let recipes = vec![recipe(
+            "9ZZTESTGAME1",
+            "playable",
+            &["loader.memfd-main-image"],
+        )];
+        let rt = runtime_with(&[], CapabilitySource::Probed);
+        let own = Ownership::Unknown;
+        let cat = catalog(vec![product("9ZZTESTGAME1", "Test Game", &["content-b"])]);
+        let recs: BTreeMap<String, Record> = [(
+            "9ZZTESTGAME1".to_string(),
+            record("9ZZTESTGAME1", &["content-a"]),
+        )]
+        .into();
+        let rows = library(&Inputs {
+            recipes: &recipes,
+            runtime: Some(&rt),
+            registry: None,
+            ownership: &own,
+            catalog: &cat,
+            records: &recs,
+            installed: ALL_INSTALLED,
+            installed_version: NO_VERSION_ON_DISK,
+        });
+        assert_eq!(rows[0].action, Action::Update);
+        assert!(
+            rows[0].subtitle.contains("update available"),
+            "{}",
+            rows[0].subtitle
+        );
+        assert!(
+            rows[0].subtitle.contains("could not be found"),
+            "{}",
+            rows[0].subtitle
+        );
+    }
+
+    /// An unasked library must not read as "you do not own this", and a library
+    /// that was asked and came back without the title must not either.
+    #[test]
+    fn absence_from_the_library_cautions_rather_than_refuses() {
         let recipes = vec![recipe("9ZZTESTGAME1", "playable", &[])];
         let rt = runtime_with(&[], CapabilitySource::Manifest);
 
@@ -744,17 +876,31 @@ mod tests {
             Action::Play
         );
 
+        // Not a refusal: the collections listing is demonstrably not
+        // exhaustive -- a title installed and licensed on the development
+        // machine is absent from it -- so blocking a launch on that evidence
+        // would be wrong about something the owner can see is wrong.
         let elsewhere = Ownership::Known(entries(&["9ZZTESTOTHR"]));
-        assert_eq!(
-            library(&inputs(&recipes, Some(&rt), &elsewhere, ALL_INSTALLED))[0].action,
-            Action::Blocked("this account does not own it".into())
+        let row = &library(&inputs(&recipes, Some(&rt), &elsewhere, NOTHING_INSTALLED))[0];
+        assert_eq!(row.action, Action::Install, "still offered, not refused");
+        assert!(
+            row.subtitle
+                .contains("not in this account's library listing"),
+            "but it says so: {}",
+            row.subtitle
         );
 
         let owned = Ownership::Known(entries(&["9zztestgame1"]));
+        let row = &library(&inputs(&recipes, Some(&rt), &owned, ALL_INSTALLED))[0];
         assert_eq!(
-            library(&inputs(&recipes, Some(&rt), &owned, ALL_INSTALLED))[0].action,
+            row.action,
             Action::Play,
             "the join is case-insensitive, as it is in the CLI"
+        );
+        assert!(
+            !row.subtitle.contains("library listing"),
+            "{}",
+            row.subtitle
         );
     }
 
@@ -796,6 +942,7 @@ mod tests {
             catalog: &cat,
             records: &recs,
             installed: ALL_INSTALLED,
+            installed_version: NO_VERSION_ON_DISK,
         });
 
         let by_id: BTreeMap<&str, &LibraryRow> =
@@ -845,6 +992,7 @@ mod tests {
             catalog: &cat,
             records: &recs,
             installed: ALL_INSTALLED,
+            installed_version: NO_VERSION_ON_DISK,
         });
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["aardvark", "Zebra", "9ZZTESTNEW3"]);
@@ -869,6 +1017,7 @@ mod tests {
             catalog: &cat,
             records: &recs,
             installed: ALL_INSTALLED,
+            installed_version: NO_VERSION_ON_DISK,
         });
         assert_eq!(rows[0].action, Action::Update);
         assert_eq!(rows[0].update, Some(true));
@@ -894,9 +1043,93 @@ mod tests {
             catalog: &cat,
             records: &recs,
             installed: ALL_INSTALLED,
+            installed_version: NO_VERSION_ON_DISK,
         });
         assert_eq!(rows[0].update, None);
         assert_eq!(rows[0].action, Action::Play, "not nagged, not hidden");
+    }
+
+    /// The failure this guards against: "we cannot tell" and "up to date" draw
+    /// the same row and the same button, so if they also read the same, silence
+    /// becomes reassurance.
+    #[test]
+    fn the_three_update_states_read_differently() {
+        let up_to_date = installed_status(
+            Some(&record("9ZZTESTGAME1", &["content-a"])),
+            Some(&product("9ZZTESTGAME1", "T", &["content-a"])),
+            Some(false),
+            None,
+        );
+        let stale = installed_status(
+            Some(&record("9ZZTESTGAME1", &["content-a"])),
+            Some(&product("9ZZTESTGAME1", "T", &["content-b"])),
+            Some(true),
+            None,
+        );
+        let unrecorded = installed_status(
+            None,
+            Some(&product("9ZZTESTGAME1", "T", &["content-a"])),
+            None,
+            None,
+        );
+        let no_desktop_package = installed_status(
+            Some(&record("9ZZTESTGAME1", &["content-a"])),
+            Some(&product("9ZZTESTGAME1", "T", &[])),
+            None,
+            None,
+        );
+
+        assert!(up_to_date.contains("up to date"), "{up_to_date}");
+        assert!(stale.contains("update available"), "{stale}");
+        assert!(unrecorded.contains("cannot be checked"), "{unrecorded}");
+        assert!(
+            no_desktop_package.contains("no desktop package"),
+            "{no_desktop_package}"
+        );
+
+        let all = [&up_to_date, &stale, &unrecorded, &no_desktop_package];
+        let distinct: BTreeSet<&String> = all.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            4,
+            "no two states may read the same: {all:?}"
+        );
+    }
+
+    /// A title installed outside this launcher has a version on disk and no
+    /// record. Showing "Installed" when the tree plainly says 9.9.9.9 throws
+    /// away an answer we already have.
+    #[test]
+    fn the_version_falls_back_to_the_one_on_disk() {
+        let from_disk = installed_status(None, None, None, Some("9.9.9.9"));
+        assert!(from_disk.starts_with("Version 9.9.9.9"), "{from_disk}");
+        assert!(from_disk.contains("cannot be checked"), "{from_disk}");
+
+        // The record wins when there is one: it is what the comparison is against.
+        let recorded = installed_status(
+            Some(&record("9ZZTESTGAME1", &["content-a"])),
+            Some(&product("9ZZTESTGAME1", "T", &["content-a"])),
+            Some(false),
+            Some("9.9.9.9"),
+        );
+        assert!(recorded.starts_with("Version 1.26.4501.0"), "{recorded}");
+    }
+
+    /// The version is what a person recognises; without a record there is none
+    /// to show, and the row must not pretend otherwise.
+    #[test]
+    fn an_installed_title_shows_the_version_it_recorded() {
+        let with = installed_status(
+            Some(&record("9ZZTESTGAME1", &["content-a"])),
+            Some(&product("9ZZTESTGAME1", "T", &["content-a"])),
+            Some(false),
+            None,
+        );
+        assert!(with.starts_with("Version 1.26.4501.0"), "{with}");
+
+        let without = installed_status(None, None, None, None);
+        assert!(without.starts_with("Installed"), "{without}");
+        assert!(!without.contains("Version"), "{without}");
     }
 
     // --- search and pagination --------------------------------------------

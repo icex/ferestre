@@ -288,7 +288,7 @@ fn render_runtime(ui: &Ui, page: &adw::PreferencesPage) {
         install.connect_clicked(glib::clone!(
             #[strong]
             ui,
-            move |_| spawn_cli(&ui, &["install-runtime"])
+            move |_| spawn_cli_tracked(&ui, &["install-runtime"], "Building the runtime")
         ));
         row.add_suffix(&install);
     }
@@ -333,6 +333,7 @@ struct Drawn {
 
 fn draw_list(model: &Model, keep: impl Fn(&LibraryRow) -> bool) -> Drawn {
     let installed = |r: &Recipe| model.is_installed(r);
+    let installed_version = |r: &Recipe| model.installed_version(r);
     let rows: Vec<LibraryRow> = model::library(&Inputs {
         recipes: &model.recipes,
         runtime: model.runtime.as_ref(),
@@ -341,6 +342,7 @@ fn draw_list(model: &Model, keep: impl Fn(&LibraryRow) -> bool) -> Drawn {
         catalog: &model.catalog,
         records: &model.records,
         installed: &installed,
+        installed_version: &installed_version,
     })
     .into_iter()
     .filter(|row| keep(row))
@@ -543,12 +545,24 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
                 .map(|s| s.to_string())
                 .collect();
             button.set_tooltip_text(Some(&format!("xgdk {}", args.join(" "))));
+            // Launching a game is fire-and-forget: it runs for hours and the
+            // window has nothing to update when it ends. Installing is not --
+            // it changes what every row says about itself.
+            let waits = matches!(row.action, Action::Install | Action::Update);
+            let what = match row.action {
+                Action::Update => format!("Updating {}", row.name),
+                _ => format!("Installing {}", row.name),
+            };
             button.connect_clicked(glib::clone!(
                 #[strong]
                 ui,
                 move |_| {
                     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-                    spawn_cli(&ui, &borrowed);
+                    if waits {
+                        spawn_cli_tracked(&ui, &borrowed, &what);
+                    } else {
+                        spawn_cli(&ui, &borrowed);
+                    }
                 }
             ));
         }
@@ -624,6 +638,58 @@ fn spawn_cli(ui: &Ui, args: &[&str]) {
             .toasts
             .add_toast(adw::Toast::new(&format!("{}: {e}", program.display()))),
     }
+}
+
+/// Run `xgdk` and wait for it, then reload.
+///
+/// For work that changes what the window shows -- an install, an update, the
+/// runtime -- as opposed to launching a game, which runs for hours and must not
+/// hold anything. Waiting is the point: an install that finishes and leaves the
+/// row saying "not recorded" looks like it failed.
+fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
+    if !begin(ui) {
+        ui.toasts
+            .add_toast(adw::Toast::new("Something is already running"));
+        return;
+    }
+    let program = cli_binary();
+    let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    ui.toasts
+        .add_toast(adw::Toast::new(&format!("{what} — this can take a while")));
+
+    let ui = ui.clone();
+    let what = what.to_string();
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || {
+            std::process::Command::new(&program)
+                .args(&owned)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .map_err(|e| format!("{}: {e}", program.display()))
+        })
+        .await;
+        finish(&ui);
+        match result {
+            Ok(Ok(status)) if status.success() => {
+                // The record was written by the child, so the window has to
+                // re-read it before it can say anything different.
+                ui.model.borrow_mut().reload();
+                render(&ui);
+                ui.toasts
+                    .add_toast(adw::Toast::new(&format!("{what} finished")));
+            }
+            Ok(Ok(status)) => {
+                ui.model.borrow_mut().reload();
+                render(&ui);
+                ui.toasts
+                    .add_toast(adw::Toast::new(&format!("{what} exited {status}")))
+            }
+            Ok(Err(e)) => ui.toasts.add_toast(adw::Toast::new(&e)),
+            Err(_) => ui
+                .toasts
+                .add_toast(adw::Toast::new(&format!("{what}: the process crashed"))),
+        }
+    });
 }
 
 fn open_editor(ui: &Ui, product_id: &str, name: &str) {

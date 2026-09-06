@@ -354,6 +354,27 @@ impl Paths {
         dirs
     }
 
+    /// The market and language the catalog is asked in.
+    ///
+    /// Only decides which name and art come back; every market has the same
+    /// product ids. Lives here rather than in each caller so the CLI and the
+    /// window cannot ask for different ones and cache over each other.
+    pub fn market(&self) -> (String, String) {
+        (
+            self.var("XGDK_MARKET")
+                .unwrap_or(crate::catalog::DEFAULT_MARKET)
+                .to_string(),
+            self.var("XGDK_LANGUAGE")
+                .unwrap_or(crate::catalog::DEFAULT_LANGUAGE)
+                .to_string(),
+        )
+    }
+
+    /// Where catalog answers and art are kept.
+    pub fn catalog_cache(&self) -> crate::catalog::Cache {
+        crate::catalog::Cache::new(self.cache.join("catalog"))
+    }
+
     pub fn cache_dir(&self) -> &Path {
         &self.cache
     }
