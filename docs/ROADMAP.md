@@ -46,7 +46,30 @@ understand.
 - Publish versioned tarballs that install as a Steam compatibility tool, so the
   runtime is useful on its own before any launcher exists.
 
+## A constraint that rules out the obvious approach
+
+Modern Linux launchers (Heroic, Lutris) run Proton through
+[umu-launcher](https://github.com/Open-Wine-Components/umu-launcher), which
+executes inside a Steam Runtime container via pressure-vessel. **That cannot
+work here**, and it was tested rather than assumed: the entry point was invoked
+directly, bypassing umu's downloader so the result is about pressure-vessel
+itself, and **inherited file descriptors do not survive the container layer**.
+
+A GDK title's executable only exists decrypted inside a memfd passed to Wine as
+an inherited fd. Lose the fd, lose the executable — for every title, not as an
+edge case. So the launcher must invoke the runtime directly, and the runtime
+tarball must carry what it needs (a full ffmpeg included) rather than relying on
+a container to supply it.
+
 ## Phase 2 — the launcher
+
+Shape: a **CLI core with a GUI over it**, the split legendary/Heroic uses. The
+CLI subsumes the thirteen shell scripts in `scripts/` into one binary with
+subcommands, which is also the only way CI can test a launch path at all.
+
+The largest genuinely missing piece is **enumerating what an account owns** —
+minting a token for the collections relying party and joining entitlements
+against product ids. Everything else exists in some form.
 
 Smallest useful version, in order:
 
@@ -67,6 +90,21 @@ Two decisions worth stating up front:
 - **The client is carried, not assumed.** Because launching requires the
   decrypt path, "install Xodus separately" is not a real option for an end user.
 
+### Per-title configuration as data
+
+Adding a title today means editing five places, which is what caps this at three
+titles. Replace it with one `titles/<store-product-id>.toml` per title — the
+product id is the identifier a user actually has, since it is in the Store URL.
+
+Do **not** pin a Proton version per title. Ship a generated capability list with
+the runtime (`loader.memfd-main-image`, `appmodel.package-identity`, and so on)
+and have a title declare the capabilities it needs. That way a title keeps
+working across runtime updates instead of being frozen to one build.
+
+Turn the twelve symptom/cause/fix rows in `docs/RECIPES.md` into a
+fingerprint file the runner consults automatically on a failed launch, so a new
+title diagnoses itself rather than needing someone who remembers.
+
 ## Phase 3 — packaging
 
 - AUR first: the development platform is Arch-based and it is the cheapest way
@@ -74,6 +112,17 @@ Two decisions worth stating up front:
 - AppImage or Flatpak for everyone else. Whether a public Flatpak remote is
   appropriate is a posture decision, not a technical one — see below.
 - The runtime is downloaded, never bundled into the launcher package.
+
+Three independently versioned release trains: the launcher (small, frequent),
+the runtime (~264 MiB compressed, when Wine or the GDK DLL changes), and title
+recipes (continuously, community-contributed).
+
+**CI is affordable.** Measured against the upstream Proton fork's own workflow:
+a warm-cache build completed on free public runners in ~35 minutes, and a cold
+build in ~1h12m. A self-hosted runner is a nice-to-have for a GPU smoke test,
+not a requirement to build at all. Building from forked repositories rather than
+applying a directory of loose patches removes a whole class of "the patch no
+longer applies" breakage.
 
 ## Phase 4 — showing it works
 
