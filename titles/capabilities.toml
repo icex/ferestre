@@ -91,7 +91,10 @@ name = "winrt.regionpolicyevaluator"
 summary = "Windows.Internal.System.Profile.RegionPolicyEvaluator is activatable, hosted in windows.system.profile.systemid.dll."
 provided-by = ["patches/wine/0004-regionpolicyevaluator-winrt-class.patch"]
 symptom-if-missing = "RoGetActivationFactory fails for that class and the title then throws on a fiber: \"frame is not in stack limits\""
-note = "A fresh prefix registers the class; an existing prefix needs its ActivatableClassId added by hand."
+note = "Registering it is a separate job from implementing it: Proton copies new prefixes from a default baked at runtime-build time, so a class added later is missing from every prefix made since. The launcher adds what is missing before a launch."
+winrt-classes = [
+    { class = "Windows.Internal.System.Profile.RegionPolicyEvaluator", dll = "windows.system.profile.systemid.dll" },
+]
 verify = [
     { file = "files/lib/wine/x86_64-windows/windows.system.profile.systemid.dll", contains = "RegionPolicyEvaluator" },
 ]

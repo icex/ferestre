@@ -25,6 +25,7 @@ pub mod paths;
 pub mod recipe;
 pub mod runtime;
 pub mod steam;
+pub mod winrt;
 
 pub use recipe::{Recipe, Status, TitleState};
 

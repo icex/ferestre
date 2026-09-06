@@ -301,6 +301,18 @@ pub struct CapabilityInfo {
     pub provided_by: Vec<String>,
     #[serde(default)]
     pub note: Option<String>,
+    /// WinRT runtime classes this capability makes activatable, and the dll
+    /// that hosts each. Implementing a class is only half of it: a class the
+    /// prefix has never been told about cannot be activated, however complete
+    /// the code behind it. See [`crate::winrt`].
+    #[serde(default, rename = "winrt-classes")]
+    pub winrt_classes: Vec<WinrtClass>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct WinrtClass {
+    pub class: String,
+    pub dll: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -333,6 +345,19 @@ impl Registry {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         Self::parse(&text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+    }
+
+    /// Every WinRT class the registry says the runtime can host, whether or not
+    /// this build actually provides it. Deliberately not filtered by what the
+    /// runtime advertises: registering a class whose dll is absent costs a
+    /// registry key nobody reads, and *not* registering one that is present
+    /// costs a title that cannot start.
+    pub fn winrt_classes(&self) -> Vec<crate::winrt::Class> {
+        self.by_name
+            .values()
+            .flat_map(|capability| capability.winrt_classes.iter())
+            .map(|c| crate::winrt::Class::new(&c.class, &c.dll))
+            .collect()
     }
 
     pub fn get(&self, name: &str) -> Option<&CapabilityInfo> {

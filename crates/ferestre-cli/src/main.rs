@@ -36,6 +36,7 @@ use ferestre_core::library;
 use ferestre_core::paths::Paths;
 use ferestre_core::recipe::Recipe;
 use ferestre_core::runtime::{self, Assessment, InstalledRuntime, Registry};
+use ferestre_core::winrt;
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -437,6 +438,14 @@ fn cmd_run(
         eprintln!("{line}");
     }
 
+    // Before anything is started: a runtime class the prefix has never been told
+    // about cannot be activated, however complete the implementation. Cheap when
+    // there is nothing to do -- reading one file -- and it is the difference
+    // between a patched runtime working and merely existing.
+    if let Some(registry) = &registry {
+        register_winrt_classes(&paths, recipe, registry, &runtime);
+    }
+
     let dirs = launch_dirs(&paths)?;
     let options = launch::Options {
         steam_integration: steam,
@@ -726,6 +735,62 @@ fn cmd_uninstall(
         eprintln!("   the files are still in {}", dir.display());
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Tell the prefix about the WinRT classes this runtime hosts.
+///
+/// Best effort on purpose: a class that cannot be registered is a title that
+/// may still run, and failing a launch over it would trade a definite loss for
+/// a possible one. What it must not do is stay quiet -- if a title then dies in
+/// `RoGetActivationFactory`, the reason is on screen above it.
+fn register_winrt_classes(
+    paths: &Paths,
+    recipe: &Recipe,
+    registry: &Registry,
+    runtime: &InstalledRuntime,
+) {
+    let classes = registry.winrt_classes();
+    if classes.is_empty() {
+        return;
+    }
+    let Ok(prefix) = paths.prefix_dir(recipe) else {
+        return;
+    };
+    // A prefix that does not exist yet is about to be created from the default
+    // one, and that copy would overwrite anything written now.
+    if !winrt::registry_path(&prefix).is_file() {
+        return;
+    }
+    let missing = winrt::missing_in_prefix(&prefix, &classes);
+    if missing.is_empty() {
+        return;
+    }
+
+    for class in missing {
+        let status = Command::new(runtime.path.join("files/bin/wine"))
+            .args([
+                "reg",
+                "add",
+                &class.key(),
+                "/v",
+                "DllPath",
+                "/d",
+                &class.dll_path(),
+                "/f",
+            ])
+            .env("WINEPREFIX", prefix.join("pfx"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        match status {
+            Ok(status) if status.success() => {
+                eprintln!("-- registered {} with the prefix", class.name)
+            }
+            Ok(status) => eprintln!("-- could not register {}: reg exited {status}", class.name),
+            Err(e) => eprintln!("-- could not register {}: {e}", class.name),
+        }
+    }
 }
 
 /// Describe an installed title from its own package, if it is installed and the
