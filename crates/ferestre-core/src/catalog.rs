@@ -109,13 +109,13 @@ impl Product {
         Some(format.eq_ignore_ascii_case(RUNNABLE_FORMAT))
     }
 
-    /// A size to show, or an empty string. Powers of ten, like a store page:
-    /// nobody comparing "47 GB" against their free space means gibibytes.
+    /// A size to show, or an empty string when the catalog gave none. The empty
+    /// string is the point: a row says nothing about a size it does not know,
+    /// rather than saying zero.
     pub fn size_label(&self) -> String {
         match self.download_bytes {
             None | Some(0) => String::new(),
-            Some(b) if b >= 1_000_000_000 => format!("{:.1} GB", b as f64 / 1e9),
-            Some(b) => format!("{} MB", b / 1_000_000),
+            Some(b) => crate::human_bytes(b),
         }
     }
 }

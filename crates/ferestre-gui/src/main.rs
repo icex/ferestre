@@ -23,7 +23,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use ferestre_core::recipe::Recipe;
-use ferestre_core::{account, catalog, gamepass, steam};
+use ferestre_core::{account, catalog, gamepass, library, steam};
 use model::{Action, Inputs, LibraryRow, Ownership};
 use state::{Model, Section, AVATAR_PX, ICON_PX, PER_PAGE};
 
@@ -64,8 +64,45 @@ fn main() -> glib::ExitCode {
     app.run()
 }
 
+/// Let a window run from a source checkout find its own icon.
+///
+/// An installed copy gets it from the icon theme, because the package puts it
+/// there. A `cargo run` gets nothing, and the shell draws a letter tile -- for
+/// a project whose icon is the thing its name is a joke about, that is a poor
+/// first impression and it took someone reporting it to notice.
+///
+/// Adds the checkout's icon directory to the theme's search path when the
+/// binary is sitting in a `target/` directory with one above it. Silent when
+/// there is nothing there, which is every installed run.
+fn add_source_icon_path(display: &gdk::Display) {
+    let Some(exe) = std::env::current_exe().ok() else {
+        return;
+    };
+    // target/debug/ferestre-gui -> the checkout root.
+    let Some(root) = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+    else {
+        return;
+    };
+    let icons = root.join("packaging/icons");
+    if icons.join("hicolor/scalable/apps").is_dir() {
+        gtk::IconTheme::for_display(display).add_search_path(&icons);
+    }
+}
+
 fn build_ui(app: &adw::Application) {
     let model = Rc::new(RefCell::new(Model::load()));
+
+    if let Some(display) = gdk::Display::default() {
+        add_source_icon_path(&display);
+    }
+    // Without this the shell has no icon to draw and falls back to a generated
+    // letter tile. The name is the application id, which is what the packaging
+    // installs the SVG as. Set here rather than in `main`, because it goes
+    // through GTK and GTK is not initialised until the application activates.
+    gtk::Window::set_default_icon_name(APP_ID);
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -391,6 +428,7 @@ fn draw_list(
     let installed = |r: &Recipe| model.is_installed(r);
     let installed_version = |r: &Recipe| model.installed_version(r);
     let installed_product = |id: &str| model.product_is_installed(id);
+    let describes_itself = |id: &str| model.product_executable(id).is_some();
     let inputs = Inputs {
         recipes: &model.recipes,
         runtime: model.runtime.as_ref(),
@@ -404,6 +442,7 @@ fn draw_list(
         installed: &installed,
         installed_version: &installed_version,
         installed_product: &installed_product,
+        product_describes_itself: &describes_itself,
         running: &running,
     };
     // The Game Pass section is a different list, not a filter over the same
@@ -673,6 +712,26 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
         action_row.add_suffix(&badge);
     }
 
+    // Anything on disk can be removed, recipe or not -- and the rows that most
+    // need it are the ones with no recipe, because a failed install leaves
+    // exactly that and there was previously no way to say so.
+    if row.installed {
+        let remove = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .tooltip_text("Remove this title from disk")
+            .build();
+        let product_id = row.product_id.clone();
+        let name = row.name.clone();
+        remove.connect_clicked(glib::clone!(
+            #[strong]
+            ui,
+            move |_| confirm_remove(&ui, &product_id, &name)
+        ));
+        action_row.add_suffix(&remove);
+    }
+
     // A shortcut needs something to point at, which means a recipe.
     if row.has_recipe {
         let to_steam = gtk::Button::builder()
@@ -815,9 +874,198 @@ fn render_account_button(ui: &Ui) {
     ui.account_button.set_child(Some(&content));
     ui.account_button
         .set_tooltip_text(Some(match &model.account {
-            Some(_) => "Load what this account owns",
+            Some(_) => "This account, and what to do with it",
             None => "Sign in through the Xodus client",
         }));
+}
+
+/// Xbox's own page for the signed-in account.
+const XBOX_PROFILE: &str = "https://account.xbox.com/en-us/profile";
+/// Where a title is bought, for the titles this cannot install because the
+/// account does not own them.
+const MICROSOFT_STORE: &str = "https://apps.microsoft.com/games";
+
+/// The menu behind the account button, once somebody is signed in.
+///
+/// A button that did one unlabelled thing was the wrong shape for it: signing
+/// out had nowhere to live, and "reload what this account owns" is not what a
+/// person expects a name and a picture to do.
+fn account_menu(ui: &Ui) {
+    let popover = gtk::Popover::builder()
+        .autohide(true)
+        .has_arrow(true)
+        .build();
+    let items = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+
+    let entry = |label: &str, tooltip: &str| {
+        let button = gtk::Button::builder()
+            .label(label)
+            .tooltip_text(tooltip)
+            .css_classes(["flat"])
+            .build();
+        button.set_child(Some(
+            &gtk::Label::builder().label(label).xalign(0.0).build(),
+        ));
+        button
+    };
+
+    let reload = entry(
+        "Reload library",
+        "Ask the service again what this account owns",
+    );
+    reload.connect_clicked(glib::clone!(
+        #[strong]
+        ui,
+        #[strong]
+        popover,
+        move |_| {
+            popover.popdown();
+            refresh_library(&ui);
+        }
+    ));
+    items.append(&reload);
+
+    let profile = entry("My profile", XBOX_PROFILE);
+    profile.connect_clicked(glib::clone!(
+        #[strong]
+        popover,
+        move |button| {
+            popover.popdown();
+            open_link(button, XBOX_PROFILE);
+        }
+    ));
+    items.append(&profile);
+
+    let store = entry("Microsoft Store", MICROSOFT_STORE);
+    store.connect_clicked(glib::clone!(
+        #[strong]
+        popover,
+        move |button| {
+            popover.popdown();
+            open_link(button, MICROSOFT_STORE);
+        }
+    ));
+    items.append(&store);
+
+    items.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+    let out = entry("Sign out", "Forget this machine's tokens");
+    out.add_css_class("destructive-action");
+    out.connect_clicked(glib::clone!(
+        #[strong]
+        ui,
+        #[strong]
+        popover,
+        move |_| {
+            popover.popdown();
+            confirm_sign_out(&ui);
+        }
+    ));
+    items.append(&out);
+
+    popover.set_child(Some(&items));
+    popover.set_parent(&ui.account_button);
+    popover.popup();
+    // The popover is parented to a widget that outlives it, so it has to be
+    // unparented or it leaks and the next one stacks on top of it.
+    popover.connect_closed(|popover| popover.unparent());
+}
+
+fn open_link(widget: &impl IsA<gtk::Widget>, url: &str) {
+    let launcher = gtk::UriLauncher::new(url);
+    launcher.launch(
+        widget.as_ref().root().and_downcast_ref::<gtk::Window>(),
+        gio::Cancellable::NONE,
+        |_| {},
+    );
+}
+
+/// Signing out is asked about, because what it costs is not obvious from the
+/// words: nothing will launch afterwards until somebody signs in again. A
+/// launch needs a licence, and a licence needs a token.
+fn confirm_sign_out(ui: &Ui) {
+    let dialog = adw::AlertDialog::new(
+        Some("Sign out?"),
+        Some(
+            "This machine's tokens are removed. Titles already downloaded stay on disk, \
+             but none of them will start until you sign in again -- launching needs a \
+             licence, and a licence needs a signed-in account.",
+        ),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("out", "Sign out");
+    dialog.set_response_appearance("out", adw::ResponseAppearance::Destructive);
+    dialog.set_close_response("cancel");
+
+    let window = ui.window.clone();
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response == "out" {
+            sign_out(&ui);
+        }
+    });
+    dialog.present(Some(&window));
+}
+
+/// Remove the tokens, through the client that owns them.
+///
+/// Not by deleting a file: the client keeps them in a keychain-backed store
+/// whose location is its business, and reaching into it from here would break
+/// the first time it changed.
+fn sign_out(ui: &Ui) {
+    let Some(client) = ui.model.borrow().xodus_cli() else {
+        ui.toasts
+            .add_toast(adw::Toast::new("The Xodus client was not found"));
+        return;
+    };
+    if !begin(ui) {
+        return;
+    }
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || {
+            std::process::Command::new(&client)
+                .arg("logout")
+                .stdin(std::process::Stdio::null())
+                .status()
+                .map_err(|e| format!("{}: {e}", client.display()))
+        })
+        .await;
+        finish(&ui);
+        match result {
+            Ok(Ok(status)) if status.success() => {
+                {
+                    // The listing goes with the tokens. Leaving it on screen
+                    // would show a library belonging to nobody, with buttons
+                    // that all fail at the licence step.
+                    let mut model = ui.model.borrow_mut();
+                    model.account = None;
+                    model.avatar = None;
+                    model.ownership = Ownership::Unknown;
+                    model.subscriptions.clear();
+                    if let Some(paths) = model.paths.as_ref() {
+                        let _ = std::fs::remove_file(library::cache_path(paths.state_dir()));
+                    }
+                }
+                render(&ui);
+                ui.toasts.add_toast(adw::Toast::new("Signed out"));
+            }
+            Ok(Ok(status)) => ui
+                .toasts
+                .add_toast(adw::Toast::new(&format!("Sign out exited {status}"))),
+            Ok(Err(e)) => ui.toasts.add_toast(adw::Toast::new(&e)),
+            Err(_) => ui
+                .toasts
+                .add_toast(adw::Toast::new("Could not run the client")),
+        }
+    });
 }
 
 // --- actions ---------------------------------------------------------------
@@ -1248,6 +1496,56 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
     dialog.present(Some(&window));
 }
 
+/// Ask before removing a title, and say exactly what will go.
+///
+/// The path and the size are both in the question, because "remove" is a
+/// different amount of work to undo depending on whether it is 4 MB of a failed
+/// download or 45 GB of a game -- and because a launcher deleting a directory
+/// the person cannot see named is a launcher nobody should trust.
+fn confirm_remove(ui: &Ui, product_id: &str, name: &str) {
+    let dir = {
+        let model = ui.model.borrow();
+        model
+            .records
+            .get(&product_id.to_ascii_uppercase())
+            .map(|record| record.dir.clone())
+    };
+    let Some(dir) = dir else {
+        ui.toasts.add_toast(adw::Toast::new(
+            "Nothing is recorded on disk for this title",
+        ));
+        return;
+    };
+
+    let size = ferestre_core::install::tree_size(&dir);
+    let body = format!(
+        "{} will be deleted, freeing {}.\n\nThe title stays in your library and can be \
+         installed again.",
+        dir.display(),
+        ferestre_core::human_bytes(size)
+    );
+    let dialog = adw::AlertDialog::new(Some(&format!("Remove {name}?")), Some(&body));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("remove", "Remove");
+    dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+    dialog.set_close_response("cancel");
+
+    let window = ui.window.clone();
+    let ui = ui.clone();
+    let product_id = product_id.to_string();
+    let name = name.to_string();
+    dialog.connect_response(None, move |_, response| {
+        if response == "remove" {
+            spawn_cli_tracked(
+                &ui,
+                &["uninstall", &product_id, "--yes"],
+                &format!("Removing {name}"),
+            );
+        }
+    });
+    dialog.present(Some(&window));
+}
+
 /// How much room is left where a title would go, in the words a person uses.
 fn free_space_label(dir: &Path) -> Option<String> {
     // The directory itself may not exist yet; ask about the nearest ancestor
@@ -1361,7 +1659,7 @@ fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {
 
 fn account_pressed(ui: &Ui) {
     if ui.model.borrow().account.is_some() {
-        refresh_library(ui);
+        account_menu(ui);
     } else {
         sign_in(ui);
     }

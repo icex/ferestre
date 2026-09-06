@@ -158,6 +158,14 @@ pub struct Inputs<'a> {
     /// Installed-but-undescribed happens when the automatic recipe could not
     /// find an executable, or when somebody downloaded it by other means.
     pub installed_product: &'a dyn Fn(&str) -> bool,
+    /// Whether the package on disk names its own entry point.
+    ///
+    /// The difference between a title that can simply be started and one that
+    /// genuinely needs a person: when the manifest names an executable there is
+    /// nothing to ask, so asking is a step that exists only because nobody
+    /// looked. Separate from [`Self::installed_product`] because a package can
+    /// be on disk and still not say what to run.
+    pub product_describes_itself: &'a dyn Fn(&str) -> bool,
     /// Whether this window started the title and it has not exited. Only what
     /// this window started: a title launched from a terminal is not tracked,
     /// and claiming otherwise would need guessing from the process table.
@@ -325,7 +333,11 @@ pub fn gamepass(inputs: &Inputs, product_ids: &[String]) -> Vec<LibraryRow> {
             let action = match (installed, runnable) {
                 (true, _) => {
                     parts.push("installed".into());
-                    Action::Adopt
+                    if (inputs.product_describes_itself)(product_id) {
+                        Action::Play
+                    } else {
+                        Action::Adopt
+                    }
                 }
                 (false, Some(false)) => {
                     let container = product
@@ -433,6 +445,21 @@ pub fn library(inputs: &Inputs) -> Vec<LibraryRow> {
                     );
                 }
             }
+        }
+    }
+
+    // And whatever is on disk. The third source, and the one that was missing:
+    // a title installed through a Game Pass subscription is not in the
+    // entitlement listing and has no recipe, so it appeared in neither of the
+    // two lists above -- installed, taking up 40 GB, and absent from the
+    // library and from Installed both.
+    for record in inputs.records.values() {
+        let key = record.product_id.to_ascii_uppercase();
+        if !rows.contains_key(&key) {
+            rows.insert(
+                key.clone(),
+                undescribed_row(inputs, &record.product_id, &key),
+            );
         }
     }
 
@@ -551,6 +578,10 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
     let name = product
         .map(|p| p.name.clone())
         .unwrap_or_else(|| product_id.to_string());
+    // Whether it is on disk is asked once and used everywhere below, including
+    // on the rows that cannot run: something that got installed and then turned
+    // out to be unrunnable is exactly the row that needs to offer removal.
+    let on_disk = (inputs.installed_product)(product_id);
     let unrunnable = |subtitle: String, reason: String| LibraryRow {
         product_id: product_id.to_string(),
         name: name.clone(),
@@ -559,7 +590,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
         image: product.and_then(|p| p.image.clone()),
         owned: true,
         has_recipe: false,
-        installed: false,
+        installed: on_disk,
         update: None,
         unsupported: true,
         action: Action::Blocked(reason),
@@ -671,19 +702,23 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
         image: product.and_then(|p| p.image.clone()),
         owned: true,
         has_recipe: false,
-        installed: false,
+        installed: on_disk,
         update: None,
         unsupported: false,
-        // Install, not "set up", *unless* it is already here. Nothing can
-        // describe a title before it is on disk, because the executable comes
-        // out of its package manifest -- and the install writes the recipe
-        // itself, so downloading is the whole flow for trying something nobody
-        // has tried. Once it is on disk and still undescribed, the manifest can
-        // be read, so setting it up is the thing to offer.
-        action: if (inputs.installed_product)(product_id) {
-            Action::Adopt
-        } else {
-            Action::Install
+        // Install, unless it is already here -- and then Play, not "set up",
+        // whenever the package names its own entry point. That is the common
+        // case, and asking someone to go and find an .exe in a tree of
+        // thousands of files when the manifest already says which one is a step
+        // that exists only because nobody read it. `run` writes the recipe from
+        // the manifest on the way past, so the answer is kept and stays
+        // editable for a title that turns out to need something else.
+        //
+        // Set up stays for the case that genuinely needs a person: on disk, and
+        // the package does not say what to start.
+        action: match (on_disk, (inputs.product_describes_itself)(product_id)) {
+            (true, true) => Action::Play,
+            (true, false) => Action::Adopt,
+            (false, _) => Action::Install,
         },
     }
 }
@@ -877,6 +912,7 @@ mod tests {
             installed,
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
+            product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             running: NOTHING_RUNNING,
         }
     }
@@ -947,6 +983,8 @@ mod tests {
     const NOTHING_RUNNING: &dyn Fn(&str) -> bool = &|_| false;
     /// And where an undescribed title is not on disk either.
     const NOT_ON_DISK: &dyn Fn(&str) -> bool = &|_| false;
+    /// And so nothing on disk describes itself.
+    const NOTHING_DESCRIBES_ITSELF: &dyn Fn(&str) -> bool = &|_| false;
 
     #[test]
     fn a_playable_installed_title_plays() {
@@ -1139,6 +1177,7 @@ mod tests {
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
+            product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             running: NOTHING_RUNNING,
         });
         assert_eq!(rows[0].action, Action::Update);
@@ -1237,6 +1276,7 @@ mod tests {
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
+            product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             running: NOTHING_RUNNING,
         });
 
@@ -1299,6 +1339,7 @@ mod tests {
             installed: NOTHING_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
+            product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             running: NOTHING_RUNNING,
         });
         let by_id: BTreeMap<&str, &LibraryRow> =
@@ -1355,6 +1396,7 @@ mod tests {
             installed: NOTHING_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
+            product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             running: NOTHING_RUNNING,
         });
         assert!(
@@ -1399,6 +1441,7 @@ mod tests {
             installed: NOTHING_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
+            product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             running: NOTHING_RUNNING,
         });
         let row = rows
@@ -1452,6 +1495,7 @@ mod tests {
             installed: NOTHING_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
+            product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             running: NOTHING_RUNNING,
         });
         assert!(
@@ -1498,6 +1542,7 @@ mod tests {
                 installed: NOTHING_INSTALLED,
                 installed_version: NO_VERSION_ON_DISK,
                 installed_product: NOT_ON_DISK,
+                product_describes_itself: NOTHING_DESCRIBES_ITSELF,
                 running: NOTHING_RUNNING,
             },
             &listing,
@@ -1536,6 +1581,84 @@ mod tests {
         assert!(!unknown.unsupported);
     }
 
+    /// A title installed through a subscription is in neither the entitlement
+    /// listing nor the recipes, so before this it was in no list at all --
+    /// installed, taking up disk, and invisible in both Library and Installed.
+    #[test]
+    fn a_title_that_is_only_on_disk_still_gets_a_row() {
+        let mut recs = BTreeMap::new();
+        recs.insert("9ZZTESTDISK".to_string(), record("9ZZTESTDISK", &[]));
+        let cat = catalog(vec![product("9ZZTESTDISK", "Only On Disk", &["cid"])]);
+        let on_disk: &dyn Fn(&str) -> bool = &|id| id.eq_ignore_ascii_case("9ZZTESTDISK");
+        let describes: &dyn Fn(&str) -> bool = &|_| true;
+        let rows = library(&Inputs {
+            recipes: &[],
+            // Signed out, so nothing is known about what the account owns.
+            ownership: &Ownership::Unknown,
+            runtime: None,
+            registry: None,
+            catalog: &cat,
+            records: &recs,
+            available: &BTreeMap::new(),
+            installed: NOTHING_INSTALLED,
+            installed_version: NO_VERSION_ON_DISK,
+            installed_product: on_disk,
+            product_describes_itself: describes,
+            running: NOTHING_RUNNING,
+        });
+        assert_eq!(rows.len(), 1, "the row exists at all");
+        assert_eq!(rows[0].name, "Only On Disk");
+        assert!(rows[0].installed, "and it shows up under Installed");
+    }
+
+    /// The package manifest names the entry point, so there is nothing to ask.
+    /// "Set up" survives only for the case that genuinely needs a person: on
+    /// disk, and the package does not say what to start.
+    #[test]
+    fn an_installed_title_that_describes_itself_offers_play_not_set_up() {
+        let mut recs = BTreeMap::new();
+        recs.insert("9ZZTESTDISK".to_string(), record("9ZZTESTDISK", &[]));
+        let cat = catalog(vec![product("9ZZTESTDISK", "Only On Disk", &["cid"])]);
+        let on_disk: &dyn Fn(&str) -> bool = &|_| true;
+
+        let with_manifest: &dyn Fn(&str) -> bool = &|_| true;
+        let rows = library(&Inputs {
+            recipes: &[],
+            ownership: &Ownership::Unknown,
+            runtime: None,
+            registry: None,
+            catalog: &cat,
+            records: &recs,
+            available: &BTreeMap::new(),
+            installed: NOTHING_INSTALLED,
+            installed_version: NO_VERSION_ON_DISK,
+            installed_product: on_disk,
+            product_describes_itself: with_manifest,
+            running: NOTHING_RUNNING,
+        });
+        assert_eq!(rows[0].action, Action::Play);
+
+        let rows = library(&Inputs {
+            recipes: &[],
+            ownership: &Ownership::Unknown,
+            runtime: None,
+            registry: None,
+            catalog: &cat,
+            records: &recs,
+            available: &BTreeMap::new(),
+            installed: NOTHING_INSTALLED,
+            installed_version: NO_VERSION_ON_DISK,
+            installed_product: on_disk,
+            product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            running: NOTHING_RUNNING,
+        });
+        assert_eq!(
+            rows[0].action,
+            Action::Adopt,
+            "nothing on disk says what to start, so a person has to"
+        );
+    }
+
     /// A row still showing a twelve-character code is waiting for the catalog,
     /// and burying it among the named ones just because a Store id starts with
     /// a digit makes the list look broken.
@@ -1561,6 +1684,7 @@ mod tests {
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
+            product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             running: NOTHING_RUNNING,
         });
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
@@ -1591,6 +1715,7 @@ mod tests {
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
+            product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             running: NOTHING_RUNNING,
         });
         assert_eq!(rows[0].action, Action::Update);
@@ -1621,6 +1746,7 @@ mod tests {
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
+            product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             running: NOTHING_RUNNING,
         });
         assert_eq!(rows[0].update, None);
@@ -1733,6 +1859,7 @@ mod tests {
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
+            product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             running,
         });
         assert_eq!(rows[0].action, Action::Stop);

@@ -131,7 +131,7 @@ package() {
   if [[ -f packaging/appimage/$id.desktop ]]; then
     install -Dm644 "packaging/appimage/$id.desktop" \
       "$pkgdir/usr/share/applications/$id.desktop"
-    install -Dm644 "packaging/appimage/$id.svg" \
+    install -Dm644 "packaging/icons/hicolor/scalable/apps/$id.svg" \
       "$pkgdir/usr/share/icons/hicolor/scalable/apps/$id.svg"
     install -Dm644 "packaging/appimage/$id.png" \
       "$pkgdir/usr/share/icons/hicolor/256x256/apps/$id.png"

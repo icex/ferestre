@@ -313,6 +313,16 @@ impl Model {
         install::executable(&dir)
     }
 
+    /// What the installed package says it launches, if anything did install it
+    /// and the manifest names an entry point.
+    ///
+    /// By product id rather than by recipe, because the titles this matters for
+    /// are exactly the ones with no recipe yet.
+    pub fn product_executable(&self, product_id: &str) -> Option<String> {
+        let record = self.records.get(&product_id.to_ascii_uppercase())?;
+        install::executable(&record.dir)
+    }
+
     pub fn catalog_cache(&self) -> Option<Cache> {
         self.paths.as_ref().map(Paths::catalog_cache)
     }

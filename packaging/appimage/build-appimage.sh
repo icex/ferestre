@@ -357,7 +357,8 @@ cp "$APPDIR/$APP_ID.desktop"             "$APPDIR/usr/share/applications/$APP_ID
 
 cp "$HERE/$DEFAULT_APP_ID.png" "$APPDIR/$APP_ID.png"
 cp "$HERE/$DEFAULT_APP_ID.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/$APP_ID.png"
-cp "$HERE/$DEFAULT_APP_ID.svg" "$APPDIR/usr/share/icons/hicolor/scalable/apps/$APP_ID.svg"
+cp "$HERE/../icons/hicolor/scalable/apps/$DEFAULT_APP_ID.svg" \
+   "$APPDIR/usr/share/icons/hicolor/scalable/apps/$APP_ID.svg"
 ln -sf "$APP_ID.png" "$APPDIR/.DirIcon"
 
 subst_id "$HERE/$DEFAULT_APP_ID.metainfo.xml" "$APPDIR/usr/share/metainfo/$APP_ID.metainfo.xml"

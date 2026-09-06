@@ -264,6 +264,35 @@ honestly marked as unproven rather than planned.
       minutes several times a second. A stalled download says so instead of
       estimating.
 
+- [x] **Removing a title.** There was no uninstall at all: a title that failed
+      to install left a record claiming it was there, a directory with a partial
+      container in it, and no way to say otherwise. `ferestre uninstall
+      <product-id>` removes the files and the record, and the window offers it
+      on any installed row. Reinstalling is then the ordinary Install button.
+
+      The path is checked rather than trusted before anything is deleted -- a
+      record is a JSON file anybody can edit, and `remove_dir_all` on a bad path
+      is the one thing here that cannot be undone.
+
+- [ ] **Appx and Msix packages — the other 95%.** This runtime opens MSIXVC,
+      the container Xbox GDK titles ship in. Everything else in a typical Store
+      library is UWP: `Appx`, `AppxBundle`, `Msix`, `MsixBundle` and the
+      `E`-prefixed encrypted variants. Measured on a real account, that is 95 of
+      102 owned titles, and the window currently holds all of them back behind a
+      switch that says why.
+
+      Not a small item, and worth being honest about the shape of it. A UWP app
+      is not a Win32 executable with a manifest beside it: it expects the
+      Windows app model -- package identity, an activation host, WinRT brokers,
+      the app container -- which is a different thing to stand up than the GDK
+      surface this project already builds. Some of that work exists in Wine and
+      in this fork already (package identity, `RegionPolicyEvaluator`), which is
+      the argument for it being possible rather than the argument for it being
+      quick.
+
+      Worth doing in the order the library suggests: `AppxBundle` first, since
+      it is the single largest group.
+
 - [x] **Differential updates — answered.** The roadmap said not to promise this
       until two builds of one large title had settled it. That experiment turned
       out to be unnecessary: Microsoft publishes the patch plans themselves, and
@@ -366,6 +395,14 @@ These are judgement calls, not engineering ones:
    given upstream will not take these changes.
 
 ## Known gaps, stated plainly
+
+- **An install can fail while the client exits zero.** A title the account is
+  not licensed for prints `not entitled to this content` and returns success,
+  leaving a directory holding a partial container. The launcher used to believe
+  the exit code and record an install that never happened. It now checks the
+  destination before recording, and a record for a directory that holds no
+  install is treated as stale -- but the underlying behaviour is the client's,
+  and this is a check around it rather than a fix.
 
 - **Update detection does not work yet, and the reason was a wrong premise.**
   It compared *content ids*, on the belief that a rebuild produces a new one. It

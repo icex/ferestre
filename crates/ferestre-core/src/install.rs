@@ -59,13 +59,16 @@ pub struct Record {
 }
 
 impl Record {
-    /// Whether the directory this record describes is still there.
+    /// Whether this record no longer describes something installed.
     ///
-    /// People move and delete game directories without telling a launcher, and a
-    /// record for a title that is gone would keep it in the Installed list and
-    /// could offer an update for something not on disk.
+    /// Two ways that happens, and both leave a row claiming a title is there
+    /// when it is not. People move and delete game directories without telling
+    /// a launcher. And an install can fail while the client exits zero -- a
+    /// title the account turned out not to be licensed for leaves a directory
+    /// with a partial container in it and nothing else -- so the directory
+    /// existing is not enough to go on.
     pub fn is_stale(&self) -> bool {
-        !self.dir.is_dir()
+        !self.dir.is_dir() || !looks_installed(&self.dir)
     }
 
     /// Whether the tree on disk still looks like what was recorded.
@@ -147,6 +150,64 @@ pub fn forget(state_dir: &Path, product_id: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether a directory is safe for the launcher to delete.
+///
+/// Deleting a tree is the one thing here that cannot be undone, so the path is
+/// checked before it is handed to `remove_dir_all` rather than trusted because
+/// a record named it. A record is a JSON file anybody can edit, and a bug that
+/// writes the wrong path into one turns into a bug that deletes a home
+/// directory.
+///
+/// Refused: anything that is not a directory, a symlink (deleting through one
+/// is how a link in a game directory takes the target with it), the home
+/// directory itself, and any path within two levels of the filesystem root --
+/// `/usr`, `/home/someone` and `/` are all things a launcher has no business
+/// removing whatever a record says.
+pub fn safe_to_remove(dir: &Path) -> Result<()> {
+    use anyhow::bail;
+
+    if !dir.is_dir() {
+        bail!("{} is not a directory", dir.display());
+    }
+    if dir.is_symlink() {
+        bail!("{} is a symlink; remove it by hand", dir.display());
+    }
+    if !dir.is_absolute() {
+        bail!("{} is not an absolute path", dir.display());
+    }
+    let depth = dir.components().count();
+    // RootDir plus two names: `/a/b` has three components, and is the shallowest
+    // thing worth allowing.
+    if depth < 3 {
+        bail!("{} is too close to the root to remove", dir.display());
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        if dir == Path::new(&home) {
+            bail!("{} is the home directory", dir.display());
+        }
+    }
+    Ok(())
+}
+
+/// Bytes used by a directory tree, following no symlinks.
+///
+/// Best effort: a file that cannot be read contributes nothing rather than
+/// failing the walk, because this exists to put a number in a sentence, not to
+/// audit a filesystem.
+pub fn tree_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => tree_size(&entry.path()),
+            Ok(kind) if kind.is_file() => entry.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
 }
 
 /// An RFC 3339 timestamp for now, in UTC.
@@ -284,6 +345,32 @@ fn attribute(element: &str, name: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+/// Whether this directory holds an installed title, rather than the debris of
+/// an install that did not happen.
+///
+/// The check exists because the client can fail and exit zero. A Game Pass
+/// title the account turned out not to be entitled to printed
+///
+/// ```text
+/// not entitled to this content: The entitlement has been revoked and can no
+/// longer be used to create a Content License.
+/// ```
+///
+/// and then exited successfully, leaving a directory with nothing in it but a
+/// 4 MB `.xodus-streaming-tmp.msixvc`. The launcher believed it, wrote a record,
+/// and the title sat in the library claiming to be installed forever.
+///
+/// Any one of the three is enough, because the three describe different
+/// legitimate layouts: a decrypted tree with a manifest, a package whose header
+/// the client kept beside it, or both. The *temporary* container deliberately
+/// does not count -- it is exactly what a half-finished download leaves.
+pub fn looks_installed(dir: &Path) -> bool {
+    dir.join(CONTAINER).is_file()
+        || ["appxmanifest.xml", "AppxManifest.xml"]
+            .iter()
+            .any(|name| dir.join(name).is_file())
+}
+
 /// Build a record for a title already on disk that nothing recorded.
 ///
 /// Exact, not assumed: everything comes from the install itself. Returns `None`
@@ -352,6 +439,69 @@ pub fn all(state_dir: &Path) -> Vec<Record> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guard on the one irreversible thing here. A record is a JSON file
+    /// anybody can edit, so the path in it is checked rather than trusted.
+    #[test]
+    fn shallow_paths_and_symlinks_are_refused() {
+        assert!(safe_to_remove(Path::new("/")).is_err());
+        assert!(safe_to_remove(Path::new("/usr")).is_err(), "one level down");
+        assert!(safe_to_remove(Path::new("relative/path")).is_err());
+        assert!(
+            safe_to_remove(Path::new("/nonexistent/deep/enough")).is_err(),
+            "a path that is not there is not a directory to remove"
+        );
+
+        let dir = std::env::temp_dir().join(format!("ferestre-rm-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("game")).expect("temp dir");
+        assert!(safe_to_remove(&dir.join("game")).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_tree_is_measured_including_what_is_under_it() {
+        let dir = std::env::temp_dir().join(format!("ferestre-size-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("data")).expect("temp dir");
+        std::fs::write(dir.join("a"), vec![0u8; 1000]).expect("write");
+        std::fs::write(dir.join("data/b"), vec![0u8; 2000]).expect("write");
+        assert_eq!(tree_size(&dir), 3000);
+        assert_eq!(tree_size(Path::new("/nonexistent")), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The state a failed install leaves, and the reason this check exists: the
+    /// client printed "not entitled to this content" and exited zero, so
+    /// everything downstream treated an empty directory as a finished install.
+    #[test]
+    fn a_directory_holding_only_a_partial_download_is_not_an_install() {
+        let dir = std::env::temp_dir().join(format!("ferestre-partial-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert!(
+            !looks_installed(&dir),
+            "an empty directory is not an install"
+        );
+
+        std::fs::write(dir.join(".xodus-streaming-tmp.msixvc"), b"partial").expect("write");
+        assert!(
+            !looks_installed(&dir),
+            "and neither is one holding only the temporary container"
+        );
+
+        std::fs::write(dir.join("appxmanifest.xml"), b"<Package/>").expect("write");
+        assert!(looks_installed(&dir), "a manifest is a decrypted title");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other legitimate layout: the client keeps the package header beside
+    /// a title it streamed, and there is no decrypted manifest at the top.
+    #[test]
+    fn a_directory_with_the_package_header_is_an_install() {
+        let dir = std::env::temp_dir().join(format!("ferestre-streamed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(dir.join(CONTAINER), b"header").expect("write");
+        assert!(looks_installed(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn record(content_ids: &[&str]) -> Record {
         Record {
@@ -572,6 +722,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ferestre-stale-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("makes the dir");
+        std::fs::write(dir.join(CONTAINER), b"header").expect("write");
 
         let mut present = record(&["content-a"]);
         present.dir = dir.clone();
@@ -579,6 +730,26 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).expect("removes it");
         assert!(present.is_stale(), "the directory is gone");
+    }
+
+    /// And a record for a directory that is *there* but holds nothing. This is
+    /// the shape a failed install leaves: the client printed "not entitled to
+    /// this content", exited zero, and left a partial container behind. The
+    /// record was written, and the title claimed to be installed from then on.
+    #[test]
+    fn a_record_for_a_directory_that_holds_no_install_is_stale() {
+        let dir = std::env::temp_dir().join(format!("ferestre-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("makes the dir");
+        std::fs::write(dir.join(".xodus-streaming-tmp.msixvc"), b"partial").expect("write");
+
+        let mut record = record(&[]);
+        record.dir = dir.clone();
+        assert!(
+            record.is_stale(),
+            "a directory is not an install just because it exists"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Something updated the title outside the launcher, so the recorded content

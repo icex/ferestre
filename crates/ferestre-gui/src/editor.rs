@@ -151,12 +151,24 @@ pub fn present(
         .build();
     environment.buffer().set_text(&draft.environment);
 
+    // The name first, because that is what a person recognises -- a row that
+    // says "Product 9MSVBF0KZFVW" is asking somebody to set up something the
+    // window has not told them the name of. The id stays, since it is what a
+    // Store URL carries and what the recipe file is named after, and it is the
+    // only thing there is when the catalog has not answered yet.
     let identity = adw::PreferencesGroup::builder()
         .title("Title")
-        .description(format!(
-            "Product {} — saved to your own titles directory, so an upgrade will not undo it",
-            recipe.borrow().title.product_id
-        ))
+        .description({
+            let recipe = recipe.borrow();
+            let id = &recipe.title.product_id;
+            let named = recipe.title.name.trim();
+            let what = if named.is_empty() || named.eq_ignore_ascii_case(id) {
+                format!("Product {id}")
+            } else {
+                format!("{named} ({id})")
+            };
+            format!("{what} — saved to your own titles directory, so an upgrade will not undo it")
+        })
         .build();
     identity.add(&name);
     identity.add(&executable);

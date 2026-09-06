@@ -135,16 +135,9 @@ impl Download {
     }
 }
 
-/// Powers of ten, like a store page and like [`Product::size_label`]: nobody
-/// comparing a download against their free space means gibibytes.
-pub fn bytes(n: u64) -> String {
-    match n {
-        n if n >= 1_000_000_000 => format!("{:.1} GB", n as f64 / 1e9),
-        n if n >= 1_000_000 => format!("{} MB", n / 1_000_000),
-        n if n >= 1_000 => format!("{} kB", n / 1_000),
-        n => format!("{n} B"),
-    }
-}
+/// The same units the catalog sizes are shown in, from the same place: a
+/// download that says 8.1 GB has to agree with the row that offered it.
+pub use ferestre_core::human_bytes as bytes;
 
 /// Rounded to something worth reading. "1h 12m" and not "1h 12m 4s": the
 /// seconds are wrong by more than a second, and printing them claims otherwise.

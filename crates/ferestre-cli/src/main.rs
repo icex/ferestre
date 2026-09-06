@@ -136,6 +136,20 @@ enum Cmd {
         dir: Option<PathBuf>,
     },
 
+    /// Remove an installed title: its files and the launcher's record of it.
+    #[command(alias = "remove")]
+    Uninstall {
+        /// The 12-character Store product id.
+        #[arg(value_name = "PRODUCT-ID")]
+        product_id: String,
+        /// Forget the record but leave the files where they are.
+        #[arg(long)]
+        keep_files: bool,
+        /// Do not ask. Required when there is no terminal to ask at.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
     /// Build and install the patched Proton runtime.
     InstallRuntime,
 
@@ -196,6 +210,11 @@ fn dispatch(cli: &Cli) -> Result<ExitCode> {
             args,
         } => cmd_run(cli, title, *dry_run, *force, *steam, args),
         Cmd::Install { product_id, dir } => cmd_install(cli, product_id, dir.as_deref()),
+        Cmd::Uninstall {
+            product_id,
+            keep_files,
+            yes,
+        } => cmd_uninstall(cli, product_id, *keep_files, *yes),
         Cmd::InstallRuntime => cmd_install_runtime(cli),
         Cmd::Env => cmd_env(cli),
         Cmd::Version => cmd_version(cli),
@@ -374,7 +393,24 @@ fn cmd_run(
     }
 
     let paths = Paths::from_env()?;
-    let (dir, recipes) = load_recipes(cli)?;
+    let (dir, mut recipes) = load_recipes(cli)?;
+
+    // Nothing describes it, but it is on disk and its package says how to start
+    // it -- so describe it and carry on rather than stopping to ask. The
+    // manifest is the authority here: it names the entry point, which is the
+    // one thing a person would otherwise have to go and find in a tree of
+    // thousands of files. Writing it down means the answer survives, and stays
+    // editable when a title turns out to need something else.
+    if !recipes.iter().any(|r| r.matches(title)) {
+        if let Some(written) = describe_from_disk(&paths, title)? {
+            eprintln!(
+                "-- no recipe, so one was written from the package manifest: {}",
+                written.display()
+            );
+            recipes = load_recipes(cli)?.1;
+        }
+    }
+
     let recipe = recipes.iter().find(|r| r.matches(title)).ok_or_else(|| {
         anyhow!(
             "no recipe for '{title}' in {} (see: ferestre titles)",
@@ -478,6 +514,27 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
         return Ok(ExitCode::from(code));
     }
 
+    // Exiting zero is not the same as having installed something. The client
+    // prints "not entitled to this content" and exits successfully when the
+    // account's licence does not cover a title -- which happens routinely with
+    // Game Pass, where the catalogue lists far more than any one tier grants --
+    // and it leaves a directory holding only a partial container. Believing the
+    // exit code there writes a record claiming a title is installed that is
+    // not, and it never corrects itself: the row offers to launch nothing.
+    if !install::looks_installed(&dest) {
+        eprintln!(
+            "!! {product_id} did not install: nothing arrived in {}",
+            dest.display()
+        );
+        eprintln!(
+            "   the client exited successfully, so the reason is in its output above -- \
+             \"not entitled to this content\" means this account's licence does not cover \
+             the title, which for a Game Pass title means the subscription tier does not \
+             include it"
+        );
+        return Ok(ExitCode::FAILURE);
+    }
+
     // A download replaces whatever was patched last time -- Microsoft's
     // XCurl.dll comes back with every update -- so the after-install steps run
     // again here, not once at first install.
@@ -516,6 +573,98 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Remove a title: the files, and the record that says it is installed.
+///
+/// Both, because either on its own leaves a lie behind. Files without a record
+/// is a directory nothing knows about; a record without files is a row offering
+/// to launch nothing, which is exactly the state that made this command
+/// necessary -- an install failed while the client exited zero, and there was
+/// no way to say so.
+fn cmd_uninstall(cli: &Cli, product_id: &str, keep_files: bool, yes: bool) -> Result<ExitCode> {
+    let product_id = normalise_product_id(product_id);
+    let paths = Paths::from_env()?;
+
+    // The record first, then the recipe: the record is what the launcher acted
+    // on, and a recipe's install directory is where it *would* have gone.
+    let record = install::load(paths.state_dir(), &product_id);
+    let (_, recipes) = load_recipes(cli).unwrap_or_else(|_| (PathBuf::new(), Vec::new()));
+    let dir = match &record {
+        Some(record) => Some(record.dir.clone()),
+        None => recipes
+            .iter()
+            .find(|r| r.matches(&product_id))
+            .and_then(|r| paths.install_dir(r).ok()),
+    };
+
+    let Some(dir) = dir else {
+        bail!("nothing is recorded or described for {product_id}, so there is nothing to remove");
+    };
+    let removing = !keep_files && dir.is_dir();
+
+    if cli.json {
+        print_json(&json!({
+            "schema": JSON_SCHEMA,
+            "product_id": product_id,
+            "directory": dir.display().to_string(),
+            "removing_files": removing,
+            "had_record": record.is_some(),
+        }));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if removing {
+        install::safe_to_remove(&dir)?;
+        let size = install::tree_size(&dir);
+        eprintln!(
+            ":: removing {} ({})",
+            dir.display(),
+            ferestre_core::human_bytes(size)
+        );
+        if !yes {
+            // Asked, not assumed. This is the only command here that destroys
+            // something, and `--yes` exists for the window, which asks first in
+            // its own dialog.
+            eprint!("   delete it? [y/N] ");
+            use std::io::Write;
+            std::io::stderr().flush().ok();
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                eprintln!("-- left alone");
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+        eprintln!("-- removed {}", dir.display());
+    } else if !keep_files {
+        eprintln!(":: {} is already gone", dir.display());
+    }
+
+    install::forget(paths.state_dir(), &product_id)?;
+    eprintln!("-- forgot the install record for {product_id}");
+    if keep_files {
+        eprintln!("   the files are still in {}", dir.display());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Describe an installed title from its own package, if it is installed and the
+/// package names an executable.
+///
+/// `Ok(None)` covers three honest cases that are all "there is nothing to write
+/// down": nothing recorded this product, the directory it recorded is gone, or
+/// the manifest names no entry point.
+fn describe_from_disk(paths: &Paths, title: &str) -> Result<Option<PathBuf>> {
+    let product_id = normalise_product_id(title);
+    let Some(record) = install::load(paths.state_dir(), &product_id) else {
+        return Ok(None);
+    };
+    if !install::looks_installed(&record.dir) {
+        return Ok(None);
+    }
+    write_detected_recipe(paths, &product_id, &record.dir)
 }
 
 /// Write a recipe for a title that had none, from what the package says.
