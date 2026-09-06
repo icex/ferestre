@@ -16,6 +16,7 @@
 pub mod account;
 pub mod capability;
 pub mod catalog;
+pub mod gamepass;
 pub mod http;
 pub mod install;
 pub mod launch;

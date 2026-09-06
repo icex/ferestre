@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use ferestre_core::account::Account;
 use ferestre_core::catalog::{self, Cache, Product};
+use ferestre_core::gamepass;
 use ferestre_core::install::{self, Record};
 use ferestre_core::library;
 use ferestre_core::paths::Paths;
@@ -32,14 +33,16 @@ pub const PER_PAGE: usize = 20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Library,
+    GamePass,
     Installed,
     Updates,
     Runtime,
 }
 
 impl Section {
-    pub const ALL: [Section; 4] = [
+    pub const ALL: [Section; 5] = [
         Section::Library,
+        Section::GamePass,
         Section::Installed,
         Section::Updates,
         Section::Runtime,
@@ -48,6 +51,7 @@ impl Section {
     pub fn title(self) -> &'static str {
         match self {
             Section::Library => "Library",
+            Section::GamePass => "Game Pass",
             Section::Installed => "Installed",
             Section::Updates => "Updates",
             Section::Runtime => "Runtime",
@@ -57,6 +61,7 @@ impl Section {
     pub fn icon(self) -> &'static str {
         match self {
             Section::Library => "view-grid-symbolic",
+            Section::GamePass => "emblem-shared-symbolic",
             Section::Installed => "drive-harddisk-symbolic",
             Section::Updates => "software-update-available-symbolic",
             Section::Runtime => "applications-engineering-symbolic",
@@ -81,6 +86,12 @@ pub struct Model {
     pub available: BTreeMap<String, String>,
     pub account: Option<Account>,
     pub avatar: Option<PathBuf>,
+    /// The PC Game Pass catalogue, as product ids, and the subscriptions this
+    /// account actually holds. Separate on purpose: the catalogue is public and
+    /// the entitlement is not, and a launcher that guesses the second from the
+    /// first tells people they cannot install titles they can.
+    pub gamepass: Vec<String>,
+    pub subscriptions: Vec<&'static str>,
 
     /// Where the view is, which is state the widgets must not own -- a rebuild
     /// destroys them and the person's place in the list should survive it.
@@ -163,6 +174,23 @@ impl Model {
             }
             _ => BTreeMap::new(),
         };
+        // Both off disk, like the library: a window that opens with an empty
+        // Game Pass section until someone presses something has not shown them
+        // their Game Pass.
+        let market = paths
+            .as_ref()
+            .map(|p| Paths::market(p).0)
+            .unwrap_or_else(|| catalog::DEFAULT_MARKET.to_string());
+        let gamepass = paths
+            .as_ref()
+            .and_then(|p| gamepass::load_cache(p.state_dir(), &market))
+            .map(|listing| listing.product_ids)
+            .unwrap_or_default();
+        let subscriptions = match &ownership {
+            Ownership::Known(entries) => gamepass::active(entries),
+            Ownership::Unknown => Vec::new(),
+        };
+
         let icons = paths
             .as_ref()
             .map(|p| {
@@ -195,6 +223,8 @@ impl Model {
             available: BTreeMap::new(),
             account: None,
             avatar,
+            gamepass,
+            subscriptions,
             section: Section::Library,
             query: String::new(),
             page: 0,
@@ -216,6 +246,8 @@ impl Model {
             available: std::mem::take(&mut self.available),
             account: self.account.take(),
             avatar: self.avatar.take(),
+            gamepass: std::mem::take(&mut self.gamepass),
+            subscriptions: std::mem::take(&mut self.subscriptions),
             section: self.section,
             query: std::mem::take(&mut self.query),
             page: self.page,

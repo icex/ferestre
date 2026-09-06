@@ -452,6 +452,42 @@ def main():
                 f,
             )
 
+    # A Game Pass listing, cached, so the section draws from disk. Seeded rather
+    # than fetched: this test must not depend on a Microsoft endpoint being up,
+    # and a listing already present is one the window will not go and refetch.
+    pass_titles = [
+        ("9ZZSMOKEPASS", "Subscription Racer", "MSIXVC", 8_100_000_000),
+        ("9ZZSMOKEPUWP", "Subscription Puzzler", "AppxBundle", 120_000_000),
+    ]
+    with open(os.path.join(state, "gamepass.json"), "w") as f:
+        json.dump(
+            {
+                "schema": 1,
+                "fetched": 0,
+                "market": "US",
+                "product_ids": [pid for pid, _, _, _ in pass_titles],
+            },
+            f,
+        )
+    for pid, name, package_format, size in pass_titles:
+        with open(os.path.join(catalog, f"{pid}.json"), "w") as f:
+            json.dump(
+                {
+                    "schema": schema,
+                    "product": {
+                        "product_id": pid,
+                        "name": name,
+                        "publisher": "Smoke Test Studios",
+                        "download_bytes": size,
+                        "content_ids": [f"contentid-{pid.lower()}"],
+                        "has_packages": True,
+                        "has_pc_package": True,
+                        "package_format": package_format,
+                    },
+                },
+                f,
+            )
+
     gui = subprocess.Popen([binary], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     deadline = time.monotonic() + TIMEOUT
     failures = []
@@ -646,6 +682,45 @@ def main():
         check(
             not any("9.9.9.9" in t for t in labels),
             "a title of unknown build is not reported as needing an update",
+            frame,
+        )
+
+        print("game pass")
+        select_in_list(frame, "Game Pass")
+        labels = wait_for(
+            frame,
+            lambda root: texts(root)
+            if any("Subscription Racer" in t for t in texts(root))
+            else None,
+            "the Game Pass section",
+            time.monotonic() + TIMEOUT,
+        )
+        check(
+            any("2 titles are included with PC Game Pass" in t for t in labels),
+            "the section says what the list is and how long it is",
+            frame,
+        )
+        # The distinction the whole section rests on: what the catalogue
+        # includes is not the same as what this account may install, and saying
+        # so is what stops a licence refusal from reading as a bug.
+        check(
+            any("No active subscription was found" in t for t in labels),
+            "and says plainly that no subscription was found on this account",
+            frame,
+        )
+        check(
+            any("Included with PC Game Pass" in t and "8.1 GB" in t for t in labels),
+            f"a row carries the size before the download: {[t for t in labels if 'GB' in t]}",
+            frame,
+        )
+        check(
+            not any("Subscription Puzzler" in t for t in labels),
+            "the same filter applies: an AppxBundle is held back here too",
+            frame,
+        )
+        check(
+            row_button(frame, "Subscription Racer", "Install") is not None,
+            "and an included title offers an install",
             frame,
         )
 

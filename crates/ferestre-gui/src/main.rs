@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use ferestre_core::recipe::Recipe;
-use ferestre_core::{account, catalog, steam};
+use ferestre_core::{account, catalog, gamepass, steam};
 use model::{Action, Inputs, LibraryRow, Ownership};
 use state::{Model, Section, AVATAR_PX, ICON_PX, PER_PAGE};
 
@@ -46,6 +46,9 @@ struct Ui {
     /// Product ids whose name has been looked up, so a lookup that came back
     /// with nothing is not repeated on every redraw.
     asked_names: Rc<RefCell<std::collections::BTreeSet<String>>>,
+    /// Set while the Game Pass listing is being fetched, so opening the section
+    /// twice does not ask twice.
+    fetching_gamepass: Rc<RefCell<bool>>,
     /// Titles this window started that have not exited, by product id, each
     /// mapped to the process group to signal. Deliberately not the `busy` flag:
     /// a game runs for hours and must not hold the window's other work.
@@ -165,6 +168,7 @@ fn build_ui(app: &adw::Application) {
         busy: Rc::new(RefCell::new(false)),
         running: Rc::new(RefCell::new(BTreeMap::new())),
         asked_names: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
+        fetching_gamepass: Rc::new(RefCell::new(false)),
     };
 
     // Activation and selection both, because they are not the same event:
@@ -216,6 +220,9 @@ fn build_ui(app: &adw::Application) {
         move |_| {
             ui.model.borrow_mut().reload();
             render(&ui);
+            // Reload means "check again", and the Game Pass catalogue is a
+            // thing that changes without anything here doing so.
+            fetch_gamepass(&ui, true);
         }
     ));
 
@@ -244,8 +251,10 @@ fn render(ui: &Ui) {
 
     let section = ui.model.borrow().section;
     ui.title.set_title(section.title());
-    ui.search
-        .set_visible(matches!(section, Section::Library | Section::Installed));
+    ui.search.set_visible(matches!(
+        section,
+        Section::Library | Section::GamePass | Section::Installed
+    ));
     render_account_button(ui);
 
     let page = adw::PreferencesPage::new();
@@ -269,6 +278,13 @@ fn render(ui: &Ui) {
                 move |row| show_all || !row.unsupported,
                 "Nothing here yet.",
             )
+        }
+        Section::GamePass => {
+            // Fetched the first time the section is opened rather than at
+            // startup: it is a network round trip for a list most sessions
+            // never look at.
+            fetch_gamepass(ui, false);
+            render_gamepass(ui, &page)
         }
         Section::Installed => render_rows(
             ui,
@@ -358,13 +374,14 @@ struct Drawn {
 fn draw_list(
     model: &Model,
     running: &BTreeMap<String, u32>,
+    section: Section,
     keep: impl Fn(&LibraryRow) -> bool,
 ) -> Drawn {
     let running = |product_id: &str| running.contains_key(&product_id.to_ascii_uppercase());
     let installed = |r: &Recipe| model.is_installed(r);
     let installed_version = |r: &Recipe| model.installed_version(r);
     let installed_product = |id: &str| model.product_is_installed(id);
-    let rows: Vec<LibraryRow> = model::library(&Inputs {
+    let inputs = Inputs {
         recipes: &model.recipes,
         runtime: model.runtime.as_ref(),
         registry: model.registry.as_ref(),
@@ -378,9 +395,14 @@ fn draw_list(
         installed_version: &installed_version,
         installed_product: &installed_product,
         running: &running,
-    })
-    .into_iter()
-    .collect();
+    };
+    // The Game Pass section is a different list, not a filter over the same
+    // one: its rows come from a public catalogue listing rather than from what
+    // the account owns.
+    let rows: Vec<LibraryRow> = match section {
+        Section::GamePass => model::gamepass(&inputs, &model.gamepass),
+        _ => model::library(&inputs),
+    };
     let unsupported = rows.iter().filter(|row| row.unsupported).count();
     let rows: Vec<LibraryRow> = rows.into_iter().filter(|row| keep(row)).collect();
 
@@ -430,14 +452,70 @@ fn draw_list(
     }
 }
 
+/// The Game Pass section: a header saying what this list is and what it is not,
+/// then the titles.
+///
+/// The header is not decoration. A row here means the PC catalogue includes the
+/// title, which is not the same as this account being able to install it, and
+/// leaving that unsaid would make every licence refusal look like a bug in the
+/// launcher.
+fn render_gamepass(ui: &Ui, page: &adw::PreferencesPage) {
+    let (held, listing, market) = {
+        let model = ui.model.borrow();
+        (
+            model.subscriptions.clone(),
+            model.gamepass.len(),
+            model.market().0,
+        )
+    };
+
+    let group = adw::PreferencesGroup::builder().build();
+    let (title, subtitle) = match (listing, held.as_slice()) {
+        (0, _) => (
+            "The Game Pass catalogue has not been fetched yet".to_string(),
+            "Reload to fetch it. It is a public listing -- no account needed.".to_string(),
+        ),
+        (n, []) => (
+            format!("{n} titles are included with PC Game Pass in {market}"),
+            "No active subscription was found on this account, so installing one \
+             will be refused at the licence step."
+                .to_string(),
+        ),
+        (n, subs) => (
+            format!("{n} titles are included with PC Game Pass in {market}"),
+            format!(
+                "This account holds {}. Whether a tier covers a given title is decided \
+                 when it is installed, not here.",
+                subs.join(" and ")
+            ),
+        ),
+    };
+    let row = adw::ActionRow::builder()
+        .title(&title)
+        .subtitle(&subtitle)
+        .subtitle_lines(3)
+        .build();
+    row.add_css_class("dim-label");
+    group.add(&row);
+    page.add(&group);
+
+    let show_all = ui.model.borrow().show_unsupported;
+    render_rows(
+        ui,
+        page,
+        move |row| show_all || !row.unsupported,
+        "Nothing here yet.",
+    );
+}
+
 fn render_rows(
     ui: &Ui,
     page: &adw::PreferencesPage,
     keep: impl Fn(&LibraryRow) -> bool,
     empty_message: &str,
 ) {
-    let drawn = draw_list(&ui.model.borrow(), &ui.running.borrow(), keep);
     let section = ui.model.borrow().section;
+    let drawn = draw_list(&ui.model.borrow(), &ui.running.borrow(), section, keep);
 
     let group = adw::PreferencesGroup::builder().build();
     // Deliberately not an early return: an empty list is exactly when the
@@ -462,7 +540,7 @@ fn render_rows(
 
     // Only in the library: the other sections list installed or updatable
     // titles, which are runnable by construction.
-    if section == Section::Library && drawn.unsupported > 0 {
+    if matches!(section, Section::Library | Section::GamePass) && drawn.unsupported > 0 {
         let row = adw::SwitchRow::builder()
             .title("Show titles Ferestre cannot run")
             .subtitle(format!(
@@ -1301,6 +1379,58 @@ fn refresh_library(ui: &Ui) {
 /// A page at a time, like the art, and each id is attempted once: a product the
 /// catalog does not answer for would otherwise be re-requested on every redraw,
 /// which is a request loop rather than a retry.
+/// Fetch the PC Game Pass listing, unless there is already one and `force` is
+/// not set.
+///
+/// Anonymous: this asks a public catalogue what PC Game Pass includes, which
+/// needs no account and grants nothing. What the account may install is decided
+/// by the licence request at install time.
+fn fetch_gamepass(ui: &Ui, force: bool) {
+    let (paths, market, language, have) = {
+        let model = ui.model.borrow();
+        let (market, language) = model.market();
+        (
+            model.paths.as_ref().map(|p| p.state_dir().to_path_buf()),
+            market,
+            language,
+            !model.gamepass.is_empty(),
+        )
+    };
+    if have && !force {
+        return;
+    }
+    // Not the `busy` flag: this is a background list, and holding the window's
+    // sign-in and library buttons hostage to it would be out of proportion.
+    if !ui.fetching_gamepass.replace(true) {
+        let ui = ui.clone();
+        glib::spawn_future_local(async move {
+            let fetched = gio::spawn_blocking({
+                let market = market.clone();
+                move || gamepass::fetch(&market, &language)
+            })
+            .await;
+            ui.fetching_gamepass.replace(false);
+            let Ok(Ok(ids)) = fetched else {
+                // Silent on purpose when there is already a listing: a failed
+                // refresh of a public list is not worth a toast over the top of
+                // whatever someone is doing.
+                if !have {
+                    ui.toasts
+                        .add_toast(adw::Toast::new("Could not fetch the Game Pass catalogue"));
+                }
+                return;
+            };
+            if let Some(dir) = paths {
+                let _ = gamepass::save_cache(&dir, &market, &ids);
+            }
+            ui.model.borrow_mut().gamepass = ids;
+            if ui.model.borrow().section == Section::GamePass {
+                render(&ui);
+            }
+        });
+    }
+}
+
 fn fetch_names(ui: &Ui, product_ids: Vec<String>) {
     let (cache, market, wanted) = {
         let model = ui.model.borrow();

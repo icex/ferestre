@@ -293,6 +293,75 @@ fn row_sized(explanation: &str, title: &str) -> String {
     }
 }
 
+/// The rows for the Game Pass section: what a subscription makes installable.
+///
+/// Built from the public catalogue listing, not from an entitlement, and that
+/// is the honest shape. What a given tier covers is not derivable from its name
+/// -- the tiers have been renamed and re-sliced, and the catalogue differs by
+/// market -- so a row here means "PC Game Pass includes this", never "you can
+/// definitely install this". The licence request at install time is what
+/// decides, and it says why when it refuses.
+///
+/// Titles already owned outright are dropped: they are in the library, with
+/// their real state, and listing them twice under a heading that implies a
+/// subscription is needed would be worse than not listing them.
+pub fn gamepass(inputs: &Inputs, product_ids: &[String]) -> Vec<LibraryRow> {
+    let mut rows: Vec<LibraryRow> = product_ids
+        .iter()
+        .filter(|id| inputs.ownership.owns(id) != Some(true))
+        .map(|product_id| {
+            let key = product_id.to_ascii_uppercase();
+            let product = inputs.catalog.get(&key);
+            let name = product
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| product_id.clone());
+            let installed = (inputs.installed_product)(product_id);
+            let runnable = product.and_then(Product::is_runnable_here);
+
+            let mut parts = vec!["Included with PC Game Pass".to_string()];
+            if let Some(size) = product.map(Product::size_label).filter(|s| !s.is_empty()) {
+                parts.push(size);
+            }
+            let action = match (installed, runnable) {
+                (true, _) => {
+                    parts.push("installed".into());
+                    Action::Adopt
+                }
+                (false, Some(false)) => {
+                    let container = product
+                        .and_then(|p| p.package_format.clone())
+                        .unwrap_or_else(|| "that format".into());
+                    parts.push(format!("{container} package, not MSIXVC"));
+                    Action::Blocked(format!(
+                        "this is a {container} package; the runtime here opens MSIXVC packages"
+                    ))
+                }
+                // `None` is "the catalog has not been asked yet", and it must
+                // read as install rather than as a refusal: a row greyed out
+                // while its own description is still loading is a row nobody
+                // comes back to.
+                (false, _) => Action::Install,
+            };
+
+            LibraryRow {
+                product_id: product_id.clone(),
+                name,
+                subtitle: parts.join("  ·  "),
+                badge: None,
+                image: product.and_then(|p| p.image.clone()),
+                owned: false,
+                has_recipe: false,
+                installed,
+                update: None,
+                unsupported: runnable == Some(false),
+                action,
+            }
+        })
+        .collect();
+    rows.sort_by(sort_key);
+    rows
+}
+
 /// `1 title`, `3 titles`. English only, like the rest of the window.
 fn plural(count: usize, noun: &str) -> String {
     match count {
@@ -368,16 +437,19 @@ pub fn library(inputs: &Inputs) -> Vec<LibraryRow> {
     }
 
     let mut rows: Vec<LibraryRow> = rows.into_values().collect();
-    // Named rows alphabetically, then the ones still showing a product id.
-    // Sorting them together would scatter unnamed rows through the list purely
-    // because a Store id happens to start with a digit.
-    rows.sort_by(|a, b| {
-        a.is_named()
-            .cmp(&b.is_named())
-            .reverse()
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    rows.sort_by(sort_key);
     rows
+}
+
+/// Named rows alphabetically, then the ones still showing a product id.
+///
+/// Sorting them together would scatter unnamed rows through the list purely
+/// because a Store id happens to start with a digit.
+fn sort_key(a: &LibraryRow, b: &LibraryRow) -> std::cmp::Ordering {
+    a.is_named()
+        .cmp(&b.is_named())
+        .reverse()
+        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
 }
 
 fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
@@ -1392,6 +1464,76 @@ mod tests {
             "{}",
             rows[0].subtitle
         );
+    }
+
+    /// The Game Pass list is what a subscription makes installable, and the
+    /// three states it has to keep apart.
+    #[test]
+    fn the_gamepass_list_shows_what_is_installable_and_says_what_is_not() {
+        let listing: Vec<String> = ["9ZZTESTGDK1", "9ZZTESTUWP2", "9ZZTESTOWND", "9ZZTESTUNKN"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Owned outright: it belongs in the library with its real state, not
+        // here under a heading implying a subscription is needed for it.
+        let own = Ownership::Known(entries(&["9ZZTESTOWND"]));
+        let cat = catalog(vec![
+            product("9ZZTESTGDK1", "A GDK Title", &["cid"]),
+            Product {
+                package_format: Some("AppxBundle".into()),
+                ..product("9ZZTESTUWP2", "A UWP Title", &["cid2"])
+            },
+            product("9ZZTESTOWND", "Already Owned", &["cid3"]),
+            // 9ZZTESTUNKN is deliberately absent: the catalog has not answered.
+        ]);
+        let rows = gamepass(
+            &Inputs {
+                recipes: &[],
+                runtime: None,
+                registry: None,
+                ownership: &own,
+                catalog: &cat,
+                records: &BTreeMap::new(),
+                available: &BTreeMap::new(),
+                installed: NOTHING_INSTALLED,
+                installed_version: NO_VERSION_ON_DISK,
+                installed_product: NOT_ON_DISK,
+                running: NOTHING_RUNNING,
+            },
+            &listing,
+        );
+
+        let ids: Vec<&str> = rows.iter().map(|r| r.product_id.as_str()).collect();
+        assert!(
+            !ids.contains(&"9ZZTESTOWND"),
+            "an owned title is in the library, not in the subscription list: {ids:?}"
+        );
+        assert_eq!(rows.len(), 3);
+
+        let by_id = |id: &str| rows.iter().find(|r| r.product_id == id).expect(id);
+
+        let runnable = by_id("9ZZTESTGDK1");
+        assert_eq!(runnable.action, Action::Install);
+        assert!(
+            !runnable.owned,
+            "included is not owned, and the row says so"
+        );
+        assert!(runnable.subtitle.contains("Included with PC Game Pass"));
+        assert!(
+            runnable.subtitle.contains("2.5 GB"),
+            "the size before the download: {}",
+            runnable.subtitle
+        );
+
+        let uwp = by_id("9ZZTESTUWP2");
+        assert!(uwp.unsupported);
+        assert!(matches!(uwp.action, Action::Blocked(_)));
+
+        // Still loading is not a refusal. A row greyed out while its own
+        // description is being fetched is a row nobody comes back to.
+        let unknown = by_id("9ZZTESTUNKN");
+        assert_eq!(unknown.action, Action::Install);
+        assert!(!unknown.unsupported);
     }
 
     /// A row still showing a twelve-character code is waiting for the catalog,
