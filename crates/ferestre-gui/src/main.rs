@@ -322,7 +322,7 @@ fn render(ui: &Ui) {
             render_rows(
                 ui,
                 &page,
-                move |row| show_all || !row.unsupported,
+                move |row| show_all || !row.known_uninstallable(),
                 "Nothing here yet.",
             )
         }
@@ -412,10 +412,12 @@ struct Drawn {
     /// Rows on this page still showing a product id because nothing has looked
     /// their name up.
     want_names: Vec<String>,
-    /// How many of the owned titles ship in a package format this runtime
-    /// cannot open. Counted before the filter, so the number does not change
-    /// depending on whether they are currently being shown.
+    /// How many rows ship in a package format this runtime cannot open, and how
+    /// many the account's subscription tier does not include. Counted before
+    /// the filter, so the numbers do not change depending on whether they are
+    /// currently being shown.
     unsupported: usize,
+    outside_tier: usize,
 }
 
 fn draw_list(
@@ -456,6 +458,7 @@ fn draw_list(
         _ => model::library(&inputs),
     };
     let unsupported = rows.iter().filter(|row| row.unsupported).count();
+    let outside_tier = rows.iter().filter(|row| row.outside_tier).count();
     let rows: Vec<LibraryRow> = rows.into_iter().filter(|row| keep(row)).collect();
 
     let matching = model::search(&rows, &model.query);
@@ -501,6 +504,7 @@ fn draw_list(
         has_next: view.has_next(),
         rows: view.rows.into_iter().cloned().collect(),
         unsupported,
+        outside_tier,
     }
 }
 
@@ -555,7 +559,7 @@ fn render_gamepass(ui: &Ui, page: &adw::PreferencesPage) {
     render_rows(
         ui,
         page,
-        move |row| show_all || !row.unsupported,
+        move |row| show_all || !row.known_uninstallable(),
         "Nothing here yet.",
     );
 }
@@ -592,14 +596,27 @@ fn render_rows(
 
     // Only in the library: the other sections list installed or updatable
     // titles, which are runnable by construction.
-    if matches!(section, Section::Library | Section::GamePass) && drawn.unsupported > 0 {
-        let row = adw::SwitchRow::builder()
-            .title("Show titles Ferestre cannot run")
-            .subtitle(format!(
-                "{} of your titles ship as Appx or Msix packages. This runtime opens the \
-                 MSIXVC packages Xbox GDK titles use.",
+    let held_back = drawn.unsupported + drawn.outside_tier;
+    if matches!(section, Section::Library | Section::GamePass) && held_back > 0 {
+        // Two reasons a title is held back, and the switch names whichever
+        // applies. Saying "95 titles" without saying why is the kind of filter
+        // that makes people think a library is broken.
+        let mut why = Vec::new();
+        if drawn.outside_tier > 0 {
+            why.push(format!(
+                "{} are not in the Game Pass tier this account holds",
+                drawn.outside_tier
+            ));
+        }
+        if drawn.unsupported > 0 {
+            why.push(format!(
+                "{} ship as Appx or Msix packages, which this runtime cannot open",
                 drawn.unsupported
-            ))
+            ));
+        }
+        let row = adw::SwitchRow::builder()
+            .title("Show titles you cannot install")
+            .subtitle(format!("{}.", why.join("; ")))
             .subtitle_lines(2)
             .active(ui.model.borrow().show_unsupported)
             .build();
@@ -1521,6 +1538,19 @@ fn confirm_remove(ui: &Ui, product_id: &str, name: &str) {
     };
 
     let size = ferestre_core::install::tree_size(&dir);
+    let prefix = ui
+        .model
+        .borrow()
+        .recipe_for(product_id)
+        .and_then(|recipe| {
+            ui.model
+                .borrow()
+                .paths
+                .as_ref()
+                .and_then(|paths| paths.prefix_dir(recipe).ok())
+        })
+        .filter(|p| p.is_dir());
+
     let body = format!(
         "{} will be deleted, freeing {}.\n\nThe title stays in your library and can be \
          installed again.",
@@ -1533,18 +1563,41 @@ fn confirm_remove(ui: &Ui, product_id: &str, name: &str) {
     dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
     dialog.set_close_response("cancel");
 
+    // The Wine prefix is the title's C: drive, so it is where saved games are.
+    // Off by default, and it says why: removing it silently along with the
+    // files throws away the one thing somebody would want back, and leaving it
+    // unmentioned is how a `stardew-valley-proton` sits there afterwards with
+    // nothing explaining what it is.
+    let also_prefix = prefix.as_ref().map(|path| {
+        let check = gtk::CheckButton::builder()
+            .label(format!(
+                "Also delete saved games and settings ({}, in {})",
+                ferestre_core::human_bytes(ferestre_core::install::tree_size(path)),
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ))
+            .active(false)
+            .margin_top(6)
+            .build();
+        dialog.set_extra_child(Some(&check));
+        check
+    });
+
     let window = ui.window.clone();
     let ui = ui.clone();
     let product_id = product_id.to_string();
     let name = name.to_string();
     dialog.connect_response(None, move |_, response| {
-        if response == "remove" {
-            spawn_cli_tracked(
-                &ui,
-                &["uninstall", &product_id, "--yes"],
-                &format!("Removing {name}"),
-            );
+        if response != "remove" {
+            return;
         }
+        let mut args = vec!["uninstall", &product_id, "--yes"];
+        if also_prefix
+            .as_ref()
+            .is_some_and(gtk::prelude::CheckButtonExt::is_active)
+        {
+            args.push("--prefix");
+        }
+        spawn_cli_tracked(&ui, &args, &format!("Removing {name}"));
     });
     dialog.present(Some(&window));
 }
@@ -1875,7 +1928,11 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
             model.paths.as_ref().map(|p| p.state_dir().to_path_buf()),
             market,
             language,
-            !model.gamepass.is_empty(),
+            // Both halves, or a cached listing means the tier map is never
+            // fetched: the listing survives a restart and the tier map does
+            // not, so every session after the first showed 524 titles with no
+            // idea which of them this account can install.
+            !model.gamepass.is_empty() && !model.tiers.included.is_empty(),
         )
     };
     if have && !force {
@@ -1910,7 +1967,7 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
                 return;
             };
             if let Some(dir) = paths {
-                let _ = gamepass::save_cache(&dir, &market, &ids);
+                let _ = gamepass::save_cache(&dir, &market, &ids, &tiers);
             }
             {
                 let mut model = ui.model.borrow_mut();

@@ -145,6 +145,10 @@ enum Cmd {
         /// Forget the record but leave the files where they are.
         #[arg(long)]
         keep_files: bool,
+        /// Also remove the title's Wine prefix. Saved games usually live there,
+        /// so it is kept unless this is passed.
+        #[arg(long)]
+        prefix: bool,
         /// Do not ask. Required when there is no terminal to ask at.
         #[arg(long, short = 'y')]
         yes: bool,
@@ -213,8 +217,9 @@ fn dispatch(cli: &Cli) -> Result<ExitCode> {
         Cmd::Uninstall {
             product_id,
             keep_files,
+            prefix,
             yes,
-        } => cmd_uninstall(cli, product_id, *keep_files, *yes),
+        } => cmd_uninstall(cli, product_id, *keep_files, *prefix, *yes),
         Cmd::InstallRuntime => cmd_install_runtime(cli),
         Cmd::Env => cmd_env(cli),
         Cmd::Version => cmd_version(cli),
@@ -512,38 +517,57 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
     std::fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
     eprintln!(":: {product_id} -> {}", dest.display());
     let code = run_inherited(command)?;
-    if code != 0 {
-        return Ok(ExitCode::from(code));
-    }
 
-    // Exiting zero is not the same as having installed something. The client
-    // prints "not entitled to this content" and exits successfully when the
-    // account's licence does not cover a title -- which happens routinely with
-    // Game Pass, where the catalogue lists far more than any one tier grants --
-    // and it leaves a directory holding only a partial container. Believing the
-    // exit code there writes a record claiming a title is installed that is
-    // not, and it never corrects itself: the row offers to launch nothing.
+    // Checked whatever the exit code was, because both halves have been wrong.
+    //
+    // Exiting non-zero is the ordinary failure -- the client panicked partway
+    // through a download -- and it leaves a directory behind that looks like a
+    // half-finished install to anybody who goes looking.
+    //
+    // Exiting *zero* is the surprising one: the client prints "not entitled to
+    // this content" and returns success when the account's licence does not
+    // cover a title, which happens routinely with Game Pass, where the
+    // catalogue lists far more than any one tier grants. Believing the exit
+    // code there records a title as installed that is not, and it never
+    // corrects itself: the row offers to launch nothing.
     if !install::looks_installed(&dest) {
-        eprintln!(
-            "!! {product_id} did not install: nothing arrived in {}",
-            dest.display()
-        );
-        eprintln!(
-            "   the client exited successfully, so the reason is in its output above -- \
-             \"not entitled to this content\" means this account's licence does not cover \
-             the title, which for a Game Pass title means the subscription tier does not \
-             include it"
-        );
-        // Clean up after ourselves, but only what we made: a directory that was
-        // already there might be somebody's, and the partial container is worth
-        // keeping if a resume could use it.
+        if code == 0 {
+            eprintln!(
+                "!! {product_id} did not install: nothing arrived in {}",
+                dest.display()
+            );
+            eprintln!(
+                "   the client exited successfully, so the reason is in its output above -- \
+                 \"not entitled to this content\" means this account's licence does not \
+                 cover the title, which for a Game Pass title means the subscription tier \
+                 does not include it"
+            );
+        } else {
+            eprintln!("!! {product_id} did not install: the client exited {code}");
+        }
+        // Clean up after ourselves, and only what we made: a directory that was
+        // already there might be somebody's.
         if !dest_existed
             && install::safe_to_remove(&dest).is_ok()
             && std::fs::remove_dir_all(&dest).is_ok()
         {
-            eprintln!("   removed the empty {}", dest.display());
+            eprintln!("   removed the unfinished {}", dest.display());
+        } else if dest_existed {
+            eprintln!(
+                "   {} was left as it is; `ferestre uninstall {product_id}` clears it",
+                dest.display()
+            );
         }
         return Ok(ExitCode::FAILURE);
+    }
+    if code != 0 {
+        // Files arrived and the client still failed. Not recorded, because a
+        // record is a claim that a title is ready to launch.
+        eprintln!(
+            "!! the client exited {code}; {} has files in it but the install did not finish",
+            dest.display()
+        );
+        return Ok(ExitCode::from(code));
     }
 
     // A download replaces whatever was patched last time -- Microsoft's
@@ -593,7 +617,13 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
 /// to launch nothing, which is exactly the state that made this command
 /// necessary -- an install failed while the client exited zero, and there was
 /// no way to say so.
-fn cmd_uninstall(cli: &Cli, product_id: &str, keep_files: bool, yes: bool) -> Result<ExitCode> {
+fn cmd_uninstall(
+    cli: &Cli,
+    product_id: &str,
+    keep_files: bool,
+    remove_prefix: bool,
+    yes: bool,
+) -> Result<ExitCode> {
     let product_id = normalise_product_id(product_id);
     let paths = Paths::from_env()?;
 
@@ -622,6 +652,17 @@ fn cmd_uninstall(cli: &Cli, product_id: &str, keep_files: bool, yes: bool) -> Re
     };
     let removing = !keep_files && dir.is_dir();
 
+    // The Wine prefix is a separate directory and it outlives the install: it
+    // is where a title's saved games are, so removing it silently alongside the
+    // files would throw away the thing somebody most wants to keep. Named
+    // either way, because a directory left behind that nothing mentions is how
+    // `stardew-valley-proton` sat there after Stardew Valley was uninstalled.
+    let prefix = recipes
+        .iter()
+        .find(|r| r.matches(&product_id))
+        .and_then(|r| paths.prefix_dir(r).ok())
+        .filter(|p| p.is_dir());
+
     if cli.json {
         print_json(&json!({
             "schema": JSON_SCHEMA,
@@ -629,6 +670,8 @@ fn cmd_uninstall(cli: &Cli, product_id: &str, keep_files: bool, yes: bool) -> Re
             "directory": dir.display().to_string(),
             "removing_files": removing,
             "had_record": record.is_some(),
+            "prefix": prefix.as_ref().map(|p| p.display().to_string()),
+            "removing_prefix": remove_prefix && prefix.is_some(),
         }));
         return Ok(ExitCode::SUCCESS);
     }
@@ -659,6 +702,22 @@ fn cmd_uninstall(cli: &Cli, product_id: &str, keep_files: bool, yes: bool) -> Re
         eprintln!("-- removed {}", dir.display());
     } else if !keep_files {
         eprintln!(":: {} is already gone", dir.display());
+    }
+
+    if let Some(prefix) = &prefix {
+        if remove_prefix {
+            install::safe_to_remove(prefix)?;
+            std::fs::remove_dir_all(prefix)
+                .with_context(|| format!("removing {}", prefix.display()))?;
+            eprintln!("-- removed the Wine prefix {}", prefix.display());
+        } else {
+            eprintln!(
+                "-- kept the Wine prefix {} ({}), which is where saved games live",
+                prefix.display(),
+                ferestre_core::human_bytes(install::tree_size(prefix))
+            );
+            eprintln!("   remove it too with: ferestre uninstall {product_id} --prefix");
+        }
     }
 
     install::forget(paths.state_dir(), &product_id)?;

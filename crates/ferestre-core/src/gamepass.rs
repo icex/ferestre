@@ -249,15 +249,29 @@ pub struct Listing {
     pub fetched: u64,
     pub market: String,
     pub product_ids: Vec<String>,
+    /// Which tiers include which of them. Kept with the listing rather than
+    /// separately because the two are answers about the same catalogue at the
+    /// same moment, and a listing paired with a tier map from another day would
+    /// warn about titles that moved between tiers in between.
+    #[serde(default)]
+    pub tiers: Tiers,
 }
 
-const LISTING_SCHEMA: u32 = 1;
+/// Version 2 is where the tier map joined the listing. A version-1 file parses
+/// and is not wrong, it just has nothing to say about tiers -- but treating it
+/// as complete would mean never fetching them.
+const LISTING_SCHEMA: u32 = 2;
 
 pub fn cache_path(state_dir: &Path) -> PathBuf {
     state_dir.join("gamepass.json")
 }
 
-pub fn save_cache(state_dir: &Path, market: &str, product_ids: &[String]) -> Result<()> {
+pub fn save_cache(
+    state_dir: &Path,
+    market: &str,
+    product_ids: &[String],
+    tiers: &Tiers,
+) -> Result<()> {
     std::fs::create_dir_all(state_dir)?;
     let listing = Listing {
         schema: LISTING_SCHEMA,
@@ -267,6 +281,7 @@ pub fn save_cache(state_dir: &Path, market: &str, product_ids: &[String]) -> Res
             .unwrap_or_default(),
         market: market.to_string(),
         product_ids: product_ids.to_vec(),
+        tiers: tiers.clone(),
     };
     std::fs::write(cache_path(state_dir), serde_json::to_vec_pretty(&listing)?)?;
     Ok(())
@@ -465,7 +480,7 @@ mod tests {
     #[test]
     fn a_cached_listing_is_only_used_for_the_market_it_was_fetched_for() {
         let dir = std::env::temp_dir().join(format!("ferestre-gp-{}", std::process::id()));
-        save_cache(&dir, "US", &["9NBLGGH2JHXJ".into()]).expect("writes");
+        save_cache(&dir, "US", &["9NBLGGH2JHXJ".into()], &Tiers::default()).expect("writes");
         assert!(load_cache(&dir, "US").is_some());
         assert!(load_cache(&dir, "GB").is_none(), "not this market's list");
         assert!(

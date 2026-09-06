@@ -368,10 +368,10 @@ pub fn gamepass(
                 // comes back to.
                 (false, _) => Action::Install,
             };
-            // A warning, never a refusal. The tier mapping is inferred rather
-            // than stated by the service, so the button stays live and the
-            // licence request remains the thing that decides -- being wrong
-            // here must cost a reader a sentence, not a title.
+            // A warning, never a refusal: the button stays live. The tier
+            // mapping is inferred rather than stated by the service, so being
+            // wrong here must cost a reader a sentence, not a title -- and
+            // somebody who turns the filter off is asking to try anyway.
             if covered == Some(false) {
                 parts.push("installing it will probably be refused".into());
             }
@@ -387,6 +387,7 @@ pub fn gamepass(
                 installed,
                 update: None,
                 unsupported: runnable == Some(false),
+                outside_tier: covered == Some(false),
                 action,
             }
         })
@@ -428,6 +429,11 @@ pub struct LibraryRow {
     /// lost among the ninety-five that do not. Never set on "we do not know":
     /// hiding a title on no evidence is the same mistake as refusing one.
     pub unsupported: bool,
+    /// The catalogue lists this title, and the subscriptions this account holds
+    /// do not include it. Only ever set from a positive answer -- `covered()`
+    /// says `None` for everything it does not actually know, and a row hidden
+    /// on a guess is the same mistake as a row refused on one.
+    pub outside_tier: bool,
     pub action: Action,
 }
 
@@ -436,6 +442,16 @@ impl LibraryRow {
     /// showing its product id is waiting, not broken.
     pub fn is_named(&self) -> bool {
         self.name != self.product_id
+    }
+
+    /// Whether there is a known reason this machine and this account could not
+    /// install it. The rule the default filter uses, in one place because both
+    /// list sections need the same answer.
+    ///
+    /// Both halves are set only from positive evidence, so "we have not asked
+    /// yet" is never a reason to hide anything.
+    pub fn known_uninstallable(&self) -> bool {
+        self.unsupported || self.outside_tier
     }
 }
 
@@ -549,6 +565,7 @@ fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
         // A described title is one somebody got working, whatever the catalog
         // says the container is.
         unsupported: false,
+        outside_tier: false,
         action,
     }
 }
@@ -614,6 +631,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
         installed: on_disk,
         update: None,
         unsupported: true,
+        outside_tier: false,
         action: Action::Blocked(reason),
     };
 
@@ -680,6 +698,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
             installed: false,
             update: None,
             unsupported: true,
+            outside_tier: false,
             action: Action::Blocked(format!(
                 "this is a {container} package; the runtime here opens MSIXVC packages"
             )),
@@ -726,6 +745,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
         installed: on_disk,
         update: None,
         unsupported: false,
+        outside_tier: false,
         // Install, unless it is already here -- and then Play, not "set up",
         // whenever the package names its own entry point. That is the common
         // case, and asking someone to go and find an .exe in a tree of
@@ -1974,6 +1994,7 @@ mod tests {
                 installed: false,
                 update: None,
                 unsupported: false,
+                outside_tier: false,
                 action: Action::Adopt,
             })
             .collect()

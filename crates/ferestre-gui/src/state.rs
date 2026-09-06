@@ -184,11 +184,13 @@ impl Model {
             .as_ref()
             .map(|p| Paths::market(p).0)
             .unwrap_or_else(|| catalog::DEFAULT_MARKET.to_string());
-        let gamepass = paths
+        let cached = paths
             .as_ref()
-            .and_then(|p| gamepass::load_cache(p.state_dir(), &market))
-            .map(|listing| listing.product_ids)
-            .unwrap_or_default();
+            .and_then(|p| gamepass::load_cache(p.state_dir(), &market));
+        let (gamepass, tiers) = match cached {
+            Some(listing) => (listing.product_ids, listing.tiers),
+            None => (Vec::new(), gamepass::Tiers::default()),
+        };
         let subscriptions = match &ownership {
             Ownership::Known(entries) => gamepass::active(entries),
             Ownership::Unknown => Vec::new(),
@@ -228,7 +230,7 @@ impl Model {
             avatar,
             gamepass,
             subscriptions,
-            tiers: gamepass::Tiers::default(),
+            tiers,
             section: Section::Library,
             query: String::new(),
             page: 0,

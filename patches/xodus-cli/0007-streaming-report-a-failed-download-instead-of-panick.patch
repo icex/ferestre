@@ -1,0 +1,105 @@
+From e23b31376126dd0736b082a7e7eebe9e007932f7 Mon Sep 17 00:00:00 2001
+From: Ice <icex@users.noreply.github.com>
+Date: Sun, 6 Sep 2026 20:32:58 +0300
+Subject: [PATCH] streaming: report a failed download instead of panicking
+
+The header parses read through a cache the HTTP response fills. When the
+response ends early the cache is shorter than it recorded -- "cache ended
+before cached_len" -- and every read past that point fails.
+
+That reached the user as a Rust panic and a backtrace, in a launcher's log, for
+what is an interrupted download. Now it says so and exits.
+---
+ crates/xodus-cli/src/commands/streaming.rs | 57 +++++++++++++++-------
+ 1 file changed, 40 insertions(+), 17 deletions(-)
+
+diff --git a/crates/xodus-cli/src/commands/streaming.rs b/crates/xodus-cli/src/commands/streaming.rs
+index 41fb9d6..03d19b1 100644
+--- a/crates/xodus-cli/src/commands/streaming.rs
++++ b/crates/xodus-cli/src/commands/streaming.rs
+@@ -285,6 +285,27 @@ where
+     .await
+ }
+ 
++/// Report a streaming failure and stop, instead of panicking.
++///
++/// These parses read the package header through a cache that the HTTP response
++/// fills. When the response ends early the cache is shorter than it recorded --
++/// `cache ended before cached_len` -- and every read past that point fails. That
++/// is an interrupted download, and it reached the user as a Rust panic and a
++/// backtrace, which says nothing about what happened or what to do next.
++fn or_stop<T, E: std::fmt::Display>(what: &str, result: Result<T, E>) -> T {
++    match result {
++        Ok(value) => value,
++        Err(err) => {
++            eprintln!("failed to {what}: {err}");
++            eprintln!(
++                "the download did not finish -- this is usually the connection dropping \
++                 partway through, so trying again is the first thing to do"
++            );
++            std::process::exit(1);
++        }
++    }
++}
++
+ async fn run_reader<Reader>(
+     client: &reqwest::Client,
+     tokens: &TokenManager,
+@@ -307,24 +328,24 @@ where
+     let cache_path = out.join(".xodus-streaming-tmp.msixvc");
+     let final_path = out.join(".xodus-streaming.msixvc");
+ 
+-    let mut remote_file = streaming::PrefixCacheFile::new(reader, l, cache_path.clone())
+-        .await
+-        .expect("no err");
+-    let remote_xvd = XvdFile::parse(&mut remote_file).await.expect("no err");
++    let mut remote_file = or_stop(
++        "open the download cache",
++        streaming::PrefixCacheFile::new(reader, l, cache_path.clone()).await,
++    );
++    let remote_xvd = or_stop("read the package header", XvdFile::parse(&mut remote_file).await);
+     let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
+     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
+ 
+-    let files = remote_xvd
+-        .parse_user_package_files(&mut remote_file)
+-        .await
+-        .expect("ok");
++    let files = or_stop(
++        "read the package file table",
++        remote_xvd.parse_user_package_files(&mut remote_file).await,
++    );
+     for (k, v) in &files {
+         if k == "SegmentMetadata.bin" {
+-            let sfiles = remote_xvd
+-                .parse_segment_metadata(&mut remote_file, v)
+-                .await
+-                .expect("ok");
+-            rfiles = sfiles;
++            rfiles = or_stop(
++                "read the package segment metadata",
++                remote_xvd.parse_segment_metadata(&mut remote_file, v).await,
++            );
+         }
+     }
+ 
+@@ -334,10 +355,12 @@ where
+         })
+         .await
+         .ok();
+-        let sfiles = remote_xvd
+-            .parse_ntfs_segment_metadata(&mut remote_file, !rfiles.is_empty())
+-            .await
+-            .expect("ok");
++        let sfiles = or_stop(
++            "read the package filesystem",
++            remote_xvd
++                .parse_ntfs_segment_metadata(&mut remote_file, !rfiles.is_empty())
++                .await,
++        );
+         rfiles.extend(sfiles);
+     }
+ 
+-- 
+2.55.0
+

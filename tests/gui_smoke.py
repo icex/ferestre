@@ -458,14 +458,31 @@ def main():
     pass_titles = [
         ("9ZZSMOKEPASS", "Subscription Racer", "MSIXVC", 8_100_000_000),
         ("9ZZSMOKEPUWP", "Subscription Puzzler", "AppxBundle", 120_000_000),
+        ("9ZZSMOKETIER", "Higher Tier Only", "MSIXVC", 5_000_000_000),
     ]
+    # The tier map is seeded with the listing, and its presence is what stops
+    # the window going to the network for one: a section that fetched on every
+    # open would make this suite depend on a Microsoft endpoint being up.
+    listing_schema = re.search(
+        r"const LISTING_SCHEMA: u32 = (\d+);",
+        open(os.path.join(os.getcwd(), "crates", "ferestre-core", "src", "gamepass.rs")).read(),
+    )
+    if not listing_schema:
+        raise Failure("no LISTING_SCHEMA in gamepass.rs; has it been renamed?")
     with open(os.path.join(state, "gamepass.json"), "w") as f:
         json.dump(
             {
-                "schema": 1,
+                "schema": int(listing_schema.group(1)),
                 "fetched": 0,
                 "market": "US",
                 "product_ids": [pid for pid, _, _, _ in pass_titles],
+                "tiers": {
+                    "included": {
+                        # In the tier the seeded account holds, and not.
+                        "9ZZSMOKEPASS": ["StandardSubMetadata", "PCSubMetadata"],
+                        "9ZZSMOKETIER": ["PCSubMetadata"],
+                    }
+                },
             },
             f,
         )
@@ -586,8 +603,9 @@ print(":: done", flush=True)
             frame,
         )
         check(
-            any("25 of your titles" in t for t in labels),
-            "and the count of them is stated rather than left as a silent filter",
+            any("25 ship as Appx or Msix packages" in t for t in labels),
+            "and the count of them is stated, with the reason, rather than left "
+            "as a silent filter",
             frame,
         )
 
@@ -595,7 +613,7 @@ print(":: done", flush=True)
         # Three nodes carry this name -- the row, its label, and the switch
         # inside it -- and only the last of them does anything, so this goes
         # through the by-name search that skips the ones that cannot act.
-        SWITCH = "Show titles Ferestre cannot run"
+        SWITCH = "Show titles you cannot install"
         click_named(frame, SWITCH, "the show-everything switch")
         labels = wait_for(
             frame,
@@ -729,7 +747,7 @@ print(":: done", flush=True)
             time.monotonic() + TIMEOUT,
         )
         check(
-            any("2 titles are included with PC Game Pass" in t for t in labels),
+            any("3 titles are included with PC Game Pass" in t for t in labels),
             "the section says what the list is and how long it is",
             frame,
         )
@@ -749,6 +767,14 @@ print(":: done", flush=True)
         check(
             not any("Subscription Puzzler" in t for t in labels),
             "the same filter applies: an AppxBundle is held back here too",
+            frame,
+        )
+        # The seeded account holds nothing, so nothing is known about tiers and
+        # nothing may be hidden on that basis -- hiding a title because a lookup
+        # has not happened is the same mistake as refusing one.
+        check(
+            any("Higher Tier Only" in t for t in labels),
+            "with no subscription known, no title is hidden for being outside a tier",
             frame,
         )
         check(
