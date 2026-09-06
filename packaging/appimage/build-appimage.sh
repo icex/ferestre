@@ -253,6 +253,15 @@ if [ -z "$LAUNCHER_BIN" ]; then
         if [ -x "$cand" ]; then LAUNCHER_BIN=$cand; break; fi
     done
 fi
+# The window, if it was built. Optional: it links GTK4 and libadwaita, which
+# resolve against the host like the rest of this AppImage's dependencies, so a
+# build without it is a valid CLI-only package rather than a broken one.
+GUI_BIN=${FERESTRE_GUI_BIN:-}
+if [ -z "$GUI_BIN" ]; then
+    for cand in "$REPO/target/release/ferestre-gui" "$REPO/target/debug/ferestre-gui"; do
+        if [ -x "$cand" ]; then GUI_BIN=$cand; break; fi
+    done
+fi
 if [ -n "$LAUNCHER_BIN" ]; then
     [ -x "$LAUNCHER_BIN" ] || die "not an executable: $LAUNCHER_BIN"
     say "launcher: $LAUNCHER_BIN"
@@ -293,6 +302,12 @@ mkdir -p "$APPDIR/usr/bin" \
 
 install -m 0755 "$HERE/AppRun"      "$APPDIR/AppRun"
 install -m 0755 "$LAUNCHER_BIN"     "$APPDIR/usr/bin/ferestre"
+if [ -n "$GUI_BIN" ]; then
+    say "window: $GUI_BIN"
+    install -m 0755 "$GUI_BIN"      "$APPDIR/usr/bin/ferestre-gui"
+else
+    warn "no window binary; this AppImage is command-line only"
+fi
 
 # The packaged command reports the version the package was built with rather
 # than a constant compiled into it, so `ferestre version` and the AppImage filename
@@ -325,6 +340,19 @@ done
 subst_id() { sed "s/$DEFAULT_APP_ID/$APP_ID/g" "$1" > "$2"; }
 
 subst_id "$HERE/$DEFAULT_APP_ID.desktop" "$APPDIR/$APP_ID.desktop"
+# The shared entry names `ferestre-gui`, which is right for a system install
+# where that is a binary on PATH. In an AppImage it is not: an integrator
+# rewrites `Exec=` to the AppImage's own path, so the entry point is AppRun,
+# which opens the window when given no arguments. Point the entry at that, and
+# fall back to the terminal command when no window was bundled -- an entry that
+# launches something the package does not contain is indistinguishable from the
+# whole thing being broken.
+sed -i 's/^Exec=ferestre-gui$/Exec=ferestre/; s/^TryExec=ferestre-gui$/TryExec=ferestre/' \
+    "$APPDIR/$APP_ID.desktop"
+if [ -z "$GUI_BIN" ]; then
+    sed -i 's/^Exec=ferestre$/Exec=ferestre doctor/; s/^Terminal=false$/Terminal=true/' \
+        "$APPDIR/$APP_ID.desktop"
+fi
 cp "$APPDIR/$APP_ID.desktop"             "$APPDIR/usr/share/applications/$APP_ID.desktop"
 
 cp "$HERE/$DEFAULT_APP_ID.png" "$APPDIR/$APP_ID.png"

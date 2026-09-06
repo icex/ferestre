@@ -31,4 +31,11 @@ export PATH="$APPDIR/usr/bin:$PATH"
 # invoking usr/bin/ferestre directly out of an extracted AppDir.
 export FERESTRE_SCRIPTS_DIR="${FERESTRE_SCRIPTS_DIR:-$APPDIR/usr/lib/ferestre/scripts}"
 
+# No arguments means somebody clicked the icon, so open the window; arguments
+# mean they typed a command, so run the CLI. Desktop integrators rewrite a
+# .desktop `Exec=` to the AppImage's own path and drop the binary name, so this
+# dispatch -- not the desktop entry -- is what decides which one starts.
+if [ $# -eq 0 ] && [ -x "$APPDIR/usr/bin/ferestre-gui" ]; then
+    exec "$APPDIR/usr/bin/ferestre-gui"
+fi
 exec "$APPDIR/usr/bin/ferestre" "$@"
