@@ -74,16 +74,18 @@ if [ -d "$WINE_REPO/.git" ] || [ -f "$WINE_REPO/.git" ]; then
     # Only meaningful where the repository IS a build tree, i.e. has the patches
     # applied as working-tree edits. A pristine clone (CI) has nothing to
     # reproduce, and comparing against it would fail for the wrong reason.
+    # dlls/xgameruntime is excluded from the comparison because it is a
+    # submodule with its own remote and its own patch series, checked separately
+    # below. A worktree does not populate submodules, so comparing it here
+    # reports every file in it as missing -- which looks like catastrophic drift
+    # and is nothing at all.
+    reproduces_build_tree() {
+        diff -rq --exclude=.git --exclude=xgameruntime "$WORK/wine/dlls" "$WINE_REPO/dlls" >/dev/null 2>&1 \
+            && diff -rq --exclude=.git --exclude=dlls "$WORK/wine" "$WINE_REPO" >/dev/null 2>&1
+    }
     if [ -z "$(git -C "$WINE_REPO" status --porcelain 2>/dev/null | head -1)" ]; then
         say "   (pristine checkout, so nothing to reproduce -- applied-only check)"
-    elif
-    #
-    # dlls/xgameruntime is excluded because it is a submodule with its own
-    # remote and its own patch series, checked separately below. A worktree
-    # does not populate submodules, so comparing it here reports every file in
-    # it as missing -- which looks like catastrophic drift and is nothing.
-       diff -rq --exclude=.git --exclude=xgameruntime "$WORK/wine/dlls" "$WINE_REPO/dlls" >/dev/null 2>&1 \
-       && diff -rq --exclude=.git --exclude=dlls "$WORK/wine" "$WINE_REPO" >/dev/null 2>&1; then
+    elif reproduces_build_tree; then
         ok "the series reproduces the build tree exactly"
     else
         bad "the series applies but does NOT reproduce the build tree:"
