@@ -1,0 +1,43 @@
+# DRAFT — not buildable yet. The launcher it packages does not exist.
+#
+# The application id below is a placeholder. Flathub requires an id under a
+# domain the submitter controls (commonly io.github.<owner>.<App>), so it has
+# to be set by whoever submits rather than baked in here.
+id: org.xgdk.Launcher.PLACEHOLDER
+
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: xgdk-launcher
+
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --device=dri
+  # The client stores account tokens in the keyring and currently cannot start
+  # without a Secret Service provider.
+  - --talk-name=org.freedesktop.secrets
+  # Installs are tens of gigabytes; the user picks where they live.
+  - --filesystem=xdg-documents
+  - --filesystem=xdg-download
+
+modules:
+  - name: xgdk-launcher
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+    build-commands:
+      - cargo build --release --offline
+      - install -Dm755 target/release/xgdk-launcher /app/bin/xgdk-launcher
+    sources:
+      - type: dir
+        path: ../..
+
+  # The patched Proton runtime is NOT bundled: ~264 MiB, versioned separately,
+  # downloaded on first use. If Flathub requires it declared up front it becomes
+  # an extra-data source here rather than a silent download.
