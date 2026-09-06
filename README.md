@@ -31,6 +31,20 @@ all. Everything else here — the GDK runtime, the launcher, the catalogue work 
 grew out of that one requirement, and the same machinery turned out to run other
 Store titles too.
 
+## What to expect from it
+
+This is a pet project I built for my kid over a weekend, largely vibe-coded, and
+it should be read that way. It is not a product and there is no team behind it —
+support is whatever my personal time allows, which some weeks is none.
+
+That said, it works, it is public, and it is open source for a reason: **please
+test it, open issues, and send pull requests.** A bug report that names a title
+and says what it did is genuinely useful, and a recipe for a title that turned
+out to need something unusual is the most useful thing anyone can contribute —
+[CONTRIBUTING.md](CONTRIBUTING.md) covers adding one, and
+[docs/RECIPES.md](docs/RECIPES.md) covers doing it by hand first. Just do not
+mistake it for something with a support contract behind it.
+
 ## The name
 
 **Ferestre** is Romanian for **windows** — the plural of *fereastră*, the thing
