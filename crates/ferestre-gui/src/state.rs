@@ -307,11 +307,16 @@ impl Model {
 
     /// Whether a title with no recipe is on disk, where `ferestre install`
     /// would have put it: games_dir/<product id>.
+    /// Whether a title with no recipe is nevertheless installed.
+    ///
+    /// A directory being there is not enough: one appears the moment a download
+    /// starts, so this answered yes for a title that was 2% downloaded, and the
+    /// row called itself installed and offered to set it up.
     pub fn product_is_installed(&self, product_id: &str) -> bool {
         self.paths
             .as_ref()
             .map(|p| p.games_dir().join(product_id.to_ascii_lowercase()))
-            .is_some_and(|dir| dir.is_dir())
+            .is_some_and(|dir| install::looks_installed(&dir))
     }
 
     /// The entry point the installed package declares, if it is on disk.

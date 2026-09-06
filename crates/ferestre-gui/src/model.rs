@@ -36,6 +36,13 @@ pub enum Action {
     /// had not written yet, and saves are the whole reason people run these
     /// titles here rather than buying them again somewhere else.
     Stop,
+    /// This window is downloading it right now.
+    ///
+    /// Its own state because the alternatives both lie. A directory appears the
+    /// moment a download starts and the package header lands well before the
+    /// files do, so "is it on disk" answers yes halfway through -- which is how
+    /// a title being downloaded came to offer Set up and call itself installed.
+    Installing,
     /// Nothing to press. The string is shown as the tooltip and the subtitle,
     /// so it has to read as a sentence to someone who has never seen the CLI.
     Blocked(String),
@@ -49,12 +56,13 @@ impl Action {
             Action::Update => "Update",
             Action::Adopt => "Set up",
             Action::Stop => "Stop",
+            Action::Installing => "Installing…",
             Action::Blocked(_) => "Play",
         }
     }
 
     pub fn is_enabled(&self) -> bool {
-        !matches!(self, Action::Blocked(_))
+        !matches!(self, Action::Blocked(_) | Action::Installing)
     }
 
     /// The `ferestre` arguments this action runs, or `None` when it runs nothing.
@@ -68,7 +76,7 @@ impl Action {
             Action::Install | Action::Update => Some(["install", product_id]),
             // Both are handled by the window rather than by a command: `Adopt`
             // opens the editor, `Stop` signals a process this window started.
-            Action::Adopt | Action::Stop | Action::Blocked(_) => None,
+            Action::Adopt | Action::Stop | Action::Installing | Action::Blocked(_) => None,
         }
     }
 }
@@ -167,6 +175,10 @@ pub struct Inputs<'a> {
     /// looked. Separate from [`Self::installed_product`] because a package can
     /// be on disk and still not say what to run.
     pub product_describes_itself: &'a dyn Fn(&str) -> bool,
+    /// Whether this window is downloading it at this moment. Only what this
+    /// window started, like [`Self::running`]: a download begun elsewhere is
+    /// not something it can honestly report on.
+    pub installing: &'a dyn Fn(&str) -> bool,
     /// Whether this window started the title and it has not exited. Only what
     /// this window started: a title launched from a terminal is not tracked,
     /// and claiming otherwise would need guessing from the process table.
@@ -223,6 +235,9 @@ fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
     // running is telling the person something they can see is untrue.
     if (inputs.running)(&recipe.title.product_id) {
         return (Action::Stop, None);
+    }
+    if (inputs.installing)(&recipe.title.product_id) {
+        return (Action::Installing, None);
     }
 
     // Nothing about the *title* blocks a launch -- only facts about this
@@ -376,6 +391,7 @@ pub fn gamepass(
                 .map(|p| p.name.clone())
                 .unwrap_or_else(|| product_id.clone());
             let installed = (inputs.installed_product)(product_id);
+            let installing = (inputs.installing)(product_id);
             let runnable = product.and_then(Product::is_runnable_here);
 
             // Said before the download, not after it. A title outside the
@@ -391,6 +407,10 @@ pub fn gamepass(
                 parts.push(note);
             }
             let action = match (installed, runnable) {
+                _ if installing => {
+                    parts.push("installing".into());
+                    Action::Installing
+                }
                 (true, _) => {
                     parts.push("installed".into());
                     if (inputs.product_describes_itself)(product_id) {
@@ -676,6 +696,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
     // on the rows that cannot run: something that got installed and then turned
     // out to be unrunnable is exactly the row that needs to offer removal.
     let on_disk = (inputs.installed_product)(product_id);
+    let installing = (inputs.installing)(product_id);
     let unrunnable = |subtitle: String, reason: String| LibraryRow {
         product_id: product_id.to_string(),
         name: name.clone(),
@@ -823,6 +844,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
         // Set up stays for the case that genuinely needs a person: on disk, and
         // the package does not say what to start.
         action: match (on_disk, (inputs.product_describes_itself)(product_id)) {
+            _ if installing => Action::Installing,
             (true, true) => Action::Play,
             (true, false) => Action::Adopt,
             (false, _) => Action::Install,
@@ -1020,6 +1042,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
         }
     }
@@ -1092,6 +1115,8 @@ mod tests {
     const NOT_ON_DISK: &dyn Fn(&str) -> bool = &|_| false;
     /// And so nothing on disk describes itself.
     const NOTHING_DESCRIBES_ITSELF: &dyn Fn(&str) -> bool = &|_| false;
+    /// And nothing is being downloaded.
+    const NOTHING_INSTALLING: &dyn Fn(&str) -> bool = &|_| false;
 
     #[test]
     fn a_playable_installed_title_plays() {
@@ -1285,6 +1310,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
         });
         assert_eq!(rows[0].action, Action::Update);
@@ -1384,6 +1410,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
         });
 
@@ -1447,6 +1474,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
         });
         let by_id: BTreeMap<&str, &LibraryRow> =
@@ -1504,6 +1532,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
         });
         assert!(
@@ -1549,6 +1578,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
         });
         let row = rows
@@ -1607,6 +1637,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
         });
         assert!(
@@ -1654,6 +1685,7 @@ mod tests {
                 installed_version: NO_VERSION_ON_DISK,
                 installed_product: NOT_ON_DISK,
                 product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+                installing: NOTHING_INSTALLING,
                 running: NOTHING_RUNNING,
             },
             &listing,
@@ -1717,6 +1749,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: on_disk,
             product_describes_itself: describes,
+            installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
         });
         assert_eq!(rows.len(), 1, "the row exists at all");
@@ -1747,6 +1780,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: on_disk,
             product_describes_itself: with_manifest,
+            installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
         });
         assert_eq!(rows[0].action, Action::Play);
@@ -1763,6 +1797,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: on_disk,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
         });
         assert_eq!(
@@ -1804,6 +1839,7 @@ mod tests {
                 installed_version: NO_VERSION_ON_DISK,
                 installed_product: NOT_ON_DISK,
                 product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+                installing: NOTHING_INSTALLING,
                 running: NOTHING_RUNNING,
             },
             &listing,
@@ -1829,6 +1865,44 @@ mod tests {
             inside.subtitle
         );
         assert!(!inside.subtitle.contains("refused"), "{}", inside.subtitle);
+    }
+
+    /// A download in flight is its own state. Both alternatives lie: a
+    /// directory appears the moment a download starts and the package header
+    /// lands well before the files do, so "is it on disk" answers yes halfway
+    /// through -- which is how a title being downloaded came to call itself
+    /// installed and offer Set up.
+    #[test]
+    fn a_title_being_downloaded_says_so_and_offers_nothing_to_press() {
+        let downloading: &dyn Fn(&str) -> bool = &|id| id.eq_ignore_ascii_case("9ZZTESTGDK1");
+        // The worst case for the old behaviour: far enough in that the files
+        // look like an install.
+        let on_disk: &dyn Fn(&str) -> bool = &|_| true;
+        let cat = catalog(vec![product("9ZZTESTGDK1", "Being Downloaded", &["cid"])]);
+        let own = Ownership::Known(entries(&["9ZZTESTGDK1"]));
+        let rows = library(&Inputs {
+            recipes: &[],
+            runtime: None,
+            registry: None,
+            ownership: &own,
+            catalog: &cat,
+            records: &BTreeMap::new(),
+            available: &BTreeMap::new(),
+            installed: NOTHING_INSTALLED,
+            installed_version: NO_VERSION_ON_DISK,
+            installed_product: on_disk,
+            product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            installing: downloading,
+            running: NOTHING_RUNNING,
+        });
+        assert_eq!(rows[0].action, Action::Installing);
+        assert_eq!(rows[0].action.label(), "Installing…");
+        assert!(!rows[0].action.is_enabled());
+        assert_eq!(
+            rows[0].action.command("9ZZTESTGDK1"),
+            None,
+            "there is nothing to run: it is already running"
+        );
     }
 
     /// A row still showing a twelve-character code is waiting for the catalog,
@@ -1857,6 +1931,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
         });
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
@@ -1888,6 +1963,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
         });
         assert_eq!(rows[0].action, Action::Update);
@@ -1919,6 +1995,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
         });
         assert_eq!(rows[0].update, None);
@@ -2032,6 +2109,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            installing: NOTHING_INSTALLING,
             running,
         });
         assert_eq!(rows[0].action, Action::Stop);

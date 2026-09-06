@@ -25,6 +25,9 @@ const MIN_SPAN: Duration = Duration::from_secs(2);
 /// One download, as it is running.
 #[derive(Debug, Clone)]
 pub struct Download {
+    /// Which title this is, so a row can say it is being downloaded rather than
+    /// guessing from a directory that appears the moment a download starts.
+    pub product_id: String,
     pub name: String,
     /// What the launcher is doing, for the line above the bar.
     pub what: String,
@@ -36,8 +39,9 @@ pub struct Download {
 }
 
 impl Download {
-    pub fn new(name: &str, what: &str, at: Instant) -> Self {
+    pub fn new(product_id: &str, name: &str, what: &str, at: Instant) -> Self {
         Download {
+            product_id: product_id.to_string(),
             name: name.to_string(),
             what: what.to_string(),
             done: 0,
@@ -198,7 +202,7 @@ mod tests {
     #[test]
     fn a_steady_download_reports_its_rate_and_what_is_left() {
         let start = Instant::now();
-        let mut d = Download::new("A Title", "Installing", start);
+        let mut d = Download::new("9ZZTESTGAME1", "A Title", "Installing", start);
         // 10 MB/s for ten seconds, of a 200 MB download.
         for second in 1..=10 {
             d.observe(second * 10_000_000, 200_000_000, at(start, second));
@@ -226,7 +230,7 @@ mod tests {
     #[test]
     fn nothing_is_claimed_before_there_is_history_to_claim_it_from() {
         let start = Instant::now();
-        let mut d = Download::new("A Title", "Installing", start);
+        let mut d = Download::new("9ZZTESTGAME1", "A Title", "Installing", start);
         d.observe(4_000_000, 200_000_000, start + Duration::from_millis(100));
         let now = start + Duration::from_millis(100);
         assert_eq!(d.rate(now), None);
@@ -247,7 +251,7 @@ mod tests {
     #[test]
     fn a_stalled_download_says_so_instead_of_estimating_forever() {
         let start = Instant::now();
-        let mut d = Download::new("A Title", "Installing", start);
+        let mut d = Download::new("9ZZTESTGAME1", "A Title", "Installing", start);
         d.observe(50_000_000, 200_000_000, at(start, 1));
         for second in 2..=30 {
             d.observe(50_000_000, 200_000_000, at(start, second));
@@ -264,7 +268,7 @@ mod tests {
     #[test]
     fn a_total_that_grows_is_reported_rather_than_smoothed_over() {
         let start = Instant::now();
-        let mut d = Download::new("A Title", "Installing", start);
+        let mut d = Download::new("9ZZTESTGAME1", "A Title", "Installing", start);
         d.observe(90_000_000, 100_000_000, at(start, 1));
         assert_eq!(d.fraction(), Some(0.9));
         d.observe(90_000_000, 300_000_000, at(start, 2));
@@ -274,7 +278,7 @@ mod tests {
     #[test]
     fn there_is_no_progress_to_show_before_a_total_arrives() {
         let start = Instant::now();
-        let mut d = Download::new("A Title", "Installing", start);
+        let mut d = Download::new("9ZZTESTGAME1", "A Title", "Installing", start);
         d.observe(1_000_000, 0, at(start, 1));
         assert_eq!(d.fraction(), None, "an indeterminate bar, not a full one");
         assert_eq!(d.detail(at(start, 1)), "1 MB");
@@ -282,7 +286,7 @@ mod tests {
 
     #[test]
     fn the_heading_says_what_is_happening_to_what() {
-        let d = Download::new("A Title", "Installing", Instant::now());
+        let d = Download::new("9ZZTESTGAME1", "A Title", "Installing", Instant::now());
         assert_eq!(d.heading(), "Installing A Title");
     }
 

@@ -418,15 +418,22 @@ struct Drawn {
     /// currently being shown.
     unsupported: usize,
     outside_tier: usize,
+    /// Rows in the whole list still waiting for a name while a search is
+    /// running. A search cannot match what has not been fetched, and saying
+    /// "nothing matches" during that is telling somebody something untrue.
+    pending_names: usize,
 }
 
 fn draw_list(
     model: &Model,
     running: &BTreeMap<String, u32>,
+    downloading: Option<&str>,
     section: Section,
     keep: impl Fn(&LibraryRow) -> bool,
 ) -> Drawn {
     let running = |product_id: &str| running.contains_key(&product_id.to_ascii_uppercase());
+    let installing =
+        |product_id: &str| downloading.is_some_and(|id| id.eq_ignore_ascii_case(product_id));
     let installed = |r: &Recipe| model.is_installed(r);
     let installed_version = |r: &Recipe| model.installed_version(r);
     let installed_product = |id: &str| model.product_is_installed(id);
@@ -445,6 +452,7 @@ fn draw_list(
         installed_version: &installed_version,
         installed_product: &installed_product,
         product_describes_itself: &describes_itself,
+        installing: &installing,
         running: &running,
     };
     // The Game Pass section is a different list, not a filter over the same
@@ -463,11 +471,26 @@ fn draw_list(
 
     let matching = model::search(&rows, &model.query);
     let view = model::paginate(&matching, model.page, PER_PAGE);
+    // With a query, the rows that are *not* on screen matter: search matches on
+    // the name, and a row nothing has looked up is still showing its product
+    // id, so "age of" cannot match it. That was a search that found nothing
+    // until you happened to page past the row, and then worked ever after.
+    let searching = !model.query.trim().is_empty();
+    let unnamed_off_page: Vec<String> = if searching {
+        rows.iter()
+            .filter(|row| !row.is_named())
+            .map(|row| row.product_id.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Drawn {
-        want_names: view
-            .rows
+        pending_names: unnamed_off_page.len(),
+        want_names: unnamed_off_page
             .iter()
-            .flat_map(|row| {
+            .cloned()
+            .chain(view.rows.iter().flat_map(|row| {
                 let mut wanted = Vec::new();
                 if !row.is_named() {
                     wanted.push(row.product_id.clone());
@@ -486,7 +509,7 @@ fn draw_list(
                     );
                 }
                 wanted
-            })
+            }))
             .collect(),
         want_icons: view
             .rows
@@ -571,7 +594,19 @@ fn render_rows(
     empty_message: &str,
 ) {
     let section = ui.model.borrow().section;
-    let drawn = draw_list(&ui.model.borrow(), &ui.running.borrow(), section, keep);
+    let downloading = ui
+        .download
+        .current
+        .borrow()
+        .as_ref()
+        .map(|d| d.product_id.clone());
+    let drawn = draw_list(
+        &ui.model.borrow(),
+        &ui.running.borrow(),
+        downloading.as_deref(),
+        section,
+        keep,
+    );
 
     let group = adw::PreferencesGroup::builder().build();
     // Deliberately not an early return: an empty list is exactly when the
@@ -581,6 +616,12 @@ fn render_rows(
         let query = ui.model.borrow().query.clone();
         let message = if query.trim().is_empty() {
             empty_message.to_string()
+        } else if drawn.pending_names > 0 {
+            format!(
+                "Still looking up {} titles — searching finds the ones the catalog has \
+                 answered about",
+                drawn.pending_names
+            )
         } else {
             format!("Nothing matches {query:?}")
         };
@@ -732,6 +773,16 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
         action_row.add_suffix(&badge);
     }
 
+    let store = gtk::Button::builder()
+        .icon_name("web-browser-symbolic")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .tooltip_text("Open this title's Microsoft Store page")
+        .build();
+    let store_url = format!("{STORE_PAGE}{}", row.product_id);
+    store.connect_clicked(move |button| open_link(button, &store_url));
+    action_row.add_suffix(&store);
+
     // Anything on disk can be removed, recipe or not -- and the rows that most
     // need it are the ones with no recipe, because a failed install leaves
     // exactly that and there was previously no way to say so.
@@ -752,8 +803,10 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
         action_row.add_suffix(&remove);
     }
 
-    // A shortcut needs something to point at, which means a recipe.
-    if row.has_recipe {
+    // A shortcut needs something that will launch. A recipe is one; a title on
+    // disk is another, because `run` writes a recipe from the package manifest
+    // on its way past.
+    if row.has_recipe || row.installed {
         let to_steam = gtk::Button::builder()
             .icon_name("list-add-symbolic")
             .valign(gtk::Align::Center)
@@ -785,6 +838,14 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
         action_row.add_suffix(&edit);
     }
 
+    // A greyed-out "Play" is a button that says a title might work if you found
+    // the right thing to click. It never will: the reason is in the subtitle
+    // and on the row, and the Store link beside it is the thing to press.
+    if let Action::Blocked(reason) = &row.action {
+        action_row.set_tooltip_text(Some(reason));
+        return action_row;
+    }
+
     let button = gtk::Button::builder()
         .label(row.action.label())
         .valign(gtk::Align::Center)
@@ -794,6 +855,10 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
 
     match &row.action {
         Action::Blocked(reason) => button.set_tooltip_text(Some(reason)),
+        Action::Installing => {
+            button.set_tooltip_text(Some("Downloading — the bar at the bottom has the detail"));
+            button.remove_css_class("suggested-action");
+        }
         Action::Adopt => {
             button.set_tooltip_text(Some("Describe how this title launches, and try it"));
             button.remove_css_class("suggested-action");
@@ -903,6 +968,9 @@ fn render_account_button(ui: &Ui) {
             None => "Sign in through the Xodus client",
         }));
 }
+
+/// A title's page on the web Store, by product id.
+const STORE_PAGE: &str = "https://apps.microsoft.com/detail/";
 
 /// Xbox's own page for the signed-in account.
 const XBOX_PROFILE: &str = "https://account.xbox.com/en-us/profile";
@@ -1284,8 +1352,8 @@ impl DownloadBar {
         }
     }
 
-    fn start(&self, name: &str, what: &str) {
-        let download = progress::Download::new(name, what, std::time::Instant::now());
+    fn start(&self, product_id: &str, name: &str, what: &str) {
+        let download = progress::Download::new(product_id, name, what, std::time::Instant::now());
         *self.seen.lock().unwrap() = None;
         self.title.set_label(&download.heading());
         *self.current.borrow_mut() = Some(download);
@@ -1342,7 +1410,7 @@ fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&str>, what:
         args.push(dir.to_string());
     }
 
-    ui.download.start(name, what);
+    ui.download.start(product_id, name, what);
     let seen = Arc::clone(&ui.download.seen);
 
     // One timer for the life of the download, stopped when it ends. Attached
@@ -2006,24 +2074,31 @@ fn fetch_names(ui: &Ui, product_ids: Vec<String>) {
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let (market, language) = market;
-        let found = gio::spawn_blocking(move || {
-            let (products, _failures) = catalog::resolve(&cache, &wanted, &market, &language);
-            products
-        })
-        .await;
-        let Ok(found) = found else { return };
-        if found.is_empty() {
-            return;
-        }
-        {
-            let mut model = ui.model.borrow_mut();
-            for product in found {
-                model
-                    .catalog
-                    .insert(product.product_id.to_ascii_uppercase(), product);
+        // In chunks, so filling in five hundred names shows rows as they land
+        // rather than after every request has finished. Each chunk is several
+        // batched lookups, so this is not a request per await.
+        for chunk in wanted.chunks(catalog::BATCH * 5) {
+            let ids = chunk.to_vec();
+            let (cache, market, language) = (cache.clone(), market.clone(), language.clone());
+            let found = gio::spawn_blocking(move || {
+                let (products, _failures) = catalog::resolve(&cache, &ids, &market, &language);
+                products
+            })
+            .await;
+            let Ok(found) = found else { return };
+            if found.is_empty() {
+                continue;
             }
+            {
+                let mut model = ui.model.borrow_mut();
+                for product in found {
+                    model
+                        .catalog
+                        .insert(product.product_id.to_ascii_uppercase(), product);
+                }
+            }
+            render(&ui);
         }
-        render(&ui);
     });
 }
 
