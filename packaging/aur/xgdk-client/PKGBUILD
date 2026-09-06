@@ -27,7 +27,7 @@ pkgrel=1
 pkgdesc='Xodus client for Microsoft Store titles, with the xgdk patches (sign-in, licences, MSIXVC download and decrypt)'
 arch=('x86_64')
 url='https://github.com/xodus-gaming/xodus'
-license=('GPL-3.0-or-later')
+license=('GPL-3.0-only')
 
 # From the NEEDED entries of the built xodus-cli and xodus-service. webkit2gtk
 # and gtk3 come from wry/tao, which draw the Microsoft sign-in window; the

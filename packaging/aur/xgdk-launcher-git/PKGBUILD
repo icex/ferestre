@@ -25,8 +25,8 @@ arch=('x86_64')
 url='https://github.com/icex/xgdk-launcher'
 # Mixed, because the tree is: the scripts and tooling are MIT, and the patches/
 # directory that ships with the package is LGPL-2.1-or-later (wine,
-# xgameruntime), GPL-3.0-or-later (xodus-cli) and BSD-3-Clause (proton).
-license=('MIT' 'LGPL-2.1-or-later' 'GPL-3.0-or-later' 'BSD-3-Clause')
+# xgameruntime), GPL-3.0-only (xodus-cli) and BSD-3-Clause (proton).
+license=('MIT' 'LGPL-2.1-or-later' 'GPL-3.0-only' 'BSD-3-Clause')
 
 depends=(
   'bash'
@@ -36,6 +36,10 @@ depends=(
   # is what makes Minecraft's sign-in and marketplace work at all. It downloads
   # and unpacks the official curl build.
   'curl' 'unzip'
+  # fix-xcurl.sh compares the two DLLs' import/export tables with an inline
+  # python3 script and refuses the swap without it. Today this is satisfied only
+  # as a side effect of xgdk-runtime-bin needing python for the proton script.
+  'python'
 )
 makedepends=('git')
 optdepends=(

@@ -518,7 +518,7 @@ entitled, `2` could not tell (network, no sign-in). Do not print the licence.
 ### 8.1 What, where, how long
 
 Everything lives under `${XDG_CACHE_HOME:-$HOME/.cache}/xgdk/`, mode `0700`,
-files `0600`. `XGDK_CACHE_DIR` overrides. Per-account files are named by a
+files `0600`. `XGDK_LIBRARY_CACHE_DIR` overrides. Per-account files are named by a
 truncated hash of the PUID, not the PUID — cache paths end up in screenshots and
 `ls` output.
 
@@ -663,7 +663,7 @@ and `xgdk run` already depend on the service.
 ## 10. Settling the inferences
 
 What is left is the request body. There is a probe for exactly this in the Xodus
-fork — `xodus-cli collections probe <url> [--body <json>] [--relying-party <rp>]`
+fork — `xodus-cli collections <url> [--body <json>] [--relying-party <rp>]`
 — which mints a token, substitutes placeholders (`{XUID}`, `{PUID}`, `{UHS}`) so
 no account identifier has to appear on a command line, and prints the status, the
 `MS-CV` and the raw body. Iterate from the shell; do not recompile per guess.

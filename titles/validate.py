@@ -262,6 +262,10 @@ def check_recipe(path, known):
             err("[status].last-verified: an untested title has not been verified")
     elif "last-verified" not in status:
         err("[status].last-verified: required -- a matrix entry with no date is a rumour")
+    elif isinstance(status["last-verified"], datetime.datetime):
+        # A bare date and a date-time are different TOML types, and the latter
+        # satisfies isinstance(..., datetime.date) while failing to compare.
+        err("[status].last-verified: expected a bare date (YYYY-MM-DD), not a date-time")
     elif status["last-verified"] > datetime.date.today():
         err(f"[status].last-verified: {status['last-verified']} is in the future")
     if state == "playable-with-issues" and not data.get("issues"):
@@ -358,7 +362,7 @@ def main(argv):
                                     f"{seen[key][value]}")
                 seen.setdefault(key, {})[value] = path.name
             if provided is not None:
-                for name in data["runtime"]["requires"]:
+                for name in data["runtime"].get("requires", []):
                     if name not in provided:
                         problems.append(f"[runtime].requires: the runtime does not "
                                         f"provide '{name}'")

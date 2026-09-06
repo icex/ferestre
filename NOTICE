@@ -6,7 +6,8 @@ each under a different licence. Which applies depends on the directory.
 
 MIT (see LICENSE)
 -----------------
-  docs/      notes/      scripts/      tests/      tools/
+  .github/   docs/      notes/      scripts/      tests/      titles/
+  tools/
 
   Original work: the debugging and automation tooling, the test suites, the
   build and launch scripts, and the written notes. Reuse, modify and fork
@@ -24,12 +25,13 @@ LGPL-2.1-or-later (see LICENSE.LGPL-2.1)
   however it is redistributed. Ship binaries built from these and you must make
   the corresponding source available.
 
-GPL-3.0-or-later
-----------------
+GPL-3.0-only
+------------
   patches/xodus-cli/
 
-  Modifications to Xodus, which is GPL-3.0. These patches are derivative works
-  of it and carry its licence.
+  Modifications to Xodus, which ships a bare GPLv3 with no "or any later
+  version" grant and no per-file headers, so it is GPL-3.0-only. These patches
+  are derivative works of it and carry that licence.
 
 BSD-3-Clause (Valve)
 --------------------
@@ -62,7 +64,7 @@ Upstream projects
   Proton          https://github.com/ValveSoftware/Proton
                   Valve's top-level components are BSD-3-Clause; the Wine
                   inside it remains LGPL-2.1-or-later.
-  Xodus           https://github.com/xodus-gaming    GPL-3.0
+  Xodus           https://github.com/xodus-gaming    GPL-3.0-only
                   The client that signs in, fetches a licence, and downloads
                   and decrypts a package. Not affiliated with this project.
                   These patches are not submitted upstream: Xodus operates a

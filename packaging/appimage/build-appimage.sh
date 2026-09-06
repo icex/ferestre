@@ -333,10 +333,31 @@ cp "$HERE/$DEFAULT_APP_ID.svg" "$APPDIR/usr/share/icons/hicolor/scalable/apps/$A
 ln -sf "$APP_ID.png" "$APPDIR/.DirIcon"
 
 subst_id "$HERE/$DEFAULT_APP_ID.metainfo.xml" "$APPDIR/usr/share/metainfo/$APP_ID.metainfo.xml"
-# The metainfo in the repo carries a development version; make the packaged copy
-# describe the artefact actually being produced.
-sed -i -e "s|<release version=\"[^\"]*\" date=\"[^\"]*\"|<release version=\"$VERSION\" date=\"$(date -u +%Y-%m-%d)\"|" \
-       "$APPDIR/usr/share/metainfo/$APP_ID.metainfo.xml"
+# The metainfo in the repo describes a placeholder development build; make the
+# packaged copy describe the artefact actually being produced. Rewriting only
+# the version and date used to leave a real release advertising itself as a
+# placeholder -- software centres and Gear Lever show that text to users.
+META="$APPDIR/usr/share/metainfo/$APP_ID.metainfo.xml"
+if [ "$PLACEHOLDER" -eq 1 ]; then
+    sed -i -e "s|<release version=\"[^\"]*\" date=\"[^\"]*\"|<release version=\"$VERSION\" date=\"$(date -u +%Y-%m-%d)\"|" "$META"
+else
+    # A real build: stamp it, drop the development marker, and replace the
+    # placeholder prose rather than leaving it to contradict the artefact.
+    python3 - "$META" "$VERSION" "$(date -u +%Y-%m-%d)" <<'PYEOF'
+import re, sys
+path, version, date = sys.argv[1], sys.argv[2], sys.argv[3]
+xml = open(path).read()
+xml = re.sub(
+    r'<release version="[^"]*" date="[^"]*"[^>]*>.*?</release>',
+    f'<release version="{version}" date="{date}">\n'
+    f'      <description>\n'
+    f'        <p>See the project\'s release notes for what changed in {version}.</p>\n'
+    f'      </description>\n'
+    f'    </release>',
+    xml, count=1, flags=re.S)
+open(path, "w").write(xml)
+PYEOF
+fi
 
 # appimagetool still looks for the pre-2019 <id>.appdata.xml name and prints a
 # five-line "AppStream metadata is missing" warning when it does not find one.

@@ -11,10 +11,14 @@ a log you paste into an issue.
 ## Layout
 
 ```
+.github/   issue and PR templates, and the script that regenerates the
+           compatibility matrix from the recipes
 patches/   modifications to Wine/Proton and to the GDK DLL, as plain git diffs
-           (LGPL-2.1-or-later, because Wine is)
+           (LGPL-2.1-or-later, because Wine is; the Xodus ones are GPL-3.0-only)
 scripts/   build, install and per-title launch
 tests/     synthetic suites; run them before proposing a runtime change
+titles/    one TOML recipe per Store product id -- the per-title data the
+           compatibility matrix is generated from
 tools/     debugging and automation
 docs/      how to build, install and run
 notes/     write-ups of problems that were hard to find
@@ -42,11 +46,16 @@ of clicking.
 
 ## Adding a title
 
-Per-title knowledge currently lives in `scripts/launch-*.sh` and a section of
-`docs/RECIPES.md`. A title needs, at minimum: the product id, the executable
-path inside the package, and whatever environment or DLL overrides it turns out
-to want. Keep the launch script to the few lines that differ and let
-`scripts/launch-gdk.sh` do the rest.
+Per-title knowledge is data: one `titles/<store-product-id>.toml` per title.
+The product id is the twelve-character identifier in the Store URL, which is
+also what the collections API returns, so a recipe joins straight to what an
+account owns.
+
+Start from an existing recipe, run `python3 titles/validate.py`, and let
+`scripts/launch-gdk.sh` do the shared work. A recipe declares the runtime
+*capabilities* it needs rather than a Proton version, so it keeps working across
+runtime updates. `docs/COMPATIBILITY.md` is generated from these -- do not edit
+it by hand.
 
 If a title does not work, say precisely where it stops. "Does not launch" is not
 actionable; "exits with no window after `XGameRuntimeInitialize`, with this in
