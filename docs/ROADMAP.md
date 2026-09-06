@@ -29,6 +29,15 @@ than treat it as an optional extra.
       `scripts/launch-gdk.sh` is 75 lines and most of it is undoing environment
       that Steam injects — so this is a modest schema, not a framework.
       `titles/*.toml`, `titles/SCHEMA.md`, validated in CI.
+- [x] **A runtime publishes what it provides, and proves it.** Every capability
+      in `titles/capabilities.toml` carries `verify` markers — a file inside the
+      installed runtime and a string that is only there once the patch is — and
+      `scripts/write-capabilities.sh` checks them against the real tree and
+      writes `files/share/ferestre/capabilities.json`. `install-xodus-proton.sh`
+      runs it. The manifest is therefore measured, not asserted, and
+      `validate.py` refuses a capability with no way to check it. Before this,
+      probing found 4 of 12 and every title carried "may not start" wording it
+      did not deserve.
 - [ ] CI running the synthetic suites on every change. **Half done.** The Rust
       workspace, `cargo fmt`, `clippy` and the AT-SPI end-to-end GUI test run on
       every change, and so does recipe validation. `tests/xgr_tests.c` — the
@@ -237,13 +246,6 @@ These are judgement calls, not engineering ones:
 
 ## Known gaps, stated plainly
 
-- **The runtime does not publish a capability list.** `files/share/ferestre/capabilities.json`
-  is the manifest a build is supposed to ship; no build writes one, so the
-  launcher falls back to probing, finds four of the capabilities it looks for,
-  and every title carries "could not be found" wording it does not deserve. The
-  launcher already refuses to *block* on probed evidence, which is the correct
-  behaviour, but the wording will keep looking like a warning until
-  `install-xodus-proton.sh` writes the manifest.
 - **There are no delta updates.** MSIXVC downloads are resumable but not
   differential, so "update" currently means re-downloading the title. That is
   ~2.5 GB for Bedrock but tens of gigabytes for a large title, which makes

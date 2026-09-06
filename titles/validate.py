@@ -129,6 +129,33 @@ def load_capabilities(path):
             continue
         if name in known:
             problems.append(f"capabilities.toml: '{name}' defined twice")
+        # Every capability must be checkable against a real build. Without a
+        # marker, `scripts/write-capabilities.sh` cannot publish it, so the
+        # launcher falls back to probing and hedges about every title -- and a
+        # capability nobody can verify is a promise, which is the thing the
+        # manifest exists to replace.
+        markers = entry.get("verify")
+        if not isinstance(markers, list) or not markers:
+            problems.append(
+                f"capabilities.toml: '{name}' has no `verify` markers, so no build "
+                f"can prove it provides it"
+            )
+        else:
+            for i, marker in enumerate(markers):
+                where = f"capabilities.toml: '{name}'.verify[{i}]"
+                if not isinstance(marker, dict):
+                    problems.append(f"{where}: expected a table")
+                    continue
+                for field in ("file", "contains"):
+                    value = marker.get(field)
+                    if not isinstance(value, str) or not value:
+                        problems.append(f"{where}: `{field}` must be a non-empty string")
+                path = marker.get("file")
+                if isinstance(path, str) and (path.startswith("/") or ".." in path):
+                    problems.append(
+                        f"{where}: `file` is relative to the runtime directory, "
+                        f"not an absolute or climbing path"
+                    )
         known[name] = entry
     if not known:
         problems.append("capabilities.toml: no capabilities defined")

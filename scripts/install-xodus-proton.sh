@@ -1,5 +1,6 @@
 #!/bin/bash
-# Build and install the Xodus Proton fork, then re-apply the local patch.
+# Build and install the Xodus Proton fork, re-apply the local patch, and write
+# down what the result can do.
 #
 # Two things make this more than "make install":
 #
@@ -52,3 +53,10 @@ else
     echo "!! xgameruntime looks stale -- saves will not work" >&2
     exit 1
 fi
+
+# Last, because it describes what was just installed. Without it the launcher
+# falls back to probing, finds a third of the capabilities, and tells the user
+# every title "may not start" -- a build that cannot say what it provides is a
+# build the launcher has to be pessimistic about.
+echo ":: publishing the capability manifest"
+"$REPO_DIR/scripts/write-capabilities.sh" "$TOOL_DIR"
