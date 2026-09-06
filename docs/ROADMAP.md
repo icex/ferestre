@@ -23,12 +23,16 @@ than treat it as an optional extra.
 
 - [x] Repository with no personal data, licences, and a clear statement that
       users must own their games
-- [ ] Replace prose recipes with a **declarative per-title manifest** (product
+- [x] Replace prose recipes with a **declarative per-title manifest** (product
       id, executable path, prefix layout, environment, DLL overrides, required
       GDK features, known issues). The launch surface turns out to be small —
       `scripts/launch-gdk.sh` is 75 lines and most of it is undoing environment
       that Steam injects — so this is a modest schema, not a framework.
-- [ ] CI running the synthetic suites on every change
+      `titles/*.toml`, `titles/SCHEMA.md`, validated in CI.
+- [ ] CI running the synthetic suites on every change. **Half done.** The Rust
+      workspace, `cargo fmt`, `clippy` and the AT-SPI end-to-end GUI test run on
+      every change, and so does recipe validation. `tests/xgr_tests.c` — the
+      synthetic GDK suites — still runs only by hand.
 
 ## Phase 1 — ship the runtime
 
@@ -112,13 +116,13 @@ Turn the twelve symptom/cause/fix rows in `docs/RECIPES.md` into a
 fingerprint file the runner consults automatically on a failed launch, so a new
 title diagnoses itself rather than needing someone who remembers.
 
-### The window, and what it still owes
+### The window
 
-The GTK4 window exists and launches titles. Everything below is asked for and
-not yet built. Ordered by how much it changes what the launcher *is*, not by
-effort.
+The GTK4 window exists and launches titles. Most of what this section once listed
+as missing is now built; what remains is at the bottom, and the hardest of it is
+honestly marked as unproven rather than planned.
 
-- [ ] **Real names and cover art for owned titles.** Collections returns product
+- [x] **Real names and cover art for owned titles.** Collections returns product
       ids and nothing else — no name, no image — so a library of 100+ titles
       currently reads as a list of twelve-character codes. The names and art
       come from DisplayCatalog (`displaycatalog.mp.microsoft.com/v7.0/products`),
@@ -126,11 +130,11 @@ effort.
       nobody owns and cached on disk without touching auth. Batch the ids, cache
       per product, and never block the window on it.
 
-- [ ] **Pagination for the owned list.** A hundred rows in one `AdwPreferencesGroup`
+- [x] **Pagination for the owned list.** A hundred rows in one `AdwPreferencesGroup`
       is neither usable nor fast. Pages plus a search box; search matters more
       than the pager once names exist.
 
-- [ ] **A login flow, and the signed-in account on screen.** Today signing in is
+- [x] **A login flow, and the signed-in account on screen.** Today signing in is
       a side effect of asking for the library. It should be explicit: a
       Sign in / Sign out control, the gamertag and gamerpic in the header, and a
       window that says plainly when nobody is signed in. The client has `login`
@@ -139,12 +143,17 @@ effort.
       token for `http://xboxlive.com` rather than the licensing relying party
       the library uses.
 
-- [ ] **Updates.** Show that an installed title has a newer version, and update
-      it. Needs a version for what is installed (recorded at install time, since
-      the decrypted tree does not carry one reliably) and a version for what is
-      available (the catalog's package listing).
+- [ ] **Updates. Half built, and the missing half is the one that matters.**
+      The comparison works: `ContentId` from the catalog is the key, an install
+      record holds what was installed, `Record::update_available` returns
+      `None` rather than guessing when either side is unknown, and the window
+      has an Updates section that reads from it. **But nothing writes a record**
+      — `install::save` has no caller — so no title is ever known to be
+      installed-at-a-version and the section is permanently empty. Wiring
+      `xgdk install` to record the content ids it fetched is the whole
+      remaining task, and it is small.
 
-- [ ] **A recipe editor.** The catalog will list a hundred titles with three
+- [x] **A recipe editor.** The catalog will list a hundred titles with three
       recipes between them, so the common case is a title nobody has described.
       Someone should be able to fill in an executable path and a couple of
       environment variables in the window, try it, and hand the result back as
@@ -152,14 +161,14 @@ effort.
       `$XDG_CONFIG_HOME/xgdk/titles/` and win over the packaged recipe, so an
       upgrade never reverts them and "what did I change" stays answerable.
 
-- [ ] **Add to Steam.** A non-Steam shortcut for the overlay, controller
+- [x] **Add to Steam.** A non-Steam shortcut for the overlay, controller
       configuration and Remote Play. Writing `shortcuts.vdf` means rewriting a
       file full of shortcuts that have nothing to do with this launcher, so it
       round-trips the whole document and keeps every field it did not write.
       Steam rewrites that file from memory on exit, so the launcher has to
       refuse while Steam is running rather than write an edit that vanishes.
 
-- [ ] **A sidebar, and a layout that survives a hundred titles.** One flat
+- [x] **A sidebar, and a layout that survives a hundred titles.** One flat
       preferences page was right for three recipes and is wrong for a library.
       Library / Installed / Updates / Runtime as sidebar sections.
 
@@ -223,10 +232,16 @@ These are judgement calls, not engineering ones:
 
 ## Known gaps, stated plainly
 
-- **There is no owned-title enumeration.** Every command today takes a product
-  id typed by hand; nothing anywhere lists what an account owns. "Show me my
-  games" is new work against a Microsoft endpoint, and it is the one feature a
-  launcher is judged on.
+- **Nothing records what it installed.** See Updates above: the detection is
+  built and the writer is not, so the Updates section is empty by construction
+  rather than because everything is current.
+- **The runtime does not publish a capability list.** `files/share/xgdk/capabilities.json`
+  is the manifest a build is supposed to ship; no build writes one, so the
+  launcher falls back to probing, finds four of the capabilities it looks for,
+  and every title carries "could not be found" wording it does not deserve. The
+  launcher already refuses to *block* on probed evidence, which is the correct
+  behaviour, but the wording will keep looking like a warning until
+  `install-xodus-proton.sh` writes the manifest.
 - **There are no delta updates.** MSIXVC downloads are resumable but not
   differential, so "update" currently means re-downloading the title. That is
   ~2.5 GB for Bedrock but tens of gigabytes for a large title, which makes
