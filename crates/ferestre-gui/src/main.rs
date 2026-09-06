@@ -341,6 +341,9 @@ fn draw_list(model: &Model, keep: impl Fn(&LibraryRow) -> bool) -> Drawn {
         ownership: &model.ownership,
         catalog: &model.catalog,
         records: &model.records,
+        // Empty until something asks the update service what it is offering.
+        // See `Inputs::available` and docs/ROADMAP.md.
+        available: &model.available,
         installed: &installed,
         installed_version: &installed_version,
     })

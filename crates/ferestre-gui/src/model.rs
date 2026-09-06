@@ -135,6 +135,13 @@ pub struct Inputs<'a> {
     pub catalog: &'a BTreeMap<String, Product>,
     /// What the launcher recorded at install time, keyed the same way.
     pub records: &'a BTreeMap<String, Record>,
+    /// The version the service is offering, keyed the same way. Empty today,
+    /// and that is the honest state: the anonymous catalog reports every
+    /// version as "0", and the endpoint that knows -- `GetBasePackage` on
+    /// update.xboxlive.com -- needs a token nothing here mints yet. Injected
+    /// rather than looked up so that connecting it is one line at the call
+    /// site, and so a test can describe a machine with an update waiting.
+    pub available: &'a BTreeMap<String, String>,
     /// Whether the title's install directory is on disk. A closure because the
     /// answer is a filesystem probe, and keeping it out of here is what lets a
     /// test describe a half-installed machine in one line.
@@ -332,8 +339,7 @@ fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
     let installed = (inputs.installed)(recipe);
     let record = inputs.records.get(key);
     let update = record
-        .zip(product)
-        .and_then(|(record, product)| record.update_available(&product.content_ids));
+        .and_then(|record| record.update_available(inputs.available.get(key).map(String::as_str)));
 
     let action = match (&view.action, update) {
         // An update is worth offering even when the runtime has doubts about
@@ -402,9 +408,10 @@ fn installed_status(
             format!("{version}  ·  not recorded, so updates cannot be checked")
         }
         None if product.is_none() => format!("{version}  ·  check the library to see updates"),
-        // The catalog answered and listed no desktop package to compare
-        // against -- an Xbox-only title, or one no longer sold.
-        None => format!("{version}  ·  no desktop package listed, so updates cannot be checked"),
+        // A record and a catalog entry, and still no answer: the version on
+        // offer is not published anonymously. Saying so is the point -- the
+        // failure this wording exists to prevent is silence reading as "fine".
+        None => format!("{version}  ·  update checking is not wired up yet"),
     }
 }
 
@@ -624,6 +631,7 @@ mod tests {
             ownership,
             catalog: empty_catalog(),
             records: empty_records(),
+            available: empty_available(),
             installed,
             installed_version: NO_VERSION_ON_DISK,
         }
@@ -637,6 +645,17 @@ mod tests {
     fn empty_records() -> &'static BTreeMap<String, Record> {
         static EMPTY: std::sync::OnceLock<BTreeMap<String, Record>> = std::sync::OnceLock::new();
         EMPTY.get_or_init(BTreeMap::new)
+    }
+
+    /// The production state: nothing knows what version is on offer.
+    fn empty_available() -> &'static BTreeMap<String, String> {
+        static EMPTY: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(BTreeMap::new)
+    }
+
+    /// A machine where the service is offering a newer build.
+    fn offering(product_id: &str, version: &str) -> BTreeMap<String, String> {
+        [(product_id.to_ascii_uppercase(), version.to_string())].into()
     }
 
     fn product(product_id: &str, name: &str, content_ids: &[&str]) -> Product {
@@ -840,6 +859,7 @@ mod tests {
             record("9ZZTESTGAME1", &["content-a"]),
         )]
         .into();
+        let avail = offering("9ZZTESTGAME1", "1.26.4600.0");
         let rows = library(&Inputs {
             recipes: &recipes,
             runtime: Some(&rt),
@@ -847,6 +867,7 @@ mod tests {
             ownership: &own,
             catalog: &cat,
             records: &recs,
+            available: &avail,
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
         });
@@ -934,6 +955,7 @@ mod tests {
             product("9ZZTESTNEW3", "Zebra", &[]),
         ]);
         let recs = BTreeMap::new();
+        let avail = BTreeMap::new();
         let rows = library(&Inputs {
             recipes: &recipes,
             runtime: Some(&rt),
@@ -941,6 +963,7 @@ mod tests {
             ownership: &own,
             catalog: &cat,
             records: &recs,
+            available: &avail,
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
         });
@@ -984,6 +1007,7 @@ mod tests {
             product("9ZZTESTNEW4", "aardvark", &[]),
         ]);
         let recs = BTreeMap::new();
+        let avail = BTreeMap::new();
         let rows = library(&Inputs {
             recipes: &recipes,
             runtime: Some(&rt),
@@ -991,6 +1015,7 @@ mod tests {
             ownership: &own,
             catalog: &cat,
             records: &recs,
+            available: &avail,
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
         });
@@ -998,8 +1023,9 @@ mod tests {
         assert_eq!(names, vec!["aardvark", "Zebra", "9ZZTESTNEW3"]);
     }
 
+    /// The record holds 1.26.4501.0; the service offers 1.26.4600.0.
     #[test]
-    fn a_rebuilt_package_turns_play_into_update() {
+    fn a_newer_version_on_offer_turns_play_into_update() {
         let recipes = vec![recipe("9ZZTESTGAME1", "playable", &[])];
         let rt = runtime_with(&[], CapabilitySource::Manifest);
         let own = Ownership::Unknown;
@@ -1009,6 +1035,7 @@ mod tests {
             record("9ZZTESTGAME1", &["content-a"]),
         )]
         .into();
+        let avail = offering("9ZZTESTGAME1", "1.26.4600.0");
         let rows = library(&Inputs {
             recipes: &recipes,
             runtime: Some(&rt),
@@ -1016,6 +1043,7 @@ mod tests {
             ownership: &own,
             catalog: &cat,
             records: &recs,
+            available: &avail,
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
         });
@@ -1035,6 +1063,7 @@ mod tests {
         let own = Ownership::Unknown;
         let cat = catalog(vec![product("9ZZTESTGAME1", "Test Game", &["content-b"])]);
         let recs = BTreeMap::new();
+        let avail = BTreeMap::new();
         let rows = library(&Inputs {
             recipes: &recipes,
             runtime: Some(&rt),
@@ -1042,6 +1071,7 @@ mod tests {
             ownership: &own,
             catalog: &cat,
             records: &recs,
+            available: &avail,
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
         });
@@ -1072,7 +1102,7 @@ mod tests {
             None,
             None,
         );
-        let no_desktop_package = installed_status(
+        let not_wired_up = installed_status(
             Some(&record("9ZZTESTGAME1", &["content-a"])),
             Some(&product("9ZZTESTGAME1", "T", &[])),
             None,
@@ -1082,12 +1112,9 @@ mod tests {
         assert!(up_to_date.contains("up to date"), "{up_to_date}");
         assert!(stale.contains("update available"), "{stale}");
         assert!(unrecorded.contains("cannot be checked"), "{unrecorded}");
-        assert!(
-            no_desktop_package.contains("no desktop package"),
-            "{no_desktop_package}"
-        );
+        assert!(not_wired_up.contains("not wired up"), "{not_wired_up}");
 
-        let all = [&up_to_date, &stale, &unrecorded, &no_desktop_package];
+        let all = [&up_to_date, &stale, &unrecorded, &not_wired_up];
         let distinct: BTreeSet<&String> = all.iter().copied().collect();
         assert_eq!(
             distinct.len(),

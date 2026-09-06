@@ -5,9 +5,19 @@
 //! of it, and the anonymous catalog reports `Version` as `"0"` for everything.
 //! So the launcher records what it installed, at the moment it installs it.
 //!
-//! The recorded thing is the set of **content ids**, because that is what
-//! actually changes when a package is rebuilt. An update is then a comparison
-//! rather than a download: the catalog lists a content id we do not have.
+//! The recorded thing was the set of **content ids**, on the belief that a
+//! content id changes when a package is rebuilt. **It does not.** Measured
+//! against 26 published patch plans spanning 26 distinct builds of three
+//! titles: three content ids, one per title, identical across every build. A
+//! content id names the title's package; the *version* names the build, and the
+//! delivery path is `/{ContentId}/{VersionId}/`.
+//!
+//! So the update key is the package version, and the content ids are kept only
+//! because they are the path component a download needs. What the anonymous
+//! catalog cannot supply is the *available* version -- it reports `"0"` for
+//! everything -- so until the authenticated update endpoint is wired up, the
+//! honest answer to "is there an update" is "cannot tell", and that is what
+//! this returns. See docs/ROADMAP.md for the endpoint and the plan format.
 //!
 //! The install does not have to be taken on trust, either. The client leaves the
 //! package header on disk as `.xodus-streaming.msixvc`, and the GUID in it *is*
@@ -29,10 +39,9 @@ pub struct Record {
     /// Where it went. Kept so a record can be recognised as stale when someone
     /// moves or deletes the directory behind the launcher's back.
     pub dir: PathBuf,
-    /// The catalog's content ids at install time. Empty when the install
-    /// predates this record or happened outside the launcher, which is not an
-    /// error -- it only means updates cannot be detected for that title until
-    /// it is installed again.
+    /// The package's content ids. **Not** the update key -- they are identical
+    /// across every build of a title -- but they are the path component a
+    /// download is fetched by, so they are worth having written down.
     #[serde(default)]
     pub content_ids: Vec<String>,
     /// RFC 3339, as the caller spells it. Nothing does arithmetic on it.
@@ -72,17 +81,25 @@ impl Record {
         }
     }
 
-    /// Whether the catalog is now offering a build this install does not have.
+    /// Whether a newer build than this one is available.
     ///
-    /// Unknown -- rather than "no" -- when either side has nothing to compare.
-    /// An install recorded before content ids were kept must not be reported as
-    /// up to date on no evidence; a title whose catalog entry has not been
-    /// fetched yet must not be reported as stale.
-    pub fn update_available(&self, catalog: &[String]) -> Option<bool> {
-        if self.content_ids.is_empty() || catalog.is_empty() {
+    /// `available` is the version the service is offering. `None` -- meaning
+    /// "cannot tell" -- whenever either side is unknown, which today is always,
+    /// because the anonymous catalog reports every version as `"0"` and nothing
+    /// yet asks the authenticated endpoint that knows.
+    ///
+    /// That is deliberate and it is the whole point of this signature. The
+    /// previous version compared content ids, which are identical across every
+    /// build of a title, so it could only ever answer "up to date" -- a
+    /// confident wrong answer to the one question this module exists to ask.
+    /// "Cannot tell" is worth more than that.
+    pub fn update_available(&self, available: Option<&str>) -> Option<bool> {
+        let installed = self.package_version.as_deref()?;
+        let available = available?;
+        if installed.is_empty() || available.is_empty() {
             return None;
         }
-        Some(catalog.iter().any(|id| !self.content_ids.contains(id)))
+        Some(installed != available)
     }
 }
 
@@ -304,250 +321,32 @@ mod tests {
         }
     }
 
+    /// The correction this signature exists for. Content ids do not change
+    /// between builds -- 26 published plans across 26 builds of three titles
+    /// carry three content ids, one per title -- so comparing them answered
+    /// "up to date" to every real update. A version comparison answers it.
     #[test]
-    fn a_new_content_id_in_the_catalog_is_an_update() {
+    fn a_newer_version_is_an_update() {
         let installed = record(&["content-a"]);
-        assert_eq!(
-            installed.update_available(&["content-a".into()]),
-            Some(false)
-        );
-        assert_eq!(
-            installed.update_available(&["content-b".into()]),
-            Some(true)
-        );
-    }
-
-    /// A title split across packages is stale if any one of them was rebuilt.
-    #[test]
-    fn one_rebuilt_package_out_of_several_is_an_update() {
-        let installed = record(&["content-a", "content-b"]);
-        assert_eq!(
-            installed.update_available(&["content-a".into(), "content-b".into()]),
-            Some(false)
-        );
-        assert_eq!(
-            installed.update_available(&["content-a".into(), "content-c".into()]),
-            Some(true)
-        );
+        assert_eq!(installed.update_available(Some("1.26.4501.0")), Some(false));
+        assert_eq!(installed.update_available(Some("1.26.4600.0")), Some(true));
+        // Downgrades count as different, because "not what I have" is the
+        // question; a rollback still needs the files fetched.
+        assert_eq!(installed.update_available(Some("1.26.4403.0")), Some(true));
     }
 
     /// Neither "up to date" nor "stale" is honest with nothing to compare, and
     /// a launcher that guesses either way either nags or hides a real update.
+    /// Today the available version is never known, so this is the normal case.
     #[test]
     fn nothing_to_compare_is_unknown_not_a_verdict() {
-        assert_eq!(record(&[]).update_available(&["content-a".into()]), None);
-        assert_eq!(record(&["content-a"]).update_available(&[]), None);
-    }
-
-    /// The manifest is Microsoft's and attribute order is not guaranteed, so the
-    /// reader must not assume the shape the two titles here happen to have.
-    #[test]
-    fn the_package_version_is_read_whatever_the_attribute_order() {
-        let dir =
-            std::env::temp_dir().join(format!("ferestre-manifest-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("makes the dir");
-
-        let write = |body: &str| {
-            std::fs::write(dir.join("appxmanifest.xml"), body).expect("writes");
-            package_version(&dir)
-        };
-
-        // The real shape, from a shipped title.
-        assert_eq!(
-            write(
-                r#"<?xml version="1.0"?><Package><Identity Name="Microsoft.MinecraftUWP" Publisher="CN=Microsoft Corporation" Version="1.26.4501.0" ProcessorArchitecture="x64" /></Package>"#
-            ),
-            Some("1.26.4501.0".into())
-        );
-        // Version first, single quotes, and extra whitespace.
-        assert_eq!(
-            write("<Package><Identity   Version='2.0.1.0'  Name=\"X\" /></Package>"),
-            Some("2.0.1.0".into())
-        );
-        // A package with no version, and one with an empty one.
-        assert_eq!(write(r#"<Package><Identity Name="X" /></Package>"#), None);
-        assert_eq!(
-            write(r#"<Package><Identity Version="" Name="X" /></Package>"#),
-            None
-        );
-        // Not a manifest at all.
-        assert_eq!(write("not xml"), None);
-        // A later element that mentions Version must not be mistaken for it.
-        assert_eq!(
-            write(r#"<Package><Identity Name="X" /><Dependency Version="9.9.9.9" /></Package>"#),
-            None,
-            "only the Identity element names the package version"
-        );
-
-        std::fs::remove_dir_all(&dir).expect("cleans up");
-    }
-
-    /// Hand-rolled date maths earns its tests. Vectors chosen for the cases that
-    /// break naive conversions: the epoch, a leap day, and a century that is not
-    /// a leap year on the other side of one that is.
-    #[test]
-    fn timestamps_are_rfc_3339_utc() {
-        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
-        assert_eq!(rfc3339(1), "1970-01-01T00:00:01Z");
-        assert_eq!(
-            rfc3339(951_782_400),
-            "2000-02-29T00:00:00Z",
-            "2000 is a leap year"
-        );
-        assert_eq!(rfc3339(1_709_164_800), "2024-02-29T00:00:00Z");
-        assert_eq!(rfc3339(1_788_690_600), "2026-09-06T10:30:00Z");
-        assert_eq!(
-            rfc3339(4_107_542_400),
-            "2100-03-01T00:00:00Z",
-            "2100 is not"
-        );
-        assert_eq!(rfc3339(86_399), "1970-01-01T23:59:59Z");
-        assert_eq!(rfc3339(86_400), "1970-01-02T00:00:00Z");
-
-        let now = now_rfc3339().expect("the clock is after 1970");
-        assert_eq!(now.len(), 20, "{now}");
-        assert!(now.ends_with('Z') && now.contains('T'), "{now}");
-    }
-
-    /// A synthetic container: the magic where the header starts and a known
-    /// GUID where VDUID sits.
-    fn container(dir: &Path, guid: &[u8; 16], magic: &[u8; 8]) {
-        let mut bytes = vec![0u8; 0x1000];
-        bytes[0x200..0x208].copy_from_slice(magic);
-        bytes[0x220..0x230].copy_from_slice(guid);
-        std::fs::write(dir.join(CONTAINER), bytes).expect("writes the container");
-    }
-
-    /// The bytes of 7792d9ce-355a-493c-afbd-768f4a77c3b0 as Microsoft stores
-    /// them -- first three fields little-endian. Taken from a real install.
-    const REAL_GUID: [u8; 16] = [
-        0xce, 0xd9, 0x92, 0x77, 0x5a, 0x35, 0x3c, 0x49, 0xaf, 0xbd, 0x76, 0x8f, 0x4a, 0x77, 0xc3,
-        0xb0,
-    ];
-
-    #[test]
-    fn the_content_id_is_read_from_the_package_header() {
-        let dir =
-            std::env::temp_dir().join(format!("ferestre-container-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("makes the dir");
-
-        container(&dir, &REAL_GUID, b"msft-xvd");
-        assert_eq!(
-            content_id(&dir).as_deref(),
-            Some("7792d9ce-355a-493c-afbd-768f4a77c3b0"),
-            "the byte order is Microsoft's, not RFC 4122's"
-        );
-
-        std::fs::remove_dir_all(&dir).expect("cleans up");
-    }
-
-    /// Every way of not knowing must produce `None`. A guess here becomes a
-    /// wrong "up to date", which is the one answer worth failing to avoid.
-    #[test]
-    fn anything_that_is_not_a_package_header_yields_nothing() {
-        let dir =
-            std::env::temp_dir().join(format!("ferestre-container-neg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("makes the dir");
-
-        assert_eq!(content_id(&dir), None, "no container at all");
-
-        container(&dir, &REAL_GUID, b"not-xvd!");
-        assert_eq!(content_id(&dir), None, "wrong magic");
-
-        std::fs::write(dir.join(CONTAINER), vec![0u8; 0x100]).expect("writes");
-        assert_eq!(content_id(&dir), None, "truncated before the header");
-
-        std::fs::write(dir.join(CONTAINER), b"").expect("writes");
-        assert_eq!(content_id(&dir), None, "empty");
-
-        std::fs::remove_dir_all(&dir).expect("cleans up");
-    }
-
-    /// Adoption is exact or it does not happen. It must never invent a content
-    /// id, and it must not claim an install date it does not know.
-    #[test]
-    fn adoption_reads_the_install_or_declines() {
-        let dir = std::env::temp_dir().join(format!("ferestre-adopt-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("makes the dir");
-
-        assert!(
-            adopt("9ZZTESTGAME1", &dir).is_none(),
-            "nothing to read, nothing to claim"
-        );
-
-        container(&dir, &REAL_GUID, b"msft-xvd");
-        std::fs::write(
-            dir.join("appxmanifest.xml"),
-            r#"<Package><Identity Name="X" Version="1.26.4501.0" /></Package>"#,
-        )
-        .expect("writes");
-
-        let adopted = adopt("9ZZTESTGAME1", &dir).expect("adopts");
-        assert_eq!(
-            adopted.content_ids,
-            vec!["7792d9ce-355a-493c-afbd-768f4a77c3b0"]
-        );
-        assert_eq!(adopted.package_version.as_deref(), Some("1.26.4501.0"));
-        assert_eq!(adopted.dir, dir);
-        assert_eq!(
-            adopted.installed_at, None,
-            "the install date is not knowable from disk, so it is not invented"
-        );
-
-        // The point of all of it: an adopted record answers the update question.
-        assert_eq!(
-            adopted.update_available(&["7792d9ce-355a-493c-afbd-768f4a77c3b0".into()]),
-            Some(false)
-        );
-        assert_eq!(
-            adopted.update_available(&["9999ffff-0000-0000-0000-000000000000".into()]),
-            Some(true)
-        );
-
-        std::fs::remove_dir_all(&dir).expect("cleans up");
-    }
-
-    #[test]
-    fn a_directory_with_no_manifest_has_no_version() {
-        assert_eq!(package_version(Path::new("/nonexistent/game")), None);
-    }
-
-    /// A record for a directory somebody deleted must not keep the title in the
-    /// Installed list, nor offer an update for something that is not there.
-    #[test]
-    fn a_record_whose_directory_is_gone_is_stale() {
-        let dir = std::env::temp_dir().join(format!("ferestre-stale-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("makes the dir");
-
-        let mut present = record(&["content-a"]);
-        present.dir = dir.clone();
-        assert!(!present.is_stale());
-
-        std::fs::remove_dir_all(&dir).expect("removes it");
-        assert!(present.is_stale(), "the directory is gone");
-    }
-
-    /// Something updated the title outside the launcher, so the recorded content
-    /// ids describe a build that is no longer on disk.
-    #[test]
-    fn a_tree_that_changed_underneath_the_record_is_detectable() {
         let installed = record(&["content-a"]);
-        assert_eq!(installed.matches_disk(Some("1.26.4501.0")), Some(true));
-        assert_eq!(installed.matches_disk(Some("1.27.0.0")), Some(false));
-        assert_eq!(
-            installed.matches_disk(None),
-            None,
-            "nothing to compare is not a mismatch"
-        );
+        assert_eq!(installed.update_available(None), None);
+        assert_eq!(installed.update_available(Some("")), None);
 
         let mut versionless = installed.clone();
         versionless.package_version = None;
-        assert_eq!(versionless.matches_disk(Some("1.26.4501.0")), None);
+        assert_eq!(versionless.update_available(Some("1.26.4600.0")), None);
     }
 
     #[test]

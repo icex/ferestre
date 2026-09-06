@@ -220,18 +220,61 @@ honestly marked as unproven rather than planned.
       preferences page was right for three recipes and is wrong for a library.
       Library / Installed / Updates / Runtime as sidebar sections.
 
-- [ ] **Differential updates — download only what changed.** Not confirmed
-      possible yet, and worth saying so rather than promising it. What is known:
-      an MSIXVC is an XVC container whose header carries per-block hashes, the
-      client already has a chunk-granular `streaming` path rather than only a
-      whole-file download, and the delivery endpoints are Azure blob URLs, which
-      support HTTP range requests. If those three hold together, an update is
-      "fetch the new header, compare block hashes against the local file, refetch
-      the blocks that differ" — no delta format from Microsoft required. The open
-      questions are whether block boundaries survive a content change (an insert
-      that shifts everything defeats fixed-block comparison) and whether the
-      published package is rebuilt wholesale between versions. Answer those with
-      two versions of one large title before writing any code.
+- [x] **Differential updates — answered.** The roadmap said not to promise this
+      until two builds of one large title had settled it. That experiment turned
+      out to be unnecessary: Microsoft publishes the patch plans themselves, and
+      26 real ones across three titles were fetched and parsed. Verdict:
+      **possible, and worth doing — but as "check whether a patch plan exists
+      for your exact build and say the byte count before starting", never as
+      "updates download only what changed".**
+
+      The three questions, answered against the containers on this machine:
+
+      - **Hashes: yes**, and better than needed. A four-level Merkle tree of
+        24-byte entries, one per 4096-byte page, at file offset `0x4000`, and
+        **entirely inside the retained prefix** — 14 / 265 / 897 MiB for the
+        three titles. The decisive measurement: *the prefix's tree indexes the
+        whole package*, not just the prefix. Pages of `ForzaHorizon5.exe` at
+        container pages 1,290,859–1,332,814 verify against a prefix that ends at
+        page 260,341.
+      - **Ranges: yes.** Every install already depends on them — the client
+        sends a bounded `Range` and gates on `206` with no fallback.
+      - **Alignment: no, and it does not matter.** The layout is stream-ordered,
+        so one file growing shifts everything after it: in a real plan, 37.0M of
+        38.1M reusable blocks sit at shift +45 and another has *zero* at shift 0.
+        A fixed-offset comparison would report ~100% changed. What rescues it is
+        that identity here is per-(file, page-in-file): the XTS data unit is
+        **per-file, not positional** (49/49 and 41/41 file boundaries show no
+        continuity), which is why Microsoft can copy 97.6% of a 149 GiB volume
+        to new offsets.
+
+      **Measured savings**, as this launcher's real payload:
+      Minecraft 2.32 GiB — 318 MB (12.8%) from the previous build;
+      Expedition 33 44 GiB — 1.65 GB (3.5%) for 1.5.5.0 → 1.5.6.0;
+      Forza Horizon 5 149 GiB — 2.76 GB (1.7%) from 3.688.44.
+
+      **And the finding that stops this being a promise:** coverage is a
+      publishing policy, not a property of the content. Microsoft ships a
+      template full-download fallback, and for 10 of FH5's 12 published source
+      versions — *including the build immediately before the current one* —
+      that is all there is. So the same title is a 2.8 GB update from one build
+      and a 160 GB one from the next. The feature must therefore announce the
+      exact number before transferring anything, and say "full download" when
+      that is what it is.
+
+      Two further findings worth more than the feature:
+
+      - **Do not implement this per-file.** On the real Expedition 33 plan,
+        page-granular costs 1.65 GB and per-file costs 45.78 GB — 28× worse, and
+        96.8% of a full download, because the largest single file is 12 GB.
+        Per-file is what `xodus-cli` does today.
+      - **The update key is the version, not the content id** — see below. That
+        was a defect in the shipped code, not a future concern.
+
+      The full specification — every offset, the plan format, the algorithm and
+      its verification step — is in the workflow transcript rather than here;
+      what belongs in a roadmap is the decision, which is: implement it, gated
+      behind an honest byte count, after update detection works at all.
 
 ## Phase 3 — packaging
 
@@ -280,6 +323,16 @@ These are judgement calls, not engineering ones:
 
 ## Known gaps, stated plainly
 
+- **Update detection does not work yet, and the reason was a wrong premise.**
+  It compared *content ids*, on the belief that a rebuild produces a new one. It
+  does not: 26 published patch plans spanning 26 builds of three titles carry
+  three content ids, one per title. A content id names the package; the version
+  names the build. Detection is keyed on the version now, but the *available*
+  version is not published anonymously — the catalog reports `"0"` for
+  everything — so every installed title honestly reads "update checking is not
+  wired up yet" until `GetBasePackage` on update.xboxlive.com is called with an
+  XSTS token. That endpoint also returns the patch plans, so it is the same
+  piece of work as the item above.
 - **There are no delta updates.** MSIXVC downloads are resumable but not
   differential, so "update" currently means re-downloading the title. That is
   ~2.5 GB for Bedrock but tens of gigabytes for a large title, which makes

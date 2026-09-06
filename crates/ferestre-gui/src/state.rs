@@ -75,6 +75,10 @@ pub struct Model {
     pub ownership: Ownership,
     pub catalog: BTreeMap<String, Product>,
     pub icons: BTreeMap<String, PathBuf>,
+    /// The version the service is offering per title. Nothing fills this yet --
+    /// the anonymous catalog reports every version as "0" -- so every installed
+    /// title reads "cannot be checked", which is true.
+    pub available: BTreeMap<String, String>,
     pub account: Option<Account>,
     pub avatar: Option<PathBuf>,
 
@@ -183,6 +187,7 @@ impl Model {
             ownership,
             catalog,
             icons,
+            available: BTreeMap::new(),
             account: None,
             avatar,
             section: Section::Library,
@@ -202,6 +207,7 @@ impl Model {
             ownership: std::mem::take(&mut self.ownership),
             catalog: std::mem::take(&mut self.catalog),
             icons: std::mem::take(&mut self.icons),
+            available: std::mem::take(&mut self.available),
             account: self.account.take(),
             avatar: self.avatar.take(),
             section: self.section,
