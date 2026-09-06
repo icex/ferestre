@@ -43,6 +43,22 @@ verify = [
 ]
 
 [[capability]]
+name = "loader.image-name-for-mapped-image"
+summary = """
+NtQueryInformationProcess reports the real path of a main image that was mapped \
+from a memfd, so a title that asks where its own executable is gets an answer."""
+provided-by = ["patches/wine/0006-process-image-name-for-a-memfd-mapped-main-image.patch"]
+symptom-if-missing = "GetModuleFileNameEx(GetCurrentProcess(), NULL, ...) returns an empty string; DOOM 64 then calls strlen on what it makes of that and dies before it draws a frame, with rc=3 and nothing in the log"
+note = """
+Nothing in a recipe can work around this and no title needs to ask for it: the \
+answer is wrong for every title that asks, and right for every title once the \
+patch is in. Kept as a capability so a runtime too old to have it is named as \
+the reason rather than the title being blamed."""
+verify = [
+    { file = "files/lib/wine/x86_64-unix/ntdll.so", contains = "has no server name; answering from the PEB" },
+]
+
+[[capability]]
 name = "appmodel.package-identity"
 summary = "kernelbase reports the current process's package identity from the manifest beside the executable, so GetCurrentPackageFullName and friends succeed."
 provided-by = ["patches/wine/0002-kernelbase-current-package-identity.patch"]

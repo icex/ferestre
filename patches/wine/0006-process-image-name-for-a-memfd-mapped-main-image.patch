@@ -1,0 +1,64 @@
+diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -1167,6 +1167,7 @@
+ {
+     unsigned int ret = STATUS_SUCCESS;
+     ULONG len = 0;
++    BOOL server_had_no_name = FALSE;
+ 
+     TRACE( "(%p,0x%08x,%p,0x%08x,%p)\n", handle, class, info, size, ret_len );
+ 
+@@ -1524,6 +1525,7 @@
+     case ProcessImageFileName:
+         /* FIXME: Should return a device path */
+     case ProcessImageFileNameWin32:
++        server_had_no_name = FALSE;
+         SERVER_START_REQ( get_process_image_name )
+         {
+             const unsigned int min_size = sizeof(UNICODE_STRING) + sizeof(WCHAR);
+@@ -1543,8 +1545,44 @@
+                 str->Buffer = (PWSTR)(str + 1);
+                 str->Buffer[str->Length / sizeof(WCHAR)] = 0;
+             }
++            server_had_no_name = !reply->len;
+         }
+         SERVER_END_REQ;
++        /* The server answers from the name of the file the main image was
++         * mapped from, and an image mapped through WINE_DLL_FILE_MAP was mapped
++         * from a memfd, which has no name in the NT namespace. So the query
++         * succeeds and returns an empty string -- and a title that asks where
++         * its own executable is gets "" and, in at least one case, calls strlen
++         * on what it makes of that and dies before it draws a frame.
++         *
++         * The PEB knows: it was given the real path at process creation. Used
++         * only for the current process, and only when the server had nothing,
++         * so an ordinary launch is answered exactly as before.
++         */
++        if (!ret && server_had_no_name && info && handle == NtCurrentProcess() &&
++            peb->ProcessParameters && peb->ProcessParameters->ImagePathName.Length)
++        {
++            const UNICODE_STRING *image = &peb->ProcessParameters->ImagePathName;
++            /* The NT form is the DOS path behind the \??\ prefix the server
++             * would have stripped for the Win32 form. */
++            TRACE( "image mapped from a memfd has no server name; answering from the PEB: %s\n",
++                   debugstr_us( image ) );
++            static const WCHAR ntprefix[] = { '\\','?','?','\\' };
++            unsigned int prefix = (class == ProcessImageFileNameWin32) ? 0 : sizeof(ntprefix);
++            UNICODE_STRING *str = info;
++
++            len = sizeof(UNICODE_STRING) + prefix + image->Length + sizeof(WCHAR);
++            if (size < len) ret = STATUS_INFO_LENGTH_MISMATCH;
++            else
++            {
++                str->Length = prefix + image->Length;
++                str->MaximumLength = str->Length + sizeof(WCHAR);
++                str->Buffer = (PWSTR)(str + 1);
++                memcpy( str->Buffer, ntprefix, prefix );
++                memcpy( (char *)str->Buffer + prefix, image->Buffer, image->Length );
++                str->Buffer[str->Length / sizeof(WCHAR)] = 0;
++            }
++        }
+         break;
+ 
+     case ProcessExecuteFlags:

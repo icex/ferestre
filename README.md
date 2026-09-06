@@ -70,7 +70,8 @@ not inferred from the fact that it downloaded:
 | **Clair Obscur: Expedition 33** | Store / Game Pass | Playable — saves, video, full game |
 | **DREDGE** | Game Pass | Playable |
 | **Stardew Valley** | Game Pass | Installs and launches |
-| **Overthrown** | Game Pass | Installs; not played through yet |
+| **DOOM 64** | Game Pass | Playable |
+| **Overthrown** | Game Pass | Playable |
 | **Age of Empires Definitive Edition** | Game Pass | Downloads; not played through yet |
 | **Forza Horizon 5** | Store | Downloads, does not run: blocked by protection inside the title, not by anything here |
 
