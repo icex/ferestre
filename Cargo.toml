@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/xgdk-core", "crates/xgdk-cli"]
+members = ["crates/xgdk-core", "crates/xgdk-cli", "crates/xgdk-gui"]
 
 [workspace.package]
 version = "0.1.0"
