@@ -80,7 +80,7 @@ _commit=3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
 # happened once already. If the history is ever rewritten again, repin here and
 # in .SRCINFO, and regenerate the sha256sums -- the patch files themselves may
 # have changed too.
-_patchrev=88a037895996ab7db68f45cc1ca1a2a94119d79a
+_patchrev=72c210e0c40263e84695860424392322a9e2544c
 _patchurl="https://raw.githubusercontent.com/icex/ferestre/$_patchrev/patches/xodus-cli"
 
 source=(
@@ -94,7 +94,7 @@ sha256sums=(
   'SKIP'
   '20d613add707a69f488b50041e53c60f8a0096132c05338b66d594fa8963c918'
   'c15806efefdfe7613755ada8ee0fe28784ad955ea7df26825ddeabc7be731256'
-  '531c461dc6a5dcc1ba47aa039ab998ae03a1762682a4d3abe65cb56dd4a99262'
+  '304c5e0f309c9609e9578f79f96fbf2800e429b72b26bbd590ad1e3fbdf05efd'
   'b5c9feec3aa4dba5f287609d5ae3727e5fb38aa4cf967997bfb5901d2b3a3d47'
 )
 
