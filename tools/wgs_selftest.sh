@@ -4,6 +4,11 @@
 # folder, validating the on-disk result with wgs_dump.py after each step.
 #
 #   XGSTEST=~/xbox-games/xgstest.sh WGS_DIR=~/xbox-games/wgs-test/<XUID>_<SCID> wgs_selftest.sh
+#
+# The <XUID> below is a placeholder and the script will not find a real save
+# folder with it. Your own is the 16-hex-digit prefix of the directories under
+# the Windows install's SystemAppData/wgs -- pass it in WGS_DIR rather than
+# editing it in here, so it does not end up in a commit.
 set -u
 SCID=${SCID:-00000000-0000-0000-0000-0000697f9ec3}
 XGSTEST=${XGSTEST:-${XODUS_GAMES_DIR:-$HOME/xbox-games}/xgstest.sh}
