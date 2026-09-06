@@ -152,6 +152,11 @@ PKGBUILD assumes a shape. The contract:
   if `xgameruntime.dll` is missing. Both have been shipped broken before by
   hand; both look like the title crashing rather than like a packaging mistake.
 
+`scripts/package-runtime.sh` produces exactly that shape from an installed
+runtime, and asserts every point of the contract above before writing the
+tarball. It also slims and strips: 1416 MB installed becomes 968 MB, 187 MB
+compressed. Run it, then upload `out/*.tar.zst` as the release asset.
+
 Then, in `ferestre-runtime-bin/`:
 
 ```sh

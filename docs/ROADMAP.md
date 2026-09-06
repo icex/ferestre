@@ -65,14 +65,33 @@ would, so the two version independently and the launcher fetches runtimes. This
 is the Proton-GE / ProtonUp-Qt model, which people on this platform already
 understand.
 
-- **Slim the build.** Measured: dropping `wine-gecko` (208 MB) and `wine-mono`
-  (226 MB) takes an installed runtime from 1.4 GB to **983 MB**, and Minecraft
-  still launches, navigates its menus and joins a server. Neither is needed by a
-  native GDK title. Keep a full build available in case a title wants .NET or an
-  embedded browser.
-- Strip binaries (76 of the first 400 checked still carry symbols).
-- Publish versioned tarballs that install as a Steam compatibility tool, so the
-  runtime is useful on its own before any launcher exists.
+- [x] **Slim the build, strip it, and package it.** All three were measured
+      long ago and none was implemented; `scripts/package-runtime.sh` now does
+      them, from an installed runtime, without touching it — everything happens
+      in a staging copy.
+
+      Measured on this machine: **1416 MB installed → 968 MB, 187 MB
+      compressed.** Dropping `wine-gecko` (208 MB) and `wine-mono` (226 MB) is
+      most of it; a native GDK title needs neither, and `--full` keeps them for
+      one that turns out to. Stripping the 82 ELF shared objects is the rest.
+      Only the ELF objects: Wine resolves a builtin DLL through data a strip can
+      remove, so the PE builtins are left alone deliberately.
+
+      Verified rather than assumed: the slimmed tarball was extracted, pointed
+      at with `XODUS_PROTON_DIR`, and Minecraft launched and rendered on it.
+
+      One trap, because it cost a silent two-thirds of the saving: **the runtime
+      ships its libraries read-only** (`-r-xr-xr-x`), and `strip` works by
+      writing a copy alongside, so it failed with "Permission denied" on 73 of
+      82 files and reported nothing. It took noticing "stripped 9" against a
+      known 82 to catch it.
+
+      The script also asserts the release contract in `packaging/aur/README.md`
+      rather than trusting it — one top-level directory, a
+      `compatibilitytool.vdf` naming the tool `ferestre`, the `close_fds=False`
+      patch, a real `xgameruntime.dll`, and the capability manifest — because
+      each of those has been shipped broken by hand before, and each looks like
+      the title crashing rather than like a packaging mistake.
 
 ## A constraint that rules out the obvious approach
 
