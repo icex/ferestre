@@ -1,0 +1,563 @@
+From 513a587ded9358e3708128c919e8632631734ed3 Mon Sep 17 00:00:00 2001
+From: Ice <icex@users.noreply.github.com>
+Date: Sun, 6 Sep 2026 11:18:58 +0300
+Subject: [PATCH] account: who is signed in, and a --header escape hatch for
+ the probe
+
+A launcher has to be able to say whose library it is showing. The gamertag is
+already a claim on any XSTS token, so it costs nothing; the gamerpic is not,
+and lives on the profile service.
+
+That service is the reason this is a command rather than something a caller
+assembles out of `collections`: without `x-xbl-contract-version` it answers
+401, not 400. A 401 reads as a token problem, so the missing header sends you
+chasing auth instead of headers. Adding `--header NAME:VALUE` to the probe is
+what made that visible, and it stays, because the next XBL service with its own
+request shape should not need another command.
+
+The profile call is best-effort. The token already yields a usable answer, so a
+profile service that is down costs the picture, not the identity.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ Cargo.lock                                   |   3 +
+ crates/xodus-cli/src/commands.rs             |   2 +
+ crates/xodus-cli/src/commands/account.rs     |  86 +++++
+ crates/xodus-cli/src/commands/collections.rs | 323 +++++++++++++++++++
+ crates/xodus-cli/src/main.rs                 |  54 ++++
+ 5 files changed, 468 insertions(+)
+ create mode 100644 crates/xodus-cli/src/commands/account.rs
+ create mode 100644 crates/xodus-cli/src/commands/collections.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index b14a82f..9f6a2b3 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7149,10 +7149,12 @@ dependencies = [
+  "num-bigint-dig 0.9.1",
+  "num-integer",
+  "num_enum",
++ "p256",
+  "prost",
+  "prost-build",
+  "quick-xml 0.42.0",
+  "rand 0.10.2",
++ "rand_core 0.6.4",
+  "reqwest 0.13.4",
+  "rsa",
+  "serde",
+@@ -7202,6 +7204,7 @@ dependencies = [
+ name = "xodus-service"
+ version = "0.1.0"
+ dependencies = [
++ "base64 0.23.1",
+  "chrono",
+  "console-subscriber",
+  "quick-xml 0.42.0",
+diff --git a/crates/xodus-cli/src/commands.rs b/crates/xodus-cli/src/commands.rs
+index dc75156..02cf77b 100644
+--- a/crates/xodus-cli/src/commands.rs
++++ b/crates/xodus-cli/src/commands.rs
+@@ -1,4 +1,6 @@
++pub mod account;
+ pub mod clep;
++pub mod collections;
+ pub mod download;
+ pub mod extract;
+ pub mod extract_eappx;
+diff --git a/crates/xodus-cli/src/commands/account.rs b/crates/xodus-cli/src/commands/account.rs
+new file mode 100644
+index 0000000..be4e171
+--- /dev/null
++++ b/crates/xodus-cli/src/commands/account.rs
+@@ -0,0 +1,86 @@
++//! Who is signed in.
++//!
++//! Two sources, because neither has all of it. The gamertag is already a claim
++//! on any XSTS token, so it costs nothing; the gamerpic is not, and comes from
++//! the profile service.
++//!
++//! That service is the reason this is a command rather than something a caller
++//! assembles out of `collections`: it answers **401** rather than 400 when
++//! `x-xbl-contract-version` is missing, which reads as a token problem and
++//! sends you chasing auth for an afternoon. The header is the whole fix.
++
++use std::process::ExitCode;
++
++use super::collections::{send, xsts_for};
++
++const XBOXLIVE_RELYING_PARTY: &str = "http://xboxlive.com";
++const PROFILE_SETTINGS: &str = "https://profile.xboxlive.com/users/me/profile/settings\
++?settings=Gamertag,ModernGamertag,GameDisplayPicRaw,AccountTier";
++
++/// Pull one setting out of the profile payload.
++fn setting(profile: &serde_json::Value, id: &str) -> Option<String> {
++    profile
++        .get("profileUsers")?
++        .as_array()?
++        .first()?
++        .get("settings")?
++        .as_array()?
++        .iter()
++        .find(|s| s.get("id").and_then(|v| v.as_str()) == Some(id))?
++        .get("value")?
++        .as_str()
++        .filter(|v| !v.is_empty())
++        .map(str::to_string)
++}
++
++pub async fn run(client: &reqwest::Client, tokens: &xodus::tokens::TokenManager, json: bool) -> ExitCode {
++    let xsts = match xsts_for(client, tokens, XBOXLIVE_RELYING_PARTY).await {
++        Ok(xsts) => xsts,
++        Err(message) => {
++            eprintln!("{message}");
++            return ExitCode::FAILURE;
++        }
++    };
++    // From the token itself, so these survive a profile service that is down.
++    let mut account = serde_json::json!({
++        "gamertag": xsts.gamertag().unwrap_or_default(),
++        "xuid": xsts.xuid().unwrap_or_default(),
++    });
++    let auth = xodus::api::xbox::get_xsts_auth_header(xsts);
++
++    let headers = ["x-xbl-contract-version:3".to_string()];
++    match send(client, PROFILE_SETTINGS, None, &auth, &headers).await {
++        Ok((status, text, cv)) if status.is_success() => {
++            match serde_json::from_str::<serde_json::Value>(&text) {
++                Ok(profile) => {
++                    for (key, id) in [
++                        ("gamerpic", "GameDisplayPicRaw"),
++                        ("tier", "AccountTier"),
++                        ("modern_gamertag", "ModernGamertag"),
++                    ] {
++                        if let Some(value) = setting(&profile, id) {
++                            account[key] = serde_json::Value::String(value);
++                        }
++                    }
++                }
++                // The token already gave us a usable answer, so a profile that
++                // cannot be parsed is a note, not a failure.
++                Err(e) => eprintln!("profile response was not JSON ({e}); MS-CV {cv}"),
++            }
++        }
++        Ok((status, _, cv)) => eprintln!("profile settings: HTTP {status} (MS-CV {cv})"),
++        Err(message) => eprintln!("profile settings: {message}"),
++    }
++
++    if json {
++        println!("{}", serde_json::to_string_pretty(&account).unwrap_or_default());
++    } else {
++        let gamertag = account["gamertag"].as_str().unwrap_or("");
++        if gamertag.is_empty() {
++            eprintln!("signed in, but the token carries no gamertag");
++            return ExitCode::FAILURE;
++        }
++        println!("{gamertag}");
++    }
++    ExitCode::SUCCESS
++}
+diff --git a/crates/xodus-cli/src/commands/collections.rs b/crates/xodus-cli/src/commands/collections.rs
+new file mode 100644
+index 0000000..e252a3c
+--- /dev/null
++++ b/crates/xodus-cli/src/commands/collections.rs
+@@ -0,0 +1,323 @@
++//! Enumerate what the signed-in account owns.
++//!
++//! There was no owned-title listing anywhere in the client: every command takes
++//! a product id typed by hand, and `package.rs` can only answer "is THIS product
++//! owned". A launcher needs the opposite question.
++//!
++//! The routing is not guesswork. The endpoint table the client already carries
++//! (api/xbox/title.rs) lists:
++//!
++//!   {"Host":"collections.mp.microsoft.com","RelyingParty":"http://licensing.xboxlive.com",
++//!    "TokenType":"JWT","SignaturePolicyIndex":0}
++//!
++//! so an ordinary XSTS token for that relying party is what it wants -- the same
++//! one licensing.mp.microsoft.com is routed with. Confirmed by request: the
++//! service answers a malformed body with 400 and a schema complaint rather than
++//! 401, so the token is accepted.
++//!
++//! `probe` stays for iterating on the request shape from the shell without
++//! recompiling; `query` builds the real request.
++
++use std::process::ExitCode;
++use uuid::Uuid;
++use xodus::models::live::ExchangeUserTokenOutcome;
++use xodus::models::secrets::Token;
++use xodus::models::soap;
++use xodus::models::xbox::XstsResponse;
++use xodus::tokens::TokenManager;
++
++const COLLECTIONS_RELYING_PARTY: &str = "http://licensing.xboxlive.com";
++const COLLECTIONS_QUERY: &str = "https://collections.mp.microsoft.com/v6.0/collections/query";
++
++/// Mint an XSTS token for a relying party using the stored device and user
++/// tokens. Returns the token itself, because callers need its claims (the xuid
++/// identifies the beneficiary of a collections query) as well as the header.
++pub(crate) async fn xsts_for(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++    relying_party: &str,
++) -> Result<XstsResponse, String> {
++    let Ok(Token::Legacy(dev_token)) = tokens.get_device_sts_token() else {
++        return Err("no usable device token; run `xodus-cli login` first".into());
++    };
++    let Ok(Token::Legacy(user_token)) = tokens.get_user_sts_token() else {
++        return Err("no usable user token; run `xodus-cli login` first".into());
++    };
++    Ok(xodus::api::xbox::run(client, dev_token, user_token, relying_party).await)
++}
++
++fn correlation_vector() -> String {
++    // These services want an MS-CV, and it is the identifier support would ask
++    // for if a call misbehaves.
++    format!("{}.0", Uuid::new_v4().simple())
++}
++
++pub(crate) async fn send(
++    client: &reqwest::Client,
++    url: &str,
++    body: Option<String>,
++    auth: &str,
++    extra: &[String],
++) -> Result<(reqwest::StatusCode, String, String), String> {
++    let cv = correlation_vector();
++    let request = match &body {
++        Some(json) => client.post(url).body(json.clone()),
++        None => client.get(url),
++    };
++    let mut request = request
++        .header("Authorization", auth)
++        .header("Content-Type", "application/json")
++        .header("MS-CV", &cv);
++    // Not every XBL service takes the same shape. profile.xboxlive.com answers
++    // 401 -- not 400 -- without `x-xbl-contract-version`, which reads as an auth
++    // failure and sends you chasing the token instead of the header.
++    for header in extra {
++        let (name, value) = header
++            .split_once(':')
++            .ok_or_else(|| format!("--header wants NAME:VALUE, got {header:?}"))?;
++        request = request.header(name.trim(), value.trim());
++    }
++    let response = request
++        .send()
++        .await
++        .map_err(|e| format!("request failed: {e}"))?;
++    let status = response.status();
++    let text = response.text().await.unwrap_or_default();
++    Ok((status, text, cv))
++}
++
++/// Raw probe: caller supplies the URL and body. `{XUID}` in the body is
++/// replaced with the xuid from the minted token, so an account identifier never
++/// has to appear on a command line.
++pub async fn probe(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++    url: String,
++    body: Option<String>,
++    relying_party: String,
++    headers: Vec<String>,
++) -> ExitCode {
++    let xsts = match xsts_for(client, tokens, &relying_party).await {
++        Ok(xsts) => xsts,
++        Err(message) => {
++            eprintln!("{message}");
++            return ExitCode::FAILURE;
++        }
++    };
++    // Placeholders so an account identifier never has to appear on a command
++    // line while the request shape is still being worked out.
++    let xuid = xsts.xuid().unwrap_or_default().to_string();
++    let uhs = xsts.user_hash().unwrap_or_default().to_string();
++    let puid = tokens.get_user().map(|u| u.puid).unwrap_or_default();
++    let raw_token = xsts.token.clone();
++    let auth = xodus::api::xbox::get_xsts_auth_header(xsts);
++    let body = body.map(|b| {
++        b.replace("{XUID}", &xuid)
++            .replace("{UHS}", &uhs)
++            .replace("{PUID}", &puid)
++            .replace("{XTOKEN}", &auth)
++            .replace("{RAWTOKEN}", &raw_token)
++    });
++
++    match send(client, &url, body, &auth, &headers).await {
++        Ok((status, text, cv)) => {
++            eprintln!("HTTP {status}  (MS-CV {cv})");
++            println!("{text}");
++            if status.is_success() {
++                ExitCode::SUCCESS
++            } else {
++                ExitCode::FAILURE
++            }
++        }
++        Err(message) => {
++            eprintln!("{message}");
++            ExitCode::FAILURE
++        }
++    }
++}
++
++/// An MSA device ticket. Collections authenticates the caller with this, not
++/// with the Xbox token: presenting an XSTS token gets InvalidDeviceToken. The
++/// licensing path does the same thing.
++async fn msa_device_ticket(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++    target: &str,
++) -> Result<String, String> {
++    let Ok(Token::Legacy(dev_token)) = tokens.get_device_sts_token() else {
++        return Err("no usable device token".into());
++    };
++    let issued = xodus::api::live::exchange_device_token(
++        client,
++        dev_token,
++        "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".to_string(),
++        target.to_owned(),
++        Some(soap::PolicyReference::mbi_ssl()),
++    )
++    .await
++    .map_err(|e| format!("MSA device exchange failed: {e:?}"))?;
++
++    match Token::from(issued) {
++        Token::Compact(ticket) => Ok(ticket),
++        Token::Legacy(_) => Err("device exchange returned a legacy token".into()),
++    }
++}
++
++/// An MSA user ticket for a Store service.
++///
++/// The collections endpoint rejects every Xbox identity type -- b2b-partner,
++/// xtoken, xuid, puid all come back UnsupportedIdentityType -- and accepts only
++/// "msa", failing it with InvalidMsaTicketFormat. So the beneficiary is proven
++/// with a Microsoft account ticket, not the Xbox token in Authorization. This
++/// mints one the same way the licensing path does.
++async fn msa_user_ticket(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++    target: &str,
++) -> Result<String, String> {
++    let Ok(Token::Legacy(dev_token)) = tokens.get_device_sts_token() else {
++        return Err("no usable device token".into());
++    };
++    let Ok(Token::Legacy(user_legacy)) = tokens.get_user_sts_token() else {
++        return Err("no usable user token".into());
++    };
++    let user = tokens.get_user().map_err(|e| format!("no stored user: {e}"))?;
++
++    let outcome = xodus::api::live::exchange_user_token(
++        client,
++        user_legacy,
++        user.username,
++        dev_token,
++        None,
++        Some("Silent".to_string()),
++        "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".to_string(),
++        &[(target.to_owned(), Some(soap::PolicyReference::mbi_ssl()))],
++    )
++    .await
++    .map_err(|e| format!("MSA exchange failed: {e:?}"))?;
++
++    let token: Token = match outcome {
++        ExchangeUserTokenOutcome::Fault(_) => return Err("MSA exchange returned a fault".into()),
++        ExchangeUserTokenOutcome::Issued(
++            soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
++        ) => collection.security_tokens.remove(0).into(),
++        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(t)) => {
++            (*t).into()
++        }
++        _ => return Err("unexpected MSA response shape".into()),
++    };
++    match token {
++        Token::Compact(ticket) => Ok(ticket),
++        Token::Legacy(_) => Err("MSA exchange returned a legacy token, wanted a compact one".into()),
++    }
++}
++
++/// List what the account owns.
++///
++/// Collections pages with a continuation token, and an account accumulates a
++/// lot that is not a title -- add-ons, passes, expired trials -- so the useful
++/// output is the filtered set: things still active, that a launcher could
++/// plausibly install. The product id is the 12-character Store id, the same
++/// identifier that appears in a Store URL and that titles/*.toml is keyed by.
++pub async fn query(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++    page_size: u32,
++    msa_target: String,
++    all: bool,
++    json_out: bool,
++) -> ExitCode {
++    let auth = match msa_device_ticket(client, tokens, &msa_target).await {
++        Ok(ticket) => ticket,
++        Err(message) => {
++            eprintln!("{message}");
++            return ExitCode::FAILURE;
++        }
++    };
++    let identity = match msa_user_ticket(client, tokens, &msa_target).await {
++        Ok(ticket) => ticket,
++        Err(message) => {
++            eprintln!("{message}");
++            return ExitCode::FAILURE;
++        }
++    };
++
++    let mut entries: Vec<serde_json::Value> = Vec::new();
++    let mut continuation: Option<String> = None;
++
++    loop {
++        let mut body = serde_json::json!({
++            "maxPageSize": page_size,
++            "excludeDuplicates": true,
++            "productTypes": ["Application", "Durable", "Game", "Pass"],
++            "beneficiaries": [{
++                "identitytype": "msa",
++                "identityValue": identity,
++                "localTicketReference": "1",
++            }],
++        });
++        if let Some(token) = &continuation {
++            body["continuationToken"] = serde_json::Value::String(token.clone());
++        }
++
++        let (status, text, cv) =
++            match send(client, COLLECTIONS_QUERY, Some(body.to_string()), &auth, &[]).await {
++                Ok(result) => result,
++                Err(message) => {
++                    eprintln!("{message}");
++                    return ExitCode::FAILURE;
++                }
++            };
++        if !status.is_success() {
++            eprintln!("HTTP {status} (MS-CV {cv})");
++            println!("{text}");
++            return ExitCode::FAILURE;
++        }
++
++        let Ok(page) = serde_json::from_str::<serde_json::Value>(&text) else {
++            eprintln!("collections returned something that is not JSON (MS-CV {cv})");
++            return ExitCode::FAILURE;
++        };
++        if let Some(items) = page.get("items").and_then(|i| i.as_array()) {
++            entries.extend(items.iter().cloned());
++        }
++        continuation = page
++            .get("continuationToken")
++            .and_then(|t| t.as_str())
++            .map(str::to_string);
++        if continuation.is_none() {
++            break;
++        }
++    }
++
++    let total = entries.len();
++    if !all {
++        entries.retain(|item| {
++            let field = |name: &str| item.get(name).and_then(|v| v.as_str()).unwrap_or_default();
++            field("status") == "Active"
++                && matches!(field("productType"), "Game" | "Application")
++        });
++    }
++
++    if json_out {
++        let out = serde_json::json!({ "count": entries.len(), "items": entries });
++        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
++    } else {
++        for item in &entries {
++            let field = |name: &str| item.get(name).and_then(|v| v.as_str()).unwrap_or("-");
++            println!(
++                "{:<14} {:<12} {:<8} {}",
++                field("productId"),
++                field("productType"),
++                field("skuType"),
++                field("acquiredDate")
++            );
++        }
++        eprintln!(
++            "{} shown, {} entitlements total (add --all to keep add-ons, passes and expired items)",
++            entries.len(),
++            total
++        );
++    }
++    ExitCode::SUCCESS
++}
+diff --git a/crates/xodus-cli/src/main.rs b/crates/xodus-cli/src/main.rs
+index cf0db1d..75d3d59 100644
+--- a/crates/xodus-cli/src/main.rs
++++ b/crates/xodus-cli/src/main.rs
+@@ -13,6 +13,47 @@ mod webview;
+ 
+ #[derive(Subcommand)]
+ enum SubCommand {
++    #[command(
++        about = "Probe an authenticated Microsoft endpoint (research: owned-title enumeration)"
++    )]
++    Library {
++        #[arg(long, default_value_t = 100, help = "Page size for the collections query")]
++        page_size: u32,
++        #[arg(
++            long,
++            default_value = "www.microsoft.com",
++            help = "MSA ticket target; the licensing path uses www.microsoft.com"
++        )]
++        msa_target: String,
++        #[arg(long, default_value_t = false, help = "Keep add-ons, passes and inactive entitlements")]
++        all: bool,
++        #[arg(long, default_value_t = false, help = "Emit JSON")]
++        json: bool,
++    },
++    #[command(about = "Show the signed-in account: gamertag, xuid and gamerpic")]
++    Account {
++        #[arg(long, default_value_t = false, help = "Emit JSON")]
++        json: bool,
++    },
++    #[command(about = "Raw probe of an authenticated Microsoft endpoint ({XUID} is substituted)")]
++    Collections {
++        #[clap(help = "Full URL to request")]
++        url: String,
++        #[arg(long, help = "JSON body; omitted means GET")]
++        body: Option<String>,
++        #[arg(
++            long,
++            default_value = "http://licensing.xboxlive.com",
++            help = "XSTS relying party (collections.mp.microsoft.com routes with licensing.xboxlive.com)"
++        )]
++        relying_party: String,
++        #[arg(
++            long = "header",
++            value_name = "NAME:VALUE",
++            help = "Extra request header, repeatable (profile.xboxlive.com needs x-xbl-contract-version:3)"
++        )]
++        headers: Vec<String>,
++    },
+     #[command(about = "Download msixvc or xsp files fo given game")]
+     Download {
+         product: String,
+@@ -240,6 +281,19 @@ async fn main() -> ExitCode {
+             } => commands::clep::generate(smbios, disk_serial),
+             ClepAction::Decrypt { data } => commands::clep::decrypt(data),
+         },
++        SubCommand::Account { json } => commands::account::run(&client, &tokens, json).await,
++        SubCommand::Collections {
++            url,
++            body,
++            relying_party,
++            headers,
++        } => commands::collections::probe(&client, &tokens, url, body, relying_party, headers).await,
++        SubCommand::Library {
++            page_size,
++            msa_target,
++            all,
++            json,
++        } => commands::collections::query(&client, &tokens, page_size, msa_target, all, json).await,
+         SubCommand::SpLicense { block } => commands::splicense::run(block),
+     };
+ 
+-- 
+2.55.0
+

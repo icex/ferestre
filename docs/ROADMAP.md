@@ -112,6 +112,70 @@ Turn the twelve symptom/cause/fix rows in `docs/RECIPES.md` into a
 fingerprint file the runner consults automatically on a failed launch, so a new
 title diagnoses itself rather than needing someone who remembers.
 
+### The window, and what it still owes
+
+The GTK4 window exists and launches titles. Everything below is asked for and
+not yet built. Ordered by how much it changes what the launcher *is*, not by
+effort.
+
+- [ ] **Real names and cover art for owned titles.** Collections returns product
+      ids and nothing else — no name, no image — so a library of 100+ titles
+      currently reads as a list of twelve-character codes. The names and art
+      come from DisplayCatalog (`displaycatalog.mp.microsoft.com/v7.0/products`),
+      which is anonymous: no token, no account, so it can be called for a title
+      nobody owns and cached on disk without touching auth. Batch the ids, cache
+      per product, and never block the window on it.
+
+- [ ] **Pagination for the owned list.** A hundred rows in one `AdwPreferencesGroup`
+      is neither usable nor fast. Pages plus a search box; search matters more
+      than the pager once names exist.
+
+- [ ] **A login flow, and the signed-in account on screen.** Today signing in is
+      a side effect of asking for the library. It should be explicit: a
+      Sign in / Sign out control, the gamertag and gamerpic in the header, and a
+      window that says plainly when nobody is signed in. The client has `login`
+      and `logout`; the gamertag and picture come from
+      `profile.xboxlive.com/users/me/profile/settings`, which needs an XSTS
+      token for `http://xboxlive.com` rather than the licensing relying party
+      the library uses.
+
+- [ ] **Updates.** Show that an installed title has a newer version, and update
+      it. Needs a version for what is installed (recorded at install time, since
+      the decrypted tree does not carry one reliably) and a version for what is
+      available (the catalog's package listing).
+
+- [ ] **A recipe editor.** The catalog will list a hundred titles with three
+      recipes between them, so the common case is a title nobody has described.
+      Someone should be able to fill in an executable path and a couple of
+      environment variables in the window, try it, and hand the result back as
+      an issue — not learn a TOML schema first. Edits go to
+      `$XDG_CONFIG_HOME/xgdk/titles/` and win over the packaged recipe, so an
+      upgrade never reverts them and "what did I change" stays answerable.
+
+- [ ] **Add to Steam.** A non-Steam shortcut for the overlay, controller
+      configuration and Remote Play. Writing `shortcuts.vdf` means rewriting a
+      file full of shortcuts that have nothing to do with this launcher, so it
+      round-trips the whole document and keeps every field it did not write.
+      Steam rewrites that file from memory on exit, so the launcher has to
+      refuse while Steam is running rather than write an edit that vanishes.
+
+- [ ] **A sidebar, and a layout that survives a hundred titles.** One flat
+      preferences page was right for three recipes and is wrong for a library.
+      Library / Installed / Updates / Runtime as sidebar sections.
+
+- [ ] **Differential updates — download only what changed.** Not confirmed
+      possible yet, and worth saying so rather than promising it. What is known:
+      an MSIXVC is an XVC container whose header carries per-block hashes, the
+      client already has a chunk-granular `streaming` path rather than only a
+      whole-file download, and the delivery endpoints are Azure blob URLs, which
+      support HTTP range requests. If those three hold together, an update is
+      "fetch the new header, compare block hashes against the local file, refetch
+      the blocks that differ" — no delta format from Microsoft required. The open
+      questions are whether block boundaries survive a content change (an insert
+      that shifts everything defeats fixed-block comparison) and whether the
+      published package is rebuilt wholesale between versions. Answer those with
+      two versions of one large title before writing any code.
+
 ## Phase 3 — packaging
 
 - AUR first: the development platform is Arch-based and it is the cheapest way

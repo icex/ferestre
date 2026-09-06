@@ -15,3 +15,7 @@ serde_json = "1"
 toml = "0.8"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+# Only for the anonymous catalog and profile calls. Blocking on purpose: the
+# two callers already run these off the main thread, and an async runtime would
+# be a much larger dependency for two GETs.
+ureq = "3"

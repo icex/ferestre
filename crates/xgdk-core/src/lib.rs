@@ -13,11 +13,15 @@
 //! decrypted executable is passed to Wine as an inherited file descriptor and
 //! has to stay a child of the process that opened it.
 
+pub mod account;
 pub mod capability;
+pub mod catalog;
+pub mod http;
 pub mod launch;
 pub mod library;
 pub mod paths;
 pub mod recipe;
 pub mod runtime;
+pub mod steam;
 
 pub use recipe::{Recipe, Status, TitleState};

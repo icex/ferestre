@@ -160,6 +160,7 @@ pub struct Paths {
     cli_dir: Option<PathBuf>,
     state: PathBuf,
     cache: PathBuf,
+    config: PathBuf,
     vars: BTreeMap<String, String>,
 }
 
@@ -241,6 +242,7 @@ impl Paths {
             cli_dir,
             state: xdg(env, "XDG_STATE_HOME", ".local/state").join(APP),
             cache: xdg(env, "XDG_CACHE_HOME", ".cache").join(APP),
+            config: xdg(env, "XDG_CONFIG_HOME", ".config").join(APP),
             vars: env.vars.clone(),
         })
     }
@@ -323,6 +325,31 @@ impl Paths {
     }
 
     /// XDG cache: things that can be thrown away and fetched again.
+    /// Where the launcher keeps what a person changed, as opposed to what it
+    /// shipped with.
+    pub fn config_dir(&self) -> &Path {
+        &self.config
+    }
+
+    /// Recipes someone wrote or edited here, which win over the packaged ones.
+    ///
+    /// A separate directory rather than edits in place, for three reasons: the
+    /// packaged `titles/` is read-only in an AppImage or a system package, an
+    /// upgrade must not silently revert someone's fix, and "what did I change"
+    /// has to be answerable -- it is the thing they will paste into an issue.
+    pub fn user_titles_dir(&self) -> PathBuf {
+        self.config.join("titles")
+    }
+
+    /// Every directory recipes are read from, least specific first. Loading in
+    /// this order and letting later ones win is what makes an edit an override
+    /// rather than a fork.
+    pub fn title_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = self.titles.iter().map(PathBuf::from).collect();
+        dirs.push(self.user_titles_dir());
+        dirs
+    }
+
     pub fn cache_dir(&self) -> &Path {
         &self.cache
     }
