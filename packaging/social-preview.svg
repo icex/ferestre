@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Source for the GitHub repository social preview card (1280x640).
+
+     GitHub crops and scales this into small contexts, so everything that has to
+     survive is large and well inside the margins: the mark, the name, one line
+     of what it does. The ownership line is small on purpose but it is here,
+     because it is the first thing a stranger should learn about this project
+     and a link preview is where a lot of strangers meet it.
+
+     Render:
+       rsvg-convert -w 1280 -h 640 packaging/social-preview.svg \
+         -o packaging/social-preview.png -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <defs>
+    <linearGradient id="glass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffd88a"/>
+      <stop offset="1" stop-color="#ef9440"/>
+    </linearGradient>
+    <radialGradient id="spill" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#ef9440" stop-opacity="0.20"/>
+      <stop offset="1" stop-color="#ef9440" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1280" height="640" fill="#151a22"/>
+  <!-- Light from the window, falling across the card. -->
+  <ellipse cx="300" cy="320" rx="470" ry="400" fill="url(#spill)"/>
+
+  <!-- The application icon, drawn at 300px rather than imported, so this file
+       renders on its own with no external reference. -->
+  <g transform="translate(74,170) scale(1.171875)">
+    <rect x="8" y="8" width="240" height="240" rx="52" ry="52" fill="#1b2029"/>
+    <rect x="8" y="8" width="240" height="240" rx="52" ry="52"
+          fill="none" stroke="#343d4c" stroke-width="4"/>
+    <path d="M78 190 L78 126 A50 50 0 0 1 178 126 L178 190 Z" fill="url(#glass)"/>
+    <path d="M78 190 L78 126 A50 50 0 0 1 178 126 L178 190"
+          fill="none" stroke="#f4ece0" stroke-width="14"
+          stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M78 126 L178 126 M128 126 L128 190"
+          fill="none" stroke="#f4ece0" stroke-width="12" stroke-linecap="round"/>
+    <rect x="64" y="188" width="128" height="15" rx="7" ry="7" fill="#f4ece0"/>
+  </g>
+
+  <!-- Sizes are measured, not guessed: from x=430 there are 794px before a
+       56px right margin, and every line below fits inside it. -->
+  <g font-family="Fira Sans">
+    <text x="426" y="272" font-size="128" font-weight="700" fill="#f4ece0">Ferestre</text>
+    <text x="430" y="338" font-size="36" fill="#9aa4b2">Xbox GDK and Microsoft Store titles, on Linux</text>
+    <text x="430" y="392" font-size="36" fill="#9aa4b2">patched Proton and a from-scratch GDK runtime</text>
+    <text x="430" y="464" font-size="33" fill="#ef9440">ferestre — Romanian for “windows”</text>
+    <text x="430" y="522" font-size="28" fill="#6b7482">You need to own the games. It ships no game content.</text>
+  </g>
+</svg>
