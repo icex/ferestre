@@ -61,21 +61,29 @@ verify = [
 [[capability]]
 name = "winrt.loggingchannel"
 summary = """
-Windows.Foundation.Diagnostics.LoggingChannel and LoggingChannelOptions are \
-activatable, hosted in windows.system.profile.systemid.dll."""
+Windows.Foundation.Diagnostics.LoggingChannel, LoggingChannelOptions and \
+LoggingOptions are activatable, hosted in windows.system.profile.systemid.dll."""
 provided-by = ["patches/wine/0008-loggingchannel-winrt-classes.patch"]
 symptom-if-missing = "RoGetActivationFactory fails for the class and the title dereferences what it got back -- Age of Empires Definitive Edition faults reading 0xFFFFFFFFFFFFFFFF on the next instruction"
 note = """
-Interface ids and method order are the published ones from the Windows SDK's \
-own IDL, not inferred. That distinction is load-bearing: the factory a title \
-asks for is ILoggingChannelFactory2, whose *second* method is the one it calls, \
-and a vtable one entry short sends it jumping to address zero."""
+Interface ids and method order are the published ones, taken from Microsoft's \
+own metadata (microsoft/windows-rs), not inferred. That distinction is \
+load-bearing: the channel factory a title asks for is ILoggingChannelFactory2, \
+whose *second* method is the one it calls, and a vtable one entry short sends \
+it jumping to address zero.
+
+All three classes go together. A title walks the set in order -- options, then \
+channel, then the per-event LoggingOptions -- and stopping one short leaves it \
+holding an uninitialised pointer it does not check, which is the 0xFFFF... \
+fault above rather than a clean failure."""
 winrt-classes = [
     { class = "Windows.Foundation.Diagnostics.LoggingChannel", dll = "windows.system.profile.systemid.dll" },
     { class = "Windows.Foundation.Diagnostics.LoggingChannelOptions", dll = "windows.system.profile.systemid.dll" },
+    { class = "Windows.Foundation.Diagnostics.LoggingOptions", dll = "windows.system.profile.systemid.dll" },
 ]
 verify = [
     { file = "files/lib/wine/x86_64-windows/windows.system.profile.systemid.dll", contains = "LoggingChannelOptions" },
+    { file = "files/lib/wine/x86_64-windows/windows.system.profile.systemid.dll", contains = "RuntimeClass_Windows_Foundation_Diagnostics_LoggingOptions" },
 ]
 
 [[capability]]

@@ -1,0 +1,144 @@
+diff --git a/private.h b/private.h
+index c1840ad..fae808a 100644
+--- a/private.h
++++ b/private.h
+@@ -127,6 +127,17 @@ WCHAR *xgr_package_root( void );
+ /* MicrosoftGame.config text (inline or from disk; UTF-8, malloc'd, or NULL). */
+ char *xgr_load_game_config( void );
+ 
++/* The running title's identity for Xbox authentication, from its
++ * MicrosoftGame.config: `TitleId` (rendered decimal, since the config carries
++ * it in hexadecimal and Xbox wants decimal) and `MSAAppId`. Either comes back
++ * empty when the config does not carry it.
++ *
++ * Xbox mints the XSTS *title claim* from the pair, and the claim is not a
++ * formality: a service that scopes what it returns by title -- presence's
++ * titles/current, the session directory -- answers 403 to a token claiming a
++ * different title just as flatly as to one claiming none. */
++void xgr_title_identity( char *title_id, SIZE_T title_id_len, char *client_id, SIZE_T client_id_len );
++
+ /* Wrap a UTF-8 filesystem path in an XPackageMountHandle (from xpackage.c). */
+ void *xgr_make_mount( const char *path );
+ 
+diff --git a/unixlib.c b/unixlib.c
+index 1daaf3e..a15f8f8 100644
+--- a/unixlib.c
++++ b/unixlib.c
+@@ -212,7 +212,7 @@ static NTSTATUS xsts_token_once( void *args )
+ {
+     struct xsts_token_params *params = args;
+     char *request = NULL, header[8], *body = NULL, *body_b64 = NULL;
+-    char *url_esc = NULL, *method_esc = NULL;
++    char *url_esc = NULL, *method_esc = NULL, *title_esc = NULL, *client_esc = NULL;
+     unsigned int magic, size;
+     unsigned short type, len;
+     NTSTATUS status = STATUS_UNSUCCESSFUL;
+@@ -233,17 +233,27 @@ static NTSTATUS xsts_token_once( void *args )
+     }
+ 
+     if (!(url_esc = xml_escape( params->url )) ||
+-        !(method_esc = xml_escape( params->method ? params->method : "GET" )))
++        !(method_esc = xml_escape( params->method ? params->method : "GET" )) ||
++        !(title_esc = xml_escape( params->title_id ? params->title_id : "" )) ||
++        !(client_esc = xml_escape( params->title_client_id ? params->title_client_id : "" )))
+     { status = STATUS_NO_MEMORY; goto done; }
+ 
+     request_size = 512 + strlen( url_esc ) + strlen( method_esc ) +
++                   strlen( title_esc ) + strlen( client_esc ) +
+                    (body_b64 ? strlen( body_b64 ) : 0);
+     if (!(request = malloc( request_size ))) { status = STATUS_NO_MEMORY; goto done; }
+ 
++    /* RelyingParty stays empty on purpose: the service resolves it from the
++     * title-management endpoint list, which is authoritative and knows hosts
++     * this side does not. TitleId and MSAAppId, on the other hand, only this
++     * side can see -- they come out of the game's own MicrosoftGame.config. */
+     body_len = snprintf( request, request_size,
+                          "<XSTSTokenRequest><Url>%s</Url><RelyingParty></RelyingParty>"
+-                         "<Method>%s</Method><BodyBase64>%s</BodyBase64></XSTSTokenRequest>",
+-                         url_esc, method_esc, body_b64 ? body_b64 : "" );
++                         "<Method>%s</Method><TitleId>%s</TitleId>"
++                         "<TitleClientId>%s</TitleClientId>"
++                         "<BodyBase64>%s</BodyBase64></XSTSTokenRequest>",
++                         url_esc, method_esc, title_esc, client_esc,
++                         body_b64 ? body_b64 : "" );
+     if (body_len < 0 || body_len >= (int)request_size) goto done;
+     if (body_len > 0xffff)
+     {
+@@ -302,6 +312,8 @@ static NTSTATUS xsts_token_once( void *args )
+ done:
+     free( url_esc );
+     free( method_esc );
++    free( title_esc );
++    free( client_esc );
+     free( request );
+     free( body_b64 );
+     free( body );
+diff --git a/unixlib.h b/unixlib.h
+index af0263c..e9086ec 100644
+--- a/unixlib.h
++++ b/unixlib.h
+@@ -50,6 +50,8 @@ struct xsts_token_params
+     const char *method;                     /* in:  its HTTP method */
+     const void *body;                       /* in:  its body, may be NULL */
+     ULONG body_size;                        /* in */
++    const char *title_id;                   /* in:  decimal TitleId, may be NULL */
++    const char *title_client_id;            /* in:  MSAAppId, may be NULL */
+     char token[XGR_TOKEN_MAX];              /* out: "XBL3.0 x=<uhs>;<token>" */
+     char signature[XGR_SIGNATURE_MAX];      /* out: Signature header, may be empty */
+     char xuid[XGR_IDENTITY_MAX];            /* out: decimal XUID, may be empty */
+diff --git a/xpackage.c b/xpackage.c
+index e119d55..9e5d9a5 100644
+--- a/xpackage.c
++++ b/xpackage.c
+@@ -141,6 +141,20 @@ static BOOL config_element( const char *element, char *out, SIZE_T cap )
+     return TRUE;
+ }
+ 
++/* See private.h: the title identity Xbox mints the XSTS title claim from. */
++void xgr_title_identity( char *title_id, SIZE_T title_id_len, char *client_id, SIZE_T client_id_len )
++{
++    char hex[64];
++
++    title_id[0] = client_id[0] = 0;
++    /* The config spells TitleId in hexadecimal ("69C7AA31"); every Xbox service
++     * and the token endpoints want it decimal, so convert here rather than
++     * leaving each caller to guess which form it is holding. */
++    if (config_element( "TitleId", hex, sizeof(hex) ) && hex[0])
++        snprintf( title_id, title_id_len, "%lu", strtoul( hex, NULL, 16 ) );
++    config_element( "MSAAppId", client_id, client_id_len );
++}
++
+ /* Pull attr="value" from the first <element ...> in MicrosoftGame.config. */
+ static BOOL config_attr( const char *element, const char *attr, char *out, SIZE_T cap )
+ {
+diff --git a/xuser.c b/xuser.c
+index c75e39c..a6361ec 100644
+--- a/xuser.c
++++ b/xuser.c
+@@ -379,6 +379,7 @@ static HRESULT token_and_signature_async( XAsyncBlock *async, const char *method
+ {
+     struct xsts_token_params params = {0};
+     XUserGetTokenAndSignatureData *data;
++    char title_id[64], title_client_id[64];
+     SIZE_T token_len, sig_len, size;
+     char *token_copy, *sig_copy;
+ 
+@@ -391,6 +392,18 @@ static HRESULT token_and_signature_async( XAsyncBlock *async, const char *method
+     params.method = method;
+     params.body = body;
+     params.body_size = body_size;
++
++    /* Which title is asking. Xbox puts it in the token as a claim, and the
++     * services that scope by title refuse a token claiming the wrong one --
++     * loudly enough (403) to look like a broken sign-in rather than a wrong
++     * claim, which is what makes this worth carrying on every request. */
++    xgr_title_identity( title_id, sizeof(title_id), title_client_id, sizeof(title_client_id) );
++    params.title_id = title_id;
++    params.title_client_id = title_client_id;
++    if (!title_id[0] || !title_client_id[0])
++        WARN( "MicrosoftGame.config has no %s; the token will carry no title claim and "
++              "presence and multiplayer will answer 403.\n",
++              title_id[0] ? "MSAAppId" : "TitleId" );
+     if (XGR_UNIX_CALL( xsts_token, &params ))
+     {
+         xgr_async_complete( async, E_GAMEUSER_NO_AUTH_USER, NULL );

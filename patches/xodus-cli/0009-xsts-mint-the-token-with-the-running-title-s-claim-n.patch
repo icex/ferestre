@@ -1,0 +1,971 @@
+From 78ff54eb4a9457acdd0947dff2256a8b2390e215 Mon Sep 17 00:00:00 2001
+From: Ice <icex@users.noreply.github.com>
+Date: Sun, 6 Sep 2026 23:49:57 +0300
+Subject: [PATCH] xsts: mint the token with the running title's claim, not a
+ stand-in
+
+An XSTS token can carry a title claim, and the services that scope what
+they do by title -- presence's titles/current, the session directory --
+refuse a token that does not carry the right one. Measured against a live
+account, `POST sessiondirectory.xboxlive.com/handles/query` for a title's
+service config answers:
+
+  * 200, with a token carrying no title claim at all,
+  * 403 "The requested service config cannot be accessed.", with a token
+    claiming a *different* title,
+  * 200, with a token claiming the title that owns the config.
+
+So a stand-in claim is worse than none. The service was handing every
+title the Xbox app's identity, which is why Goat Simulator 3 reported
+"failed to create party" and set no presence while its profile, social,
+achievements and stats calls all returned 200 with the same token.
+
+The runtime now sends the running title's TitleId and MSAAppId (out of
+its MicrosoftGame.config) with each token request, and the SISU identity
+is minted and cached per title. Where the title is unknown the claimless
+chain is used rather than a substitute, because that is the answer that
+works. A relying party that refuses a title token is remembered so the
+retry costs one round trip once, rather than a hardcoded list of which
+audiences take one.
+
+Two things make the failure visible next time. `api::xbox::claims` names
+the routes that are scoped by title, and the service logs, at the moment
+it hands back a claimless token for one of them, which of the three
+possible reasons it was: no identity from the runtime, a relying party
+that refused, or SISU failing. And the service's own log now defaults to
+info rather than to the EnvFilter's error-only default, since it is the
+only place that reason ever appears.
+
+`xodus-cli xbl-check <game dir>` runs the same distinction on demand:
+unclaimed reads first, then the claim, then a claimed read, so a failure
+is attributed instead of guessed at.
+---
+ crates/xodus-cli/src/commands.rs              |   1 +
+ crates/xodus-cli/src/commands/collections.rs  |  51 +++-
+ crates/xodus-cli/src/commands/xblcheck.rs     | 257 ++++++++++++++++++
+ crates/xodus-cli/src/main.rs                  |  63 ++++-
+ crates/xodus-service/src/connection/xml.rs    | 152 +++++++++--
+ crates/xodus-service/src/main.rs              |  10 +-
+ crates/xodus/src/api/xbox/claims.rs           | 154 +++++++++++
+ crates/xodus/src/api/xbox/mod.rs              |   1 +
+ crates/xodus/src/auth.rs                      |  24 +-
+ crates/xodus/src/models/xgameruntime/xuser.rs |  20 ++
+ 10 files changed, 700 insertions(+), 33 deletions(-)
+ create mode 100644 crates/xodus-cli/src/commands/xblcheck.rs
+ create mode 100644 crates/xodus/src/api/xbox/claims.rs
+
+diff --git a/crates/xodus-cli/src/commands.rs b/crates/xodus-cli/src/commands.rs
+index 02cf77b..3122252 100644
+--- a/crates/xodus-cli/src/commands.rs
++++ b/crates/xodus-cli/src/commands.rs
+@@ -9,5 +9,6 @@ pub mod login;
+ pub mod logout;
+ #[cfg(unix)]
+ pub mod run;
++pub mod xblcheck;
+ pub mod splicense;
+ pub mod streaming;
+diff --git a/crates/xodus-cli/src/commands/collections.rs b/crates/xodus-cli/src/commands/collections.rs
+index e252a3c..656a179 100644
+--- a/crates/xodus-cli/src/commands/collections.rs
++++ b/crates/xodus-cli/src/commands/collections.rs
+@@ -46,6 +46,31 @@ pub(crate) async fn xsts_for(
+     Ok(xodus::api::xbox::run(client, dev_token, user_token, relying_party).await)
+ }
+ 
++/// Mint an XSTS token carrying a title claim for `title_id`.
++///
++/// The whole chain has to come from SISU: Xbox will not issue a title token
++/// against the ticket this client holds, and it rejects a request that mixes a
++/// title token minted under one proof key with a user token minted under
++/// another. `xodus::auth::sisu_identity_for` returns the matching set.
++pub(crate) async fn title_claim_xsts(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++    client_id: &str,
++    title_id: i64,
++    relying_party: &str,
++) -> Result<XstsResponse, String> {
++    let id = xodus::auth::sisu_identity_for(client, tokens, client_id, title_id).await?;
++    xodus::api::xbox::request_xsts_token(
++        client,
++        id.user_token,
++        Some(id.device_token),
++        Some(id.title_token),
++        relying_party,
++    )
++    .await
++    .map_err(|e| format!("xsts/authorize refused the title claim: {e}"))
++}
++
+ fn correlation_vector() -> String {
+     // These services want an MS-CV, and it is the identifier support would ask
+     // for if a call misbehaves.
+@@ -96,8 +121,22 @@ pub async fn probe(
+     body: Option<String>,
+     relying_party: String,
+     headers: Vec<String>,
++    // (TitleId, MSAAppId) when the caller wants a title claim in the token.
++    title: Option<(i64, String)>,
+ ) -> ExitCode {
+-    let xsts = match xsts_for(client, tokens, &relying_party).await {
++    let minted = match &title {
++        Some((title_id, client_id)) => title_claim_xsts(
++            client,
++            tokens,
++            client_id,
++            *title_id,
++            &relying_party,
++        )
++        .await
++        .map_err(|e| format!("{e}")),
++        None => xsts_for(client, tokens, &relying_party).await,
++    };
++    let xsts = match minted {
+         Ok(xsts) => xsts,
+         Err(message) => {
+             eprintln!("{message}");
+@@ -111,13 +150,17 @@ pub async fn probe(
+     let puid = tokens.get_user().map(|u| u.puid).unwrap_or_default();
+     let raw_token = xsts.token.clone();
+     let auth = xodus::api::xbox::get_xsts_auth_header(xsts);
+-    let body = body.map(|b| {
+-        b.replace("{XUID}", &xuid)
++    let fill = |text: &str| {
++        text.replace("{XUID}", &xuid)
+             .replace("{UHS}", &uhs)
+             .replace("{PUID}", &puid)
+             .replace("{XTOKEN}", &auth)
+             .replace("{RAWTOKEN}", &raw_token)
+-    });
++    };
++    // The path carries the xuid as often as the body does -- presence and
++    // social are both /users/xuid(...) -- so substitute in both.
++    let url = fill(&url);
++    let body = body.as_deref().map(fill);
+ 
+     match send(client, &url, body, &auth, &headers).await {
+         Ok((status, text, cv)) => {
+diff --git a/crates/xodus-cli/src/commands/xblcheck.rs b/crates/xodus-cli/src/commands/xblcheck.rs
+new file mode 100644
+index 0000000..f7b11f2
+--- /dev/null
++++ b/crates/xodus-cli/src/commands/xblcheck.rs
+@@ -0,0 +1,257 @@
++//! Check that a title's Xbox Live calls will actually be authorised.
++//!
++//! A title never reports *why* an Xbox call failed. It sees a 403 and says
++//! "failed to create party", or shows a sign-in error, or quietly does nothing.
++//! The one distinction that matters is invisible from there: whether the token
++//! it was handed carries a claim naming *this* title.
++//!
++//! So run the calls here instead, where the failure can be attributed. Each
++//! probe is a real request to a real service, chosen so that the ones needing a
++//! title claim and the ones not needing one are both represented -- if only the
++//! claimed probes fail, the claim is the problem and nothing else is; if the
++//! unclaimed ones fail too, the account or the sign-in is.
++//!
++//! Nothing here is destructive: every probe reads.
++
++use std::path::Path;
++use std::process::ExitCode;
++use xodus::tokens::TokenManager;
++
++/// One request, and what its failure would mean.
++struct Probe {
++    name: &'static str,
++    url: &'static str,
++    body: Option<&'static str>,
++    headers: &'static [&'static str],
++}
++
++/// Reads that do not depend on which title is asking.
++const UNCLAIMED: &[Probe] = &[
++    Probe {
++        name: "profile",
++        url: "https://profile.xboxlive.com/users/me/profile/settings?settings=Gamertag",
++        body: None,
++        headers: &["x-xbl-contract-version:3"],
++    },
++    Probe {
++        name: "social",
++        url: "https://social.xboxlive.com/users/xuid({XUID})/people?view=FriendList",
++        body: None,
++        headers: &["x-xbl-contract-version:1"],
++    },
++];
++
++/// Reads that are scoped by title. These are the ones a wrong claim breaks.
++const CLAIMED: &[Probe] = &[Probe {
++    name: "multiplayer (session directory)",
++    url: "https://sessiondirectory.xboxlive.com/handles/query?include=relatedInfo,customProperties",
++    body: Some(
++        r#"{"type":"activity","scid":"{SCID}","owners":{"people":{"moniker":"people","monikerXuid":"{XUID}"}}}"#,
++    ),
++    headers: &["x-xbl-contract-version:107"],
++}];
++
++/// The title identity Xbox mints a claim from, out of a MicrosoftGame.config.
++#[derive(Debug)]
++pub struct TitleIdentity {
++    pub title_id: i64,
++    pub client_id: String,
++}
++
++impl TitleIdentity {
++    /// The service config id a title's sessions live under. Titles are free to
++    /// use another, but the convention -- and what the probe needs in order to
++    /// address *something* of this title's -- is the title id in the last
++    /// twelve digits.
++    fn scid(&self) -> String {
++        format!("00000000-0000-0000-0000-0000{:08x}", self.title_id)
++    }
++}
++
++/// Read `TitleId` and `MSAAppId` out of a game directory's MicrosoftGame.config.
++///
++/// The config spells TitleId in hexadecimal and every Xbox endpoint wants it
++/// decimal, which is a conversion worth doing in exactly one place.
++pub fn identity_from_game_dir(dir: &Path) -> Result<TitleIdentity, String> {
++    let path = dir.join("MicrosoftGame.config");
++    let xml = std::fs::read_to_string(&path)
++        .map_err(|e| format!("reading {}: {e}", path.display()))?;
++    let element = |name: &str| -> Option<String> {
++        let open = format!("<{name}>");
++        let start = xml.find(&open)? + open.len();
++        let len = xml[start..].find('<')?;
++        Some(xml[start..start + len].trim().to_string())
++    };
++    let hex = element("TitleId")
++        .ok_or_else(|| format!("{} has no <TitleId>", path.display()))?;
++    let title_id = i64::from_str_radix(hex.trim_start_matches("0x"), 16)
++        .map_err(|_| format!("<TitleId>{hex}</TitleId> is not hexadecimal"))?;
++    let client_id = element("MSAAppId")
++        .ok_or_else(|| format!("{} has no <MSAAppId>", path.display()))?;
++    Ok(TitleIdentity {
++        title_id,
++        client_id,
++    })
++}
++
++async fn run_probe(
++    client: &reqwest::Client,
++    probe: &Probe,
++    auth: &str,
++    xuid: &str,
++    scid: &str,
++) -> (reqwest::StatusCode, String) {
++    let fill = |s: &str| s.replace("{XUID}", xuid).replace("{SCID}", scid);
++    let headers: Vec<String> = probe.headers.iter().map(|h| h.to_string()).collect();
++    match super::collections::send(
++        client,
++        &fill(probe.url),
++        probe.body.map(fill),
++        auth,
++        &headers,
++    )
++    .await
++    {
++        Ok((status, text, _)) => (status, text),
++        Err(message) => (reqwest::StatusCode::SERVICE_UNAVAILABLE, message),
++    }
++}
++
++pub async fn run(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++    identity: TitleIdentity,
++) -> ExitCode {
++    println!(
++        ":: title {} (client id {})",
++        identity.title_id, identity.client_id
++    );
++
++    let plain = match super::collections::xsts_for(client, tokens, "http://xboxlive.com").await {
++        Ok(xsts) => xsts,
++        Err(message) => {
++            eprintln!("!! no Xbox token at all: {message}");
++            eprintln!("   Sign in first: xodus-cli login");
++            return ExitCode::FAILURE;
++        }
++    };
++    let xuid = plain.xuid().unwrap_or_default().to_string();
++    let plain_auth = xodus::api::xbox::get_xsts_auth_header(plain);
++
++    let mut failed = 0;
++    for probe in UNCLAIMED {
++        let (status, body) = run_probe(client, probe, &plain_auth, &xuid, "").await;
++        if status.is_success() {
++            println!("   ok    {}", probe.name);
++        } else {
++            failed += 1;
++            println!("   FAIL  {} -- HTTP {status} {}", probe.name, first_line(&body));
++        }
++    }
++    if failed > 0 {
++        eprintln!(
++            "!! calls that do not depend on the title are failing, so this is not a title-claim \
++             problem. Check the sign-in (xodus-cli account) before looking further."
++        );
++        return ExitCode::FAILURE;
++    }
++
++    // The claim itself. A failure here is the interesting one, and it is the
++    // failure a title reports as "failed to create party".
++    let claimed = super::collections::title_claim_xsts(
++        client,
++        tokens,
++        &identity.client_id,
++        identity.title_id,
++        "http://xboxlive.com",
++    )
++    .await;
++    let claimed_auth = match claimed {
++        Ok(xsts) => xodus::api::xbox::get_xsts_auth_header(xsts),
++        Err(message) => {
++            eprintln!("!! could not mint a token claiming title {}: {message}", identity.title_id);
++            eprintln!(
++                "   Everything scoped by title -- multiplayer, parties, presence -- will answer \
++                 403 until this works."
++            );
++            return ExitCode::FAILURE;
++        }
++    };
++    println!("   ok    title claim minted");
++
++    let scid = identity.scid();
++    for probe in CLAIMED {
++        let (status, body) = run_probe(client, probe, &claimed_auth, &xuid, &scid).await;
++        if status.is_success() {
++            println!("   ok    {}", probe.name);
++            continue;
++        }
++        failed += 1;
++        println!("   FAIL  {} -- HTTP {status} {}", probe.name, first_line(&body));
++
++        // Say which of the two it is: a claim Xbox will not accept for this
++        // service, or a service that is unhappy for some other reason. The
++        // same request with no claim distinguishes them.
++        let (plain_status, _) = run_probe(client, probe, &plain_auth, &xuid, &scid).await;
++        if plain_status.is_success() {
++            println!(
++                "         the same call succeeds with no title claim, so the claim is being \
++                 refused -- check that MSAAppId and TitleId match the running title"
++            );
++        }
++    }
++
++    if failed == 0 {
++        println!(":: Xbox Live is fully authorised for this title");
++        ExitCode::SUCCESS
++    } else {
++        ExitCode::FAILURE
++    }
++}
++
++fn first_line(body: &str) -> String {
++    let line = body.lines().next().unwrap_or_default().trim();
++    if line.len() > 120 {
++        format!("{}...", &line[..120])
++    } else {
++        line.to_string()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_game_config_yields_the_pair_xbox_mints_a_claim_from() {
++        let dir = tempfile::tempdir().expect("tempdir");
++        std::fs::write(
++            dir.path().join("MicrosoftGame.config"),
++            r#"<?xml version="1.0" encoding="utf-8"?>
++<Game configVersion="1">
++  <TitleId>69C7AA31</TitleId>
++  <MSAAppId>cb41e2e1-503c-48ac-98b6-55b194b4ab66</MSAAppId>
++</Game>"#,
++        )
++        .expect("write");
++        let id = identity_from_game_dir(dir.path()).expect("parsed");
++        assert_eq!(
++            id.title_id, 1_774_457_393,
++            "the config carries the title id in hexadecimal and Xbox wants it decimal"
++        );
++        assert_eq!(id.client_id, "cb41e2e1-503c-48ac-98b6-55b194b4ab66");
++        assert_eq!(id.scid(), "00000000-0000-0000-0000-000069c7aa31");
++    }
++
++    #[test]
++    fn a_config_missing_the_app_id_says_which_one_is_missing() {
++        let dir = tempfile::tempdir().expect("tempdir");
++        std::fs::write(
++            dir.path().join("MicrosoftGame.config"),
++            "<Game><TitleId>69C7AA31</TitleId></Game>",
++        )
++        .expect("write");
++        let err = identity_from_game_dir(dir.path()).expect_err("no MSAAppId");
++        assert!(err.contains("MSAAppId"), "{err}");
++    }
++}
+diff --git a/crates/xodus-cli/src/main.rs b/crates/xodus-cli/src/main.rs
+index 75d3d59..7befc57 100644
+--- a/crates/xodus-cli/src/main.rs
++++ b/crates/xodus-cli/src/main.rs
+@@ -53,6 +53,30 @@ enum SubCommand {
+             help = "Extra request header, repeatable (profile.xboxlive.com needs x-xbl-contract-version:3)"
+         )]
+         headers: Vec<String>,
++        #[arg(
++            long,
++            value_name = "TITLEID",
++            help = "Mint the token with a title claim for this decimal TitleId (needs --title-client-id)"
++        )]
++        title_id: Option<i64>,
++        #[arg(
++            long,
++            value_name = "GUID",
++            help = "The title's MSAAppId, from its MicrosoftGame.config"
++        )]
++        title_client_id: Option<String>,
++    },
++    #[command(
++        name = "xbl-check",
++        about = "Check that a title's Xbox Live calls will be authorised (multiplayer, presence)"
++    )]
++    XblCheck {
++        #[arg(help = "The installed game directory holding MicrosoftGame.config")]
++        game_dir: Option<std::path::PathBuf>,
++        #[arg(long, help = "Decimal TitleId, instead of reading the game directory")]
++        title_id: Option<i64>,
++        #[arg(long, help = "The title's MSAAppId, instead of reading the game directory")]
++        title_client_id: Option<String>,
+     },
+     #[command(about = "Download msixvc or xsp files fo given game")]
+     Download {
+@@ -282,12 +306,49 @@ async fn main() -> ExitCode {
+             ClepAction::Decrypt { data } => commands::clep::decrypt(data),
+         },
+         SubCommand::Account { json } => commands::account::run(&client, &tokens, json).await,
++        SubCommand::XblCheck {
++            game_dir,
++            title_id,
++            title_client_id,
++        } => {
++            let identity = match (title_id.zip(title_client_id), game_dir) {
++                (Some((title_id, client_id)), _) => Ok(commands::xblcheck::TitleIdentity {
++                    title_id,
++                    client_id,
++                }),
++                (None, Some(dir)) => commands::xblcheck::identity_from_game_dir(&dir),
++                (None, None) => Err(
++                    "give the installed game directory, or --title-id with --title-client-id"
++                        .to_string(),
++                ),
++            };
++            match identity {
++                Ok(identity) => commands::xblcheck::run(&client, &tokens, identity).await,
++                Err(message) => {
++                    eprintln!("{message}");
++                    std::process::ExitCode::FAILURE
++                }
++            }
++        }
+         SubCommand::Collections {
+             url,
+             body,
+             relying_party,
+             headers,
+-        } => commands::collections::probe(&client, &tokens, url, body, relying_party, headers).await,
++            title_id,
++            title_client_id,
++        } => {
++            commands::collections::probe(
++                &client,
++                &tokens,
++                url,
++                body,
++                relying_party,
++                headers,
++                title_id.zip(title_client_id),
++            )
++            .await
++        }
+         SubCommand::Library {
+             page_size,
+             msa_target,
+diff --git a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/src/connection/xml.rs
+index d8d9123..67ba7b2 100644
+--- a/crates/xodus-service/src/connection/xml.rs
++++ b/crates/xodus-service/src/connection/xml.rs
+@@ -30,14 +30,71 @@ static TITLE_TOKEN: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_n
+ static ENDPOINTS: tokio::sync::OnceCell<Option<xodus::models::xbox::TitleMgtResponse>> =
+     tokio::sync::OnceCell::const_new();
+ 
+-/// One signing key for the life of the service. Tokens are minted bound to it
+-/// (as ProofKey) and requests signed with it, so the two always agree.
+-/// The identity SISU issued, if it would give us one: device, title and user
+-/// tokens plus the key they are all bound to. Presence needs a title claim and
+-/// Xbox will not let us mix keys, so when this is present it replaces the whole
+-/// locally-built chain -- signing key included.
+-static SISU: tokio::sync::OnceCell<Option<xodus::auth::SisuIdentity>> =
+-    tokio::sync::OnceCell::const_new();
++/// The identity SISU issued for a title: device, title and user tokens plus the
++/// key they are all bound to. Xbox will not let us mix keys, so when this is
++/// present it replaces the whole locally-built chain -- signing key included.
++///
++/// Keyed by title, because the claim it carries *names* a title. A token
++/// claiming the wrong one is not a weaker token, it is a refused one: the
++/// session directory answers "The requested service config cannot be accessed."
++/// and presence's titles/current answers 403, while the same request with no
++/// claim at all goes through. Handing every title the Xbox app's identity --
++/// which is what this used to do -- therefore broke exactly the two services a
++/// title needs it for.
++///
++/// The mutex is held across the mint so a title asking for several relying
++/// parties at once runs SISU once rather than once per ask.
++static SISU: std::sync::LazyLock<
++    tokio::sync::Mutex<std::collections::HashMap<i64, Option<std::sync::Arc<xodus::auth::SisuIdentity>>>>,
++> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
++
++/// Relying parties xsts/authorize refused a title token for.
++///
++/// Rather than carry a list of which audiences accept a title claim -- which
++/// would be wrong the moment Xbox changes one -- try it and remember the
++/// answer. The retry without the claim happens on the same request, so a
++/// refusal costs one extra round trip, once.
++static NO_TITLE_CLAIM: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
++    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
++
++/// Mint (or reuse) the SISU identity for one title.
++///
++/// The SOAP exchange behind it fails intermittently -- an empty or truncated
++/// response deserialises as a missing `wst:TokenType` -- and a failure here
++/// costs the title its multiplayer, so a second attempt is worth more than the
++/// second or so it takes.
++async fn sisu_for(
++    client: &reqwest::Client,
++    tokens: &xodus::tokens::TokenManager,
++    title_id: i64,
++    client_id: &str,
++) -> Option<std::sync::Arc<xodus::auth::SisuIdentity>> {
++    let mut cache = SISU.lock().await;
++    if let Some(hit) = cache.get(&title_id) {
++        return hit.clone();
++    }
++    let mut last = String::new();
++    for attempt in 1..=2 {
++        match xodus::auth::sisu_identity_for(client, tokens, client_id, title_id).await {
++            Ok(id) => {
++                tracing::info!("SISU issued a token set claiming title {title_id}");
++                let id = std::sync::Arc::new(id);
++                cache.insert(title_id, Some(id.clone()));
++                return Some(id);
++            }
++            Err(e) => {
++                tracing::warn!("SISU attempt {attempt} for title {title_id} failed: {e}");
++                last = e;
++            }
++        }
++    }
++    tracing::error!(
++        "no title claim for title {title_id} (client id {client_id}): {last}. \
++         Presence and multiplayer will answer 403 until this succeeds."
++    );
++    cache.insert(title_id, None);
++    None
++}
+ 
+ /// The key that signs requests. It has to be the key the token was minted
+ /// under, so it follows SISU when SISU supplied the tokens.
+@@ -293,7 +350,21 @@ pub async fn parse_message(
+                     }
+                 }
+             };
+-            tracing::debug!("Relying party: {relying_party}");
++            // Which title is asking, when the runtime told us. Everything
++            // below keys off it: two titles running at once must not be handed
++            // each other's claim, and neither must a title be handed the
++            // claimless token minted before its own arrived.
++            let title = req.title().map(|(id, client)| (id, client.to_string()));
++            match &title {
++                Some((id, client)) => {
++                    tracing::debug!("Relying party: {relying_party} (title {id}, client {client})")
++                }
++                None => tracing::debug!("Relying party: {relying_party} (no title claim asked for)"),
++            }
++            let cache_key = format!(
++                "{}|{relying_party}",
++                title.as_ref().map(|(id, _)| *id).unwrap_or(0)
++            );
+ 
+             // Re-use a still-valid token rather than paying for the whole
+             // chain again; keep a minute of headroom so one never expires in
+@@ -302,7 +373,7 @@ pub async fn parse_message(
+             if let Some(hit) = XSTS_CACHE
+                 .lock()
+                 .ok()
+-                .and_then(|c| c.get(&relying_party).cloned())
++                .and_then(|c| c.get(&cache_key).cloned())
+                 .filter(|c| c.expiry > now + 60)
+             {
+                 tracing::debug!("Re-using cached token for {relying_party}");
+@@ -357,20 +428,40 @@ pub async fn parse_message(
+             }
+             let device_token = context.device_token.as_ref().unwrap().clone();
+ 
+-            let sisu = SISU
+-                .get_or_init(|| async {
+-                    match xodus::auth::sisu_identity(&context.client, context.tokens()).await {
+-                        Ok(id) => {
+-                            tracing::info!("SISU issued a device, title and user token set");
+-                            Some(id)
+-                        }
+-                        Err(e) => {
+-                            tracing::warn!("{e}; falling back to a user-only chain");
+-                            None
++            // A claim for the title that is actually running, or none.
++            //
++            // Never a stand-in: a token claiming some other title is refused by
++            // the very services the claim exists for, so where the title is
++            // unknown the claimless chain below is the better answer.
++            let refused = NO_TITLE_CLAIM
++                .lock()
++                .map(|s| s.contains(&relying_party))
++                .unwrap_or(false);
++            let sisu = match (&title, refused) {
++                (Some((id, client)), false) => {
++                    sisu_for(&context.client, context.tokens(), *id, client).await
++                }
++                _ => None,
++            };
++
++            // Say so when this request is one of the ones that will come back
++            // 403 without a claim. It is the only chance to name the cause:
++            // the title makes the call itself, sees a bare 403, and reports it
++            // as "failed to create party" or a broken sign-in.
++            if sisu.is_none() {
++                if let Some(what) = xodus::api::xbox::claims::needs_title_claim(&req.url) {
++                    let why = match (&title, refused) {
++                        (None, _) => "the runtime sent no TitleId/MSAAppId (is the title's \
++                                      MicrosoftGame.config readable?)"
++                            .to_string(),
++                        (Some(_), true) => {
++                            format!("{relying_party} would not issue a token carrying one")
+                         }
+-                    }
+-                })
+-                .await;
++                        (Some((id, _)), false) => format!("SISU could not mint one for title {id}"),
++                    };
++                    tracing::error!("{} will fail: no title claim -- {why}", what);
++                }
++            }
+ 
+             if let Some(id) = sisu.as_ref() {
+                 let signer = xodus::api::xbox::RequestSigner::from_pkcs8(&id.key_pkcs8);
+@@ -398,7 +489,7 @@ pub async fn parse_message(
+                         };
+                         if let Ok(mut cache) = XSTS_CACHE.lock() {
+                             cache.insert(
+-                                relying_party.clone(),
++                                cache_key.clone(),
+                                 CachedToken {
+                                     token: payload.token.clone(),
+                                     xuid: payload.xuid.clone(),
+@@ -410,7 +501,16 @@ pub async fn parse_message(
+                         return Ok(quick_xml::se::to_string(&payload)?.as_bytes().to_vec());
+                     }
+                     Err(e) => {
+-                        tracing::warn!("SISU-based XSTS failed for {relying_party}: {e}");
++                        // The audience would not take a title claim. Remember
++                        // it so the next request for it skips straight to the
++                        // claimless chain instead of paying for the refusal.
++                        tracing::warn!(
++                            "{relying_party} refused a title claim ({e}); \
++                             falling back to a token without one"
++                        );
++                        if let Ok(mut set) = NO_TITLE_CLAIM.lock() {
++                            set.insert(relying_party.clone());
++                        }
+                     }
+                 }
+             }
+@@ -459,7 +559,7 @@ pub async fn parse_message(
+             };
+             if let Ok(mut cache) = XSTS_CACHE.lock() {
+                 cache.insert(
+-                    relying_party.clone(),
++                    cache_key,
+                     CachedToken {
+                         token: payload.token.clone(),
+                         xuid: payload.xuid.clone(),
+diff --git a/crates/xodus-service/src/main.rs b/crates/xodus-service/src/main.rs
+index 392bd90..313c401 100644
+--- a/crates/xodus-service/src/main.rs
++++ b/crates/xodus-service/src/main.rs
+@@ -18,7 +18,15 @@ const PROTO_MAGIC: u32 = 0x58445350;
+ 
+ #[tokio::main]
+ async fn main() {
+-    let filter = tracing_subscriber::EnvFilter::from_env("XODUS_LOG");
++    // Default to info rather than to the EnvFilter's own error-only default.
++    // The service's log is the only place the reason a title's Xbox call was
++    // refused ever appears -- the title itself just sees the 403 -- and a log
++    // that stays silent until someone knows to set XODUS_LOG is a log nobody
++    // reads at the moment it would have helped.
++    let filter = match std::env::var("XODUS_LOG") {
++        Ok(value) if !value.trim().is_empty() => tracing_subscriber::EnvFilter::new(value),
++        _ => tracing_subscriber::EnvFilter::new("info"),
++    };
+     let registry =
+         tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_filter(filter));
+ 
+diff --git a/crates/xodus/src/api/xbox/claims.rs b/crates/xodus/src/api/xbox/claims.rs
+new file mode 100644
+index 0000000..b03a451
+--- /dev/null
++++ b/crates/xodus/src/api/xbox/claims.rs
+@@ -0,0 +1,154 @@
++//! Which Xbox Live calls need the token to say *which title* is asking.
++//!
++//! An XSTS token can carry a title claim, minted from a title's `TitleId` and
++//! `MSAAppId`. Most services ignore it. A few scope everything they do by it,
++//! and those refuse a token that does not carry the right one -- not with a
++//! diagnosable error, but with a bare 403 that reads, from inside the game, as
++//! "sign-in is broken" or "failed to create party".
++//!
++//! Worse, a *wrong* claim is not a weaker claim. Measured against a live
++//! account: `POST sessiondirectory.xboxlive.com/handles/query` for a title's
++//! service config answers
++//!
++//!   * 200, with a token carrying no title claim at all,
++//!   * 403 "The requested service config cannot be accessed.", with a token
++//!     claiming a different title,
++//!   * 200, with a token claiming the title that owns the config.
++//!
++//! So a stand-in claim is worse than none, and the failure looks identical to a
++//! sign-in problem. This table exists so the failure can be named instead:
++//! when a request lands on one of these routes and the token has no claim to
++//! give it, something says so, in words, at the moment it happens.
++//!
++//! It is a diagnostic, not a gate. The token always carries the running title's
++//! claim when one can be minted; this only decides whether *not* having one is
++//! worth complaining about.
++
++/// A route that is scoped by title.
++struct Rule {
++    /// Host, matched exactly or as a suffix after a leading dot.
++    host: &'static str,
++    /// A fragment the path must contain, or `None` for "any path on this host".
++    path: Option<&'static str>,
++    /// What breaks when the claim is missing, in the user's terms.
++    what: &'static str,
++}
++
++const RULES: &[Rule] = &[
++    Rule {
++        // MPSD: sessions, handles and the activity/party plumbing above them.
++        // Every read and write is against a title's service config.
++        host: "sessiondirectory.xboxlive.com",
++        path: None,
++        what: "multiplayer sessions, parties and invites",
++    },
++    Rule {
++        host: "multiplayeractivity.xboxlive.com",
++        path: None,
++        what: "the multiplayer activity a friend joins from",
++    },
++    Rule {
++        // Presence *for the title you are in*. The batch and people routes on
++        // the same host are not scoped and answer fine without a claim.
++        host: "userpresence.xboxlive.com",
++        path: Some("/devices/current/titles/current"),
++        what: "showing the game you are playing on your profile",
++    },
++    Rule {
++        host: "titlestorage.xboxlive.com",
++        path: None,
++        what: "title storage (leaderboard blobs, saved configuration)",
++    },
++    Rule {
++        // Writes are per-title; the read routes titles use at startup are not.
++        host: "achievements.xboxlive.com",
++        path: Some("/achievements/update"),
++        what: "unlocking achievements",
++    },
++];
++
++/// What the URL needs a title claim *for*, or `None` if it does not need one.
++pub fn needs_title_claim(url: &str) -> Option<&'static str> {
++    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
++    let (authority, path) = match rest.find('/') {
++        Some(at) => (&rest[..at], &rest[at..]),
++        None => (rest, "/"),
++    };
++    let host = authority
++        .rsplit_once('@')
++        .map(|(_, h)| h)
++        .unwrap_or(authority);
++    let host = host.split_once(':').map(|(h, _)| h).unwrap_or(host);
++    let host = host.to_ascii_lowercase();
++
++    RULES
++        .iter()
++        .find(|rule| {
++            (host == rule.host || host.ends_with(&format!(".{}", rule.host)))
++                && rule.path.is_none_or(|fragment| path.contains(fragment))
++        })
++        .map(|rule| rule.what)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn the_session_directory_is_scoped_by_title_whatever_the_route() {
++        assert_eq!(
++            needs_title_claim(
++                "https://sessiondirectory.xboxlive.com/handles/query?include=relatedInfo"
++            ),
++            Some("multiplayer sessions, parties and invites")
++        );
++        assert!(
++            needs_title_claim("https://sessiondirectory.xboxlive.com/serviceconfigs/x").is_some()
++        );
++    }
++
++    /// The distinction that makes the table worth having: one host, two routes,
++    /// and only one of them cares. Reporting the whole host would cry wolf on
++    /// every presence batch a title makes at startup.
++    #[test]
++    fn presence_is_scoped_only_where_it_names_the_current_title() {
++        assert!(
++            needs_title_claim(
++                "https://userpresence.xboxlive.com/users/xuid(1)/devices/current/titles/current"
++            )
++            .is_some()
++        );
++        assert!(needs_title_claim("https://userpresence.xboxlive.com/users/batch").is_none());
++    }
++
++    #[test]
++    fn services_that_do_not_scope_by_title_are_not_reported() {
++        for url in [
++            "https://profile.xboxlive.com/users/batch/profile/settings",
++            "https://social.xboxlive.com/users/xuid(1)/people?view=FriendList",
++            "https://userstats.xboxlive.com/batch?operation=read",
++            "https://collections.mp.microsoft.com/v6.0/collections/query",
++        ] {
++            assert!(needs_title_claim(url).is_none(), "{url}");
++        }
++    }
++
++    /// Hosts arrive from a title, not from us, so the match has to survive a
++    /// port, a case difference and a regional prefix without either missing a
++    /// real match or claiming a lookalike domain.
++    #[test]
++    fn the_host_is_matched_and_not_merely_searched_for() {
++        assert!(needs_title_claim("https://SessionDirectory.XboxLive.com/handles").is_some());
++        assert!(needs_title_claim("https://eu.sessiondirectory.xboxlive.com/handles").is_some());
++        assert!(needs_title_claim("https://sessiondirectory.xboxlive.com:443/handles").is_some());
++        assert!(
++            needs_title_claim("https://sessiondirectory.xboxlive.com.example.net/handles")
++                .is_none(),
++            "a domain that merely starts with the host is a different domain"
++        );
++        assert!(
++            needs_title_claim("https://example.net/sessiondirectory.xboxlive.com").is_none(),
++            "and the host must come from the authority, not from the path"
++        );
++    }
++}
+diff --git a/crates/xodus/src/api/xbox/mod.rs b/crates/xodus/src/api/xbox/mod.rs
+index 42206d8..e82879b 100644
+--- a/crates/xodus/src/api/xbox/mod.rs
++++ b/crates/xodus/src/api/xbox/mod.rs
+@@ -4,6 +4,7 @@ use crate::models::soap;
+ use crate::models::xbox::XstsResponse;
+ 
+ pub mod auth;
++pub mod claims;
+ pub mod signing;
+ pub mod title;
+ pub use auth::{
+diff --git a/crates/xodus/src/auth.rs b/crates/xodus/src/auth.rs
+index 4cb7345..ebc1282 100644
+--- a/crates/xodus/src/auth.rs
++++ b/crates/xodus/src/auth.rs
+@@ -217,13 +217,35 @@ pub struct SisuIdentity {
+     pub user_token: String,
+ }
+ 
++/// The Xbox app's own identity: a title claim, but for the Xbox app rather than
++/// for whatever is running. Services that only ask "is there a title claim at
++/// all" accept it; services that check *which* title do not.
++pub const XBOX_APP_CLIENT_ID: &str = "0000000040159362";
++pub const XBOX_APP_TITLE_ID: i64 = 896928775;
++
+ pub async fn sisu_identity(
+     client: &Client,
+     manager: &TokenManager,
++) -> Result<SisuIdentity, String> {
++    sisu_identity_for(client, manager, XBOX_APP_CLIENT_ID, XBOX_APP_TITLE_ID).await
++}
++
++/// The same set, but claiming a particular title.
++///
++/// `client_id` is the title's `MSAAppId` and `title_id` its `TitleId`, both
++/// out of its `MicrosoftGame.config`. Xbox mints the title claim from the pair,
++/// and a service that scopes what it returns by title -- presence's
++/// `titles/current`, the session directory -- answers 403 to a claim naming a
++/// different title just as it does to no claim at all.
++pub async fn sisu_identity_for(
++    client: &Client,
++    manager: &TokenManager,
++    client_id: &str,
++    title_id: i64,
+ ) -> Result<SisuIdentity, String> {
+     use p256::pkcs8::EncodePrivateKey;
+ 
+-    let (auth, resp, device) = do_sisu(client, manager, "0000000040159362", 896928775)
++    let (auth, resp, device) = do_sisu(client, manager, client_id, title_id)
+         .await
+         .map_err(|e| format!("SISU failed: {e}"))?;
+ 
+diff --git a/crates/xodus/src/models/xgameruntime/xuser.rs b/crates/xodus/src/models/xgameruntime/xuser.rs
+index 16843b9..9d483ca 100644
+--- a/crates/xodus/src/models/xgameruntime/xuser.rs
++++ b/crates/xodus/src/models/xgameruntime/xuser.rs
+@@ -35,6 +35,26 @@ pub struct XSTSTokenRequest {
+     pub method: String,
+     #[serde(default)]
+     pub body_base64: String,
++    /// The running title, out of its `MicrosoftGame.config`: `TitleId` in
++    /// decimal and `MSAAppId`. Xbox mints the token's *title claim* from the
++    /// pair, and services that scope by title -- presence's `titles/current`,
++    /// the session directory -- refuse a claim naming a different title exactly
++    /// as they refuse none. Empty when an older runtime is on the other end.
++    #[serde(default)]
++    pub title_id: String,
++    #[serde(default)]
++    pub title_client_id: String,
++}
++
++impl XSTSTokenRequest {
++    /// The title this request is on behalf of, when it named one.
++    pub fn title(&self) -> Option<(i64, &str)> {
++        if self.title_client_id.is_empty() {
++            return None;
++        }
++        let id = self.title_id.parse::<i64>().ok().filter(|id| *id > 0)?;
++        Some((id, self.title_client_id.as_str()))
++    }
+ }
+ 
+ /// The `XBL3.0 x=<uhs>;<token>` header a title puts on its request, plus the
+-- 
+2.55.0
+

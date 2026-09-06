@@ -1,195 +1,5 @@
-diff --git a/include/windows.foundation.diagnostics.idl b/include/windows.foundation.diagnostics.idl
-new file mode 100644
---- /dev/null
-+++ b/include/windows.foundation.diagnostics.idl
-@@ -0,0 +1,175 @@
-+/*
-+ * Windows.Foundation.Diagnostics runtime classes
-+ *
-+ * Copyright (C) 2026 the ferestre project
-+ *
-+ * This library is free software; you can redistribute it and/or
-+ * modify it under the terms of the GNU Lesser General Public
-+ * License as published by the Free Software Foundation; either
-+ * version 2.1 of the License, or (at your option) any later version.
-+ *
-+ * This library is distributed in the hope that it will be useful,
-+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-+ * Lesser General Public License for more details.
-+ *
-+ * You should have received a copy of the GNU Lesser General Public
-+ * License along with this library; if not, write to the Free Software
-+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
-+ */
-+
-+/* Interface identifiers and method order are the published ones, taken from the
-+ * Windows SDK's own `windows.foundation.diagnostics.idl`. They are not guesses,
-+ * and the difference is not cosmetic: an invented IID fails QueryInterface
-+ * silently, and a method list one entry short sends the caller off the end of
-+ * the vtable and into whatever follows it.
-+ *
-+ * Only the subset a title has actually been seen to use is declared here. */
-+
-+#ifdef __WIDL__
-+#pragma winrt ns_prefix
-+#endif
-+
-+import "inspectable.idl";
-+import "asyncinfo.idl";
-+import "eventtoken.idl";
-+import "windowscontracts.idl";
-+import "windows.foundation.idl";
-+
-+namespace Windows.Foundation.Diagnostics {
-+    typedef enum LoggingLevel LoggingLevel;
-+
-+    interface ILoggingChannel;
-+    interface ILoggingChannel2;
-+    interface ILoggingChannelFactory;
-+    interface ILoggingChannelFactory2;
-+    interface ILoggingChannelOptions;
-+    interface ILoggingChannelOptionsFactory;
-+
-+    runtimeclass LoggingChannel;
-+    runtimeclass LoggingChannelOptions;
-+
-+    declare {
-+        interface Windows.Foundation.TypedEventHandler<Windows.Foundation.Diagnostics.ILoggingChannel *, IInspectable *>;
-+    }
-+
-+    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
-+    enum LoggingLevel
-+    {
-+        Verbose     = 0,
-+        Information = 1,
-+        Warning     = 2,
-+        Error       = 3,
-+        Critical    = 4,
-+    };
-+
-+    [
-+        contract(Windows.Foundation.UniversalApiContract, 1.0),
-+        uuid(e9a50343-11d7-4f01-b5ca-cf495278c0a8)
-+    ]
-+    interface ILoggingChannel : IInspectable
-+        requires Windows.Foundation.IClosable
-+    {
-+        [propget] HRESULT Name([out, retval] HSTRING *value);
-+        [propget] HRESULT Enabled([out, retval] boolean *value);
-+        [propget] HRESULT Level([out, retval] Windows.Foundation.Diagnostics.LoggingLevel *value);
-+        HRESULT LogMessage([in] HSTRING eventString);
-+        HRESULT LogMessageWithLevel([in] HSTRING eventString,
-+                                    [in] Windows.Foundation.Diagnostics.LoggingLevel level);
-+        HRESULT LogValuePair([in] HSTRING value1, [in] INT32 value2);
-+        HRESULT LogValuePairWithLevel([in] HSTRING value1, [in] INT32 value2,
-+                                      [in] Windows.Foundation.Diagnostics.LoggingLevel level);
-+        [eventadd] HRESULT LoggingEnabled(
-+            [in] Windows.Foundation.TypedEventHandler<Windows.Foundation.Diagnostics.ILoggingChannel *, IInspectable *> *handler,
-+            [out, retval] EventRegistrationToken *token);
-+        [eventremove] HRESULT LoggingEnabled([in] EventRegistrationToken token);
-+    }
-+
-+    [
-+        contract(Windows.Foundation.UniversalApiContract, 1.0),
-+        exclusiveto(Windows.Foundation.Diagnostics.LoggingChannel),
-+        uuid(9f4c3cf3-0bac-45a5-9e33-baf3f3a246a5)
-+    ]
-+    interface ILoggingChannel2 : IInspectable
-+        requires Windows.Foundation.Diagnostics.ILoggingChannel, Windows.Foundation.IClosable
-+    {
-+        [propget] HRESULT Id([out, retval] GUID *value);
-+    }
-+
-+    [
-+        contract(Windows.Foundation.UniversalApiContract, 1.0),
-+        exclusiveto(Windows.Foundation.Diagnostics.LoggingChannel),
-+        uuid(4edc5b9c-af80-4a9b-b0dc-398f9ae5207b)
-+    ]
-+    interface ILoggingChannelFactory : IInspectable
-+    {
-+        HRESULT Create([in] HSTRING name,
-+                       [out, retval] Windows.Foundation.Diagnostics.LoggingChannel **result);
-+    }
-+
-+    /* The one a title was seen to ask for, and the reason a single-method
-+     * vtable sent it jumping to address zero: it calls the *second* method. */
-+    [
-+        contract(Windows.Foundation.UniversalApiContract, 1.0),
-+        exclusiveto(Windows.Foundation.Diagnostics.LoggingChannel),
-+        uuid(4c6ef5dd-3b27-4dc9-99f0-299c6e4603a1)
-+    ]
-+    interface ILoggingChannelFactory2 : IInspectable
-+    {
-+        HRESULT CreateWithOptions([in] HSTRING name,
-+                                  [in] Windows.Foundation.Diagnostics.LoggingChannelOptions *options,
-+                                  [out, retval] Windows.Foundation.Diagnostics.LoggingChannel **result);
-+        HRESULT CreateWithOptionsAndId([in] HSTRING name,
-+                                       [in] Windows.Foundation.Diagnostics.LoggingChannelOptions *options,
-+                                       [in] GUID id,
-+                                       [out, retval] Windows.Foundation.Diagnostics.LoggingChannel **result);
-+    }
-+
-+    [
-+        contract(Windows.Foundation.UniversalApiContract, 1.0),
-+        exclusiveto(Windows.Foundation.Diagnostics.LoggingChannelOptions),
-+        uuid(c3e847ff-0ebb-4a53-8c54-dec24926cb2c)
-+    ]
-+    interface ILoggingChannelOptions : IInspectable
-+    {
-+        [propget] HRESULT Group([out, retval] GUID *value);
-+        [propput] HRESULT Group([in] GUID value);
-+    }
-+
-+    [
-+        contract(Windows.Foundation.UniversalApiContract, 1.0),
-+        exclusiveto(Windows.Foundation.Diagnostics.LoggingChannelOptions),
-+        uuid(a93151da-7faf-4191-8755-5e86dc65d896)
-+    ]
-+    interface ILoggingChannelOptionsFactory : IInspectable
-+    {
-+        HRESULT Create([in] GUID group,
-+                       [out, retval] Windows.Foundation.Diagnostics.LoggingChannelOptions **result);
-+    }
-+
-+    [
-+        contract(Windows.Foundation.UniversalApiContract, 1.0),
-+        marshaling_behavior(agile),
-+        activatable(Windows.Foundation.Diagnostics.ILoggingChannelFactory, Windows.Foundation.UniversalApiContract, 1.0),
-+        activatable(Windows.Foundation.Diagnostics.ILoggingChannelFactory2, Windows.Foundation.UniversalApiContract, 1.0),
-+        threading(both)
-+    ]
-+    runtimeclass LoggingChannel
-+    {
-+        [default] interface Windows.Foundation.Diagnostics.ILoggingChannel;
-+        interface Windows.Foundation.IClosable;
-+        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Foundation.Diagnostics.ILoggingChannel2;
-+    }
-+
-+    [
-+        contract(Windows.Foundation.UniversalApiContract, 1.0),
-+        marshaling_behavior(agile),
-+        activatable(Windows.Foundation.Diagnostics.ILoggingChannelOptionsFactory, Windows.Foundation.UniversalApiContract, 1.0),
-+        activatable(Windows.Foundation.UniversalApiContract, 1.0),
-+        threading(both)
-+    ]
-+    runtimeclass LoggingChannelOptions
-+    {
-+        [default] interface Windows.Foundation.Diagnostics.ILoggingChannelOptions;
-+    }
-+}
-diff --git a/include/Makefile.in b/include/Makefile.in
---- a/include/Makefile.in
-+++ b/include/Makefile.in
-@@ -889,6 +889,7 @@
- 	windows.devices.radios.idl \
- 	windows.devices.usb.idl \
- 	windows.foundation.collections.idl \
-+	windows.foundation.diagnostics.idl \
- 	windows.foundation.idl \
- 	windows.foundation.metadata.idl \
- 	windows.foundation.numerics.idl \
 diff --git a/dlls/windows.system.profile.systemid/classes.idl b/dlls/windows.system.profile.systemid/classes.idl
+index fcb856f..2309801 100644
 --- a/dlls/windows.system.profile.systemid/classes.idl
 +++ b/dlls/windows.system.profile.systemid/classes.idl
 @@ -23,6 +23,7 @@
@@ -200,7 +10,7 @@ diff --git a/dlls/windows.system.profile.systemid/classes.idl b/dlls/windows.sys
  
  namespace Windows.System.Profile {
      runtimeclass SystemIdentification;
-@@ -31,3 +32,11 @@
+@@ -31,3 +32,13 @@ namespace Windows.System.Profile {
  namespace Windows.Internal.System.Profile {
      runtimeclass RegionPolicyEvaluator;
  }
@@ -210,27 +20,15 @@ diff --git a/dlls/windows.system.profile.systemid/classes.idl b/dlls/windows.sys
 + * a title asks for is found through the registry by name, not by which dll it
 + * happens to live in. */
 +namespace Windows.Foundation.Diagnostics {
++    runtimeclass LoggingChannel;
 +    runtimeclass LoggingChannelOptions;
++    runtimeclass LoggingOptions;
 +}
-diff --git a/dlls/windows.system.profile.systemid/private.h b/dlls/windows.system.profile.systemid/private.h
---- a/dlls/windows.system.profile.systemid/private.h
-+++ b/dlls/windows.system.profile.systemid/private.h
-@@ -33,8 +33,11 @@
- #define WIDL_using_Windows_System_Profile
- #define WIDL_using_Windows_Internal_System_Profile
- #define WIDL_using_Windows_Storage_Streams
-+#define WIDL_using_Windows_Foundation
-+#define WIDL_using_Windows_Foundation_Diagnostics
- #include "windows.system.profile.h"
- #include "windows.internal.system.profile.h"
-+#include "windows.foundation.diagnostics.h"
- #include "windows.storage.streams.h"
- 
- #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
 diff --git a/dlls/windows.system.profile.systemid/main.c b/dlls/windows.system.profile.systemid/main.c
+index 6f2585d..241bc6b 100644
 --- a/dlls/windows.system.profile.systemid/main.c
 +++ b/dlls/windows.system.profile.systemid/main.c
-@@ -443,6 +443,642 @@
+@@ -443,6 +443,915 @@ HRESULT WINAPI DllGetClassObject( REFCLSID clsid, REFIID riid, void **out )
      return CLASS_E_CLASSNOTAVAILABLE;
  }
  
@@ -486,15 +284,288 @@ diff --git a/dlls/windows.system.profile.systemid/main.c b/dlls/windows.system.p
 +
 +static IActivationFactory *logging_options_factory = &logging_options_statics.IActivationFactory_iface;
 +
++/* Windows.Foundation.Diagnostics.LoggingOptions.
++ *
++ * The per-event options a title passes alongside a logged message: ETW
++ * keywords, tags, task and opcode, and the activity ids that correlate one
++ * event with another. All of it is bookkeeping for a trace session, so the
++ * object stores what it is given and hands it back.
++ *
++ * Storing it rather than ignoring it is not politeness. A title that sets a
++ * property and reads it back expects its own value; XSAPI does exactly that
++ * while building its channel, and a getter that answered zero would send it
++ * down a path meant for a runtime that does not support logging. */
++struct logging_options
++{
++    ILoggingOptions ILoggingOptions_iface;
++    LONG ref;
++    INT64 keywords;
++    INT32 tags;
++    INT16 task;
++    LoggingOpcode opcode;
++    GUID activity_id;
++    GUID related_activity_id;
++};
++
++static inline struct logging_options *impl_from_ILoggingOptions( ILoggingOptions *iface )
++{
++    return CONTAINING_RECORD( iface, struct logging_options, ILoggingOptions_iface );
++}
++
++static HRESULT WINAPI event_options_QueryInterface( ILoggingOptions *iface, REFIID iid, void **out )
++{
++    struct logging_options *impl = impl_from_ILoggingOptions( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_ILoggingOptions ))
++    {
++        *out = &impl->ILoggingOptions_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI event_options_AddRef( ILoggingOptions *iface )
++{
++    struct logging_options *impl = impl_from_ILoggingOptions( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI event_options_Release( ILoggingOptions *iface )
++{
++    struct logging_options *impl = impl_from_ILoggingOptions( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI event_options_GetIids( ILoggingOptions *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI event_options_GetRuntimeClassName( ILoggingOptions *iface, HSTRING *class_name )
++{
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++    return WindowsCreateString( RuntimeClass_Windows_Foundation_Diagnostics_LoggingOptions,
++                                ARRAY_SIZE(RuntimeClass_Windows_Foundation_Diagnostics_LoggingOptions) - 1,
++                                class_name );
++}
++
++static HRESULT WINAPI event_options_GetTrustLevel( ILoggingOptions *iface, TrustLevel *trust_level )
++{
++    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
++    return E_NOTIMPL;
++}
++
++#define LOGGING_OPTIONS_PROPERTY( name, type, field )                                   \
++    static HRESULT WINAPI event_options_get_##name( ILoggingOptions *iface, type *value )\
++    {                                                                                   \
++        struct logging_options *impl = impl_from_ILoggingOptions( iface );               \
++        TRACE( "iface %p, value %p.\n", iface, value );                                 \
++        if (!value) return E_POINTER;                                                    \
++        *value = impl->field;                                                            \
++        return S_OK;                                                                     \
++    }                                                                                    \
++    static HRESULT WINAPI event_options_put_##name( ILoggingOptions *iface, type value ) \
++    {                                                                                   \
++        struct logging_options *impl = impl_from_ILoggingOptions( iface );               \
++        TRACE( "iface %p.\n", iface );                                                  \
++        impl->field = value;                                                             \
++        return S_OK;                                                                     \
++    }
++
++LOGGING_OPTIONS_PROPERTY( Keywords, INT64, keywords )
++LOGGING_OPTIONS_PROPERTY( Tags, INT32, tags )
++LOGGING_OPTIONS_PROPERTY( Task, INT16, task )
++LOGGING_OPTIONS_PROPERTY( Opcode, LoggingOpcode, opcode )
++LOGGING_OPTIONS_PROPERTY( ActivityId, GUID, activity_id )
++LOGGING_OPTIONS_PROPERTY( RelatedActivityId, GUID, related_activity_id )
++
++#undef LOGGING_OPTIONS_PROPERTY
++
++static const struct ILoggingOptionsVtbl event_options_vtbl =
++{
++    event_options_QueryInterface,
++    event_options_AddRef,
++    event_options_Release,
++    /* IInspectable */
++    event_options_GetIids,
++    event_options_GetRuntimeClassName,
++    event_options_GetTrustLevel,
++    /* ILoggingOptions */
++    event_options_get_Keywords,
++    event_options_put_Keywords,
++    event_options_get_Tags,
++    event_options_put_Tags,
++    event_options_get_Task,
++    event_options_put_Task,
++    event_options_get_Opcode,
++    event_options_put_Opcode,
++    event_options_get_ActivityId,
++    event_options_put_ActivityId,
++    event_options_get_RelatedActivityId,
++    event_options_put_RelatedActivityId,
++};
++
++struct event_options_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    ILoggingOptionsFactory ILoggingOptionsFactory_iface;
++    LONG ref;
++};
++
++static inline struct event_options_statics *event_options_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct event_options_statics, IActivationFactory_iface );
++}
++
++static HRESULT event_options_create( INT64 keywords, ILoggingOptions **out )
++{
++    struct logging_options *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->ILoggingOptions_iface.lpVtbl = &event_options_vtbl;
++    impl->ref = 1;
++    impl->keywords = keywords;
++    *out = &impl->ILoggingOptions_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI event_options_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct event_options_statics *impl = event_options_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = &impl->IActivationFactory_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
++    if (IsEqualGUID( iid, &IID_ILoggingOptionsFactory ))
++    {
++        *out = &impl->ILoggingOptionsFactory_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI event_options_factory_AddRef( IActivationFactory *iface )
++{
++    struct event_options_statics *impl = event_options_from_IActivationFactory( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI event_options_factory_Release( IActivationFactory *iface )
++{
++    struct event_options_statics *impl = event_options_from_IActivationFactory( iface );
++    return InterlockedDecrement( &impl->ref );
++}
++
++static HRESULT WINAPI event_options_factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI event_options_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI event_options_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI event_options_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    ILoggingOptions *options;
++    HRESULT hr;
++
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++
++    if (!instance) return E_POINTER;
++    if (FAILED(hr = event_options_create( 0, &options ))) return hr;
++    *instance = (IInspectable *)options;
++    return S_OK;
++}
++
++static const struct IActivationFactoryVtbl event_options_activation_vtbl =
++{
++    event_options_factory_QueryInterface,
++    event_options_factory_AddRef,
++    event_options_factory_Release,
++    event_options_factory_GetIids,
++    event_options_factory_GetRuntimeClassName,
++    event_options_factory_GetTrustLevel,
++    event_options_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( event_options_creator, ILoggingOptionsFactory, struct event_options_statics,
++                     IActivationFactory_iface )
++
++static HRESULT WINAPI event_options_creator_CreateWithKeywords( ILoggingOptionsFactory *iface, INT64 keywords,
++                                                                ILoggingOptions **value )
++{
++    TRACE( "iface %p, keywords %#I64x, value %p.\n", iface, keywords, value );
++
++    if (!value) return E_POINTER;
++    return event_options_create( keywords, value );
++}
++
++static const struct ILoggingOptionsFactoryVtbl event_options_creator_vtbl =
++{
++    event_options_creator_QueryInterface,
++    event_options_creator_AddRef,
++    event_options_creator_Release,
++    /* IInspectable */
++    event_options_creator_GetIids,
++    event_options_creator_GetRuntimeClassName,
++    event_options_creator_GetTrustLevel,
++    /* ILoggingOptionsFactory */
++    event_options_creator_CreateWithKeywords,
++};
++
++static struct event_options_statics event_options_statics =
++{
++    {&event_options_activation_vtbl},
++    {&event_options_creator_vtbl},
++    1,
++};
++
++static IActivationFactory *event_options_factory = &event_options_statics.IActivationFactory_iface;
++
 +/* Windows.Foundation.Diagnostics.LoggingChannel.
 + *
-+ * Deliberately incomplete for one cycle. The factory identifier is known --
-+ * the title asks for it by IID -- but its argument list is not: a v1 factory
-+ * takes (name), a v2 takes (name, options), and the result pointer is the last
-+ * argument either way. Assuming the wrong one means writing an object pointer
-+ * through whatever register the caller did not set, which corrupts memory
-+ * rather than failing. So this logs what it was actually passed and refuses,
-+ * and the shape is read off a real call instead of guessed. */
++ * The channel a title's telemetry is written to. Nothing is written anywhere:
++ * the messages are ETW events for a Windows trace session that does not exist
++ * here, and the point of implementing the class is that the title gets an
++ * object back rather than a failure it does not check.
++ *
++ * The vtable order is the published one, not an inferred one. It matters more
++ * than usual here: the factory has two Create methods whose result pointer sits
++ * in a different argument, so a vtable one entry short does not fail, it writes
++ * an object pointer through whatever register the caller left holding a GUID. */
 +struct logging_channel
 +{
 +    ILoggingChannel ILoggingChannel_iface;
@@ -873,7 +944,7 @@ diff --git a/dlls/windows.system.profile.systemid/main.c b/dlls/windows.system.p
  HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **factory )
  {
      const WCHAR *name = WindowsGetStringRawBuffer( classid, NULL );
-@@ -455,6 +1091,10 @@
+@@ -455,6 +1364,12 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
          IActivationFactory_QueryInterface( system_id_factory, &IID_IActivationFactory, (void **)factory );
      else if (!wcscmp( name, RuntimeClass_Windows_Internal_System_Profile_RegionPolicyEvaluator ))
          IActivationFactory_QueryInterface( region_policy_factory, &IID_IActivationFactory, (void **)factory );
@@ -881,6 +952,278 @@ diff --git a/dlls/windows.system.profile.systemid/main.c b/dlls/windows.system.p
 +        IActivationFactory_QueryInterface( logging_options_factory, &IID_IActivationFactory, (void **)factory );
 +    else if (!wcscmp( name, RuntimeClass_Windows_Foundation_Diagnostics_LoggingChannel ))
 +        IActivationFactory_QueryInterface( logging_channel_factory, &IID_IActivationFactory, (void **)factory );
++    else if (!wcscmp( name, RuntimeClass_Windows_Foundation_Diagnostics_LoggingOptions ))
++        IActivationFactory_QueryInterface( event_options_factory, &IID_IActivationFactory, (void **)factory );
  
      if (*factory) return S_OK;
      return CLASS_E_CLASSNOTAVAILABLE;
+diff --git a/dlls/windows.system.profile.systemid/private.h b/dlls/windows.system.profile.systemid/private.h
+index 938e811..eaac301 100644
+--- a/dlls/windows.system.profile.systemid/private.h
++++ b/dlls/windows.system.profile.systemid/private.h
+@@ -33,8 +33,11 @@
+ #define WIDL_using_Windows_System_Profile
+ #define WIDL_using_Windows_Internal_System_Profile
+ #define WIDL_using_Windows_Storage_Streams
++#define WIDL_using_Windows_Foundation
++#define WIDL_using_Windows_Foundation_Diagnostics
+ #include "windows.system.profile.h"
+ #include "windows.internal.system.profile.h"
++#include "windows.foundation.diagnostics.h"
+ #include "windows.storage.streams.h"
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+diff --git a/include/Makefile.in b/include/Makefile.in
+index b6a5d11..323beae 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -889,6 +889,7 @@ SOURCES = \
+ 	windows.devices.radios.idl \
+ 	windows.devices.usb.idl \
+ 	windows.foundation.collections.idl \
++	windows.foundation.diagnostics.idl \
+ 	windows.foundation.idl \
+ 	windows.foundation.metadata.idl \
+ 	windows.foundation.numerics.idl \
+diff --git a/include/windows.foundation.diagnostics.idl b/include/windows.foundation.diagnostics.idl
+new file mode 100644
+index 0000000..16e9ecb
+--- /dev/null
++++ b/include/windows.foundation.diagnostics.idl
+@@ -0,0 +1,236 @@
++/*
++ * Windows.Foundation.Diagnostics runtime classes
++ *
++ * Copyright (C) 2026 the ferestre project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* Interface identifiers and method order are the published ones, checked against
++ * Microsoft's own Windows metadata as published in microsoft/windows-rs
++ * (crates/libs/windows/src/Windows/Foundation/Diagnostics). They are not
++ * guesses, and the difference is not cosmetic: an invented IID fails
++ * QueryInterface silently, and a method list one entry short sends the caller
++ * off the end of the vtable and into whatever follows it.
++ *
++ * Only the subset a title has actually been seen to use is declared here. */
++
++#ifdef __WIDL__
++#pragma winrt ns_prefix
++#endif
++
++import "inspectable.idl";
++import "asyncinfo.idl";
++import "eventtoken.idl";
++import "windowscontracts.idl";
++import "windows.foundation.idl";
++
++namespace Windows.Foundation.Diagnostics {
++    typedef enum LoggingLevel LoggingLevel;
++    typedef enum LoggingOpcode LoggingOpcode;
++
++    interface ILoggingChannel;
++    interface ILoggingChannel2;
++    interface ILoggingChannelFactory;
++    interface ILoggingChannelFactory2;
++    interface ILoggingChannelOptions;
++    interface ILoggingChannelOptionsFactory;
++    interface ILoggingOptions;
++    interface ILoggingOptionsFactory;
++
++    runtimeclass LoggingChannel;
++    runtimeclass LoggingChannelOptions;
++    runtimeclass LoggingOptions;
++
++    declare {
++        interface Windows.Foundation.TypedEventHandler<Windows.Foundation.Diagnostics.ILoggingChannel *, IInspectable *>;
++    }
++
++    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
++    enum LoggingLevel
++    {
++        Verbose     = 0,
++        Information = 1,
++        Warning     = 2,
++        Error       = 3,
++        Critical    = 4,
++    };
++
++    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
++    enum LoggingOpcode
++    {
++        Info    = 0,
++        Start   = 1,
++        Stop    = 2,
++        Reply   = 6,
++        Resume  = 7,
++        Suspend = 8,
++        Send    = 9,
++    };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        uuid(e9a50343-11d7-4f01-b5ca-cf495278c0a8)
++    ]
++    interface ILoggingChannel : IInspectable
++        requires Windows.Foundation.IClosable
++    {
++        [propget] HRESULT Name([out, retval] HSTRING *value);
++        [propget] HRESULT Enabled([out, retval] boolean *value);
++        [propget] HRESULT Level([out, retval] Windows.Foundation.Diagnostics.LoggingLevel *value);
++        HRESULT LogMessage([in] HSTRING eventString);
++        HRESULT LogMessageWithLevel([in] HSTRING eventString,
++                                    [in] Windows.Foundation.Diagnostics.LoggingLevel level);
++        HRESULT LogValuePair([in] HSTRING value1, [in] INT32 value2);
++        HRESULT LogValuePairWithLevel([in] HSTRING value1, [in] INT32 value2,
++                                      [in] Windows.Foundation.Diagnostics.LoggingLevel level);
++        [eventadd] HRESULT LoggingEnabled(
++            [in] Windows.Foundation.TypedEventHandler<Windows.Foundation.Diagnostics.ILoggingChannel *, IInspectable *> *handler,
++            [out, retval] EventRegistrationToken *token);
++        [eventremove] HRESULT LoggingEnabled([in] EventRegistrationToken token);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Foundation.Diagnostics.LoggingChannel),
++        uuid(9f4c3cf3-0bac-45a5-9e33-baf3f3a246a5)
++    ]
++    interface ILoggingChannel2 : IInspectable
++        requires Windows.Foundation.Diagnostics.ILoggingChannel, Windows.Foundation.IClosable
++    {
++        [propget] HRESULT Id([out, retval] GUID *value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Foundation.Diagnostics.LoggingChannel),
++        uuid(4edc5b9c-af80-4a9b-b0dc-398f9ae5207b)
++    ]
++    interface ILoggingChannelFactory : IInspectable
++    {
++        HRESULT Create([in] HSTRING name,
++                       [out, retval] Windows.Foundation.Diagnostics.LoggingChannel **result);
++    }
++
++    /* The one a title was seen to ask for, and the reason a single-method
++     * vtable sent it jumping to address zero: it calls the *second* method. */
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Foundation.Diagnostics.LoggingChannel),
++        uuid(4c6ef5dd-3b27-4dc9-99f0-299c6e4603a1)
++    ]
++    interface ILoggingChannelFactory2 : IInspectable
++    {
++        HRESULT CreateWithOptions([in] HSTRING name,
++                                  [in] Windows.Foundation.Diagnostics.LoggingChannelOptions *options,
++                                  [out, retval] Windows.Foundation.Diagnostics.LoggingChannel **result);
++        HRESULT CreateWithOptionsAndId([in] HSTRING name,
++                                       [in] Windows.Foundation.Diagnostics.LoggingChannelOptions *options,
++                                       [in] GUID id,
++                                       [out, retval] Windows.Foundation.Diagnostics.LoggingChannel **result);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Foundation.Diagnostics.LoggingChannelOptions),
++        uuid(c3e847ff-0ebb-4a53-8c54-dec24926cb2c)
++    ]
++    interface ILoggingChannelOptions : IInspectable
++    {
++        [propget] HRESULT Group([out, retval] GUID *value);
++        [propput] HRESULT Group([in] GUID value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Foundation.Diagnostics.LoggingChannelOptions),
++        uuid(a93151da-7faf-4191-8755-5e86dc65d896)
++    ]
++    interface ILoggingChannelOptionsFactory : IInspectable
++    {
++        HRESULT Create([in] GUID group,
++                       [out, retval] Windows.Foundation.Diagnostics.LoggingChannelOptions **result);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Foundation.Diagnostics.LoggingOptions),
++        uuid(90bc7850-0192-4f5d-ac26-006adaca12d8)
++    ]
++    interface ILoggingOptions : IInspectable
++    {
++        [propget] HRESULT Keywords([out, retval] INT64 *value);
++        [propput] HRESULT Keywords([in] INT64 value);
++        [propget] HRESULT Tags([out, retval] INT32 *value);
++        [propput] HRESULT Tags([in] INT32 value);
++        [propget] HRESULT Task([out, retval] INT16 *value);
++        [propput] HRESULT Task([in] INT16 value);
++        [propget] HRESULT Opcode([out, retval] Windows.Foundation.Diagnostics.LoggingOpcode *value);
++        [propput] HRESULT Opcode([in] Windows.Foundation.Diagnostics.LoggingOpcode value);
++        [propget] HRESULT ActivityId([out, retval] GUID *value);
++        [propput] HRESULT ActivityId([in] GUID value);
++        [propget] HRESULT RelatedActivityId([out, retval] GUID *value);
++        [propput] HRESULT RelatedActivityId([in] GUID value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Foundation.Diagnostics.LoggingOptions),
++        uuid(d713c6cb-98ab-464b-9f22-a3268478368a)
++    ]
++    interface ILoggingOptionsFactory : IInspectable
++    {
++        HRESULT CreateWithKeywords([in] INT64 keywords,
++                                   [out, retval] Windows.Foundation.Diagnostics.LoggingOptions **result);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        activatable(Windows.Foundation.Diagnostics.ILoggingChannelFactory, Windows.Foundation.UniversalApiContract, 1.0),
++        activatable(Windows.Foundation.Diagnostics.ILoggingChannelFactory2, Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass LoggingChannel
++    {
++        [default] interface Windows.Foundation.Diagnostics.ILoggingChannel;
++        interface Windows.Foundation.IClosable;
++        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Foundation.Diagnostics.ILoggingChannel2;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        activatable(Windows.Foundation.Diagnostics.ILoggingChannelOptionsFactory, Windows.Foundation.UniversalApiContract, 1.0),
++        activatable(Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass LoggingChannelOptions
++    {
++        [default] interface Windows.Foundation.Diagnostics.ILoggingChannelOptions;
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        activatable(Windows.Foundation.Diagnostics.ILoggingOptionsFactory, Windows.Foundation.UniversalApiContract, 1.0),
++        activatable(Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass LoggingOptions
++    {
++        [default] interface Windows.Foundation.Diagnostics.ILoggingOptions;
++    }
++}
