@@ -1,0 +1,76 @@
+From cac038ad3e8b8012ede3905a9a17d10cd39d70c9 Mon Sep 17 00:00:00 2001
+From: Ice <icex@users.noreply.github.com>
+Date: Sun, 6 Sep 2026 12:07:37 +0300
+Subject: [PATCH] run: hand the mapped image to Proton as a Win32 path, not an
+ NT one
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two spellings of one path, and they are not interchangeable.
+
+`WINE_DLL_FILE_MAP` is keyed by the NT path, because that is the name the
+loader has in hand when it decides whether an image comes from a descriptor.
+The command line is a different question: Proton passes it to steam.exe, which
+calls CreateProcessW with a null application name, so the string is parsed as a
+Win32 path. An NT path there is read as *relative* --
+`\??\Z:\home\...\Game.exe` becomes `Z:\??\Z:\home\...\Game.exe` -- which
+resolves to nothing.
+
+What that looks like from outside is the worst kind of error message:
+
+    err:steam:run_process Failed to create process
+      L"\??\Z:\home\...\Minecraft.Windows.exe": 2
+
+File not found, for a file that is plainly there, with the descriptor open and
+the map correct. The trace is the only place it is visible: `find_exe_file`
+searching `C:\windows\system32;.;…` for the whole NT path, then
+`RtlGetFullPathName_U` prefixing the current drive onto it.
+
+So the map keeps the NT form and the argument becomes the Win32 one.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ crates/xodus-cli/src/commands/run.rs | 20 ++++++++++++++++----
+ 1 file changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/crates/xodus-cli/src/commands/run.rs b/crates/xodus-cli/src/commands/run.rs
+index bc62549..5a052e7 100644
+--- a/crates/xodus-cli/src/commands/run.rs
++++ b/crates/xodus-cli/src/commands/run.rs
+@@ -220,16 +220,28 @@ pub async fn run(
+         }
+ 
+         let nt_suffix = fd.0.trim_start_matches('\\');
+-        let nt_path = format!("\\??\\Z:{}\\{}", nt_prefix, nt_suffix);
++        // Two spellings of one path, and they are not interchangeable.
++        //
++        // The map is keyed by the NT path, because that is the name the loader
++        // has in hand when it decides whether an image comes from a descriptor.
++        //
++        // What gets passed as the command line has to be the ordinary Win32
++        // path. Proton hands it to steam.exe, which calls CreateProcessW with a
++        // null application name -- so the string is parsed as a Win32 path, and
++        // an NT one is treated as relative: `\??\Z:\...` becomes
++        // `Z:\??\Z:\...`, which resolves to nothing and surfaces as
++        // "Failed to create process ...: 2" with the file plainly on disk.
++        let win32_path = format!("Z:{}\\{}", nt_prefix, nt_suffix);
++        let nt_path = format!("\\??\\{win32_path}");
+         if let Some(exe) = &exe {
+             if exe == fd.0 {
+-                nt_entry = Some(nt_path)
++                nt_entry = Some(win32_path)
+             }
+         } else if nt_entry.is_none() {
+-            nt_entry = Some(nt_path)
++            nt_entry = Some(win32_path)
+         }
+ 
+-        env_value.push_str(&format!("{}:\\??\\Z:{}\\{}", fd.1, nt_prefix, nt_suffix))
++        env_value.push_str(&format!("{}:{}", fd.1, nt_path))
+     }
+ 
+     let Some(nt_entry) = nt_entry else {
+-- 
+2.55.0
+
