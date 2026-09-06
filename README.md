@@ -39,9 +39,20 @@ Honest version, because this is early:
 | **Forza Horizon 5** (Store) | Downloads, does not run: blocked by protection inside the title, not by anything here |
 
 There is a launcher: a CLI (`ferestre`) and a GTK4 window (`ferestre-gui`) that
-signs in, lists what your account owns with real names and cover art, installs,
-detects updates, and launches. See [docs/ROADMAP.md](docs/ROADMAP.md) for what is
-still missing and [docs/RECIPES.md](docs/RECIPES.md) for doing any of it by hand.
+signs in, lists what your account owns with real names, cover art and download
+sizes, lists what a Game Pass subscription includes, installs with a progress
+bar and a time remaining, detects updates, and launches. See
+[docs/ROADMAP.md](docs/ROADMAP.md) for what is still missing and
+[docs/RECIPES.md](docs/RECIPES.md) for doing any of it by hand.
+
+Two things the window is careful about, because both are easy to get wrong in a
+way that looks like it works. Titles whose package this runtime cannot open --
+Appx and Msix, which is most of a typical Store library -- are held back behind
+a switch that says how many there are, rather than mixed in among the ones that
+run. And a title being in the Game Pass catalogue is not the same as your
+account being entitled to it: the window says what the catalogue includes and
+which subscriptions the account holds, and lets the licence request at install
+time be the thing that decides.
 
 ## How it fits together
 

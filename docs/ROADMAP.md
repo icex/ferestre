@@ -236,6 +236,34 @@ honestly marked as unproven rather than planned.
       clicked. Installing now asks first, with the size, the free space, and an
       editable destination.
 
+- [x] **What a subscription makes installable.** A library that lists only what
+      was bought outright misses most of what can actually be installed.
+      `catalog.gamepass.com` answers anonymously, so the PC Game Pass catalogue
+      -- 524 titles in this market -- is its own section, with the sizes and the
+      same "this runtime cannot open that container" filter the library uses.
+
+      What it deliberately does not do is claim entitlement. Tier names have
+      been renamed and re-sliced, catalogues differ by market, and entitlement
+      lists carry revoked subscriptions beside live ones. The section states
+      what the catalogue includes and which subscriptions the account holds; the
+      licence request at install time decides, and already says why when it
+      refuses.
+
+- [x] **A download size for every title.** Thirteen of 101 owned products had
+      none, for three unrelated reasons: Windows 8 store apps (a PC platform the
+      parser did not count), console-only titles (no PC download exists, which
+      is an answer rather than a gap), and bundles (no packages of their own,
+      only children). All three now resolve, and the count of products with no
+      size and no reason is zero.
+
+- [x] **Progress and a time remaining.** The client draws a terminal bar that
+      hides itself when stderr is not a terminal, so a window had nothing to
+      read. Patch 0006 adds machine-readable progress behind
+      `XODUS_PROGRESS=json`; rate and estimate are smoothed over twenty seconds
+      here, because an unsmoothed one flips between four seconds and nine
+      minutes several times a second. A stalled download says so instead of
+      estimating.
+
 - [x] **Differential updates — answered.** The roadmap said not to promise this
       until two builds of one large title had settled it. That experiment turned
       out to be unnecessary: Microsoft publishes the patch plans themselves, and
