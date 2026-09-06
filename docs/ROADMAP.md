@@ -397,6 +397,10 @@ The claim invites scepticism, so the evidence should be hard to wave away:
 - A compatibility matrix that says exactly where each title stops.
 - A demo produced by `tools/auto-join.py`, which launches the game, drives the
   menus and screenshots the result without anyone touching the keyboard.
+  `tools/drive-aoe.py` is the same idea for Age of Empires, and exists because
+  that title's failure was on the way *into* a match: the main menu drew
+  correctly for weeks while starting a game faulted, so a launch-and-look check
+  would have called it playable and been wrong.
 - The write-ups in `notes/`. The best of them: a stubbed callback made
   libHttpClient believe the machine had no network, so it refused every
   WebSocket connect — while plain HTTP kept working, which hid it — and its
