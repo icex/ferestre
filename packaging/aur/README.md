@@ -191,17 +191,29 @@ detected and not included". Those are the documented gaps, not oversights.
 
 ## The client fork, pinned
 
+**This package cannot build today.** Its patch sources are raw URLs into this
+repository, and this repository is private, so `makepkg` gets a 404 for every
+one of them. That is a visibility setting, not a packaging problem, and nothing
+else in `packaging/` depends on it.
+
 `xgdk-client` does not track upstream. It pins upstream commit `3e75c9f` and
-applies two of the three patches in `patches/xodus-cli/`. That is not
-arbitrary — it was verified by applying them:
+applies four of the five patches in `patches/xodus-cli/`. That is not
+arbitrary — it was verified by applying them, in order, into a clean worktree
+at that commit, and type-checking the result:
 
 - upstream `3e75c9f` + `0002` reproduces the fork's working tree **byte for
   byte, except `Cargo.lock`** (and the patch's lock is the better of the two: it
   carries the `p256`/`rand_core`/`base64` entries the fork's committed lock is
   missing, so `cargo build --locked` works after patching).
-- `0003` applies cleanly on top of that.
+- `0003`, `0004` and `0005` apply cleanly on top of that, in that order.
 - `0001` is an earlier export of work `0002` already contains. Applying both
   fails. It is not in the source array.
+
+`0004` had the same disease as `0001` and was re-exported to cure it: it was cut
+from a commit that had swept in the then-uncommitted collections work, so it
+carried `0003`'s changes and could not apply after it. Exporting a patch from a
+dirty tree is how this series keeps acquiring overlaps, and applying it into a
+clean worktree is the only check that catches them.
 
 Two consequences worth stating plainly. First, `patches/xodus-cli/` is not a
 clean series against one base — `0001` applies to today's upstream `main`,
