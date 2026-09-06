@@ -135,6 +135,26 @@ def wait_for(root, predicate, what, deadline):
     raise Failure(f"timed out waiting for {what}")
 
 
+# at-spi2 does not spell every role the same way across versions: a GtkButton
+# comes back as "button" on one machine and "push button" on another, and a test
+# that hard-codes either finds nothing on the other. It found nothing on CI for
+# five commits, which is exactly as useful as having no test.
+ROLE_ALIASES = {
+    "button": ("button", "push button"),
+    "push button": ("button", "push button"),
+    # The other two pairs this test depends on. Widening is safe because every
+    # lookup that uses them also matches on an exact name.
+    "text": ("text", "entry"),
+    "entry": ("text", "entry"),
+    "dialog": ("dialog", "alert"),
+    "alert": ("dialog", "alert"),
+}
+
+
+def role_matches(node_role, wanted):
+    return node_role in ROLE_ALIASES.get(wanted, (wanted,))
+
+
 def find_all(root, role=None, name=None, name_contains=None):
     """Matching nodes, each once.
 
@@ -149,7 +169,7 @@ def find_all(root, role=None, name=None, name_contains=None):
             if node.path in seen:
                 continue
             seen.add(node.path)
-            if role and node.get_role_name() != role:
+            if role and not role_matches(node.get_role_name(), role):
                 continue
             node_name = node.get_name() or ""
         except GLib.GError:

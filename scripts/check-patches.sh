@@ -26,6 +26,11 @@ CLIENT_REPO=${CLIENT_REPO:-${XODUS_SRC_DIR:-$HOME/src}/xodus-cli}
 # The upstream commit the client series is written against. Documented in
 # packaging/aur/ferestre-client/PKGBUILD, and pinned here so the two agree.
 CLIENT_BASE=${CLIENT_BASE:-3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60}
+# Same for the xgameruntime series, and for the same reason. Locally that
+# repository is the build tree and its HEAD is the base; on a fresh clone it is
+# whatever upstream has moved on to, which is how this check went red for five
+# commits while every patch applied perfectly to the tree it was written for.
+XGR_BASE=${XGR_BASE:-64aebcabb8c66121eae25d3bf0ace4b582ebb0da}
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -105,8 +110,14 @@ fi
 # and is not one.
 XGR_REPO=$WINE_REPO/dlls/xgameruntime
 if [ -e "$XGR_REPO/.git" ]; then
-    say "xgameruntime series against $(git -C "$XGR_REPO" rev-parse --short HEAD)"
-    git -C "$XGR_REPO" worktree add -q --detach "$WORK/xgr" HEAD
+    if ! git -C "$XGR_REPO" cat-file -e "$XGR_BASE^{commit}" 2>/dev/null; then
+        bad "the pinned base $XGR_BASE is not in $XGR_REPO (fetch it first)"
+        XGR_BASE=""
+    fi
+fi
+if [ -n "${XGR_BASE:-}" ] && [ -e "$XGR_REPO/.git" ]; then
+    say "xgameruntime series against ${XGR_BASE:0:8}"
+    git -C "$XGR_REPO" worktree add -q --detach "$WORK/xgr" "$XGR_BASE"
     for p in "$REPO_DIR"/patches/xgameruntime/*.patch; do
         name=$(basename "$p")
         if git -C "$WORK/xgr" apply --check "$p" 2>/dev/null; then
@@ -116,7 +127,9 @@ if [ -e "$XGR_REPO/.git" ]; then
             bad "$name does not apply"
         fi
     done
-    if [ -z "$(git -C "$XGR_REPO" status --porcelain 2>/dev/null | head -1)" ]; then
+    if [ "$(git -C "$XGR_REPO" rev-parse HEAD)" != "$XGR_BASE" ]; then
+        say "   (checked out elsewhere, so nothing to reproduce -- applied-only check)"
+    elif [ -z "$(git -C "$XGR_REPO" status --porcelain 2>/dev/null | head -1)" ]; then
         say "   (pristine checkout, so nothing to reproduce -- applied-only check)"
     elif diff -rq --exclude=.git "$WORK/xgr" "$XGR_REPO" >/dev/null 2>&1; then
         ok "the series reproduces the build tree exactly"
