@@ -1,5 +1,5 @@
 From 755dd6377d7d68448abae048d48ba5d6401bb080 Mon Sep 17 00:00:00 2001
-From: xgdk <noreply@anthropic.com>
+From: ferestre <noreply@anthropic.com>
 Date: Sun, 6 Sep 2026 12:11:30 +0300
 Subject: [PATCH] account: who is signed in, and a --header escape hatch for
  the probe

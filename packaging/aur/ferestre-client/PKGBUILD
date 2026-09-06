@@ -1,0 +1,157 @@
+# Maintainer: the ferestre contributors <https://github.com/icex/ferestre>
+
+# The client: Microsoft sign-in, licences, content keys, MSIXVC download and
+# decrypt -- and the only thing that can start a GDK title, because the title's
+# executable is encrypted on disk and exists decrypted only inside a memfd that
+# `xodus-cli run` hands to Wine.
+#
+# This is upstream Xodus (GPL-3.0) plus the patches in patches/xodus-cli/ of the
+# ferestre repository. It is a third package rather than part of the
+# launcher for three reasons, in order of weight:
+#
+#   1. Licence. Xodus is GPL-3.0 and the launcher is MIT. The launcher shells
+#      out to this binary instead of linking its crates, and that separation is
+#      easier to keep honest when the GPL-3.0 code is its own package with its
+#      own licence field and its own source.
+#   2. Build cost. This links webkit2gtk (the sign-in window). The launcher does
+#      not. Nobody should rebuild webkit-linked code to pick up a launcher fix.
+#   3. Provenance. It is someone else's project, carried as a fork. It moves on
+#      its own schedule, not the launcher's.
+#
+# See ../README.md for the split, and for what has to change when the fork stops
+# being a directory of patches.
+
+pkgname=ferestre-client
+pkgver=0.1.0.r130.g3e75c9f
+pkgrel=1
+pkgdesc='Xodus client for Microsoft Store titles, with the ferestre patches (sign-in, licences, MSIXVC download and decrypt)'
+arch=('x86_64')
+url='https://github.com/xodus-gaming/xodus'
+license=('GPL-3.0-only')
+
+# From the NEEDED entries of the built xodus-cli and xodus-service. webkit2gtk
+# and gtk3 come from wry/tao, which draw the Microsoft sign-in window; the
+# service itself needs only dbus and openssl.
+depends=(
+  'glibc' 'gcc-libs'
+  'webkit2gtk-4.1'          # also supplies libjavascriptcoregtk-4.1
+  'gtk3' 'gdk-pixbuf2' 'cairo' 'glib2'
+  'libsoup3'
+  'dbus'
+  'openssl'
+)
+makedepends=(
+  'cargo'
+  'git'
+  'protobuf'    # prost-build shells out to protoc for crates/xodus/proto/
+)
+optdepends=(
+  'gnome-keyring: Secret Service provider for the account tokens'
+  'kwallet: Secret Service provider for the account tokens (KDE)'
+  'ferestre-git: the front end that drives this client'
+)
+
+# There is no other xodus-cli in the repositories today. Declaring these keeps
+# the day an official one appears from being a surprise, and makes it obvious
+# that this installs upstream's binary names.
+provides=('xodus-cli' 'xodus-service')
+conflicts=('xodus-cli' 'xodus-cli-git')
+
+# THE FORK, PINNED.
+#
+# Verified by applying them here rather than assumed:
+#
+#   * upstream 3e75c9f + patch 0002 reproduces the fork's working tree exactly,
+#     byte for byte, except Cargo.lock -- and the patch's Cargo.lock is the more
+#     correct of the two, because it carries the p256/rand_core/base64 entries
+#     the fork's committed lock is missing.
+#   * patches 0003, 0004 and 0005 apply cleanly on top of that, in order.
+#   * patch 0001 is an earlier export of work that 0002 already contains.
+#     Applying it as well fails. It is deliberately not in the list below.
+#
+# So the base is pinned, not tracked: upstream main has moved past 3e75c9f and
+# 0002 does not apply to it. Bumping this pin means re-basing the patches, which
+# is exactly the maintenance the roadmap's "how is the client carried" question
+# is about. When that is settled and the fork lives in a repository of its own,
+# this becomes one git source and prepare() goes away.
+_commit=3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
+# _patchrev pins a commit of THIS repository, so a history rewrite invalidates
+# it: every URL below 404s permanently the moment the SHAs change. It has
+# happened once already. If the history is ever rewritten again, repin here and
+# in .SRCINFO, and regenerate the sha256sums -- the patch files themselves may
+# have changed too.
+_patchrev=88a037895996ab7db68f45cc1ca1a2a94119d79a
+_patchurl="https://raw.githubusercontent.com/icex/ferestre/$_patchrev/patches/xodus-cli"
+
+source=(
+  "xodus::git+https://github.com/xodus-gaming/xodus.git#commit=$_commit"
+  "$_patchurl/0002-relying-party-device-claim-and-no-panic.patch"
+  "$_patchurl/0003-owned-title-enumeration.patch"
+  "$_patchurl/0004-account-and-probe-headers.patch"
+  "$_patchurl/0005-win32-path-for-the-mapped-main-image.patch"
+)
+sha256sums=(
+  'SKIP'
+  '20d613add707a69f488b50041e53c60f8a0096132c05338b66d594fa8963c918'
+  'c15806efefdfe7613755ada8ee0fe28784ad955ea7df26825ddeabc7be731256'
+  '531c461dc6a5dcc1ba47aa039ab998ae03a1762682a4d3abe65cb56dd4a99262'
+  'b5c9feec3aa4dba5f287609d5ae3727e5fb38aa4cf967997bfb5901d2b3a3d47'
+)
+
+prepare() {
+  cd "$srcdir/xodus"
+
+  # In order, and the order is load-bearing: 0004 was cut from a tree that
+  # already had 0003, and 0005 changes a line 0002 does not touch. Verified by
+  # applying all four onto 3e75c9f in a clean worktree and type-checking.
+  git apply -v \
+    "$srcdir/0002-relying-party-device-claim-and-no-panic.patch" \
+    "$srcdir/0003-owned-title-enumeration.patch" \
+    "$srcdir/0004-account-and-probe-headers.patch" \
+    "$srcdir/0005-win32-path-for-the-mapped-main-image.patch"
+
+  # Fetch after patching: the patches change Cargo.toml and Cargo.lock, and the
+  # build below is offline.
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$srcdir/xodus"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+
+  # Upstream sets -Ctarget-feature=+aes,+ssse3 in .cargo/config.toml for the
+  # MSIXVC decrypt path, and an exported RUSTFLAGS -- which makepkg sets --
+  # silently overrides that file. Put it back, or every download decrypts on
+  # the software AES fallback. The cost is upstream's own: a CPU older than
+  # about 2011 has no AES-NI and the binary dies with an illegal instruction.
+  export RUSTFLAGS="${RUSTFLAGS:-} -Ctarget-feature=+aes,+ssse3"
+
+  cargo build --frozen --release --workspace
+}
+
+# No check(). Not a judgement about the tests -- they were not run while writing
+# this, so the package does not claim they pass. `cargo test --frozen
+# --workspace` belongs here once someone has confirmed the suite needs neither
+# network nor a Secret Service, which a build chroot has neither of.
+
+package() {
+  cd "$srcdir/xodus"
+
+  install -Dm755 target/release/xodus-cli     "$pkgdir/usr/bin/xodus-cli"
+  install -Dm755 target/release/xodus-service "$pkgdir/usr/bin/xodus-service"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  # The corresponding source for a GPL-3.0 binary is upstream plus these; ship
+  # them so the package carries its own provenance.
+  install -Dm644 "$srcdir/0002-relying-party-device-claim-and-no-panic.patch" \
+    "$pkgdir/usr/share/licenses/$pkgname/patches/0002-relying-party-device-claim-and-no-panic.patch"
+  install -Dm644 "$srcdir/0003-owned-title-enumeration.patch" \
+    "$pkgdir/usr/share/licenses/$pkgname/patches/0003-owned-title-enumeration.patch"
+  install -Dm644 "$srcdir/0004-account-and-probe-headers.patch" \
+    "$pkgdir/usr/share/licenses/$pkgname/patches/0004-account-and-probe-headers.patch"
+  install -Dm644 "$srcdir/0005-win32-path-for-the-mapped-main-image.patch" \
+    "$pkgdir/usr/share/licenses/$pkgname/patches/0005-win32-path-for-the-mapped-main-image.patch"
+}

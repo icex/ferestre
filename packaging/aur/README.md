@@ -8,11 +8,11 @@ by a compatibility tool showing up in `compatibilitytools.d`.
 
 | package | what it is | size | changes when |
 |---|---|---|---|
-| [`xgdk-runtime-bin`](xgdk-runtime-bin/) | the patched Proton, prebuilt, into `/usr/share/steam/compatibilitytools.d/xgdk` | ~264 MiB download, ~1.4 GB installed | Wine or `xgameruntime.dll` changes |
-| [`xgdk-client`](xgdk-client/) | the Xodus client with our patches: `xodus-cli`, `xodus-service` | ~15 MB | the fork rebases |
-| [`xgdk-launcher-git`](xgdk-launcher-git/) | the front end: `xgdk`, the launch scripts, the docs | ~400 KB | constantly |
+| [`ferestre-runtime-bin`](ferestre-runtime-bin/) | the patched Proton, prebuilt, into `/usr/share/steam/compatibilitytools.d/ferestre` | ~264 MiB download, ~1.4 GB installed | Wine or `xgameruntime.dll` changes |
+| [`ferestre-client`](ferestre-client/) | the Xodus client with our patches: `xodus-cli`, `xodus-service` | ~15 MB | the fork rebases |
+| [`ferestre-git`](ferestre-git/) | the front end: `ferestre`, the launch scripts, the docs | ~400 KB | constantly |
 
-`xgdk-launcher-git` depends on the other two, so `paru -S xgdk-launcher-git`
+`ferestre-git` depends on the other two, so `paru -S ferestre-git`
 installs the lot. The other two are independently useful: the runtime is a
 working Proton build on its own, and the client downloads titles without any of
 the rest.
@@ -42,24 +42,24 @@ weight:
    [cannot be upstreamed](../../NOTICE). It moves on its own schedule.
 
 The counter-argument is real: three packages is more to keep in step, and the
-client is useless on its own. That is why `xgdk-launcher-git` hard-depends on
+client is useless on its own. That is why `ferestre-git` hard-depends on
 both, so nobody has to know the structure to install it.
 
 ## Where things go
 
 ```
-/usr/bin/xgdk                                   front end (placeholder today)
+/usr/bin/ferestre                                   front end (placeholder today)
 /usr/bin/xodus-cli, /usr/bin/xodus-service      client
-/usr/lib/xgdk/scripts/                          the launch path
-/usr/lib/xgdk/patches/                          read by `xgdk install-runtime`
-/usr/lib/xgdk/VERSION
-/usr/share/steam/compatibilitytools.d/xgdk/     the runtime
-/usr/share/doc/xgdk/                            README, NOTICE, RECIPES, ROADMAP
+/usr/lib/ferestre/scripts/                          the launch path
+/usr/lib/ferestre/patches/                          read by `ferestre install-runtime`
+/usr/lib/ferestre/VERSION
+/usr/share/steam/compatibilitytools.d/ferestre/     the runtime
+/usr/share/doc/ferestre/                            README, NOTICE, RECIPES, ROADMAP
 ```
 
-The layout under `/usr/lib/xgdk` is the AppImage's AppDir layout, deliberately:
-`packaging/appimage/xgdk-placeholder.sh` finds its scripts through
-`$0/../lib/xgdk/scripts`, so the same command behaves identically whether it
+The layout under `/usr/lib/ferestre` is the AppImage's AppDir layout, deliberately:
+`packaging/appimage/ferestre-placeholder.sh` finds its scripts through
+`$0/../lib/ferestre/scripts`, so the same command behaves identically whether it
 came from an AppImage or from pacman. **When `build-appimage.sh` starts staging
 another directory, stage it here too** — `titles/` is the obvious next one.
 
@@ -70,10 +70,10 @@ another directory, stage it here too** — `titles/` is the obvious next one.
 auto-detected, and both `.install` files say:
 
 ```sh
-export XODUS_PROTON_DIR=/usr/share/steam/compatibilitytools.d/xgdk
+export XODUS_PROTON_DIR=/usr/share/steam/compatibilitytools.d/ferestre
 ```
 
-Adding `/usr/share/steam/compatibilitytools.d/xgdk` to the `_first_existing`
+Adding `/usr/share/steam/compatibilitytools.d/ferestre` to the `_first_existing`
 probe list in `xodus-env.sh` would delete that manual step for every packaging
 format at once. That file belongs to `scripts/`, so it is a request, not a
 change made here.
@@ -85,7 +85,7 @@ Not copied from another Proton package. For the runtime, every ELF file under
 itself were subtracted, and the remainder resolved to packages:
 
 ```sh
-D=/usr/share/steam/compatibilitytools.d/xgdk
+D=/usr/share/steam/compatibilitytools.d/ferestre
 find "$D/files" -type f \( -name '*.so*' -o -perm -u+x \) |
   while read -r f; do
     case $(file -b "$f") in *"ELF 64-bit"*)
@@ -135,24 +135,24 @@ moment to decide whether to ship the 32-bit tree at all.
 
 ## Cutting a runtime release
 
-`xgdk-runtime-bin` is the only package with an artefact to publish, and its
+`ferestre-runtime-bin` is the only package with an artefact to publish, and its
 PKGBUILD assumes a shape. The contract:
 
 - **Tag** `runtime-<pkgver>`, where `pkgver` is `<proton major>.<minor>.<date>`
   — `11.0.20260803`. Upstream's own version string
   (`xodus-bleeding-edge-11.0-20260803-3-g7c0b4354`, in the tool's `version`
   file) cannot be a `pkgver`: hyphens are not allowed.
-- **Asset** `xgdk-runtime-<pkgver>-x86_64.tar.zst`, containing exactly one
-  top-level directory named `xgdk-runtime-<pkgver>`, which *is* the
+- **Asset** `ferestre-runtime-<pkgver>-x86_64.tar.zst`, containing exactly one
+  top-level directory named `ferestre-runtime-<pkgver>`, which *is* the
   compatibility tool: `proton`, `toolmanifest.vdf`, `compatibilitytool.vdf`,
   `version`, `files/`.
-- The `compatibilitytool.vdf` in the asset should name the tool `xgdk`, not
+- The `compatibilitytool.vdf` in the asset should name the tool `ferestre`, not
   `xodus-proton`. The PKGBUILD does not rewrite it.
 - `package()` refuses to build if `proton` lacks the `close_fds=False` patch or
   if `xgameruntime.dll` is missing. Both have been shipped broken before by
   hand; both look like the title crashing rather than like a packaging mistake.
 
-Then, in `xgdk-runtime-bin/`:
+Then, in `ferestre-runtime-bin/`:
 
 ```sh
 updpkgsums                        # replaces the sha256sums SKIP placeholder
@@ -167,13 +167,13 @@ message rather than a clear one.
 
 Each directory here becomes its own AUR git repository — the AUR has no concept
 of a monorepo, and a `PKGBUILD` cannot reference a file outside its own
-directory. That is why `xgdk-client` fetches its patches by URL from a pinned
+directory. That is why `ferestre-client` fetches its patches by URL from a pinned
 commit of this repository rather than reaching up the tree.
 
 ```sh
-git clone ssh://aur@aur.archlinux.org/xgdk-runtime-bin.git
-cp packaging/aur/xgdk-runtime-bin/{PKGBUILD,.SRCINFO,*.install} xgdk-runtime-bin/
-cd xgdk-runtime-bin && git add -A && git commit && git push
+git clone ssh://aur@aur.archlinux.org/ferestre-runtime-bin.git
+cp packaging/aur/ferestre-runtime-bin/{PKGBUILD,.SRCINFO,*.install} ferestre-runtime-bin/
+cd ferestre-runtime-bin && git add -A && git commit && git push
 ```
 
 Keep this directory the source of truth and copy outward, or the two drift.
@@ -196,7 +196,7 @@ repository, and this repository is private, so `makepkg` gets a 404 for every
 one of them. That is a visibility setting, not a packaging problem, and nothing
 else in `packaging/` depends on it.
 
-`xgdk-client` does not track upstream. It pins upstream commit `3e75c9f` and
+`ferestre-client` does not track upstream. It pins upstream commit `3e75c9f` and
 applies four of the five patches in `patches/xodus-cli/`. That is not
 arbitrary — it was verified by applying them, in order, into a clean worktree
 at that commit, and type-checking the result:
@@ -226,7 +226,7 @@ sources and becomes six lines shorter.**
 
 ## What is not done here
 
-- **No release exists**, so `xgdk-runtime-bin` cannot be built as written. Its
+- **No release exists**, so `ferestre-runtime-bin` cannot be built as written. Its
   checksum is a placeholder and everything else about it is real.
 - **The client was not built.** Patch application was verified; the compile was
   not. `0003` in particular arrived as a patch file with no corresponding commit
@@ -235,4 +235,4 @@ sources and becomes six lines shorter.**
 - **No systemd user unit for `xodus-service`.** `launch-gdk.sh` starts it with
   `nohup` if `pgrep` does not find it, and a unit would be a second way to do
   the same thing. Worth revisiting when the launcher stops being shell.
-- **No `xgdk-launcher` (tagged, non-`-git`) package.** Nothing to tag yet.
+- **No `ferestre` (tagged, non-`-git`) package.** Nothing to tag yet.

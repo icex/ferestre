@@ -50,18 +50,18 @@ cd ~/src/xodus-proton
 git -c filter.lfs.smudge= -c filter.lfs.process= submodule update --init --force --recursive
 
 # this repo, with the patches and scripts
-git clone https://github.com/icex/xgdk-launcher ~/src/xgdk-launcher
+git clone https://github.com/icex/ferestre ~/src/ferestre
 
 # apply the local patches (they are plain git diffs against the fork)
 cd ~/src/xodus-proton/wine
-git apply ~/src/xgdk-launcher/patches/wine/*.patch
-git -C dlls/xgameruntime apply ~/src/xgdk-launcher/patches/xgameruntime/*.patch
+git apply ~/src/ferestre/patches/wine/*.patch
+git -C dlls/xgameruntime apply ~/src/ferestre/patches/xgameruntime/*.patch
 # the proton script patch is re-applied by the installer after every install
 
 # configure the build tree once (Xodus' own instructions), then build+install:
 mkdir -p ~/src/xodus-build && cd ~/src/xodus-build
 ../xodus-proton/configure.sh --build-name=xodus --container-engine=docker
-~/src/xgdk-launcher/scripts/install-xodus-proton.sh
+~/src/ferestre/scripts/install-xodus-proton.sh
 ```
 
 `install-xodus-proton.sh` invalidates the stale build stamps (editing the
@@ -75,7 +75,7 @@ installed `xgameruntime.dll` is stale.
 ```bash
 cd ~/src/xodus-build
 rsync -a --exclude .git ~/src/xodus-proton/wine/dlls/kernelbase/ src-wine/dlls/kernelbase/
-echo "WORKDIR=$PWD/obj-wine-x86_64 ~/src/xgdk-launcher/tools/in-container.sh \
+echo "WORKDIR=$PWD/obj-wine-x86_64 ~/src/ferestre/tools/in-container.sh \
   make -j$(nproc) dlls/kernelbase/x86_64-windows/kernelbase.dll" | newgrp docker
 # the installed copy is read-only; replace it explicitly
 D=$XODUS_PROTON_DIR/files/lib/wine/x86_64-windows/kernelbase.dll

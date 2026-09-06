@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build the xgdk AppImage.
+# Build the ferestre AppImage.
 #
 #   packaging/appimage/build-appimage.sh [options]
 #
@@ -53,7 +53,7 @@ RUNTIME_VER=20251108
 RUNTIME_URL="https://github.com/AppImage/type2-runtime/releases/download/${RUNTIME_VER}/runtime-x86_64"
 RUNTIME_SHA=2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
 
-DEFAULT_APP_ID=io.github.icex.xgdk
+DEFAULT_APP_ID=io.github.icex.ferestre
 DEFAULT_VERSION=0.0.0
 
 # --- output ------------------------------------------------------------------
@@ -86,23 +86,23 @@ options
   -h, --help         this text
 
 environment
-  XGDK_BIN, XGDK_OUT_DIR, XGDK_VERSION, XGDK_APP_ID, XGDK_UPDATE_INFO
-  XGDK_CACHE_DIR         build-tool cache      (default \${XDG_CACHE_HOME:-\$HOME/.cache}/xgdk-appimage)
-  XGDK_BUILD_DIR         AppDir staging        (default $REPO/build/appimage)
-  XGDK_APPIMAGETOOL      a local appimagetool AppImage, instead of downloading
-  XGDK_APPIMAGE_RUNTIME  a local type-2 runtime file, instead of downloading
-  XGDK_APPIMAGETOOL_ARGS extra arguments passed through to appimagetool
+  FERESTRE_BIN, FERESTRE_OUT_DIR, FERESTRE_VERSION, FERESTRE_APP_ID, FERESTRE_UPDATE_INFO
+  FERESTRE_CACHE_DIR         build-tool cache      (default \${XDG_CACHE_HOME:-\$HOME/.cache}/ferestre-appimage)
+  FERESTRE_BUILD_DIR         AppDir staging        (default $REPO/build/appimage)
+  FERESTRE_APPIMAGETOOL      a local appimagetool AppImage, instead of downloading
+  FERESTRE_APPIMAGE_RUNTIME  a local type-2 runtime file, instead of downloading
+  FERESTRE_APPIMAGETOOL_ARGS extra arguments passed through to appimagetool
 EOF
 }
 
 # --- arguments ---------------------------------------------------------------
-OUT_DIR=${XGDK_OUT_DIR:-$REPO/out}
-BUILD_DIR=${XGDK_BUILD_DIR:-$REPO/build/appimage}
-CACHE_DIR=${XGDK_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/xgdk-appimage}
-LAUNCHER_BIN=${XGDK_BIN:-}
-VERSION=${XGDK_VERSION:-}
-APP_ID=${XGDK_APP_ID:-$DEFAULT_APP_ID}
-UPDATE_INFO=${XGDK_UPDATE_INFO:-}
+OUT_DIR=${FERESTRE_OUT_DIR:-$REPO/out}
+BUILD_DIR=${FERESTRE_BUILD_DIR:-$REPO/build/appimage}
+CACHE_DIR=${FERESTRE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/ferestre-appimage}
+LAUNCHER_BIN=${FERESTRE_BIN:-}
+VERSION=${FERESTRE_VERSION:-}
+APP_ID=${FERESTRE_APP_ID:-$DEFAULT_APP_ID}
+UPDATE_INFO=${FERESTRE_UPDATE_INFO:-}
 OFFLINE=0 KEEP_APPDIR=0 SELF_TEST=1 SIGN=0
 
 while [ $# -gt 0 ]; do
@@ -129,7 +129,7 @@ done
 
 case "$APP_ID" in
     *[!A-Za-z0-9._-]*|"" ) die "not a usable application id: $APP_ID" \
-        "use reverse-DNS, letters digits dot dash underscore only, e.g. io.github.you.xgdk" ;;
+        "use reverse-DNS, letters digits dot dash underscore only, e.g. io.github.you.ferestre" ;;
 esac
 
 [ -f "$REPO/scripts/xodus-env.sh" ] || die \
@@ -159,7 +159,7 @@ fetch_pinned() {
 
     if [ -f "$dest" ]; then
         got=$(sha256 "$dest")
-        if [ "$got" = "$want" ] || [ -n "${XGDK_SKIP_SHA:-}" ]; then
+        if [ "$got" = "$want" ] || [ -n "${FERESTRE_SKIP_SHA:-}" ]; then
             say "$name: cached"
             return 0
         fi
@@ -193,7 +193,7 @@ fetch_pinned() {
         "  $dest"; }
 
     got=$(sha256 "$dest.part")
-    if [ "$got" != "$want" ] && [ -z "${XGDK_SKIP_SHA:-}" ]; then
+    if [ "$got" != "$want" ] && [ -z "${FERESTRE_SKIP_SHA:-}" ]; then
         rm -f "$dest.part"
         die "$name failed its checksum" \
             "expected $want" \
@@ -201,26 +201,26 @@ fetch_pinned() {
             "url      $url" \
             "Upstream sometimes re-uploads assets under an existing tag. If you have" \
             "checked the new file and trust it, update the pin at the top of this" \
-            "script, or set XGDK_SKIP_SHA=1 for a one-off build, or point" \
-            "XGDK_APPIMAGETOOL / XGDK_APPIMAGE_RUNTIME at a local copy you trust."
+            "script, or set FERESTRE_SKIP_SHA=1 for a one-off build, or point" \
+            "FERESTRE_APPIMAGETOOL / FERESTRE_APPIMAGE_RUNTIME at a local copy you trust."
     fi
     mv "$dest.part" "$dest"
 }
 
 mkdir -p "$CACHE_DIR"
 
-if [ -n "${XGDK_APPIMAGETOOL:-}" ]; then
-    [ -f "$XGDK_APPIMAGETOOL" ] || die "XGDK_APPIMAGETOOL is set but $XGDK_APPIMAGETOOL does not exist"
-    TOOL_IMG=$(readlink -f "$XGDK_APPIMAGETOOL")
+if [ -n "${FERESTRE_APPIMAGETOOL:-}" ]; then
+    [ -f "$FERESTRE_APPIMAGETOOL" ] || die "FERESTRE_APPIMAGETOOL is set but $FERESTRE_APPIMAGETOOL does not exist"
+    TOOL_IMG=$(readlink -f "$FERESTRE_APPIMAGETOOL")
     say "appimagetool: using $TOOL_IMG"
 else
     TOOL_IMG="$CACHE_DIR/appimagetool-$APPIMAGETOOL_VER-x86_64.AppImage"
     fetch_pinned "appimagetool $APPIMAGETOOL_VER" "$APPIMAGETOOL_URL" "$APPIMAGETOOL_SHA" "$TOOL_IMG"
 fi
 
-if [ -n "${XGDK_APPIMAGE_RUNTIME:-}" ]; then
-    [ -f "$XGDK_APPIMAGE_RUNTIME" ] || die "XGDK_APPIMAGE_RUNTIME is set but $XGDK_APPIMAGE_RUNTIME does not exist"
-    RUNTIME_FILE=$(readlink -f "$XGDK_APPIMAGE_RUNTIME")
+if [ -n "${FERESTRE_APPIMAGE_RUNTIME:-}" ]; then
+    [ -f "$FERESTRE_APPIMAGE_RUNTIME" ] || die "FERESTRE_APPIMAGE_RUNTIME is set but $FERESTRE_APPIMAGE_RUNTIME does not exist"
+    RUNTIME_FILE=$(readlink -f "$FERESTRE_APPIMAGE_RUNTIME")
     say "runtime: using $RUNTIME_FILE"
 else
     RUNTIME_FILE="$CACHE_DIR/runtime-$RUNTIME_VER-x86_64"
@@ -239,7 +239,7 @@ if [ ! -x "$TOOL_ROOT/AppRun" ]; then
         "could not unpack appimagetool" \
         "tried: $TOOL_IMG --appimage-extract" \
         "If it reported a FUSE error, the AppImage is a build this script has not" \
-        "seen; delete $CACHE_DIR and try again, or set XGDK_APPIMAGETOOL to a" \
+        "seen; delete $CACHE_DIR and try again, or set FERESTRE_APPIMAGETOOL to a" \
         "known-good appimagetool."
     [ -x "$TOOL_ROOT/AppRun" ] || die "appimagetool unpacked but has no AppRun at $TOOL_ROOT"
 fi
@@ -249,7 +249,7 @@ export PATH="$TOOL_ROOT/usr/bin:$PATH"
 # --- what goes in usr/bin ----------------------------------------------------
 PLACEHOLDER=0
 if [ -z "$LAUNCHER_BIN" ]; then
-    for cand in "$REPO/target/release/xgdk" "$REPO/target/debug/xgdk"; do
+    for cand in "$REPO/target/release/ferestre" "$REPO/target/debug/ferestre"; do
         if [ -x "$cand" ]; then LAUNCHER_BIN=$cand; break; fi
     done
 fi
@@ -258,7 +258,7 @@ if [ -n "$LAUNCHER_BIN" ]; then
     say "launcher: $LAUNCHER_BIN"
 else
     PLACEHOLDER=1
-    LAUNCHER_BIN=$HERE/xgdk-placeholder.sh
+    LAUNCHER_BIN=$HERE/ferestre-placeholder.sh
     warn "no launcher binary; packaging the placeholder shell command"
     warn "the AppImage will be marked -placeholder in its version and filename"
 fi
@@ -284,40 +284,40 @@ BUILD_DIR=$(cd "$BUILD_DIR" && pwd)
 APPDIR=$BUILD_DIR/$APP_ID.AppDir
 rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" \
-         "$APPDIR/usr/lib/xgdk" \
+         "$APPDIR/usr/lib/ferestre" \
          "$APPDIR/usr/share/applications" \
          "$APPDIR/usr/share/icons/hicolor/256x256/apps" \
          "$APPDIR/usr/share/icons/hicolor/scalable/apps" \
          "$APPDIR/usr/share/metainfo" \
-         "$APPDIR/usr/share/doc/xgdk"
+         "$APPDIR/usr/share/doc/ferestre"
 
 install -m 0755 "$HERE/AppRun"      "$APPDIR/AppRun"
-install -m 0755 "$LAUNCHER_BIN"     "$APPDIR/usr/bin/xgdk"
+install -m 0755 "$LAUNCHER_BIN"     "$APPDIR/usr/bin/ferestre"
 
 # The packaged command reports the version the package was built with rather
-# than a constant compiled into it, so `xgdk version` and the AppImage filename
+# than a constant compiled into it, so `ferestre version` and the AppImage filename
 # can never disagree.
-printf '%s\n' "$VERSION" > "$APPDIR/usr/lib/xgdk/VERSION"
+printf '%s\n' "$VERSION" > "$APPDIR/usr/lib/ferestre/VERSION"
 
 # The scripts are the launch path, not documentation: launch-gdk.sh assembles
 # the environment and proton-wine-shim.sh is what xodus-cli execs as its "wine"
 # binary. patches/ comes along because install-xodus-proton.sh reads
 # patches/proton out of it, and because someone holding only the AppImage should
 # still be able to follow docs/RECIPES.md.
-cp -a "$REPO/scripts"  "$APPDIR/usr/lib/xgdk/scripts"
-cp -a "$REPO/patches"  "$APPDIR/usr/lib/xgdk/patches"
+cp -a "$REPO/scripts"  "$APPDIR/usr/lib/ferestre/scripts"
+cp -a "$REPO/patches"  "$APPDIR/usr/lib/ferestre/patches"
 # The recipes are the canonical per-title data; the launch scripts are the
 # fallback until the real launcher reads them directly.
-cp -a "$REPO/titles"   "$APPDIR/usr/lib/xgdk/titles"
-find "$APPDIR/usr/lib/xgdk/scripts" -name '*.sh' -exec chmod 0755 {} +
+cp -a "$REPO/titles"   "$APPDIR/usr/lib/ferestre/titles"
+find "$APPDIR/usr/lib/ferestre/scripts" -name '*.sh' -exec chmod 0755 {} +
 
 # Ship the licences with the thing they cover. patches/wine and
 # patches/xgameruntime are LGPL-2.1-or-later and patches/xodus-cli is GPL-3.0;
 # they travel as source diffs, and NOTICE is the map that says which is which.
 for d in NOTICE LICENSE LICENSE.LGPL-2.1 README.md; do
-    if [ -f "$REPO/$d" ]; then cp "$REPO/$d" "$APPDIR/usr/share/doc/xgdk/"; fi
+    if [ -f "$REPO/$d" ]; then cp "$REPO/$d" "$APPDIR/usr/share/doc/ferestre/"; fi
 done
-[ -d "$REPO/docs" ] && cp "$REPO/docs"/*.md "$APPDIR/usr/share/doc/xgdk/" 2>/dev/null || true
+[ -d "$REPO/docs" ] && cp "$REPO/docs"/*.md "$APPDIR/usr/share/doc/ferestre/" 2>/dev/null || true
 
 # --- desktop entry, icon, metainfo ------------------------------------------
 # Everything is named after the app id, so a fork that overrides it gets a
@@ -376,7 +376,7 @@ fi
 # --- build -------------------------------------------------------------------
 mkdir -p "$OUT_DIR"
 OUT_DIR=$(cd "$OUT_DIR" && pwd)
-OUT_FILE="$OUT_DIR/xgdk-$VERSION-x86_64.AppImage"
+OUT_FILE="$OUT_DIR/ferestre-$VERSION-x86_64.AppImage"
 rm -f "$OUT_FILE" "$OUT_FILE.zsync"
 
 args=(--runtime-file "$RUNTIME_FILE")
@@ -384,7 +384,7 @@ if [ -n "$UPDATE_INFO" ]; then args+=(-u "$UPDATE_INFO"); fi
 if [ "$SIGN" -eq 1 ]; then args+=(--sign); fi
 # Deliberately unquoted: this is a caller-supplied argument list, not one word.
 # shellcheck disable=SC2206
-if [ -n "${XGDK_APPIMAGETOOL_ARGS:-}" ]; then args+=(${XGDK_APPIMAGETOOL_ARGS}); fi
+if [ -n "${FERESTRE_APPIMAGETOOL_ARGS:-}" ]; then args+=(${FERESTRE_APPIMAGETOOL_ARGS}); fi
 
 # Run it from the output directory. With -u, appimagetool writes the .zsync
 # file into the *current* directory rather than beside the AppImage it was told
@@ -446,7 +446,7 @@ if [ "$SELF_TEST" -eq 1 ]; then
     if [ "$PLACEHOLDER" -eq 1 ] \
        && ! "$OUT_FILE" --appimage-extract-and-run titles >/dev/null 2>&1; then
         die "the packaged command cannot read its own scripts directory" \
-            "check usr/lib/xgdk/scripts in $APPDIR"
+            "check usr/lib/ferestre/scripts in $APPDIR"
     fi
 fi
 
@@ -457,7 +457,7 @@ printf '\n'
 say "built $OUT_FILE ($(du -h "$OUT_FILE" | cut -f1))"
 if [ -f "$OUT_FILE.zsync" ]; then say "update file $OUT_FILE.zsync"; fi
 if [ "$PLACEHOLDER" -eq 1 ]; then
-    warn "this is a placeholder build: usr/bin/xgdk is a shell script over scripts/,"
+    warn "this is a placeholder build: usr/bin/ferestre is a shell script over scripts/,"
     warn "not the launcher. Build the launcher and re-run, or pass --bin."
 fi
 case "$fuse_ok" in

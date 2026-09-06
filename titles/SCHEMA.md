@@ -146,7 +146,7 @@ That last field is the useful one: it turns a capability list into a diagnosis.
 A runtime build is expected to ship the list of what it provides — one name per
 line, `#` comments allowed — and the validator will check a recipe against it:
 
-    titles/validate.py --runtime "$XODUS_PROTON_DIR/xgdk-capabilities.txt"
+    titles/validate.py --runtime "$XODUS_PROTON_DIR/ferestre-capabilities.txt"
 
 No runtime build generates that file yet. This is the contract it has to
 satisfy when one does; until then the check is opt-in and the registry is

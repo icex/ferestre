@@ -10,7 +10,7 @@ packaging/appimage/build-appimage.sh
 ```
 
 That is the whole thing. It downloads two pinned build tools on first run, then
-produces `out/xgdk-<version>-x86_64.AppImage` (about 1.1 MB) and runs it twice
+produces `out/ferestre-<version>-x86_64.AppImage` (about 1.1 MB) and runs it twice
 to prove it works before telling you it is done.
 
 The build host needs `bash`, `curl` or `wget`, coreutils and network access the
@@ -29,24 +29,24 @@ Useful options:
 | `--offline` | never touch the network; the tools must already be cached |
 | `--skip-self-test`, `--keep-appdir` | for debugging the packaging itself |
 
-`--help` lists the `XGDK_*` environment equivalents. Build tools are cached in
-`${XDG_CACHE_HOME:-~/.cache}/xgdk-appimage`, so every build after the first is
+`--help` lists the `FERESTRE_*` environment equivalents. Build tools are cached in
+`${XDG_CACHE_HOME:-~/.cache}/ferestre-appimage`, so every build after the first is
 offline-capable.
 
 ## What is in it, and what is not
 
 ```
 AppRun                        four lines, and deliberately so (below)
-usr/bin/xgdk                  the launcher, or the placeholder shell command
-usr/lib/xgdk/scripts/         the launch path: launch-gdk.sh, proton-wine-shim.sh, …
-usr/lib/xgdk/patches/         so install-runtime works, and RECIPES.md is followable
+usr/bin/ferestre                  the launcher, or the placeholder shell command
+usr/lib/ferestre/scripts/         the launch path: launch-gdk.sh, proton-wine-shim.sh, …
+usr/lib/ferestre/patches/         so install-runtime works, and RECIPES.md is followable
 usr/share/{applications,icons,metainfo,doc}
 ```
 
 **The patched Proton runtime is not in there.** It is ~264 MiB compressed,
 versions independently, and would tie a 1 MB application to a 264 MB release
-train. It is built or downloaded separately; `xgdk doctor` says whether it is
-installed and `xgdk install-runtime` builds it.
+train. It is built or downloaded separately; `ferestre doctor` says whether it is
+installed and `ferestre install-runtime` builds it.
 
 Nor is `xodus-cli`. It is GPL-3.0, it needs a Rust toolchain and it is what
 signs in — carrying it is a decision for the launcher, not for the packaging.
@@ -55,22 +55,22 @@ signs in — carrying it is a decision for the launcher, not for the packaging.
 ## The placeholder
 
 The launcher binary does not exist yet (`docs/ROADMAP.md`, phase 2). Until it
-does, `build-appimage.sh` packages `xgdk-placeholder.sh`: a thin front end over
+does, `build-appimage.sh` packages `ferestre-placeholder.sh`: a thin front end over
 the shell scripts in `scripts/`, using the subcommand names the CLI is planned
 to have.
 
 ```
-xgdk doctor                      check this machine for everything a launch needs
-xgdk titles                      what has a launch recipe
-xgdk download <product-id>       download and decrypt a title you own
-xgdk run bedrock                 launch it
-xgdk install-runtime             build and install the patched Proton
-xgdk stop                        kill everything a launch left behind
+ferestre doctor                      check this machine for everything a launch needs
+ferestre titles                      what has a launch recipe
+ferestre download <product-id>       download and decrypt a title you own
+ferestre run bedrock                 launch it
+ferestre install-runtime             build and install the patched Proton
+ferestre stop                        kill everything a launch left behind
 ```
 
 A placeholder build is marked as one: the version gets a `-placeholder` suffix,
 the filename carries it, and the build prints a warning. Pass `--bin` (or build
-`target/release/xgdk`, which is auto-detected) and it disappears.
+`target/release/ferestre`, which is auto-detected) and it disappears.
 
 Packaging the placeholder is the point. It means the packaging is tested rather
 than described, and the day the binary exists nothing about this directory has
@@ -102,7 +102,7 @@ cannot mount anything, and no runtime choice fixes that. For those the answer is
 `--appimage-extract-and-run`:
 
 ```sh
-./xgdk-*.AppImage --appimage-extract-and-run doctor
+./ferestre-*.AppImage --appimage-extract-and-run doctor
 ```
 
 The build's self-test tries both paths and says which worked, so this is
@@ -142,7 +142,7 @@ spends fifteen lines unsetting what Steam injects for the same reason; do not
 give it more to undo.
 
 **The launcher must stay in the foreground.** An AppImage is mounted for exactly
-as long as its process lives, and `usr/lib/xgdk/scripts` lives on that mount —
+as long as its process lives, and `usr/lib/ferestre/scripts` lives on that mount —
 including `proton-wine-shim.sh`, which `xodus-cli` execs as its "wine" binary.
 A launcher that daemonised itself and exited would pull the shim out from under
 the running game.
@@ -177,10 +177,10 @@ the running game.
 The AppImage carries the patch series, which is not all MIT: `patches/wine` and
 `patches/xgameruntime` are LGPL-2.1-or-later and `patches/xodus-cli` is GPL-3.0.
 They travel as source diffs, which is aggregation and satisfies both. `NOTICE`,
-`LICENSE` and `LICENSE.LGPL-2.1` ship in `usr/share/doc/xgdk/` so the map is
+`LICENSE` and `LICENSE.LGPL-2.1` ship in `usr/share/doc/ferestre/` so the map is
 inside the artefact and not just in the repository.
 
-The application id defaults to `io.github.icex.xgdk`, derived from this
+The application id defaults to `io.github.icex.ferestre`, derived from this
 project's own repository. A fork that publishes its own builds should pass
 `--app-id`; the build rewrites the desktop entry, the metainfo and every
 filename to match rather than shipping someone else's id.

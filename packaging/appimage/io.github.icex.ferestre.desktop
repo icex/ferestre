@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Ferestre
+GenericName=Xbox GDK title launcher
+Comment=Download and run the Microsoft Store and Xbox GDK titles you own
+# The window, not the terminal. This entry predates the GUI and used to open a
+# terminal on `doctor`, which is not what someone clicking an icon wants.
+Exec=ferestre-gui
+TryExec=ferestre-gui
+Icon=io.github.icex.ferestre
+Terminal=false
+Categories=Game;
+Keywords=Xbox;GDK;MSIXVC;Microsoft Store;Proton;Wine;ferestre;windows;
+StartupNotify=false

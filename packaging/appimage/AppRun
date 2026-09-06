@@ -13,7 +13,7 @@
 # LD_LIBRARY_PATH for the same reason; do not give it more to undo.
 #
 # The other thing to know: the AppImage is mounted for exactly as long as this
-# process lives. usr/lib/xgdk/scripts, including proton-wine-shim.sh which
+# process lives. usr/lib/ferestre/scripts, including proton-wine-shim.sh which
 # xodus-cli execs as its "wine" binary, lives on that mount. So the launcher
 # must stay in the foreground for the lifetime of the game and must never
 # daemonise itself away. It execs, and waits.
@@ -28,7 +28,7 @@ export PATH="$APPDIR/usr/bin:$PATH"
 
 # Where the shell scripts and patches landed inside the AppDir. The placeholder
 # command falls back to its own location, so this is belt and braces for anyone
-# invoking usr/bin/xgdk directly out of an extracted AppDir.
-export XGDK_SCRIPTS_DIR="${XGDK_SCRIPTS_DIR:-$APPDIR/usr/lib/xgdk/scripts}"
+# invoking usr/bin/ferestre directly out of an extracted AppDir.
+export FERESTRE_SCRIPTS_DIR="${FERESTRE_SCRIPTS_DIR:-$APPDIR/usr/lib/ferestre/scripts}"
 
-exec "$APPDIR/usr/bin/xgdk" "$@"
+exec "$APPDIR/usr/bin/ferestre" "$@"

@@ -3,7 +3,7 @@
 Design note for the one feature a launcher is judged on and this project does
 not have. Today every command takes a product id typed by hand — `get-game.sh`
 even carries `bedrock` as a hardcoded alias for `9NBLGGH2JHXJ` because there is
-nothing to look it up in. This is the design for `xgdk library`.
+nothing to look it up in. This is the design for `ferestre library`.
 
 No launcher code has been written from this yet. It is written against the code
 in the Xodus checkout (`crates/xodus`, `crates/xodus-cli`, `crates/xodus-service`) and
@@ -242,7 +242,7 @@ the account is not entitled (`crates/xodus/src/models/licensing.rs:73` — "not
 owned, or not covered by the account's current subscription tier"), and
 `LicenseContentError::NotEntitled` carries its description.
 
-That gives a working `xgdk owns <product-id>` today, and a degenerate library:
+That gives a working `ferestre owns <product-id>` today, and a degenerate library:
 probe a fixed list of ids. It is the right thing to ship first, because it makes
 the JSON schema, the cache and the CLI real while the collections query is still
 being settled, and it keeps working as a fallback afterwards.
@@ -360,7 +360,7 @@ should not be changed: a real market can drop availabilities or 404 a product.
 But `neutral` is the wrong market for *presentation* — localized properties and
 prices are selected by it. So:
 
-- presentation lookup: `market` from `XGDK_MARKET`, else derived from the
+- presentation lookup: `market` from `FERESTRE_MARKET`, else derived from the
   session locale, else `US`; `languages` from `LANG` plus `en` plus `neutral`.
 - if that lookup fails, or yields no Windows.Desktop package, retry once with
   `market=neutral&languages=en,neutral` — today's exact behaviour — and mark the
@@ -429,20 +429,20 @@ titles when three are known to work would undo that in one screenshot.
 ## 7. CLI surface
 
 ```
-xgdk library [--json] [--refresh] [--offline] [--all]
+ferestre library [--json] [--refresh] [--offline] [--all]
              [--market <m>] [--language <l>]
-xgdk show <product-id> [--json]
-xgdk owns <product-id>
+ferestre show <product-id> [--json]
+ferestre owns <product-id>
 ```
 
-`xgdk library` prints one aligned line per playable title: product id, name,
+`ferestre library` prints one aligned line per playable title: product id, name,
 entitlement kind, installed state. `--all` adds the rows normally filtered out
 (subscriptions, DLC, console-only) with a reason column.
 
 `--json` is the contract other things build on, so it gets rules:
 
 - stdout is **only** the JSON document. Progress, warnings and HTTP diagnostics
-  go to stderr. `xgdk library --json | jq` must work with no flags.
+  go to stderr. `ferestre library --json | jq` must work with no flags.
 - never interactive. If sign-in is needed, fail with a message telling the user
   to run `xodus-cli login`, exit non-zero.
 - exit `0` on a complete list, `0` with `"stale": true` on a cache-served list
@@ -506,7 +506,7 @@ Notes on the shape:
 - `schema` is a plain integer. Bump it on any incompatible change; a GUI built
   against `1` should refuse `2` rather than misread it.
 
-### 7.2 `xgdk owns`
+### 7.2 `ferestre owns`
 
 Backed by §3.5, so it works before collections does. Exit `0` entitled, `1` not
 entitled, `2` could not tell (network, no sign-in). Do not print the licence.
@@ -517,8 +517,8 @@ entitled, `2` could not tell (network, no sign-in). Do not print the licence.
 
 ### 8.1 What, where, how long
 
-Everything lives under `${XDG_CACHE_HOME:-$HOME/.cache}/xgdk/`, mode `0700`,
-files `0600`. `XGDK_LIBRARY_CACHE_DIR` overrides. Per-account files are named by a
+Everything lives under `${XDG_CACHE_HOME:-$HOME/.cache}/ferestre/`, mode `0700`,
+files `0600`. `FERESTRE_LIBRARY_CACHE_DIR` overrides. Per-account files are named by a
 truncated hash of the PUID, not the PUID — cache paths end up in screenshots and
 `ls` output.
 
@@ -581,7 +581,7 @@ Two ways out, in order:
 
 1. **One process per refresh.** The catalog command does the whole enumeration in
    a single invocation and prints one JSON document. This is the reason
-   `xgdk library --json` is one call rather than a loop over `xgdk show`, and it
+   `ferestre library --json` is one call rather than a loop over `ferestre show`, and it
    is the recommended shape.
 2. **Ask the running service for tokens.** `xodus-service` is *already* started by
    `scripts/launch-gdk.sh` before any title runs, and its
@@ -597,8 +597,8 @@ Two ways out, in order:
    the service signs with the key the token was minted under.
 
 Option 2 is strictly better once the service is running anyway, but it couples
-the launcher to the IPC protocol. Do option 1 first; revisit when `xgdk install`
-and `xgdk run` already depend on the service.
+the launcher to the IPC protocol. Do option 1 first; revisit when `ferestre install`
+and `ferestre run` already depend on the service.
 
 ---
 
@@ -674,14 +674,14 @@ Order of work, cheapest first, and only two steps touch an account:
    for `9NBLGGH2JHXJ` and read the document. That settles every §5.2 inference,
    the image URI form, and the batch-`bigIds` question, with no sign-in and no
    account risk. Do this first; it unblocks the whole presentation layer.
-2. **Ship `xgdk owns` and the schema** on the §3.5 licensing oracle. Real output,
+2. **Ship `ferestre owns` and the schema** on the §3.5 licensing oracle. Real output,
    real cache, real CLI, no unknown endpoint.
 3. **Vary the collections body.** The auth question is closed (§3.2), so every
    remaining 400 is about the body and each one names the field it disliked. Work
    the schema complaint, not the token. Try the PUID and the XUID as beneficiary.
 4. **Cross-check against `mygames`** once collections answers, per §3.3. If the
    two disagree, the query is filtering too hard.
-5. **Only then** widen the model and wire `xgdk library` to it.
+5. **Only then** widen the model and wire `ferestre library` to it.
 
 Record what each probe returned — status, `MS-CV`, and the *shape* of the body —
 in `notes/`, the way the rest of this project's hard-won findings are recorded.

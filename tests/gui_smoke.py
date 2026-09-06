@@ -12,7 +12,7 @@ backwards.
 It drives the real window through AT-SPI, the accessibility bus, so the thing
 under test is the shipped binary with no test hooks compiled into it.
 
-    tests/gui_smoke.py [--binary target/debug/xgdk-gui] [--keep]
+    tests/gui_smoke.py [--binary target/debug/ferestre-gui] [--keep]
 
 Needs at-spi2-core and the Atspi GObject bindings. Exits non-zero on the first
 failed expectation, and prints what it found so a failure is diagnosable
@@ -253,7 +253,7 @@ def check(condition, message, root=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--binary", default="target/debug/xgdk-gui")
+    parser.add_argument("--binary", default="target/debug/ferestre-gui")
     parser.add_argument(
         "--keep",
         action="store_true",
@@ -263,12 +263,12 @@ def main():
 
     binary = os.path.abspath(args.binary)
     if not os.path.isfile(binary):
-        raise Failure(f"{binary} is not there; cargo build -p xgdk-gui")
+        raise Failure(f"{binary} is not there; cargo build -p ferestre-gui")
 
     # A throwaway HOME, so the test cannot read a real account's cached library
     # or write into one. It also means the run starts from the state a new user
     # has, which is the state most worth testing.
-    home = tempfile.mkdtemp(prefix="xgdk-gui-smoke-")
+    home = tempfile.mkdtemp(prefix="ferestre-gui-smoke-")
     env = dict(os.environ)
     env.update(
         {
@@ -277,7 +277,7 @@ def main():
             "XDG_STATE_HOME": os.path.join(home, "state"),
             "XDG_CONFIG_HOME": os.path.join(home, "config"),
             "GTK_A11Y": "atspi",
-            "XGDK_TITLES": os.path.join(os.getcwd(), "titles"),
+            "FERESTRE_TITLES": os.path.join(os.getcwd(), "titles"),
             # Recipes come from the checkout, but nothing else should: no Steam,
             # no runtime, no client.
             "XODUS_GAMES_DIR": os.path.join(home, "games"),
@@ -292,7 +292,7 @@ def main():
     # the test can only ever exercise that one path -- which is not the path most
     # of the window is about.
     runtime = os.path.join(home, "runtime")
-    os.makedirs(os.path.join(runtime, "files", "share", "xgdk"), exist_ok=True)
+    os.makedirs(os.path.join(runtime, "files", "share", "ferestre"), exist_ok=True)
     with open(os.path.join(runtime, "proton"), "w") as f:
         f.write("#!/bin/sh\nexit 0\n")
     with open(os.path.join(runtime, "version"), "w") as f:
@@ -305,7 +305,7 @@ def main():
             recipe = tomllib.load(f)
         wanted |= set(recipe.get("runtime", {}).get("requires", []))
         wanted |= set(recipe.get("runtime", {}).get("wants", []))
-    with open(os.path.join(runtime, "files", "share", "xgdk", "capabilities.json"), "w") as f:
+    with open(os.path.join(runtime, "files", "share", "ferestre", "capabilities.json"), "w") as f:
         json.dump({"capabilities": sorted(wanted)}, f)
 
     # A title that is installed but whose build nothing can identify: a manifest,
@@ -375,7 +375,7 @@ def main():
             frame,
         )
         check(
-            not os.path.exists(os.path.join(home, "state", "xgdk", "installed")),
+            not os.path.exists(os.path.join(home, "state", "ferestre", "installed")),
             "and nothing was recorded, because there was no package header to read",
         )
 
@@ -478,7 +478,7 @@ def main():
         check(True, "and closing it leaves the library where it was")
 
         print("saving an edit")
-        user_titles = os.path.join(home, "config", "xgdk", "titles")
+        user_titles = os.path.join(home, "config", "ferestre", "titles")
         check(
             not glob.glob(os.path.join(user_titles, "*.toml")),
             "nothing has been written yet",

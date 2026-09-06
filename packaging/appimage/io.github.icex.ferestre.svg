@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Source for the application icon.
+
+     An arched window, lit from inside: "ferestre" is Romanian for "windows",
+     and the joke is that this runs Windows games. Architectural on purpose.
+     A four-pane rectangle is the shape of Microsoft's mark, so the window here
+     is arched and split in two, and the palette is warm rather than the
+     red/green/blue/yellow of that logo. This project is affiliated with
+     Microsoft, Mojang, Valve and Xodus in no way at all, and the icon should
+     not suggest otherwise.
+
+     Drawn to read at 24px: three thick strokes and one warm shape. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="glass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffd88a"/>
+      <stop offset="1" stop-color="#ef9440"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="8" y="8" width="240" height="240" rx="52" ry="52" fill="#1b2029"/>
+  <rect x="8" y="8" width="240" height="240" rx="52" ry="52"
+        fill="none" stroke="#343d4c" stroke-width="4"/>
+
+  <!-- The lit glass, one shape: the arch and the two panes below it. Wider
+       than it is tall below the spring line, because a tall narrow opening
+       reads as a door. -->
+  <path d="M78 190 L78 126 A50 50 0 0 1 178 126 L178 190 Z" fill="url(#glass)"/>
+
+  <!-- The frame, over the glass so the joins stay crisp. -->
+  <path d="M78 190 L78 126 A50 50 0 0 1 178 126 L178 190"
+        fill="none" stroke="#f4ece0" stroke-width="14"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Transom at the spring line, mullion below it: two panes, not four. -->
+  <path d="M78 126 L178 126 M128 126 L128 190"
+        fill="none" stroke="#f4ece0" stroke-width="12" stroke-linecap="round"/>
+
+  <!-- Sill, wider than the opening, which is what makes it read as a window
+       rather than a doorway. -->
+  <rect x="64" y="188" width="128" height="15" rx="7" ry="7" fill="#f4ece0"/>
+</svg>

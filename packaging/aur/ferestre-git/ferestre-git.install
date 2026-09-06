@@ -1,0 +1,36 @@
+post_install() {
+	cat <<'EOF'
+
+  Start with:
+
+      ferestre doctor      what this machine is missing, in order
+      ferestre help        the subcommands
+
+  Two things it will almost certainly tell you:
+
+    * Point the tools at the packaged runtime, once:
+
+          export XODUS_PROTON_DIR=/usr/share/steam/compatibilitytools.d/ferestre
+
+    * Sign in with your own Microsoft account before anything can be
+      downloaded:
+
+          xodus-cli login
+
+      Tokens go to the desktop keyring over the Secret Service D-Bus
+      interface. Without a keyring provider running, sign-in aborts rather
+      than degrading.
+
+  You need to own the titles. This installs no game content and cannot get
+  you any: it downloads your purchases with your licence.
+
+  The launch scripts live in /usr/lib/ferestre/scripts and take every path from
+  XODUS_* environment variables -- `ferestre env` prints what they resolve to.
+  /usr/share/doc/ferestre/RECIPES.md is the per-title walkthrough.
+
+EOF
+}
+
+post_upgrade() {
+	post_install
+}

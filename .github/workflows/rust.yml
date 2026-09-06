@@ -1,6 +1,6 @@
 # The launcher's own tests. Two jobs, because they need different things.
 #
-# `test` is the fast one: everything decided in `xgdk-core` and in the GUI's
+# `test` is the fast one: everything decided in `ferestre-core` and in the GUI's
 # `model` is pure, so it runs anywhere with a Rust toolchain -- no display, no
 # runtime, no Microsoft account, no game.
 #
@@ -81,7 +81,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build the window
-        run: cargo build -p xgdk-gui
+        run: cargo build -p ferestre-gui
 
       # A session bus for the accessibility bus to live on, a display for the
       # window to map into, and then the test drives it by pressing things.

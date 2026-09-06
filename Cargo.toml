@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/xgdk-core", "crates/xgdk-cli", "crates/xgdk-gui"]
+members = ["crates/ferestre-core", "crates/ferestre-cli", "crates/ferestre-gui"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.77"
 license = "MIT"
-repository = "https://github.com/icex/xgdk-launcher"
+repository = "https://github.com/icex/ferestre"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

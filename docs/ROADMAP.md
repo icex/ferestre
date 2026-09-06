@@ -163,7 +163,7 @@ honestly marked as unproven rather than planned.
       Someone should be able to fill in an executable path and a couple of
       environment variables in the window, try it, and hand the result back as
       an issue — not learn a TOML schema first. Edits go to
-      `$XDG_CONFIG_HOME/xgdk/titles/` and win over the packaged recipe, so an
+      `$XDG_CONFIG_HOME/ferestre/titles/` and win over the packaged recipe, so an
       upgrade never reverts them and "what did I change" stays answerable.
 
 - [x] **Add to Steam.** A non-Steam shortcut for the overlay, controller
@@ -237,7 +237,7 @@ These are judgement calls, not engineering ones:
 
 ## Known gaps, stated plainly
 
-- **The runtime does not publish a capability list.** `files/share/xgdk/capabilities.json`
+- **The runtime does not publish a capability list.** `files/share/ferestre/capabilities.json`
   is the manifest a build is supposed to ship; no build writes one, so the
   launcher falls back to probing, finds four of the capabilities it looks for,
   and every title carries "could not be found" wording it does not deserve. The

@@ -1,14 +1,32 @@
-# xgdk-launcher
+<img src="packaging/appimage/io.github.icex.ferestre.svg" width="96" align="left" alt="">
+
+# Ferestre
 
 Running **Xbox GDK / Microsoft Store (MSIXVC) titles on Linux**, on a patched
 Wine/Proton with a from-scratch implementation of the Xbox Game Development Kit
 runtime.
+
+<br clear="left">
 
 > **You need to own the games.** This project ships no game content and never
 > will. It signs in with *your* Microsoft account, uses *your* licences, and
 > downloads *your* purchases. If you do not own a title, or your account does
 > not have a Game Pass entitlement for it, there is nothing here that will let
 > you play it — and that is deliberate.
+
+## The name
+
+**Ferestre** is Romanian for **windows** — the plural of *fereastră*, the thing
+in a wall you look through, not the operating system. Romanian gets it from
+Latin *fenestra*, the same root behind French *fenêtre*, Italian *finestra* and
+the English word *defenestration*.
+
+The joke is that this project runs Windows games, on Linux, by putting a window
+around them — and that the pun only works in a language Microsoft did not name
+anything after. The icon is an arched window rather than a four-pane rectangle
+for the same reason: a four-pane rectangle is somebody else's trademark.
+
+Pronounced roughly *feh-RESS-treh*.
 
 ## Status
 
@@ -20,10 +38,10 @@ Honest version, because this is early:
 | **Clair Obscur: Expedition 33** (Store / Game Pass) | Playable — saves, video, full game |
 | **Forza Horizon 5** (Store) | Downloads, does not run: blocked by protection inside the title, not by anything here |
 
-There is no launcher application yet. Today this is a set of patches, scripts
-and documentation that get titles running; see [docs/ROADMAP.md](docs/ROADMAP.md)
-for where it is going and [docs/RECIPES.md](docs/RECIPES.md) for how to do it by
-hand in the meantime.
+There is a launcher: a CLI (`ferestre`) and a GTK4 window (`ferestre-gui`) that
+signs in, lists what your account owns with real names and cover art, installs,
+detects updates, and launches. See [docs/ROADMAP.md](docs/ROADMAP.md) for what is
+still missing and [docs/RECIPES.md](docs/RECIPES.md) for doing any of it by hand.
 
 ## How it fits together
 
@@ -36,7 +54,13 @@ Three layers, only one of which is unusual:
    can actually be *loaded*, plus `xgameruntime.dll`: an implementation of the
    GDK (task queues, async, users, storage, networking, save games, packages)
    written against the observable behaviour of the API.
-3. **The launcher** — does not exist yet. See the roadmap.
+3. **The launcher** — this repository. `ferestre-core` decides everything (which
+   recipe applies, whether the runtime can satisfy it, where a title installs);
+   the CLI and the window are two faces on the same decisions, so they cannot
+   disagree. It never links the client: Xodus is GPL-3.0-only and this is MIT,
+   so the client is run as a child process — which is also the only shape that
+   works, because a decrypted executable is passed to Wine as an inherited file
+   descriptor.
 
 The awkward part is that a GDK title's executable is encrypted on disk and only
 ever exists decrypted inside a memfd handed to Wine, so it cannot be started

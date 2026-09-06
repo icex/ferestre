@@ -121,7 +121,7 @@ body:
   - type: input
     id: repo-commit
     attributes:
-      label: xgdk-launcher commit
+      label: ferestre commit
       description: git rev-parse --short HEAD
       placeholder: 35fe31c
     validations:

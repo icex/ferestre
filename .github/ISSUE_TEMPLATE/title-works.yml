@@ -7,7 +7,7 @@ body:
     attributes:
       value: |
         This is the report that becomes a `titles/<product id>.toml` recipe and a
-        row in [the compatibility matrix](https://github.com/icex/xgdk-launcher/blob/main/docs/COMPATIBILITY.md),
+        row in [the compatibility matrix](https://github.com/icex/ferestre/blob/main/docs/COMPATIBILITY.md),
         so the details below are the whole point of it.
 
         ### Do not paste account identifiers, tokens or game content
@@ -114,7 +114,7 @@ body:
   - type: input
     id: repo-commit
     attributes:
-      label: xgdk-launcher commit
+      label: ferestre commit
       description: git rev-parse --short HEAD
       placeholder: 35fe31c
     validations:

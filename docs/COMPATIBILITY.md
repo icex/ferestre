@@ -63,7 +63,7 @@ because a matrix entry without one is a rumour.
 ## Reporting a title
 
 Two forms, both under
-[New issue](https://github.com/icex/xgdk-launcher/issues/new/choose):
+[New issue](https://github.com/icex/ferestre/issues/new/choose):
 
 - **Title report: it works** — for a title that reaches gameplay. What is
   wanted is the recipe: the product id, the executable path inside the package,

@@ -2,14 +2,14 @@
 #
 # The id matches the AppImage build and the project's GitHub home, which is what
 # Flathub wants: an id under a domain the submitter controls.
-id: io.github.icex.xgdk
+id: io.github.icex.ferestre
 
 runtime: org.freedesktop.Platform
 runtime-version: '24.08'
 sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
-command: xgdk-launcher
+command: ferestre
 
 finish-args:
   - --share=network
@@ -26,13 +26,13 @@ finish-args:
   - --filesystem=xdg-download
 
 modules:
-  - name: xgdk-launcher
+  - name: ferestre
     buildsystem: simple
     build-options:
       append-path: /usr/lib/sdk/rust-stable/bin
     build-commands:
       - cargo build --release --offline
-      - install -Dm755 target/release/xgdk-launcher /app/bin/xgdk-launcher
+      - install -Dm755 target/release/ferestre /app/bin/ferestre
     sources:
       - type: dir
         path: ../..

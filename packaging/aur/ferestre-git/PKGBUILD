@@ -1,0 +1,153 @@
+# Maintainer: the ferestre contributors <https://github.com/icex/ferestre>
+
+# The front end.
+#
+# Today that is the repository's shell scripts plus the `ferestre` command from
+# packaging/appimage/ferestre-placeholder.sh, which is a thin, honest wrapper over
+# them with the subcommand names the real launcher will use. When the Rust
+# binary lands (docs/ROADMAP.md, phase 2) this PKGBUILD builds and installs it
+# instead, with no other change: build() and package() already look for it.
+#
+# It is a -git package because there are no tags yet. A tagged release gets a
+# sibling `ferestre` package that drops the pkgver() and takes a tarball.
+#
+# The layout deliberately matches the AppImage's AppDir (usr/bin/ferestre,
+# usr/lib/ferestre/scripts, usr/lib/ferestre/patches, usr/lib/ferestre/VERSION) so the same
+# command behaves identically however it was installed. In particular the
+# placeholder finds its scripts through $0/../lib/ferestre/scripts, which is why
+# they go to /usr/lib/ferestre and not /usr/share.
+
+pkgname=ferestre-git
+pkgver=0.0.0.r18.g88a0378
+pkgrel=1
+pkgdesc='Download and run the Microsoft Store and Xbox GDK titles you own, on Linux'
+arch=('x86_64')
+url='https://github.com/icex/ferestre'
+# Mixed, because the tree is: the scripts and tooling are MIT, and the patches/
+# directory that ships with the package is LGPL-2.1-or-later (wine,
+# xgameruntime), GPL-3.0-only (xodus-cli) and BSD-3-Clause (proton).
+license=('MIT' 'LGPL-2.1-or-later' 'GPL-3.0-only' 'BSD-3-Clause')
+
+depends=(
+  'bash'
+  'ferestre-client'         # the only thing that can start an encrypted title
+  'ferestre-runtime-bin'    # the patched Proton it starts the title with
+  # fix-xcurl.sh swaps Microsoft's XCurl.dll for a real Windows libcurl, which
+  # is what makes Minecraft's sign-in and marketplace work at all. It downloads
+  # and unpacks the official curl build.
+  'curl' 'unzip'
+  # fix-xcurl.sh compares the two DLLs' import/export tables with an inline
+  # python3 script and refuses the swap without it. Today this is satisfied only
+  # as a side effect of ferestre-runtime-bin needing python for the proton script.
+  'python'
+)
+makedepends=('git')
+optdepends=(
+  'steam: Proton wants STEAM_COMPAT_CLIENT_INSTALL_PATH, and a title can be added as a non-Steam shortcut'
+  'vulkan-tools: `vulkaninfo`, for checking the GPU side before blaming the launcher'
+  # `ferestre install-runtime` builds the runtime from source instead of using the
+  # ferestre-runtime-bin package. It is the developer path, and it needs a
+  # container engine plus the tools install-xodus-proton.sh drives.
+  'docker: building the patched Proton runtime yourself (ferestre install-runtime)'
+  'podman: building the patched Proton runtime yourself, instead of docker'
+  'patch: re-applying the proton patch after a self-built runtime install'
+  'binutils: the runtime build checks the installed xgameruntime.dll with strings(1)'
+  'rsync: rebuilding a single DLL against the runtime build tree'
+)
+
+provides=('ferestre')
+conflicts=('ferestre')
+
+install="$pkgname.install"
+
+source=("$pkgname::git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$srcdir/$pkgname"
+
+  # Mirrors packaging/appimage/build-appimage.sh: the version is the launcher
+  # crate's when there is one, 0.0.0 until then, and the commit count keeps it
+  # monotonic either way.
+  local v=
+  if [[ -f Cargo.toml ]]; then
+    v=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+  fi
+  printf '%s.r%s.g%s' \
+    "${v:-0.0.0}" \
+    "$(git rev-list --count HEAD)" \
+    "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd "$srcdir/$pkgname"
+
+  # Nothing to compile until the launcher crate exists. Keeping this guarded
+  # rather than commented out means the package starts shipping the real binary
+  # the moment the crate lands, without a packaging change.
+  [[ -f Cargo.toml ]] || return 0
+
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+  cargo build --frozen --release
+}
+
+package() {
+  cd "$srcdir/$pkgname"
+
+  install -d "$pkgdir/usr/lib/ferestre"
+
+  # The scripts are the launch path, not documentation: launch-gdk.sh strips
+  # the environment Steam injects and proton-wine-shim.sh is what xodus-cli
+  # execs as its "wine" binary. patches/ comes with them because
+  # install-xodus-proton.sh reads patches/proton out of the repository root,
+  # which for an installed copy is /usr/lib/ferestre.
+  cp -a scripts  "$pkgdir/usr/lib/ferestre/scripts"
+  cp -a patches  "$pkgdir/usr/lib/ferestre/patches"
+  find "$pkgdir/usr/lib/ferestre/scripts" -name '*.sh' -exec chmod 0755 {} +
+
+  # The placeholder reads this as $SCRIPTS/../VERSION, so a packaged command
+  # cannot disagree with the version of the package it came from.
+  printf '%s\n' "$pkgver" > "$pkgdir/usr/lib/ferestre/VERSION"
+
+  # The `ferestre` command: the real binary once it exists, the placeholder that
+  # drives the shell scripts until then. A package with neither is not worth
+  # installing, so say so loudly instead of shipping a directory of scripts and
+  # no way to run them.
+  if [[ -x target/release/ferestre ]]; then
+    install -Dm755 target/release/ferestre "$pkgdir/usr/bin/ferestre"
+  elif [[ -f packaging/appimage/ferestre-placeholder.sh ]]; then
+    install -Dm755 packaging/appimage/ferestre-placeholder.sh "$pkgdir/usr/bin/ferestre"
+  else
+    printf '==> ERROR: no launcher binary and no packaging/appimage/ferestre-placeholder.sh\n' >&2
+    return 1
+  fi
+
+  # Desktop integration is shared with the AppImage, which owns these files.
+  # It is not load-bearing for a command-line tool, so a rename over there
+  # should not break the package -- but it should be visible.
+  local id=io.github.icex.ferestre
+  if [[ -f packaging/appimage/$id.desktop ]]; then
+    install -Dm644 "packaging/appimage/$id.desktop" \
+      "$pkgdir/usr/share/applications/$id.desktop"
+    install -Dm644 "packaging/appimage/$id.svg" \
+      "$pkgdir/usr/share/icons/hicolor/scalable/apps/$id.svg"
+    install -Dm644 "packaging/appimage/$id.png" \
+      "$pkgdir/usr/share/icons/hicolor/256x256/apps/$id.png"
+    install -Dm644 "packaging/appimage/$id.metainfo.xml" \
+      "$pkgdir/usr/share/metainfo/$id.metainfo.xml"
+  else
+    printf '==> WARNING: packaging/appimage/%s.desktop is gone; no desktop entry\n' \
+      "$id" >&2
+  fi
+
+  install -Dm644 README.md        "$pkgdir/usr/share/doc/ferestre/README.md"
+  install -Dm644 NOTICE           "$pkgdir/usr/share/doc/ferestre/NOTICE"
+  install -Dm644 docs/RECIPES.md  "$pkgdir/usr/share/doc/ferestre/RECIPES.md"
+  install -Dm644 docs/ROADMAP.md  "$pkgdir/usr/share/doc/ferestre/ROADMAP.md"
+
+  install -Dm644 LICENSE            "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 LICENSE.LGPL-2.1   "$pkgdir/usr/share/licenses/$pkgname/LICENSE.LGPL-2.1"
+  install -Dm644 NOTICE             "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
+}

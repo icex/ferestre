@@ -52,7 +52,7 @@ index e56e580..60dc3ce 100644
 + * server from the in-game list ends with an HC_WEBSOCKET_OBSERVER destructor
 + * running against an already-destroyed WebSocket, and libHttpClient narrates
 + * exactly that. It is not our DLL, so this only switches its tracing on and
-+ * forwards it into the Wine log, and only when asked: set XGDK_HC_TRACE=1.
++ * forwards it into the Wine log, and only when asked: set FERESTRE_HC_TRACE=1.
 + *
 + * libHttpClient loads after us, so this waits for it rather than assuming. */
 +static void CALLBACK hc_trace_callback( const char *area, UINT32 level, UINT64 thread,
@@ -90,7 +90,7 @@ index e56e580..60dc3ce 100644
 +    BOOL pending;
 +
 +    if (!InitOnceBeginInitialize( &once, 0, &pending, NULL ) || !pending) return;
-+    if (getenv( "XGDK_HC_TRACE" ))
++    if (getenv( "FERESTRE_HC_TRACE" ))
 +    {
 +        HANDLE thread = CreateThread( NULL, 0, hc_trace_thread, NULL, 0, NULL );
 +

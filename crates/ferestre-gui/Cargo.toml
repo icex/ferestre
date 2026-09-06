@@ -1,0 +1,24 @@
+[package]
+name = "ferestre-gui"
+description = "A window over the ferestre launcher: your titles, their state, and one button to play them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ferestre-gui"
+path = "src/main.rs"
+
+[dependencies]
+# The GUI links ferestre-core for the decisions -- same workspace, same MIT licence,
+# and it means the window and the CLI cannot disagree about what a recipe says.
+# It never links Xodus: that stays a child process, for the licence and because
+# the decrypted executable has to remain a child of whoever opened it.
+ferestre-core = { path = "../ferestre-core" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+gtk = { package = "gtk4", version = "0.9", features = ["v4_10"] }
+adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
