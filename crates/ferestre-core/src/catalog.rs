@@ -74,9 +74,21 @@ pub struct Product {
     /// from `content_ids` alone.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub has_packages: bool,
+    /// The container the PC package ships in -- `MSIXVC` for a GDK title,
+    /// `Appx`/`AppxBundle` for a UWP one. Only an MSIXVC is something this
+    /// launcher can install and run today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_format: Option<String>,
 }
 
 impl Product {
+    /// Whether this launcher could install it: a PC package, in the container
+    /// its runtime knows how to open.
+    pub fn is_runnable_here(&self) -> Option<bool> {
+        let format = self.package_format.as_deref()?;
+        Some(format.eq_ignore_ascii_case(RUNNABLE_FORMAT))
+    }
+
     /// A size to show, or an empty string. Powers of ten, like a store page:
     /// nobody comparing "47 GB" against their free space means gibibytes.
     pub fn size_label(&self) -> String {
@@ -183,6 +195,8 @@ struct Package {
     content_id: Option<String>,
     #[serde(rename = "MaxDownloadSizeInBytes", default)]
     download_bytes: Option<u64>,
+    #[serde(rename = "PackageFormat", default)]
+    format: Option<String>,
     #[serde(rename = "PlatformDependencies", default)]
     platforms: Vec<PlatformDependency>,
 }
@@ -193,14 +207,28 @@ struct PlatformDependency {
     name: Option<String>,
 }
 
-/// The only platform whose packages this launcher can install.
-const DESKTOP: &str = "Windows.Desktop";
+/// The platforms that mean "runs on a PC".
+///
+/// Both, and the second one matters: a UWP app declares `Windows.Universal` and
+/// nothing else -- Candy Crush Saga has a Universal package, an Xbox one and two
+/// phone ones, and no `Windows.Desktop` at all. Filtering on Desktop alone drops
+/// such titles to zero packages, which reads as "not available" for something
+/// the account owns and Windows runs perfectly well.
+const DESKTOP: [&str; 2] = ["Windows.Desktop", "Windows.Universal"];
+
+/// The package format this launcher's runtime can actually load.
+///
+/// The whole decrypt-and-launch path is built for MSIXVC. `Appx`, `AppxBundle`
+/// and the `E`-prefixed Xbox variants are different containers, so a title whose
+/// only PC package is one of those is not something this can run yet -- and
+/// saying which format it is beats failing later with the client's own error.
+pub const RUNNABLE_FORMAT: &str = "MSIXVC";
 
 impl Package {
     fn is_desktop(&self) -> bool {
         self.platforms
             .iter()
-            .any(|p| p.name.as_deref() == Some(DESKTOP))
+            .any(|p| p.name.as_deref().is_some_and(|n| DESKTOP.contains(&n)))
     }
 }
 
@@ -272,6 +300,7 @@ pub fn parse(json: &str) -> Result<Vec<Product>> {
             let mut download_bytes = None;
             let mut last_update = None;
             let mut has_packages = false;
+            let mut package_format: Option<String> = None;
             for sku in &raw.skus {
                 let Some(properties) = sku.sku.as_ref().and_then(|s| s.properties.as_ref()) else {
                     continue;
@@ -291,6 +320,9 @@ pub fn parse(json: &str) -> Result<Vec<Product>> {
                     // and the full sku point at one build -- so the same content
                     // id turns up repeatedly and only the distinct set means
                     // anything as an update key.
+                    package_format = package_format
+                        .take()
+                        .or_else(|| package.format.clone().filter(|f| !f.is_empty()));
                     if let Some(id) = package.content_id.clone().filter(|s| !s.is_empty()) {
                         if !content_ids.contains(&id) {
                             content_ids.push(id);
@@ -313,6 +345,7 @@ pub fn parse(json: &str) -> Result<Vec<Product>> {
                 last_update,
                 content_ids,
                 has_packages,
+                package_format,
             })
         })
         .collect())
@@ -464,8 +497,10 @@ mod tests {
           "DisplaySkuAvailabilities": [
             {"Sku": {"Properties": {"Packages": [
               {"ContentId": "content-b", "MaxDownloadSizeInBytes": 47272595456,
+               "PackageFormat": "MSIXVC",
                "PlatformDependencies": [{"PlatformName": "Windows.Desktop"}]},
               {"ContentId": "content-c", "MaxDownloadSizeInBytes": 49074888704,
+               "PackageFormat": "MSIXVC",
                "PlatformDependencies": [{"PlatformName": "Windows.Xbox"}]}
             ]}}}
           ]
@@ -525,6 +560,65 @@ mod tests {
         assert_eq!(products[1].download_bytes, Some(47272595456));
         assert_eq!(products[1].size_label(), "47.3 GB");
         assert!(products[1].has_packages);
+    }
+
+    /// A UWP app declares `Windows.Universal` and nothing else. Filtering on
+    /// `Windows.Desktop` alone dropped Candy Crush Saga to zero packages --
+    /// "not available" for something the account owns and Windows runs.
+    #[test]
+    fn a_universal_package_counts_as_a_pc_package() {
+        let uwp = r#"{"Products":[{
+          "ProductId": "9ZZTESTUWP01",
+          "LocalizedProperties": [{"ProductTitle": "A UWP App"}],
+          "DisplaySkuAvailabilities": [{"Sku": {"Properties": {"Packages": [
+            {"ContentId": "content-u", "MaxDownloadSizeInBytes": 177700000,
+             "PackageFormat": "Appx",
+             "PlatformDependencies": [{"PlatformName": "Windows.Universal"}]},
+            {"ContentId": "content-x", "MaxDownloadSizeInBytes": 209200000,
+             "PackageFormat": "EAppx",
+             "PlatformDependencies": [{"PlatformName": "Windows.Xbox"}]},
+            {"ContentId": "content-p", "MaxDownloadSizeInBytes": 56300000,
+             "PackageFormat": "Xap",
+             "PlatformDependencies": [{"PlatformName": "Windows.WindowsPhone8x"}]}
+          ]}}}]
+        }]}"#;
+        let products = parse(uwp).expect("parses");
+        assert_eq!(
+            products[0].content_ids,
+            vec!["content-u"],
+            "the PC package, and only it"
+        );
+        assert_eq!(products[0].size_label(), "177 MB");
+    }
+
+    /// Being installable and being runnable here are different questions. A UWP
+    /// Appx is a PC package this launcher cannot open: the whole
+    /// decrypt-and-launch path is built for MSIXVC.
+    #[test]
+    fn the_package_format_says_whether_this_launcher_could_run_it() {
+        let products = parse(PAYLOAD).expect("parses");
+        assert_eq!(products[1].package_format.as_deref(), Some("MSIXVC"));
+        assert_eq!(products[1].is_runnable_here(), Some(true));
+
+        let uwp = r#"{"Products":[{
+          "ProductId": "9ZZTESTUWP01",
+          "LocalizedProperties": [{"ProductTitle": "A UWP App"}],
+          "DisplaySkuAvailabilities": [{"Sku": {"Properties": {"Packages": [
+            {"ContentId": "content-u", "PackageFormat": "Appx",
+             "PlatformDependencies": [{"PlatformName": "Windows.Universal"}]}
+          ]}}}]
+        }]}"#;
+        let products = parse(uwp).expect("parses");
+        assert_eq!(products[0].package_format.as_deref(), Some("Appx"));
+        assert_eq!(products[0].is_runnable_here(), Some(false));
+
+        // Nothing listed is not the same as "no".
+        let bare = parse(
+            r#"{"Products":[{"ProductId":"9ZZTESTBARE1",
+          "LocalizedProperties":[{"ProductTitle":"Bare"}]}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(bare[0].is_runnable_here(), None);
     }
 
     /// Some titles are Xbox-only. The honest answer is an empty set, which

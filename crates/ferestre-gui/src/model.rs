@@ -154,6 +154,10 @@ pub struct Inputs<'a> {
     /// answer is a filesystem probe, and keeping it out of here is what lets a
     /// test describe a half-installed machine in one line.
     pub installed: &'a dyn Fn(&Recipe) -> bool,
+    /// Whether a title with no recipe is nevertheless on disk, by product id.
+    /// Installed-but-undescribed happens when the automatic recipe could not
+    /// find an executable, or when somebody downloaded it by other means.
+    pub installed_product: &'a dyn Fn(&str) -> bool,
     /// Whether this window started the title and it has not exited. Only what
     /// this window started: a title launched from a terminal is not tracked,
     /// and claiming otherwise would need guessing from the process table.
@@ -457,6 +461,28 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
     let name = product
         .map(|p| p.name.clone())
         .unwrap_or_else(|| product_id.to_string());
+    // A PC package this runtime cannot open is worth naming before someone
+    // spends a download finding out. Candy Crush Saga is a UWP Appx; the whole
+    // decrypt-and-launch path here is built for MSIXVC.
+    if let Some(format) = product.filter(|p| p.is_runnable_here() == Some(false)) {
+        let container = format.package_format.as_deref().unwrap_or("that format");
+        return LibraryRow {
+            product_id: product_id.to_string(),
+            name,
+            subtitle: format!(
+                "{container} package, not MSIXVC — Ferestre installs Xbox GDK titles"
+            ),
+            badge: None,
+            image: product.and_then(|p| p.image.clone()),
+            owned: true,
+            has_recipe: false,
+            installed: false,
+            update: None,
+            action: Action::Blocked(format!(
+                "this is a {container} package; the runtime here opens MSIXVC packages"
+            )),
+        };
+    }
     let subtitle = match product {
         Some(p) => {
             let size = p.size_label();
@@ -479,7 +505,17 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
         has_recipe: false,
         installed: false,
         update: None,
-        action: Action::Adopt,
+        // Install, not "set up", *unless* it is already here. Nothing can
+        // describe a title before it is on disk, because the executable comes
+        // out of its package manifest -- and the install writes the recipe
+        // itself, so downloading is the whole flow for trying something nobody
+        // has tried. Once it is on disk and still undescribed, the manifest can
+        // be read, so setting it up is the thing to offer.
+        action: if (inputs.installed_product)(product_id) {
+            Action::Adopt
+        } else {
+            Action::Install
+        },
     }
 }
 
@@ -671,6 +707,7 @@ mod tests {
             available: empty_available(),
             installed,
             installed_version: NO_VERSION_ON_DISK,
+            installed_product: NOT_ON_DISK,
             running: NOTHING_RUNNING,
         }
     }
@@ -706,6 +743,7 @@ mod tests {
             last_update: None,
             content_ids: content_ids.iter().map(|s| s.to_string()).collect(),
             has_packages: !content_ids.is_empty(),
+            package_format: Some("MSIXVC".into()),
         }
     }
 
@@ -732,6 +770,8 @@ mod tests {
     const NO_VERSION_ON_DISK: &dyn Fn(&Recipe) -> Option<String> = &|_| None;
     /// And where the window has not started anything.
     const NOTHING_RUNNING: &dyn Fn(&str) -> bool = &|_| false;
+    /// And where an undescribed title is not on disk either.
+    const NOT_ON_DISK: &dyn Fn(&str) -> bool = &|_| false;
 
     #[test]
     fn a_playable_installed_title_plays() {
@@ -923,6 +963,7 @@ mod tests {
             available: &avail,
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
+            installed_product: NOT_ON_DISK,
             running: NOTHING_RUNNING,
         });
         assert_eq!(rows[0].action, Action::Update);
@@ -1020,6 +1061,7 @@ mod tests {
             available: &avail,
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
+            installed_product: NOT_ON_DISK,
             running: NOTHING_RUNNING,
         });
 
@@ -1040,7 +1082,9 @@ mod tests {
 
         let owned_not_described = by_id["9ZZTESTNEW3"];
         assert!(owned_not_described.owned && !owned_not_described.has_recipe);
-        assert_eq!(owned_not_described.action, Action::Adopt);
+        // Install, not "set up": nothing can describe a title that is not on
+        // disk yet, because the executable comes out of its package manifest.
+        assert_eq!(owned_not_described.action, Action::Install);
         assert!(owned_not_described.badge.is_none(), "no state to report");
         assert!(
             owned_not_described.subtitle.contains("no recipe"),
@@ -1073,6 +1117,7 @@ mod tests {
             available: &avail,
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
+            installed_product: NOT_ON_DISK,
             running: NOTHING_RUNNING,
         });
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
@@ -1102,6 +1147,7 @@ mod tests {
             available: &avail,
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
+            installed_product: NOT_ON_DISK,
             running: NOTHING_RUNNING,
         });
         assert_eq!(rows[0].action, Action::Update);
@@ -1131,6 +1177,7 @@ mod tests {
             available: &avail,
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
+            installed_product: NOT_ON_DISK,
             running: NOTHING_RUNNING,
         });
         assert_eq!(rows[0].update, None);
@@ -1242,6 +1289,7 @@ mod tests {
             available: &avail,
             installed: ALL_INSTALLED,
             installed_version: NO_VERSION_ON_DISK,
+            installed_product: NOT_ON_DISK,
             running,
         });
         assert_eq!(rows[0].action, Action::Stop);

@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use ferestre_core::catalog;
 use ferestre_core::install;
 use ferestre_core::launch;
 use ferestre_core::library;
@@ -493,7 +494,64 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
         // bookkeeping would be the tail wagging the dog.
         Err(e) => eprintln!("-- installed, but could not record the version: {e}"),
     }
+
+    // A title nobody has described can describe itself now that it is on disk.
+    // This is the moment it becomes possible: the package manifest names the
+    // executable, and before the download there was no manifest to read. Doing
+    // it here rather than in the window means `ferestre install <anything>`
+    // leaves something runnable whichever way it was invoked.
+    if recipe.is_none() {
+        match write_detected_recipe(&paths, &product_id, &dest) {
+            Ok(Some(path)) => eprintln!(
+                "-- wrote a recipe from the package manifest: {}\n\
+                    check it with `ferestre titles`, and edit it if the title \
+                 needs something else",
+                path.display()
+            ),
+            Ok(None) => eprintln!(
+                "-- no recipe, and the package manifest does not name an executable; \
+                 write one by hand: see titles/SCHEMA.md"
+            ),
+            Err(e) => eprintln!("-- could not write a recipe: {e}"),
+        }
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Write a recipe for a title that had none, from what the package says.
+///
+/// `Ok(None)` when the manifest names no executable -- honest rather than a
+/// guess, because a recipe pointing at the wrong binary produces a launch
+/// failure that looks like the launcher's fault rather than an unfinished
+/// description.
+fn write_detected_recipe(paths: &Paths, product_id: &str, dest: &Path) -> Result<Option<PathBuf>> {
+    let Some(executable) = install::executable(dest) else {
+        return Ok(None);
+    };
+
+    // The catalog knows the name; without it the product id is still a name.
+    let (market, language) = paths.market();
+    let (products, _) = catalog::resolve(
+        &paths.catalog_cache(),
+        &[product_id.to_string()],
+        &market,
+        &language,
+    );
+    let name = products
+        .iter()
+        .find(|p| p.product_id.eq_ignore_ascii_case(product_id))
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| product_id.to_string());
+
+    let mut recipe = Recipe::blank(product_id, &name);
+    recipe.launch.executable = executable;
+    // The download went to games_dir/<product id>, not to the slug the blank
+    // recipe would default to, so the recipe has to say where it actually is.
+    if let Ok(relative) = dest.strip_prefix(paths.games_dir()) {
+        recipe.install.dir = Some(relative.to_string_lossy().into_owned());
+    }
+    let path = recipe.save_to(&paths.user_titles_dir())?;
+    Ok(Some(path))
 }
 
 /// Write down what was just installed, so an update can be detected later.

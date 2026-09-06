@@ -344,6 +344,7 @@ fn draw_list(
     let running = |product_id: &str| running.contains_key(&product_id.to_ascii_uppercase());
     let installed = |r: &Recipe| model.is_installed(r);
     let installed_version = |r: &Recipe| model.installed_version(r);
+    let installed_product = |id: &str| model.product_is_installed(id);
     let rows: Vec<LibraryRow> = model::library(&Inputs {
         recipes: &model.recipes,
         runtime: model.runtime.as_ref(),
@@ -356,6 +357,7 @@ fn draw_list(
         available: &model.available,
         installed: &installed,
         installed_version: &installed_version,
+        installed_product: &installed_product,
         running: &running,
     })
     .into_iter()

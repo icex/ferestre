@@ -247,6 +247,15 @@ impl Model {
         Some((server, paths.prefix_dir(recipe).ok()?.join("pfx")))
     }
 
+    /// Whether a title with no recipe is on disk, where `ferestre install`
+    /// would have put it: games_dir/<product id>.
+    pub fn product_is_installed(&self, product_id: &str) -> bool {
+        self.paths
+            .as_ref()
+            .map(|p| p.games_dir().join(product_id.to_ascii_lowercase()))
+            .is_some_and(|dir| dir.is_dir())
+    }
+
     /// The entry point the installed package declares, if it is on disk.
     pub fn detected_executable(&self, recipe: &Recipe) -> Option<String> {
         let dir = self.paths.as_ref()?.install_dir(recipe).ok()?;
