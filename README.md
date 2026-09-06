@@ -1,4 +1,4 @@
-# gdk-linux
+# xgdk-launcher
 
 Running **Xbox GDK / Microsoft Store (MSIXVC) titles on Linux**, on a patched
 Wine/Proton with a from-scratch implementation of the Xbox Game Development Kit
@@ -64,6 +64,11 @@ directly. Everything has to go through the client's `run` path.
 
 ## Licence
 
-MIT for the original work here, LGPL-2.1-or-later for `patches/` because those
-are modifications to Wine. See [NOTICE](NOTICE) for the map and the upstream
-projects.
+Mixed, because the work is. MIT for the original tooling, tests, scripts and
+notes; LGPL-2.1-or-later for the Wine patches; GPL-3.0-or-later for the Xodus
+patches; BSD-3-Clause for the Proton one. [NOTICE](NOTICE) has the map.
+
+One consequence worth knowing before building on this: Xodus is GPL-3.0, and it
+is what signs in and downloads. A launcher that *shells out* to the `xodus-cli`
+binary is aggregation and may carry any licence; one that *links* the `xodus` or
+`msixvc` crates becomes GPL-3.0 itself.

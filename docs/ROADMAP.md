@@ -79,7 +79,14 @@ Smallest useful version, in order:
 4. Launch using the title's manifest
 5. Save management, then uninstall
 
-Two decisions worth stating up front:
+Three decisions worth stating up front:
+
+- **Shell out to the client, do not link it.** Xodus is GPL-3.0. Linking its
+  crates makes the launcher GPL-3.0 too; running `xodus-cli` as a child process
+  is aggregation and leaves the licence free. That is also the practical shape:
+  the decrypt-and-launch path lives in the *binary* crate, not a library, so
+  linking would mean lifting code out of a fork that cannot be upstreamed and
+  rebasing it forever.
 
 - **Steam integration is a toggle, not a policy.** By default the launcher runs
   an isolated runtime and strips Steam's injected environment, because the
@@ -149,3 +156,15 @@ These are judgement calls, not engineering ones:
    Valve or Xodus.
 3. **How the client is carried** — vendored, submodule, or a maintained fork —
    given upstream will not take these changes.
+
+## Known gaps, stated plainly
+
+- **There is no owned-title enumeration.** Every command today takes a product
+  id typed by hand; nothing anywhere lists what an account owns. "Show me my
+  games" is new work against a Microsoft endpoint, and it is the one feature a
+  launcher is judged on.
+- **There are no delta updates.** MSIXVC downloads are resumable but not
+  differential, so "update" currently means re-downloading the title. That is
+  ~2.5 GB for Bedrock but tens of gigabytes for a large title, which makes
+  update detection close to useless until it is solved. Epic's chunked manifests
+  give Heroic deltas for free; this has no equivalent yet.

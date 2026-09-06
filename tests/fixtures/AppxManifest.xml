@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Hand-written fixture for the app-model regression tests. Not extracted from
+     a shipped package: it carries only the identity fields the tests need in
+     order to check that a real title's package family name is derived
+     correctly. -->
 <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
   <Identity Name="Microsoft.MinecraftUWP"
             Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"

@@ -1,9 +1,8 @@
 Licensing map
 =============
 
-This repository contains two kinds of material, under two licences. Which
-applies depends on the directory, because part of the work is original and part
-of it is a modification of someone else's project.
+This repository mixes original work with modifications to three other projects,
+each under a different licence. Which applies depends on the directory.
 
 MIT (see LICENSE)
 -----------------
@@ -13,37 +12,70 @@ MIT (see LICENSE)
   build and launch scripts, and the written notes. Reuse, modify and fork
   freely; attribution is the only condition.
 
+  tests/ and tools/ include a few Wine headers when they are built. That does
+  not change their licence, but you need a Wine source tree to build them.
+
 LGPL-2.1-or-later (see LICENSE.LGPL-2.1)
 ----------------------------------------
-  patches/
+  patches/wine/      patches/xgameruntime/
 
-  These are modifications to Wine and to Proton, distributed as plain git
-  diffs. Wine is LGPL-2.1-or-later, so a modification of it is too, and it
-  stays that way however it is redistributed. If you ship binaries built from
-  these patches you must also make the corresponding source available, as the
-  LGPL requires.
+  Modifications to Wine, distributed as plain git diffs. Wine is
+  LGPL-2.1-or-later, so a modification of it is too, and it stays that way
+  however it is redistributed. Ship binaries built from these and you must make
+  the corresponding source available.
 
-  Note that tests/ and tools/ include a few Wine headers when they are built.
-  That does not change their licence, but it does mean you need a Wine source
-  tree to build them.
+GPL-3.0-or-later
+----------------
+  patches/xodus-cli/
+
+  Modifications to Xodus, which is GPL-3.0. These patches are derivative works
+  of it and carry its licence.
+
+BSD-3-Clause (Valve)
+--------------------
+  patches/proton/
+
+  A modification to Proton's top-level `proton` script, which is covered by
+  Valve's licence (see LICENSE.proton in the Proton tree).
+
+What this means for a launcher built on this
+--------------------------------------------
+Xodus is GPL-3.0, and it is what signs in, fetches a licence and downloads and
+decrypts a package. How a launcher uses it decides the launcher's own licence:
+
+  * **Shelling out to the `xodus-cli` binary** — separate process, arm's-length
+    interface — is aggregation. The launcher may then be under any licence.
+    This is how Heroic uses legendary, and it is the recommended shape here for
+    that reason among others.
+
+  * **Linking the `xodus` or `msixvc` Rust crates** makes the launcher a
+    derivative work of GPL-3.0 code, so the launcher must be GPL-3.0 too.
+
+Note also that the pieces are mutually compatible in that direction:
+LGPL-2.1-**or-later** can be taken to GPL-3.0, and MIT is compatible with
+everything here. The reverse is not true, so GPL-3.0 code must not be pulled
+into the MIT-licensed directories.
 
 Upstream projects
 -----------------
   Wine            https://www.winehq.org/            LGPL-2.1-or-later
   Proton          https://github.com/ValveSoftware/Proton
-                  Valve's own components carry the BSD-style licence in
-                  Proton's LICENSE; the Wine inside it remains LGPL.
-  Xodus           https://github.com/xodus-gaming
-                  The client that signs in, fetches a licence and downloads
-                  and decrypts a package. Not affiliated with this project,
-                  and this project's patches are not submitted upstream --
-                  Xodus operates a clean-room policy that excludes
-                  AI-assisted contributions.
+                  Valve's top-level components are BSD-3-Clause; the Wine
+                  inside it remains LGPL-2.1-or-later.
+  Xodus           https://github.com/xodus-gaming    GPL-3.0
+                  The client that signs in, fetches a licence, and downloads
+                  and decrypts a package. Not affiliated with this project.
+                  These patches are not submitted upstream: Xodus operates a
+                  clean-room policy that excludes AI-assisted contributions.
 
 Trademarks
 ----------
   Xbox, Microsoft, the Microsoft Store, Minecraft and the titles named in the
   documentation are trademarks of their respective owners. This project is not
-  affiliated with, endorsed by, or connected to Microsoft, Mojang, Valve or
-  the Xodus project. Names are used only to describe what the software is
+  affiliated with, endorsed by, or connected to Microsoft, Mojang, Valve or the
+  Xodus project. Names are used only to describe what the software is
   compatible with.
+
+  Test fixtures under tests/fixtures/ are hand-written and carry only the
+  identifier fields the tests need. No game content, package, licence or key is
+  present in this repository, and none will be.
