@@ -1,0 +1,133 @@
+diff --git a/xsystemanalytics.c b/xsystemanalytics.c
+--- a/xsystemanalytics.c
++++ b/xsystemanalytics.c
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include "private.h"
++#include "winternl.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+ 
+@@ -68,6 +69,40 @@
+     return ref;
+ }
+ 
++/* What this machine is, without asking WinRT.
++ *
++ * Every failure path below used to `return NULL`, and that is not a thing this
++ * function may do. It returns a struct *by value*: the caller passes the buffer
++ * in `__ret` and expects the same pointer back in rax, then copies the struct
++ * out of it. Goat Simulator 3 does exactly that --
++ *
++ *     call rax             ; XSystemGetAnalyticsInfo
++ *     movups xmm0,[rax]    ; copy the 32 bytes it returned
++ *
++ * -- so returning NULL is a null dereference in the title, one instruction
++ * later, with nothing in the log to say why.
++ *
++ * The answer is also not a guess: on Windows this reports the Desktop device
++ * family, which is what the successful path derives by splitting
++ * "Windows.Desktop" at the dot, and the version is the one the OS reports. */
++static void analytics_info_fallback( XSystemAnalyticsInfo *info )
++{
++    RTL_OSVERSIONINFOEXW version = { .dwOSVersionInfoSize = sizeof(version) };
++
++    memset( info, 0, sizeof(*info) );
++    strcpy( info->family, "Windows" );
++    strcpy( info->form, "Desktop" );
++
++    if (!RtlGetVersion( &version ))
++    {
++        info->osVersion.major = version.dwMajorVersion;
++        info->osVersion.minor = version.dwMinorVersion;
++        info->osVersion.build = version.dwBuildNumber;
++        info->osVersion.revision = 0;
++    }
++    info->hostingOsVersion = info->osVersion;
++}
++
+ static XSystemAnalyticsInfo* WINAPI x_system_analytics_XSystemGetAnalyticsInfo( IXSystemAnalyticsImpl *iface, XSystemAnalyticsInfo *__ret )
+ {
+     /* For Windows, XSystemAnalyticsInfo->form is always "Desktop" */
+@@ -86,21 +121,21 @@
+     TRACE( "iface %p.\n", iface );
+ 
+     status = WindowsCreateString( analytics_info_str, wcslen( analytics_info_str ), &analytics_info_class );
+-    if (FAILED( status )) return NULL;
++    if (FAILED( status )) goto fallback;
+ 
+     status = RoGetActivationFactory( analytics_info_class, &IID_IAnalyticsInfoStatics, (void **)&analytics_info_statics );
+     WindowsDeleteString( analytics_info_class );
+-    if (FAILED( status )) return NULL;
++    if (FAILED( status )) goto fallback;
+ 
+     status = IAnalyticsInfoStatics_get_VersionInfo( analytics_info_statics, &analytics_version_info );
+     IAnalyticsInfoStatics_Release( analytics_info_statics );
+-    if (FAILED( status )) return NULL;
++    if (FAILED( status )) goto fallback;
+ 
+     status = IAnalyticsVersionInfo_get_DeviceFamilyVersion( analytics_version_info, &deviceFamilyVersion );
+     if (FAILED( status ))
+     {
+         IAnalyticsVersionInfo_Release( analytics_version_info );
+-        return NULL;
++        goto fallback;
+     }
+ 
+     status = IAnalyticsVersionInfo_get_DeviceFamily( analytics_version_info, &deviceFamily );
+@@ -108,7 +143,7 @@
+     if (FAILED( status ))
+     {
+         WindowsDeleteString( deviceFamilyVersion );
+-        return NULL;
++        goto fallback;
+     }
+ 
+     deviceFamilyStr = WindowsGetStringRawBuffer( deviceFamily, NULL );
+@@ -119,7 +154,7 @@
+     {
+         WindowsDeleteString( deviceFamilyVersion );
+         WindowsDeleteString( deviceFamily );
+-        return NULL;
++        goto fallback;
+     }
+ 
+     if (!WideCharToMultiByte( CP_UTF8, 0, deviceFamilyStr, -1, str, strSize, NULL, NULL ))
+@@ -127,7 +162,7 @@
+         WindowsDeleteString( deviceFamilyVersion );
+         WindowsDeleteString( deviceFamily );
+         free( str );
+-        return NULL;
++        goto fallback;
+     }
+ 
+     splitter = strchr( str, '.' );
+@@ -149,14 +184,14 @@
+     if (!str)
+     {
+         WindowsDeleteString( deviceFamilyVersion );
+-        return NULL;
++        goto fallback;
+     }
+ 
+     if (!WideCharToMultiByte( CP_UTF8, 0, deviceFamilyVersionStr, -1, str, strSize, NULL, NULL ))
+     {
+         WindowsDeleteString( deviceFamilyVersion );
+         free( str );
+-        return NULL;
++        goto fallback;
+     }
+ 
+     version = strtoull( str, NULL, 10 );
+@@ -173,6 +208,10 @@
+     *__ret = info;
+ 
+     return __ret;
++
++fallback:
++    analytics_info_fallback( __ret );
++    return __ret;
+ }
+ 
+ static const struct IXSystemAnalyticsImplVtbl x_system_analytics_vtbl =

@@ -59,6 +59,50 @@ verify = [
 ]
 
 [[capability]]
+name = "winrt.loggingchannel"
+summary = """
+Windows.Foundation.Diagnostics.LoggingChannel and LoggingChannelOptions are \
+activatable, hosted in windows.system.profile.systemid.dll."""
+provided-by = ["patches/wine/0008-loggingchannel-winrt-classes.patch"]
+symptom-if-missing = "RoGetActivationFactory fails for the class and the title dereferences what it got back -- Age of Empires Definitive Edition faults reading 0xFFFFFFFFFFFFFFFF on the next instruction"
+note = """
+Interface ids and method order are the published ones from the Windows SDK's \
+own IDL, not inferred. That distinction is load-bearing: the factory a title \
+asks for is ILoggingChannelFactory2, whose *second* method is the one it calls, \
+and a vtable one entry short sends it jumping to address zero."""
+winrt-classes = [
+    { class = "Windows.Foundation.Diagnostics.LoggingChannel", dll = "windows.system.profile.systemid.dll" },
+    { class = "Windows.Foundation.Diagnostics.LoggingChannelOptions", dll = "windows.system.profile.systemid.dll" },
+]
+verify = [
+    { file = "files/lib/wine/x86_64-windows/windows.system.profile.systemid.dll", contains = "LoggingChannelOptions" },
+]
+
+[[capability]]
+name = "loader.exception-bytes"
+summary = "An access violation logs the faulting instruction's bytes, not just its address."
+provided-by = ["patches/wine/0007-dump-faulting-bytes-for-access-violations.patch"]
+symptom-if-missing = "a crash in a title gives an address and nothing else; the image is decrypted into a memfd, so there is nothing on disk to disassemble afterwards"
+note = "Diagnostic only, and it paid for itself twice: the bytes said `cmp byte ptr [rdi+rax], 0` in a loop, which is a strlen on a pointer somebody handed the title."
+verify = [
+    { file = "files/lib/wine/x86_64-windows/ntdll.dll", contains = "Code %p-32..+16" },
+]
+
+[[capability]]
+name = "xgameruntime.analytics-info"
+summary = "XSystemGetAnalyticsInfo fills the caller's buffer and returns it, on every path including the failing ones."
+provided-by = ["patches/xgameruntime/0002-analytics-info-must-return-the-callers-buffer.patch"]
+symptom-if-missing = "the title faults one instruction after the call, on `movups xmm0,[rax]` -- Goat Simulator 3 does exactly that and exits 3"
+note = """
+The API returns a struct by value, which in this ABI means the caller passes the \
+buffer and expects the same pointer back. Returning NULL on a failure path is \
+therefore a null dereference in the *title*, one instruction later, with nothing \
+in the log to say why. There is no failure path where NULL is a legal answer."""
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "Desktop" },
+]
+
+[[capability]]
 name = "appmodel.package-identity"
 summary = "kernelbase reports the current process's package identity from the manifest beside the executable, so GetCurrentPackageFullName and friends succeed."
 provided-by = ["patches/wine/0002-kernelbase-current-package-identity.patch"]

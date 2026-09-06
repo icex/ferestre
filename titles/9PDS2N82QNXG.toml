@@ -1,0 +1,46 @@
+# Goat Simulator 3: Windows Edition -- Microsoft Store / Game Pass
+#
+# An Unreal WinGDK title, the same shape as Expedition 33. It used to fault one
+# instruction after calling XSystemGetAnalyticsInfo, and the reason is worth
+# knowing: that API returns a struct *by value*, so the caller passes a buffer
+# and expects the same pointer back. Every failure path in the runtime returned
+# NULL instead, and this title does
+#
+#     call rax             ; XSystemGetAnalyticsInfo
+#     movups xmm0,[rax]    ; copy the 32 bytes it returned
+#
+# so NULL was a fault in the title's own code with nothing to explain it. Fixed
+# in the runtime, not here.
+
+schema = 1
+
+[title]
+product-id      = "9PDS2N82QNXG"
+name            = "Goat Simulator 3: Windows Edition"
+slug            = "goat-simulator-3"
+publisher       = "Coffee Stain Publishing"
+install-size-gb = 26.0
+
+
+[launch]
+executable = 'Goat2\Binaries\WinGDK\Goat2-WinGDK-Shipping.exe'
+
+[runtime]
+requires = [
+    "loader.memfd-main-image",
+    "xgameruntime.analytics-info",
+]
+
+[status]
+state   = "playable-with-issues"
+summary = "Boots and plays; the online features do not work."
+last-verified = 2026-09-06
+
+[[issues]]
+symptom = "Online features do not work."
+cause = """
+The title polls the user state in a tight loop and never gets what it wants: one \
+run counted 27,932 XUserDuplicateHandle and 27,931 XUserCloseHandle calls beside \
+9,333 XUserGetId, which is a retry that never succeeds rather than a title doing \
+work. What it is waiting for has not been established."""
+fix = "none known"

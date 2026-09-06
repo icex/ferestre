@@ -1,0 +1,25 @@
+diff --git a/dlls/ntdll/exception.c b/dlls/ntdll/exception.c
+--- a/dlls/ntdll/exception.c
++++ b/dlls/ntdll/exception.c
+@@ -214,10 +214,17 @@
+ 
+         /* An illegal instruction is nearly always a deliberate trap -- ud2 from
+          * a failed check, or an instruction the CPU does not have -- and which
+-         * one it is decides where to look next. Dump the bytes: the faulting
+-         * image may exist only in memory, decrypted into a memfd with nothing
+-         * on disk to disassemble, so a debugger cannot recover them later. */
+-        if (rec->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION && rec->ExceptionAddress)
++         * one it is decides where to look next. An access violation is the same
++         * question in a different form: the instruction says what was being
++         * dereferenced, and a `cmp byte ptr [rdi+rax], 0` in a loop is a strlen
++         * on a pointer somebody handed the title.
++         *
++         * Dump the bytes for both: the faulting image may exist only in memory,
++         * decrypted into a memfd with nothing on disk to disassemble, so a
++         * debugger cannot recover them later and neither can anyone reading the
++         * log afterwards. */
++        if ((rec->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION ||
++             rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) && rec->ExceptionAddress)
+         {
+             char bytes[48 * 3 + 1];
+             unsigned int i;

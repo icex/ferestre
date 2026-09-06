@@ -1,0 +1,25 @@
+# Overthrown -- Microsoft Store / Game Pass
+#
+# A plain GDK title. Notable only for how it first appeared to fail: the
+# download broke, intermittently, on a buffering race in the client's prefix
+# cache -- nothing to do with the title. See patch 0008 of the client series.
+
+schema = 1
+
+[title]
+product-id      = "9MT5KSV3RCWD"
+name            = "Overthrown"
+slug            = "overthrown"
+install-size-gb = 0.05
+
+
+[launch]
+executable = 'Overthrown.exe'
+
+[runtime]
+requires = ["loader.memfd-main-image"]
+
+[status]
+state   = "playable"
+summary = "Plays."
+last-verified = 2026-09-06

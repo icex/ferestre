@@ -1,0 +1,26 @@
+# DREDGE -- Microsoft Store / Game Pass
+#
+# A plain GDK title and the least eventful one here: the package manifest names
+# the executable, nothing beyond the runtime's own capabilities is needed, and
+# the recipe is what the launcher writes for itself.
+
+schema = 1
+
+[title]
+product-id      = "9MSVVM5NS9L6"
+name            = "DREDGE"
+slug            = "dredge"
+publisher       = "Team17"
+install-size-gb = 0.83
+
+
+[launch]
+executable = 'DREDGE.exe'
+
+[runtime]
+requires = ["loader.memfd-main-image"]
+
+[status]
+state   = "playable"
+summary = "Plays."
+last-verified = 2026-09-06

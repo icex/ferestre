@@ -1,0 +1,34 @@
+# DOOM 64 (Nightdive KEX engine) -- Microsoft Store / Game Pass
+#
+# The reason this title is worth a packaged recipe: it asks Windows for the path
+# of its own executable and calls strlen on the answer. A GDK main image is
+# mapped from a memfd, which has no name in the NT namespace, so the answer was
+# an empty string and the title died before drawing a frame -- rc=3, and nothing
+# in the log. Nothing in a recipe could have fixed that; see
+# `loader.image-name-for-mapped-image`.
+
+schema = 1
+
+[title]
+product-id       = "9MXND4PQLK3W"
+name             = "DOOM 64"
+slug             = "doom-64"
+publisher        = "Bethesda Softworks"
+package-identity = "BethesdaSoftworks.Doom641997"
+title-id         = "7f5169e4"
+install-size-gb  = 0.11
+
+
+[launch]
+executable = 'DOOM64_x64.exe'
+
+[runtime]
+requires = [
+    "loader.memfd-main-image",
+    "loader.image-name-for-mapped-image",
+]
+
+[status]
+state   = "playable"
+summary = "Plays."
+last-verified = 2026-09-06
