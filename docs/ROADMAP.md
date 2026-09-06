@@ -396,6 +396,45 @@ These are judgement calls, not engineering ones:
 
 ## Known gaps, stated plainly
 
+- **Two titles crash on a null pointer the runtime handed them, and both fixes
+  are runtime-wide rather than per-title.** Neither is fixed: both need a change
+  inside the Wine fork and a rebuilt runtime, and there is no mingw toolchain on
+  the machine they were diagnosed on, so neither could be compiled or tested.
+
+  **Age of Empires Definitive Edition** — diagnosed, and the fix is clear.
+  Thread `0224` asks for a WinRT class the fork does not implement, and
+  dereferences what it gets back:
+
+  ```text
+  0224:err:combase:RoGetActivationFactory Failed to find library for
+        L"Windows.Foundation.Diagnostics.LoggingChannelOptions"
+  wine: Unhandled page fault on read access to FFFFFFFFFFFFFFFF at
+        address 0000000140392304 (thread 0224), starting debugger...
+  ```
+
+  Same thread, consecutive lines, requested IID
+  `{a93151da-7faf-4191-8755-5e86dc65d896}`. Nothing in the tree implements
+  `Windows.Foundation.Diagnostics` -- no IDL, no class -- so the fix is to host
+  `LoggingChannel` and `LoggingChannelOptions` in an existing WinRT dll and
+  no-op the logging, exactly the way
+  `patches/wine/0004-regionpolicyevaluator-winrt-class.patch` hosts
+  `RegionPolicyEvaluator` in `windows.system.profile.systemid`. Every title gets
+  it, no recipe involved.
+
+  **DOOM 64** — narrowed, not solved. It writes its own crash log: an access
+  violation reading address 0 at `DOOM64_x64.exe+0x55b03`, with rax, rdx, rsi,
+  rdi, r8 and r9 all zero. The GDK calls it makes before that all succeed --
+  `XStoreQueryGameLicense{Async,Result}` returns an active perpetual licence,
+  `XSystemGetXboxLiveSandboxId` returns `RETAIL`, `XGameGetXboxTitleId` answers
+  -- so nothing obviously hands it the null.
+
+  The one suspicious thing is `XUserRegisterForChangeEvent`, which it calls once
+  and which is a no-op stub returning a token that never fires. No `XUserAdd`
+  ever follows, so the title never gets a user. That is the same shape as a bug
+  already fixed once here -- a `Register*Changed` stub that returned `S_OK`
+  without delivering the current value left libHttpClient believing there was no
+  network -- but it is a hypothesis, and saying so is the point.
+
 - **An install can fail while the client exits zero.** A title the account is
   not licensed for prints `not entitled to this content` and returns success,
   leaving a directory holding a partial container. The launcher used to believe
