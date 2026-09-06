@@ -26,14 +26,16 @@ pkgbase = ferestre-client
 	conflicts = xodus-cli
 	conflicts = xodus-cli-git
 	source = xodus::git+https://github.com/xodus-gaming/xodus.git#commit=3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
-	source = https://raw.githubusercontent.com/icex/ferestre/72c210e0c40263e84695860424392322a9e2544c/patches/xodus-cli/0002-relying-party-device-claim-and-no-panic.patch
-	source = https://raw.githubusercontent.com/icex/ferestre/72c210e0c40263e84695860424392322a9e2544c/patches/xodus-cli/0003-owned-title-enumeration.patch
-	source = https://raw.githubusercontent.com/icex/ferestre/72c210e0c40263e84695860424392322a9e2544c/patches/xodus-cli/0004-account-and-probe-headers.patch
-	source = https://raw.githubusercontent.com/icex/ferestre/72c210e0c40263e84695860424392322a9e2544c/patches/xodus-cli/0005-win32-path-for-the-mapped-main-image.patch
+	source = https://raw.githubusercontent.com/icex/ferestre/5d5475103f545d7bc5c59a7e107ceed6403e6259/patches/xodus-cli/0002-relying-party-device-claim-and-no-panic.patch
+	source = https://raw.githubusercontent.com/icex/ferestre/5d5475103f545d7bc5c59a7e107ceed6403e6259/patches/xodus-cli/0003-owned-title-enumeration.patch
+	source = https://raw.githubusercontent.com/icex/ferestre/5d5475103f545d7bc5c59a7e107ceed6403e6259/patches/xodus-cli/0004-account-and-probe-headers.patch
+	source = https://raw.githubusercontent.com/icex/ferestre/5d5475103f545d7bc5c59a7e107ceed6403e6259/patches/xodus-cli/0005-win32-path-for-the-mapped-main-image.patch
+	source = https://raw.githubusercontent.com/icex/ferestre/5d5475103f545d7bc5c59a7e107ceed6403e6259/patches/xodus-cli/0006-streaming-progress-a-launcher-can-read-behind-XODUS_.patch
 	sha256sums = SKIP
 	sha256sums = 20d613add707a69f488b50041e53c60f8a0096132c05338b66d594fa8963c918
 	sha256sums = c15806efefdfe7613755ada8ee0fe28784ad955ea7df26825ddeabc7be731256
 	sha256sums = 304c5e0f309c9609e9578f79f96fbf2800e429b72b26bbd590ad1e3fbdf05efd
 	sha256sums = b5c9feec3aa4dba5f287609d5ae3727e5fb38aa4cf967997bfb5901d2b3a3d47
+	sha256sums = ab51b007ed0b8802785be1b000ba78185f25760850174de55e2667ed64ac4a2d
 
 pkgname = ferestre-client
