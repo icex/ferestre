@@ -23,6 +23,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -403,6 +404,16 @@ def main():
     # account exactly seven ship as MSIXVC; the rest are UWP packages this
     # runtime cannot open. A fixture with one of each would pass a filter that
     # is useless at the size that matters.
+    # The cache refuses an entry written by a different build, which is the
+    # whole point of the field -- so a fixture that hardcodes a number seeds a
+    # cache the window correctly ignores, and every check below times out
+    # waiting for a row that will never draw. Read it from the constant instead.
+    catalog_rs = os.path.join(os.getcwd(), "crates", "ferestre-core", "src", "catalog.rs")
+    schema = re.search(r"const CACHE_SCHEMA: u32 = (\d+);", open(catalog_rs).read())
+    if not schema:
+        raise Failure(f"no CACHE_SCHEMA in {catalog_rs}; has it been renamed?")
+    schema = int(schema.group(1))
+
     state = os.path.join(home, "state", "ferestre")
     catalog = os.path.join(home, "cache", "ferestre", "catalog")
     os.makedirs(state, exist_ok=True)
@@ -426,7 +437,7 @@ def main():
         with open(os.path.join(catalog, f"{pid}.json"), "w") as f:
             json.dump(
                 {
-                    "schema": 2,
+                    "schema": schema,
                     "product": {
                         "product_id": pid,
                         "name": name,
@@ -434,6 +445,7 @@ def main():
                         "download_bytes": size,
                         "content_ids": [f"contentid-{pid.lower()}"],
                         "has_packages": True,
+                        "has_pc_package": True,
                         "package_format": package_format,
                     },
                 },

@@ -1,0 +1,890 @@
+{
+ "Products": [
+  {
+   "ProductId": "9N82W416G5KK",
+   "LocalizedProperties": [
+    {
+     "ProductTitle": "Battlefield™ 6 Open Beta",
+     "PublisherName": "Electronic Arts"
+    }
+   ],
+   "DisplaySkuAvailabilities": [
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2025-09-15T15:26:41.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "9a6346ce-51b6-44be-9695-f056e2707b30",
+         "MaxDownloadSizeInBytes": 40342130688,
+         "PackageFormat": "XVC",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Xbox"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2025-09-15T15:26:41.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "9a6346ce-51b6-44be-9695-f056e2707b30",
+         "MaxDownloadSizeInBytes": 40342130688,
+         "PackageFormat": "XVC",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Xbox"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "ProductId": "9NG1JPX403JM",
+   "LocalizedProperties": [
+    {
+     "ProductTitle": "TEKKEN 8 - DEMO",
+     "PublisherName": "Bandai Namco Entertainment America Inc."
+    }
+   ],
+   "DisplaySkuAvailabilities": [
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2025-05-07T03:20:31.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "da5b17c6-1022-4c7b-bd1f-1c498355070e",
+         "MaxDownloadSizeInBytes": 27077484544,
+         "PackageFormat": "XVC",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Xbox"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2025-05-07T03:20:31.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "da5b17c6-1022-4c7b-bd1f-1c498355070e",
+         "MaxDownloadSizeInBytes": 27077484544,
+         "PackageFormat": "XVC",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Xbox"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "ProductId": "9NKJ0VZQ4N0L",
+   "LocalizedProperties": [
+    {
+     "ProductTitle": "It Takes Two",
+     "PublisherName": "Electronic Arts"
+    }
+   ],
+   "DisplaySkuAvailabilities": [
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2026-08-13T09:45:25.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "8cb82994-85e5-4b7a-bead-40976c34f2d9",
+         "MaxDownloadSizeInBytes": 31281860608,
+         "PackageFormat": "XVC",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Xbox"
+          }
+         ]
+        },
+        {
+         "ContentId": "8cb82994-85e5-4b7a-bead-40976c34f2d9",
+         "MaxDownloadSizeInBytes": 48246886400,
+         "PackageFormat": "XVC",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Xbox"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2026-08-13T09:45:25.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "8cb82994-85e5-4b7a-bead-40976c34f2d9",
+         "MaxDownloadSizeInBytes": 31281860608,
+         "PackageFormat": "XVC",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Xbox"
+          }
+         ]
+        },
+        {
+         "ContentId": "8cb82994-85e5-4b7a-bead-40976c34f2d9",
+         "MaxDownloadSizeInBytes": 48246886400,
+         "PackageFormat": "XVC",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Xbox"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2026-08-13T09:45:25.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "8cb82994-85e5-4b7a-bead-40976c34f2d9",
+         "MaxDownloadSizeInBytes": 31281860608,
+         "PackageFormat": "XVC",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Xbox"
+          }
+         ]
+        },
+        {
+         "ContentId": "8cb82994-85e5-4b7a-bead-40976c34f2d9",
+         "MaxDownloadSizeInBytes": 48246886400,
+         "PackageFormat": "XVC",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Xbox"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "ProductId": "9NMG7ZJ9XK0H",
+   "LocalizedProperties": [
+    {
+     "ProductTitle": "It Takes Two - Friend's Pass",
+     "PublisherName": "Electronic Arts"
+    }
+   ],
+   "DisplaySkuAvailabilities": [
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2025-06-24T20:53:02.0000000Z",
+       "BundledSkus": [
+        {
+         "BigId": "9NKJ0VZQ4N0L",
+         "DisplayRank": 0,
+         "IsPrimary": false,
+         "FulfillmentType": null
+        }
+       ],
+       "Packages": []
+      }
+     }
+    }
+   ]
+  },
+  {
+   "ProductId": "9NNFG8BQRCXL",
+   "LocalizedProperties": [
+    {
+     "ProductTitle": "Call of Duty®: Warzone™",
+     "PublisherName": "Activision Publishing Inc."
+    }
+   ],
+   "DisplaySkuAvailabilities": [
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2026-07-23T18:37:48.0000000Z",
+       "BundledSkus": [
+        {
+         "BigId": "9N201KQXS5BM",
+         "DisplayRank": 0,
+         "IsPrimary": true,
+         "FulfillmentType": null
+        },
+        {
+         "BigId": "9NKNP2K9Z3W6",
+         "DisplayRank": 1,
+         "IsPrimary": false,
+         "FulfillmentType": null
+        }
+       ],
+       "Packages": []
+      }
+     }
+    }
+   ]
+  },
+  {
+   "ProductId": "9NXP44L49SHJ",
+   "LocalizedProperties": [
+    {
+     "ProductTitle": "Minecraft: Java & Bedrock Edition for PC",
+     "PublisherName": "Microsoft Studios"
+    }
+   ],
+   "DisplaySkuAvailabilities": [
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2026-08-12T02:16:17.0000000Z",
+       "BundledSkus": [
+        {
+         "BigId": "9PGW18NPBZV5",
+         "DisplayRank": 0,
+         "IsPrimary": false,
+         "FulfillmentType": null
+        },
+        {
+         "BigId": "9NBLGGH2JHXJ",
+         "DisplayRank": 1,
+         "IsPrimary": false,
+         "FulfillmentType": null
+        },
+        {
+         "BigId": "9PJ8266BHFWN",
+         "DisplayRank": 2,
+         "IsPrimary": false,
+         "FulfillmentType": null
+        }
+       ],
+       "Packages": []
+      }
+     }
+    }
+   ]
+  },
+  {
+   "ProductId": "9NXVC0482QS5",
+   "LocalizedProperties": [
+    {
+     "ProductTitle": "It Takes Two - Digital Version",
+     "PublisherName": "Electronic Arts"
+    }
+   ],
+   "DisplaySkuAvailabilities": [
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2026-08-13T07:32:43.0000000Z",
+       "BundledSkus": [
+        {
+         "BigId": "9NM4RGZ49TMK",
+         "DisplayRank": 0,
+         "IsPrimary": false,
+         "FulfillmentType": null
+        },
+        {
+         "BigId": "9NKJ0VZQ4N0L",
+         "DisplayRank": 1,
+         "IsPrimary": false,
+         "FulfillmentType": null
+        }
+       ],
+       "Packages": []
+      }
+     }
+    },
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2026-08-13T07:32:43.0000000Z",
+       "BundledSkus": [
+        {
+         "BigId": "9NM4RGZ49TMK",
+         "DisplayRank": 0,
+         "IsPrimary": false,
+         "FulfillmentType": null
+        },
+        {
+         "BigId": "9NKJ0VZQ4N0L",
+         "DisplayRank": 1,
+         "IsPrimary": false,
+         "FulfillmentType": null
+        }
+       ],
+       "Packages": []
+      }
+     }
+    }
+   ]
+  },
+  {
+   "ProductId": "9PNJXVCVWD4K",
+   "LocalizedProperties": [
+    {
+     "ProductTitle": "Forza Horizon 4 Standard Edition",
+     "PublisherName": "Microsoft Studios"
+    }
+   ],
+   "DisplaySkuAvailabilities": [
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2026-02-18T23:54:36.0000000Z",
+       "BundledSkus": [
+        {
+         "BigId": "9PNQKHFLD2WQ",
+         "DisplayRank": 0,
+         "IsPrimary": true,
+         "FulfillmentType": null
+        },
+        {
+         "BigId": "9NVKDJ03CZZ8",
+         "DisplayRank": 1,
+         "IsPrimary": false,
+         "FulfillmentType": null
+        }
+       ],
+       "Packages": []
+      }
+     }
+    }
+   ]
+  },
+  {
+   "ProductId": "9WZDNCRDFSHB",
+   "LocalizedProperties": [
+    {
+     "ProductTitle": "Wake On Lan",
+     "PublisherName": "Sepiro Ltd"
+    }
+   ],
+   "DisplaySkuAvailabilities": [
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2024-11-20T01:05:25.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "d6e57138-0da0-dede-f3d3-a2d5ff9bb402",
+         "MaxDownloadSizeInBytes": 264499,
+         "PackageFormat": "appx",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Windows8x"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2024-11-20T01:05:25.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "d6e57138-0da0-dede-f3d3-a2d5ff9bb402",
+         "MaxDownloadSizeInBytes": 264499,
+         "PackageFormat": "appx",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Windows8x"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "ProductId": "9WZDNCRDN17M",
+   "LocalizedProperties": [
+    {
+     "ProductTitle": "Digi.Online",
+     "PublisherName": "RCS and RDS"
+    }
+   ],
+   "DisplaySkuAvailabilities": [
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2020-10-12T05:07:16.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "24550391-ebbb-b90e-5fec-c9d57c65854a",
+         "MaxDownloadSizeInBytes": 2179274,
+         "PackageFormat": "Xap",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.WindowsPhone8x"
+          }
+         ]
+        },
+        {
+         "ContentId": "85e4f47c-09c8-6d5f-6821-86c75525f171",
+         "MaxDownloadSizeInBytes": 4192963,
+         "PackageFormat": "appxbundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Windows8x"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2020-10-12T05:07:16.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "24550391-ebbb-b90e-5fec-c9d57c65854a",
+         "MaxDownloadSizeInBytes": 2179274,
+         "PackageFormat": "Xap",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.WindowsPhone8x"
+          }
+         ]
+        },
+        {
+         "ContentId": "85e4f47c-09c8-6d5f-6821-86c75525f171",
+         "MaxDownloadSizeInBytes": 4192963,
+         "PackageFormat": "appxbundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Windows8x"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "ProductId": "9WZDNCRFJ3PV",
+   "LocalizedProperties": [
+    {
+     "ProductTitle": "Windows Scan",
+     "PublisherName": "Microsoft Corporation"
+    }
+   ],
+   "DisplaySkuAvailabilities": [
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2026-06-11T16:59:10.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "e6836156-6348-ee2b-01b6-a3e6a83a2f75",
+         "MaxDownloadSizeInBytes": 4293731,
+         "PackageFormat": "appxbundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Windows8x"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2026-06-11T16:59:10.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "e6836156-6348-ee2b-01b6-a3e6a83a2f75",
+         "MaxDownloadSizeInBytes": 4293731,
+         "PackageFormat": "appxbundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Windows8x"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "ProductId": "9WZDNCRFJ3T0",
+   "LocalizedProperties": [
+    {
+     "ProductTitle": "VLC for Windows Store",
+     "PublisherName": "VideoLAN"
+    }
+   ],
+   "DisplaySkuAvailabilities": [
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2026-06-09T00:44:57.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "05b87da7-95d0-3e7a-5a0c-2d9373523ffc",
+         "MaxDownloadSizeInBytes": 43424888,
+         "PackageFormat": "appxbundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Windows8x"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2026-06-09T00:44:57.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "05b87da7-95d0-3e7a-5a0c-2d9373523ffc",
+         "MaxDownloadSizeInBytes": 43424888,
+         "PackageFormat": "appxbundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Windows8x"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "ProductId": "C125W9BG2K0V",
+   "LocalizedProperties": [
+    {
+     "ProductTitle": "Rocket League®",
+     "PublisherName": "PSYONIX LLC"
+    }
+   ],
+   "DisplaySkuAvailabilities": [
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2026-08-31T19:13:05.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "d4a06cee-d1f5-4eb1-b6df-000976933a9d",
+         "MaxDownloadSizeInBytes": 50206117888,
+         "PackageFormat": "XVC",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Xbox"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2026-08-31T19:13:05.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "d4a06cee-d1f5-4eb1-b6df-000976933a9d",
+         "MaxDownloadSizeInBytes": 50206117888,
+         "PackageFormat": "XVC",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Xbox"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "ProductId": "9NBLGGH4VVNH",
+   "LocalizedProperties": [
+    {
+     "ProductTitle": "VLC UWP",
+     "PublisherName": "VideoLAN"
+    }
+   ],
+   "DisplaySkuAvailabilities": [
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2026-06-09T07:53:55.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "f67422af-ef48-505b-0942-0c3d26c1e322",
+         "MaxDownloadSizeInBytes": 250523147,
+         "PackageFormat": "EAppxBundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Xbox"
+          }
+         ]
+        },
+        {
+         "ContentId": "4162e2d1-58a7-4915-9c07-d88cd97fa926",
+         "MaxDownloadSizeInBytes": 113885163,
+         "PackageFormat": "AppxBundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Universal"
+          }
+         ]
+        },
+        {
+         "ContentId": "28ff20b7-d2d3-31d0-bb16-7c291126536a",
+         "MaxDownloadSizeInBytes": 43424762,
+         "PackageFormat": "appxbundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Windows8x"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2026-06-09T07:53:55.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "f67422af-ef48-505b-0942-0c3d26c1e322",
+         "MaxDownloadSizeInBytes": 250523147,
+         "PackageFormat": "EAppxBundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Xbox"
+          }
+         ]
+        },
+        {
+         "ContentId": "4162e2d1-58a7-4915-9c07-d88cd97fa926",
+         "MaxDownloadSizeInBytes": 113885163,
+         "PackageFormat": "AppxBundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Universal"
+          }
+         ]
+        },
+        {
+         "ContentId": "28ff20b7-d2d3-31d0-bb16-7c291126536a",
+         "MaxDownloadSizeInBytes": 43424762,
+         "PackageFormat": "appxbundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Windows8x"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "ProductId": "9WZDNCRFJ1CS",
+   "LocalizedProperties": [
+    {
+     "ProductTitle": "AccuWeather - Weather for Life",
+     "PublisherName": "AccuWeather"
+    }
+   ],
+   "DisplaySkuAvailabilities": [
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2026-06-09T06:50:42.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "6f131959-311b-4469-760f-bd04b63fe3f7",
+         "MaxDownloadSizeInBytes": 87442499,
+         "PackageFormat": "AppxBundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Universal"
+          }
+         ]
+        },
+        {
+         "ContentId": "e89e1c24-412e-cbb2-e58d-9d4658548f63",
+         "MaxDownloadSizeInBytes": 129111483,
+         "PackageFormat": "EAppxBundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Xbox"
+          }
+         ]
+        },
+        {
+         "ContentId": "6f131959-311b-4469-760f-bd04b63fe3f7",
+         "MaxDownloadSizeInBytes": 91739929,
+         "PackageFormat": "AppxBundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Universal"
+          }
+         ]
+        },
+        {
+         "ContentId": "6f131959-311b-4469-760f-bd04b63fe3f7",
+         "MaxDownloadSizeInBytes": 97110538,
+         "PackageFormat": "AppxBundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Universal"
+          }
+         ]
+        },
+        {
+         "ContentId": "e89e1c24-412e-cbb2-e58d-9d4658548f63",
+         "MaxDownloadSizeInBytes": 143449339,
+         "PackageFormat": "EAppxBundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Xbox"
+          }
+         ]
+        },
+        {
+         "ContentId": "44d5db58-a5d8-634c-e1ee-18b39cf3116f",
+         "MaxDownloadSizeInBytes": 92496415,
+         "PackageFormat": "appxbundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Windows8x"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "Sku": {
+      "Properties": {
+       "LastUpdateDate": "2026-06-09T06:50:42.0000000Z",
+       "Packages": [
+        {
+         "ContentId": "6f131959-311b-4469-760f-bd04b63fe3f7",
+         "MaxDownloadSizeInBytes": 87442499,
+         "PackageFormat": "AppxBundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Universal"
+          }
+         ]
+        },
+        {
+         "ContentId": "e89e1c24-412e-cbb2-e58d-9d4658548f63",
+         "MaxDownloadSizeInBytes": 129111483,
+         "PackageFormat": "EAppxBundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Xbox"
+          }
+         ]
+        },
+        {
+         "ContentId": "6f131959-311b-4469-760f-bd04b63fe3f7",
+         "MaxDownloadSizeInBytes": 91739929,
+         "PackageFormat": "AppxBundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Universal"
+          }
+         ]
+        },
+        {
+         "ContentId": "6f131959-311b-4469-760f-bd04b63fe3f7",
+         "MaxDownloadSizeInBytes": 97110538,
+         "PackageFormat": "AppxBundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Universal"
+          }
+         ]
+        },
+        {
+         "ContentId": "e89e1c24-412e-cbb2-e58d-9d4658548f63",
+         "MaxDownloadSizeInBytes": 143449339,
+         "PackageFormat": "EAppxBundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Xbox"
+          }
+         ]
+        },
+        {
+         "ContentId": "44d5db58-a5d8-634c-e1ee-18b39cf3116f",
+         "MaxDownloadSizeInBytes": 92496415,
+         "PackageFormat": "appxbundle",
+         "PlatformDependencies": [
+          {
+           "PlatformName": "Windows.Windows8x"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    }
+   ]
+  }
+ ]
+}

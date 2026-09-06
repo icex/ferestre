@@ -79,6 +79,26 @@ pub struct Product {
     /// launcher can install and run today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package_format: Option<String>,
+    /// Whether any package listed is one a PC can install.
+    ///
+    /// The distinction `has_packages` alone cannot make. Four owned titles --
+    /// It Takes Two, Rocket League, Battlefield 6 Open Beta, the Tekken 8 demo
+    /// -- list packages for `Windows.Xbox` and nothing else. They have no PC
+    /// download and no PC size, which is a fact about the title rather than a
+    /// gap in what we fetched, and a row that says "no recipe yet" for one of
+    /// them is describing the wrong problem.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_pc_package: bool,
+    /// The products this one is a bundle of, catalog order with the primary
+    /// first. Empty for an ordinary title.
+    ///
+    /// Five owned products are bundles -- Minecraft: Java & Bedrock Edition,
+    /// Forza Horizon 4 Standard, Call of Duty: Warzone and two It Takes Two
+    /// skus -- and a bundle carries no packages at all, so without following
+    /// these it has no size, no format and nothing to install, for no reason a
+    /// reader could see.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundled_ids: Vec<String>,
 }
 
 impl Product {
@@ -187,6 +207,27 @@ struct SkuProperties {
     last_update: Option<String>,
     #[serde(rename = "Packages", default)]
     packages: Vec<Package>,
+    /// The products a bundle is made of. A bundle carries no packages of its
+    /// own, so this is the only route from "Minecraft: Java & Bedrock Edition
+    /// for PC" to something with a size and a download.
+    ///
+    /// Typed as a bare `Value` because the catalog sends it **both ways**: an
+    /// array for some products and that same array encoded into a string for
+    /// others -- `"[{\"BigId\": ...}]"`. Both forms turned up in fifteen real
+    /// records, so this is the shape of the service rather than a guess about
+    /// it, and a struct that insists on either one fails to parse the whole
+    /// response for products that use the other.
+    #[serde(rename = "BundledSkus", default)]
+    bundled_skus: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct BundledSku {
+    #[serde(rename = "BigId", default)]
+    big_id: Option<String>,
+    /// The catalog's own idea of which child is the title and which are extras.
+    #[serde(rename = "IsPrimary", default)]
+    is_primary: bool,
 }
 
 #[derive(Deserialize)]
@@ -216,6 +257,26 @@ struct PlatformDependency {
 /// the account owns and Windows runs perfectly well.
 const DESKTOP: [&str; 2] = ["Windows.Desktop", "Windows.Universal"];
 
+/// The platforms that mean "there is a PC download", best first.
+///
+/// Wider than [`DESKTOP`], and deliberately a *separate* list rather than an
+/// extension of it. `Windows.Windows8x` is the Windows 8 store era, and four
+/// owned apps -- VLC for Windows Store, Windows Scan, Digi.Online, Wake On Lan
+/// -- ship nothing else, so filtering it out reports no size and no format for
+/// something the account owns and Windows installs perfectly well.
+///
+/// It must not join `DESKTOP`, because that list is the *update key*: two owned
+/// titles (VLC UWP, AccuWeather) carry a `Windows.Universal` package **and** a
+/// `Windows.Windows8x` one with a different content id, so counting both puts a
+/// second id in `content_ids` and reports a permanent pending update. Measured,
+/// not assumed -- across 101 owned products those two are the ones that would
+/// have broken.
+///
+/// Order is preference, and it decides which packages a size is summed over: a
+/// title ships one platform's build, so summing across tiers would report VLC
+/// UWP as its Universal package plus its Windows 8 one.
+const PC_PLATFORMS: [&str; 3] = ["Windows.Desktop", "Windows.Universal", "Windows.Windows8x"];
+
 /// The package format this launcher's runtime can actually load.
 ///
 /// The whole decrypt-and-launch path is built for MSIXVC. `Appx`, `AppxBundle`
@@ -229,6 +290,43 @@ impl Package {
         self.platforms
             .iter()
             .any(|p| p.name.as_deref().is_some_and(|n| DESKTOP.contains(&n)))
+    }
+
+    fn runs_on(&self, platform: &str) -> bool {
+        self.platforms
+            .iter()
+            .any(|p| p.name.as_deref() == Some(platform))
+    }
+}
+
+/// The bundle's children, appended in place, primary first and without repeats.
+///
+/// `BundledSkus` arrives either as an array or as one encoded into a string, so
+/// both are tried, and a failure to read it is not an error: a bundle whose
+/// children we cannot read is a bundle with no children, which is what the row
+/// already says.
+fn collect_bundled(properties: &SkuProperties, into: &mut Vec<String>) {
+    let Some(raw) = properties.bundled_skus.as_ref() else {
+        return;
+    };
+    let children = match raw {
+        serde_json::Value::String(text) => serde_json::from_str::<Vec<BundledSku>>(text).ok(),
+        other => serde_json::from_value::<Vec<BundledSku>>(other.clone()).ok(),
+    };
+    let Some(children) = children else {
+        return;
+    };
+    let mut ids: Vec<(bool, String)> = children
+        .into_iter()
+        .filter_map(|c| Some((c.is_primary, c.big_id.filter(|s| !s.is_empty())?)))
+        .collect();
+    // Primary first: it is the child that *is* the title, and the one whose
+    // size and package the bundle should be described by.
+    ids.sort_by_key(|(primary, _)| !primary);
+    for (_, id) in ids {
+        if !into.contains(&id) {
+            into.push(id);
+        }
     }
 }
 
@@ -297,40 +395,63 @@ pub fn parse(json: &str) -> Result<Vec<Product>> {
                 .filter(|s| !s.is_empty())?;
 
             let mut content_ids = Vec::new();
-            let mut download_bytes = None;
             let mut last_update = None;
             let mut has_packages = false;
-            let mut package_format: Option<String> = None;
-            for sku in &raw.skus {
-                let Some(properties) = sku.sku.as_ref().and_then(|s| s.properties.as_ref()) else {
-                    continue;
-                };
-                last_update = last_update
-                    .take()
-                    .or_else(|| properties.last_update.clone());
-                for package in &properties.packages {
-                    has_packages = true;
-                    // Xbox packages are listed beside the desktop one and are a
-                    // different build with a different content id. Counting them
-                    // is what makes an up-to-date title report an update.
-                    if !package.is_desktop() {
-                        continue;
-                    }
-                    // Every sku of a title lists the same packages -- a trial
-                    // and the full sku point at one build -- so the same content
-                    // id turns up repeatedly and only the distinct set means
-                    // anything as an update key.
-                    package_format = package_format
+            let mut bundled_ids = Vec::new();
+            let packages: Vec<&Package> = raw
+                .skus
+                .iter()
+                .filter_map(|sku| sku.sku.as_ref()?.properties.as_ref())
+                .flat_map(|properties| {
+                    last_update = last_update
                         .take()
-                        .or_else(|| package.format.clone().filter(|f| !f.is_empty()));
-                    if let Some(id) = package.content_id.clone().filter(|s| !s.is_empty()) {
-                        if !content_ids.contains(&id) {
-                            content_ids.push(id);
-                            download_bytes = Some(
-                                download_bytes.unwrap_or(0) + package.download_bytes.unwrap_or(0),
-                            );
-                        }
+                        .or_else(|| properties.last_update.clone());
+                    collect_bundled(properties, &mut bundled_ids);
+                    has_packages |= !properties.packages.is_empty();
+                    properties.packages.iter()
+                })
+                .collect();
+
+            // The update key. Xbox packages are listed beside the desktop one
+            // and are a different build with a different content id; counting
+            // them is what makes an up-to-date title report an update. Every
+            // sku of a title lists the same packages -- a trial and the full
+            // sku point at one build -- so only the distinct set means anything.
+            for package in packages.iter().filter(|p| p.is_desktop()) {
+                if let Some(id) = package.content_id.clone().filter(|s| !s.is_empty()) {
+                    if !content_ids.contains(&id) {
+                        content_ids.push(id);
                     }
+                }
+            }
+
+            // The size and the container, over the wider list and over one tier
+            // only: a title ships one platform's build, so summing a Universal
+            // package together with the Windows 8 one beside it would report a
+            // download twice the size of the one that happens.
+            let tier = PC_PLATFORMS
+                .iter()
+                .find(|platform| packages.iter().any(|p| p.runs_on(platform)));
+            let mut download_bytes = None;
+            let mut package_format: Option<String> = None;
+            let mut counted: Vec<&str> = Vec::new();
+            for package in tier
+                .into_iter()
+                .flat_map(|platform| packages.iter().filter(move |p| p.runs_on(platform)))
+            {
+                package_format = package_format
+                    .take()
+                    .or_else(|| package.format.clone().filter(|f| !f.is_empty()));
+                // Keyed on the content id so a package repeated across skus is
+                // counted once, but a package without one still counts: its
+                // size is real, and dropping it silently reported no size at all.
+                match package.content_id.as_deref().filter(|s| !s.is_empty()) {
+                    Some(id) if counted.contains(&id) => continue,
+                    Some(id) => counted.push(id),
+                    None => {}
+                }
+                if let Some(bytes) = package.download_bytes {
+                    download_bytes = Some(download_bytes.unwrap_or(0) + bytes);
                 }
             }
 
@@ -346,6 +467,8 @@ pub fn parse(json: &str) -> Result<Vec<Product>> {
                 content_ids,
                 has_packages,
                 package_format,
+                has_pc_package: tier.is_some(),
+                bundled_ids,
             })
         })
         .collect())
@@ -358,7 +481,12 @@ pub fn parse(json: &str) -> Result<Vec<Product>> {
 /// parses perfectly and is *wrong*, because it holds the union across platforms,
 /// which update detection reads as a permanent pending update. A cache that
 /// survives a change of meaning is worse than no cache.
-const CACHE_SCHEMA: u32 = 2;
+///
+/// Version 3 is where `download_bytes` widened to every PC platform and stopped
+/// being summed across them. A version-2 file has no size at all for a Windows 8
+/// store app and does not know a bundle has children, which reads as "the
+/// catalog does not give a size" for something the catalog answers fine.
+const CACHE_SCHEMA: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct CacheEntry {
@@ -589,6 +717,154 @@ mod tests {
             "the PC package, and only it"
         );
         assert_eq!(products[0].size_label(), "177 MB");
+    }
+
+    /// The Windows 8 store era. Four owned apps ship nothing else -- VLC for
+    /// Windows Store, Windows Scan, Digi.Online, Wake On Lan -- and reporting
+    /// no size and no format for them says "we could not find out" about
+    /// something the catalog answers plainly.
+    #[test]
+    fn a_windows8x_package_still_has_a_size_and_a_format() {
+        let old = r#"{"Products":[{
+          "ProductId": "9WZDNCRFJ3T0",
+          "LocalizedProperties": [{"ProductTitle": "VLC for Windows Store"}],
+          "DisplaySkuAvailabilities": [{"Sku": {"Properties": {"Packages": [
+            {"ContentId": "content-8x", "MaxDownloadSizeInBytes": 43424888,
+             "PackageFormat": "appxbundle",
+             "PlatformDependencies": [{"PlatformName": "Windows.Windows8x"}]},
+            {"ContentId": "content-8x", "MaxDownloadSizeInBytes": 43424888,
+             "PackageFormat": "appxbundle",
+             "PlatformDependencies": [{"PlatformName": "Windows.Windows8x"}]}
+          ]}}}]
+        }]}"#;
+        let products = parse(old).expect("parses");
+        assert_eq!(products[0].size_label(), "43 MB", "counted once, not twice");
+        assert_eq!(products[0].package_format.as_deref(), Some("appxbundle"));
+        assert!(products[0].has_pc_package);
+        // And still not an update key: `content_ids` is Desktop and Universal
+        // only, so a Windows 8 package can never make a title look out of date.
+        assert!(products[0].content_ids.is_empty());
+    }
+
+    /// The reason `PC_PLATFORMS` is a separate list from `DESKTOP` and why a
+    /// size is summed over one tier. Two owned products are shaped like this --
+    /// VLC UWP and AccuWeather -- and both would break in two ways at once:
+    /// a second content id is a permanent phantom update, and adding the two
+    /// package sizes together describes a download that never happens.
+    #[test]
+    fn a_universal_package_beside_a_windows8x_one_counts_once() {
+        let both = r#"{"Products":[{
+          "ProductId": "9NBLGGH4VVNH",
+          "LocalizedProperties": [{"ProductTitle": "VLC UWP"}],
+          "DisplaySkuAvailabilities": [{"Sku": {"Properties": {"Packages": [
+            {"ContentId": "content-universal", "MaxDownloadSizeInBytes": 100000000,
+             "PackageFormat": "AppxBundle",
+             "PlatformDependencies": [{"PlatformName": "Windows.Universal"}]},
+            {"ContentId": "content-win8", "MaxDownloadSizeInBytes": 40000000,
+             "PackageFormat": "appxbundle",
+             "PlatformDependencies": [{"PlatformName": "Windows.Windows8x"}]},
+            {"ContentId": "content-xbox", "MaxDownloadSizeInBytes": 90000000,
+             "PackageFormat": "EAppxBundle",
+             "PlatformDependencies": [{"PlatformName": "Windows.Xbox"}]}
+          ]}}}]
+        }]}"#;
+        let products = parse(both).expect("parses");
+        assert_eq!(
+            products[0].content_ids,
+            vec!["content-universal"],
+            "one update key, or every check reports an update that does not exist"
+        );
+        assert_eq!(
+            products[0].size_label(),
+            "100 MB",
+            "the tier that would be installed, not the sum of every tier"
+        );
+    }
+
+    /// A title with packages for the console and none for a PC. Four owned
+    /// products are in this state -- It Takes Two, Rocket League, the
+    /// Battlefield 6 beta, the Tekken 8 demo -- and `has_packages` alone cannot
+    /// tell it from "the catalog gave us nothing", so a row would say "no
+    /// recipe yet" about a title no recipe could ever help.
+    #[test]
+    fn an_xbox_only_title_says_so_rather_than_looking_undescribed() {
+        let console = r#"{"Products":[{
+          "ProductId": "C125W9BG2K0V",
+          "LocalizedProperties": [{"ProductTitle": "Rocket League"}],
+          "DisplaySkuAvailabilities": [{"Sku": {"Properties": {"Packages": [
+            {"ContentId": "content-xbox", "MaxDownloadSizeInBytes": 50206117888,
+             "PackageFormat": "XVC",
+             "PlatformDependencies": [{"PlatformName": "Windows.Xbox"}]}
+          ]}}}]
+        }]}"#;
+        let products = parse(console).expect("parses");
+        assert!(products[0].has_packages, "the catalog did answer");
+        assert!(
+            !products[0].has_pc_package,
+            "and the answer was: not for a PC"
+        );
+        assert_eq!(products[0].download_bytes, None, "there is no PC download");
+        assert_eq!(products[0].is_runnable_here(), None);
+    }
+
+    /// A bundle carries no packages of its own. Five owned products are one,
+    /// including Minecraft: Java & Bedrock Edition, whose Bedrock child this
+    /// launcher runs -- so following the children is the difference between a
+    /// dead row and an installable title.
+    #[test]
+    fn a_bundle_lists_its_children_primary_first() {
+        // `BundledSkus` really is a JSON array inside a string, and the primary
+        // child really is not always the first one listed.
+        let bundle = r#"{"Products":[{
+          "ProductId": "9PNJXVCVWD4K",
+          "LocalizedProperties": [{"ProductTitle": "Forza Horizon 4 Standard Edition"}],
+          "DisplaySkuAvailabilities": [{"Sku": {"Properties": {
+            "IsBundle": "true",
+            "BundledSkus": "[{\"BigId\": \"9NVKDJ03CZZ8\", \"IsPrimary\": false}, {\"BigId\": \"9PNQKHFLD2WQ\", \"IsPrimary\": true}]",
+            "Packages": []
+          }}}]
+        }]}"#;
+        let products = parse(bundle).expect("parses");
+        assert_eq!(
+            products[0].bundled_ids,
+            vec!["9PNQKHFLD2WQ", "9NVKDJ03CZZ8"],
+            "primary first: it is the child the bundle should be described by"
+        );
+        assert!(!products[0].has_packages);
+        assert!(!products[0].has_pc_package);
+    }
+
+    /// The other encoding. The catalog sends `BundledSkus` as a plain array for
+    /// some products and as that array inside a string for others, and a parser
+    /// that handles only one of them fails the whole response for half of them.
+    #[test]
+    fn a_bundle_is_read_whether_its_children_arrive_as_an_array_or_a_string() {
+        let array_form = r#"{"Products":[{
+          "ProductId": "9NXVC0482QS5",
+          "LocalizedProperties": [{"ProductTitle": "It Takes Two - Digital Version"}],
+          "DisplaySkuAvailabilities": [{"Sku": {"Properties": {
+            "BundledSkus": [{"BigId": "9NKJ0VZQ4N0L", "IsPrimary": false}],
+            "Packages": []
+          }}}]
+        }]}"#;
+        let products = parse(array_form).expect("parses");
+        assert_eq!(products[0].bundled_ids, vec!["9NKJ0VZQ4N0L"]);
+    }
+
+    /// Unreadable children are no children. A bundle whose `BundledSkus` this
+    /// cannot parse must not take the whole product down with it.
+    #[test]
+    fn a_bundle_that_cannot_be_read_is_still_a_product() {
+        let broken = r#"{"Products":[{
+          "ProductId": "9ZZTESTBNDL",
+          "LocalizedProperties": [{"ProductTitle": "Broken Bundle"}],
+          "DisplaySkuAvailabilities": [{"Sku": {"Properties": {
+            "BundledSkus": "not json at all", "Packages": []
+          }}}]
+        }]}"#;
+        let products = parse(broken).expect("parses");
+        assert_eq!(products[0].name, "Broken Bundle");
+        assert!(products[0].bundled_ids.is_empty());
     }
 
     /// Being installable and being runnable here are different questions. A UWP

@@ -293,6 +293,14 @@ fn row_sized(explanation: &str, title: &str) -> String {
     }
 }
 
+/// `1 title`, `3 titles`. English only, like the rest of the window.
+fn plural(count: usize, noun: &str) -> String {
+    match count {
+        1 => format!("1 {noun}"),
+        n => format!("{n} {noun}s"),
+    }
+}
+
 /// One row of the library: something owned, something described, or both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryRow {
@@ -471,6 +479,65 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
     let name = product
         .map(|p| p.name.clone())
         .unwrap_or_else(|| product_id.to_string());
+    let unrunnable = |subtitle: String, reason: String| LibraryRow {
+        product_id: product_id.to_string(),
+        name: name.clone(),
+        subtitle,
+        badge: None,
+        image: product.and_then(|p| p.image.clone()),
+        owned: true,
+        has_recipe: false,
+        installed: false,
+        update: None,
+        unsupported: true,
+        action: Action::Blocked(reason),
+    };
+
+    // A bundle before anything else, because it is the one state where the
+    // answer is somewhere other than this record: a bundle carries no packages,
+    // so every other check would read it as "nothing is known".
+    if let Some(children) = product.map(|p| &p.bundled_ids).filter(|c| !c.is_empty()) {
+        let installable = children
+            .iter()
+            .find_map(|id| inputs.catalog.get(&id.to_ascii_uppercase()))
+            .filter(|child| child.is_runnable_here() == Some(true));
+        return match installable {
+            // Named, sized, and pointing at the thing to actually install.
+            Some(child) => unrunnable(
+                format!(
+                    "Bundle of {}  ·  install {} instead{}",
+                    plural(children.len(), "title"),
+                    child.name,
+                    match child.size_label().as_str() {
+                        "" => String::new(),
+                        size => format!("  ·  {size}"),
+                    }
+                ),
+                format!(
+                    "a bundle -- install {} ({}) instead",
+                    child.name, child.product_id
+                ),
+            ),
+            None => unrunnable(
+                format!(
+                    "Bundle of {}  ·  none of them is a title this runtime opens",
+                    plural(children.len(), "title")
+                ),
+                "a bundle, and none of its titles ships a package this runtime opens".into(),
+            ),
+        };
+    }
+
+    // Packages, but none a PC can install. A fact about the title rather than
+    // a gap in what was fetched, and the difference matters: "no recipe yet"
+    // invites someone to write one for a title that has no PC build to launch.
+    if product.is_some_and(|p| p.has_packages && !p.has_pc_package) {
+        return unrunnable(
+            "No PC version  ·  this title ships for Xbox only".into(),
+            "the catalog lists no PC package for this title, only an Xbox one".into(),
+        );
+    }
+
     // A PC package this runtime cannot open is worth naming before someone
     // spends a download finding out. Candy Crush Saga is a UWP Appx; the whole
     // decrypt-and-launch path here is built for MSIXVC.
@@ -496,12 +563,30 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
     }
     let subtitle = match product {
         Some(p) => {
+            // "No recipe yet" is the right closing note only when a download is
+            // the next step. When the catalog lists no package at all -- a
+            // delisted title, or one fulfilled some other way -- saying that
+            // invites someone to write a recipe for something there is nothing
+            // to install.
+            let tail = if p.has_packages {
+                "no recipe yet"
+            } else {
+                "the catalog lists no package for it"
+            };
             let size = p.size_label();
             match (p.publisher.as_deref(), size.is_empty()) {
-                (Some(publisher), false) => format!("{publisher}  ·  {size}  ·  no recipe yet"),
-                (Some(publisher), true) => format!("{publisher}  ·  no recipe yet"),
-                (None, false) => format!("{size}  ·  no recipe yet"),
-                (None, true) => "No recipe yet".to_string(),
+                (Some(publisher), false) => format!("{publisher}  ·  {size}  ·  {tail}"),
+                (Some(publisher), true) => format!("{publisher}  ·  {tail}"),
+                (None, false) => format!("{size}  ·  {tail}"),
+                (None, true) => {
+                    let mut chars = tail.chars();
+                    chars
+                        .next()
+                        .into_iter()
+                        .flat_map(char::to_uppercase)
+                        .collect::<String>()
+                        + chars.as_str()
+                }
             }
         }
         None => "No recipe yet".to_string(),
@@ -754,8 +839,14 @@ mod tests {
             download_bytes: Some(2_490_064_896),
             last_update: None,
             content_ids: content_ids.iter().map(|s| s.to_string()).collect(),
-            has_packages: !content_ids.is_empty(),
+            // A coherent record: it has a size and an MSIXVC format, so it has
+            // a PC package. Deriving this from `content_ids` instead made the
+            // fixture describe a title with a 2.5 GB download and no packages,
+            // which the catalog would never return.
+            has_packages: true,
             package_format: Some("MSIXVC".into()),
+            has_pc_package: true,
+            bundled_ids: Vec::new(),
         }
     }
 
@@ -1163,6 +1254,143 @@ mod tests {
         assert!(
             !by_id["9ZZTESTMYST"].unsupported,
             "the catalog said nothing about it, which is not the same as saying no"
+        );
+    }
+
+    /// Three states the catalog can now tell apart, and used not to. Every one
+    /// of them used to render as "no recipe yet", which is advice to write a
+    /// recipe -- useless for a title with no PC build, and actively wrong for a
+    /// bundle, where the thing to install is a different product entirely.
+    #[test]
+    fn a_title_with_no_pc_build_says_so_instead_of_asking_for_a_recipe() {
+        let console = Product {
+            has_packages: true,
+            has_pc_package: false,
+            package_format: None,
+            download_bytes: None,
+            ..product("9ZZTESTXBOX", "A Console Title", &[])
+        };
+        let own = Ownership::Known(entries(&["9ZZTESTXBOX"]));
+        let cat = catalog(vec![console]);
+        let rows = library(&Inputs {
+            recipes: &[],
+            runtime: None,
+            registry: None,
+            ownership: &own,
+            catalog: &cat,
+            records: &BTreeMap::new(),
+            available: &BTreeMap::new(),
+            installed: NOTHING_INSTALLED,
+            installed_version: NO_VERSION_ON_DISK,
+            installed_product: NOT_ON_DISK,
+            running: NOTHING_RUNNING,
+        });
+        assert!(
+            rows[0].subtitle.contains("No PC version"),
+            "{}",
+            rows[0].subtitle
+        );
+        assert!(
+            !rows[0].subtitle.contains("recipe"),
+            "no recipe can give a title a PC build: {}",
+            rows[0].subtitle
+        );
+        assert!(rows[0].unsupported);
+        assert!(matches!(rows[0].action, Action::Blocked(_)));
+    }
+
+    /// A bundle points at the child worth installing, by name and by size.
+    /// Minecraft: Java & Bedrock Edition is the real case: the bundle itself
+    /// has no package, and one of its three children is a title this launcher
+    /// runs.
+    #[test]
+    fn a_bundle_names_the_child_to_install() {
+        let bundle = Product {
+            has_packages: false,
+            has_pc_package: false,
+            package_format: None,
+            download_bytes: None,
+            bundled_ids: vec!["9ZZTESTCHLD".into(), "9ZZTESTOTHR".into()],
+            ..product("9ZZTESTBNDL", "A Bundle", &[])
+        };
+        let child = product("9ZZTESTCHLD", "The Playable One", &["cid"]);
+        let own = Ownership::Known(entries(&["9ZZTESTBNDL"]));
+        let cat = catalog(vec![bundle, child]);
+        let rows = library(&Inputs {
+            recipes: &[],
+            runtime: None,
+            registry: None,
+            ownership: &own,
+            catalog: &cat,
+            records: &BTreeMap::new(),
+            available: &BTreeMap::new(),
+            installed: NOTHING_INSTALLED,
+            installed_version: NO_VERSION_ON_DISK,
+            installed_product: NOT_ON_DISK,
+            running: NOTHING_RUNNING,
+        });
+        let row = rows
+            .iter()
+            .find(|r| r.product_id == "9ZZTESTBNDL")
+            .expect("the bundle");
+        assert!(
+            row.subtitle.contains("Bundle of 2 titles"),
+            "{}",
+            row.subtitle
+        );
+        assert!(
+            row.subtitle.contains("install The Playable One instead"),
+            "{}",
+            row.subtitle
+        );
+        assert!(
+            row.subtitle.contains("2.5 GB"),
+            "the child's size is the bundle's answer: {}",
+            row.subtitle
+        );
+        match &row.action {
+            Action::Blocked(why) => assert!(why.contains("9ZZTESTCHLD"), "{why}"),
+            other => panic!("a bundle is not installable itself: {other:?}"),
+        }
+    }
+
+    /// And says only what it knows. Before the children are fetched there is no
+    /// name and no size to give, and inventing either would be worse than the
+    /// count on its own.
+    #[test]
+    fn a_bundle_whose_children_are_not_cached_yet_claims_nothing() {
+        let bundle = Product {
+            has_packages: false,
+            has_pc_package: false,
+            package_format: None,
+            download_bytes: None,
+            bundled_ids: vec!["9ZZTESTCHLD".into()],
+            ..product("9ZZTESTBNDL", "A Bundle", &[])
+        };
+        let own = Ownership::Known(entries(&["9ZZTESTBNDL"]));
+        let cat = catalog(vec![bundle]);
+        let rows = library(&Inputs {
+            recipes: &[],
+            runtime: None,
+            registry: None,
+            ownership: &own,
+            catalog: &cat,
+            records: &BTreeMap::new(),
+            available: &BTreeMap::new(),
+            installed: NOTHING_INSTALLED,
+            installed_version: NO_VERSION_ON_DISK,
+            installed_product: NOT_ON_DISK,
+            running: NOTHING_RUNNING,
+        });
+        assert!(
+            rows[0].subtitle.contains("Bundle of 1 title"),
+            "{}",
+            rows[0].subtitle
+        );
+        assert!(
+            !rows[0].subtitle.contains("install"),
+            "{}",
+            rows[0].subtitle
         );
     }
 

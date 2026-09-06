@@ -390,8 +390,26 @@ fn draw_list(
         want_names: view
             .rows
             .iter()
-            .filter(|row| !row.is_named())
-            .map(|row| row.product_id.clone())
+            .flat_map(|row| {
+                let mut wanted = Vec::new();
+                if !row.is_named() {
+                    wanted.push(row.product_id.clone());
+                }
+                // A bundle's answer is in another record. Until its children
+                // are fetched the row can only say how many there are, so they
+                // are asked for alongside the names on this page rather than
+                // waiting for someone to open something.
+                if let Some(product) = model.catalog.get(&row.product_id.to_ascii_uppercase()) {
+                    wanted.extend(
+                        product
+                            .bundled_ids
+                            .iter()
+                            .filter(|id| !model.catalog.contains_key(&id.to_ascii_uppercase()))
+                            .cloned(),
+                    );
+                }
+                wanted
+            })
             .collect(),
         want_icons: view
             .rows
