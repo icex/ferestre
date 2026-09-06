@@ -80,7 +80,7 @@ _commit=3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
 # happened once already. If the history is ever rewritten again, repin here and
 # in .SRCINFO, and regenerate the sha256sums -- the patch files themselves may
 # have changed too.
-_patchrev=5d5475103f545d7bc5c59a7e107ceed6403e6259
+_patchrev=0a8afd00dded754555651377f479ef6383fd26be
 _patchurl="https://raw.githubusercontent.com/icex/ferestre/$_patchrev/patches/xodus-cli"
 
 source=(
@@ -90,6 +90,7 @@ source=(
   "$_patchurl/0004-account-and-probe-headers.patch"
   "$_patchurl/0005-win32-path-for-the-mapped-main-image.patch"
   "$_patchurl/0006-streaming-progress-a-launcher-can-read-behind-XODUS_.patch"
+  "$_patchurl/0007-streaming-report-a-failed-download-instead-of-panick.patch"
 )
 sha256sums=(
   'SKIP'
@@ -98,6 +99,7 @@ sha256sums=(
   '304c5e0f309c9609e9578f79f96fbf2800e429b72b26bbd590ad1e3fbdf05efd'
   'b5c9feec3aa4dba5f287609d5ae3727e5fb38aa4cf967997bfb5901d2b3a3d47'
   'ab51b007ed0b8802785be1b000ba78185f25760850174de55e2667ed64ac4a2d'
+  'fae49957d9fb4725627c16c7c80224601c2102d772cfa54bb3dd9cb9dc996a0d'
 )
 
 prepare() {
@@ -115,7 +117,8 @@ prepare() {
     "$srcdir/0003-owned-title-enumeration.patch" \
     "$srcdir/0004-account-and-probe-headers.patch" \
     "$srcdir/0005-win32-path-for-the-mapped-main-image.patch" \
-    "$srcdir/0006-streaming-progress-a-launcher-can-read-behind-XODUS_.patch"
+    "$srcdir/0006-streaming-progress-a-launcher-can-read-behind-XODUS_.patch" \
+    "$srcdir/0007-streaming-report-a-failed-download-instead-of-panick.patch"
 
   # Fetch after patching: the patches change Cargo.toml and Cargo.lock, and the
   # build below is offline.
@@ -163,4 +166,6 @@ package() {
     "$pkgdir/usr/share/licenses/$pkgname/patches/0005-win32-path-for-the-mapped-main-image.patch"
   install -Dm644 "$srcdir/0006-streaming-progress-a-launcher-can-read-behind-XODUS_.patch" \
     "$pkgdir/usr/share/licenses/$pkgname/patches/0006-streaming-progress-a-launcher-can-read-behind-XODUS_.patch"
+  install -Dm644 "$srcdir/0007-streaming-report-a-failed-download-instead-of-panick.patch" \
+    "$pkgdir/usr/share/licenses/$pkgname/patches/0007-streaming-report-a-failed-download-instead-of-panick.patch"
 }
