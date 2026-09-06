@@ -1,0 +1,24 @@
+# Stardew Valley -- Microsoft Store / Game Pass
+#
+# A plain GDK title with nothing unusual about it: the package manifest names
+# the executable and the runtime's own capabilities are enough.
+
+schema = 1
+
+[title]
+product-id      = "9MWR1NC6VQ6L"
+name            = "Stardew Valley"
+slug            = "stardew-valley"
+publisher       = "ConcernedApe"
+install-size-gb = 0.7
+
+[launch]
+executable = 'Stardew Valley.exe'
+
+[runtime]
+requires = ["loader.memfd-main-image"]
+
+[status]
+state   = "playable"
+summary = "Plays."
+last-verified = 2026-09-06

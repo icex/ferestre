@@ -69,7 +69,7 @@ not inferred from the fact that it downloaded:
 | **Minecraft for Windows** (Bedrock) | Store | Playable. Signs in to Xbox Live, loads the profile, and **joins third-party servers from the in-game list** |
 | **Clair Obscur: Expedition 33** | Store / Game Pass | Playable — saves, video, full game |
 | **DREDGE** | Game Pass | Playable |
-| **Stardew Valley** | Game Pass | Installs and launches |
+| **Stardew Valley** | Game Pass | Playable |
 | **DOOM 64** | Game Pass | Playable |
 | **Overthrown** | Game Pass | Playable |
 | **Goat Simulator 3** | Game Pass | Boots and plays; online features do not work |
