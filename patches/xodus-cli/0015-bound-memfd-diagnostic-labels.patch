@@ -1,0 +1,20 @@
+Subject: [PATCH] Keep long package filenames within the memfd label limit
+
+Linux limits memfd labels to 249 bytes. Package basenames can be longer;
+fall back to the generic diagnostic label instead of failing the image open.
+This changes only the label, not the file mapping or package path.
+
+--- a/crates/xodus-cli/src/commands/run.rs
++++ b/crates/xodus-cli/src/commands/run.rs
+@@ -42,7 +42,10 @@
+         .next()
+         .filter(|s| !s.is_empty())
+         .unwrap_or("xodus");
+-    let fd = memfd_create(leaf, MemfdFlags::CLOEXEC).map_err(std::io::Error::from)?;
++    // A valid package filename can exceed Linux's 249-byte memfd label limit.
++    // The label is diagnostic only, so use the generic label in that case.
++    let label = if leaf.len() <= 249 { leaf } else { "xodus" };
++    let fd = memfd_create(label, MemfdFlags::CLOEXEC).map_err(std::io::Error::from)?;
+     Ok(std::fs::File::from(fd))
+ }
+ 

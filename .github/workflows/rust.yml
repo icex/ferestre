@@ -22,6 +22,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'tests/gui_smoke.py'
+      - 'tools/xsts_probe.py'
+      - 'tools/test_xsts_probe.py'
       - 'titles/**'
       # The `patches` job below is the only thing that checks these, and a
       # patch-only commit is exactly the kind that breaks them.
@@ -34,6 +36,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'tests/gui_smoke.py'
+      - 'tools/xsts_probe.py'
+      - 'tools/test_xsts_probe.py'
       - 'titles/**'
       # The `patches` job below is the only thing that checks these, and a
       # patch-only commit is exactly the kind that breaks them.
@@ -75,6 +79,9 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      - name: Authentication probe tests (offline)
+        run: python3 -m unittest discover -s tools -p test_xsts_probe.py
 
   # The cheap half of testing the runtime. Building it needs a 26 GB tree and an
   # hour, so `tests/run-*.sh` cannot run per push -- but checking that the

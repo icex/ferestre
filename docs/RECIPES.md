@@ -171,7 +171,7 @@ scripts/launch-bedrock.sh
   `xodus-service` running for tokens -- the launcher starts it. See README
   "Minecraft Bedrock" for the full chain of blockers that had to be closed.
 
-### Forza Horizon 5 (Store) — **plays; online unavailable**
+### Forza Horizon 5 (Store) — **plays; online services working**
 
 ```bash
 scripts/get-game.sh <its Store product id> "$XODUS_GAMES_DIR/fh5"   # 150 GB
@@ -181,9 +181,14 @@ tools/drive-fh5.py                                                   # unattende
 
 Signs in and drives with a restored Windows profile, vehicle and livery.
 The world, HUD and minimap rendered, and the player confirmed gameplay.
-**Forza Online reports "Forza Horizon 5 server is currently not available"**;
-its connectivity is still being investigated. A restart and save round trip
-have not yet been verified.
+The selected vehicle survived a subsequent launch. The live Festival Playlist
+now loads, title-service requests return HTTP 200, and the player confirmed
+the online fix. Multiplayer race completion has not been automated.
+
+The online fix is in **client patch 0014**, so updating the Wine runtime alone
+is insufficient. It authenticates each title from its own metadata and reads
+its published service rules. See [Xbox Live authentication](XBOX_LIVE.md) for
+the generic implementation and checks to use with another title.
 
 The runtime needs the capabilities listed in
 [`titles/9NNX1VVR3KNQ.toml`](../titles/9NNX1VVR3KNQ.toml). Three findings explain

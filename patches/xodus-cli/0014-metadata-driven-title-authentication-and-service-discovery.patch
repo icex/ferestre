@@ -1,0 +1,2803 @@
+Subject: [PATCH] Authenticate and discover services from each title's metadata
+
+Use Windows TitleId authentication for configurations without MSAAppId, and
+retain each configured SISU client for newer titles. Discover the current
+publisher service list under its own title claim, retain policy ownership,
+and match WebSocket upgrade schemes without title-specific routes.
+
+Scope cached tokens by account, title, client, audience and issuer; sign fresh
+requests with the token's own key. Bound per-key authentication/discovery work,
+retry failed discovery, and keep proof-bound user/XSTS exchanges signed.
+No substitute title claim or generic-audience retry is used for failed titles.
+
+Regression fixtures cover multiple synthetic titles, key/audience boundaries,
+request signatures, endpoint precedence and concurrent cache work.
+
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7210,6 +7210,7 @@
+  "quick-xml 0.42.0",
+  "reqwest 0.13.4",
+  "serde_json",
++ "sha2 0.11.0",
+  "tokio",
+  "tokio-util",
+  "tracing",
+diff --git a/crates/xodus-cli/src/commands/collections.rs b/crates/xodus-cli/src/commands/collections.rs
+--- a/crates/xodus-cli/src/commands/collections.rs
++++ b/crates/xodus-cli/src/commands/collections.rs
+@@ -60,12 +60,15 @@
+     relying_party: &str,
+ ) -> Result<XstsResponse, String> {
+     let id = xodus::auth::sisu_identity_for(client, tokens, client_id, title_id).await?;
++    let signer = xodus::api::xbox::RequestSigner::from_pkcs8(&id.key_pkcs8)
++        .ok_or("invalid title signing key")?;
+     xodus::api::xbox::request_xsts_token(
+         client,
+         id.user_token,
+         Some(id.device_token),
+         Some(id.title_token),
+         relying_party,
++        Some(&signer),
+     )
+     .await
+     .map_err(|e| format!("xsts/authorize refused the title claim: {e}"))
+diff --git a/crates/xodus-cli/src/commands/xblcheck.rs b/crates/xodus-cli/src/commands/xblcheck.rs
+--- a/crates/xodus-cli/src/commands/xblcheck.rs
++++ b/crates/xodus-cli/src/commands/xblcheck.rs
+@@ -62,16 +62,17 @@
+     /// The service config id a title's sessions live under. Titles are free to
+     /// use another, but the convention -- and what the probe needs in order to
+     /// address *something* of this title's -- is the title id in the last
+-    /// twelve digits.
++    /// eight hexadecimal digits.
+     fn scid(&self) -> String {
+         format!("00000000-0000-0000-0000-0000{:08x}", self.title_id)
+     }
+ }
+ 
+-/// Read `TitleId` and `MSAAppId` out of a game directory's MicrosoftGame.config.
++/// Read `TitleId` and optional `MSAAppId` from MicrosoftGame.config.
+ ///
+ /// The config spells TitleId in hexadecimal and every Xbox endpoint wants it
+-/// decimal, which is a conversion worth doing in exactly one place.
++/// decimal, which is a conversion worth doing in exactly one place. Legacy
++/// packages omit MSAAppId and use Windows title authentication instead of SISU.
+ pub fn identity_from_game_dir(dir: &Path) -> Result<TitleIdentity, String> {
+     // The GDK documents the file as MicrosoftGame.config, but a package is
+     // free to ship any spelling of it and Forza Horizon 5 ships
+@@ -102,14 +103,43 @@
+         Some(xml[start..start + len].trim().to_string())
+     };
+     let hex = element("TitleId").ok_or_else(|| format!("{} has no <TitleId>", path.display()))?;
+-    let title_id = i64::from_str_radix(hex.trim_start_matches("0x"), 16)
+-        .map_err(|_| format!("<TitleId>{hex}</TitleId> is not hexadecimal"))?;
+-    let client_id =
+-        element("MSAAppId").ok_or_else(|| format!("{} has no <MSAAppId>", path.display()))?;
++    let title_id = u32::from_str_radix(hex.trim_start_matches("0x"), 16)
++        .ok()
++        .filter(|id| *id != 0)
++        .map(i64::from)
++        .ok_or_else(|| {
++            format!("<TitleId>{hex}</TitleId> must be a nonzero 32-bit hexadecimal integer")
++        })?;
++    let client_id = element("MSAAppId").unwrap_or_default();
+     Ok(TitleIdentity {
+         title_id,
+         client_id,
+     })
++}
++
++async fn title_claim_xsts(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++    identity: &TitleIdentity,
++) -> Result<xodus::models::xbox::XstsResponse, String> {
++    let claim = if identity.client_id.is_empty() {
++        xodus::auth::win32_identity_for(client, tokens, identity.title_id).await?
++    } else {
++        xodus::auth::sisu_identity_for(client, tokens, &identity.client_id, identity.title_id)
++            .await?
++    };
++    let signer = xodus::api::xbox::RequestSigner::from_pkcs8(&claim.key_pkcs8)
++        .ok_or("invalid title signing key")?;
++    xodus::api::xbox::request_xsts_token(
++        client,
++        claim.user_token,
++        Some(claim.device_token),
++        Some(claim.title_token),
++        "http://xboxlive.com",
++        Some(&signer),
++    )
++    .await
++    .map_err(|e| format!("xsts/authorize refused the title claim: {e}"))
+ }
+ 
+ async fn run_probe(
+@@ -140,10 +170,17 @@
+     tokens: &TokenManager,
+     identity: TitleIdentity,
+ ) -> ExitCode {
+-    println!(
+-        ":: title {} (client id {})",
+-        identity.title_id, identity.client_id
+-    );
++    if identity.client_id.is_empty() {
++        println!(
++            ":: title {} (Windows title authentication)",
++            identity.title_id
++        );
++    } else {
++        println!(
++            ":: title {} (SISU client id {})",
++            identity.title_id, identity.client_id
++        );
++    }
+ 
+     let plain = match super::collections::xsts_for(client, tokens, "http://xboxlive.com").await {
+         Ok(xsts) => xsts,
+@@ -180,14 +217,7 @@
+ 
+     // The claim itself. A failure here is the interesting one, and it is the
+     // failure a title reports as "failed to create party".
+-    let claimed = super::collections::title_claim_xsts(
+-        client,
+-        tokens,
+-        &identity.client_id,
+-        identity.title_id,
+-        "http://xboxlive.com",
+-    )
+-    .await;
++    let claimed = title_claim_xsts(client, tokens, &identity).await;
+     let claimed_auth = match claimed {
+         Ok(xsts) => xodus::api::xbox::get_xsts_auth_header(xsts),
+         Err(message) => {
+@@ -225,13 +255,13 @@
+         if plain_status.is_success() {
+             println!(
+                 "         the same call succeeds with no title claim, so the claim is being \
+-                 refused -- check that MSAAppId and TitleId match the running title"
++                 refused -- check TitleId and MSAAppId (when present) against the running title"
+             );
+         }
+     }
+ 
+     if failed == 0 {
+-        println!(":: Xbox Live is fully authorised for this title");
++        println!(":: all Xbox Live diagnostic probes passed for this title");
+         ExitCode::SUCCESS
+     } else {
+         ExitCode::FAILURE
+@@ -289,14 +319,46 @@
+     }
+ 
+     #[test]
+-    fn a_config_missing_the_app_id_says_which_one_is_missing() {
++    fn a_legacy_config_without_an_app_id_keeps_its_title_and_scid() {
+         let dir = tempfile::tempdir().expect("tempdir");
+         std::fs::write(
+             dir.path().join("MicrosoftGame.config"),
+-            "<Game><TitleId>69C7AA31</TitleId></Game>",
++            r#"<Game configVersion="0"><TitleId>10203040</TitleId></Game>"#,
+         )
+         .expect("write");
+-        let err = identity_from_game_dir(dir.path()).expect_err("no MSAAppId");
+-        assert!(err.contains("MSAAppId"), "{err}");
+-    }
+-}
++        let id = identity_from_game_dir(dir.path()).expect("legacy title identity");
++        assert_eq!(id.title_id, 0x1020_3040);
++        assert!(id.client_id.is_empty(), "no SISU client ID is available");
++        assert_eq!(id.scid(), "00000000-0000-0000-0000-000010203040");
++    }
++
++    #[test]
++    fn an_empty_app_id_also_selects_the_legacy_identity() {
++        let dir = tempfile::tempdir().expect("tempdir");
++        std::fs::write(
++            dir.path().join("MicrosoftGame.config"),
++            "<Game><TitleId>FFFFFFFF</TitleId><MSAAppId> </MSAAppId></Game>",
++        )
++        .expect("write");
++        let id = identity_from_game_dir(dir.path()).expect("empty app ID");
++        assert_eq!(id.title_id, u32::MAX as i64);
++        assert!(id.client_id.is_empty());
++        assert_eq!(id.scid(), "00000000-0000-0000-0000-0000ffffffff");
++    }
++
++    #[test]
++    fn invalid_title_ids_are_rejected_before_authentication() {
++        let dir = tempfile::tempdir().expect("tempdir");
++        for title_id in ["0", "-1", "100000000", "not-hex", ""] {
++            std::fs::write(
++                dir.path().join("MicrosoftGame.config"),
++                format!(
++                    "<Game><TitleId>{title_id}</TitleId><MSAAppId>synthetic-client</MSAAppId></Game>"
++                ),
++            )
++            .expect("write");
++            let err = identity_from_game_dir(dir.path()).expect_err("invalid title ID");
++            assert!(err.contains("TitleId"), "{title_id}: {err}");
++        }
++    }
++}
+diff --git a/crates/xodus-service/Cargo.toml b/crates/xodus-service/Cargo.toml
+--- a/crates/xodus-service/Cargo.toml
++++ b/crates/xodus-service/Cargo.toml
+@@ -16,6 +16,7 @@
+ quick-xml = { version = "0.42.0", features = ["serialize", "overlapped-lists"] }
+ tokio-util = "0.7.19"
+ serde_json = "1.0.151"
++sha2 = "0.11.0"
+ 
+ [features]
+ tokio_console = ["dep:console-subscriber"]
+diff --git a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/src/connection/xml.rs
+--- a/crates/xodus-service/src/connection/xml.rs
++++ b/crates/xodus-service/src/connection/xml.rs
+@@ -1,3 +1,9 @@
++use sha2::{Digest, Sha256};
++use std::collections::HashMap;
++use std::future::Future;
++use std::hash::Hash;
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
+ use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ use xodus::models::live::ExchangeUserTokenOutcome;
+ use xodus::models::secrets::Token;
+@@ -9,6 +15,73 @@
+ 
+ use crate::XML_MAGIC;
+ use crate::simple_context::SimpleContext;
++
++const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
++
++enum CachedValue<V> {
++    Ready(V),
++    Failed {
++        message: String,
++        retry_after: tokio::time::Instant,
++    },
++}
++
++/// Each key has its own in-flight fetch. Network work never holds the map
++/// lock, so an unavailable title cannot stall another title's cached requests.
++struct AsyncCache<K, V> {
++    entries: Mutex<HashMap<K, Arc<tokio::sync::Mutex<Option<CachedValue<V>>>>>>,
++    fetch_timeout: Duration,
++    retry_delay: Duration,
++}
++
++impl<K: Eq + Hash, V: Clone> AsyncCache<K, V> {
++    fn new(fetch_timeout: Duration, retry_delay: Duration) -> Self {
++        Self {
++            entries: Mutex::new(HashMap::new()),
++            fetch_timeout,
++            retry_delay,
++        }
++    }
++
++    async fn get_or_try_init<F, Fut>(
++        &self,
++        key: K,
++        valid: impl Fn(&V) -> bool,
++        fetch: F,
++    ) -> Result<V, String>
++    where
++        F: FnOnce() -> Fut,
++        Fut: Future<Output = Result<V, String>>,
++    {
++        let entry = self
++            .entries
++            .lock()
++            .map_err(|_| "authentication cache poisoned")?
++            .entry(key)
++            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)))
++            .clone();
++        let mut entry = entry.lock().await;
++        match entry.as_ref() {
++            Some(CachedValue::Ready(value)) if valid(value) => return Ok(value.clone()),
++            Some(CachedValue::Failed {
++                message,
++                retry_after,
++            }) if *retry_after > tokio::time::Instant::now() => return Err(message.clone()),
++            _ => {}
++        }
++        let result = tokio::time::timeout(self.fetch_timeout, fetch())
++            .await
++            .unwrap_or_else(|_| Err("authentication or endpoint discovery timed out".to_string()));
++        *entry = Some(match &result {
++            Ok(value) => CachedValue::Ready(value.clone()),
++            Err(message) => CachedValue::Failed {
++                message: message.clone(),
++                retry_after: tokio::time::Instant::now() + self.retry_delay,
++            },
++        });
++        result
++    }
++}
+ 
+ /// Tokens cached per relying party until shortly before they expire.
+ ///
+@@ -20,35 +93,19 @@
+     std::sync::Mutex<std::collections::HashMap<String, CachedToken>>,
+ > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+ 
+-/// Whether the one-off SISU run that yields a title token has been attempted.
+-static TITLE_TOKEN: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+-
+ /// The title-management endpoint list: which relying party each host
+ /// authenticates against. It is static configuration, but fetching it is a
+ /// network round trip -- and doing that per request cost more than minting the
+ /// token did.
+-static ENDPOINTS: tokio::sync::OnceCell<Option<xodus::models::xbox::TitleMgtResponse>> =
+-    tokio::sync::OnceCell::const_new();
+-
+-/// The identity SISU issued for a title: device, title and user tokens plus the
+-/// key they are all bound to. Xbox will not let us mix keys, so when this is
+-/// present it replaces the whole locally-built chain -- signing key included.
+-///
+-/// Keyed by title, because the claim it carries *names* a title. A token
+-/// claiming the wrong one is not a weaker token, it is a refused one: the
+-/// session directory answers "The requested service config cannot be accessed."
+-/// and presence's titles/current answers 403, while the same request with no
+-/// claim at all goes through. Handing every title the Xbox app's identity --
+-/// which is what this used to do -- therefore broke exactly the two services a
+-/// title needs it for.
+-///
+-/// The mutex is held across the mint so a title asking for several relying
+-/// parties at once runs SISU once rather than once per ask.
+-static SISU: std::sync::LazyLock<
+-    tokio::sync::Mutex<
+-        std::collections::HashMap<i64, Option<std::sync::Arc<xodus::auth::SisuIdentity>>>,
+-    >,
+-> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
++static ENDPOINTS: std::sync::LazyLock<AsyncCache<(), xodus::models::xbox::TitleMgtResponse>> =
++    std::sync::LazyLock::new(|| AsyncCache::new(Duration::from_secs(15), Duration::from_secs(5)));
++
++/// One user/device/title identity and its proof key per title and auth client.
++/// Legacy Windows titles authenticate by TitleId; newer configs supply a
++/// client ID for SISU. Failed attempts are retried after a short backoff.
++static IDENTITIES: std::sync::LazyLock<
++    AsyncCache<([u8; 32], i64, String), std::sync::Arc<xodus::auth::SisuIdentity>>,
++> = std::sync::LazyLock::new(|| AsyncCache::new(AUTH_TIMEOUT, Duration::from_secs(60)));
+ 
+ /// Relying parties xsts/authorize refused a title token for.
+ ///
+@@ -59,71 +116,157 @@
+ static NO_TITLE_CLAIM: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+ 
+-/// Mint (or reuse) the SISU identity for one title.
++/// Mint (or reuse) the identity for one title.
+ ///
+ /// The SOAP exchange behind it fails intermittently -- an empty or truncated
+ /// response deserialises as a missing `wst:TokenType` -- and a failure here
+ /// costs the title its multiplayer, so a second attempt is worth more than the
+ /// second or so it takes.
+-async fn sisu_for(
++async fn identity_for(
+     client: &reqwest::Client,
+     tokens: &xodus::tokens::TokenManager,
+     title_id: i64,
+     client_id: &str,
++    session: [u8; 32],
+ ) -> Option<std::sync::Arc<xodus::auth::SisuIdentity>> {
+-    let mut cache = SISU.lock().await;
+-    if let Some(hit) = cache.get(&title_id) {
+-        return hit.clone();
+-    }
+-    let mut last = String::new();
+-    for attempt in 1..=2 {
+-        match xodus::auth::sisu_identity_for(client, tokens, client_id, title_id).await {
+-            Ok(id) => {
+-                tracing::info!("SISU issued a token set claiming title {title_id}");
+-                let id = std::sync::Arc::new(id);
+-                cache.insert(title_id, Some(id.clone()));
+-                return Some(id);
++    let result = IDENTITIES.get_or_try_init(
++        (session, title_id, client_id.to_string()),
++        |id| id.expires_at > chrono::Utc::now().timestamp() + 60,
++        || async {
++            let mut last = String::new();
++            for attempt in 1..=2 {
++                let result = if client_id.is_empty() {
++                    xodus::auth::win32_identity_for(client, tokens, title_id).await
++                } else {
++                    xodus::auth::sisu_identity_for(client, tokens, client_id, title_id).await
++                };
++                match result {
++                    Ok(id) => {
++                        tracing::info!("issued a token set claiming title {title_id}");
++                        return Ok(std::sync::Arc::new(id));
++                    }
++                    Err(e) => {
++                        tracing::warn!(
++                            "title authentication attempt {attempt} for title {title_id} failed: {e}"
++                        );
++                        last = e;
++                    }
++                }
+             }
+-            Err(e) => {
+-                tracing::warn!("SISU attempt {attempt} for title {title_id} failed: {e}");
+-                last = e;
+-            }
+-        }
+-    }
+-    tracing::error!(
+-        "no title claim for title {title_id} (client id {client_id}): {last}. \
+-         Presence and multiplayer will answer 403 until this succeeds."
+-    );
+-    cache.insert(title_id, None);
+-    None
++            Err(last)
++        },
++    ).await;
++    result
++        .map_err(|error| {
++            tracing::error!(
++                "no title claim for title {title_id} (client id {client_id}): {error}. \
++             Requests needing this title identity may be refused until authentication succeeds."
++            );
++        })
++        .ok()
+ }
+ 
+ /// The key that signs requests. It has to be the key the token was minted
+-/// under, so it follows SISU when SISU supplied the tokens.
++/// under; cached tokens retain their own issuer key.
+ static SIGNER: std::sync::LazyLock<xodus::api::xbox::RequestSigner> =
+     std::sync::LazyLock::new(xodus::api::xbox::RequestSigner::generate);
+ 
+-/// The signature policy for a host, if it has one: the policy version and how
+-/// much of the body is covered.
+-fn signature_policy(
+-    url: &str,
+-    endpoints: &Option<xodus::models::xbox::TitleMgtResponse>,
+-) -> Option<(u32, usize)> {
+-    let list = endpoints.as_ref()?;
+-    let endpoint = xodus::api::xbox::title::get_endpoint(url, list).or_else(|| {
+-        let host = reqwest::Url::parse(url).ok()?.host_str()?.to_string();
+-        list.end_points
+-            .iter()
+-            .filter(|e| !e.host.contains('*') && host.ends_with(&format!(".{}", e.host)))
+-            .max_by_key(|e| e.host.len())
+-    })?;
++/// Default and title-specific NSAL keep their own signature-policy tables.
++struct EndpointConfig {
++    default: xodus::models::xbox::TitleMgtResponse,
++    title: Option<xodus::models::xbox::TitleMgtResponse>,
++}
++
++impl EndpointConfig {
++    fn endpoint(
++        &self,
++        url: &str,
++    ) -> Option<(
++        &xodus::models::xbox::TitleMgtEndPoint,
++        &xodus::models::xbox::TitleMgtResponse,
++    )> {
++        xodus::api::xbox::title::get_endpoint_with_title(url, &self.default, self.title.as_ref())
++    }
++
++    fn relying_party(&self, url: &str) -> String {
++        self.endpoint(url)
++            .and_then(|(e, _)| e.relying_party.clone())
++            .unwrap_or_else(|| {
++                reqwest::Url::parse(url)
++                    .ok()
++                    .and_then(|u| u.host_str().map(|h| format!("https://{h}/")))
++                    .unwrap_or_else(|| "http://xboxlive.com".to_string())
++            })
++    }
++}
++
++fn signature_policy(url: &str, endpoints: &EndpointConfig) -> Option<(u32, usize)> {
++    let (endpoint, source) = endpoints.endpoint(url)?;
+     let index = endpoint.signature_policy_index? as usize;
+-    let policy = list.signature_policies.get(index)?;
++    let policy = source.signature_policies.get(index)?;
+     Some((policy.version as u32, policy.max_body_bytes as usize))
++}
++
++static TITLE_ENDPOINTS: std::sync::LazyLock<
++    AsyncCache<i64, xodus::models::xbox::TitleMgtResponse>,
++> = std::sync::LazyLock::new(|| AsyncCache::new(Duration::from_secs(15), Duration::from_secs(5)));
++
++async fn title_endpoints_for(
++    client: &reqwest::Client,
++    title_id: i64,
++    identity: &xodus::auth::SisuIdentity,
++) -> Result<xodus::models::xbox::TitleMgtResponse, String> {
++    TITLE_ENDPOINTS
++        .get_or_try_init(
++            title_id,
++            |_| true,
++            || async {
++                let signer = xodus::api::xbox::RequestSigner::from_pkcs8(&identity.key_pkcs8)
++                    .ok_or_else(|| "invalid title signing key".to_string())?;
++                let xsts = xodus::api::xbox::request_xsts_token(
++                    client,
++                    identity.user_token.clone(),
++                    Some(identity.device_token.clone()),
++                    Some(identity.title_token.clone()),
++                    "http://xboxlive.com",
++                    Some(&signer),
++                )
++                .await
++                .map_err(|e| format!("title discovery authorization failed: {e}"))?;
++                let authorization = xodus::api::xbox::get_xsts_auth_header(xsts);
++                let endpoints =
++                    xodus::api::xbox::title::get_title_endpoints(client, &authorization, &signer)
++                        .await
++                        .map_err(|e| format!("title endpoint discovery failed: {e}"))?;
++                tracing::info!(
++                    "discovered {} service endpoints for title {title_id}",
++                    endpoints.end_points.len()
++                );
++                Ok(endpoints)
++            },
++        )
++        .await
++}
++
++fn token_cache_key(
++    session: &[u8; 32],
++    title: Option<&(i64, String)>,
++    relying_party: &str,
++    signer: &xodus::api::xbox::RequestSigner,
++) -> String {
++    let proof = signer.proof_key();
++    format!(
++        "{session:?}|{}|{}|{relying_party}|{}|{}",
++        title.map(|(id, _)| *id).unwrap_or(0),
++        title.map(|(_, client)| client.as_str()).unwrap_or(""),
++        proof.x,
++        proof.y
++    )
+ }
+ 
+ #[derive(Clone)]
+ struct CachedToken {
++    signer: xodus::api::xbox::RequestSigner,
+     token: String,
+     xuid: String,
+     gamertag: String,
+@@ -157,30 +300,26 @@
+ 
+ async fn endpoints_for(client: &reqwest::Client) -> Option<xodus::models::xbox::TitleMgtResponse> {
+     ENDPOINTS
+-        .get_or_init(|| async {
+-            xodus::api::xbox::title::get_title_management(client)
+-                .await
+-                .ok()
+-        })
++        .get_or_try_init(
++            (),
++            |_| true,
++            || async {
++                xodus::api::xbox::title::get_title_management(client)
++                    .await
++                    .map_err(|error| format!("default endpoint discovery failed: {error}"))
++            },
++        )
+         .await
+-        .clone()
+-}
+-
+-/// Sign the caller's request, if its endpoint demands one.
+-fn sign_for(
+-    req: &XSTSTokenRequest,
+-    authorization: &str,
+-    endpoints: &Option<xodus::models::xbox::TitleMgtResponse>,
+-) -> String {
+-    sign_for_with(req, authorization, endpoints, &SIGNER)
+-}
+-
+-/// As `sign_for`, but with the key the token was actually minted under: a
++        .map_err(|error| tracing::warn!("{error}"))
++        .ok()
++}
++
++/// Sign with the key the token was actually minted under: a
+ /// signature made with any other key is rejected.
+ fn sign_for_with(
+     req: &XSTSTokenRequest,
+     authorization: &str,
+-    endpoints: &Option<xodus::models::xbox::TitleMgtResponse>,
++    endpoints: &EndpointConfig,
+     signer: &xodus::api::xbox::RequestSigner,
+ ) -> String {
+     let Some((version, max_body)) = signature_policy(&req.url, endpoints) else {
+@@ -305,78 +444,57 @@
+             let req = quick_xml::de::from_str::<XSTSTokenRequest>(std::str::from_utf8(&buffer)?)?;
+             tracing::debug!("XSTS token request for {}", req.url);
+ 
+-            // Which relying party this URL authenticates against. The
+-            // title-management endpoint list is authoritative; its PlayFab entry
+-            // is the bare domain, so fall back to a suffix match for the
+-            // per-title hosts (b980a380.minecraft.playfabapi.com and friends).
+-            let relying_party = if !req.relying_party.is_empty() {
+-                req.relying_party.clone()
+-            } else {
+-                let endpoints = ENDPOINTS
+-                    .get_or_init(|| async {
+-                        xodus::api::xbox::title::get_title_management(&context.client)
+-                            .await
+-                            .ok()
+-                    })
+-                    .await;
+-                let from_list = endpoints.as_ref().and_then(|list| {
+-                    xodus::api::xbox::title::get_endpoint(&req.url, list)
+-                        .and_then(|e| e.relying_party.clone())
+-                });
+-                match from_list {
+-                    Some(rp) => rp,
+-                    None => {
+-                        let host = reqwest::Url::parse(&req.url)
+-                            .ok()
+-                            .and_then(|u| u.host_str().map(str::to_owned))
+-                            .unwrap_or_default();
+-                        let fallback = endpoints.as_ref().and_then(|list| {
+-                            list.end_points
+-                                .iter()
+-                                .filter(|e| {
+-                                    e.relying_party.is_some()
+-                                        && !e.host.contains('*')
+-                                        && host.ends_with(&format!(".{}", e.host))
+-                                })
+-                                .max_by_key(|e| e.host.len())
+-                                .and_then(|e| e.relying_party.clone())
+-                        });
+-                        // A service Xbox does not list still has a relying
+-                        // party: its own origin. Minecraft Realms is the case
+-                        // in point -- the title asks for a token for
+-                        // pocket.realms.minecraft.net, which is not an
+-                        // xboxlive.com host, and handing it an xboxlive.com
+-                        // token made every Realms endpoint answer 401.
+-                        fallback.unwrap_or_else(|| {
+-                            reqwest::Url::parse(&req.url)
+-                                .ok()
+-                                .and_then(|u| u.host_str().map(|h| format!("https://{h}/")))
+-                                .unwrap_or_else(|| "http://xboxlive.com".to_string())
+-                        })
+-                    }
++            // Read the persisted credential before any cache lookup: a logout
++            // invalidates access and a different login must never reuse an old identity.
++            let Token::Legacy(current_user) = context.tokens().get_user_sts_token()? else {
++                return Ok(vec![]);
++            };
++            // STS refresh rotates credential bytes during ordinary SISU calls.
++            // Scope caches to the signed-in account, while requiring both its
++            // persisted identity and credentials to still exist after logout.
++            let account = context.tokens().get_user()?;
++            if account.puid.is_empty() {
++                return Err("signed-in account has no identity".into());
++            }
++            let session: [u8; 32] = Sha256::digest(account.puid.as_bytes()).into();
++            let title = req.title().map(|(id, client)| (id, client.to_string()));
++            let identity = match &title {
++                Some((id, client)) => {
++                    identity_for(&context.client, context.tokens(), *id, client, session).await
+                 }
+-            };
+-            // Which title is asking, when the runtime told us. Everything
+-            // below keys off it: two titles running at once must not be handed
+-            // each other's claim, and neither must a title be handed the
+-            // claimless token minted before its own arrived.
+-            let title = req.title().map(|(id, client)| (id, client.to_string()));
+-            match &title {
+-                Some((id, client)) => {
+-                    tracing::debug!("Relying party: {relying_party} (title {id}, client {client})")
+-                }
+-                None => {
+-                    tracing::debug!("Relying party: {relying_party} (no title claim asked for)")
++                None => None,
++            };
++            if title.is_some() && identity.is_none() {
++                return Err(
++                    "the requested title identity could not be authenticated; retry later".into(),
++                );
++            }
++            let issuer = match &identity {
++                Some(id) => xodus::api::xbox::RequestSigner::from_pkcs8(&id.key_pkcs8)
++                    .ok_or("invalid title signing key")?,
++                None => SIGNER.clone(),
++            };
++            let mut endpoints = EndpointConfig {
++                default: endpoints_for(&context.client).await.unwrap_or(
++                    xodus::models::xbox::TitleMgtResponse {
++                        end_points: vec![],
++                        signature_policies: vec![],
++                    },
++                ),
++                title: None,
++            };
++            if let (Some((id, _)), Some(identity)) = (&title, &identity) {
++                match title_endpoints_for(&context.client, *id, identity).await {
++                    Ok(list) => endpoints.title = Some(list),
++                    Err(e) => tracing::warn!("title {id}: {e}"),
+                 }
+             }
+-            let cache_key = format!(
+-                "{}|{relying_party}",
+-                title.as_ref().map(|(id, _)| *id).unwrap_or(0)
+-            );
+-
+-            // Re-use a still-valid token rather than paying for the whole
+-            // chain again; keep a minute of headroom so one never expires in
+-            // flight.
++            let relying_party = if req.relying_party.is_empty() {
++                endpoints.relying_party(&req.url)
++            } else {
++                req.relying_party.clone()
++            };
++            let cache_key = token_cache_key(&session, title.as_ref(), &relying_party, &issuer);
+             let now = chrono::Utc::now().timestamp();
+             if let Some(hit) = XSTS_CACHE
+                 .lock()
+@@ -384,8 +502,7 @@
+                 .and_then(|c| c.get(&cache_key).cloned())
+                 .filter(|c| c.expiry > now + 60)
+             {
+-                tracing::debug!("Re-using cached token for {relying_party}");
+-                let signature = sign_for(&req, &hit.token, &endpoints_for(&context.client).await);
++                let signature = sign_for_with(&req, &hit.token, &endpoints, &hit.signer);
+                 let payload = XSTSTokenResponse {
+                     token: hit.token,
+                     xuid: hit.xuid,
+@@ -393,176 +510,97 @@
+                     expiry: hit.expiry,
+                     signature,
+                 };
+-                return Ok(quick_xml::se::to_string(&payload)?.as_bytes().to_vec());
++                return Ok(quick_xml::se::to_string(&payload)?.into_bytes());
+             }
+ 
+-            let Token::Legacy(user_token) = context.tokens().get_user_sts_token()? else {
+-                return Ok(vec![]);
+-            };
+-
+-            // Xbox will only issue a title token against an RPS ticket obtained
+-            // under the title's own client id, which is why title/authenticate
+-            // answers 403 for the generic ticket the token path holds. SISU does
+-            // hold one, so run it once and hand the title token over: presence
+-            // resolves `titles/current` from that claim and fails without it.
+-            // Off unless asked for: the token SISU returns is bound to its own
+-            // proof key, while the user and device tokens here are bound to
+-            // ours, and xsts/authorize answers 400 to that mixture. Presence
+-            // needs the whole chain minted under one key, which is a rebuild of
+-            // this path rather than an addition to it.
+-            if std::env::var("XODUS_TITLE_TOKEN").is_ok_and(|v| v == "1") {
+-                TITLE_TOKEN
+-                    .get_or_init(|| async {
+-                        match xodus::auth::do_sisu(
++            let (xsts, signer) = if let Some(identity) = identity {
++                let signer = xodus::api::xbox::RequestSigner::from_pkcs8(&identity.key_pkcs8)
++                    .ok_or("invalid title signing key")?;
++                let refused = NO_TITLE_CLAIM
++                    .lock()
++                    .map(|s| s.contains(&cache_key))
++                    .unwrap_or(false);
++                let result = tokio::time::timeout(
++                    AUTH_TIMEOUT,
++                    xodus::api::xbox::request_xsts_token(
++                        &context.client,
++                        identity.user_token.clone(),
++                        Some(identity.device_token.clone()),
++                        if refused {
++                            None
++                        } else {
++                            Some(identity.title_token.clone())
++                        },
++                        &relying_party,
++                        Some(&signer),
++                    ),
++                )
++                .await
++                .map_err(|_| "XSTS authorization timed out")?;
++                let xsts = match result {
++                    Ok(token) => token,
++                    Err(e)
++                        if !refused
++                            && matches!(
++                                e.status(),
++                                Some(
++                                    reqwest::StatusCode::BAD_REQUEST
++                                        | reqwest::StatusCode::FORBIDDEN
++                                )
++                            ) =>
++                    {
++                        // Some audiences accept the user/device chain only. Retry
++                        // under the same key, scoped to this title and audience.
++                        let token = tokio::time::timeout(AUTH_TIMEOUT, xodus::api::xbox::request_xsts_token(
+                             &context.client,
+-                            context.tokens(),
+-                            "0000000040159362",
+-                            896928775,
+-                        )
+-                        .await
+-                        {
+-                            Ok((_, resp, _)) => {
+-                                tracing::info!("SISU supplied a title token");
+-                                xodus::api::xbox::set_title_token(resp.title_token.token.clone());
+-                                true
+-                            }
+-                            Err(e) => {
+-                                tracing::warn!("SISU title token unavailable: {e}");
+-                                false
+-                            }
++                            identity.user_token.clone(),
++                            Some(identity.device_token.clone()),
++                            None,
++                            &relying_party,
++                            Some(&signer),
++                        ))
++                        .await.map_err(|_| "XSTS authorization without title claim timed out")?
++                        .map_err(|e| std::io::Error::other(format!("XSTS authorization without title claim for {relying_party} failed: {e}")))?;
++                        tracing::warn!(
++                            "{relying_party} accepts this title's user/device token without a title claim"
++                        );
++                        if let Ok(mut set) = NO_TITLE_CLAIM.lock() {
++                            set.insert(cache_key.clone());
+                         }
+-                    })
+-                    .await;
+-            }
+-            let device_token = context.device_token.as_ref().unwrap().clone();
+-
+-            // A claim for the title that is actually running, or none.
+-            //
+-            // Never a stand-in: a token claiming some other title is refused by
+-            // the very services the claim exists for, so where the title is
+-            // unknown the claimless chain below is the better answer.
+-            let refused = NO_TITLE_CLAIM
+-                .lock()
+-                .map(|s| s.contains(&relying_party))
+-                .unwrap_or(false);
+-            let sisu = match (&title, refused) {
+-                (Some((id, client)), false) => {
+-                    sisu_for(&context.client, context.tokens(), *id, client).await
+-                }
+-                _ => None,
+-            };
+-
+-            // Say so when this request is one of the ones that will come back
+-            // 403 without a claim. It is the only chance to name the cause:
+-            // the title makes the call itself, sees a bare 403, and reports it
+-            // as "failed to create party" or a broken sign-in.
+-            if sisu.is_none() {
+-                if let Some(what) = xodus::api::xbox::claims::needs_title_claim(&req.url) {
+-                    let why = match (&title, refused) {
+-                        (None, _) => "the runtime sent no TitleId/MSAAppId (is the title's \
+-                                      MicrosoftGame.config readable?)"
+-                            .to_string(),
+-                        (Some(_), true) => {
+-                            format!("{relying_party} would not issue a token carrying one")
+-                        }
+-                        (Some((id, _)), false) => format!("SISU could not mint one for title {id}"),
+-                    };
+-                    tracing::error!("{} will fail: no title claim -- {why}", what);
+-                }
+-            }
+-
+-            if let Some(id) = sisu.as_ref() {
+-                let signer = xodus::api::xbox::RequestSigner::from_pkcs8(&id.key_pkcs8);
+-                let xsts = xodus::api::xbox::request_xsts_token(
+-                    &context.client,
+-                    id.user_token.clone(),
+-                    Some(id.device_token.clone()),
+-                    Some(id.title_token.clone()),
+-                    &relying_party,
+-                )
+-                .await;
+-                match xsts {
+-                    Ok(xsts) => {
+-                        let token = xodus::api::xbox::get_xsts_auth_header(xsts.clone());
+-                        let signature = match signer.as_ref() {
+-                            Some(s) => sign_for_with(
+-                                &req,
+-                                &token,
+-                                &endpoints_for(&context.client).await,
+-                                s,
+-                            ),
+-                            None => String::new(),
+-                        };
+-                        let payload = XSTSTokenResponse {
+-                            xuid: xsts.xuid().unwrap_or_default().to_string(),
+-                            gamertag: xsts.gamertag().unwrap_or_default().to_string(),
+-                            expiry: xsts.not_after.timestamp(),
+-                            token,
+-                            signature,
+-                        };
+-                        if let Ok(mut cache) = XSTS_CACHE.lock() {
+-                            cache.insert(
+-                                cache_key.clone(),
+-                                CachedToken {
+-                                    token: payload.token.clone(),
+-                                    xuid: payload.xuid.clone(),
+-                                    gamertag: payload.gamertag.clone(),
+-                                    expiry: payload.expiry,
+-                                },
+-                            );
+-                        }
+-                        return Ok(quick_xml::se::to_string(&payload)?.as_bytes().to_vec());
++                        token
+                     }
+                     Err(e) => {
+-                        // The audience would not take a title claim. Remember
+-                        // it so the next request for it skips straight to the
+-                        // claimless chain instead of paying for the refusal.
+-                        tracing::warn!(
+-                            "{relying_party} refused a title claim ({e}); \
+-                             falling back to a token without one"
+-                        );
+-                        if let Ok(mut set) = NO_TITLE_CLAIM.lock() {
+-                            set.insert(relying_party.clone());
+-                        }
++                        return Err(std::io::Error::other(format!(
++                            "XSTS authorization for {relying_party} failed: {e}"
++                        ))
++                        .into());
+                     }
+-                }
+-            }
+-
+-            // A refused relying party used to panic the task serving this
+-            // request, leaving the title waiting for a token for ever. Report
+-            // it instead, and try the generic Xbox audience before giving up.
+-            let xsts = match xodus::api::xbox::try_run_with_signer(
+-                &context.client,
+-                device_token.clone(),
+-                user_token.clone(),
+-                &relying_party,
+-                Some(&SIGNER),
+-            )
+-            .await
+-            {
+-                Ok(t) => t,
+-                Err(e) => {
+-                    tracing::warn!("{e}; retrying with the generic Xbox audience");
+-                    match xodus::api::xbox::try_run_with_signer(
++                };
++                (xsts, signer)
++            } else {
++                let user_token = current_user;
++                let device_token = context
++                    .device_token
++                    .as_ref()
++                    .ok_or("no device credentials")?
++                    .clone();
++                let token = tokio::time::timeout(
++                    AUTH_TIMEOUT,
++                    xodus::api::xbox::try_run_with_signer(
+                         &context.client,
+                         device_token,
+                         user_token,
+-                        "http://xboxlive.com",
++                        &relying_party,
+                         Some(&SIGNER),
+-                    )
+-                    .await
+-                    {
+-                        Ok(t) => t,
+-                        Err(e) => {
+-                            tracing::error!("no token for {}: {e}", req.url);
+-                            return Ok(vec![]);
+-                        }
+-                    }
+-                }
+-            };
+-
++                    ),
++                )
++                .await
++                .map_err(|_| "unclaimed Xbox authentication timed out")?
++                .map_err(std::io::Error::other)?;
++                (token, SIGNER.clone())
++            };
+             let token = xodus::api::xbox::get_xsts_auth_header(xsts.clone());
+-            let signature = sign_for(&req, &token, &endpoints_for(&context.client).await);
++            let signature = sign_for_with(&req, &token, &endpoints, &signer);
+             let payload = XSTSTokenResponse {
+                 xuid: xsts.xuid().unwrap_or_default().to_string(),
+                 gamertag: xsts.gamertag().unwrap_or_default().to_string(),
+@@ -574,6 +612,7 @@
+                 cache.insert(
+                     cache_key,
+                     CachedToken {
++                        signer,
+                         token: payload.token.clone(),
+                         xuid: payload.xuid.clone(),
+                         gamertag: payload.gamertag.clone(),
+@@ -581,8 +620,12 @@
+                     },
+                 );
+             }
+-            Ok(quick_xml::se::to_string(&payload)?.as_bytes().to_vec())
++            Ok(quick_xml::se::to_string(&payload)?.into_bytes())
+         }
+         _ => Err("Unimplemented".into()),
+     }
+ }
++
++#[cfg(test)]
++#[path = "xml_tests.rs"]
++mod tests;
+diff --git a/crates/xodus/src/api/xbox/auth.rs b/crates/xodus/src/api/xbox/auth.rs
+--- a/crates/xodus/src/api/xbox/auth.rs
++++ b/crates/xodus/src/api/xbox/auth.rs
+@@ -6,7 +6,7 @@
+ pub async fn authenticate_xbox_user(
+     client: &reqwest::Client,
+     rps_ticket: String,
+-    proof_key: Option<crate::api::xbox::signing::ProofKey>,
++    signer: Option<&crate::api::xbox::signing::RequestSigner>,
+ ) -> reqwest::Result<XstsResponse> {
+     let body = UserAuthRequest {
+         relying_party: "http://auth.xboxlive.com".to_string(),
+@@ -15,18 +15,22 @@
+             auth_method: "RPS".to_string(),
+             site_name: "user.auth.xboxlive.com".to_string(),
+             rps_ticket,
+-            proof_key,
++            proof_key: signer.map(|s| s.proof_key()),
+         },
+     };
+ 
+-    let resp = client
++    let payload = serde_json::to_vec(&body).expect("user auth request serialises");
++    let mut request = client
+         .post("https://user.auth.xboxlive.com/user/authenticate")
+         .header("Content-Type", "application/json")
+-        .header("x-xbl-contract-version", "1")
+-        .json(&body)
+-        .send()
+-        .await?
+-        .error_for_status()?;
++        .header("x-xbl-contract-version", "1");
++    if let Some(signer) = signer {
++        request = request.header(
++            "Signature",
++            signer.sign(1, "POST", "/user/authenticate", "", &payload, 8192),
++        );
++    }
++    let resp = request.body(payload).send().await?.error_for_status()?;
+ 
+     resp.json().await
+ }
+@@ -59,14 +63,7 @@
+     };
+ 
+     let payload = serde_json::to_vec(&body).expect("device auth request serialises");
+-    let signature = signer.sign(
+-        1,
+-        "POST",
+-        "/device/authenticate",
+-        "",
+-        &payload,
+-        8192,
+-    );
++    let signature = signer.sign(1, "POST", "/device/authenticate", "", &payload, 8192);
+ 
+     let resp = client
+         .post("https://device.auth.xboxlive.com/device/authenticate")
+@@ -120,13 +117,100 @@
+     resp.json().await
+ }
+ 
++fn win32_title_auth_payload(
++    device_token: &str,
++    title_id: i64,
++    proof_key: crate::api::xbox::signing::ProofKey,
++) -> Result<Vec<u8>, String> {
++    if !(1..=u32::MAX as i64).contains(&title_id) {
++        return Err(
++            "Windows title authentication requires a TitleId in 1..=4294967295".to_string(),
++        );
++    }
++
++    serde_json::to_vec(&serde_json::json!({
++        "RelyingParty": "http://auth.xboxlive.com",
++        "TokenType": "JWT",
++        "Properties": {
++            "DeviceToken": device_token,
++            "TitleId": title_id,
++            "ProofKey": proof_key,
++        },
++    }))
++    .map_err(|e| format!("could not serialize Windows title authentication request: {e}"))
++}
++
++/// Authenticate a Windows title using its configured numeric TitleId.
++///
++/// This is the Windows client-attested flow: it uses the device token and its
++/// proof key, without requiring an MSAAppId or a title-scoped RPS ticket. The
++/// device token must have been issued under `signer` as well.
++pub async fn authenticate_xbox_title_win(
++    client: &reqwest::Client,
++    device_token: String,
++    title_id: i64,
++    signer: &crate::api::xbox::signing::RequestSigner,
++) -> Result<XstsResponse, String> {
++    let payload = win32_title_auth_payload(&device_token, title_id, signer.proof_key())?;
++    let signature = signer.sign(1, "POST", "/title/authenticate", "", &payload, 8192);
++
++    let resp = client
++        .post("https://title.auth.xboxlive.com/title/authenticate")
++        .header("Content-Type", "application/json")
++        .header("x-xbl-contract-version", "1")
++        .header("Signature", signature)
++        .body(payload)
++        .send()
++        .await
++        .and_then(reqwest::Response::error_for_status)
++        .map_err(|e| format!("Windows title authentication failed: {e}"))?;
++
++    resp.json()
++        .await
++        .map_err(|e| format!("could not parse Windows title authentication response: {e}"))
++}
++
++/// Mint a token under the supplied proof key, or leave a user-only chain unbound.
++/// A proof-bound identity must sign authorization with the same key that created it.
++/// The existing XAL implementation signs this exchange as well as service calls.
+ pub async fn request_xsts_token(
+     client: &reqwest::Client,
+     token: String,
+     device_token: Option<String>,
+     title_token: Option<String>,
+     relying_party: &str,
++    signer: Option<&crate::api::xbox::signing::RequestSigner>,
+ ) -> reqwest::Result<XstsResponse> {
++    let request = xsts_request(
++        client,
++        token,
++        device_token,
++        title_token,
++        relying_party,
++        signer,
++    )?;
++    let resp = client.execute(request).await?;
++    if let Err(error) = resp.error_for_status_ref() {
++        let status = resp.status();
++        let detail = resp.json::<serde_json::Value>().await.ok();
++        let code = detail
++            .as_ref()
++            .and_then(|v| v.get("XErr"))
++            .and_then(|v| v.as_u64());
++        tracing::warn!(%status, ?code, "XSTS authorization refused for {relying_party}");
++        return Err(error);
++    }
++    resp.json().await
++}
++
++fn xsts_request(
++    client: &reqwest::Client,
++    token: String,
++    device_token: Option<String>,
++    title_token: Option<String>,
++    relying_party: &str,
++    signer: Option<&crate::api::xbox::signing::RequestSigner>,
++) -> reqwest::Result<reqwest::Request> {
+     let body = XstsRequest {
+         relying_party: Some(relying_party.to_string()),
+         token_type: Some("JWT".to_string()),
+@@ -140,19 +224,151 @@
+         },
+     };
+ 
+-    let resp = client
++    let payload = serde_json::to_vec(&body).expect("XSTS request serialises");
++    let mut request = client
+         .post("https://xsts.auth.xboxlive.com/xsts/authorize")
+         .header("Content-Type", "application/json")
+-        .header("x-xbl-contract-version", "1")
+-        .json(&body)
+-        .send()
+-        .await?
+-        .error_for_status()?;
+-
+-    resp.json().await
++        .header("x-xbl-contract-version", "1");
++    if let Some(signer) = signer {
++        request = request.header(
++            "Signature",
++            signer.sign(1, "POST", "/xsts/authorize", "", &payload, 8192),
++        );
++    }
++    request.body(payload).build()
+ }
+ 
+ pub fn get_xsts_auth_header(xsts: XstsResponse) -> String {
+     let uhs = xsts.user_hash().expect("XSTS response missing xui claim");
+     format!("XBL3.0 x={uhs};{}", xsts.token)
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::api::xbox::signing::ProofKey;
++
++    fn synthetic_proof_key() -> ProofKey {
++        ProofKey {
++            crv: "P-256".to_string(),
++            alg: "ES256".to_string(),
++            use_: "sig".to_string(),
++            kty: "EC".to_string(),
++            x: "synthetic-x".to_string(),
++            y: "synthetic-y".to_string(),
++        }
++    }
++
++    #[test]
++    fn proof_bound_xsts_request_signs_its_exact_wire_body() {
++        use base64::Engine;
++        use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
++        use p256::pkcs8::DecodePrivateKey;
++
++        let signer = crate::api::xbox::RequestSigner::generate();
++        let request = xsts_request(
++            &reqwest::Client::new(),
++            "synthetic-user".into(),
++            Some("synthetic-device".into()),
++            Some("synthetic-title".into()),
++            "https://audience.example.test/",
++            Some(&signer),
++        )
++        .unwrap();
++        let encoded = request
++            .headers()
++            .get("Signature")
++            .expect("proof-bound XSTS must be signed");
++        let signature = base64::engine::general_purpose::STANDARD
++            .decode(encoded)
++            .unwrap();
++        assert_eq!(signature.len(), 76);
++        let body = request.body().unwrap().as_bytes().unwrap();
++        let value: serde_json::Value = serde_json::from_slice(body).unwrap();
++        assert_eq!(value["RelyingParty"], "https://audience.example.test/");
++        assert_eq!(value["Properties"]["TitleToken"], "synthetic-title");
++        let mut message = Vec::new();
++        for part in [
++            &signature[..4],
++            &signature[4..12],
++            b"POST",
++            b"/xsts/authorize",
++            b"",
++            &body[..body.len().min(8192)],
++        ] {
++            message.extend_from_slice(part);
++            message.push(0);
++        }
++        let key = p256::SecretKey::from_pkcs8_der(&signer.to_pkcs8().unwrap()).unwrap();
++        let verifier = VerifyingKey::from(key.public_key());
++        let signed = Signature::from_slice(&signature[12..]).unwrap();
++        verifier
++            .verify(&message, &signed)
++            .expect("signature must use this identity's key and transmitted body");
++        message[13] ^= 1;
++        assert!(
++            verifier.verify(&message, &signed).is_err(),
++            "changed request must not authenticate"
++        );
++    }
++
++    #[test]
++    fn unbound_xsts_request_remains_unsigned() {
++        let request = xsts_request(
++            &reqwest::Client::new(),
++            "synthetic-user".into(),
++            None,
++            None,
++            "https://audience.example.test/",
++            None,
++        )
++        .unwrap();
++        assert!(!request.headers().contains_key("Signature"));
++    }
++
++    #[test]
++    fn win32_title_request_uses_numeric_title_id_and_device_proof_only() {
++        let payload =
++            win32_title_auth_payload("synthetic-device-token", 0x12345678, synthetic_proof_key())
++                .expect("valid title ID");
++        let body: serde_json::Value = serde_json::from_slice(&payload).unwrap();
++
++        assert_eq!(
++            body,
++            serde_json::json!({
++                "RelyingParty": "http://auth.xboxlive.com",
++                "TokenType": "JWT",
++                "Properties": {
++                    "DeviceToken": "synthetic-device-token",
++                    "TitleId": 305419896,
++                    "ProofKey": {
++                        "crv": "P-256", "alg": "ES256", "use": "sig",
++                        "kty": "EC", "x": "synthetic-x", "y": "synthetic-y"
++                    }
++                }
++            })
++        );
++    }
++
++    #[test]
++    fn win32_title_request_rejects_ids_outside_nonzero_u32_range() {
++        for title_id in [4294967296, 0, -1, i64::MIN, i64::MAX] {
++            assert_eq!(
++                win32_title_auth_payload("synthetic-device-token", title_id, synthetic_proof_key())
++                    .unwrap_err(),
++                "Windows title authentication requires a TitleId in 1..=4294967295"
++            );
++        }
++    }
++
++    #[test]
++    fn win32_title_request_accepts_nonzero_u32_boundaries() {
++        for title_id in [1, u32::MAX as i64] {
++            let payload =
++                win32_title_auth_payload("synthetic-device-token", title_id, synthetic_proof_key())
++                    .expect("valid title ID boundary");
++            let body: serde_json::Value = serde_json::from_slice(&payload).unwrap();
++            assert_eq!(body["Properties"]["TitleId"], title_id);
++        }
++    }
++}
+diff --git a/crates/xodus/src/api/xbox/mod.rs b/crates/xodus/src/api/xbox/mod.rs
+--- a/crates/xodus/src/api/xbox/mod.rs
++++ b/crates/xodus/src/api/xbox/mod.rs
+@@ -8,7 +8,8 @@
+ pub mod signing;
+ pub mod title;
+ pub use auth::{
+-    authenticate_xbox_device, authenticate_xbox_title, authenticate_xbox_user, get_xsts_auth_header, request_xsts_token,
++    authenticate_xbox_device, authenticate_xbox_title, authenticate_xbox_title_win,
++    authenticate_xbox_user, get_xsts_auth_header, request_xsts_token,
+ };
+ pub use signing::{ProofKey, RequestSigner, path_and_query};
+ 
+@@ -21,91 +22,14 @@
+     run_with_signer(client, dev_token, legacy, relying_party, None).await
+ }
+ 
+-/// As `run`, but binds the issued token to a signing key so the caller can sign
+-/// requests to endpoints that require it.
+-/// As `run_with_signer`, but reports failure instead of panicking.
+-///
+-/// The panicking version kills the task serving a token request, so the title
+-/// waits for an answer that never arrives -- one bad relying party or one
+-/// hiccup from the Xbox token service and that account looks signed out for
+-/// the rest of the session.
+-/// An RPS ticket issued under Minecraft's own client id.
+-///
+-/// Xbox will not issue a title token against the generic user ticket the rest
+-/// of this path uses -- title/authenticate answers 403 -- so the title call
+-/// needs its own ticket, obtained the way the SISU flow obtains one. Doing it
+-/// here rather than through SISU keeps the whole chain bound to our signing
+-/// key, which is what xsts/authorize insists on: a title token bound to a
+-/// different key makes it answer 400.
+-async fn title_scoped_rps(
+-    client: &reqwest::Client,
+-    dev_token: LegacyToken,
+-    legacy: LegacyToken,
+-) -> Result<String, String> {
+-    const CLIENT_ID: &str = "0000000040159362"; /* Minecraft */
+-
+-    let dev_for_title = dev_token.clone();
+-    let legacy_for_title = legacy.clone();
+-    let outcome = crate::api::live::exchange_user_token(
+-        client,
+-        legacy,
+-        "USERNAME".to_string(),
+-        dev_token,
+-        None,
+-        Some("Silent".to_string()),
+-        CLIENT_ID.to_string(),
+-        &[
+-            (
+-                format!("scope=xboxlive.signin&api-version=2.0&clientid={CLIENT_ID}"),
+-                Some(soap::PolicyReference::token_broker()),
+-            ),
+-            ("http://Passport.NET/tb".to_string(), None),
+-        ],
+-    )
+-    .await
+-    .map_err(|e| format!("title-scoped RPS exchange failed: {e}"))?;
+-
+-    let ExchangeUserTokenOutcome::Issued(
+-        soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
+-    ) = outcome
+-    else {
+-        return Err("title-scoped RPS exchange returned no collection".to_string());
+-    };
+-    if collection.security_tokens.is_empty() {
+-        return Err("title-scoped RPS exchange returned no tokens".to_string());
+-    }
+-    let token: Token = collection.security_tokens.remove(0).into();
+-    match token {
+-        Token::Compact(t) => {
+-            eprintln!(
+-                "[xodus] title-scoped ticket: {} chars, prefix {:?}",
+-                t.len(),
+-                &t[..t.len().min(2)]
+-            );
+-            Ok(t)
+-        }
+-        _ => Err("title-scoped RPS ticket is not compact".to_string()),
+-    }
+-}
+-
+-/// A title token supplied from outside, for when title/authenticate refuses us.
+-///
+-/// Xbox only issues a title token to an RPS ticket obtained under the title's
+-/// own client id, and the ticket this path holds is a generic user one, so
+-/// title/authenticate answers 403. The SISU flow does hold such a ticket, so
+-/// the service runs it once and hands the result here.
+-static SISU_TITLE_TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+-
+-pub fn set_title_token(token: String) {
+-    let _ = SISU_TITLE_TOKEN.set(token);
+-}
+-
+-/// Whether to attach device and title claims. On by default; set
++/// Whether to attach a device claim. On by default; set
+ /// XODUS_DEVICE_TOKEN=0 to mint plain user-only tokens.
+ fn claims_wanted() -> bool {
+     !std::env::var("XODUS_DEVICE_TOKEN").is_ok_and(|v| v == "0")
+ }
+ 
++/// Authenticate the signed-in user and optional device without a title claim.
++/// Reports authentication failures instead of panicking.
+ pub async fn try_run_with_signer(
+     client: &reqwest::Client,
+     dev_token: LegacyToken,
+@@ -113,8 +37,6 @@
+     relying_party: &str,
+     signer: Option<&signing::RequestSigner>,
+ ) -> Result<XstsResponse, String> {
+-    let dev_for_title = dev_token.clone();
+-    let legacy_for_title = legacy.clone();
+     let outcome = crate::api::live::exchange_user_token(
+         client,
+         legacy,
+@@ -150,58 +72,33 @@
+         return Err("unsupported MSA token form".to_string());
+     };
+ 
+-    let resp = authenticate_xbox_user(client, user_token, signer.map(|s| s.proof_key()))
++    let resp = authenticate_xbox_user(client, user_token, signer)
+         .await
+         .map_err(|e| format!("Xbox user authentication failed: {e}"))?;
+ 
+-    // Device and title claims travel together. `devices/current` resolves from
+-    // one and `titles/current` from the other, so presence needs both; sending
+-    // only the device claim still leaves the service answering 400. Either
+-    // failing is not fatal -- everything that does not need them keeps working.
+-    let (device_token, title_token) = match signer.filter(|_| claims_wanted()) {
+-        Some(s) => {
+-            let dev = match authenticate_xbox_device(client, s).await {
+-                Ok(d) => Some(d.token),
+-                Err(e) => {
+-                    eprintln!("[xodus] device authenticate failed: {e}");
+-                    None
+-                }
+-            };
+-            let title = match dev.as_ref() {
+-                Some(d) => {
+-                    let ticket = match title_scoped_rps( client, dev_for_title.clone(), legacy_for_title.clone() ).await {
+-                        Ok(t) => Some(t),
+-                        Err(e) => {
+-                            eprintln!("[xodus] {e}");
+-                            None
+-                        }
+-                    };
+-                    match ticket {
+-                        Some(ticket) => match authenticate_xbox_title(client, ticket, d.clone(), s).await {
+-                            Ok(t) => Some(t.token),
+-                            Err(e) => {
+-                                eprintln!("[xodus] title authenticate failed: {e}");
+-                                SISU_TITLE_TOKEN.get().cloned()
+-                            }
+-                        },
+-                        None => SISU_TITLE_TOKEN.get().cloned(),
+-                    }
+-                }
+-                None => None,
+-            };
+-            eprintln!(
+-                "[xodus] claims: device={} title={}",
+-                dev.is_some(),
+-                title.is_some()
+-            );
+-            (dev, title)
+-        }
+-        None => (None, None),
++    // This generic flow has no title metadata, so it can only attach the
++    // user's own device claim. Title-specific callers authenticate separately.
++    let device_token = match signer.filter(|_| claims_wanted()) {
++        Some(s) => match authenticate_xbox_device(client, s).await {
++            Ok(device) => Some(device.token),
++            Err(e) => {
++                tracing::warn!("Xbox device authentication failed: {e}");
++                None
++            }
++        },
++        None => None,
+     };
+ 
+-    request_xsts_token(client, resp.token, device_token, title_token, relying_party)
+-        .await
+-        .map_err(|e| format!("XSTS authorize failed for {relying_party}: {e}"))
++    request_xsts_token(
++        client,
++        resp.token,
++        device_token,
++        None,
++        relying_party,
++        signer,
++    )
++    .await
++    .map_err(|e| format!("XSTS authorize failed for {relying_party}: {e}"))
+ }
+ 
+ pub async fn run_with_signer(
+@@ -211,94 +108,7 @@
+     relying_party: &str,
+     signer: Option<&signing::RequestSigner>,
+ ) -> XstsResponse {
+-    let dev_for_title = dev_token.clone();
+-    let legacy_for_title = legacy.clone();
+-    let user_token = crate::api::live::exchange_user_token(
+-        client,
+-        legacy,
+-        "USERNAME".to_string(),
+-        dev_token,
+-        None,
+-        Some("Silent".to_string()),
+-        "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".to_string(),
+-        &[(
+-            "user.auth.xboxlive.com".to_owned(),
+-            Some(soap::PolicyReference::mbi_ssl()),
+-        )],
+-    )
+-    .await
+-    .expect("Failed to get ms user token");
+-
+-    let user_token: Token = match user_token {
+-        ExchangeUserTokenOutcome::Fault(_) => {
+-            eprintln!("Failed to get exchange MS token");
+-            panic!("TODO");
+-        }
+-        ExchangeUserTokenOutcome::Issued(
+-            soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
+-        ) => {
+-            let token = collection.security_tokens.remove(0);
+-            token.into()
+-        }
+-        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(
+-            token,
+-        )) => (*token).into(),
+-        _ => unreachable!("Only responses are handled"),
+-    };
+-    let Token::Compact(user_token) = user_token else {
+-        eprintln!("Unsupported token");
+-        panic!("TODO");
+-    };
+-    let resp = authenticate_xbox_user(client, user_token, signer.map(|s| s.proof_key()))
+-        .await
+-        .expect("Failed to authenticate Xbox user");
+-
+-    // A device claim is what lets services address `devices/current`; without
+-    // one, setting presence is rejected and the account never shows as online.
+-    // A failure here is not fatal -- everything that does not need a device
+-    // still works -- so fall back to a user-only token.
+-    let (device_token, title_token) = match signer.filter(|_| claims_wanted()) {
+-        Some(s) => {
+-            let dev = match authenticate_xbox_device(client, s).await {
+-                Ok(d) => Some(d.token),
+-                Err(e) => {
+-                    eprintln!("[xodus] device authenticate failed: {e}");
+-                    None
+-                }
+-            };
+-            let title = match dev.as_ref() {
+-                Some(d) => {
+-                    let ticket = match title_scoped_rps( client, dev_for_title.clone(), legacy_for_title.clone() ).await {
+-                        Ok(t) => Some(t),
+-                        Err(e) => {
+-                            eprintln!("[xodus] {e}");
+-                            None
+-                        }
+-                    };
+-                    match ticket {
+-                        Some(ticket) => match authenticate_xbox_title(client, ticket, d.clone(), s).await {
+-                            Ok(t) => Some(t.token),
+-                            Err(e) => {
+-                                eprintln!("[xodus] title authenticate failed: {e}");
+-                                SISU_TITLE_TOKEN.get().cloned()
+-                            }
+-                        },
+-                        None => SISU_TITLE_TOKEN.get().cloned(),
+-                    }
+-                }
+-                None => None,
+-            };
+-            eprintln!(
+-                "[xodus] claims: device={} title={}",
+-                dev.is_some(),
+-                title.is_some()
+-            );
+-            (dev, title)
+-        }
+-        None => (None, None),
+-    };
+-
+-    request_xsts_token(client, resp.token, device_token, title_token, relying_party)
++    try_run_with_signer(client, dev_token, legacy, relying_party, signer)
+         .await
+         .expect("Failed to authenticate Xbox user")
+ }
+diff --git a/crates/xodus/src/api/xbox/title.rs b/crates/xodus/src/api/xbox/title.rs
+--- a/crates/xodus/src/api/xbox/title.rs
++++ b/crates/xodus/src/api/xbox/title.rs
+@@ -1,3 +1,4 @@
++use crate::api::xbox::signing::RequestSigner;
+ use crate::models::xbox::{TitleMgtEndPoint, TitleMgtResponse};
+ 
+ pub async fn get_title_management(client: &reqwest::Client) -> reqwest::Result<TitleMgtResponse> {
+@@ -8,25 +9,132 @@
+     response.json().await
+ }
+ 
++/// Fetch endpoints for the title identified by the supplied authorization.
++/// The authorization and signature must come from the same proof key.
++/// Keep this response separate from the default list: policy indices are local.
++pub async fn get_title_endpoints(
++    client: &reqwest::Client,
++    authorization: &str,
++    signer: &RequestSigner,
++) -> reqwest::Result<TitleMgtResponse> {
++    let signature = signer.sign(
++        1,
++        "GET",
++        "/titles/current/endpoints",
++        authorization,
++        &[],
++        8192,
++    );
++    client
++        .get("https://title.mgt.xboxlive.com/titles/current/endpoints")
++        .header("Authorization", authorization)
++        .header("Signature", signature)
++        .header("x-xbl-contract-version", "1")
++        .send()
++        .await?
++        .error_for_status()?
++        .json()
++        .await
++}
++
++// Host specificity wins first; an exact host breaks a wildcard tie, and a
++// matching path restriction wins over the same host's unrestricted entry.
++fn endpoint_specificity(
++    url: &reqwest::Url,
++    endpoint: &TitleMgtEndPoint,
++    suffix_only: bool,
++) -> Option<(usize, bool, usize)> {
++    // WebSocket authentication uses the HTTP Upgrade request's protocol,
++    // as in xal-rs SignaturePolicyCache's policy and relying-party lookups.
++    let protocol = match url.scheme() {
++        "wss" => "https",
++        "ws" => "http",
++        scheme => scheme,
++    };
++    if !endpoint.protocol.eq_ignore_ascii_case(protocol) {
++        return None;
++    }
++    let host = url.host_str()?;
++    let pattern = endpoint.host.to_ascii_lowercase();
++    let matcher = globset::GlobBuilder::new(&pattern)
++        .case_insensitive(true)
++        .build()
++        .ok()?
++        .compile_matcher();
++    // Some default entries name a service's parent domain without a glob.
++    // Keep the service's subdomains, but never a lookalike suffix.
++    let suffix = !pattern.contains(['*', '?', '[', '{', '\\'])
++        && host
++            .strip_suffix(&pattern)
++            .is_some_and(|prefix| prefix.ends_with('.'));
++    let matches_host = if suffix_only {
++        suffix
++    } else {
++        matcher.is_match(host)
++    };
++    if !matches_host {
++        return None;
++    }
++    let path = endpoint.path.as_deref().unwrap_or("");
++    if !path.is_empty() && url.path() != path {
++        let rest = url.path().strip_prefix(path)?;
++        if !path.ends_with('/') && !rest.starts_with('/') {
++            return None;
++        }
++    }
++    Some((
++        pattern.chars().filter(|c| !matches!(c, '*' | '?')).count(),
++        host.eq_ignore_ascii_case(&pattern),
++        path.len(),
++    ))
++}
++
+ pub fn get_endpoint<'a>(url: &str, response: &'a TitleMgtResponse) -> Option<&'a TitleMgtEndPoint> {
+-    let parsed_url = reqwest::Url::parse(url).ok()?;
+-    let filtered: Vec<&TitleMgtEndPoint> = response
+-        .end_points
+-        .iter()
+-        .filter(|e| e.protocol == parsed_url.scheme())
+-        .collect();
+-    let hosts: Vec<globset::Glob> = filtered
+-        .iter()
+-        .map(|e| globset::Glob::new(&e.host).expect("Unsupported glob"))
+-        .collect();
+-    let set = globset::GlobSet::new(hosts).ok()?;
+-    let matched = set.matches(parsed_url.host_str().unwrap());
+-    let matched: Vec<&TitleMgtEndPoint> = matched.into_iter().map(|m| filtered[m]).collect();
+-
+-    matched
+-        .iter()
+-        .max_by_key(|&&pat| pat.host.chars().filter(|&c| c != '*').count())
+-        .copied()
++    let url = reqwest::Url::parse(url).ok()?;
++    select_endpoint(&url, response, None, false).map(|(endpoint, _)| endpoint)
++}
++
++fn select_endpoint<'a>(
++    url: &reqwest::Url,
++    default: &'a TitleMgtResponse,
++    title: Option<&'a TitleMgtResponse>,
++    suffix_only: bool,
++) -> Option<(&'a TitleMgtEndPoint, &'a TitleMgtResponse)> {
++    [Some(default), title]
++        .into_iter()
++        .flatten()
++        .flat_map(|source| {
++            source
++                .end_points
++                .iter()
++                .map(move |endpoint| (endpoint, source))
++        })
++        .filter(|(endpoint, _)| !suffix_only || endpoint.relying_party.is_some())
++        .filter_map(|(endpoint, source)| {
++            endpoint_specificity(url, endpoint, suffix_only)
++                .map(|specificity| (specificity, endpoint, source))
++        })
++        .max_by_key(|(specificity, _, _)| *specificity)
++        .map(|(_, endpoint, source)| (endpoint, source))
++}
++
++/// Select the most specific matching host/path across both endpoint lists.
++/// Equal rules prefer the current title. Return the source list alongside the
++/// endpoint so its SignaturePolicyIndex cannot address another list's policy.
++/// If no matching rule supplies an RP, try bare service domains as suffixes,
++/// retaining dot boundaries. That compatibility fallback never replaces an
++/// explicitly matched RP, including one selected by a wildcard.
++pub fn get_endpoint_with_title<'a>(
++    url: &str,
++    default: &'a TitleMgtResponse,
++    title: Option<&'a TitleMgtResponse>,
++) -> Option<(&'a TitleMgtEndPoint, &'a TitleMgtResponse)> {
++    let url = reqwest::Url::parse(url).ok()?;
++    let endpoint = select_endpoint(&url, default, title, false);
++    if endpoint.is_some_and(|(entry, _)| entry.relying_party.is_some()) {
++        return endpoint;
++    }
++    select_endpoint(&url, default, title, true).or(endpoint)
+ }
+ 
+ #[cfg(test)]
+@@ -58,3 +166,284 @@
+         );
+     }
+ }
++
++#[cfg(test)]
++mod nsal_tests {
++    use super::*;
++    use serde_json::json;
++
++    fn response(endpoints: serde_json::Value, max_body_bytes: u64) -> TitleMgtResponse {
++        serde_json::from_value(json!({
++            "EndPoints": endpoints,
++            "SignaturePolicies": [{
++                "Version": 1,
++                "SupportedAlgorithms": ["ES256"],
++                "MaxBodyBytes": max_body_bytes,
++                "SupportedSignatureTypes": ["XBL"]
++            }]
++        }))
++        .unwrap()
++    }
++
++    #[test]
++    fn websocket_schemes_use_only_the_matching_http_security_level() {
++        for (websocket, http, other_websocket) in [("wss", "https", "ws"), ("ws", "http", "wss")] {
++            let list = response(
++                json!([{
++                    "Protocol": http, "Host": "stream.example.test",
++                    "RelyingParty": "rp://stream", "SignaturePolicyIndex": 0
++                }]),
++                8192,
++            );
++            for scheme in [websocket, http] {
++                let endpoint = get_endpoint(
++                    &format!("{scheme}://stream.example.test/connect?version=1"),
++                    &list,
++                )
++                .expect("WebSocket handshake uses its HTTP endpoint policy");
++                assert_eq!(endpoint.relying_party.as_deref(), Some("rp://stream"));
++                assert_eq!(endpoint.signature_policy_index, Some(0));
++            }
++            assert!(
++                get_endpoint(
++                    &format!("{other_websocket}://stream.example.test/connect"),
++                    &list
++                )
++                .is_none(),
++                "secure and plain WebSockets must not share policies"
++            );
++        }
++    }
++
++    #[test]
++    fn websocket_title_routes_preserve_path_boundaries_and_ignore_query_for_selection() {
++        for (websocket, http) in [("wss", "https"), ("ws", "http")] {
++            let default = response(
++                json!([{
++                    "Protocol": http, "Host": "*.example.test",
++                    "RelyingParty": "rp://default", "SignaturePolicyIndex": 0
++                }]),
++                8192,
++            );
++            let title = response(
++                json!([{
++                    "Protocol": http, "Host": "stream.example.test", "Path": "/events",
++                    "RelyingParty": "rp://events", "SignaturePolicyIndex": 0
++                }]),
++                123,
++            );
++            for (path, rp, max_bytes) in [
++                ("/events?version=1", "rp://events", 123),
++                ("/events/new?version=2", "rp://events", 123),
++                ("/eventstream?next=/events", "rp://default", 8192),
++                ("/other?next=/events", "rp://default", 8192),
++            ] {
++                let (endpoint, source) = get_endpoint_with_title(
++                    &format!("{websocket}://stream.example.test{path}"),
++                    &default,
++                    Some(&title),
++                )
++                .expect("WebSocket endpoint rule");
++                assert_eq!(endpoint.relying_party.as_deref(), Some(rp), "{path}");
++                assert_eq!(
++                    source.signature_policies[endpoint.signature_policy_index.unwrap() as usize]
++                        .max_body_bytes,
++                    max_bytes
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn current_title_nsal_can_omit_signature_policies() {
++        let title: TitleMgtResponse = serde_json::from_value(json!({
++            "EndPoints": [{"Protocol": "https", "Host": "*.race.example.test",
++                "RelyingParty": "https://race.example.test/"}]
++        }))
++        .unwrap();
++        assert!(title.signature_policies.is_empty());
++        assert_eq!(
++            get_endpoint("https://api.race.example.test/player", &title)
++                .unwrap()
++                .relying_party
++                .as_deref(),
++            Some("https://race.example.test/")
++        );
++    }
++
++    #[test]
++    fn path_routes_do_not_capture_other_paths_on_the_same_host() {
++        let list = response(
++            json!([
++                {"Protocol": "https", "Host": "api.example.test", "RelyingParty": "rp://general"},
++                {"Protocol": "https", "Host": "api.example.test", "Path": "/private",
++                 "RelyingParty": "rp://private"}
++            ]),
++            8192,
++        );
++        for (path, expected) in [
++            ("/public", "rp://general"),
++            ("/privately", "rp://general"),
++            ("/private", "rp://private"),
++            ("/private/player?x=1", "rp://private"),
++        ] {
++            assert_eq!(
++                get_endpoint(&format!("https://api.example.test{path}"), &list)
++                    .unwrap()
++                    .relying_party
++                    .as_deref(),
++                Some(expected),
++                "{path}"
++            );
++        }
++    }
++
++    #[test]
++    fn malformed_host_globs_do_not_panic_or_hide_valid_entries() {
++        let list = response(
++            json!([
++                {"Protocol": "https", "Host": "[invalid", "RelyingParty": "rp://invalid"},
++                {"Protocol": "https", "Host": "*.example.test", "RelyingParty": "rp://valid"}
++            ]),
++            8192,
++        );
++        assert_eq!(
++            get_endpoint("https://api.example.test/", &list)
++                .unwrap()
++                .relying_party
++                .as_deref(),
++            Some("rp://valid")
++        );
++        assert!(get_endpoint("data:text/plain,no-host", &list).is_none());
++    }
++
++    #[test]
++    fn title_service_rp_and_signature_policy_keep_their_own_source() {
++        let default = response(
++            json!([
++                {"Protocol": "https", "Host": "*.example.test", "RelyingParty": "rp://public",
++                 "SignaturePolicyIndex": 0}
++            ]),
++            8192,
++        );
++        let title = response(
++            json!([
++                {"Protocol": "https", "Host": "*.race.example.test", "RelyingParty": "rp://race",
++                 "SignaturePolicyIndex": 0}
++            ]),
++            123,
++        );
++        for (url, rp, max_bytes) in [
++            ("https://api.race.example.test/player", "rp://race", 123),
++            ("https://public.example.test/player", "rp://public", 8192),
++        ] {
++            let (endpoint, source) = get_endpoint_with_title(url, &default, Some(&title)).unwrap();
++            assert_eq!(endpoint.relying_party.as_deref(), Some(rp));
++            assert_eq!(
++                source.signature_policies[endpoint.signature_policy_index.unwrap() as usize]
++                    .max_body_bytes,
++                max_bytes
++            );
++        }
++    }
++
++    #[test]
++    fn equal_title_rules_override_default_without_overriding_more_specific_hosts() {
++        let default = response(
++            json!([
++                {"Protocol": "https", "Host": "*.example.test", "RelyingParty": "rp://default"},
++                {"Protocol": "https", "Host": "profile.example.test", "RelyingParty": "rp://profile"}
++            ]),
++            8192,
++        );
++        let title = response(
++            json!([
++                {"Protocol": "https", "Host": "*", "RelyingParty": "rp://catchall"},
++                {"Protocol": "https", "Host": "*.example.test", "RelyingParty": "rp://title"}
++            ]),
++            8192,
++        );
++        for (url, rp) in [
++            ("https://api.example.test/", "rp://title"),
++            ("https://profile.example.test/", "rp://profile"),
++        ] {
++            assert_eq!(
++                get_endpoint_with_title(url, &default, Some(&title))
++                    .unwrap()
++                    .0
++                    .relying_party
++                    .as_deref(),
++                Some(rp)
++            );
++        }
++    }
++
++    #[test]
++    fn title_configurations_are_isolated_even_when_hosts_match() {
++        let default = response(json!([]), 8192);
++        let one = response(
++            json!([
++                {"Protocol": "https", "Host": "api.example.test", "RelyingParty": "rp://one"}
++            ]),
++            8192,
++        );
++        let two = response(
++            json!([
++                {"Protocol": "https", "Host": "api.example.test", "RelyingParty": "rp://two"}
++            ]),
++            8192,
++        );
++        for (title, rp) in [(&one, "rp://one"), (&two, "rp://two"), (&one, "rp://one")] {
++            assert_eq!(
++                get_endpoint_with_title("https://api.example.test/", &default, Some(title))
++                    .unwrap()
++                    .0
++                    .relying_party
++                    .as_deref(),
++                Some(rp)
++            );
++        }
++        assert!(get_endpoint_with_title("https://api.example.test/", &default, None).is_none());
++    }
++
++    #[test]
++    fn bare_domain_fallback_beats_an_empty_title_catchall_without_matching_lookalikes() {
++        let default = response(
++            json!([
++                {"Protocol": "https", "Host": "backend.example.test", "RelyingParty": "rp://backend"}
++            ]),
++            8192,
++        );
++        let title = response(json!([{"Protocol": "https", "Host": "*"}]), 8192);
++        let (endpoint, _) = get_endpoint_with_title(
++            "https://api.site.backend.example.test/",
++            &default,
++            Some(&title),
++        )
++        .unwrap();
++        assert_eq!(endpoint.relying_party.as_deref(), Some("rp://backend"));
++        for host in ["evilbackend.example.test", "backend.example.test.evil.test"] {
++            assert!(
++                get_endpoint_with_title(&format!("https://{host}/"), &default, Some(&title))
++                    .unwrap()
++                    .0
++                    .relying_party
++                    .is_none()
++            );
++        }
++    }
++
++    #[test]
++    fn implicit_domain_suffix_does_not_override_a_matching_wildcard_rp() {
++        let default = response(
++            json!([
++                {"Protocol": "https", "Host": "*.example.test", "RelyingParty": "rp://explicit"},
++                {"Protocol": "https", "Host": "service.example.test", "RelyingParty": "rp://suffix"}
++            ]),
++            8192,
++        );
++        let (endpoint, _) =
++            get_endpoint_with_title("https://api.service.example.test/", &default, None).unwrap();
++        assert_eq!(endpoint.relying_party.as_deref(), Some("rp://explicit"));
++    }
++}
+diff --git a/crates/xodus/src/auth.rs b/crates/xodus/src/auth.rs
+--- a/crates/xodus/src/auth.rs
++++ b/crates/xodus/src/auth.rs
+@@ -150,7 +150,11 @@
+             tracing::warn!("Failed to persist refreshed STS token: {err}");
+         }
+     }
+-    let token: soap::RequestSecurityTokenResponse = collection.security_tokens.remove(0);
++    let token = collection
++        .security_tokens
++        .into_iter()
++        .next()
++        .ok_or_else(|| std::io::Error::other("MSA returned no user token for SISU"))?;
+     let token: Token = token.into();
+     let Token::Compact(user_token) = token else {
+         return Err(Box::new(std::io::Error::new(
+@@ -181,8 +185,7 @@
+         .await?;
+     let resp = auth
+         .sisu_authorize_rps(&user_token, &data.token, None)
+-        .await
+-        .expect("ok");
++        .await?;
+     Ok((auth, resp, data))
+ }
+ 
+@@ -205,16 +208,131 @@
+ /// Everything a title needs to authenticate, all bound to one signing key.
+ ///
+ /// Xbox refuses to mix keys: a title token minted under one key and a user
+-/// token minted under another makes xsts/authorize answer 400, and
+-/// title/authenticate will not issue a title token to this path's own ticket
+-/// at all (403). SISU issues device, title and user tokens together under a
+-/// single key, so the way to get a title claim is to take that whole set --
+-/// and its key, which then has to sign our requests too.
++/// token minted under another makes xsts/authorize answer 400. Both SISU and
++/// the Windows title authentication flow return this complete set, including
++/// the key that must also sign subsequent service requests.
+ pub struct SisuIdentity {
+     pub key_pkcs8: Vec<u8>,
+     pub device_token: String,
+     pub title_token: String,
+     pub user_token: String,
++    /// Earliest token expiry, expressed as a Unix timestamp.
++    pub expires_at: i64,
++}
++
++/// Authenticate a Windows title whose metadata provides a TitleId.
++///
++/// Uses the signed-in account's legacy credentials for the user exchange and
++/// binds the user, device and title tokens to one newly generated signing key.
++/// Unlike SISU, the Windows title exchange does not require an MSAAppId.
++pub async fn win32_identity_for(
++    client: &Client,
++    manager: &TokenManager,
++    title_id: i64,
++) -> Result<SisuIdentity, String> {
++    use crate::api::xbox::{
++        RequestSigner, authenticate_xbox_device, authenticate_xbox_title_win,
++        authenticate_xbox_user,
++    };
++
++    if !(1..=u32::MAX as i64).contains(&title_id) {
++        return Err(
++            "Windows title authentication requires a TitleId in 1..=4294967295".to_string(),
++        );
++    }
++    let Token::Legacy(user_sts) = manager
++        .get_user_sts_token()
++        .map_err(|e| format!("could not load the signed-in user's STS token: {e}"))?
++    else {
++        return Err("Windows title authentication requires a legacy user STS token".to_string());
++    };
++    let Token::Legacy(device_sts) = manager
++        .get_device_sts_token()
++        .map_err(|e| format!("could not load the device STS token: {e}"))?
++    else {
++        return Err("Windows title authentication requires a legacy device STS token".to_string());
++    };
++
++    let outcome = crate::api::live::exchange_user_token(
++        client,
++        user_sts,
++        "USERNAME".to_string(),
++        device_sts,
++        None,
++        Some("Silent".to_string()),
++        "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".to_string(),
++        &[(
++            "user.auth.xboxlive.com".to_owned(),
++            Some(soap::PolicyReference::mbi_ssl()),
++        )],
++    )
++    .await
++    .map_err(|e| format!("MSA user token exchange failed: {e}"))?;
++
++    let user_ticket: Token = match outcome {
++        ExchangeUserTokenOutcome::Fault(_) => return Err("MSA returned a fault".to_string()),
++        ExchangeUserTokenOutcome::Issued(
++            soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
++        ) => {
++            if collection.security_tokens.is_empty() {
++                return Err("MSA returned no tokens".to_string());
++            }
++            collection.security_tokens.remove(0).into()
++        }
++        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(t)) => {
++            (*t).into()
++        }
++        _ => return Err("unexpected MSA response".to_string()),
++    };
++    let Token::Compact(user_ticket) = user_ticket else {
++        return Err("unsupported MSA token form".to_string());
++    };
++
++    let signer = RequestSigner::generate();
++    let key_pkcs8 = signer
++        .to_pkcs8()
++        .ok_or_else(|| "could not export the Windows signing key".to_string())?;
++    let user = authenticate_xbox_user(client, user_ticket, Some(&signer))
++        .await
++        .map_err(|e| format!("Xbox user authentication failed: {e}"))?;
++    let device = authenticate_xbox_device(client, &signer)
++        .await
++        .map_err(|e| format!("Xbox device authentication failed: {e}"))?;
++    let title =
++        authenticate_xbox_title_win(client, device.token.clone(), title_id, &signer).await?;
++
++    Ok(SisuIdentity {
++        key_pkcs8,
++        expires_at: user
++            .not_after
++            .timestamp()
++            .min(device.not_after.timestamp())
++            .min(title.not_after.timestamp()),
++        device_token: device.token,
++        title_token: title.token,
++        user_token: user.token,
++    })
++}
++
++#[cfg(test)]
++mod win32_identity_tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn win32_identity_rejects_invalid_title_id_before_loading_credentials() {
++        let client = Client::new();
++        let manager = TokenManager::with_memory();
++        for title_id in [4294967296, 0, -1, i64::MIN, i64::MAX] {
++            let error = win32_identity_for(&client, &manager, title_id)
++                .await
++                .err()
++                .expect("invalid title ID must fail");
++            assert_eq!(
++                error,
++                "Windows title authentication requires a TitleId in 1..=4294967295"
++            );
++        }
++    }
+ }
+ 
+ /// The Xbox app's own identity: a title claim, but for the Xbox app rather than
+@@ -258,6 +376,12 @@
+ 
+     Ok(SisuIdentity {
+         key_pkcs8,
++        expires_at: resp
++            .user_token
++            .not_after
++            .timestamp()
++            .min(device.not_after.timestamp())
++            .min(resp.title_token.not_after.timestamp()),
+         device_token: device.token,
+         title_token: resp.title_token.token,
+         user_token: resp.user_token.token,
+diff --git a/crates/xodus/src/models/xbox.rs b/crates/xodus/src/models/xbox.rs
+--- a/crates/xodus/src/models/xbox.rs
++++ b/crates/xodus/src/models/xbox.rs
+@@ -34,7 +34,7 @@
+ struct DisplayClaims {
+     #[serde(default)]
+     xui: Vec<XuiClaim>,
+-    #[serde(default)]
++    #[serde(default, deserialize_with = "deserialize_title_claims")]
+     xti: Vec<XtiClaim>,
+ }
+ 
+@@ -52,6 +52,60 @@
+     tid: Option<String>,
+ }
+ 
++fn deserialize_title_claims<'de, D>(deserializer: D) -> Result<Vec<XtiClaim>, D::Error>
++where
++    D: serde::Deserializer<'de>,
++{
++    // title/authenticate returns one object; xsts/authorize returns an array.
++    #[derive(Deserialize)]
++    #[serde(untagged)]
++    enum TitleClaims {
++        Single(XtiClaim),
++        Multiple(Vec<XtiClaim>),
++    }
++
++    match TitleClaims::deserialize(deserializer)? {
++        TitleClaims::Single(claim) => Ok(vec![claim]),
++        TitleClaims::Multiple(claims) => Ok(claims),
++    }
++}
++
++#[cfg(test)]
++mod title_claim_tests {
++    use super::*;
++
++    #[test]
++    fn title_claim_accepts_authentication_object_and_xsts_array() {
++        for xti in [
++            serde_json::json!({"tid": "305419896"}),
++            serde_json::json!([{"tid": "305419896"}]),
++        ] {
++            let response: XstsResponse = serde_json::from_value(serde_json::json!({
++                "NotAfter": "2030-01-01T00:00:00Z",
++                "Token": "synthetic-token",
++                "DisplayClaims": {"xti": xti}
++            }))
++            .expect("title claim shape is supported");
++            assert_eq!(response.display_claims.xti.len(), 1);
++            assert_eq!(
++                response.display_claims.xti[0].tid.as_deref(),
++                Some("305419896")
++            );
++        }
++    }
++
++    #[test]
++    fn title_claim_remains_optional_for_user_and_device_tokens() {
++        let response: XstsResponse = serde_json::from_value(serde_json::json!({
++            "NotAfter": "2030-01-01T00:00:00Z",
++            "Token": "synthetic-token",
++            "DisplayClaims": {}
++        }))
++        .expect("title claim is optional");
++        assert!(response.display_claims.xti.is_empty());
++    }
++}
++
+ impl XstsResponse {
+     pub fn user_hash(&self) -> Option<&str> {
+         self.display_claims
+@@ -119,6 +173,7 @@
+ #[serde(rename_all = "PascalCase")]
+ pub struct TitleMgtResponse {
+     pub end_points: Vec<TitleMgtEndPoint>,
++    #[serde(default)]
+     pub signature_policies: Vec<TitleMgtSignaturePolicy>,
+ }
+ 
+@@ -129,6 +184,8 @@
+     pub host: String,
+     #[serde(default)]
+     pub host_type: Option<String>,
++    #[serde(default)]
++    pub path: Option<String>,
+     #[serde(default)]
+     pub relying_party: Option<String>,
+     #[serde(default)]
+diff --git a/crates/xodus/src/models/xgameruntime/xuser.rs b/crates/xodus/src/models/xgameruntime/xuser.rs
+--- a/crates/xodus/src/models/xgameruntime/xuser.rs
++++ b/crates/xodus/src/models/xgameruntime/xuser.rs
+@@ -36,8 +36,8 @@
+     #[serde(default)]
+     pub body_base64: String,
+     /// The running title, out of its `MicrosoftGame.config`: `TitleId` in
+-    /// decimal and `MSAAppId`. Xbox mints the token's *title claim* from the
+-    /// pair, and services that scope by title -- presence's `titles/current`,
++    /// decimal and optional `MSAAppId`. Xbox mints the token's *title claim* from the
++    /// Windows title ID (or the pair for SISU), and services that scope by title -- presence's `titles/current`,
+     /// the session directory -- refuse a claim naming a different title exactly
+     /// as they refuse none. Empty when an older runtime is on the other end.
+     #[serde(default)]
+@@ -49,10 +49,7 @@
+ impl XSTSTokenRequest {
+     /// The title this request is on behalf of, when it named one.
+     pub fn title(&self) -> Option<(i64, &str)> {
+-        if self.title_client_id.is_empty() {
+-            return None;
+-        }
+-        let id = self.title_id.parse::<i64>().ok().filter(|id| *id > 0)?;
++        let id = self.title_id.parse::<u32>().ok().filter(|id| *id > 0)? as i64;
+         Some((id, self.title_client_id.as_str()))
+     }
+ }
+@@ -70,3 +67,38 @@
+     #[serde(default)]
+     pub signature: String,
+ }
++
++#[cfg(test)]
++mod title_tests {
++    use super::*;
++
++    fn request(title: &str, client: &str) -> XSTSTokenRequest {
++        XSTSTokenRequest {
++            url: "https://service.example.test/".into(),
++            relying_party: String::new(),
++            method: String::new(),
++            body_base64: String::new(),
++            title_id: title.into(),
++            title_client_id: client.into(),
++        }
++    }
++
++    #[test]
++    fn legacy_title_identity_does_not_require_an_msa_client() {
++        let req = request("12345", "");
++        assert_eq!(req.title(), Some((12345, "")));
++    }
++
++    #[test]
++    fn msa_identity_keeps_its_own_client_and_title() {
++        let req = request("67890", "example-client");
++        assert_eq!(req.title(), Some((67890, "example-client")));
++    }
++
++    #[test]
++    fn invalid_title_ids_never_become_title_claims() {
++        for id in ["", "0", "-1", "not-a-number", "4294967296"] {
++            assert_eq!(request(id, "client").title(), None);
++        }
++    }
++}
+diff --git a/crates/xodus-service/src/connection/xml_tests.rs b/crates/xodus-service/src/connection/xml_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/xodus-service/src/connection/xml_tests.rs
+@@ -0,0 +1,382 @@
++use super::*;
++use base64::Engine;
++use base64::engine::general_purpose::STANDARD;
++use std::collections::HashMap;
++use xodus::api::xbox::RequestSigner;
++
++fn synthetic_signer(scalar: u8) -> RequestSigner {
++    // Minimal PKCS#8 EC key using a deliberately public, synthetic scalar.
++    let mut der = vec![
++        0x30, 0x41, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02,
++        0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x27, 0x30, 0x25,
++        0x02, 0x01, 0x01, 0x04, 0x20,
++    ];
++    der.extend_from_slice(&[0; 31]);
++    der.push(scalar);
++    RequestSigner::from_pkcs8(&der).expect("synthetic P-256 key")
++}
++
++fn cached_token(signer: RequestSigner) -> CachedToken {
++    CachedToken {
++        signer,
++        token: "synthetic-authorization".to_string(),
++        xuid: "synthetic-account".to_string(),
++        gamertag: "Synthetic Player".to_string(),
++        expiry: 2_000_000_000,
++    }
++}
++
++#[test]
++fn cached_tokens_are_isolated_by_session_title_client_audience_and_issuer() {
++    let signer = synthetic_signer(1);
++    let renewed_signer = synthetic_signer(2);
++    let session = [11; 32];
++    let other_session = [22; 32];
++    let title = (12345, "synthetic-client".to_string());
++    let other_title = (67890, title.1.clone());
++    let other_client = (title.0, "another-client".to_string());
++    let legacy_title = (title.0, String::new());
++    let audience = "https://audience.example.test/";
++    let key = token_cache_key(&session, Some(&title), audience, &signer);
++    let cache = HashMap::from([(key, cached_token(signer.clone()))]);
++
++    for (case, candidate) in [
++        (
++            "credential session",
++            token_cache_key(&other_session, Some(&title), audience, &signer),
++        ),
++        (
++            "title",
++            token_cache_key(&session, Some(&other_title), audience, &signer),
++        ),
++        (
++            "MSA client",
++            token_cache_key(&session, Some(&other_client), audience, &signer),
++        ),
++        (
++            "legacy title",
++            token_cache_key(&session, Some(&legacy_title), audience, &signer),
++        ),
++        (
++            "no title",
++            token_cache_key(&session, None, audience, &signer),
++        ),
++        (
++            "audience",
++            token_cache_key(
++                &session,
++                Some(&title),
++                "https://other.example.test/",
++                &signer,
++            ),
++        ),
++        (
++            "issuer",
++            token_cache_key(&session, Some(&title), audience, &renewed_signer),
++        ),
++    ] {
++        assert!(
++            cache.get(&candidate).is_none(),
++            "cache crossed {case} boundary"
++        );
++    }
++
++    let restored = RequestSigner::from_pkcs8(&signer.to_pkcs8().unwrap()).unwrap();
++    let hit = cache
++        .get(&token_cache_key(
++            &session,
++            Some(&title),
++            audience,
++            &restored,
++        ))
++        .expect("restoring the same issuer should reuse its cached token");
++    assert_eq!(hit.token, "synthetic-authorization");
++}
++
++fn endpoints(max_body_bytes: usize) -> EndpointConfig {
++    EndpointConfig {
++        default: serde_json::from_value(serde_json::json!({
++            "EndPoints": [{
++                "Protocol": "https", "Host": "api.example.test",
++                "RelyingParty": "https://audience.example.test/",
++                "SignaturePolicyIndex": 0
++            }],
++            "SignaturePolicies": [{
++                "Version": 1, "MaxBodyBytes": max_body_bytes,
++                "SupportedAlgorithms": ["ES256"], "SupportedSignatureTypes": ["XBL"]
++            }]
++        }))
++        .unwrap(),
++        title: None,
++    }
++}
++
++fn request(url: &str, method: &str, body: &[u8]) -> XSTSTokenRequest {
++    XSTSTokenRequest {
++        url: url.to_string(),
++        relying_party: String::new(),
++        method: method.to_string(),
++        body_base64: STANDARD.encode(body),
++        title_id: "12345".to_string(),
++        title_client_id: String::new(),
++    }
++}
++
++fn assert_signature(
++    req: &XSTSTokenRequest,
++    cached: &CachedToken,
++    config: &EndpointConfig,
++    issuer: &RequestSigner,
++    expected_method: &str,
++    expected_path: &str,
++    expected_body: &[u8],
++    max_body_bytes: usize,
++) {
++    // RequestSigner stamps signatures to whole seconds. Retry only if these
++    // two calls straddle a clock tick, then compare the complete header.
++    for _ in 0..8 {
++        let actual = sign_for_with(req, &cached.token, config, &cached.signer);
++        let expected = issuer.sign(
++            1,
++            expected_method,
++            expected_path,
++            &cached.token,
++            expected_body,
++            max_body_bytes,
++        );
++        let actual_bytes = STANDARD.decode(&actual).expect("base64 signature");
++        let expected_bytes = STANDARD.decode(&expected).unwrap();
++        assert_eq!(actual_bytes.len(), 76, "complete XBL signature header");
++        if actual_bytes[4..12] == expected_bytes[4..12] {
++            assert_eq!(
++                actual, expected,
++                "cached issuer must sign the current request"
++            );
++            return;
++        }
++    }
++    panic!("clock changed during every signature comparison");
++}
++
++#[test]
++fn cached_issuer_resigns_each_method_path_query_body_and_authorization() {
++    let issuer = synthetic_signer(1);
++    let restored = RequestSigner::from_pkcs8(&issuer.to_pkcs8().unwrap()).unwrap();
++    let mut cached = cached_token(restored);
++    let config = endpoints(8192);
++
++    for (method, path, body) in [
++        ("POST", "/sessions?version=1", b"first-body".as_slice()),
++        ("PATCH", "/sessions?version=1", b"first-body".as_slice()),
++        ("POST", "/sessions/new?version=1", b"first-body".as_slice()),
++        ("POST", "/sessions?version=2", b"first-body".as_slice()),
++        ("POST", "/sessions?version=1", b"changed-body".as_slice()),
++    ] {
++        let req = request(&format!("https://api.example.test{path}"), method, body);
++        assert_signature(&req, &cached, &config, &issuer, method, path, body, 8192);
++    }
++
++    cached.token = "renewed-synthetic-authorization".to_string();
++    let req = request("https://api.example.test/sessions", "", &[]);
++    assert_signature(
++        &req,
++        &cached,
++        &config,
++        &issuer,
++        "GET",
++        "/sessions",
++        &[],
++        8192,
++    );
++}
++
++#[test]
++fn service_signatures_follow_the_selected_body_limit() {
++    let issuer = synthetic_signer(1);
++    let cached = cached_token(issuer.clone());
++    let config = endpoints(4);
++    let body = b"body beyond the policy limit";
++    let req = request("https://api.example.test/sessions", "POST", body);
++    assert_signature(
++        &req,
++        &cached,
++        &config,
++        &issuer,
++        "POST",
++        "/sessions",
++        body,
++        4,
++    );
++}
++
++#[test]
++fn endpoints_without_a_signature_policy_do_not_get_a_signature() {
++    let cached = cached_token(synthetic_signer(1));
++    let mut config = endpoints(8192);
++    config.default.end_points[0].signature_policy_index = None;
++    let req = request("https://api.example.test/sessions", "POST", b"body");
++    assert!(sign_for_with(&req, &cached.token, &config, &cached.signer).is_empty());
++}
++
++#[tokio::test]
++async fn pending_discovery_does_not_block_an_unrelated_title() {
++    let cache = AsyncCache::new(Duration::from_secs(1), Duration::ZERO);
++    let started = tokio::sync::Notify::new();
++    let release = tokio::sync::Notify::new();
++    let mut first = Box::pin(cache.get_or_try_init(
++        12345,
++        |_| true,
++        || async {
++            started.notify_one();
++            release.notified().await;
++            Ok("first title")
++        },
++    ));
++    tokio::select! {
++        _ = started.notified() => {}
++        _ = &mut first => panic!("discovery must still be waiting"),
++    }
++
++    let other = tokio::time::timeout(
++        Duration::from_millis(100),
++        cache.get_or_try_init(67890, |_| true, || async { Ok("other title") }),
++    )
++    .await
++    .expect("another title must not wait for the pending discovery")
++    .unwrap();
++    assert_eq!(other, "other title");
++    release.notify_one();
++    assert_eq!(first.await.unwrap(), "first title");
++}
++
++#[tokio::test]
++async fn concurrent_requests_for_one_title_share_one_fetch() {
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    let cache = AsyncCache::new(Duration::from_secs(1), Duration::ZERO);
++    let calls = AtomicUsize::new(0);
++    let started = tokio::sync::Notify::new();
++    let release = tokio::sync::Notify::new();
++    let mut first = Box::pin(cache.get_or_try_init(
++        12345,
++        |_| true,
++        || async {
++            calls.fetch_add(1, Ordering::SeqCst);
++            started.notify_one();
++            release.notified().await;
++            Ok("shared discovery")
++        },
++    ));
++    tokio::select! {
++        _ = started.notified() => {}
++        _ = &mut first => panic!("discovery must still be waiting"),
++    }
++    let second = cache.get_or_try_init(
++        12345,
++        |_| true,
++        || async {
++            calls.fetch_add(1, Ordering::SeqCst);
++            Ok("duplicate discovery")
++        },
++    );
++    let (first, second) = tokio::join!(
++        async {
++            release.notify_one();
++            first.await
++        },
++        second
++    );
++    assert_eq!(first.unwrap(), "shared discovery");
++    assert_eq!(second.unwrap(), "shared discovery");
++    assert_eq!(calls.load(Ordering::SeqCst), 1);
++}
++
++#[tokio::test]
++async fn failed_discovery_retries_after_backoff_and_then_stays_cached() {
++    let cache = AsyncCache::new(Duration::from_secs(1), Duration::from_millis(20));
++    let first = cache
++        .get_or_try_init(
++            (),
++            |_| true,
++            || async { Err::<&str, _>("temporary failure".into()) },
++        )
++        .await;
++    assert_eq!(first.unwrap_err(), "temporary failure");
++    let suppressed = cache
++        .get_or_try_init(
++            (),
++            |_| true,
++            || async { panic!("backoff must suppress another fetch") },
++        )
++        .await;
++    assert_eq!(suppressed.unwrap_err(), "temporary failure");
++
++    tokio::time::sleep(Duration::from_millis(30)).await;
++    assert_eq!(
++        cache
++            .get_or_try_init((), |_| true, || async { Ok("recovered endpoints") })
++            .await
++            .unwrap(),
++        "recovered endpoints"
++    );
++    assert_eq!(
++        cache
++            .get_or_try_init(
++                (),
++                |_| true,
++                || async { panic!("successful discovery is cached") }
++            )
++            .await
++            .unwrap(),
++        "recovered endpoints"
++    );
++}
++
++#[tokio::test]
++async fn a_timed_out_fetch_releases_its_key_for_retry() {
++    let cache = AsyncCache::new(Duration::from_millis(10), Duration::ZERO);
++    let first = cache
++        .get_or_try_init(
++            12345,
++            |_| true,
++            || std::future::pending::<Result<&str, String>>(),
++        )
++        .await;
++    assert!(first.unwrap_err().contains("timed out"));
++    assert_eq!(
++        cache
++            .get_or_try_init(12345, |_| true, || async { Ok("recovered identity") })
++            .await
++            .unwrap(),
++        "recovered identity"
++    );
++}
++
++#[tokio::test]
++async fn expired_identity_is_replaced_under_the_same_key() {
++    let cache = AsyncCache::new(Duration::from_secs(1), Duration::ZERO);
++    assert_eq!(
++        cache
++            .get_or_try_init(12345, |_| true, || async { Ok(1) })
++            .await
++            .unwrap(),
++        1
++    );
++    assert_eq!(
++        cache
++            .get_or_try_init(12345, |value| *value > 1, || async { Ok(2) })
++            .await
++            .unwrap(),
++        2
++    );
++    assert_eq!(
++        cache
++            .get_or_try_init(
++                12345,
++                |value| *value > 1,
++                || async { panic!("replacement is still valid") }
++            )
++            .await
++            .unwrap(),
++        2
++    );
++}

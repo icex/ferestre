@@ -1,10 +1,11 @@
 # Forza Horizon 5 (Microsoft Store)
 #
 # Drives with the player's restored Windows profile, vehicle and livery.
-# The player confirmed gameplay. Forza Online reports its server is currently
-# unavailable and remains under investigation; a restart/save round trip has
-# not been verified. Restoration was local from a read-only Windows backup,
-# not an automatic import feature.
+# The player confirmed gameplay and subsequently confirmed the online fix.
+# The service trace records successful title-service requests and the live
+# Festival Playlist loads. A subsequent launch retained the selected vehicle.
+# Restoration was local from a read-only Windows backup, not an automatic
+# import feature. Multiplayer race completion has not been automated.
 #
 # Runtime fixes needed along the way:
 #   * wine/0010 reports the filename of the memfd-mapped image, allowing the
@@ -31,6 +32,10 @@
 #     SCID. Imported WGS folders must retain their matching SCID suffix.
 #   * xodus-cli/0013 accepts MicrosoftGame.Config's filename casing;
 #     xgameruntime/0013 reports usable TLS protocol flags.
+#   * xodus-cli/0014 authenticates legacy Windows titles by their own TitleId,
+#     discovers their published endpoints, and caches tokens with the issuer
+#     key and account/title/audience scope. No Forza host or ID is hardcoded.
+#     xgameruntime/0017 corrects the missing-MSAAppId diagnostic.
 #
 # The earlier missing-title-claim theory did not explain the websocket crash:
 # changing XAsyncBegin's return contract removed it without adding an MSAAppId.
@@ -40,7 +45,8 @@
 # three installation monitors and read the original 967,332-byte Windows
 # profile. The world then rendered with the restored vehicle, HUD and minimap;
 # the player confirmed gameplay works. Runtime regression tests pass all 107
-# checks. Online reports that the Forza Horizon 5 server is currently unavailable.
+# checks. Online title-service requests changed from HTTP 403 to HTTP 200.
+# See docs/XBOX_LIVE.md for the shared implementation and validation limits.
 
 schema = 1
 
@@ -77,10 +83,10 @@ requires = [
 ]
 
 [status]
-state         = "playable-with-issues"
-summary       = "Plays with a restored Windows profile, vehicle and livery; Forza Online reports its server is currently unavailable and remains under investigation."
+state         = "playable"
+summary       = "Plays with a restored Windows career; title services and the live Festival Playlist load after generic authentication and endpoint-discovery fixes. Player confirmed the online fix."
 last-verified = 2026-09-07
-verified-with = "ferestre run fh5 with tools/drive-fh5.py: original Windows profile read and a rendered world with the restored vehicle, HUD and minimap; the player confirmed gameplay. Source backup remained read-only. Restart and save round trip not yet verified."
+verified-with = "tools/drive-fh5.py: restored Windows profile, rendered world and selected vehicle retained on the next launch. Title services returned HTTP 200 and the live Festival Playlist loaded; the player confirmed it worked. Source backup remained read-only. Multiplayer race completion not automated."
 
 [[issues]]
 symptom   = "the game exits seconds after launch with no window; the log ends in an unhandled illegal instruction inside ForzaHorizon5.exe"
@@ -125,5 +131,5 @@ fix       = "fixed by patches/xgameruntime/0016: current-package queries and enu
 
 [[issues]]
 symptom   = "Forza Online reports: Forza Horizon 5 server is currently not available"
-cause     = "not yet established; online connectivity is still under investigation"
-fix       = "none known; local gameplay is confirmed, online play is not"
+cause     = "the client required MSAAppId for every title claim and only read default Xbox service endpoints; this legacy Windows title omits MSAAppId and publishes its own token audience"
+fix       = "fixed by patches/xodus-cli/0014: Windows TitleId authentication, per-title endpoint discovery and issuer-bound token caching; all selected from metadata"

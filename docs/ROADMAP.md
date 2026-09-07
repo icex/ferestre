@@ -294,10 +294,9 @@ honestly marked as unproven rather than planned.
       | Candy Crush Saga, Minecraft (the old UWP one), Forza Motorsport 6: Apex | `Appx` |
 
       So the prize is Forza Horizon 4 plus a handful of casual titles -- not a
-      95% expansion of the library. Worth doing, worth not overselling. Note
-      also that Forza Horizon 5 is already recorded as `broken` for reasons
-      inside its own code protection, which is a caution about how far the
-      Forza entries would get even once they download.
+      95% expansion of the library. Forza Horizon 5 now plays using the separate
+      MSIXVC launch path; that does not establish UWP compatibility for these
+      Appx titles.
 
       **Downloading them is a different service, not a different file
       extension.** Measured: `packagespc.xboxlive.com/GetBasePackage/<contentId>`
