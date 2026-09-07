@@ -124,15 +124,32 @@ impl<'a> Reader<'a> {
 }
 
 /// Parse a binary KeyValues document.
+///
+/// The document is itself a map. `shortcuts` is its one entry, so the file ends
+/// with two terminators: one closing the `shortcuts` map and one closing the
+/// document around it. Reading only the inner map leaves that last byte behind,
+/// and writing the file back without it produces something Steam cannot parse
+/// -- which Steam responds to by dropping every shortcut in the file. Adding
+/// one shortcut then destroys the rest, which is exactly what happened.
+///
+/// So read the document as the map it is, and refuse a file with anything left
+/// over: this is Steam's file and one we do not fully understand is one we must
+/// not rewrite.
 pub fn parse(bytes: &[u8]) -> Result<Value> {
-    let mut reader = Reader { bytes, at: 0 };
-    let kind = reader.byte()?;
-    if kind != TYPE_MAP {
-        bail!("not a binary KeyValues document (first byte {kind:#04x})");
+    match bytes.first() {
+        Some(&TYPE_MAP) => {}
+        Some(kind) => bail!("not a binary KeyValues document (first byte {kind:#04x})"),
+        None => bail!("not a binary KeyValues document (empty)"),
     }
-    let name = reader.cstring()?;
-    let body = reader.map()?;
-    Ok(Value::Map(vec![(name, body)]))
+    let mut reader = Reader { bytes, at: 0 };
+    let document = reader.map()?;
+    if reader.at != bytes.len() {
+        bail!(
+            "{} bytes left over after the document: this is not a shape we know how to write back",
+            bytes.len() - reader.at
+        );
+    }
+    Ok(document)
 }
 
 fn write_value(out: &mut Vec<u8>, key: &str, value: &Value) {
@@ -171,6 +188,9 @@ pub fn serialise(document: &Value) -> Result<Vec<u8>> {
     for (key, value) in entries {
         write_value(&mut out, key, value);
     }
+    // The document's own terminator, matching the one parse() consumes. Without
+    // it the file is a byte short and Steam discards every shortcut in it.
+    out.push(END_MAP);
     Ok(out)
 }
 
@@ -370,10 +390,26 @@ pub fn load(path: &Path) -> Result<Value> {
 /// to be an answer that exists.
 pub fn save(path: &Path, document: &Value) -> Result<()> {
     let bytes = serialise(document)?;
+
+    // Read back what we are about to write, before anything on disk moves.
+    // Steam does not report a file it cannot parse -- it silently shows no
+    // shortcuts at all -- so a serialiser bug is invisible until someone
+    // notices their library is empty, by which time the backup may have been
+    // replaced too. One missing terminator byte did exactly that. This makes
+    // that class of bug a failed save instead of a lost library.
+    match parse(&bytes) {
+        Ok(read_back) if read_back == *document => {}
+        Ok(_) => bail!("refusing to write: the file would not read back as what it holds"),
+        Err(e) => bail!("refusing to write a file we cannot parse ourselves: {e}"),
+    }
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if path.is_file() {
+    // Only back up a file that still parses. A backup is worth having because
+    // it can be restored; replacing a good one with something unreadable would
+    // take away the answer it exists to provide.
+    if path.is_file() && std::fs::read(path).is_ok_and(|old| parse(&old).is_ok()) {
         let _ = std::fs::copy(path, path.with_extension("vdf.bak"));
     }
     let temporary = path.with_extension("vdf.new");
@@ -427,9 +463,12 @@ mod tests {
         out.extend_from_slice(b"tags\0");
         out.push(TYPE_STRING);
         out.extend_from_slice(b"0\0favourite\0");
-        out.push(END_MAP);
-        out.push(END_MAP);
-        out.push(END_MAP);
+        out.push(END_MAP); // tags
+        out.push(END_MAP); // the "0" entry
+        out.push(END_MAP); // the shortcuts map
+        out.push(END_MAP); // the document around it -- Steam writes this, and
+                           // a sample without it let a serialiser that dropped
+                           // it pass a byte-for-byte round-trip test
         out
     }
 
@@ -607,6 +646,75 @@ mod tests {
 
         assert!(parse(b"").is_err());
         assert!(parse(b"\x01not-a-map\0").is_err());
+    }
+
+    /// The bug that emptied a real library: Steam's file ends with the
+    /// `shortcuts` map's terminator *and* the document's own. Reading only the
+    /// inner map left the last byte behind and writing it back produced a file
+    /// one byte short, which Steam answers by showing no shortcuts at all --
+    /// so adding one destroyed the other thirteen.
+    #[test]
+    fn the_documents_own_terminator_is_read_and_written_back() {
+        let bytes = sample();
+        assert_eq!(
+            bytes.iter().rev().take_while(|b| **b == END_MAP).count(),
+            4,
+            "a Steam file closes tags, the entry, the shortcuts map and the document"
+        );
+
+        let document = parse(&bytes).expect("parses");
+        let written = serialise(&document).expect("serialises");
+        assert_eq!(written.len(), bytes.len(), "a byte short is a lost library");
+        assert_eq!(written, bytes);
+    }
+
+    /// A file we cannot account for every byte of is one we must not rewrite:
+    /// writing back what we understood would silently drop the rest.
+    #[test]
+    fn a_document_with_bytes_left_over_is_refused() {
+        let mut trailing = sample();
+        trailing.push(END_MAP);
+        assert!(parse(&trailing).is_err());
+
+        let mut truncated = sample();
+        truncated.pop();
+        assert!(
+            parse(&truncated).is_err(),
+            "a file missing the document terminator is truncated, not a shape to guess at"
+        );
+    }
+
+    /// save() reads back what it is about to write. Steam does not report a
+    /// file it cannot parse -- it just shows nothing -- so the check has to
+    /// happen here, before anything on disk moves.
+    #[test]
+    fn saving_refuses_a_document_that_would_not_read_back() {
+        let directory = std::env::temp_dir().join(format!(
+            "ferestre-steam-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        let path = directory.join("shortcuts.vdf");
+
+        let good = parse(&sample()).expect("parses");
+        save(&path, &good).expect("a well-formed document saves");
+        assert_eq!(std::fs::read(&path).expect("written"), sample());
+
+        // A key holding an interior NUL serialises to something that reads back
+        // as a different document, so the write must be refused outright.
+        let bad = Value::Map(vec![(
+            "shortcuts".into(),
+            Value::Map(vec![("0\u{0}injected".into(), Value::Str("x".into()))]),
+        )]);
+        assert!(save(&path, &bad).is_err(), "a lossy write must not happen");
+        assert_eq!(
+            std::fs::read(&path).expect("still there"),
+            sample(),
+            "a refused write leaves the previous file alone"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
