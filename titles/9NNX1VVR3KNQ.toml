@@ -108,39 +108,56 @@
 # path this runtime does not serve. Reporting it is still right: Windows does,
 # and the gap that opens up is in XStore rather than in the field.
 #
-# WHERE IT STOPS NOW
+# WHERE IT STOPS NOW, AND HOW
 #
 # It draws. A window appears -- "Forza Horizon 5", 5120x1440, confirmed through
 # KWin's window list rather than only seen -- the splash screen renders, and it
 # loads real game data: tm_api_lib_x64.dll, media/cms.zip, and batches of car
 # suspension physics out of media/physics/suspension.
 #
-# It then exits during startup, deliberately: exit_group(4353), whose low byte
-# is the 1 that reaches Proton, with no fatal signal anywhere in the process
-# tree, no crash report, and no unhandled exception. Where exactly depends on
-# what it has been told about itself, which is the most useful thing known
-# about it:
+# Then it kills itself. Not a crash and not an exit: TerminateProcess on its own
+# handle with 0x1100, which skips the orderly shutdown ExitProcess would run --
+# no DLL detach, no destructors, no message. Wine maps a status whose low byte
+# is zero to 1 on the way out, so Proton reports 1 and the process appears to
+# have simply vanished. patches/wine/0012 makes it say so instead.
 #
-#   * told nothing (title id 0)          217 calls, stops after the networking
-#                                        port query
-#   * told its title id                  7,735 calls, then 939 iterations of
-#                                        XPackageGetCurrentProcessPackageIdentifier
-#                                        and XPackageIsPackagedProcess -- both
-#                                        answering correctly -- then
-#                                        XPackageRegisterPackageInstalled, then out
-#   * told its store id as well          211 calls, stops after registering for
-#                                        the multiplayer port change
+# What the thread that does it was doing, immediately before:
 #
-# So it is reachable in three different places depending on what it knows, and
-# none of them is a crash. That is a title deciding to stop, three times, for
-# three reasons still unknown.
+#   NtCreateFile  "\??\GLOBALROOT\??\Z:\...\ForzaHorizon5.exe:4"
+#   NtSetInformationFile  FileEndOfFileInformation / FileAllocationInformation
+#   NtQueryInformationProcess (self, ProcessDebugObjectHandle)
+#   NtTerminateProcess  exit_code 0x1100
+#
+# It writes an alternate data stream on its own executable -- 323 KB of
+# high-entropy data, so the protection layer's own store -- asks whether it is
+# being debugged, and stops. Wine answers the debugger question correctly
+# (STATUS_PORT_NOT_SET; there is no debugger), and Wine materialises the stream
+# as a sibling file rather than a real NTFS stream, which is the one difference
+# visible from here.
+#
+# FileAllocationInformation was a stub and is now implemented, because it fired
+# in that sequence and shrinking below end of file is observable. It does not
+# change the outcome.
+#
+# So the remaining blocker is the title's own integrity machinery deciding it is
+# not satisfied. Working out what would satisfy it is defeating the protection
+# rather than porting around it, and that is not something this project will do.
+# Everything up to that point was ours and is fixed.
+#
+# Where it stops also moves with what the runtime tells it about itself, which
+# is worth keeping written down:
+#
+#   * told nothing (title id 0)     217 calls, stops after the networking
+#                                   port query
+#   * told its title id             7,735 calls, then 939 iterations of
+#                                   XPackageGetCurrentProcessPackageIdentifier
+#                                   and XPackageIsPackagedProcess, then out
+#   * told its store id as well     211 calls, and the self-kill above
 #
 # It is reproducible now, which it was not. Before the concrt140 capacity fix
 # the same launch alternated between 219 and 7,735 calls run to run and
 # sometimes died instead on a read fault inside RtlWakeAddressAll
 # (ntdll+0x3a880, +0x88) reading 0x2f5efbc0 -- an address that had gone away.
-# Four consecutive runs after that fix landed on the same place every time,
-# with the push_back guard never firing.
 
 schema = 1
 
@@ -167,13 +184,14 @@ requires = [
     "concrt140.concurrent-vector-push-back",
     "xgameruntime.title-id",
     "xgameruntime.package-details",
+    "loader.file-allocation-and-abnormal-exit",
 ]
 
 [status]
 state         = "broken"
-blocked-by    = "unknown"
-summary       = "Opens a window, renders its splash screen and loads real game data, then exits during startup -- at one of three points, depending on what the runtime tells it about itself."
-stops-at      = "exit_group(4353) during startup, after registering for the multiplayer port change, with no crash report and no fatal signal"
+blocked-by    = "title-protection"
+summary       = "Opens a window, renders its splash screen and loads real game data, then its own integrity layer hard-kills the process with 0x1100."
+stops-at      = "TerminateProcess on its own handle with exit code 0x1100, after writing an alternate data stream on its own executable and querying ProcessDebugObjectHandle"
 last-verified = 2026-09-07
 verified-with = "ferestre run fh5 with WINEDEBUG=+seh; tools/pe-holes.py over the decrypted image, with an ordinary DLL as the control"
 
@@ -191,5 +209,5 @@ log-match = "ACCESS_VIOLATION_WRITE"
 
 [[issues]]
 symptom   = "the splash screen appears, the game loads assets, and the window closes again; the process exits 1"
-cause     = "unknown, and it moves as the runtime tells the title more about itself: with no title id it stops after the networking port query, with a title id it polls the package identity 939 times first, and with its store id as well it stops after registering for the multiplayer port change. None of the three is a crash"
-fix       = "none yet. Two blanks that were causing earlier stops are fixed (the title id and the package details); this is what it reaches next, and the store id result suggests XStore is where to look"
+cause     = "the title's own integrity layer. It writes an encrypted alternate data stream on its own executable, queries ProcessDebugObjectHandle -- which Wine answers correctly -- and then calls TerminateProcess on itself with 0x1100, skipping the orderly shutdown entirely"
+fix       = "none this project will pursue: satisfying that machinery is defeating the protection rather than porting around it. Everything before it was ours and is fixed -- the elided call sites, a concrt140 race, a blank title id, blank package details and an unimplemented FileAllocationInformation"

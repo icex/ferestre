@@ -357,3 +357,22 @@ unlocks."""
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "reporting package %s (%s), store %s, title %s" },
 ]
+
+[[capability]]
+name = "loader.file-allocation-and-abnormal-exit"
+summary = """
+NtSetInformationFile implements FileAllocationInformation instead of stubbing \
+it, and a process that terminates itself abnormally says so with its exit \
+code."""
+provided-by = ["patches/wine/0012-file-allocation-and-an-abnormal-self-termination-is-w.patch"]
+symptom-if-missing = "setting a file's allocation size silently does nothing, and a title that hard-kills itself leaves no trace at all: the process vanishes and Proton reports 1, because a status whose low byte is zero is mapped to 1 on the way out"
+note = """
+Both came out of Forza Horizon 5's startup and neither fixes it. The allocation \
+stub is a real gap -- it fired while the title was writing an alternate data \
+stream on its own executable -- and shrinking below end of file is observable, \
+so answering success while leaving the file its old length is a lie a caller \
+can see. The warning is what turned "the process just disappeared" into "it \
+terminated itself with 0x1100", which took strace to learn the first time."""
+verify = [
+    { file = "files/lib/wine/x86_64-unix/ntdll.so", contains = "process terminating itself abnormally" },
+]

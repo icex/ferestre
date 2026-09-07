@@ -1,0 +1,84 @@
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -5523,13 +5523,49 @@
+         break;
+ 
+     case FileAllocationInformation:
+-    {
+-        const FILE_ALLOCATION_INFORMATION *info = ptr;
++        if (len >= sizeof(FILE_ALLOCATION_INFORMATION))
++        {
++            const FILE_ALLOCATION_INFORMATION *info = ptr;
++            struct stat st;
+ 
+-        FIXME("FileAllocationInformation AllocationSize %p stub.\n", (void *)(ULONG_PTR)info->AllocationSize.QuadPart);
+-        io->Status = STATUS_SUCCESS;
++            if ((status = server_get_unix_fd( handle, FILE_WRITE_DATA, &fd, &needs_close, NULL, NULL )))
++                return io->Status = status;
++
++            if (fstat( fd, &st ) == -1) status = errno_to_status( errno );
++            else if (S_ISDIR( st.st_mode )) status = STATUS_INVALID_DEVICE_REQUEST;
++            else if (info->AllocationSize.QuadPart < st.st_size)
++            {
++                /* Setting the allocation below end of file truncates on
++                 * Windows, and that part is observable -- returning success
++                 * while leaving the file its old length is a lie a caller can
++                 * see. Go through the server so the change is shared the same
++                 * way FileEndOfFileInformation's is. */
++                if (needs_close) close( fd );
++                needs_close = FALSE;
++                SERVER_START_REQ( set_fd_eof_info )
++                {
++                    req->handle = wine_server_obj_handle( handle );
++                    req->eof    = info->AllocationSize.QuadPart;
++                    status = wine_server_call( req );
++                }
++                SERVER_END_REQ;
++            }
++#if defined(__linux__) && defined(FALLOC_FL_KEEP_SIZE)
++            else if (info->AllocationSize.QuadPart > st.st_size)
++            {
++                /* Reserve the blocks without moving end of file, which is what
++                 * this class is for. posix_fallocate() is the wrong call here:
++                 * it extends the file. A filesystem that cannot reserve is not
++                 * an error -- the allocation size is a hint on Windows too. */
++                if (fallocate( fd, FALLOC_FL_KEEP_SIZE, 0, (off_t)info->AllocationSize.QuadPart ) == -1)
++                    WARN( "could not reserve %s bytes: %s\n",
++                          wine_dbgstr_longlong( info->AllocationSize.QuadPart ), strerror( errno ) );
++            }
++#endif
++            if (needs_close) close( fd );
++        }
++        else status = STATUS_INVALID_PARAMETER_3;
+         break;
+-    }
+ 
+     case FilePipeInformation:
+         if (len >= sizeof(FILE_PIPE_INFORMATION))
+diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -1007,7 +1007,21 @@
+     {
+         if (!handle) process_exiting = TRUE;
+         else if (process_exiting) exit_process( exit_code );
+-        else abort_process( exit_code );
++        else
++        {
++            /* Not an orderly exit: this skips the shutdown ExitProcess would
++             * run, so there are no DLL detach traces, no destructors and
++             * usually no message -- from outside the process simply vanishes.
++             * The exit code is worth saying out loud too, because it does not
++             * survive the trip out: a Unix parent sees only the low byte, and
++             * get_unix_exit_code() turns a status whose low byte is zero into
++             * 1 so it cannot be mistaken for success. Forza Horizon 5 leaves
++             * 0x1100 and Proton reports 1, which says nothing about what
++             * happened. Say it at warn level, so finding out takes reading a
++             * log rather than attaching strace. */
++            WARN( "process terminating itself abnormally, exit code %#x\n", (unsigned int)exit_code );
++            abort_process( exit_code );
++        }
+     }
+     return ret;
+ }
