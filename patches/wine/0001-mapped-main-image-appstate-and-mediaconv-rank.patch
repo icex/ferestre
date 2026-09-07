@@ -34,7 +34,7 @@ index 3b524d0..16eb6f8 100644
  
      switch (rec->ExceptionCode)
 diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
-index bbb448c..08404a6 100644
+index bbb448c..3a36255 100644
 --- a/dlls/ntdll/loader.c
 +++ b/dlls/ntdll/loader.c
 @@ -1729,6 +1729,25 @@ static NTSTATUS alloc_thread_tls(void)
@@ -85,7 +85,28 @@ index bbb448c..08404a6 100644
  
      for (callback = (const PIMAGE_TLS_CALLBACK *)dir->AddressOfCallBacks; *callback; callback++)
      {
-@@ -4624,6 +4656,71 @@ static void release_address_space(void)
+@@ -1745,11 +1777,20 @@ static void call_tls_callbacks( HMODULE module, UINT reason )
+         __TRY
+         {
+             call_dll_entry_point( (DLLENTRYPROC)*callback, module, reason, NULL );
++            if (trace_tls_enabled() && module == NtCurrentTeb()->Peb->ImageBaseAddress)
++                MESSAGE( "wine: main-image TLS callback %p returned\n", *callback );
+         }
+         __EXCEPT_ALL
+         {
+             TRACE_(relay)("\1exception %08lx in TLS callback (proc=%p,module=%p,reason=%s,reserved=0)\n",
+                           GetExceptionCode(), callback, module, reason_names[reason] );
++            /* Swallowed, and the remaining callbacks are skipped -- so a title
++             * whose first callback faults loses whatever the rest would have
++             * done, silently. Worth one line: for an image that unpacks part of
++             * its own .text from a callback, that silence is the whole bug. */
++            if (trace_tls_enabled() && module == NtCurrentTeb()->Peb->ImageBaseAddress)
++                MESSAGE( "wine: main-image TLS callback %p raised %08lx; skipping the rest\n",
++                         *callback, GetExceptionCode() );
+             return;
+         }
+         __ENDTRY
+@@ -4624,6 +4665,71 @@ static void release_address_space(void)
  #endif
  }
  
@@ -157,7 +178,7 @@ index bbb448c..08404a6 100644
  /******************************************************************
   *		loader_init
   *
-@@ -4760,6 +4857,7 @@ void loader_init( CONTEXT *context, void **entry )
+@@ -4760,6 +4866,7 @@ void loader_init( CONTEXT *context, void **entry )
      if (!attach_done)  /* first time around */
      {
          attach_done = 1;
