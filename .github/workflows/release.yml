@@ -11,9 +11,9 @@
 #                                       extract anything.
 #   SHA256SUMS                          for both, so a download can be checked.
 #
-# The patched Proton runtime is deliberately NOT here. It is ~264 MiB
-# compressed, it versions independently, and tying a 1 MB application to a
-# 264 MB release train would mean a quarter-gigabyte download for a typo fix.
+# The patched Proton runtime is deliberately NOT here. It is 300 MB
+# compressed, it versions independently, and tying a 3 MB application to a
+# 300 MB release train would mean a 300 MB download for a typo fix.
 # It has its own workflow (runtime.yml) and its own tags.
 #
 # Cutting a release:
@@ -199,7 +199,7 @@ jobs:
           | \`SHA256SUMS\` | Checksums for both. |
 
           The patched Proton runtime is **not** in this release. It versions
-          separately, under the \`runtime-*\` tags, because it is ~264 MiB and
+          separately, under the \`runtime-*\` tags, because it is 300 MB and
           changes only when Wine or the GDK runtime does. Install it with
           \`ferestre install-runtime\`, or from the \`ferestre-runtime-bin\`
           AUR package.

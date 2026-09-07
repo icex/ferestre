@@ -3,13 +3,13 @@
 # The patched Proton runtime, prebuilt.
 #
 # Why -bin and not built here: building it is a container build of a whole Wine
-# tree -- ~1h12m cold and ~35m warm on public CI runners, and it needs Docker or
+# tree -- 2h09m measured on a free public CI runner, and it needs Docker or
 # Podman with a Valve SDK image. That is not something an AUR helper should do
 # behind a progress bar on someone's laptop.
 #
-# Why a separate package from the launcher: the runtime is ~264 MiB compressed
+# Why a separate package from the launcher: the runtime is 300 MB compressed
 # and changes only when Wine or xgameruntime.dll changes; the launcher is a few
-# hundred kilobytes and changes often. One package would mean a 264 MiB download
+# hundred kilobytes and changes often. One package would mean a 300 MB download
 # for a typo fix. See ../README.md.
 
 pkgname=ferestre-runtime-bin

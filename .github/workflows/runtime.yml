@@ -2,9 +2,16 @@
 #
 # Builds the patched Proton -- Wine, the from-scratch Xbox GDK runtime
 # (xgameruntime.dll), and everything Proton wraps around them -- and publishes
-# the compatibility tool as one tarball. ~264 MiB compressed, ~35 minutes warm
-# and around an hour and a quarter cold on a free runner, which is why it is a
-# separate train from the launcher rather than a step in it.
+# the compatibility tool as one tarball. Measured on a free four-core runner:
+# 2h09m wall clock and 300 MB compressed. That is why it is a separate train
+# from the launcher rather than a step in it.
+#
+# Every run here is a cold build. --enable-ccache is passed, but nothing carries
+# the cache between runs, so it only helps within one. Caching it would need
+# actions/cache over a multi-gigabyte directory against a 10 GB per-repository
+# limit, to speed up a build that happens only when Wine or the GDK runtime
+# changes -- not obviously worth it, and worth reconsidering if that stops being
+# rare.
 #
 # The three sources are all public, and all pinned by commit rather than by
 # branch. A runtime nobody can reproduce is a binary blob with a changelog:
@@ -190,7 +197,7 @@ jobs:
           name: ferestre-runtime-${{ steps.version.outputs.version }}
           path: out/*
           if-no-files-found: error
-          # A 264 MiB artefact on every manual run adds up; a tag's copy lives
+          # A 300 MB artefact on every manual run adds up; a tag's copy lives
           # on the release instead.
           retention-days: 14
 

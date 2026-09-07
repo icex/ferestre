@@ -406,15 +406,23 @@ honestly marked as unproven rather than planned.
 - The runtime is downloaded, never bundled into the launcher package.
 
 Three independently versioned release trains: the launcher (small, frequent),
-the runtime (~264 MiB compressed, when Wine or the GDK DLL changes), and title
+the runtime (300 MB compressed, when Wine or the GDK DLL changes), and title
 recipes (continuously, community-contributed).
 
 **CI is affordable.** Measured against the upstream Proton fork's own workflow:
-a warm-cache build completed on free public runners in ~35 minutes, and a cold
-build in ~1h12m. A self-hosted runner is a nice-to-have for a GPU smoke test,
-not a requirement to build at all.
+**CI cost, now measured rather than quoted.** The figure here used to be "~35
+minutes warm, ~1h12m cold", taken from the upstream Proton fork's own workflow.
+Building this runtime on a free four-core runner takes **2h09m** and produces a
+**300 MB** tarball. Every run is cold: `--enable-ccache` is passed but nothing
+carries the cache between runs. That is affordable for a train that only moves
+when Wine or the GDK runtime does, and it is not affordable per push -- which is
+why `scripts/check-patches.sh` and `scripts/check-werror.sh` exist. A
+self-hosted runner is a nice-to-have for a GPU smoke test, not a requirement to
+build at all.
 
 - [x] **The launcher's release pipeline.** `.github/workflows/release.yml`.
+      Proven: a dispatch run built a 3.2 MB AppImage that FUSE-mounts and runs
+      on the runner, plus the tarball and checksums.
       A `v*` tag runs the test suite against the exact tree being shipped, then
       publishes three things: an AppImage, a tarball laid out the way an
       installed copy is (`usr/bin` beside `usr/lib/ferestre`, so it exercises
@@ -425,6 +433,8 @@ not a requirement to build at all.
       tag.
 
 - [x] **The runtime's release pipeline.** `.github/workflows/runtime.yml`.
+      Proven: run 34083526031 built it end to end in 2h09m and packaged a
+      300 MB tarball with 18/18 capabilities verified against the built tree.
       A `runtime-*` tag clones `xodus-gaming/Proton` **by commit, recursively**
       -- the submodule pins carry the exact Wine and xgameruntime commits the
       patch series targets -- applies the series, builds, re-applies the Proton
