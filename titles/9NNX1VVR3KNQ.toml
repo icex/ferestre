@@ -81,13 +81,35 @@
 # That is a Wine bug rather than anything to do with this project, and worth
 # sending upstream: any multithreaded user of concurrent_vector can hit it.
 #
+# THE THIRD THING: IT DID NOT KNOW WHO IT WAS
+#
+# XGameGetXboxTitleId returned zero. MicrosoftGame.config carries the TitleId
+# (7900C3C7) and xgr_title_identity() already read it for the token endpoints,
+# so this was a blank where an answer was available -- and a title that asks
+# for its own identity is about to key something on it.
+#
+# patches/xgameruntime/0007 reports it. The difference is not subtle: the GDK
+# conversation goes from 217 calls to 7,735.
+#
 # WHERE IT STOPS NOW
 #
 # It draws. A window appears -- "Forza Horizon 5", 5120x1440, confirmed through
-# KWin's window list and not just seen -- and the splash screen renders. Then
-# the process exits 1, quietly: no crash report, no unhandled exception, and an
-# orderly PROCESS_DETACH through every DLL, so it is deciding to quit rather
-# than dying. Why is the next question.
+# KWin's window list rather than only seen -- the splash screen renders, and it
+# loads real game data: tm_api_lib_x64.dll, media/cms.zip, and batches of car
+# suspension physics out of media/physics/suspension.
+#
+# Then it polls. 939 iterations of XPackageGetCurrentProcessPackageIdentifier
+# followed by XPackageIsPackagedProcess, which answer correctly -- the package
+# family name and TRUE -- so it is waiting on something those calls are only
+# part of. It gives up, calls XPackageRegisterPackageInstalled, and exits.
+#
+# The exit is deliberate and not a crash: exit_group(4353), whose low byte is
+# the 1 that reaches Proton, with no fatal signal anywhere in the process tree,
+# no crash report written, and no unhandled exception.
+#
+# A second failure alternates with it, run to run: a read fault inside
+# RtlWakeAddressAll (ntdll+0x3a880, +0x88) on an address that has gone away.
+# That is a race and probably a separate bug.
 
 schema = 1
 
@@ -112,13 +134,14 @@ requires = [
     "loader.memfd-main-image",
     "loader.section-name-for-mapped-image",
     "concrt140.concurrent-vector-push-back",
+    "xgameruntime.title-id",
 ]
 
 [status]
 state         = "broken"
 blocked-by    = "unknown"
-summary       = "Restores its own elided call sites, opens a window and renders its splash screen, then exits quietly during startup."
-stops-at      = "process exit 1 after the splash screen, with no crash report and an orderly PROCESS_DETACH through every DLL"
+summary       = "Opens a window, renders its splash screen and loads real game data, then polls for something 939 times and exits."
+stops-at      = "exit_group(4353) after 939 XPackageGetCurrentProcessPackageIdentifier/XPackageIsPackagedProcess iterations, with no crash report and no fatal signal"
 last-verified = 2026-09-07
 verified-with = "ferestre run fh5 with WINEDEBUG=+seh; tools/pe-holes.py over the decrypted image, with an ordinary DLL as the control"
 
@@ -135,6 +158,6 @@ fix       = "fixed by patches/wine/0011: settle the segment before deriving an e
 log-match = "ACCESS_VIOLATION_WRITE"
 
 [[issues]]
-symptom   = "the splash screen appears and the window closes again; the process exits 1"
-cause     = "unknown. There is no crash report and no unhandled exception, and every DLL gets an orderly PROCESS_DETACH, so the title is choosing to exit"
-fix       = "none yet, and not yet investigated"
+symptom   = "the splash screen appears, the game loads assets, and the window closes again; the process exits 1"
+cause     = "unknown. It polls XPackageGetCurrentProcessPackageIdentifier and XPackageIsPackagedProcess 939 times -- both answer correctly -- then registers for a package-installed notification and exits deliberately. Whatever it is waiting for is not visible in the GDK trace"
+fix       = "none yet. XGameGetXboxTitleId returning zero was one cause of stopping earlier and is fixed; this is what it reaches next"

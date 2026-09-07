@@ -316,3 +316,19 @@ without allocating and push_back derives an element pointer from the marker. \
 verify = [
     { file = "files/lib/wine/x86_64-windows/concrt140.dll", contains = "settling it before returning an element" },
 ]
+
+[[capability]]
+name = "xgameruntime.title-id"
+summary = """
+XGameGetXboxTitleId reports the TitleId from MicrosoftGame.config rather than \
+zero, so a title that asks for its own identity gets it."""
+provided-by = ["patches/xgameruntime/0007-report-the-package-s-own-xbox-title-id.patch"]
+symptom-if-missing = "Forza Horizon 5 gets through startup and then spends 939 iterations polling XPackageGetCurrentProcessPackageIdentifier before giving up; with the real id it makes 7,735 GDK calls instead of 217"
+note = """
+The config carries it and xgr_title_identity() already reads it for the token \
+endpoints, so this was a blank where an answer was available. Zero is still the \
+answer when there is no config to read, because callers treat a failure here as \
+fatal and an error would be worse than a blank."""
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "reporting title id" },
+]

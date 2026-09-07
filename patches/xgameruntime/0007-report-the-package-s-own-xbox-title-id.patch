@@ -1,0 +1,30 @@
+diff --git a/xgame.c b/xgame.c
+--- a/xgame.c
++++ b/xgame.c
+@@ -72,12 +72,23 @@
+ 
+ static HRESULT WINAPI x_game_XGameGetXboxTitleId( IXGameImpl3 *iface, UINT32 *titleId )
+ {
++    char title_id[32], client_id[64];
++
+     TRACE( "iface %p, titleId %p.\n", iface, titleId );
+ 
+-    /* Without a registered package there is no title identity to report. Hand
+-     * back zero rather than failing: callers treat an error here as fatal. */
+     if (!titleId) return E_INVALIDARG;
+-    *titleId = 0;
++
++    /* The package knows who it is: MicrosoftGame.config carries TitleId, and
++     * xgr_title_identity() already reads it for the token endpoints. Report it
++     * here too. Answering zero is not harmless -- a title that asks for its own
++     * id is about to key something on it, and Forza Horizon 5 stops during
++     * startup when it is told it has no identity.
++     *
++     * Zero remains the answer when there is no config to read, because callers
++     * treat a failure here as fatal and an error would be worse than a blank. */
++    xgr_title_identity( title_id, sizeof(title_id), client_id, sizeof(client_id) );
++    *titleId = title_id[0] ? strtoul( title_id, NULL, 10 ) : 0;
++    TRACE( "reporting title id %u.\n", *titleId );
+     return S_OK;
+ }
+ 
