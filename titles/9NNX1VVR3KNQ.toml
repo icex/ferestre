@@ -31,9 +31,25 @@
 # And .xbld holds only GRDK build strings; .detourc/.detourd are empty Detours
 # scaffolding. There is no protection stub here doing anything.
 #
-# So: a second encryption layer that the container decrypt does not undo, and
-# that nothing in the process undoes either. Where that layer comes from is the
-# open question -- the next place to look is the container, not the title.
+# And it is not the container either, which the same page settles. The client
+# decrypts AES-XTS over 4096-byte units. In the unit at file 0x383000:
+#
+#   rva 0x384980  af / 43 24 3a / movabs / .byte 0x25      -- nonsense
+#   rva 0x3849e0  mov rbx,[rcx+0x20]; mov ecx,2; call ...;
+#                 test rax,rax; je; movzwl (rbx),ecx;
+#                 mov [rax],cx; add rsp,0x20; pop rbx; ret -- perfect
+#
+# 96 bytes apart, one key, one tweak. No key or region error can garble one
+# function and leave its neighbour intact, so the container decrypt is not the
+# fault and neither is a second content key -- the licence carries exactly one,
+# and `run.rs` would have said so otherwise.
+#
+# What is left: a per-function layer inside the correctly-decrypted image,
+# byte-wise rather than block-wise (two bodies of the same length differ in six
+# bytes, in three adjacent pairs, so byte positions are preserved -- a block
+# cipher would avalanche). Something is expected to undo it and nothing here
+# does. What that something is, is the open question; it is not in this binary,
+# not in the container, and not in the licence.
 
 schema = 1
 
@@ -72,5 +88,5 @@ verified-with = "ferestre run fh5 with WINEDEBUG=+seh and WINE_TRACE_TLS=1; the 
 [[issues]]
 symptom   = "the game exits seconds after launch with no window; the log ends in an unhandled illegal instruction inside ForzaHorizon5.exe"
 cause     = "unknown. 19,878 of 459,561 functions decrypt to something that is not x86-64 code, consistently and reproducibly, and nothing in the process ever writes those pages"
-fix       = "none known. It is not a missing Windows API -- no GDK call is made first -- and it is not an unpacker this runtime prevents, because there is no unpacker. Look at the container before the title"
+fix       = "none known, and three places have been excluded by measurement: not a missing Windows API (no GDK call is made first), not an unpacker this runtime prevents (there is no unpacker), and not the container decrypt (a garbled function and a perfect one share one AES-XTS unit)"
 log-match = "Unhandled illegal instruction at address .* \\(thread"
