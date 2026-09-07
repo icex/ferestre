@@ -1,0 +1,53 @@
+From f7463a71fa2202312e7536f2e442a1627a276ff3 Mon Sep 17 00:00:00 2001
+From: Ice <icex@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 12:18:36 +0300
+Subject: [PATCH] extract: a container that stops short is not a crash
+
+`xodus-cli extract` on a local container panicked with `early eof` partway
+through. The container a streaming install leaves behind is a *prefix* of
+the package -- it holds only what was read -- so running off the end is
+the normal outcome of pointing extract at one, not a defect in the
+extractor.
+
+It now says which file it ran out on and that a cache is not a package.
+
+Found while trying to re-extract Forza Horizon 5 from its cached container
+to test whether its install was written by the pre-`cached_len` streaming
+code. It cannot be: the cache is 1.07 GB of a 149 GB package.
+---
+ crates/xodus-cli/src/commands/streaming.rs | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/crates/xodus-cli/src/commands/streaming.rs b/crates/xodus-cli/src/commands/streaming.rs
+index 89bcd3d..77d94e2 100644
+--- a/crates/xodus-cli/src/commands/streaming.rs
++++ b/crates/xodus-cli/src/commands/streaming.rs
+@@ -539,10 +539,23 @@ where
+ 
+             if let Some(fpath) = url.strip_prefix("file://") {
+                 let mut i = File::open(&fpath).await.unwrap();
+-                remote_xvd_ref
++                // A local container is often a *prefix* of the package -- the
++                // streaming install keeps only what it read. Extracting from one
++                // therefore runs off the end partway through, and `early eof`
++                // arriving as a panic reads as a bug in the extractor rather
++                // than as "this container does not go that far".
++                if let Err(err) = remote_xvd_ref
+                     .extract_file(&mut i, &mut fout, &job.content, *full_key, progress)
+                     .await
+-                    .expect("msg");
++                {
++                    eprintln!(
++                        "{}: {err}\n  {fpath} does not contain this file. A container left by a \
++                         streaming install holds only the part of the package that was read; \
++                         extracting the whole title needs the package, not the cache.",
++                        job.name
++                    );
++                    return;
++                }
+                 tx.send(ProgressEvent::Finished { id }).await.ok();
+             } else {
+                 remote_xvd_ref
+-- 
+2.55.0
+
