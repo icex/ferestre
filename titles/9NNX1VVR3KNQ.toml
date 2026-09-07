@@ -44,12 +44,25 @@
 # fault and neither is a second content key -- the licence carries exactly one,
 # and `run.rs` would have said so otherwise.
 #
+# And the install is not corrupt, which was the last thing left to exclude. It
+# was written on 2026-09-05, two days before the streaming `cached_len` fix, so
+# it was a fair suspect. Downloading the title again from scratch into a
+# separate directory produced ForzaHorizon5.exe byte for byte identical --
+# sha256 869adb5f8b2c245dba4baa653a22f6b19b1c83dead1078f1..., 0 differing bytes
+# of 171,851,776. The bytes we decrypt are the bytes Microsoft ships.
+#
 # What is left: a per-function layer inside the correctly-decrypted image,
 # byte-wise rather than block-wise (two bodies of the same length differ in six
 # bytes, in three adjacent pairs, so byte positions are preserved -- a block
-# cipher would avalanche). Something is expected to undo it and nothing here
-# does. What that something is, is the open question; it is not in this binary,
-# not in the container, and not in the licence.
+# cipher would avalanche). Stronger still: across 2,000 bodies of one length the
+# per-position agreement is 1833/2000, and the only positions that disagree are
+# 26-28, 55-57 and 65-67. They are one template with three varying ~3-byte
+# fields, which is what an accessor thunk looks like and is not what damage
+# looks like.
+#
+# Something is expected to undo that layer and nothing here does. What that
+# something is, is the open question; it is not in this binary, not in the
+# container, not in the licence, and not a bad download.
 
 schema = 1
 
@@ -88,5 +101,5 @@ verified-with = "ferestre run fh5 with WINEDEBUG=+seh and WINE_TRACE_TLS=1; the 
 [[issues]]
 symptom   = "the game exits seconds after launch with no window; the log ends in an unhandled illegal instruction inside ForzaHorizon5.exe"
 cause     = "unknown. 19,878 of 459,561 functions decrypt to something that is not x86-64 code, consistently and reproducibly, and nothing in the process ever writes those pages"
-fix       = "none known, and three places have been excluded by measurement: not a missing Windows API (no GDK call is made first), not an unpacker this runtime prevents (there is no unpacker), and not the container decrypt (a garbled function and a perfect one share one AES-XTS unit)"
+fix       = "none known. Four places excluded by measurement: not a missing Windows API (no GDK call is made first), not an unpacker this runtime prevents (there is no unpacker, and nothing ever makes those pages writable), not the container decrypt, and not a bad download (a fresh install produced the identical file, 0 of 171,851,776 bytes different)"
 log-match = "Unhandled illegal instruction at address .* \\(thread"
