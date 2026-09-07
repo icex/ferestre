@@ -76,6 +76,20 @@ jobs:
         with:
           path: ferestre
 
+      # A tag can be created on any branch, and a release cut from dev would
+      # publish work that never reached main. Now that there are two branches
+      # this is worth one fetch to be sure of.
+      - name: The tag must be on main
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          git -C "ferestre" fetch --quiet --depth=100 origin main
+          if ! git -C "ferestre" merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "::error::$GITHUB_REF_NAME is not on main -- merge to main and tag there"
+              exit 1
+          fi
+          echo ":: $GITHUB_REF_NAME is on main"
+
       - name: Resolve the Proton ref
         id: ref
         env:

@@ -7,7 +7,11 @@ name: Compatibility matrix
 
 on:
   push:
-    branches: [main]
+    # dev as well as main. Work lands on dev and only reaches main to be
+    # released, so a filter naming main alone would mean every ordinary
+    # push ran no checks at all -- and the checks would come back exactly
+    # when the work was already finished.
+    branches: [main, dev]
     paths:
       - 'titles/**'
       - 'docs/COMPATIBILITY.md'

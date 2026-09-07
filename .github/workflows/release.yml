@@ -55,6 +55,20 @@ jobs:
           # cannot describe itself.
           fetch-depth: 0
 
+      # A tag can be created on any branch, and a release cut from dev would
+      # publish work that never reached main. Now that there are two branches
+      # this is worth one fetch to be sure of.
+      - name: The tag must be on main
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          git -C "." fetch --quiet --depth=100 origin main
+          if ! git -C "." merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "::error::$GITHUB_REF_NAME is not on main -- merge to main and tag there"
+              exit 1
+          fi
+          echo ":: $GITHUB_REF_NAME is on main"
+
       # GTK4 and libadwaita because the GUI links them; fuse3 because the
       # AppImage self-test at the end of the packaging script mounts the image
       # it just built, and a build that cannot run its own output has not been

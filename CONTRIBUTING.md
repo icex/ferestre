@@ -27,6 +27,28 @@ notes/     write-ups of problems that were hard to find
 Everything resolves its paths from `XODUS_*` environment variables with
 `$HOME`-relative defaults. If you find a hardcoded path, that is a bug.
 
+## Branches
+
+`dev` is where work lands. `main` is what has been released, and the only
+branch a release tag may point at.
+
+```
+dev  ──●──●──●──────●── work happens here; every push runs the checks
+        ╲           ╱
+main ────●─────────●──── merged to release; tags are cut here only
+```
+
+Releases are driven by tags, never by a push to a branch: `v*` builds the
+launcher, `runtime-*` builds the patched Proton. Both workflows check that the
+tag is reachable from `main` and refuse otherwise, because a tag can be created
+on any branch and a release cut from `dev` would publish work that was never
+merged.
+
+The per-push checks (`Rust`, `Compatibility matrix`) run on **both** branches.
+That is deliberate and load-bearing: a filter naming `main` alone would mean an
+ordinary day's work ran no checks at all, and the checks would come back exactly
+when the work was already finished.
+
 ## Running the tests
 
 ```sh
