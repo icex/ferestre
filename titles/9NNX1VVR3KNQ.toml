@@ -1,10 +1,12 @@
 # Forza Horizon 5 (Microsoft Store)
 #
-# Runs. It reaches the welcome screen.
+# Runs, signs in, and reaches its welcome screen: "WELCOME, <gamertag>",
+# then "LOADING... PLEASE WAIT", then the real prompt -- [Return] START GAME,
+# [X] ACCESSIBILITY/SETTINGS. Pressing Start Game still ends the run.
 #
-# Getting here took five fixes and two wrong conclusions, both of which said
+# Getting here took eight fixes and two wrong conclusions, both of which said
 # some version of "the title is defending itself and there is nothing to be
-# done". Neither was true. Every one of these was ours:
+# done". Neither was true; every one of these was ours:
 #
 #   1. The image is mapped from a memfd, so NtQueryVirtualMemory with
 #      MemoryMappedFilenameInformation returned an empty string -- the title
@@ -18,13 +20,31 @@
 #   4. XPackageEnumeratePackages reported the package family name as the
 #      display name and blanks for description, publisher and store id.
 #      patches/xgameruntime/0008.
-#   5. And the one that was actually stopping it: patches/wine/0009 matched the
-#      image map by exact NT name, so \??\GlobalRoot\??\Z:\...\ForzaHorizon5.exe
-#      matched nothing. The title opens its own executable through that spelling
-#      -- three read-only opens -- hashes what it reads, and the bytes it got
-#      were the still-encrypted ones from disk. It then called TerminateProcess
-#      on itself with 0x1100. patches/wine/0013 strips the prefix before
-#      comparing, the way the file layer does a moment later.
+#   5. patches/wine/0009 matched the image map by exact NT name, so
+#      \??\GlobalRoot\??\Z:\...\ForzaHorizon5.exe matched nothing. The title
+#      opens its own executable through that spelling -- three read-only opens
+#      -- hashes what it reads, and the bytes it got were the still-encrypted
+#      ones from disk. It then called TerminateProcess on itself with 0x1100.
+#      patches/wine/0013 strips the prefix before comparing, the way the file
+#      layer does a moment later.
+#   6. XAsyncGetResult trusted a result size recorded in the block even when
+#      there was no payload behind it, which is memcpy() from address zero --
+#      a fault inside the caller's own memcpy rather than an error it can see.
+#      patches/xgameruntime/0010.
+#   7. And the one that got it to the welcome screen: libHttpClient's websocket
+#      send completes the operation from inside its own XAsyncBegin and *then*
+#      returns E_PENDING, because Wine's WinHttpWebSocketSend completes a send
+#      that does not block there and then rather than on a worker thread the
+#      way Windows does. Reading any failure HRESULT as "the provider refused
+#      to start" unlinked and freed the operation between XAsyncComplete and
+#      XAsyncGetResult. patches/xgameruntime/0010 keeps it, and holds its
+#      callback until Begin has returned, which is what every GDK API promises.
+#   8. The save provider is initialised with an all-zero configuration id,
+#      which means "the one this title was built with" and not a service
+#      configuration whose every digit is zero. Taking it literally pointed the
+#      save folder at wgs\0000000000000000_000...000, so a profile copied over
+#      from Windows would have been invisible. patches/xgameruntime/0011 falls
+#      back to the title's own SCID, ...7900C3C7.
 #
 # The elided call sites are real and still there: about a third of its functions
 # have their direct calls replaced by five bytes of filler whose first byte has
@@ -36,12 +56,42 @@
 # WHAT IT DOES NOW
 #
 #   * window: "Forza Horizon 5", confirmed through KWin's window list
-#   * splash, then the welcome screen
-#   * 342,000+ GDK calls and climbing, XTaskQueueDispatch pumping continuously
-#   * XUserGetGamertag, XUserGetId, XUserGetLocalId -- it has a signed-in user
+#   * splash, the welcome screen with the signed-in gamertag, then the loading
+#     screen, then [Return] START GAME
+#   * XUserGetGamertag, XUserGetId, XUserGetLocalId -- a signed-in user
+#   * mints tokens for profile.xboxlive.com, peoplehub.xboxlive.com and the
+#     Real-Time Activity socket at wss://rta.xboxlive.com/connect, and the
+#     websocket connects, sends and gets its result back
+#   * opens its save provider under the right SCID and looks for its profile
 #   * loads its FMOD audio banks, including glb_radiopressstart and glb_ui
 #
-# Not yet taken past the welcome screen, so this is `menus` and not `playable`.
+# WHERE IT STOPS, AND WHAT IS WORTH TRYING NEXT
+#
+# It faults reading address 0xFFFFFFFFFFFFFFFF, at one of two sites in its own
+# bundled libHttpClient: ForzaHorizon5.exe+0x5D5B31E, the handler for a
+# websocket send completing, and ForzaHorizon5.exe+0x5CA2931 during the earlier
+# HTTP calls. Both read a pointer field the title null-checks against 0 and
+# finds -1 in, then call through it. Reading -1 out of a field that is checked
+# for 0 is what a freed block filled with 0xFF looks like, so the object is
+# most likely already torn down when the handler runs.
+#
+# The strongest lead is the title claim. Forza's MicrosoftGame.Config carries
+# no <MSAAppId> -- `xodus-cli xbl-check` says so, and the runtime warns on every
+# token -- so every Xbox Live token it gets carries no title claim. A service
+# that scopes by title answers 403 to that, and libHttpClient's teardown after a
+# rejected live call is exactly the shape that destroys a websocket while an
+# observer still holds it (see the note in xnetworking.c, written for the same
+# crash in Minecraft). Establishing a title claim for a title whose config does
+# not name an MSA app is the next piece of work.
+#
+# Two smaller things found on the way, neither of them the cause:
+#   * `xodus-cli xbl-check` looks for MicrosoftGame.config; Forza ships
+#     MicrosoftGame.Config, and the client does not try both spellings.
+#   * the crash is not caused by pressing Start Game. It happens on its own
+#     about thirty seconds in as often as not; the earlier report that Start
+#     Game triggered it was the two coinciding.
+#
+# Not taken past the welcome screen, so this is `menus` and not `playable`.
 # Loading into a race, saves and multiplayer are all unverified.
 
 schema = 1
@@ -71,14 +121,16 @@ requires = [
     "xgameruntime.title-id",
     "xgameruntime.package-details",
     "xgameruntime.speech-voice-enumeration",
+    "xgameruntime.async-provider-completed-in-begin",
+    "xgameruntime.save-provider-default-scid",
 ]
 
 [status]
 state         = "menus"
-summary       = "Reaches the welcome screen. Not taken further, so loading into a race, saves and multiplayer are unverified."
-stops-at      = "not verified past the welcome screen"
+summary       = "Signs in and reaches the welcome screen and its START GAME prompt; faults in its own libHttpClient soon after, reading a field it holds as -1."
+stops-at      = "a read of 0xFFFFFFFFFFFFFFFF at ForzaHorizon5.exe+0x5D5B31E, in the handler for a websocket send completing"
 last-verified = 2026-09-07
-verified-with = "ferestre run fh5; the window confirmed through KWin's window list, and the GDK trace showing XTaskQueueDispatch pumping and XUserGetGamertag answering"
+verified-with = "ferestre run fh5, driven unattended: keys through a uinput virtual keyboard after pulling the window forward with KWin, screenshots at each press. The welcome screen names the signed-in gamertag and offers [Return] START GAME."
 
 [[issues]]
 symptom   = "the game exits seconds after launch with no window; the log ends in an unhandled illegal instruction inside ForzaHorizon5.exe"
@@ -97,3 +149,21 @@ symptom   = "the splash screen appears, the window closes again, and the process
 cause   = "the title opens its own executable as \\??\\GlobalRoot\\??\\Z:\\... to verify it, that spelling did not match the image map, and it hashed the encrypted bytes on disk. It then called TerminateProcess on itself with 0x1100"
 fix       = "fixed by patches/wine/0013: strip the GlobalRoot prefix before matching, as the file layer does"
 log-match = "process terminating itself abnormally"
+
+[[issues]]
+symptom   = "the game reaches its welcome screen and then faults reading address 0 inside ucrtbase's memmove"
+cause     = "libHttpClient asked for a 16-byte websocket result; the block recorded that size but the operation holding the bytes had been withdrawn, so XAsyncGetResult copied from a null payload"
+fix       = "fixed by patches/xgameruntime/0010"
+log-match = "completed with no payload for a .* byte buffer"
+
+[[issues]]
+symptom   = "the game faults reading 0xFFFFFFFFFFFFFFFF just after its Real-Time Activity websocket connects"
+cause     = "libHttpClient's websocket send completes the operation from inside XAsyncBegin and then reports E_PENDING; the runtime read that as a refusal to start and freed the operation between XAsyncComplete and XAsyncGetResult"
+fix       = "partly fixed by patches/xgameruntime/0010: the operation is kept, and its callback held until Begin returns. The fault still happens, further in"
+log-match = "the provider refused to begin block"
+
+[[issues]]
+symptom   = "the title's own profile is never found: it reads User_<xuid>/ProfileBackup and gets E_GS_BLOB_NOT_FOUND even where a save copied from Windows exists"
+cause     = "the title initialises its save provider with an all-zero configuration id, which means the title's own SCID; taking it literally named the save folder after a zero SCID"
+fix       = "fixed by patches/xgameruntime/0011"
+log-match = "title named no service configuration; using its own"

@@ -1,0 +1,129 @@
+diff --git a/private.h b/private.h
+--- a/private.h
++++ b/private.h
+@@ -127,6 +127,15 @@ WCHAR *xgr_package_root( void );
+ /* MicrosoftGame.config text (inline or from disk; UTF-8, malloc'd, or NULL). */
+ char *xgr_load_game_config( void );
+ 
++/* Read one value out of MicrosoftGame.config, which is parsed and cached once
++ * in xpackage.c: the text of <element>text</element>, or attr="value" from the
++ * first <element ...> found. FALSE, and an empty `out`, if it is not there.
++ * The config is the only description of the title we have offline, so what a
++ * package, a store product and a save folder say about it all comes from
++ * here and therefore agrees. */
++BOOL xgr_config_element( const char *element, char *out, SIZE_T cap );
++BOOL xgr_config_attr( const char *element, const char *attr, char *out, SIZE_T cap );
++
+ /* The running title's identity for Xbox authentication, from its
+  * MicrosoftGame.config: `TitleId` (rendered decimal, since the config carries
+  * it in hexadecimal and Xbox wants decimal) and `MSAAppId`. Either comes back
+diff --git a/xgamesave.c b/xgamesave.c
+--- a/xgamesave.c
++++ b/xgamesave.c
+@@ -601,6 +601,32 @@ static BOOL scid_to_suffix( const char *scid, WCHAR out[33] )
+     return n == 32 && !*scid;
+ }
+ 
++/* The SCID a title's saves belong to, when the title does not say.
++ *
++ * Forza Horizon 5 initialises its provider with an all-zero configuration id,
++ * which in the GDK means "the one this title was built with" rather than a
++ * service configuration whose every digit is zero. Taking it literally puts
++ * the saves under a folder named for a zero SCID, so a profile the player
++ * already has -- copied from Windows, or written by an earlier run -- is
++ * invisible, and the title starts as though it had never been played.
++ *
++ * The default follows the convention every Xbox title id-scoped SCID uses:
++ * the last eight digits are the title id, everything before them zero. */
++static BOOL title_default_suffix( WCHAR out[33] )
++{
++    char hex[32];
++
++    if (!xgr_config_element( "TitleId", hex, sizeof(hex) ) || !hex[0]) return FALSE;
++    swprintf( out, 33, L"000000000000000000000000%08lX", strtoul( hex, NULL, 16 ) );
++    return TRUE;
++}
++
++static BOOL suffix_all_zero( const WCHAR *suffix )
++{
++    while (*suffix) if (*suffix++ != '0') return FALSE;
++    return TRUE;
++}
++
+ /* The per-user folder for a service configuration. An existing folder with
+  * the right SCID suffix wins whatever XUID it carries, which is how a save
+  * copied over from Windows is picked up; otherwise one is named after the
+@@ -612,6 +638,10 @@ static WCHAR *resolve_user_dir( const WCHAR *root, const char *scid )
+     HANDLE find;
+ 
+     if (!scid_to_suffix( scid, suffix )) return NULL;
++    /* a title with no id in its config keeps the zero suffix; there is nothing
++     * better to say, and refusing to open a provider would be worse */
++    if (suffix_all_zero( suffix ) && title_default_suffix( suffix ))
++        TRACE( "title named no service configuration; using its own, %s.\n", debugstr_w( suffix ) );
+     swprintf( leaf, ARRAY_SIZE(leaf), L"*_%s", suffix );
+     if (!(pattern = path_join( root, leaf ))) return NULL;
+     find = FindFirstFileW( pattern, &data );
+diff --git a/xpackage.c b/xpackage.c
+--- a/xpackage.c
++++ b/xpackage.c
+@@ -122,8 +122,8 @@ static const char *game_config( void )
+     return cached;
+ }
+ 
+-/* Pull the text of <element>text</element> from MicrosoftGame.config. */
+-static BOOL config_element( const char *element, char *out, SIZE_T cap )
++/* See private.h: the text of <element>text</element> in MicrosoftGame.config. */
++BOOL xgr_config_element( const char *element, char *out, SIZE_T cap )
+ {
+     const char *xml = game_config(), *value;
+     char tag[64];
+@@ -150,13 +150,13 @@ void xgr_title_identity( char *title_id, SIZE_T title_id_len, char *client_id, S
+     /* The config spells TitleId in hexadecimal ("69C7AA31"); every Xbox service
+      * and the token endpoints want it decimal, so convert here rather than
+      * leaving each caller to guess which form it is holding. */
+-    if (config_element( "TitleId", hex, sizeof(hex) ) && hex[0])
++    if (xgr_config_element( "TitleId", hex, sizeof(hex) ) && hex[0])
+         snprintf( title_id, title_id_len, "%lu", strtoul( hex, NULL, 16 ) );
+-    config_element( "MSAAppId", client_id, client_id_len );
++    xgr_config_element( "MSAAppId", client_id, client_id_len );
+ }
+ 
+-/* Pull attr="value" from the first <element ...> in MicrosoftGame.config. */
+-static BOOL config_attr( const char *element, const char *attr, char *out, SIZE_T cap )
++/* See private.h: attr="value" from the first <element ...> in MicrosoftGame.config. */
++BOOL xgr_config_attr( const char *element, const char *attr, char *out, SIZE_T cap )
+ {
+     const char *xml = game_config(), *start, *end, *value;
+     SIZE_T len;
+@@ -193,7 +193,7 @@ static void fill_current_details( XPackageDetails *details, char *identifier, ch
+     details->index = 0;
+     details->count = 1;
+ 
+-    if (config_attr( "<Identity", " Version=\"", version, sizeof(version) ))
++    if (xgr_config_attr( "<Identity", " Version=\"", version, sizeof(version) ))
+     {
+         unsigned int a = 0, b = 0, c = 0, d = 0;
+         sscanf( version, "%u.%u.%u.%u", &a, &b, &c, &d );
+@@ -501,15 +501,15 @@ static HRESULT enumerate_current( XPackageKind kind, void *context, XPackageEnum
+      * name as the display name and blanks for the rest is not harmless: a title
+      * looking for itself in the list it just asked for will not recognise the
+      * entry, and the ones that key on storeId find nothing at all. */
+-    if (!config_attr( "<ShellVisuals", " DefaultDisplayName=\"", display, sizeof(display) ) || !display[0])
+-        if (!config_attr( "<Identity", " Name=\"", display, sizeof(display) ))
++    if (!xgr_config_attr( "<ShellVisuals", " DefaultDisplayName=\"", display, sizeof(display) ) || !display[0])
++        if (!xgr_config_attr( "<Identity", " Name=\"", display, sizeof(display) ))
+             strcpy( display, "Game" );
+-    if (!config_attr( "<ShellVisuals", " Description=\"", description, sizeof(description) ) || !description[0])
++    if (!xgr_config_attr( "<ShellVisuals", " Description=\"", description, sizeof(description) ) || !description[0])
+         strcpy( description, display );
+-    if (!config_attr( "<ShellVisuals", " PublisherDisplayName=\"", publisher, sizeof(publisher) ))
++    if (!xgr_config_attr( "<ShellVisuals", " PublisherDisplayName=\"", publisher, sizeof(publisher) ))
+         publisher[0] = 0;
+-    if (!config_element( "StoreId", store_id, sizeof(store_id) )) store_id[0] = 0;
+-    if (!config_element( "TitleId", title_id, sizeof(title_id) )) title_id[0] = 0;
++    if (!xgr_config_element( "StoreId", store_id, sizeof(store_id) )) store_id[0] = 0;
++    if (!xgr_config_element( "TitleId", title_id, sizeof(title_id) )) title_id[0] = 0;
+ 
+     fill_current_details( &details, identifier, display, description, publisher, store_id, title_id );
+     TRACE( "reporting package %s (%s), store %s, title %s\n", debugstr_a( identifier ),

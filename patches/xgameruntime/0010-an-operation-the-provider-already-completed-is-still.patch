@@ -1,0 +1,264 @@
+diff --git a/xthreading.c b/xthreading.c
+--- a/xthreading.c
++++ b/xthreading.c
+@@ -144,6 +144,8 @@ struct x_async_op
+     HRESULT result;
+     SIZE_T required_size;
+     BOOL completed;
++    BOOL begin_running;     /* the provider's Begin has not returned yet */
++    BOOL deliver_pending;   /* it completed in there; deliver once it has */
+ };
+ 
+ static struct list async_ops = LIST_INIT( async_ops );
+@@ -200,6 +202,9 @@ static void release_async_op( struct x_async_op *op )
+     if (op && !InterlockedDecrement( &op->ref )) free( op );
+ }
+ 
++static void store_async_result( XAsyncBlock *async, HRESULT hr, void *payload, SIZE_T result_size );
++static void deliver_async_completion( XAsyncBlock *async );
++
+ /* Record an operation's outcome and fire the block's completion callback.
+  * Shared by XAsyncComplete and by the DoWork paths that finish inline.
+  *
+@@ -214,6 +219,7 @@ static void release_async_op( struct x_async_op *op )
+ static void x_threading_XAsyncComplete_helper( XAsyncBlock *async, HRESULT result, SIZE_T required_size )
+ {
+     struct x_async_op *op, *drop = NULL;
++    BOOL defer = FALSE;
+ 
+     EnterCriticalSection( &async_ops_cs );
+     op = find_async_op( async );
+@@ -233,6 +239,23 @@ static void x_threading_XAsyncComplete_helper( XAsyncBlock *async, HRESULT resul
+         op->completed = TRUE;
+         op->result = result;
+         op->required_size = required_size;
++        /* A provider is allowed to finish the operation from inside its own
++         * Begin -- libHttpClient's websocket send does, because Wine's
++         * WinHttpWebSocketSend completes a send that does not block there and
++         * then rather than on a worker thread the way Windows does.
++         *
++         * The callback must not go out yet. Every GDK API promises to return
++         * before its completion routine runs, and a title relies on that: it
++         * calls HCWebSocketSendMessageAsync and finishes wiring up the object
++         * the completion will reach through afterwards. Delivering inside the
++         * call runs the handler against an object that is still half-built --
++         * Forza Horizon 5 reads a field it has not assigned yet, finds -1
++         * where it null-checks for 0, and calls through it.
++         *
++         * So record the outcome now (anything polling the block sees it) and
++         * hand the callback to XAsyncBegin to deliver once it returns. */
++        defer = op->begin_running;
++        if (defer) op->deliver_pending = TRUE;
+         /* An XAsyncRun operation has no provider payload to fetch later, so it
+          * is finished with here; its caller reads the outcome from the block
+          * itself. Keeping it listed would leak one entry per call. */
+@@ -241,13 +264,17 @@ static void x_threading_XAsyncComplete_helper( XAsyncBlock *async, HRESULT resul
+             list_remove( &op->entry );
+             drop = op;
+         }
++        TRACE( "operation %p completed for block %p, %Iu byte result, %s%s.\n",
++               op, async, required_size, drop ? "withdrawn" : "kept for its provider",
++               defer ? ", callback held until Begin returns" : "" );
+     }
+     LeaveCriticalSection( &async_ops_cs );
+ 
+     release_async_op( drop );
+     /* Stores the result in the block and delivers the callback according to the
+      * queue's dispatch mode. */
+-    xgr_async_complete_ex( async, result, NULL, required_size );
++    if (defer) store_async_result( async, result, NULL, required_size );
++    else xgr_async_complete_ex( async, result, NULL, required_size );
+ }
+ 
+ static void async_op_invoke( struct x_async_op *op, XAsyncOp which, SIZE_T buffer_size, void *buffer )
+@@ -434,6 +461,7 @@ static HRESULT WINAPI x_threading_XAsyncRun( IXThreadingImpl *iface, XAsyncBlock
+     EnterCriticalSection( &async_ops_cs );
+     list_add_tail( &async_ops, &op->entry );
+     LeaveCriticalSection( &async_ops_cs );
++    TRACE( "operation %p registered for block %p (run).\n", op, asyncBlock );
+ 
+     return schedule_async_work( asyncBlock, 0 );
+ }
+@@ -441,6 +469,7 @@ static HRESULT WINAPI x_threading_XAsyncRun( IXThreadingImpl *iface, XAsyncBlock
+ static HRESULT WINAPI x_threading_XAsyncBegin( IXThreadingImpl *iface, XAsyncBlock *asyncBlock, void *context, const void *identity, const char *identityName, XAsyncProvider *provider )
+ {
+     struct x_async_op *op;
++    BOOL deliver;
+     HRESULT hr;
+ 
+     TRACE( "iface %p, asyncBlock %p, context %p, identity %p, identityName %s, provider %p.\n",
+@@ -452,25 +481,66 @@ static HRESULT WINAPI x_threading_XAsyncBegin( IXThreadingImpl *iface, XAsyncBlo
+     op->provider = provider;
+     op->context = context;
+     op->identity = identity;
+-    op->ref = 1;
++    /* The list holds one reference; this frame holds the other until Begin
++     * returns, because a provider may finish the operation -- and another
++     * thread take its result, freeing it -- before that happens. */
++    op->ref = 2;
++
++    op->begin_running = TRUE;
+ 
+     EnterCriticalSection( &async_ops_cs );
+     list_add_tail( &async_ops, &op->entry );
+     LeaveCriticalSection( &async_ops_cs );
++    TRACE( "operation %p registered for block %p (begin).\n", op, asyncBlock );
+ 
+     {
+         XAsyncProviderData data = { asyncBlock, 0, NULL, context };
+         hr = provider( XAsyncOp_Begin, &data );
+     }
+ 
+-    if (FAILED(hr))
++    EnterCriticalSection( &async_ops_cs );
++    op->begin_running = FALSE;
++    deliver = op->deliver_pending;
++    op->deliver_pending = FALSE;
++    LeaveCriticalSection( &async_ops_cs );
++
++    /* Begin returning a failure does not mean the operation never started.
++     * E_PENDING says the work is under way, and a provider is free to finish
++     * the block from inside Begin and report E_PENDING all the same -- Forza
++     * Horizon 5's libHttpClient websocket send does exactly that.
++     *
++     * Withdrawing the operation there throws away the result its caller is
++     * about to ask for. The block still says "completed, 16 bytes", but the
++     * provider holding those bytes is gone, so XAsyncGetResult has nothing to
++     * fill the buffer with and the title reads a result that was never
++     * written: it poisons that local with -1 beforehand, and faults on the
++     * first field it reaches through. Only an operation that failed to start
++     * *and* never completed is ours to take back. */
++    if (FAILED(hr) && hr != E_PENDING)
+     {
++        BOOL withdraw;
++
+         EnterCriticalSection( &async_ops_cs );
+-        list_remove( &op->entry );
++        withdraw = !op->completed && find_async_op( asyncBlock ) == op;
++        if (withdraw) list_remove( &op->entry );
+         LeaveCriticalSection( &async_ops_cs );
+-        async_op_invoke( op, XAsyncOp_Cleanup, 0, NULL );
+-        release_async_op( op );
++
++        if (withdraw)
++        {
++            WARN( "operation %p withdrawn: the provider refused to begin block %p (%#lx).\n", op, asyncBlock, hr );
++            async_op_invoke( op, XAsyncOp_Cleanup, 0, NULL );
++            release_async_op( op );
++        }
++    }
++    /* Now, and not before: the operation's state is settled and this call is
++     * on its way out, so the title is past the point where the callback could
++     * catch it mid-setup. */
++    if (deliver)
++    {
++        TRACE( "delivering the held completion for block %p.\n", asyncBlock );
++        deliver_async_completion( asyncBlock );
+     }
++    release_async_op( op );
+     return hr;
+ }
+ 
+@@ -540,7 +610,7 @@ static HRESULT WINAPI x_threading_XAsyncGetResult( IXThreadingImpl *iface, XAsyn
+ 
+         size = (SIZE_T)(ULONG_PTR)asyncBlock->internal[3];
+         if (bufferUsed) *bufferUsed = size;
+-        if (size)
++        if (size && payload)
+         {
+             if (!buffer || bufferSize < size) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
+             memcpy( buffer, payload, size );
+@@ -548,8 +618,16 @@ static HRESULT WINAPI x_threading_XAsyncGetResult( IXThreadingImpl *iface, XAsyn
+         else if (buffer && bufferSize)
+         {
+             /* Success, a buffer asked for, and nothing recorded to put in it.
+-             * Saying so beats leaving the caller's memory as it found it. */
+-            WARN( "async %p completed with no payload for a %Iu byte buffer.\n", asyncBlock, bufferSize );
++             * Saying so beats leaving the caller's memory as it found it.
++             *
++             * A recorded size with a null payload lands here too, and must:
++             * a provider-driven block carries its size in the block but its
++             * data in the provider, so once the operation is gone there is
++             * nothing left to copy from. Trusting the size alone means
++             * memcpy() from address zero -- which is not an error the caller
++             * can see, it is a fault inside its own memcpy. */
++            WARN( "async %p completed with no payload for a %Iu byte buffer (result size %Iu).\n",
++                  asyncBlock, bufferSize, size );
+             return E_INVALIDARG;
+         }
+         return hr;
+@@ -572,9 +650,14 @@ static HRESULT WINAPI x_threading_XAsyncGetResult( IXThreadingImpl *iface, XAsyn
+     }
+     list_remove( &op->entry );
+     LeaveCriticalSection( &async_ops_cs );
++    TRACE( "operation %p withdrawn: its result is being taken from block %p.\n", op, asyncBlock );
+ 
+     if (SUCCEEDED(hr) && op->required_size)
++    {
++        TRACE( "asking the provider for the result of %p.\n", asyncBlock );
+         async_op_invoke( op, XAsyncOp_GetResult, bufferSize, buffer );
++        TRACE( "provider filled the result of %p.\n", asyncBlock );
++    }
+     if (bufferUsed) *bufferUsed = op->required_size;
+ 
+     async_op_invoke( op, XAsyncOp_Cleanup, 0, NULL );
+@@ -672,26 +755,32 @@ static XTaskQueueDispatchMode completion_mode_for( const XAsyncBlock *async )
+ static void CALLBACK async_completion_work( TP_CALLBACK_INSTANCE *instance, void *context )
+ {
+     XAsyncBlock *async = context;
++    TRACE( "delivering completion for block %p (pool).\n", async );
+     if (async->callback) async->callback( async );
+ }
+ 
+ static DWORD WINAPI async_completion_thread( void *context )
+ {
+     XAsyncBlock *async = context;
++    TRACE( "delivering completion for block %p (thread).\n", async );
+     if (async->callback) async->callback( async );
+     return 0;
+ }
+ 
+-void xgr_async_complete_ex( XAsyncBlock *async, HRESULT hr, void *payload, SIZE_T result_size )
++/* Record an outcome in the block without delivering the callback. Anything
++ * polling the block -- XAsyncGetResultSize, XAsyncGetResult -- sees it at once;
++ * only the callback waits. */
++static void store_async_result( XAsyncBlock *async, HRESULT hr, void *payload, SIZE_T result_size )
+ {
+-    struct x_pending_completion *item;
+-
+-    if (!async) return;
+-
+     async->internal[0] = XGR_ASYNC_MAGIC;
+     async->internal[1] = (void *)(ULONG_PTR)hr;
+     async->internal[2] = payload;
+     async->internal[3] = (void *)result_size;
++}
++
++static void deliver_async_completion( XAsyncBlock *async )
++{
++    struct x_pending_completion *item;
+ 
+     if (!async->callback) return;
+ 
+@@ -738,6 +827,13 @@ void xgr_async_complete_ex( XAsyncBlock *async, HRESULT hr, void *payload, SIZE_
+     LeaveCriticalSection( &pending_cs );
+ }
+ 
++void xgr_async_complete_ex( XAsyncBlock *async, HRESULT hr, void *payload, SIZE_T result_size )
++{
++    if (!async) return;
++    store_async_result( async, hr, payload, result_size );
++    deliver_async_completion( async );
++}
++
+ void xgr_async_complete( XAsyncBlock *async, HRESULT hr, void *payload )
+ {
+     xgr_async_complete_ex( async, hr, payload, 0 );
+@@ -774,6 +870,7 @@ static BOOL deliver_one_completion( void )
+ 
+     async = item->async;
+     free( item );
++    TRACE( "delivering completion for block %p (dispatch).\n", async );
+     if (async->callback) async->callback( async );
+     return TRUE;
+ }

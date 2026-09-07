@@ -400,3 +400,82 @@ a machine with none simply gets no calls. Forza Horizon 5 asks."""
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "XSpeechSynthesizerCreate" },
 ]
+
+[[capability]]
+name = "xgameruntime.async-provider-completed-in-begin"
+summary = """
+An XAsync operation whose provider finished it from inside XAsyncBegin keeps \
+its result and holds its callback until Begin has returned, instead of being \
+withdrawn because Begin reported E_PENDING."""
+provided-by = ["patches/xgameruntime/0010-an-operation-the-provider-already-completed-is-still.patch"]
+symptom-if-missing = "a title using libHttpClient's WinHttp websocket transport crashes shortly after the socket connects, dereferencing a pointer it poisoned with -1 before asking for a result that was never written"
+note = """
+Forza Horizon 5 connects to wss://rta.xboxlive.com/connect and sends its first \
+message; libHttpClient's winhttp_websocket_impl::enqueue_message completes the \
+block from inside Begin and *then* returns E_PENDING. Reading any failure \
+HRESULT as "the provider refused to start" unlinked and freed the operation \
+between XAsyncComplete and XAsyncGetResult, so the block still said "completed, \
+16 bytes" while the provider holding those bytes was gone.
+
+Three things came out of that. The operation is only taken back when it failed \
+to start *and* never completed -- and this frame holds a reference while Begin \
+runs, because the provider may finish the block and another thread take its \
+result before Begin returns, which made the old code unlink freed memory. \
+XAsyncGetResult also no longer trusts a recorded result size on its own: a size \
+with no payload used to mean memcpy() from address zero, which is not an error \
+the caller can see but a fault inside its own memcpy.
+
+And the callback now waits. Every GDK API returns before its completion routine \
+runs, and a title relies on it: it calls the *Async() function and finishes \
+wiring up the object the callback will reach through afterwards. The outcome is \
+recorded in the block straight away, so anything polling sees it; only the \
+callback is held, and only until Begin returns. That much is the contract. It \
+did not, on its own, get Forza past its welcome screen."""
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "operation %p registered for block %p (begin)" },
+]
+
+[[capability]]
+name = "xgameruntime.save-provider-default-scid"
+summary = """
+A save provider initialised with an all-zero configuration id uses the title's \
+own service configuration, derived from its title id."""
+provided-by = ["patches/xgameruntime/0011-a-save-provider-with-no-configuration-id-uses-the-ti.patch"]
+symptom-if-missing = "a title that passes zeros gets a save folder named for a zero SCID, so a profile copied over from Windows -- or written by an earlier run -- is invisible and it starts as though it had never been played"
+note = """
+An all-zero configuration id means "the one this title was built with", not a \
+service configuration whose every digit is zero. Forza Horizon 5 passes zeros \
+and then reads User_<xuid>/ProfileBackup, which used to land in \
+wgs\\0000000000000000_000...000 rather than the folder named for SCID \
+...7900C3C7. The default follows the convention every title id-scoped SCID \
+uses: the last eight digits are the title id, everything before them zero. A \
+title whose config carries no title id keeps the zero suffix, since there is \
+nothing better to say and refusing to open a provider would be worse."""
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "title named no service configuration; using its own" },
+]
+
+[[capability]]
+name = "xgameruntime.store-current-game-product"
+summary = """
+XStore reports the running game as a product the player owns, rather than \
+answering every product query with an empty result."""
+provided-by = ["patches/xgameruntime/0012-report-the-running-game-as-a-product-the-player-owns.patch"]
+symptom-if-missing = "a title asking what its own product is, or which games it is entitled to, is told it does not exist"
+note = """
+The one product that can be described honestly offline is the game running now: \
+its store id, title and description come from MicrosoftGame.config, and \
+isInUserCollection is true because the person is playing it -- the image was \
+decrypted with their own licence to get this far. Nothing is claimed about \
+add-ons; those really are unknown without the store, and inventing them would \
+be worse than saying nothing, so a query for durables, passes or consumables \
+still comes back empty.
+
+Honesty rather than a measured win: Forza Horizon 5 only ever asks for \
+Durable|Pass and Consumable|UnmanagedConsumable, so it does not exercise this. \
+No title has yet been seen to need it. It is here because \
+XStoreQueryProductForCurrentGameAsync answering "no such product" is wrong on \
+its own terms."""
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "reporting the running game as a product" },
+]

@@ -527,6 +527,39 @@ static void CALLBACK completion_cb( XAsyncBlock *async )
     InterlockedExchange( (LONG *)&completion_ran, 1 );
 }
 
+/* A provider that finishes the operation from inside its own Begin and then
+ * reports E_PENDING, which is what libHttpClient's WinHttp websocket send does
+ * because Wine completes a send that does not block there and then. */
+static IXThreadingImpl *threading_for_provider;
+static volatile LONG inside_begin, called_back_inside_begin;
+
+#define EARLY_RESULT 0x00c0ffee
+
+static HRESULT CALLBACK provider_completes_in_begin( XAsyncOp op, const XAsyncProviderData *data )
+{
+    switch (op)
+    {
+    case XAsyncOp_Begin:
+        InterlockedExchange( (LONG *)&inside_begin, 1 );
+        IXThreadingImpl_XAsyncComplete( threading_for_provider, data->async, S_OK, sizeof(UINT32) );
+        InterlockedExchange( (LONG *)&inside_begin, 0 );
+        return E_PENDING;
+    case XAsyncOp_GetResult:
+        if (data->buffer && data->bufferSize >= sizeof(UINT32))
+            *(UINT32 *)data->buffer = EARLY_RESULT;
+        return S_OK;
+    default:
+        return S_OK;
+    }
+}
+
+static void CALLBACK early_completion_cb( XAsyncBlock *async )
+{
+    if (InterlockedCompareExchange( (LONG *)&inside_begin, 0, 0 ))
+        InterlockedExchange( (LONG *)&called_back_inside_begin, 1 );
+    InterlockedExchange( (LONG *)&completion_ran, 1 );
+}
+
 /* A task queue port runs one callback at a time. Before this was true, ten
  * threads submitting to a single queue during a server join had libHttpClient
  * callbacks running concurrently; one freed the HTTP call while another was
@@ -646,6 +679,12 @@ static void test_xthreading(void)
             block.queue = NULL;                    /* no queue of its own */
             block.callback = completion_cb;
             InterlockedExchange( (LONG *)&completion_ran, 0 );
+            /* Begin it first. XAsyncComplete only means anything for a block
+             * this runtime started, and a title always gets here through an
+             * *Async() call; completing a block out of nowhere used to work
+             * only because a stale operation happened to sit at the same
+             * stack address. */
+            IXThreadingImpl_XAsyncBegin( threading, &block, NULL, provider_a, "routing", provider_a );
             IXThreadingImpl_XAsyncComplete( threading, &block, S_OK, 0 );
 
             /* never dispatch the manual queue -- just as the title never does.
@@ -664,6 +703,7 @@ static void test_xthreading(void)
             block.queue = manual;
             block.callback = completion_cb;
             InterlockedExchange( (LONG *)&completion_ran, 0 );
+            IXThreadingImpl_XAsyncBegin( threading, &block, NULL, provider_b, "routing", provider_b );
             IXThreadingImpl_XAsyncComplete( threading, &block, S_OK, 0 );
             for (waited = 0; waited < 200 && !completion_ran; waited++) Sleep( 10 );
             CHECK( completion_ran,
@@ -673,6 +713,40 @@ static void test_xthreading(void)
             IXThreadingImpl_XTaskQueueCloseHandle( threading, manual );
         }
         if (saved) IXThreadingImpl_XTaskQueueCloseHandle( threading, saved );
+    }
+
+    /* A provider may finish the block from inside Begin. Two things must hold:
+     * the callback waits until Begin has returned -- every GDK API promises to
+     * return before its completion routine runs, and a title finishes wiring up
+     * the object the callback reaches through after the call -- and the
+     * operation survives Begin reporting E_PENDING, so its result is still
+     * there to collect. Getting either wrong crashed Forza Horizon 5 in its
+     * websocket send handler. */
+    {
+        XAsyncBlock block;
+        UINT32 value = 0;
+        int waited;
+
+        threading_for_provider = threading;
+        memset( &block, 0, sizeof(block) );
+        block.callback = early_completion_cb;
+        InterlockedExchange( (LONG *)&completion_ran, 0 );
+        InterlockedExchange( (LONG *)&called_back_inside_begin, 0 );
+
+        hr = IXThreadingImpl_XAsyncBegin( threading, &block, NULL, provider_completes_in_begin,
+                                          "completes-in-begin", provider_completes_in_begin );
+        CHECK( hr == E_PENDING, "Begin reporting E_PENDING is passed through (0x%08lx)", hr );
+        CHECK( !called_back_inside_begin,
+               "a completion raised inside Begin does not call back before Begin returns" );
+
+        for (waited = 0; waited < 200 && !completion_ran; waited++) Sleep( 10 );
+        CHECK( completion_ran, "the held completion is delivered once Begin has returned" );
+
+        hr = IXThreadingImpl_XAsyncGetResult( threading, &block, provider_completes_in_begin,
+                                              sizeof(value), &value, NULL );
+        CHECK( hr == S_OK && value == EARLY_RESULT,
+               "the operation survives E_PENDING and still has its result (0x%08lx, %#lx)",
+               hr, (unsigned long)value );
     }
 
     {

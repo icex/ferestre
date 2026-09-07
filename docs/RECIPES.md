@@ -171,17 +171,24 @@ scripts/launch-bedrock.sh
   `xodus-service` running for tokens -- the launcher starts it. See README
   "Minecraft Bedrock" for the full chain of blockers that had to be closed.
 
-### Forza Horizon 5 (Store) — **downloads, does not run**
+### Forza Horizon 5 (Store) — **menus only**
 
 ```bash
 scripts/get-game.sh <its Store product id> "$XODUS_GAMES_DIR/fh5"   # 150 GB
-scripts/launch-fh5.sh                                                # fails
+scripts/launch-fh5.sh
+tools/drive-fh5.py                                                   # unattended
 ```
 
-The Store build crashes inside its own in-binary code protection in a C++
-static initialiser, before any runtime API is reached. That is not a Wine gap
-that can be filled and is documented in the README; the recipe is here so the
-launch path is ready if that ever changes.
+Signs in, reaches the welcome screen with the account's gamertag on it, loads,
+and offers its `[Return] START GAME` prompt. It then faults reading
+`0xFFFFFFFFFFFFFFFF` inside its own bundled libHttpClient. `titles/9NNX1VVR3KNQ.toml`
+has the eight fixes that got it here and the evidence for where it stops; the
+strongest remaining lead is that its `MicrosoftGame.Config` carries no
+`<MSAAppId>`, so every Xbox Live token it gets carries no title claim.
+
+For a long time this was written up as the title defending itself against Wine.
+It never was. Every blocker so far has been this runtime telling it something
+untrue about itself.
 
 ## 5. Troubleshooting (every error we actually hit, and its fix)
 

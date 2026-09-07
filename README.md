@@ -74,7 +74,7 @@ not inferred from the fact that it downloaded:
 | **Overthrown** | Game Pass | Playable |
 | **Goat Simulator 3** | Game Pass | Boots and plays; online features do not work |
 | **Age of Empires Definitive Edition** | Game Pass | Installs; still crashes at startup |
-| **Forza Horizon 5** | Store | Downloads, does not run: blocked by protection inside the title, not by anything here |
+| **Forza Horizon 5** | Store | Signs in and reaches the welcome screen and its Start Game prompt; faults soon after, inside its own libHttpClient |
 
 Notes worth having before you try your own library:
 
@@ -132,8 +132,8 @@ directly. Everything has to go through the client's `run` path.
 
 - Not a way to play games you do not own.
 - Not a piracy tool: no content, no keys, no bypass of a title's own protection.
-  Where a title defends itself against running under Wine (Forza Horizon 5), it
-  stays unsupported.
+  Where a title defends itself against running under Wine, it stays unsupported:
+  the job here is to tell those checks the truth, not to defeat them.
 - Not affiliated with Microsoft, Mojang, Valve, or the Xodus project.
 - Not upstreamable to Xodus: they operate a clean-room policy that excludes
   AI-assisted contributions, so this stays a downstream fork.

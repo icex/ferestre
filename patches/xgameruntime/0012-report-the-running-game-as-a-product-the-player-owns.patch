@@ -1,0 +1,145 @@
+diff --git a/xstore.c b/xstore.c
+--- a/xstore.c
++++ b/xstore.c
+@@ -43,34 +43,32 @@ struct x_store_license
+     BOOL valid;
+ };
+ 
+-/* Product queries are always empty here (no store catalogue offline). */
++/* A product query. There is no store catalogue to talk to, so the only product
++ * that can be described is the one running: its identity is in
++ * MicrosoftGame.config and the person is plainly entitled to it, because they
++ * are playing it. `has_current` says whether this query should report it. */
+ struct x_store_product_query
+ {
+-    UINT32 count;
++    BOOL has_current;
+ };
+ 
+ /* Fill an XStoreGameLicense.skuStoreId from MicrosoftGame.config's StoreId, or
+  * a neutral placeholder. It only needs to be a stable, non-empty SKU string. */
+ static void store_sku_id( char *out, SIZE_T cap )
+ {
+-    char *config = xgr_load_game_config();
+-    const char *value = NULL;
+-    SIZE_T len = 0;
+-
+-    if (config && (value = strstr( config, "<StoreId>" )))
+-    {
+-        value += 9;
+-        len = strcspn( value, "<" );
+-    }
+-    if (!len) { value = "0000000000000000"; len = strlen( value ); }
+-    if (len >= cap) len = cap - 1;
+-    memcpy( out, value, len );
+-    out[len] = 0;
+-    free( config );
++    if (!xgr_config_element( "StoreId", out, cap ) || !out[0])
++        snprintf( out, cap, "%s", "0000000000000000" );
+ }
+ 
+-/* Hand back a fresh empty product-query handle via an async block. */
+-static HRESULT complete_empty_query( XAsyncBlock *async )
++/* Hand back a fresh product-query handle via an async block.
++ *
++ * `with_current` decides whether enumerating it reports the running game. A
++ * query that should contain it and comes back empty is not a harmless blank:
++ * a title asking what it is entitled to, or what its own product is, treats
++ * "nothing" as an answer and carries on with it. Forza Horizon 5 enumerates
++ * entitled products at its welcome screen and faults within a second of being
++ * told it owns nothing. */
++static HRESULT complete_query( XAsyncBlock *async, BOOL with_current )
+ {
+     struct x_store_product_query *q;
+ 
+@@ -80,10 +78,16 @@ static HRESULT complete_empty_query( XAsyncBlock *async )
+         xgr_async_complete( async, E_OUTOFMEMORY, NULL );
+         return S_OK;
+     }
++    q->has_current = with_current;
+     xgr_async_complete( async, S_OK, q );
+     return S_OK;
+ }
+ 
++static HRESULT complete_empty_query( XAsyncBlock *async )
++{
++    return complete_query( async, FALSE );
++}
++
+ static HRESULT query_result( XAsyncBlock *async, XStoreProductQueryHandle *out )
+ {
+     void *payload;
+@@ -191,7 +195,7 @@ static HRESULT WINAPI x_store_XStoreQueryProductsResult( IXStoreImpl6 *iface, XA
+ static HRESULT WINAPI x_store_XStoreQueryEntitledProductsAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, XStoreProductKind productKinds, UINT32 maxItemsToRetrievePerPage, XAsyncBlock *async )
+ {
+     TRACE( "iface %p, storeContextHandle %p, productKinds %#x, async %p.\n", iface, storeContextHandle, productKinds, async );
+-    return complete_empty_query( async );
++    return complete_query( async, !!(productKinds & XStoreProductKind_Game) );
+ }
+ 
+ static HRESULT WINAPI x_store_XStoreQueryEntitledProductsResult( IXStoreImpl6 *iface, XAsyncBlock *async, XStoreProductQueryHandle *productQueryHandle )
+@@ -203,7 +207,7 @@ static HRESULT WINAPI x_store_XStoreQueryEntitledProductsResult( IXStoreImpl6 *i
+ static HRESULT WINAPI x_store_XStoreQueryProductForCurrentGameAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, XAsyncBlock *async )
+ {
+     TRACE( "iface %p, storeContextHandle %p, async %p.\n", iface, storeContextHandle, async );
+-    return complete_empty_query( async );
++    return complete_query( async, TRUE );
+ }
+ 
+ static HRESULT WINAPI x_store_XStoreQueryProductForCurrentGameResult( IXStoreImpl6 *iface, XAsyncBlock *async, XStoreProductQueryHandle *productQueryHandle )
+@@ -226,8 +230,44 @@ static HRESULT WINAPI x_store_XStoreQueryProductForPackageResult( IXStoreImpl6 *
+ 
+ static HRESULT WINAPI x_store_XStoreEnumerateProductsQuery( IXStoreImpl6 *iface, const XStoreProductQueryHandle productQueryHandle, void *context, XStoreProductQueryCallback *callback )
+ {
++    struct x_store_product_query *q = productQueryHandle;
++    char store_id[64], title[256], description[512], language[32], empty[1];
++    XStoreProduct product;
++
+     TRACE( "iface %p, productQueryHandle %p, context %p, callback %p.\n", iface, productQueryHandle, context, callback );
+-    /* the query is empty, so there is nothing to enumerate */
++
++    if (!callback) return E_INVALIDARG;
++    if (!q || !q->has_current) return S_OK;
++
++    /* The one product that can be described honestly: the game running now.
++     * Its identity comes from MicrosoftGame.config, and isInUserCollection is
++     * true because the person is playing it -- the image was decrypted with
++     * their own licence to get this far. Nothing is claimed about add-ons;
++     * those really are unknown offline, and saying otherwise would be worse
++     * than saying nothing. */
++    if (!xgr_config_element( "StoreId", store_id, sizeof(store_id) )) store_id[0] = 0;
++    if (!xgr_config_attr( "<ShellVisuals", " DefaultDisplayName=\"", title, sizeof(title) ) || !title[0])
++        strcpy( title, "Game" );
++    if (!xgr_config_attr( "<ShellVisuals", " Description=\"", description, sizeof(description) ) || !description[0])
++        strcpy( description, title );
++    strcpy( language, "en" );
++    empty[0] = 0;
++
++    memset( &product, 0, sizeof(product) );
++    product.storeId = store_id;
++    product.title = title;
++    product.description = description;
++    product.language = language;
++    product.inAppOfferToken = empty;
++    product.linkUri = empty;
++    product.price.currencyCode = empty;
++    product.productKind = XStoreProductKind_Game;
++    product.hasDigitalDownload = TRUE;
++    product.isInUserCollection = TRUE;
++
++    TRACE( "reporting the running game as a product: store %s, title %s\n",
++           debugstr_a( store_id ), debugstr_a( title ) );
++    callback( &product, context );
+     return S_OK;
+ }
+ 
+@@ -251,7 +291,8 @@ static HRESULT WINAPI x_store_XStoreProductsQueryNextPageResult( IXStoreImpl6 *i
+ 
+ static void WINAPI x_store_XStoreCloseProductsQueryHandle( IXStoreImpl6 *iface, XStoreProductQueryHandle productQueryHandle )
+ {
+-    FIXME( "iface %p, productQueryHandle %p stub!\n", iface, productQueryHandle );
++    TRACE( "iface %p, productQueryHandle %p.\n", iface, productQueryHandle );
++    free( productQueryHandle );
+ }
+ 
+ static HRESULT WINAPI x_store_XStoreAcquireLicenseForPackageAsync( IXStoreImpl6 *iface, const XStoreProductQueryHandle productQueryHandle, const char *packageIdentifier, XAsyncBlock *async )
