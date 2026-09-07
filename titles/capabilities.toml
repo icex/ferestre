@@ -336,3 +336,24 @@ fatal and an error would be worse than a blank."""
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "reporting title id" },
 ]
+
+[[capability]]
+name = "xgameruntime.package-details"
+summary = """
+XPackageEnumeratePackages reports the package's real display name, description, \
+publisher and store id from MicrosoftGame.config, instead of the package family \
+name and three empty strings."""
+provided-by = ["patches/xgameruntime/0008-report-the-package-s-real-details.patch"]
+symptom-if-missing = "a title looking for itself in the list it just asked for does not recognise the entry, and anything keyed on storeId finds nothing"
+note = """
+Measured on Forza Horizon 5, and it is not a straightforward win: with storeId \
+blank it polls XPackageGetCurrentProcessPackageIdentifier 939 times and exits, \
+and with the real 9NNX1VVR3KNQ it stops earlier and more quietly, at 211 GDK \
+calls instead of 7,747. Isolated to that one field by blanking it alone. \
+Reporting it is still right -- Windows does, and a title following its store id \
+into a path this runtime does not serve is a gap in XStore rather than a reason \
+to hide the field. Recorded here so the next person knows what the field \
+unlocks."""
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "reporting package %s (%s), store %s, title %s" },
+]

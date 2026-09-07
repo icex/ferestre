@@ -1,0 +1,60 @@
+diff --git a/xpackage.c b/xpackage.c
+--- a/xpackage.c
++++ b/xpackage.c
+@@ -175,6 +175,7 @@
+ /* Fill an XPackageDetails describing the current game package. The strings it
+  * points at are owned by the caller-provided storage, valid for the callback. */
+ static void fill_current_details( XPackageDetails *details, char *identifier, char *display,
++                                  char *description, char *publisher, char *store_id,
+                                   char *title_id )
+ {
+     char version[64] = {0};
+@@ -183,9 +184,9 @@
+     details->packageIdentifier = identifier;
+     details->kind = XPackageKind_Game;
+     details->displayName = display;
+-    details->description = display;
+-    details->publisher = "";
+-    details->storeId = "";
++    details->description = description;
++    details->publisher = publisher;
++    details->storeId = store_id;
+     details->titleID = title_id;
+     details->installing = FALSE;
+     details->ageRestricted = FALSE;
+@@ -488,18 +489,31 @@
+ static HRESULT enumerate_current( XPackageKind kind, void *context, XPackageEnumerationCallback *callback )
+ {
+     XPackageDetails details;
+-    char *identifier, display[256], title_id[64];
++    char *identifier, display[256], description[512], publisher[256], store_id[64], title_id[64];
+ 
+     if (!callback) return E_INVALIDARG;
+     /* only games are installed here; a Content query finds nothing */
+     if (kind != XPackageKind_Game) return S_OK;
+ 
+     if (!(identifier = xgr_package_family())) return S_OK;
+-    if (!config_attr( "<Identity", " Name=\"", display, sizeof(display) )) strcpy( display, "Game" );
++
++    /* MicrosoftGame.config carries all of this. Reporting the package family
++     * name as the display name and blanks for the rest is not harmless: a title
++     * looking for itself in the list it just asked for will not recognise the
++     * entry, and the ones that key on storeId find nothing at all. */
++    if (!config_attr( "<ShellVisuals", " DefaultDisplayName=\"", display, sizeof(display) ) || !display[0])
++        if (!config_attr( "<Identity", " Name=\"", display, sizeof(display) ))
++            strcpy( display, "Game" );
++    if (!config_attr( "<ShellVisuals", " Description=\"", description, sizeof(description) ) || !description[0])
++        strcpy( description, display );
++    if (!config_attr( "<ShellVisuals", " PublisherDisplayName=\"", publisher, sizeof(publisher) ))
++        publisher[0] = 0;
++    if (!config_element( "StoreId", store_id, sizeof(store_id) )) store_id[0] = 0;
+     if (!config_element( "TitleId", title_id, sizeof(title_id) )) title_id[0] = 0;
+ 
+-    fill_current_details( &details, identifier, display, title_id );
+-    TRACE( "reporting package %s (%s), title %s\n", debugstr_a( identifier ), debugstr_a( display ), debugstr_a( title_id ) );
++    fill_current_details( &details, identifier, display, description, publisher, store_id, title_id );
++    TRACE( "reporting package %s (%s), store %s, title %s\n", debugstr_a( identifier ),
++           debugstr_a( display ), debugstr_a( store_id ), debugstr_a( title_id ) );
+     callback( context, &details );
+     free( identifier );
+     return S_OK;

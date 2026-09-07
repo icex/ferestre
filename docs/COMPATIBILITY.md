@@ -46,7 +46,7 @@ your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
 | Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. | 2026-09-06 |
 | Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable, with issues | Boots and plays; the online features do not work. | 2026-09-06 |
-| Forza Horizon 5 | `9NNX1VVR3KNQ` | Does not run | Opens a window, renders its splash screen and loads real game data, then polls for something 939 times and exits. Stops at: exit_group(4353) after 939 XPackageGetCurrentProcessPackageIdentifier/XPackageIsPackagedProcess iterations, reproducibly, with no crash report and no fatal signal. | 2026-09-07 |
+| Forza Horizon 5 | `9NNX1VVR3KNQ` | Does not run | Opens a window, renders its splash screen and loads real game data, then exits during startup -- at one of three points, depending on what the runtime tells it about itself. Stops at: exit_group(4353) during startup, after registering for the multiplayer port change, with no crash report and no fatal signal. | 2026-09-07 |
 | Halo Infinite | `9PP5G1F0C2B6` | Does not run | Gets through EasyAntiCheat's checks and into its Linux loader, which then cannot find the game binary: it looks in /proc/<pid>/maps, and a decrypted image mapped from a descriptor has no path there. Stops at: EasyAntiCheat bootstrapper exit 207, 'Failed to locate the game binary (Wine)', after 'Starting Wine module mapping, Wine version: 11.0'. | 2026-09-07 |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.

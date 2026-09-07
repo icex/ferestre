@@ -91,6 +91,23 @@
 # patches/xgameruntime/0007 reports it. The difference is not subtle: the GDK
 # conversation goes from 217 calls to 7,735.
 #
+# THE FOURTH THING: THE PACKAGE DESCRIBED ITSELF WRONGLY TOO
+#
+# XPackageEnumeratePackages reported the package family name as the display
+# name and empty strings for description, publisher and store id, all of which
+# MicrosoftGame.config carries. patches/xgameruntime/0008 reports them.
+#
+# That one is not a straightforward win and the recipe says so. Isolated field
+# by field:
+#
+#   store id blank, everything else real   7,747 GDK calls, 939 poll iterations
+#   store id 9NNX1VVR3KNQ                    211 GDK calls, no poll
+#
+# With its real store id the title stops earlier and more quietly -- no crash,
+# no crash report, just an earlier exit. It is following the store id into a
+# path this runtime does not serve. Reporting it is still right: Windows does,
+# and the gap that opens up is in XStore rather than in the field.
+#
 # WHERE IT STOPS NOW
 #
 # It draws. A window appears -- "Forza Horizon 5", 5120x1440, confirmed through
@@ -98,22 +115,32 @@
 # loads real game data: tm_api_lib_x64.dll, media/cms.zip, and batches of car
 # suspension physics out of media/physics/suspension.
 #
-# Then it polls. 939 iterations of XPackageGetCurrentProcessPackageIdentifier
-# followed by XPackageIsPackagedProcess, which answer correctly -- the package
-# family name and TRUE -- so it is waiting on something those calls are only
-# part of. It gives up, calls XPackageRegisterPackageInstalled, and exits.
+# It then exits during startup, deliberately: exit_group(4353), whose low byte
+# is the 1 that reaches Proton, with no fatal signal anywhere in the process
+# tree, no crash report, and no unhandled exception. Where exactly depends on
+# what it has been told about itself, which is the most useful thing known
+# about it:
 #
-# The exit is deliberate and not a crash: exit_group(4353), whose low byte is
-# the 1 that reaches Proton, with no fatal signal anywhere in the process tree,
-# no crash report written, and no unhandled exception.
+#   * told nothing (title id 0)          217 calls, stops after the networking
+#                                        port query
+#   * told its title id                  7,735 calls, then 939 iterations of
+#                                        XPackageGetCurrentProcessPackageIdentifier
+#                                        and XPackageIsPackagedProcess -- both
+#                                        answering correctly -- then
+#                                        XPackageRegisterPackageInstalled, then out
+#   * told its store id as well          211 calls, stops after registering for
+#                                        the multiplayer port change
 #
-# It is at least reproducible now. Before the concrt140 capacity fix the same
-# launch alternated between 219 and 7,735 GDK calls run to run, and sometimes
-# died instead on a read fault inside RtlWakeAddressAll (ntdll+0x3a880, +0x88)
-# on an address that had gone away. Four consecutive runs since: 7747, 7735,
-# 7735, 7735 calls, all reaching the same place, with the push_back guard never
-# firing -- so reserve is settling the segments upstream, and both the varying
-# depth and that fault look like they were the same corruption downstream.
+# So it is reachable in three different places depending on what it knows, and
+# none of them is a crash. That is a title deciding to stop, three times, for
+# three reasons still unknown.
+#
+# It is reproducible now, which it was not. Before the concrt140 capacity fix
+# the same launch alternated between 219 and 7,735 calls run to run and
+# sometimes died instead on a read fault inside RtlWakeAddressAll
+# (ntdll+0x3a880, +0x88) reading 0x2f5efbc0 -- an address that had gone away.
+# Four consecutive runs after that fix landed on the same place every time,
+# with the push_back guard never firing.
 
 schema = 1
 
@@ -139,13 +166,14 @@ requires = [
     "loader.section-name-for-mapped-image",
     "concrt140.concurrent-vector-push-back",
     "xgameruntime.title-id",
+    "xgameruntime.package-details",
 ]
 
 [status]
 state         = "broken"
 blocked-by    = "unknown"
-summary       = "Opens a window, renders its splash screen and loads real game data, then polls for something 939 times and exits."
-stops-at      = "exit_group(4353) after 939 XPackageGetCurrentProcessPackageIdentifier/XPackageIsPackagedProcess iterations, reproducibly, with no crash report and no fatal signal"
+summary       = "Opens a window, renders its splash screen and loads real game data, then exits during startup -- at one of three points, depending on what the runtime tells it about itself."
+stops-at      = "exit_group(4353) during startup, after registering for the multiplayer port change, with no crash report and no fatal signal"
 last-verified = 2026-09-07
 verified-with = "ferestre run fh5 with WINEDEBUG=+seh; tools/pe-holes.py over the decrypted image, with an ordinary DLL as the control"
 
@@ -163,5 +191,5 @@ log-match = "ACCESS_VIOLATION_WRITE"
 
 [[issues]]
 symptom   = "the splash screen appears, the game loads assets, and the window closes again; the process exits 1"
-cause     = "unknown. It polls XPackageGetCurrentProcessPackageIdentifier and XPackageIsPackagedProcess 939 times -- both answer correctly -- then registers for a package-installed notification and exits deliberately. Whatever it is waiting for is not visible in the GDK trace"
-fix       = "none yet. XGameGetXboxTitleId returning zero was one cause of stopping earlier and is fixed; this is what it reaches next"
+cause     = "unknown, and it moves as the runtime tells the title more about itself: with no title id it stops after the networking port query, with a title id it polls the package identity 939 times first, and with its store id as well it stops after registering for the multiplayer port change. None of the three is a crash"
+fix       = "none yet. Two blanks that were causing earlier stops are fixed (the title id and the package details); this is what it reaches next, and the store id result suggests XStore is where to look"
