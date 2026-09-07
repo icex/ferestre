@@ -1,0 +1,67 @@
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -6521,6 +6521,63 @@
+     }
+     SERVER_END_REQ;
+ 
++    /* The server answers from the name of the file the view was mapped from,
++     * and a view mapped through WINE_DLL_FILE_MAP was mapped from a memfd,
++     * which has no name in the NT namespace. So this hands back an empty
++     * string, and a title that asks which file its own image came from is told
++     * "nowhere". Forza Horizon 5 asks three times on its image base and then
++     * stops; on Windows the Store's filter driver makes that question
++     * unremarkable, and the answer is simply the path.
++     *
++     * The PEB knows it: the real path was handed over at process creation.
++     * Answer from there, and only for the current process's own main image --
++     * confirmed against the view's base rather than assumed from the address
++     * -- so every other view is reported exactly as it was before.
++     *
++     * Sibling of the ProcessImageFileName fallback in unix/process.c. Same
++     * cause, different question. */
++    if (process == NtCurrentProcess() && (status || !info->SectionFileName.Length) &&
++        peb->ProcessParameters && peb->ProcessParameters->ImagePathName.Length)
++    {
++        /* Declarations first, all of them: Wine builds with
++         * -Werror=declaration-after-statement whenever it is built from a git
++         * checkout, so a declaration below a statement compiles here and fails
++         * for anyone building from a clone. */
++        static const WCHAR ntprefix[] = { '\\','?','?','\\' };
++        const UNICODE_STRING *image = &peb->ProcessParameters->ImagePathName;
++        SIZE_T needed = sizeof(*info) + sizeof(ntprefix) + image->Length + sizeof(WCHAR);
++        void *view_base = NULL;
++
++        SERVER_START_REQ( get_image_view_info )
++        {
++            req->process = wine_server_obj_handle( process );
++            req->addr = wine_server_client_ptr( addr );
++            if (!wine_server_call( req )) view_base = wine_server_get_ptr( reply->base );
++        }
++        SERVER_END_REQ;
++
++        if (view_base && view_base == peb->ImageBaseAddress)
++        {
++            if (ret_len) *ret_len = needed;
++            if (len < needed) status = STATUS_INFO_LENGTH_MISMATCH;
++            else
++            {
++                WCHAR *buf = (WCHAR *)(info + 1);
++
++                memcpy( buf, ntprefix, sizeof(ntprefix) );
++                memcpy( buf + ARRAY_SIZE(ntprefix), image->Buffer, image->Length );
++                info->SectionFileName.Buffer = buf;
++                info->SectionFileName.Length = sizeof(ntprefix) + image->Length;
++                info->SectionFileName.MaximumLength = info->SectionFileName.Length + sizeof(WCHAR);
++                buf[info->SectionFileName.Length / sizeof(WCHAR)] = 0;
++                status = STATUS_SUCCESS;
++                TRACE( "%p is the main image and has no section name; "
++                       "answering from the PEB: %s\n",
++                       addr, debugstr_us(&info->SectionFileName) );
++            }
++        }
++    }
++
+     return resolve_drive_symlink( &info->SectionFileName, len - sizeof(*info), ret_len, status );
+ }
+ 

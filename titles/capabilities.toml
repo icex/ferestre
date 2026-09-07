@@ -55,7 +55,7 @@ answer is wrong for every title that asks, and right for every title once the \
 patch is in. Kept as a capability so a runtime too old to have it is named as \
 the reason rather than the title being blamed."""
 verify = [
-    { file = "files/lib/wine/x86_64-unix/ntdll.so", contains = "has no server name; answering from the PEB" },
+    { file = "files/lib/wine/x86_64-unix/ntdll.so", contains = "image mapped from a memfd has no server name" },
 ]
 
 [[capability]]
@@ -277,4 +277,24 @@ game binary, which on a shared descriptor would leave the loader's next read \
 at end of file."""
 verify = [
     { file = "files/lib/wine/x86_64-unix/ntdll.so", contains = "served from the mapped image descriptor" },
+]
+
+[[capability]]
+name = "loader.section-name-for-mapped-image"
+summary = """
+NtQueryVirtualMemory(MemoryMappedFilenameInformation) reports the real path of \
+a main image mapped from a memfd, so a title that asks which file its own code \
+came from gets an answer instead of an empty string."""
+provided-by = ["patches/wine/0010-answer-the-mapped-image-s-own-filename.patch"]
+symptom-if-missing = "Forza Horizon 5 asks three times on its image base, is told its code came from nowhere, and its own code-restoring handler then declines the first elided call site: an unhandled illegal instruction at ForzaHorizon5.exe+0x53d5cec, seconds after launch, with no window"
+note = """
+The server answers this from the name of the file a view was mapped from, and \
+a view mapped through WINE_DLL_FILE_MAP was mapped from a descriptor with no \
+name in the NT namespace -- so the query succeeded and returned "". Windows has \
+no such split; the Store's filter driver decrypts on read and the answer is \
+simply the path. Sibling of loader.image-name-for-mapped-image: same cause, \
+different question, and this one is what a title asks about its own code rather \
+than about its process."""
+verify = [
+    { file = "files/lib/wine/x86_64-unix/ntdll.so", contains = "is the main image and has no section name" },
 ]

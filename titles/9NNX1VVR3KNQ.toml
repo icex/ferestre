@@ -1,87 +1,61 @@
 # Forza Horizon 5 (Microsoft Store)
 #
-# Downloads, decrypts, maps, and dies during static initialisation calling a
-# function whose first five bytes are not an instruction. What follows is
-# measured, because two earlier versions of this file guessed: first that the
-# binary was protected, then -- after the guess was rightly challenged -- that
-# the fault was ours. The measurements say protected, and they say it in a way
-# that can be rechecked with tools/pe-holes.py rather than believed.
+# Runs its own code-protection layer correctly now and stops somewhere else.
+# The history here is worth keeping, because three earlier versions of this
+# file were wrong in three different ways and the last one was wrong in the
+# expensive direction: it said the title defended itself against running here
+# and that nothing could be done about it.
 #
-# THE MECHANISM
+# WHAT THE IMAGE ACTUALLY DOES
 #
-# Direct `call`/`jmp rel32` instructions have been removed from part of the
-# image. Each is replaced by five bytes of filler. Walk a function from the
-# entry .pdata declares, and wherever decoding breaks, skip five bytes and
-# resume: the decode then reaches the declared end exactly, with nothing left
-# over. In a 256 KiB sample, 283 of 300 functions are explained that way; 183
-# of those have no holes at all, so roughly a third of functions are touched
-# and the rest are shipped intact.
+# Direct `call`/`jmp rel32` instructions are elided from part of the image.
+# Each is replaced by five bytes of filler whose first byte is an opcode with
+# no encoding in 64-bit mode -- 0xea, 0x9a, 0x3f, 0xd4, 0x16 and friends -- so
+# executing an unrestored one raises #UD immediately. That measurement was
+# right and still holds; tools/pe-holes.py reproduces it, and the same detector
+# on an ordinary DLL beside the game reports chance level.
 #
-# The filler is chosen, not random. Across 548 holes, 56% begin with a one-byte
-# opcode that has no encoding in 64-bit mode -- 0xea, 0x9a, 0x3f, 0xd4, 0xd6,
-# 0x37, 0x27, 0x16 -- drawn about evenly from that set, against a 7.8% chance
-# level. Executing an unrestored hole therefore raises #UD immediately instead
-# of running somewhere arbitrary. That is a designed property.
+# What was wrong was the conclusion. The title restores those instructions
+# itself, lazily, from a vectored handler: fault, patch the call site, resume.
+# It is not defending itself against Wine. It was declining to start.
 #
-# The control is what makes the number mean something. The same detector, run
-# on BenchmarkDefinition.x64.Release.dll -- an ordinary unencrypted DLL beside
-# the game -- reports 8.1% against the same 7.8% chance level, and its "holes"
-# are the decoder walking into jump tables (127 of 173 begin with 0x00). The
-# test discriminates; FH5 is seven times chance and the DLL is not.
+# WHY IT DECLINED
 #
-# The faulting function is the pattern in miniature: 368 bytes, 79 instructions
-# and 19 holes, every hole exactly five bytes, and the code around them is the
-# setup and use of the calls that are missing --
+# Before its first elided call site, the title asks three times which file its
+# own image was mapped from -- NtQueryVirtualMemory with
+# MemoryMappedFilenameInformation on its image base. Wine answered that from
+# the server, the server answers from the name of the file the view was mapped
+# from, and a view mapped through WINE_DLL_FILE_MAP was mapped from a memfd,
+# which has no name in the NT namespace. So the query succeeded and returned an
+# empty string: the title was told its code came from nowhere, and its handler
+# then declined the first #UD and let the process die.
 #
-#     mov rcx,rdi / mov edx,0x1000 / mov r8d,0x40 / lea r9,[rbp-0x28]
-#     <hole>                          ; VirtualProtect(p,0x1000,PAGE_EXECUTE_READWRITE,&old)
-#     sub rbx,rdi / sub rbx,5 / mov [rdi+1],ebx    ; write a rel32 at [rdi+1]
+# On Windows the question is unremarkable -- the Store's filter driver decrypts
+# on read and the answer is the path. patches/wine/0010 answers it from the
+# PEB, which was handed the real path at process creation, for the current
+# process's own main image only. Sibling of patches/wine/0006, which fixed the
+# same cause for a different question.
 #
-# -- a routine that makes a page writable and patches a five-byte instruction.
-# Its own five-byte instructions are the ones missing.
+# The difference that makes:
 #
-# WHAT IS EXCLUDED, BY MEASUREMENT
+#   before   1 illegal instruction, unhandled, process dead at
+#            ForzaHorizon5.exe+0x53d5cec, 6,128 lines of log
+#   after    323,811 illegal instructions, every one resumed
+#            (EXCEPTION_CONTINUE_EXECUTION), 0 unhandled, ~1.5M lines
 #
-#   * Not the container decrypt. The bytes Wine executes are byte-identical to
-#     the bytes the client produces (48 bytes compared at the faulting address);
-#     inter-function CC padding around the fault is pristine; and 548 of 548
-#     holes land exactly on instruction boundaries where a call belongs. AES-XTS
-#     garbles a whole 4096-byte unit or nothing -- it does not land on call
-#     sites.
-#   * Not a bad download. A second full install into a separate directory
-#     produced the identical file: sha256 869adb5f8b2c245dba4baa653a22f6b19b1c83
-#     dead1078f1..., 0 of 171,851,776 bytes different.
-#   * Not our image mapping. Wine maps it at its preferred base 0x140000000 with
-#     the right section protections, and disk and memory agree.
-#   * Not an OS loader mechanism. The load config carries no dynamic value
-#     relocation table and no hot-patch table (both fields zero), so nothing
-#     documented rewrites call sites at load time. GuardFlags is 0x100 and the
-#     CFG function table is empty.
-#   * Not the title re-reading its own image. With +file tracing the game
-#     process never opens ForzaHorizon5.exe; it normalises its own path and
-#     nothing more. So the decrypted-only-in-a-memfd layout is not the problem.
-#   * Not a missing Windows API. Before the fault the process reaches only ETW
-#     stubs (EtwRegisterTraceGuidsW, EtwEventSetInformation) and makes no GDK
-#     call at all.
-#   * Not our TLS handling. Both TLS callbacks run and return (WINE_TRACE_TLS=1).
+# That is the restorer doing exactly what it is for, several hundred thousand
+# times, on a title that previously did not survive the first one.
 #
-# WHAT IS LEFT
+# WHERE IT STOPS NOW
 #
-# The restorer is in the image and it runs: a vectored handler is registered at
-# 0x53b85b8 (an intact `jmp` thunk, with high-entropy data immediately after it)
-# and is called for the illegal instruction -- and returns 0, declining it. So
-# the title's own protection is present and chooses not to restore the code
-# here. Making it restore means working out what that decision depends on and
-# satisfying it, which is defeating the protection rather than porting around
-# it. That is not something this project will do, and owning the game does not
-# change what the work is. The container decrypt is the licence working as
-# intended; this is not.
+# Not diagnosed yet. The process exits 1 during initialisation with no window.
+# It gets a long way first -- bcrypt, cryptasn, dinput joystick probing, OpenXR,
+# OLE -- and the visible complaints are not obviously fatal: openxr
+# get_vulkan_extensions cannot create a key, ole ensure_mta fails 0x800401f0,
+# and a service device-notify thread reports RPC_S_SERVER_UNAVAILABLE. No d3d
+# or vulkan call is reached, so it stops before it renders anything.
 #
-# So this stays broken, on purpose, with the mechanism named. Anyone who wants
-# to recheck the claim rather than take it:
-#
-#     tools/pe-holes.py <a decrypted copy of the image> --sample 300
-#     tools/pe-holes.py <any ordinary DLL>              --sample 300
+# Naming that is the next job, and it should be named rather than guessed at.
 
 schema = 1
 
@@ -102,22 +76,26 @@ prefix-env = "FH5_PREFIX"
 executable = 'ForzaHorizon5.exe'
 
 [runtime]
-# Only the loader is claimed, because that is all this title has been observed
-# to reach: the client decrypts the image and Wine maps it, then the title's
-# own code stops the process. Whatever else it would need is unknown, and
-# guessing would put untested names in the matrix.
-requires = ["loader.memfd-main-image"]
+requires = [
+    "loader.memfd-main-image",
+    "loader.section-name-for-mapped-image",
+]
 
 [status]
 state         = "broken"
-blocked-by    = "title-protection"
-summary       = "Direct call sites are elided from about a third of its functions and the title's own restorer declines to put them back, so it dies calling one during static initialisation."
-stops-at      = "an illegal instruction (0xc000001d) at ForzaHorizon5.exe+0x53d5cec, reached through ucrtbase's _initterm, with no GDK call made first"
+blocked-by    = "unknown"
+summary       = "Restores its own elided call sites correctly now -- 323,811 faults, all resumed -- and then exits during initialisation without drawing a window."
+stops-at      = "process exit 1 during startup, after OpenXR and OLE initialisation and before any d3d or vulkan call; no window"
 last-verified = 2026-09-07
-verified-with = "ferestre run fh5 with WINEDEBUG=+seh,+file and WINE_TRACE_TLS=1; tools/pe-holes.py over the decrypted image and over BenchmarkDefinition.x64.Release.dll as a control"
+verified-with = "ferestre run fh5 with WINEDEBUG=+seh; tools/pe-holes.py over the decrypted image, with an ordinary DLL as the control"
 
 [[issues]]
 symptom   = "the game exits seconds after launch with no window; the log ends in an unhandled illegal instruction inside ForzaHorizon5.exe"
-cause     = "a code-protection layer. Direct call/jmp rel32 instructions are replaced by five bytes of filler whose first byte is an opcode invalid in 64-bit mode, so an unrestored call site faults immediately. The title's own vectored handler is called for that fault and declines it, leaving the code unrestored"
-fix       = "none this project will pursue: restoring the elided instructions means defeating the protection, not porting around it. Six other explanations are excluded by measurement -- the container decrypt, a bad download, our image mapping, an OS loader mechanism, the title re-reading its own image, and a missing Windows API"
+cause     = "the title asks which file its own image was mapped from and is told nothing, because the image is mapped from a memfd that has no name in the NT namespace; its own handler then declines to restore the first elided call site"
+fix       = "fixed by patches/wine/0010: answer MemoryMappedFilenameInformation for the process's own main image from the PEB"
 log-match = "Unhandled illegal instruction at address .* \\(thread"
+
+[[issues]]
+symptom   = "the game runs for several seconds, compiles nothing, draws no window, and exits with 1"
+cause     = "unknown. It reaches OpenXR and OLE initialisation and stops before any d3d or vulkan call"
+fix       = "none yet, and not yet investigated"
