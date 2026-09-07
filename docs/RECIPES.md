@@ -171,7 +171,7 @@ scripts/launch-bedrock.sh
   `xodus-service` running for tokens -- the launcher starts it. See README
   "Minecraft Bedrock" for the full chain of blockers that had to be closed.
 
-### Forza Horizon 5 (Store) — **menus only**
+### Forza Horizon 5 (Store) — **plays; online unavailable**
 
 ```bash
 scripts/get-game.sh <its Store product id> "$XODUS_GAMES_DIR/fh5"   # 150 GB
@@ -179,16 +179,41 @@ scripts/launch-fh5.sh
 tools/drive-fh5.py                                                   # unattended
 ```
 
-Signs in, reaches the welcome screen with the account's gamertag on it, loads,
-and offers its `[Return] START GAME` prompt. It then faults reading
-`0xFFFFFFFFFFFFFFFF` inside its own bundled libHttpClient. `titles/9NNX1VVR3KNQ.toml`
-has the eight fixes that got it here and the evidence for where it stops; the
-strongest remaining lead is that its `MicrosoftGame.Config` carries no
-`<MSAAppId>`, so every Xbox Live token it gets carries no title claim.
+Signs in and drives with a restored Windows profile, vehicle and livery.
+The world, HUD and minimap rendered, and the player confirmed gameplay.
+**Forza Online reports "Forza Horizon 5 server is currently not available"**;
+its connectivity is still being investigated. A restart and save round trip
+have not yet been verified.
 
-For a long time this was written up as the title defending itself against Wine.
-It never was. Every blocker so far has been this runtime telling it something
-untrue about itself.
+The runtime needs the capabilities listed in
+[`titles/9NNX1VVR3KNQ.toml`](../titles/9NNX1VVR3KNQ.toml). Three findings explain
+the previous startup and installation failures:
+
+- The title's code-restoring handler needs the mapped image's real filename,
+  and its integrity check needs reads of that file to return the decrypted
+  bytes. Wine patches 0010 and 0013 supply those answers; 0011 fixes a separate
+  concurrent-vector allocation race.
+- libHttpClient can complete a websocket send inside its provider's Begin and
+  return `E_PENDING`. Runtime patch 0010 preserved that result, but
+  `XAsyncBegin` still returned `E_PENDING` to its caller, which then destroyed
+  the context needed by the queued callback. Patches 0014 and 0015 return
+  `S_OK` after setup and complete provider failures asynchronously, with cleanup
+  after the callback. The missing-title-claim theory did not explain this crash.
+- `XPackageGetCurrentProcessPackageIdentifier` must fit the GDK's 33-byte
+  buffer. Returning the 35-character package family name made every query fail
+  and left the game at `INSTALLING... PLEASE WAIT`. Patch 0016 supplies an
+  opaque session identifier shared with enumeration. Package family names used
+  by AppModel and saves stay the same.
+
+**Restoring Windows saves:** with the game stopped, copy the existing WGS tree
+from `%LOCALAPPDATA%\Packages\<package-family>\SystemAppData\wgs` into
+`$FH5_PREFIX/pfx/drive_c/users/steamuser/AppData/Local/Packages/<package-family>/SystemAppData/wgs`.
+`FH5_PREFIX` defaults to `$XODUS_GAMES_DIR/fh5-proton`. Preserve the container
+layout and the save-folder SCID suffix; patch 0011 resolves Forza's zero
+configuration argument to the title's own SCID so that matching folders are
+found. The confirmed restoration used a read-only source backup and a local
+copy, not an automatic import feature. No account-specific folder name is
+needed in this recipe.
 
 ## 5. Troubleshooting (every error we actually hit, and its fix)
 

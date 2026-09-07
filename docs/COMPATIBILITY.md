@@ -23,9 +23,10 @@ the value of a report:
   that twice -- it dies in a static initialiser before reaching any runtime API,
   inside code whose direct calls have been replaced by deliberately invalid
   bytes -- and both times the real cause was this project telling it something
-  untrue about itself. It reaches the welcome screen now. Nothing here will try
-  to defeat a protection; a great deal here is making one work by answering it
-  honestly.
+  untrue about itself. It now drives with a restored Windows profile; online
+  connectivity remains unresolved. The fixes supplied the filename and image
+  bytes its handler expected, then corrected the runtime's async return value
+  and package identifier.
 
 So: **a clear failure report is worth as much as a success report.** "Does not
 launch" is worth nothing. "Exits with no window, last line is
@@ -49,8 +50,8 @@ your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 | Minecraft for Windows | `9NBLGGH2JHXJ` | Playable | Signs in to Xbox Live, loads the profile, plays, and joins third-party servers from the in-game list. | 2026-09-06 |
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
 | Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. | 2026-09-06 |
+| Forza Horizon 5 | `9NNX1VVR3KNQ` | Playable, with issues | Plays with a restored Windows profile, vehicle and livery; Forza Online reports its server is currently unavailable and remains under investigation. | 2026-09-07 |
 | Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable, with issues | Boots and plays; the online features do not work. | 2026-09-06 |
-| Forza Horizon 5 | `9NNX1VVR3KNQ` | Starts, menus only | Signs in and reaches the welcome screen and its START GAME prompt; faults in its own libHttpClient soon after, reading a field it holds as -1. Stops at: a read of 0xFFFFFFFFFFFFFFFF at ForzaHorizon5.exe+0x5D5B31E, in the handler for a websocket send completing. | 2026-09-07 |
 | Halo Infinite | `9PP5G1F0C2B6` | Does not run | Gets through EasyAntiCheat's checks and into its Linux loader, which then cannot find the game binary: it looks in /proc/<pid>/maps, and a decrypted image mapped from a descriptor has no path there. Stops at: EasyAntiCheat bootstrapper exit 207, 'Failed to locate the game binary (Wine)', after 'Starting Wine module mapping, Wine version: 11.0'. | 2026-09-07 |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.

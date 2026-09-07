@@ -1,106 +1,46 @@
 # Forza Horizon 5 (Microsoft Store)
 #
-# Runs, signs in, and reaches its welcome screen: "WELCOME, <gamertag>",
-# then "LOADING... PLEASE WAIT", then the real prompt -- [Return] START GAME,
-# [X] ACCESSIBILITY/SETTINGS. Pressing Start Game still ends the run.
+# Drives with the player's restored Windows profile, vehicle and livery.
+# The player confirmed gameplay. Forza Online reports its server is currently
+# unavailable and remains under investigation; a restart/save round trip has
+# not been verified. Restoration was local from a read-only Windows backup,
+# not an automatic import feature.
 #
-# Getting here took eight fixes and two wrong conclusions, both of which said
-# some version of "the title is defending itself and there is nothing to be
-# done". Neither was true; every one of these was ours:
+# Runtime fixes needed along the way:
+#   * wine/0010 reports the filename of the memfd-mapped image, allowing the
+#     title's own handler to restore its elided call sites.
+#   * wine/0011 waits for concurrent_vector segments that another thread is
+#     still allocating rather than returning its in-progress marker.
+#   * wine/0013 normalises the GlobalRoot prefix before matching reads of the
+#     executable to its decrypted image. The title's integrity check then reads
+#     the same bytes that are running, instead of terminating with 0x1100.
+#   * xgameruntime/0007, 0008 and 0009 supply the title id, package details and
+#     successful empty speech-voice enumeration.
+#   * xgameruntime/0010 preserves a provider's inline async result and defers
+#     callback delivery while the provider's Begin runs. It also rejects a
+#     missing result payload instead of copying from address zero.
+#   * xgameruntime/0014 returns S_OK once XAsyncBegin setup succeeds. Returning
+#     the provider's E_PENDING made libHttpClient tear down its context while
+#     its accepted completion was queued, causing the 0xFFFFFFFFFFFFFFFF read
+#     at ForzaHorizon5.exe+0x5D5B31E. 0015 cleans up a failed Begin after its
+#     callback without requiring GetResult, including reused async blocks.
+#   * xgameruntime/0016 gives XPackage a session identifier that fits its
+#     33-byte buffer. Returning a 35-character package family name left Forza
+#     polling installation status indefinitely.
+#   * xgameruntime/0011 maps a zero save configuration id to the title's own
+#     SCID. Imported WGS folders must retain their matching SCID suffix.
+#   * xodus-cli/0013 accepts MicrosoftGame.Config's filename casing;
+#     xgameruntime/0013 reports usable TLS protocol flags.
 #
-#   1. The image is mapped from a memfd, so NtQueryVirtualMemory with
-#      MemoryMappedFilenameInformation returned an empty string -- the title
-#      was told its own code came from nowhere, and the handler that restores
-#      its elided call sites declined the first one. patches/wine/0010.
-#   2. concrt140's _Internal_capacity counted a segment another thread was
-#      still allocating, so _Internal_reserve returned early and callers
-#      derived element pointers from the in-progress marker. patches/wine/0011.
-#   3. XGameGetXboxTitleId answered zero when MicrosoftGame.config carries the
-#      title id. patches/xgameruntime/0007.
-#   4. XPackageEnumeratePackages reported the package family name as the
-#      display name and blanks for description, publisher and store id.
-#      patches/xgameruntime/0008.
-#   5. patches/wine/0009 matched the image map by exact NT name, so
-#      \??\GlobalRoot\??\Z:\...\ForzaHorizon5.exe matched nothing. The title
-#      opens its own executable through that spelling -- three read-only opens
-#      -- hashes what it reads, and the bytes it got were the still-encrypted
-#      ones from disk. It then called TerminateProcess on itself with 0x1100.
-#      patches/wine/0013 strips the prefix before comparing, the way the file
-#      layer does a moment later.
-#   6. XAsyncGetResult trusted a result size recorded in the block even when
-#      there was no payload behind it, which is memcpy() from address zero --
-#      a fault inside the caller's own memcpy rather than an error it can see.
-#      patches/xgameruntime/0010.
-#   7. And the one that got it to the welcome screen: libHttpClient's websocket
-#      send completes the operation from inside its own XAsyncBegin and *then*
-#      returns E_PENDING, because Wine's WinHttpWebSocketSend completes a send
-#      that does not block there and then rather than on a worker thread the
-#      way Windows does. Reading any failure HRESULT as "the provider refused
-#      to start" unlinked and freed the operation between XAsyncComplete and
-#      XAsyncGetResult. patches/xgameruntime/0010 keeps it, and holds its
-#      callback until Begin has returned, which is what every GDK API promises.
-#   8. The save provider is initialised with an all-zero configuration id,
-#      which means "the one this title was built with" and not a service
-#      configuration whose every digit is zero. Taking it literally pointed the
-#      save folder at wgs\0000000000000000_000...000, so a profile copied over
-#      from Windows would have been invisible. patches/xgameruntime/0011 falls
-#      back to the title's own SCID, ...7900C3C7.
+# The earlier missing-title-claim theory did not explain the websocket crash:
+# changing XAsyncBegin's return contract removed it without adding an MSAAppId.
+# Code protection likewise needed correct runtime answers, not removal.
 #
-# The elided call sites are real and still there: about a third of its functions
-# have their direct calls replaced by five bytes of filler whose first byte has
-# no encoding in 64-bit mode, restored lazily from a vectored handler.
-# tools/pe-holes.py measures it. That mechanism works here -- 327,000 faults in
-# a startup, every one resumed -- and never needed defeating. It needed to be
-# told the truth about where its code lives.
-#
-# WHAT IT DOES NOW
-#
-#   * window: "Forza Horizon 5", confirmed through KWin's window list
-#   * splash, the welcome screen with the signed-in gamertag, then the loading
-#     screen, then [Return] START GAME
-#   * XUserGetGamertag, XUserGetId, XUserGetLocalId -- a signed-in user
-#   * mints tokens for profile.xboxlive.com, peoplehub.xboxlive.com and the
-#     Real-Time Activity socket at wss://rta.xboxlive.com/connect, and the
-#     websocket connects, sends and gets its result back
-#   * opens its save provider under the right SCID and looks for its profile
-#   * loads its FMOD audio banks, including glb_radiopressstart and glb_ui
-#
-# WHERE IT STOPS, AND WHAT IS WORTH TRYING NEXT
-#
-# It faults reading address 0xFFFFFFFFFFFFFFFF, at one of two sites in its own
-# bundled libHttpClient: ForzaHorizon5.exe+0x5D5B31E, the handler for a
-# websocket send completing, and ForzaHorizon5.exe+0x5CA2931 during the earlier
-# HTTP calls. Both read a pointer field the title null-checks against 0 and
-# finds -1 in, then call through it. Reading -1 out of a field that is checked
-# for 0 is what a freed block filled with 0xFF looks like, so the object is
-# most likely already torn down when the handler runs.
-#
-# The strongest lead is the title claim. Forza's MicrosoftGame.Config carries
-# no <MSAAppId> -- `xodus-cli xbl-check` says so, and the runtime warns on every
-# token -- so every Xbox Live token it gets carries no title claim. A service
-# that scopes by title answers 403 to that, and libHttpClient's teardown after a
-# rejected live call is exactly the shape that destroys a websocket while an
-# observer still holds it (see the note in xnetworking.c, written for the same
-# crash in Minecraft). Establishing a title claim for a title whose config does
-# not name an MSA app is the next piece of work.
-#
-# Two smaller things found on the way, both fixed, neither the cause:
-#   * `xodus-cli xbl-check` looked only for MicrosoftGame.config; Forza ships
-#     MicrosoftGame.Config, which on a case-sensitive filesystem is a different
-#     file. patches/xodus-cli/0013.
-#   * XNetworkingQuerySecurityInformationForUrl reported a TLS protocol mask of
-#     zero, which the GDK documents as being passed straight to
-#     WinHttpSetOption( WINHTTP_OPTION_SECURE_PROTOCOLS ) -- so a title doing
-#     what the documentation says had configured its session to allow no TLS
-#     version at all. patches/xgameruntime/0013.
-#
-# And one thing worth knowing before testing it: the crash is not caused by
-# pressing Start Game. Across eight unattended runs it landed at about six
-# seconds in as often as thirty-seven, with and without a press; the earlier
-# report that Start Game triggered it was the two coinciding.
-#
-# Not taken past the welcome screen, so this is `menus` and not `playable`.
-# Loading into a race, saves and multiplayer are all unverified.
+# After the package-identifier fix, a run made 936 ready-chunk queries, created
+# three installation monitors and read the original 967,332-byte Windows
+# profile. The world then rendered with the restored vehicle, HUD and minimap;
+# the player confirmed gameplay works. Runtime regression tests pass all 107
+# checks. Online reports that the Forza Horizon 5 server is currently unavailable.
 
 schema = 1
 
@@ -130,16 +70,17 @@ requires = [
     "xgameruntime.package-details",
     "xgameruntime.speech-voice-enumeration",
     "xgameruntime.async-provider-completed-in-begin",
+    "xgameruntime.async-begin-contract",
+    "xgameruntime.package-identifier",
     "xgameruntime.save-provider-default-scid",
     "xnetworking.tls-protocol-flags",
 ]
 
 [status]
-state         = "menus"
-summary       = "Signs in and reaches the welcome screen and its START GAME prompt; faults in its own libHttpClient soon after, reading a field it holds as -1."
-stops-at      = "a read of 0xFFFFFFFFFFFFFFFF at ForzaHorizon5.exe+0x5D5B31E, in the handler for a websocket send completing"
+state         = "playable-with-issues"
+summary       = "Plays with a restored Windows profile, vehicle and livery; Forza Online reports its server is currently unavailable and remains under investigation."
 last-verified = 2026-09-07
-verified-with = "ferestre run fh5, driven unattended: keys through a uinput virtual keyboard after pulling the window forward with KWin, screenshots at each press. The welcome screen names the signed-in gamertag and offers [Return] START GAME."
+verified-with = "ferestre run fh5 with tools/drive-fh5.py: original Windows profile read and a rendered world with the restored vehicle, HUD and minimap; the player confirmed gameplay. Source backup remained read-only. Restart and save round trip not yet verified."
 
 [[issues]]
 symptom   = "the game exits seconds after launch with no window; the log ends in an unhandled illegal instruction inside ForzaHorizon5.exe"
@@ -167,12 +108,22 @@ log-match = "completed with no payload for a .* byte buffer"
 
 [[issues]]
 symptom   = "the game faults reading 0xFFFFFFFFFFFFFFFF just after its Real-Time Activity websocket connects"
-cause     = "libHttpClient's websocket send completes the operation from inside XAsyncBegin and then reports E_PENDING; the runtime read that as a refusal to start and freed the operation between XAsyncComplete and XAsyncGetResult"
-fix       = "partly fixed by patches/xgameruntime/0010: the operation is kept, and its callback held until Begin returns. The fault still happens, further in"
-log-match = "the provider refused to begin block"
+cause     = "after the inline-result fix, XAsyncBegin still returned the provider's E_PENDING to libHttpClient, which treated it as a failed start and destroyed the context needed by the queued completion"
+fix       = "fixed by patches/xgameruntime/0014 and 0015: setup returns S_OK, provider failures complete asynchronously and failed-Begin cleanup waits for its callback"
+log-match = "0xFFFFFFFFFFFFFFFF"
 
 [[issues]]
 symptom   = "the title's own profile is never found: it reads User_<xuid>/ProfileBackup and gets E_GS_BLOB_NOT_FOUND even where a save copied from Windows exists"
 cause     = "the title initialises its save provider with an all-zero configuration id, which means the title's own SCID; taking it literally named the save folder after a zero SCID"
 fix       = "fixed by patches/xgameruntime/0011"
 log-match = "title named no service configuration; using its own"
+
+[[issues]]
+symptom   = "INSTALLING... PLEASE WAIT persists while the game repeatedly queries its current package identifier"
+cause     = "XPackageGetCurrentProcessPackageIdentifier returned a 35-character package family name into the GDK's 33-byte buffer and failed every query"
+fix       = "fixed by patches/xgameruntime/0016: current-package queries and enumeration share a bounded opaque session identifier"
+
+[[issues]]
+symptom   = "Forza Online reports: Forza Horizon 5 server is currently not available"
+cause     = "not yet established; online connectivity is still under investigation"
+fix       = "none known; local gameplay is confirmed, online play is not"

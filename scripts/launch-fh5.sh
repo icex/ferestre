@@ -1,8 +1,7 @@
 #!/bin/bash
-# Forza Horizon 5 (Microsoft Store build). Downloads and decrypts fine but does
-# NOT currently run: it fails inside its own in-binary code protection before
-# any runtime API is reached (see README, "Forza Horizon 5"). Kept so the
-# launch path is ready if that ever changes.
+# Forza Horizon 5 (Microsoft Store build). Drives with a restored Windows
+# profile on the runtime capabilities listed in titles/9NNX1VVR3KNQ.toml.
+# Forza Online reports its server is unavailable; see docs/RECIPES.md.
 . "$(dirname "$0")/xodus-env.sh"
 exec "$(dirname "$0")/launch-gdk.sh" "${FH5_DIR:-$XODUS_GAMES_DIR/fh5}" \
     'ForzaHorizon5.exe' \

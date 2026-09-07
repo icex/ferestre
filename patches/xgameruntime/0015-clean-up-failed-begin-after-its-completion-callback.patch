@@ -1,0 +1,236 @@
+Subject: [PATCH] Clean up a failed Begin without requiring GetResult
+
+A caller may read a failed operation with GetStatus only. Withdraw the failed
+Begin when its failure wins completion and retain the provider until Begin,
+active work and the completion callback have returned. Cleanup receives an
+owned snapshot because a callback may release the caller's async block.
+Successful and payload-bearing operations retain their existing lifecycle.
+
+--- a/xthreading.c
++++ b/xthreading.c
+@@ -146,9 +146,12 @@
+     BOOL completed;
+     BOOL begin_running;     /* the provider's Begin has not returned yet */
+     BOOL deliver_pending;   /* it completed in there; deliver once it has */
++    BOOL cleanup_on_release; /* failed Begin has no result for its caller to take */
++    XAsyncBlock cleanup_async; /* the completion may free the caller's block */
+ };
+ 
+ static struct list async_ops = LIST_INIT( async_ops );
++static const char failed_begin_marker;
+ static CRITICAL_SECTION async_ops_cs;
+ static CRITICAL_SECTION_DEBUG async_ops_cs_debug =
+ {
+@@ -199,11 +202,45 @@
+ 
+ static void release_async_op( struct x_async_op *op )
+ {
+-    if (op && !InterlockedDecrement( &op->ref )) free( op );
++    if (op && !InterlockedDecrement( &op->ref ))
++    {
++        if (op->cleanup_on_release)
++        {
++            XAsyncProviderData data = { &op->cleanup_async, 0, NULL, op->context };
++            op->provider( XAsyncOp_Cleanup, &data );
++        }
++        free( op );
++    }
+ }
+ 
+ static void store_async_result( XAsyncBlock *async, HRESULT hr, void *payload, SIZE_T result_size );
+-static void deliver_async_completion( XAsyncBlock *async );
++static void deliver_async_completion( XAsyncBlock *async, struct x_async_op *keep_alive );
++
++/* A failure returned by Begin is an async outcome with no payload. Its caller
++ * may only read GetStatus and never call GetResult, so retain the provider
++ * through Begin/work and the callback, then clean it up without a result read.
++ * An inline completion wins over the later return value. */
++static void complete_failed_begin( struct x_async_op *op, HRESULT hr )
++{
++    BOOL drop = FALSE;
++
++    EnterCriticalSection( &async_ops_cs );
++    if (!op->completed)
++    {
++        op->completed = TRUE;
++        op->result = hr;
++        op->required_size = 0;
++        op->deliver_pending = TRUE;
++        store_async_result( op->async, hr, (void *)&failed_begin_marker, 0 );
++        op->cleanup_async = *op->async;
++        op->cleanup_on_release = TRUE;
++        list_remove( &op->entry );
++        drop = TRUE;
++        TRACE( "failed Begin for block %p completes asynchronously; cleanup follows delivery.\n", op->async );
++    }
++    LeaveCriticalSection( &async_ops_cs );
++    if (drop) release_async_op( op );
++}
+ 
+ /* Record an operation's outcome and fire the block's completion callback.
+  * Shared by XAsyncComplete and by the DoWork paths that finish inline.
+@@ -457,6 +494,7 @@
+     op->async = asyncBlock;
+     op->work = work;
+     op->ref = 1;
++    memset( asyncBlock->internal, 0, sizeof(asyncBlock->internal) );
+ 
+     EnterCriticalSection( &async_ops_cs );
+     list_add_tail( &async_ops, &op->entry );
+@@ -487,6 +525,7 @@
+     op->ref = 2;
+ 
+     op->begin_running = TRUE;
++    memset( asyncBlock->internal, 0, sizeof(asyncBlock->internal) );
+ 
+     EnterCriticalSection( &async_ops_cs );
+     list_add_tail( &async_ops, &op->entry );
+@@ -504,7 +543,7 @@
+      * the completion we accepted is still queued. An already completed
+      * operation keeps its first result. */
+     if (FAILED(hr) && hr != E_PENDING)
+-        x_threading_XAsyncComplete_helper( asyncBlock, hr, 0 );
++        complete_failed_begin( op, hr );
+ 
+     EnterCriticalSection( &async_ops_cs );
+     op->begin_running = FALSE;
+@@ -518,7 +557,7 @@
+     if (deliver)
+     {
+         TRACE( "delivering the held completion for block %p.\n", asyncBlock );
+-        deliver_async_completion( asyncBlock );
++        deliver_async_completion( asyncBlock, op->cleanup_on_release ? op : NULL );
+     }
+     release_async_op( op );
+     return S_OK;
+@@ -565,6 +604,16 @@
+     if (!asyncBlock) return E_INVALIDARG;
+ 
+     EnterCriticalSection( &async_ops_cs );
++    /* A failed Begin was detached because it needs no result read. Older
++     * zero-payload operations can still be listed at this reused address;
++     * none of them may replace the current block's recorded failure. */
++    if (asyncBlock->internal[0] == XGR_ASYNC_MAGIC &&
++        asyncBlock->internal[2] == &failed_begin_marker)
++    {
++        hr = (HRESULT)(ULONG_PTR)asyncBlock->internal[1];
++        LeaveCriticalSection( &async_ops_cs );
++        return hr;
++    }
+     op = find_async_op( asyncBlock );
+     if (!op)
+     {
+@@ -693,6 +742,8 @@
+ {
+     struct list entry;
+     XAsyncBlock *async;
++    XAsyncCompletionRoutine *callback;
++    struct x_async_op *keep_alive;
+ };
+ 
+ /* Set once a title actually pumps a queue. Until then a Manual completion has
+@@ -732,18 +783,25 @@
+     return obj->completion_mode;
+ }
+ 
++static void invoke_async_completion( struct x_pending_completion *item )
++{
++    item->callback( item->async );
++    release_async_op( item->keep_alive );
++    free( item );
++}
++
+ static void CALLBACK async_completion_work( TP_CALLBACK_INSTANCE *instance, void *context )
+ {
+-    XAsyncBlock *async = context;
+-    TRACE( "delivering completion for block %p (pool).\n", async );
+-    if (async->callback) async->callback( async );
++    struct x_pending_completion *item = context;
++    TRACE( "delivering completion for block %p (pool).\n", item->async );
++    invoke_async_completion( item );
+ }
+ 
+ static DWORD WINAPI async_completion_thread( void *context )
+ {
+-    XAsyncBlock *async = context;
+-    TRACE( "delivering completion for block %p (thread).\n", async );
+-    if (async->callback) async->callback( async );
++    struct x_pending_completion *item = context;
++    TRACE( "delivering completion for block %p (thread).\n", item->async );
++    invoke_async_completion( item );
+     return 0;
+ }
+ 
+@@ -758,11 +816,16 @@
+     async->internal[3] = (void *)result_size;
+ }
+ 
+-static void deliver_async_completion( XAsyncBlock *async )
++static void deliver_async_completion( XAsyncBlock *async, struct x_async_op *keep_alive )
+ {
+     struct x_pending_completion *item;
+ 
+     if (!async->callback) return;
++    if (!(item = calloc( 1, sizeof(*item) ))) return;
++    item->async = async;
++    item->callback = async->callback;
++    item->keep_alive = keep_alive;
++    if (keep_alive) InterlockedIncrement( &keep_alive->ref );
+ 
+     /* A Manual queue is the title's to pump. Bedrock, though, creates Manual
+      * queues, hands them to XSAPI and never calls XTaskQueueDispatch even once,
+@@ -782,22 +845,19 @@
+     {
+         HANDLE thread;
+ 
+-        if (TrySubmitThreadpoolCallback( async_completion_work, async, NULL )) return;
++        if (TrySubmitThreadpoolCallback( async_completion_work, item, NULL )) return;
+ 
+         /* The pool refused the work. Falling back to the pending list would
+          * strand this completion for ever, because a title on a runtime-
+          * dispatched queue never calls XTaskQueueDispatch -- so spend a thread
+          * on it instead. */
+-        if ((thread = CreateThread( NULL, 0, (LPTHREAD_START_ROUTINE)async_completion_thread, async, 0, NULL )))
++        if ((thread = CreateThread( NULL, 0, (LPTHREAD_START_ROUTINE)async_completion_thread, item, 0, NULL )))
+         {
+             CloseHandle( thread );
+             return;
+         }
+         ERR( "could not deliver completion for asyncBlock %p.\n", async );
+     }
+-
+-    if (!(item = calloc( 1, sizeof(*item) ))) return;
+-    item->async = async;
+ 
+     EnterCriticalSection( &pending_cs );
+     list_add_tail( &pending_completions, &item->entry );
+@@ -811,7 +871,7 @@
+ {
+     if (!async) return;
+     store_async_result( async, hr, payload, result_size );
+-    deliver_async_completion( async );
++    deliver_async_completion( async, NULL );
+ }
+ 
+ void xgr_async_complete( XAsyncBlock *async, HRESULT hr, void *payload )
+@@ -824,7 +884,6 @@
+ {
+     struct x_pending_completion *item = NULL;
+     struct list *head;
+-    XAsyncBlock *async;
+ 
+     /* Titles poll this extremely hard -- millions of calls per session, from
+      * several threads at once. Taking the lock every time makes the queue a
+@@ -848,10 +907,8 @@
+         return FALSE;
+     }
+ 
+-    async = item->async;
+-    free( item );
+-    TRACE( "delivering completion for block %p (dispatch).\n", async );
+-    if (async->callback) async->callback( async );
++    TRACE( "delivering completion for block %p (dispatch).\n", item->async );
++    invoke_async_completion( item );
+     return TRUE;
+ }
+ 

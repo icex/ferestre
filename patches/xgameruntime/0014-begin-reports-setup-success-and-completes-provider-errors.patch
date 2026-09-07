@@ -1,0 +1,69 @@
+Subject: [PATCH] XAsyncBegin reports setup success, provider failures complete asynchronously
+
+Microsoft's public AsyncLib.cpp returns S_OK once state allocation succeeds.
+A failure from the provider completes the async operation instead of making
+its caller tear down a context that a queued completion still needs.
+E_PENDING leaves the operation pending; an inline completion keeps its result.
+
+Reference: https://github.com/microsoft/libHttpClient/blob/main/Source/Task/AsyncLib.cpp
+
+--- a/xthreading.c
++++ b/xthreading.c
+@@ -498,40 +498,20 @@
+         hr = provider( XAsyncOp_Begin, &data );
+     }
+ 
++    /* Setup succeeded. A provider's Begin result belongs to the async
++     * operation, never to the caller of XAsyncBegin. Returning E_PENDING (or
++     * another failure) there makes libHttpClient destroy its context while
++     * the completion we accepted is still queued. An already completed
++     * operation keeps its first result. */
++    if (FAILED(hr) && hr != E_PENDING)
++        x_threading_XAsyncComplete_helper( asyncBlock, hr, 0 );
++
+     EnterCriticalSection( &async_ops_cs );
+     op->begin_running = FALSE;
+     deliver = op->deliver_pending;
+     op->deliver_pending = FALSE;
+     LeaveCriticalSection( &async_ops_cs );
+ 
+-    /* Begin returning a failure does not mean the operation never started.
+-     * E_PENDING says the work is under way, and a provider is free to finish
+-     * the block from inside Begin and report E_PENDING all the same -- Forza
+-     * Horizon 5's libHttpClient websocket send does exactly that.
+-     *
+-     * Withdrawing the operation there throws away the result its caller is
+-     * about to ask for. The block still says "completed, 16 bytes", but the
+-     * provider holding those bytes is gone, so XAsyncGetResult has nothing to
+-     * fill the buffer with and the title reads a result that was never
+-     * written: it poisons that local with -1 beforehand, and faults on the
+-     * first field it reaches through. Only an operation that failed to start
+-     * *and* never completed is ours to take back. */
+-    if (FAILED(hr) && hr != E_PENDING)
+-    {
+-        BOOL withdraw;
+-
+-        EnterCriticalSection( &async_ops_cs );
+-        withdraw = !op->completed && find_async_op( asyncBlock ) == op;
+-        if (withdraw) list_remove( &op->entry );
+-        LeaveCriticalSection( &async_ops_cs );
+-
+-        if (withdraw)
+-        {
+-            WARN( "operation %p withdrawn: the provider refused to begin block %p (%#lx).\n", op, asyncBlock, hr );
+-            async_op_invoke( op, XAsyncOp_Cleanup, 0, NULL );
+-            release_async_op( op );
+-        }
+-    }
+     /* Now, and not before: the operation's state is settled and this call is
+      * on its way out, so the title is past the point where the callback could
+      * catch it mid-setup. */
+@@ -541,7 +521,7 @@
+         deliver_async_completion( asyncBlock );
+     }
+     release_async_op( op );
+-    return hr;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI __PADDING__( IXThreadingImpl *iface )

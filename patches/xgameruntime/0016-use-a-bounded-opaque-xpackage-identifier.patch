@@ -1,0 +1,106 @@
+Subject: [PATCH] Use a bounded opaque identifier for the current package
+
+XPackage identifiers fit in 33 bytes including the terminator. Package family
+names can exceed that limit and belong to the AppModel/save APIs instead.
+Generate one opaque identifier per process and share it with enumeration.
+
+--- a/xpackage.c
++++ b/xpackage.c
+@@ -33,6 +33,7 @@
+  */
+ 
+ #include "private.h"
++#include <bcrypt.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+ 
+@@ -174,7 +175,7 @@
+ 
+ /* Fill an XPackageDetails describing the current game package. The strings it
+  * points at are owned by the caller-provided storage, valid for the callback. */
+-static void fill_current_details( XPackageDetails *details, char *identifier, char *display,
++static void fill_current_details( XPackageDetails *details, const char *identifier, char *display,
+                                   char *description, char *publisher, char *store_id,
+                                   char *title_id )
+ {
+@@ -244,23 +245,51 @@
+ 
+ /* ---- identity ----------------------------------------------------------- */
+ 
++static char current_identifier[33];
++
++static BOOL WINAPI init_package_identifier( INIT_ONCE *once, void *param, void **context )
++{
++    static const char hex[] = "0123456789abcdef";
++    UCHAR bytes[16];
++    unsigned int i;
++
++    if (BCryptGenRandom( NULL, bytes, sizeof(bytes), BCRYPT_USE_SYSTEM_PREFERRED_RNG )) return FALSE;
++    for (i = 0; i < sizeof(bytes); i++)
++    {
++        current_identifier[2 * i] = hex[bytes[i] >> 4];
++        current_identifier[2 * i + 1] = hex[bytes[i] & 15];
++    }
++    TRACE( "created an opaque package identifier within the 33-byte GDK limit.\n" );
++    return TRUE;
++}
++
++/* XPackage identifiers are opaque, per-session installation handles. The
++ * package family names used for AppModel and save paths are a different API
++ * and can exceed XPACKAGE_IDENTIFIER_MAX_LENGTH (33 including the NUL).
++ * Share one identifier between the query and enumeration for this package. */
++static const char *package_identifier( void )
++{
++    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
++
++    if (!InitOnceExecuteOnce( &once, init_package_identifier, NULL, NULL )) return NULL;
++    return current_identifier;
++}
++
+ static HRESULT WINAPI x_package_XPackageGetCurrentProcessPackageIdentifier( IXPackageImpl3 *iface, SIZE_T bufferSize, char *buffer )
+ {
+-    char *id;
++    const char *id;
+     SIZE_T len;
+ 
+     TRACE( "iface %p, bufferSize %Iu, buffer %p.\n", iface, bufferSize, buffer );
+ 
+     if (!buffer) return E_INVALIDARG;
+-    if (!(id = xgr_package_family())) return HRESULT_FROM_WIN32( ERROR_INSTALL_FAILURE );
++    if (!(id = package_identifier())) return HRESULT_FROM_WIN32( ERROR_INSTALL_FAILURE );
+     len = strlen( id ) + 1;
+     if (bufferSize < len)
+     {
+-        free( id );
+         return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
+     }
+     memcpy( buffer, id, len );
+-    free( id );
+     return S_OK;
+ }
+ 
+@@ -489,13 +518,14 @@
+ static HRESULT enumerate_current( XPackageKind kind, void *context, XPackageEnumerationCallback *callback )
+ {
+     XPackageDetails details;
+-    char *identifier, display[256], description[512], publisher[256], store_id[64], title_id[64];
++    const char *identifier;
++    char display[256], description[512], publisher[256], store_id[64], title_id[64];
+ 
+     if (!callback) return E_INVALIDARG;
+     /* only games are installed here; a Content query finds nothing */
+     if (kind != XPackageKind_Game) return S_OK;
+ 
+-    if (!(identifier = xgr_package_family())) return S_OK;
++    if (!(identifier = package_identifier())) return HRESULT_FROM_WIN32( ERROR_INSTALL_FAILURE );
+ 
+     /* MicrosoftGame.config carries all of this. Reporting the package family
+      * name as the display name and blanks for the rest is not harmless: a title
+@@ -515,7 +545,6 @@
+     TRACE( "reporting package %s (%s), store %s, title %s\n", debugstr_a( identifier ),
+            debugstr_a( display ), debugstr_a( store_id ), debugstr_a( title_id ) );
+     callback( context, &details );
+-    free( identifier );
+     return S_OK;
+ }
+ 

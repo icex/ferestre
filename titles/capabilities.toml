@@ -336,7 +336,7 @@ summary = """
 XGameGetXboxTitleId reports the TitleId from MicrosoftGame.config rather than \
 zero, so a title that asks for its own identity gets it."""
 provided-by = ["patches/xgameruntime/0007-report-the-package-s-own-xbox-title-id.patch"]
-symptom-if-missing = "Forza Horizon 5 gets through startup and then spends 939 iterations polling XPackageGetCurrentProcessPackageIdentifier before giving up; with the real id it makes 7,735 GDK calls instead of 217"
+symptom-if-missing = "XGameGetXboxTitleId returns zero despite a TitleId in MicrosoftGame.config, so calls scoped to the running title lack its identity"
 note = """
 The config carries it and xgr_title_identity() already reads it for the token \
 endpoints, so this was a blank where an answer was available. Zero is still the \
@@ -355,14 +355,10 @@ name and three empty strings."""
 provided-by = ["patches/xgameruntime/0008-report-the-package-s-real-details.patch"]
 symptom-if-missing = "a title looking for itself in the list it just asked for does not recognise the entry, and anything keyed on storeId finds nothing"
 note = """
-Measured on Forza Horizon 5, and it is not a straightforward win: with storeId \
-blank it polls XPackageGetCurrentProcessPackageIdentifier 939 times and exits, \
-and with the real 9NNX1VVR3KNQ it stops earlier and more quietly, at 211 GDK \
-calls instead of 7,747. Isolated to that one field by blanking it alone. \
-Reporting it is still right -- Windows does, and a title following its store id \
-into a path this runtime does not serve is a gap in XStore rather than a reason \
-to hide the field. Recorded here so the next person knows what the field \
-unlocks."""
+The descriptive fields come from MicrosoftGame.config. The packageIdentifier \
+field is a separate opaque installation handle; it must also satisfy \
+xgameruntime.package-identifier. Earlier changes in startup call counts did \
+not establish that XStore caused the later crash or installation loop."""
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "reporting package %s (%s), store %s, title %s" },
 ]
@@ -404,35 +400,59 @@ verify = [
 [[capability]]
 name = "xgameruntime.async-provider-completed-in-begin"
 summary = """
-An XAsync operation whose provider finished it from inside XAsyncBegin keeps \
-its result and holds its callback until Begin has returned, instead of being \
-withdrawn because Begin reported E_PENDING."""
+An XAsync operation completed inside its provider's Begin keeps its result \
+and defers callback delivery while that provider call runs."""
 provided-by = ["patches/xgameruntime/0010-an-operation-the-provider-already-completed-is-still.patch"]
-symptom-if-missing = "a title using libHttpClient's WinHttp websocket transport crashes shortly after the socket connects, dereferencing a pointer it poisoned with -1 before asking for a result that was never written"
+symptom-if-missing = "a title using libHttpClient's WinHttp websocket transport crashes shortly after the socket connects because its completed operation was withdrawn before GetResult could fill the result buffer"
 note = """
-Forza Horizon 5 connects to wss://rta.xboxlive.com/connect and sends its first \
-message; libHttpClient's winhttp_websocket_impl::enqueue_message completes the \
-block from inside Begin and *then* returns E_PENDING. Reading any failure \
-HRESULT as "the provider refused to start" unlinked and freed the operation \
-between XAsyncComplete and XAsyncGetResult, so the block still said "completed, \
-16 bytes" while the provider holding those bytes was gone.
+Wine's WinHttpWebSocketSend can finish inline. libHttpClient completes its \
+async block during Begin and then returns E_PENDING. The runtime must preserve \
+the accepted result, and the Begin frame holds a reference while the provider \
+runs. A missing payload is reported instead of copied from address zero.
 
-Three things came out of that. The operation is only taken back when it failed \
-to start *and* never completed -- and this frame holds a reference while Begin \
-runs, because the provider may finish the block and another thread take its \
-result before Begin returns, which made the old code unlink freed memory. \
-XAsyncGetResult also no longer trusts a recorded result size on its own: a size \
-with no payload used to mean memcpy() from address zero, which is not an error \
-the caller can see but a fault inside its own memcpy.
-
-And the callback now waits. Every GDK API returns before its completion routine \
-runs, and a title relies on it: it calls the *Async() function and finishes \
-wiring up the object the callback will reach through afterwards. The outcome is \
-recorded in the block straight away, so anything polling sees it; only the \
-callback is held, and only until Begin returns. That much is the contract. It \
-did not, on its own, get Forza past its welcome screen."""
+This patch alone still returned E_PENDING from XAsyncBegin. The separate \
+xgameruntime.async-begin-contract capability corrects that return value and \
+the resulting caller teardown."""
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "operation %p registered for block %p (begin)" },
+]
+
+[[capability]]
+name = "xgameruntime.async-begin-contract"
+summary = """
+XAsyncBegin returns S_OK after setup; provider failures complete the operation \
+asynchronously and failed-Begin providers are cleaned up without GetResult."""
+provided-by = [
+    "patches/xgameruntime/0014-begin-reports-setup-success-and-completes-provider-errors.patch",
+    "patches/xgameruntime/0015-clean-up-failed-begin-after-its-completion-callback.patch",
+]
+symptom-if-missing = "libHttpClient treats a provider's E_PENDING as a failed start and tears down context still needed by its queued completion; Forza Horizon 5 faults reading 0xFFFFFFFFFFFFFFFF in its websocket completion handler"
+note = """
+Provider E_PENDING leaves the operation pending and an inline completion keeps \
+its first result. A returned provider failure is recorded for GetStatus and \
+GetResult; it is not returned to the caller of a successfully set-up Begin. \
+Failed-Begin cleanup waits for the provider and completion callback, using an \
+owned block snapshot because the callback may free the caller's block. A \
+reused block still reports its newest failure rather than an older result."""
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "failed Begin for block %p completes asynchronously; cleanup follows delivery" },
+]
+
+[[capability]]
+name = "xgameruntime.package-identifier"
+summary = """
+Current-package queries and enumeration share an opaque session identifier \
+that fits the GDK's 33-byte buffer, including its terminator."""
+provided-by = ["patches/xgameruntime/0016-use-a-bounded-opaque-xpackage-identifier.patch"]
+symptom-if-missing = "Forza Horizon 5 stays at INSTALLING... PLEASE WAIT because its 33-byte current-package identifier query cannot hold the package family name returned by the runtime"
+note = """
+XPackage installation identifiers are opaque and valid for the current game \
+session. A cached 32-character identifier meets that contract; AppModel \
+package family names and WGS save paths retain their existing identities. \
+The identifier fix lets Forza reach ready-chunk queries and installation \
+monitors instead of failing every current-package query."""
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "created an opaque package identifier within the 33-byte GDK limit" },
 ]
 
 [[capability]]

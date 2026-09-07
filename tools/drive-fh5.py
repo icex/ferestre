@@ -2,6 +2,7 @@
 """Start Forza Horizon 5 and take it through its welcome screen, without a person.
 
     drive-fh5.py            launch, press Start Game, report what happened
+    drive-fh5.py launch     launch without sending input or stopping the game
     drive-fh5.py shot NAME  capture the game window now
     drive-fh5.py start      press Start Game on an already-running game
     drive-fh5.py kill       stop the game
@@ -21,6 +22,7 @@ Start Game had caused it, when it happens on its own just as often.
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -50,7 +52,7 @@ VK_RETURN = "0D"
 # and the prompt itself only appears once the profile load finishes.
 WINDOW_TIMEOUT = 240
 PRESS_AFTER = 45
-PRESS_EVERY = 15
+OBSERVE_EVERY = 15
 PATIENCE = 300
 
 NOISE = re.compile(r"^(ntsync|radv|wineserver|wine:|WARNING|Proton)")
@@ -89,7 +91,7 @@ def bot(args, timeout=120):
 
 def game_pid():
     out = subprocess.run(
-        ["pgrep", "-f", EXE], capture_output=True, text=True
+        ["pgrep", "-x", EXE[:15]], capture_output=True, text=True
     ).stdout.split()
     return int(out[0]) if out else None
 
@@ -177,19 +179,23 @@ def launch():
         print(":: already running")
         return
     print(":: launching")
-    LOG.unlink(missing_ok=True)
+    OUT.mkdir(parents=True, exist_ok=True)
+    launcher_log = OUT / "launcher.log"
     env = dict(os.environ, WINEDEBUG=os.environ.get("XODUS_WINEDEBUG", "+timestamp,+gdkc"))
-    subprocess.Popen(
-        ["setsid", str(REPO / "target/release/ferestre"), "run", SLUG],
-        cwd=str(GAMES),
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    with launcher_log.open("w") as output:
+        process = subprocess.Popen(
+            [str(REPO / "target/release/ferestre"), "run", SLUG],
+            cwd=str(GAMES),
+            env=env,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
     deadline = time.time() + WINDOW_TIMEOUT
     while time.time() < deadline:
-        if window_rect():
+        if process.poll() is not None:
+            die(f"launcher exited with status {process.returncode}", f"details: {launcher_log}")
+        if game_pid() and window_rect():
             print(f"   window up after {int(WINDOW_TIMEOUT - (deadline - time.time()))}s")
             return
         time.sleep(5)
@@ -197,13 +203,16 @@ def launch():
 
 
 def watch():
-    """Press Start Game once the welcome screen is up, and wait for the end.
+    """Recognise Start Game, press it once, and observe the rest of the run.
 
     The presses are timed from the *game's* uptime, not the launcher's: the
     launcher spends about forty seconds decrypting and starting Proton, and a
     press before the window exists goes to whatever else has focus.
     """
+    if not shutil.which("tesseract"):
+        die("unattended input needs tesseract to recognise START GAME", "use the launch command for observation without input")
     presses = 0
+    next_observation = PRESS_AFTER
     while True:
         pid = game_pid()
         if not pid:
@@ -211,23 +220,33 @@ def watch():
         up = uptime(pid)
         if up >= PATIENCE:
             return f"still running after {up}s and {presses} Start Game press(es)"
-        if up >= PRESS_AFTER and (up - PRESS_AFTER) % PRESS_EVERY < 3:
-            presses += 1
-            print(f":: Start Game (press {presses}, {up}s in)")
-            shot(f"{presses}-before-start")
-            press_start()
-            time.sleep(5)
-            shot(f"{presses}-after-start")
+        if up >= next_observation:
+            next_observation = up + OBSERVE_EVERY
+            path = shot(f"observe-{up}s")
+            if path and not presses:
+                words = subprocess.run(
+                    ["tesseract", str(path), "stdout"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if words.returncode == 0 and re.search(r"\bSTART\s+GAME\b", words.stdout, re.I):
+                    presses += 1
+                    print(f":: recognised Start Game ({up}s in)")
+                    press_start()
         time.sleep(3)
 
 
 def report(verdict):
     text = LOG.read_text(errors="replace") if LOG.exists() else ""
+    launches = list(re.finditer(r"=== launch \(unix (\d+)\) ===", text))
+    started = int(launches[-1].group(1)) if launches else None
+    if launches:
+        text = text[launches[-1].end():]
     faults = re.findall(
         r"Unhandled page fault on \w+ access to ([0-9A-F]+) at address ([0-9A-F]+)", text
     )
     print()
     print(f":: {verdict}")
+    print("   Stability observation only; screenshots establish how far the game got.")
     if faults:
         where, addr = faults[-1]
         print(f"   faulted reading {where} at {addr}")
@@ -240,7 +259,7 @@ def report(verdict):
         / "drive_c/users/steamuser/AppData/Local/Packages"
         / "Microsoft.624F8B84B80_8wekyb3d8bbwe/PersistentLocalStorage/CrashReport.xml"
     )
-    if crash.exists():
+    if crash.exists() and started is not None and crash.stat().st_mtime >= started:
         report_text = crash.read_text(errors="replace")
         for field in ("UPTIME", "UI_SCENE"):
             m = re.search(rf'<{field} Value="([^"]*)"', report_text)
@@ -250,7 +269,11 @@ def report(verdict):
 
 
 def kill():
-    subprocess.run([str(REPO / "scripts/kill-gdk.sh")], capture_output=True)
+    subprocess.run(
+        [str(TOOL / "bin/wineserver"), "-k"],
+        env=dict(os.environ, WINEPREFIX=str(PREFIX)),
+        capture_output=True,
+    )
 
 
 def main(argv):
@@ -263,6 +286,9 @@ def main(argv):
         return 0
     if cmd == "start":
         press_start()
+        return 0
+    if cmd == "launch":
+        launch()
         return 0
     if cmd != "run":
         die(f"unknown command {cmd!r}", __doc__.strip().splitlines()[2])

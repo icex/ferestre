@@ -74,7 +74,7 @@ not inferred from the fact that it downloaded:
 | **Overthrown** | Game Pass | Playable |
 | **Goat Simulator 3** | Game Pass | Boots and plays; online features do not work |
 | **Age of Empires Definitive Edition** | Game Pass | Installs; still crashes at startup |
-| **Forza Horizon 5** | Store | Signs in and reaches the welcome screen and its Start Game prompt; faults soon after, inside its own libHttpClient |
+| **Forza Horizon 5** | Store | Plays with a restored Windows profile, vehicle and livery; Forza Online reports its server is currently unavailable |
 
 Notes worth having before you try your own library:
 

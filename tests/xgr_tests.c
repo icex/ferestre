@@ -85,7 +85,6 @@ static BOOLEAN __stdcall count_package( void *ctx, const XPackageDetails *d )
 
 static void test_xpackage(void)
 {
-    const char *expected = getenv( "XGR_EXPECTED_FAMILY" );
     struct enum_ctx ctx = { 0 };
     XAsyncBlock async = { 0 };
     XPackageMountHandle mount = NULL;
@@ -93,16 +92,20 @@ static void test_xpackage(void)
     XPackageInstallationMonitorHandle mon = NULL;
     XPackageInstallationProgress prog = { 0 };
     char buf[512];
+    char identifier[33] = {0}, repeated[33] = {0}, tiny[2] = {'!', '!'};
     SIZE_T size = 0;
     HRESULT hr;
 
     printf( "# XPackage\n" );
     CHECK( IXPackageImpl3_XPackageIsPackagedProcess( pkg ), "IsPackagedProcess is TRUE" );
 
-    hr = IXPackageImpl3_XPackageGetCurrentProcessPackageIdentifier( pkg, sizeof(buf), buf );
-    CHECK( SUCCEEDED( hr ), "GetCurrentProcessPackageIdentifier succeeds (0x%08lx)", hr );
-    if (expected)
-        CHECK( !strcmp( buf, expected ), "identifier '%s' == expected '%s'", buf, expected );
+    hr = IXPackageImpl3_XPackageGetCurrentProcessPackageIdentifier( pkg, sizeof(identifier), identifier );
+    CHECK( SUCCEEDED( hr ), "package identifier fits the GDK's 33-byte buffer (0x%08lx)", hr );
+    CHECK( identifier[0] && identifier[32] == 0, "package identifier is nonempty and terminated within its maximum" );
+    hr = IXPackageImpl3_XPackageGetCurrentProcessPackageIdentifier( pkg, sizeof(repeated), repeated );
+    CHECK( hr == S_OK && !strcmp( identifier, repeated ), "package identifier stays stable within a process" );
+    hr = IXPackageImpl3_XPackageGetCurrentProcessPackageIdentifier( pkg, 1, tiny );
+    CHECK( FAILED(hr) && tiny[0] == '!' && tiny[1] == '!', "undersized package identifier buffer is rejected without overwriting" );
 
     hr = IXPackageImpl3_XPackageGetUserLocale( pkg, sizeof(buf), buf );
     CHECK( SUCCEEDED( hr ) && buf[0], "GetUserLocale returns a locale ('%s')", buf );
@@ -110,8 +113,7 @@ static void test_xpackage(void)
     hr = IXPackageImpl3_XPackageEnumeratePackages( pkg, XPackageKind_Game,
             XPackageEnumerationScope_ThisOnly, &ctx, count_package );
     CHECK( SUCCEEDED( hr ) && ctx.count == 1, "EnumeratePackages(Game) reports exactly 1 (%d)", ctx.count );
-    if (expected)
-        CHECK( !strcmp( ctx.identifier, expected ), "enumerated identifier matches" );
+    CHECK( !strcmp( ctx.identifier, identifier ), "enumeration and current-package query identify the same installation" );
     CHECK( !strcmp( ctx.title, "4D5E6F70" ), "enumerated titleID == fixture ('%s')", ctx.title );
     CHECK( ctx.version.major == 2 && ctx.version.minor == 7 && ctx.version.build == 13 &&
            ctx.version.revision == 42, "enumerated version == 2.7.13.42 (%u.%u.%u.%u)",
@@ -122,7 +124,7 @@ static void test_xpackage(void)
             XPackageEnumerationScope_ThisOnly, &ctx, count_package );
     CHECK( SUCCEEDED( hr ) && ctx.count == 0, "EnumeratePackages(Content) reports 0 (%d)", ctx.count );
 
-    hr = IXPackageImpl3_XPackageMountWithUiAsync( pkg, buf, &async );
+    hr = IXPackageImpl3_XPackageMountWithUiAsync( pkg, identifier, &async );
     hr = IXPackageImpl3_XPackageMountWithUiResult( pkg, &async, &mount );
     CHECK( SUCCEEDED( hr ) && mount, "MountWithUi returns a handle (0x%08lx)", hr );
     if (mount)
@@ -138,11 +140,11 @@ static void test_xpackage(void)
         IXPackageImpl3_XPackageCloseMountHandle( pkg, mount );
     }
 
-    hr = IXPackageImpl3_XPackageFindChunkAvailability( pkg, buf, 0, NULL, &avail );
+    hr = IXPackageImpl3_XPackageFindChunkAvailability( pkg, identifier, 0, NULL, &avail );
     CHECK( SUCCEEDED( hr ) && avail == XPackageChunkAvailability_Ready,
            "FindChunkAvailability is Ready (%d)", avail );
 
-    hr = IXPackageImpl3_XPackageCreateInstallationMonitor( pkg, buf, 0, NULL, 0, NULL, &mon );
+    hr = IXPackageImpl3_XPackageCreateInstallationMonitor( pkg, identifier, 0, NULL, 0, NULL, &mon );
     CHECK( SUCCEEDED( hr ) && mon, "CreateInstallationMonitor returns a handle" );
     if (mon)
     {
@@ -553,6 +555,42 @@ static HRESULT CALLBACK provider_completes_in_begin( XAsyncOp op, const XAsyncPr
     }
 }
 
+static volatile LONG failed_begin_cleanups, failed_begin_callback_ok, failed_begin_cleanup_context_ok;
+static UINT32 failed_begin_cookie;
+
+static HRESULT CALLBACK provider_fails_in_begin( XAsyncOp op, const XAsyncProviderData *data )
+{
+    if (op == XAsyncOp_Cleanup)
+    {
+        if (data->async->context == &failed_begin_cookie)
+            InterlockedExchange( (LONG *)&failed_begin_cleanup_context_ok, 1 );
+        InterlockedIncrement( (LONG *)&failed_begin_cleanups );
+    }
+    return op == XAsyncOp_Begin ? E_FAIL : S_OK;
+}
+
+static HRESULT CALLBACK provider_completes_then_fails( XAsyncOp op, const XAsyncProviderData *data )
+{
+    HRESULT hr = provider_completes_in_begin( op, data );
+    return op == XAsyncOp_Begin ? E_FAIL : hr;
+}
+
+static HRESULT CALLBACK provider_completes_without_payload( XAsyncOp op, const XAsyncProviderData *data )
+{
+    if (op == XAsyncOp_Begin)
+        IXThreadingImpl_XAsyncComplete( threading_for_provider, data->async, S_OK, 0 );
+    return S_OK;
+}
+
+static void CALLBACK failed_begin_cb( XAsyncBlock *async )
+{
+    HRESULT hr = IXThreadingImpl_XAsyncGetStatus( threading_for_provider, async, FALSE );
+    if (hr == E_FAIL && !failed_begin_cleanups)
+        InterlockedExchange( (LONG *)&failed_begin_callback_ok, 1 );
+    VirtualFree( async, 0, MEM_RELEASE );
+    InterlockedExchange( (LONG *)&completion_ran, 1 );
+}
+
 static void CALLBACK early_completion_cb( XAsyncBlock *async )
 {
     if (InterlockedCompareExchange( (LONG *)&inside_begin, 0, 0 ))
@@ -735,7 +773,7 @@ static void test_xthreading(void)
 
         hr = IXThreadingImpl_XAsyncBegin( threading, &block, NULL, provider_completes_in_begin,
                                           "completes-in-begin", provider_completes_in_begin );
-        CHECK( hr == E_PENDING, "Begin reporting E_PENDING is passed through (0x%08lx)", hr );
+        CHECK( hr == S_OK, "a provider returning E_PENDING starts successfully (0x%08lx)", hr );
         CHECK( !called_back_inside_begin,
                "a completion raised inside Begin does not call back before Begin returns" );
 
@@ -747,6 +785,69 @@ static void test_xthreading(void)
         CHECK( hr == S_OK && value == EARLY_RESULT,
                "the operation survives E_PENDING and still has its result (0x%08lx, %#lx)",
                hr, (unsigned long)value );
+    }
+
+    {
+        XAsyncBlock *block = VirtualAlloc( NULL, sizeof(*block), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+        int waited;
+
+        CHECK( block != NULL, "allocate a disposable failed-Begin async block" );
+        if (!block) return;
+        block->callback = failed_begin_cb;
+        block->context = &failed_begin_cookie;
+        InterlockedExchange( (LONG *)&completion_ran, 0 );
+        InterlockedExchange( (LONG *)&failed_begin_cleanups, 0 );
+        InterlockedExchange( (LONG *)&failed_begin_callback_ok, 0 );
+        InterlockedExchange( (LONG *)&failed_begin_cleanup_context_ok, 0 );
+        hr = IXThreadingImpl_XAsyncBegin( threading, block, NULL, provider_fails_in_begin,
+                                          "fails-in-begin", provider_fails_in_begin );
+        CHECK( hr == S_OK, "provider failure is reported asynchronously after setup (0x%08lx)", hr );
+        for (waited = 0; waited < 200 && !failed_begin_cleanups; waited++) Sleep( 10 );
+        CHECK( completion_ran, "a failure returned by Begin delivers the completion callback" );
+        CHECK( failed_begin_callback_ok, "failed Begin reports E_FAIL before cleaning its provider" );
+        CHECK( failed_begin_cleanups == 1, "failed Begin cleans up exactly once without GetResult (%ld)",
+               failed_begin_cleanups );
+        CHECK( failed_begin_cleanup_context_ok, "Cleanup can read its async block after the callback frees the user's block" );
+    }
+
+    {
+        XAsyncBlock block = {0};
+        UINT32 value = 0;
+
+        block.context = &failed_begin_cookie;
+        InterlockedExchange( (LONG *)&failed_begin_cleanups, 0 );
+        hr = IXThreadingImpl_XAsyncBegin( threading, &block, NULL, provider_fails_in_begin,
+                                          "failure-without-callback", provider_fails_in_begin );
+        CHECK( hr == S_OK && failed_begin_cleanups == 1,
+               "failed Begin without a callback releases the provider (0x%08lx, %ld)", hr, failed_begin_cleanups );
+        hr = IXThreadingImpl_XAsyncGetStatus( threading, &block, FALSE );
+        CHECK( hr == E_FAIL, "failure remains readable after automatic cleanup (0x%08lx)", hr );
+        hr = IXThreadingImpl_XAsyncGetResult( threading, &block, provider_fails_in_begin, 0, NULL, NULL );
+        CHECK( hr == E_FAIL, "failed result remains readable after automatic cleanup (0x%08lx)", hr );
+
+        memset( &block, 0, sizeof(block) );
+        IXThreadingImpl_XAsyncBegin( threading, &block, NULL, provider_completes_without_payload,
+                                     "older-zero-payload", provider_completes_without_payload );
+        block.context = &failed_begin_cookie;
+        IXThreadingImpl_XAsyncBegin( threading, &block, NULL, provider_fails_in_begin,
+                                     "newer-failed-begin", provider_fails_in_begin );
+        hr = IXThreadingImpl_XAsyncGetResult( threading, &block, provider_fails_in_begin, 0, NULL, NULL );
+        CHECK( hr == E_FAIL, "a reused block returns its new Begin failure instead of an older result (0x%08lx)", hr );
+
+        IXThreadingImpl_XAsyncBegin( threading, &block, NULL, provider_b, "pending-after-failure", provider_b );
+        hr = IXThreadingImpl_XAsyncGetStatus( threading, &block, FALSE );
+        CHECK( hr == E_PENDING, "restarting a failed block clears its old terminal status (0x%08lx)", hr );
+        IXThreadingImpl_XAsyncComplete( threading, &block, S_OK, 0 );
+        IXThreadingImpl_XAsyncGetResult( threading, &block, provider_b, 0, NULL, NULL );
+
+        memset( &block, 0, sizeof(block) );
+        hr = IXThreadingImpl_XAsyncBegin( threading, &block, NULL, provider_completes_then_fails,
+                                          "success-before-begin-failure", provider_completes_then_fails );
+        CHECK( hr == S_OK, "inline completion followed by Begin failure still starts successfully (0x%08lx)", hr );
+        hr = IXThreadingImpl_XAsyncGetResult( threading, &block, provider_completes_then_fails,
+                                              sizeof(value), &value, NULL );
+        CHECK( hr == S_OK && value == EARLY_RESULT,
+               "an inline result wins over a later Begin failure (0x%08lx, %#lx)", hr, (unsigned long)value );
     }
 
     {

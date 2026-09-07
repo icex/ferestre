@@ -26,6 +26,7 @@
  *   click <x> <y>         move and left-click
  *   rclick <x> <y>        move and right-click
  *   key <VK hex>          tap a virtual key
+ *   hold <VK hex> <ms>    hold a virtual key, then release it (up to 60 seconds)
  *   text <string>         type a string
  *   wait <ms>             pause
  *   rect                  print the focused window's rectangle
@@ -110,16 +111,21 @@ static void button( DWORD down, DWORD up )
     SendInput( 1, &in, sizeof(in) );
 }
 
-static void tap_key( WORD vk )
+static void hold_key( WORD vk, DWORD ms )
 {
     INPUT in = { 0 };
 
     in.type = INPUT_KEYBOARD;
     in.ki.wVk = vk;
     SendInput( 1, &in, sizeof(in) );
-    Sleep( 40 );
+    Sleep( ms );
     in.ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput( 1, &in, sizeof(in) );
+}
+
+static void tap_key( WORD vk )
+{
+    hold_key( vk, 40 );
 }
 
 /* Client coordinates of the focused window, so a script does not depend on
@@ -191,6 +197,8 @@ static void run_script( const char *path )
             move_to( x, y );
         }
         else if (sscanf( line, "key %x", &vk ) == 1) tap_key( (WORD)vk );
+        else if (sscanf( line, "hold %x %d", &vk, &x ) == 2 && x >= 0 && x <= 60000)
+            hold_key( (WORD)vk, x );
         else if (!strncmp( line, "text ", 5 ))
         {
             const char *s = line + 5;
