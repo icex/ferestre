@@ -29,6 +29,48 @@ cd "$BUILD_DIR"
 echo ":: invalidating the wine source and build stamps"
 rm -f .wine-source .wine-x86_64-build .wine-x86_64-post-build .wine-x86_64-dist
 
+# Dropping the stamps makes the source stage run again; it does not make the
+# compiler run again. That stage rsyncs the submodule over $BUILD_DIR/src-wine
+# with -a, which preserves each file's modification time, so a source edited
+# hours ago arrives older than the object built from the previous version and
+# make has nothing to do. The build then "succeeds" in seconds and installs
+# exactly what was already there.
+#
+# It is a quiet failure and an expensive one: the runtime here sat four days
+# and several patches behind while reporting success, and the only visible sign
+# was capabilities.json dropping from 19 to 15 -- which is easy to read as a
+# verification problem rather than as the build not having happened.
+#
+# So give the files the series touches a current timestamp, in the submodule,
+# before the rsync copies them. Touching them in src-wine is no good: the
+# refresh overwrites those timestamps on the way in.
+echo ":: marking patched sources for rebuild"
+WINE_SRC=${WINE_SRC:-$XODUS_SRC_DIR/xodus-proton/wine}
+if [ -d "$WINE_SRC" ]; then
+    # `if`, not `[ -f ] && touch`: under `set -e` a false test as the last
+    # command of a loop body ends the script, so a patch naming a file that has
+    # since moved would abort the install rather than be skipped.
+    touched=0
+    touch_series() {
+        local dir=$1 p f
+        shift
+        for p in "$@"; do
+            [ -e "$p" ] || continue
+            while read -r f; do
+                if [ -f "$dir/$f" ]; then
+                    touch "$dir/$f"
+                    touched=$((touched + 1))
+                fi
+            done < <(sed -n 's|^+++ b/\(.*\)$|\1|p' "$p")
+        done
+    }
+    touch_series "$WINE_SRC" "$REPO_DIR"/patches/wine/*.patch
+    touch_series "$WINE_SRC/dlls/xgameruntime" "$REPO_DIR"/patches/xgameruntime/*.patch
+    echo "   $touched files"
+else
+    echo "   !! no wine tree at $WINE_SRC; set WINE_SRC if the build ships a stale runtime" >&2
+fi
+
 echo ":: building and installing (log: $BUILD_DIR/install.log)"
 # The exit status of a pipeline is the last command's, so a failed build would
 # otherwise be reported as success and the previous build left installed.
