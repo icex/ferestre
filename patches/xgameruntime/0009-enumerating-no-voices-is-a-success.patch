@@ -1,0 +1,24 @@
+diff --git a/xaccessibility.c b/xaccessibility.c
+--- a/xaccessibility.c
++++ b/xaccessibility.c
+@@ -103,8 +103,18 @@
+ 
+ static HRESULT WINAPI x_accessibility_XSpeechSynthesizerEnumerateInstalledVoices( IXAccessibilityImpl2 *iface, void *context, XSpeechSynthesizerInstalledVoicesCallback *callback )
+ {
+-    FIXME( "iface %p, context %p, callback %p stub!\n", iface, context, callback );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, context %p, callback %p.\n", iface, context, callback );
++
++    if (!callback) return E_INVALIDARG;
++
++    /* There is no speech synthesiser here, so there are no installed voices to
++     * report -- and reporting none is a success, not a failure. Windows returns
++     * S_OK and calls the callback once per voice; a machine with none simply
++     * gets no calls. E_NOTIMPL says something else entirely: that asking was
++     * invalid. A title that enumerates voices while starting up and is told the
++     * question does not exist has nothing sensible to do with that, and this is
++     * a question Forza Horizon 5 asks. */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI x_accessibility_XSpeechSynthesizerCreate( IXAccessibilityImpl2 *iface, XSpeechSynthesizerHandle *speechSynthesizer )

@@ -133,6 +133,7 @@ pub fn state_label(state: TitleState) -> (&'static str, &'static str) {
     match state {
         TitleState::Playable => ("Playable", "success"),
         TitleState::PlayableWithIssues => ("Issues", "warning"),
+        TitleState::Menus => ("Menus only", "warning"),
         TitleState::Broken => ("Does not run", "error"),
         TitleState::Untested => ("Untested", "dim-label"),
     }

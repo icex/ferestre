@@ -1,0 +1,49 @@
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1668,8 +1668,11 @@
+  */
+ NTSTATUS open_mapped_image_file( const UNICODE_STRING *nt_name, HANDLE *handle )
+ {
++    static const WCHAR globalrootW[] = {'\\','?','?','\\','G','l','o','b','a','l','R','o','o','t'};
+     const char *value = getenv( "WINE_DLL_FILE_MAP" );
+     const char *entry, *sep, *end;
++    const WCHAR *name;
++    unsigned int name_len;
+     char *utf8_name;
+     unsigned int allocLen;
+     NTSTATUS status;
+@@ -1678,11 +1681,30 @@
+     if (!value || !*value) return STATUS_DLL_NOT_FOUND;
+     if (!nt_name || !nt_name->Buffer || !nt_name->Length) return STATUS_DLL_NOT_FOUND;
+ 
+-    if ((status = utf8_wcstombs_size( nt_name->Buffer, nt_name->Length / sizeof(WCHAR), &allocLen )))
++    name = nt_name->Buffer;
++    name_len = nt_name->Length / sizeof(WCHAR);
++
++    /* \??\GlobalRoot\??\Z:\... names the same file as \??\Z:\..., and a title
++     * that wants the object namespace directly spells it the long way. The map
++     * is keyed by the short form, so without this the long one matches nothing
++     * and the caller is handed the file on disk -- which for these images is
++     * still encrypted.
++     *
++     * Forza Horizon 5 opens its own executable that way three times, read only,
++     * hashes what it reads and stops the process when the answer is wrong. The
++     * file layer strips this prefix a moment later in get_dos_prefix_len(); it
++     * has to be stripped here too, before the name is compared. */
++    if (name_len >= ARRAY_SIZE(globalrootW) && !wcsnicmp( name, globalrootW, ARRAY_SIZE(globalrootW) ))
++    {
++        name += ARRAY_SIZE(globalrootW);
++        name_len -= ARRAY_SIZE(globalrootW);
++    }
++    if (!name_len) return STATUS_DLL_NOT_FOUND;
++
++    if ((status = utf8_wcstombs_size( name, name_len, &allocLen )))
+         return status;
+     utf8_name = alloca( allocLen );
+-    if ((status = utf8_wcstombs( utf8_name, allocLen, &allocLen, nt_name->Buffer,
+-                                 nt_name->Length / sizeof(WCHAR) )))
++    if ((status = utf8_wcstombs( utf8_name, allocLen, &allocLen, name, name_len )))
+         return status;
+ 
+     for (entry = value; *entry; entry = *end ? end + 1 : end)

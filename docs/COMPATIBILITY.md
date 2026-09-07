@@ -18,10 +18,14 @@ the value of a report:
 - **A gap in this project.** The title asks for an API that is missing, stubbed,
   or subtly wrong, and says so in its own log. This is fixable, and the log line
   usually names the thing.
-- **The title defending itself.** Some Store builds carry code protection that
-  refuses to run under Wine. Forza Horizon 5 dies inside its own protection in a
-  static initialiser before any runtime API is reached. Nothing here will try to
-  defeat that.
+- **The title defending itself.** Some Store builds carry code protection, and
+  it is tempting to stop there. Be slow to: Forza Horizon 5 looked exactly like
+  that twice -- it dies in a static initialiser before reaching any runtime API,
+  inside code whose direct calls have been replaced by deliberately invalid
+  bytes -- and both times the real cause was this project telling it something
+  untrue about itself. It reaches the welcome screen now. Nothing here will try
+  to defeat a protection; a great deal here is making one work by answering it
+  honestly.
 
 So: **a clear failure report is worth as much as a success report.** "Does not
 launch" is worth nothing. "Exits with no window, last line is
@@ -46,7 +50,7 @@ your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
 | Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. | 2026-09-06 |
 | Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable, with issues | Boots and plays; the online features do not work. | 2026-09-06 |
-| Forza Horizon 5 | `9NNX1VVR3KNQ` | Does not run | Opens a window, renders its splash screen and loads real game data, then its own integrity layer hard-kills the process with 0x1100. Stops at: TerminateProcess on its own handle with exit code 0x1100, after writing an alternate data stream on its own executable and querying ProcessDebugObjectHandle. | 2026-09-07 |
+| Forza Horizon 5 | `9NNX1VVR3KNQ` | Starts, menus only | Reaches the welcome screen. Not taken further, so loading into a race, saves and multiplayer are unverified. Stops at: not verified past the welcome screen. | 2026-09-07 |
 | Halo Infinite | `9PP5G1F0C2B6` | Does not run | Gets through EasyAntiCheat's checks and into its Linux loader, which then cannot find the game binary: it looks in /proc/<pid>/maps, and a decrypted image mapped from a descriptor has no path there. Stops at: EasyAntiCheat bootstrapper exit 207, 'Failed to locate the game binary (Wine)', after 'Starting Wine module mapping, Wine version: 11.0'. | 2026-09-07 |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.

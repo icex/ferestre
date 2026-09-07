@@ -1,163 +1,48 @@
 # Forza Horizon 5 (Microsoft Store)
 #
-# Runs its own code-protection layer correctly now and stops somewhere else.
-# The history here is worth keeping, because three earlier versions of this
-# file were wrong in three different ways and the last one was wrong in the
-# expensive direction: it said the title defended itself against running here
-# and that nothing could be done about it.
+# Runs. It reaches the welcome screen.
 #
-# WHAT THE IMAGE ACTUALLY DOES
+# Getting here took five fixes and two wrong conclusions, both of which said
+# some version of "the title is defending itself and there is nothing to be
+# done". Neither was true. Every one of these was ours:
 #
-# Direct `call`/`jmp rel32` instructions are elided from part of the image.
-# Each is replaced by five bytes of filler whose first byte is an opcode with
-# no encoding in 64-bit mode -- 0xea, 0x9a, 0x3f, 0xd4, 0x16 and friends -- so
-# executing an unrestored one raises #UD immediately. That measurement was
-# right and still holds; tools/pe-holes.py reproduces it, and the same detector
-# on an ordinary DLL beside the game reports chance level.
+#   1. The image is mapped from a memfd, so NtQueryVirtualMemory with
+#      MemoryMappedFilenameInformation returned an empty string -- the title
+#      was told its own code came from nowhere, and the handler that restores
+#      its elided call sites declined the first one. patches/wine/0010.
+#   2. concrt140's _Internal_capacity counted a segment another thread was
+#      still allocating, so _Internal_reserve returned early and callers
+#      derived element pointers from the in-progress marker. patches/wine/0011.
+#   3. XGameGetXboxTitleId answered zero when MicrosoftGame.config carries the
+#      title id. patches/xgameruntime/0007.
+#   4. XPackageEnumeratePackages reported the package family name as the
+#      display name and blanks for description, publisher and store id.
+#      patches/xgameruntime/0008.
+#   5. And the one that was actually stopping it: patches/wine/0009 matched the
+#      image map by exact NT name, so \??\GlobalRoot\??\Z:\...\ForzaHorizon5.exe
+#      matched nothing. The title opens its own executable through that spelling
+#      -- three read-only opens -- hashes what it reads, and the bytes it got
+#      were the still-encrypted ones from disk. It then called TerminateProcess
+#      on itself with 0x1100. patches/wine/0013 strips the prefix before
+#      comparing, the way the file layer does a moment later.
 #
-# What was wrong was the conclusion. The title restores those instructions
-# itself, lazily, from a vectored handler: fault, patch the call site, resume.
-# It is not defending itself against Wine. It was declining to start.
+# The elided call sites are real and still there: about a third of its functions
+# have their direct calls replaced by five bytes of filler whose first byte has
+# no encoding in 64-bit mode, restored lazily from a vectored handler.
+# tools/pe-holes.py measures it. That mechanism works here -- 327,000 faults in
+# a startup, every one resumed -- and never needed defeating. It needed to be
+# told the truth about where its code lives.
 #
-# WHY IT DECLINED
+# WHAT IT DOES NOW
 #
-# Before its first elided call site, the title asks three times which file its
-# own image was mapped from -- NtQueryVirtualMemory with
-# MemoryMappedFilenameInformation on its image base. Wine answered that from
-# the server, the server answers from the name of the file the view was mapped
-# from, and a view mapped through WINE_DLL_FILE_MAP was mapped from a memfd,
-# which has no name in the NT namespace. So the query succeeded and returned an
-# empty string: the title was told its code came from nowhere, and its handler
-# then declined the first #UD and let the process die.
+#   * window: "Forza Horizon 5", confirmed through KWin's window list
+#   * splash, then the welcome screen
+#   * 342,000+ GDK calls and climbing, XTaskQueueDispatch pumping continuously
+#   * XUserGetGamertag, XUserGetId, XUserGetLocalId -- it has a signed-in user
+#   * loads its FMOD audio banks, including glb_radiopressstart and glb_ui
 #
-# On Windows the question is unremarkable -- the Store's filter driver decrypts
-# on read and the answer is the path. patches/wine/0010 answers it from the
-# PEB, which was handed the real path at process creation, for the current
-# process's own main image only. Sibling of patches/wine/0006, which fixed the
-# same cause for a different question.
-#
-# The difference that makes:
-#
-#   before   1 illegal instruction, unhandled, process dead at
-#            ForzaHorizon5.exe+0x53d5cec, 6,128 lines of log
-#   after    323,811 illegal instructions, every one resumed
-#            (EXCEPTION_CONTINUE_EXECUTION), 0 unhandled, ~1.5M lines
-#
-# That is the restorer doing exactly what it is for, several hundred thousand
-# times, on a title that previously did not survive the first one.
-#
-# THE SECOND THING IT HIT
-#
-# With the code restored, it got as far as a null write during startup and
-# left its own crash report behind, which is far more useful than a backtrace:
-#
-#   EXCEPTION      ACCESS_VIOLATION_WRITE
-#   EXCEPTION_INFO 0x0000000000000009
-#   STACK_TRACE    0x4f43b30,0x4f44427,0x4f493a2,0x4f64785,0x4b42852,0x8fdd96
-#   VRAM_BUDGET    14114820096          <- adapter enumeration already worked
-#   D3D_HR_ERROR   0x00000000
-#
-# The faulting instruction is `mov [rax+8], r15`, two instructions after an
-# import call whose result it treats as a pointer:
-#
-#   mov  edx, 0x10
-#   call qword [rip+0x15435bb]     ; CONCRT140.dll _Internal_push_back
-#   mov  rsi, rax
-#   mov  [rax+8], r15              ; faults, rax = 1
-#
-# That import is Concurrency::details::_Concurrent_vector_base_v4::
-# _Internal_push_back, which returns a pointer to the new element -- and Wine
-# returned 1. 1 is SEGMENT_ALLOC_MARKER, the value Wine's own concrt140 leaves
-# in the segment table while another thread allocates that segment.
-#
-# The race: _Internal_push_back calls _Internal_reserve, which asks
-# _Internal_capacity first, and that counts a segment as present when it is
-# merely non-NULL -- the marker included. So reserve returns early, push_back
-# computes `segment[seg] + element_size * 0`, gets 1, and hands that back. The
-# caller writes the first field at +8. 1 + 8 = 9, which is exactly the address
-# in the crash report. patches/wine/0011 makes push_back settle the segment
-# before deriving a pointer from it.
-#
-# That is a Wine bug rather than anything to do with this project, and worth
-# sending upstream: any multithreaded user of concurrent_vector can hit it.
-#
-# THE THIRD THING: IT DID NOT KNOW WHO IT WAS
-#
-# XGameGetXboxTitleId returned zero. MicrosoftGame.config carries the TitleId
-# (7900C3C7) and xgr_title_identity() already read it for the token endpoints,
-# so this was a blank where an answer was available -- and a title that asks
-# for its own identity is about to key something on it.
-#
-# patches/xgameruntime/0007 reports it. The difference is not subtle: the GDK
-# conversation goes from 217 calls to 7,735.
-#
-# THE FOURTH THING: THE PACKAGE DESCRIBED ITSELF WRONGLY TOO
-#
-# XPackageEnumeratePackages reported the package family name as the display
-# name and empty strings for description, publisher and store id, all of which
-# MicrosoftGame.config carries. patches/xgameruntime/0008 reports them.
-#
-# That one is not a straightforward win and the recipe says so. Isolated field
-# by field:
-#
-#   store id blank, everything else real   7,747 GDK calls, 939 poll iterations
-#   store id 9NNX1VVR3KNQ                    211 GDK calls, no poll
-#
-# With its real store id the title stops earlier and more quietly -- no crash,
-# no crash report, just an earlier exit. It is following the store id into a
-# path this runtime does not serve. Reporting it is still right: Windows does,
-# and the gap that opens up is in XStore rather than in the field.
-#
-# WHERE IT STOPS NOW, AND HOW
-#
-# It draws. A window appears -- "Forza Horizon 5", 5120x1440, confirmed through
-# KWin's window list rather than only seen -- the splash screen renders, and it
-# loads real game data: tm_api_lib_x64.dll, media/cms.zip, and batches of car
-# suspension physics out of media/physics/suspension.
-#
-# Then it kills itself. Not a crash and not an exit: TerminateProcess on its own
-# handle with 0x1100, which skips the orderly shutdown ExitProcess would run --
-# no DLL detach, no destructors, no message. Wine maps a status whose low byte
-# is zero to 1 on the way out, so Proton reports 1 and the process appears to
-# have simply vanished. patches/wine/0012 makes it say so instead.
-#
-# What the thread that does it was doing, immediately before:
-#
-#   NtCreateFile  "\??\GLOBALROOT\??\Z:\...\ForzaHorizon5.exe:4"
-#   NtSetInformationFile  FileEndOfFileInformation / FileAllocationInformation
-#   NtQueryInformationProcess (self, ProcessDebugObjectHandle)
-#   NtTerminateProcess  exit_code 0x1100
-#
-# It writes an alternate data stream on its own executable -- 323 KB of
-# high-entropy data, so the protection layer's own store -- asks whether it is
-# being debugged, and stops. Wine answers the debugger question correctly
-# (STATUS_PORT_NOT_SET; there is no debugger), and Wine materialises the stream
-# as a sibling file rather than a real NTFS stream, which is the one difference
-# visible from here.
-#
-# FileAllocationInformation was a stub and is now implemented, because it fired
-# in that sequence and shrinking below end of file is observable. It does not
-# change the outcome.
-#
-# So the remaining blocker is the title's own integrity machinery deciding it is
-# not satisfied. Working out what would satisfy it is defeating the protection
-# rather than porting around it, and that is not something this project will do.
-# Everything up to that point was ours and is fixed.
-#
-# Where it stops also moves with what the runtime tells it about itself, which
-# is worth keeping written down:
-#
-#   * told nothing (title id 0)     217 calls, stops after the networking
-#                                   port query
-#   * told its title id             7,735 calls, then 939 iterations of
-#                                   XPackageGetCurrentProcessPackageIdentifier
-#                                   and XPackageIsPackagedProcess, then out
-#   * told its store id as well     211 calls, and the self-kill above
-#
-# It is reproducible now, which it was not. Before the concrt140 capacity fix
-# the same launch alternated between 219 and 7,735 calls run to run and
-# sometimes died instead on a read fault inside RtlWakeAddressAll
-# (ntdll+0x3a880, +0x88) reading 0x2f5efbc0 -- an address that had gone away.
+# Not yet taken past the welcome screen, so this is `menus` and not `playable`.
+# Loading into a race, saves and multiplayer are all unverified.
 
 schema = 1
 
@@ -180,34 +65,35 @@ executable = 'ForzaHorizon5.exe'
 [runtime]
 requires = [
     "loader.memfd-main-image",
+    "loader.mapped-image-through-file-api",
     "loader.section-name-for-mapped-image",
     "concrt140.concurrent-vector-push-back",
     "xgameruntime.title-id",
     "xgameruntime.package-details",
-    "loader.file-allocation-and-abnormal-exit",
+    "xgameruntime.speech-voice-enumeration",
 ]
 
 [status]
-state         = "broken"
-blocked-by    = "title-protection"
-summary       = "Opens a window, renders its splash screen and loads real game data, then its own integrity layer hard-kills the process with 0x1100."
-stops-at      = "TerminateProcess on its own handle with exit code 0x1100, after writing an alternate data stream on its own executable and querying ProcessDebugObjectHandle"
+state         = "menus"
+summary       = "Reaches the welcome screen. Not taken further, so loading into a race, saves and multiplayer are unverified."
+stops-at      = "not verified past the welcome screen"
 last-verified = 2026-09-07
-verified-with = "ferestre run fh5 with WINEDEBUG=+seh; tools/pe-holes.py over the decrypted image, with an ordinary DLL as the control"
+verified-with = "ferestre run fh5; the window confirmed through KWin's window list, and the GDK trace showing XTaskQueueDispatch pumping and XUserGetGamertag answering"
 
 [[issues]]
 symptom   = "the game exits seconds after launch with no window; the log ends in an unhandled illegal instruction inside ForzaHorizon5.exe"
 cause     = "the title asks which file its own image was mapped from and is told nothing, because the image is mapped from a memfd that has no name in the NT namespace; its own handler then declines to restore the first elided call site"
-fix       = "fixed by patches/wine/0010: answer MemoryMappedFilenameInformation for the process's own main image from the PEB"
+fix       = "fixed by patches/wine/0010"
 log-match = "Unhandled illegal instruction at address .* \\(thread"
 
 [[issues]]
-symptom   = "the game exits during startup having drawn nothing, and leaves Upload_CrashReport.xml naming ACCESS_VIOLATION_WRITE at 0x0000000000000009"
-cause     = "concrt140's _Internal_push_back returned SEGMENT_ALLOC_MARKER (1) instead of a pointer to the new element, because _Internal_reserve counts a segment another thread is still allocating as capacity and returns early"
-fix       = "fixed by patches/wine/0011: settle the segment before deriving an element pointer from it"
+symptom   = "the game exits during startup and leaves Upload_CrashReport.xml naming ACCESS_VIOLATION_WRITE at 0x0000000000000009"
+cause     = "concrt140's _Internal_push_back returned SEGMENT_ALLOC_MARKER (1) instead of a pointer, because _Internal_capacity counts a segment another thread is still allocating as capacity"
+fix       = "fixed by patches/wine/0011"
 log-match = "ACCESS_VIOLATION_WRITE"
 
 [[issues]]
-symptom   = "the splash screen appears, the game loads assets, and the window closes again; the process exits 1"
-cause     = "the title's own integrity layer. It writes an encrypted alternate data stream on its own executable, queries ProcessDebugObjectHandle -- which Wine answers correctly -- and then calls TerminateProcess on itself with 0x1100, skipping the orderly shutdown entirely"
-fix       = "none this project will pursue: satisfying that machinery is defeating the protection rather than porting around it. Everything before it was ours and is fixed -- the elided call sites, a concrt140 race, a blank title id, blank package details and an unimplemented FileAllocationInformation"
+symptom   = "the splash screen appears, the window closes again, and the process exits 1 with no crash report and no fatal signal"
+cause   = "the title opens its own executable as \\??\\GlobalRoot\\??\\Z:\\... to verify it, that spelling did not match the image map, and it hashed the encrypted bytes on disk. It then called TerminateProcess on itself with 0x1100"
+fix       = "fixed by patches/wine/0013: strip the GlobalRoot prefix before matching, as the file layer does"
+log-match = "process terminating itself abnormally"

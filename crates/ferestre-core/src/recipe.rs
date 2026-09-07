@@ -18,6 +18,11 @@ pub enum TitleState {
     Playable,
     /// Runs, but with issues a person should know about before starting.
     PlayableWithIssues,
+    /// Starts and reaches its menus, but has not been taken into play. Separate
+    /// from `Playable` because "it launched" and "it plays" are different
+    /// claims, and separate from `Broken` because it is a long way from not
+    /// running at all.
+    Menus,
     /// Starts and does not get far enough to play.
     Broken,
     /// Has a recipe but nobody has run it.
@@ -34,6 +39,7 @@ impl TitleState {
         match self {
             TitleState::Playable => "playable",
             TitleState::PlayableWithIssues => "playable-with-issues",
+            TitleState::Menus => "menus",
             TitleState::Broken => "broken",
             TitleState::Untested => "untested",
         }

@@ -265,8 +265,11 @@ summary = """
 An image named in WINE_DLL_FILE_MAP is served from its descriptor when it is \
 opened read-only through the ordinary file API, not only when the loader maps \
 it, and each handle gets a file offset of its own."""
-provided-by = ["patches/wine/0009-serve-a-mapped-image-through-the-file-api.patch"]
-symptom-if-missing = "a launcher that validates the game it is about to start reads the still-encrypted bytes and refuses; Halo Infinite's EasyAntiCheat bootstrapper stops with 201, 'Invalid game executable path!', naming a file that is plainly there"
+provided-by = [
+    "patches/wine/0009-serve-a-mapped-image-through-the-file-api.patch",
+    "patches/wine/0013-match-the-globalroot-form-of-a-mapped-image-s-name.patch",
+]
+symptom-if-missing = "a launcher or an integrity check that reads the game's own image gets the still-encrypted bytes. Halo Infinite's EasyAntiCheat bootstrapper stops with 201, 'Invalid game executable path!', naming a file that is plainly there; Forza Horizon 5 hashes what it reads and kills its own process"
 note = """
 Windows has no split between the two: the Store's filter driver decrypts on \
 read, so anything that opens a package's executable sees a PE. Here the \
@@ -274,7 +277,13 @@ plaintext exists only behind a descriptor, and a title that inspects its own \
 payload rather than executing it saw ciphertext. The private file offset \
 matters as much as the substitution -- EasyAntiCheat reads all 83 MB of the \
 game binary, which on a shared descriptor would leave the loader's next read \
-at end of file."""
+at end of file.
+
+The name has to be matched in both spellings. \\??\\GlobalRoot\\??\\Z:\\... names \
+the same file as \\??\\Z:\\..., and a title reaching the object namespace \
+directly uses the long form: Forza Horizon 5 verifies its own executable that \
+way, and while only the short form matched it hashed the encrypted bytes and \
+stopped the process."""
 verify = [
     { file = "files/lib/wine/x86_64-unix/ntdll.so", contains = "served from the mapped image descriptor" },
 ]
@@ -375,4 +384,19 @@ can see. The warning is what turned "the process just disappeared" into "it \
 terminated itself with 0x1100", which took strace to learn the first time."""
 verify = [
     { file = "files/lib/wine/x86_64-unix/ntdll.so", contains = "process terminating itself abnormally" },
+]
+
+[[capability]]
+name = "xgameruntime.speech-voice-enumeration"
+summary = """
+XSpeechSynthesizerEnumerateInstalledVoices reports that there are no voices, \
+rather than failing with E_NOTIMPL."""
+provided-by = ["patches/xgameruntime/0009-enumerating-no-voices-is-a-success.patch"]
+symptom-if-missing = "a title that asks what speech voices exist during startup is told the question is invalid, which is not an answer it can carry on from"
+note = """
+There is no speech synthesiser here, so there are no voices -- and reporting \
+none is a success. Windows returns S_OK and calls the callback once per voice; \
+a machine with none simply gets no calls. Forza Horizon 5 asks."""
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "XSpeechSynthesizerCreate" },
 ]
