@@ -97,6 +97,12 @@ jobs:
       # The same series scripts/check-patches.sh verifies per push, applied for
       # real. If one has drifted, this is where the build stops -- before an
       # hour of compilation, not after it.
+      #
+      # Note for anyone reading a failure further down: Wine's configure turns
+      # on -Werror when it finds a .git, so this clone compiles more strictly
+      # than the local build tree does (which works from a copy with no .git).
+      # scripts/check-werror.sh reproduces that locally in about a minute --
+      # run it before pushing a patch that touches C.
       - name: Apply the patch series
         run: |
           set -euo pipefail

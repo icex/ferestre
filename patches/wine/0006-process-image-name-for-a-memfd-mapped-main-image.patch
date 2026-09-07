@@ -1,7 +1,8 @@
 diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
+index 83dc2d9..e910c62 100644
 --- a/dlls/ntdll/unix/process.c
 +++ b/dlls/ntdll/unix/process.c
-@@ -1167,6 +1167,7 @@
+@@ -1167,6 +1167,7 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
  {
      unsigned int ret = STATUS_SUCCESS;
      ULONG len = 0;
@@ -9,7 +10,7 @@ diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
  
      TRACE( "(%p,0x%08x,%p,0x%08x,%p)\n", handle, class, info, size, ret_len );
  
-@@ -1524,6 +1525,7 @@
+@@ -1524,6 +1525,7 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
      case ProcessImageFileName:
          /* FIXME: Should return a device path */
      case ProcessImageFileNameWin32:
@@ -17,7 +18,7 @@ diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
          SERVER_START_REQ( get_process_image_name )
          {
              const unsigned int min_size = sizeof(UNICODE_STRING) + sizeof(WCHAR);
-@@ -1543,8 +1545,44 @@
+@@ -1543,8 +1545,49 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
                  str->Buffer = (PWSTR)(str + 1);
                  str->Buffer[str->Length / sizeof(WCHAR)] = 0;
              }
@@ -38,14 +39,19 @@ diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
 +        if (!ret && server_had_no_name && info && handle == NtCurrentProcess() &&
 +            peb->ProcessParameters && peb->ProcessParameters->ImagePathName.Length)
 +        {
-+            const UNICODE_STRING *image = &peb->ProcessParameters->ImagePathName;
++            /* Declarations first, all of them: Wine builds with
++             * -Werror=declaration-after-statement whenever it is built from a
++             * git checkout, so a declaration below the TRACE compiles here and
++             * fails for anyone building from a clone. */
++            static const WCHAR ntprefix[] = { '\\','?','?','\\' };
 +            /* The NT form is the DOS path behind the \??\ prefix the server
 +             * would have stripped for the Win32 form. */
-+            TRACE( "image mapped from a memfd has no server name; answering from the PEB: %s\n",
-+                   debugstr_us( image ) );
-+            static const WCHAR ntprefix[] = { '\\','?','?','\\' };
++            const UNICODE_STRING *image = &peb->ProcessParameters->ImagePathName;
 +            unsigned int prefix = (class == ProcessImageFileNameWin32) ? 0 : sizeof(ntprefix);
 +            UNICODE_STRING *str = info;
++
++            TRACE( "image mapped from a memfd has no server name; answering from the PEB: %s\n",
++                   debugstr_us( image ) );
 +
 +            len = sizeof(UNICODE_STRING) + prefix + image->Length + sizeof(WCHAR);
 +            if (size < len) ret = STATUS_INFO_LENGTH_MISMATCH;
