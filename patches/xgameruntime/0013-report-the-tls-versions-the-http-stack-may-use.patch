@@ -1,0 +1,35 @@
+diff --git a/xnetworking.c b/xnetworking.c
+--- a/xnetworking.c
++++ b/xnetworking.c
+@@ -21,6 +21,9 @@
+ 
+ #include "private.h"
+ 
++/* for the WINHTTP_FLAG_SECURE_PROTOCOL_* mask the GDK reports below */
++#include <winhttp.h>
++
+ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+ 
+ struct x_networking
+@@ -129,8 +132,19 @@ static BOOLEAN WINAPI x_networking_XNetworkingUnregisterPreferredLocalUdpMultipl
+  *
+  * There is nothing to pin: XNetworkingVerifyServerCertificate below accepts the
+  * connection, so report no thumbprints and let the caller do the ordinary TLS
+- * validation it would otherwise do. */
+-static const XNetworkingSecurityInformation default_security_information;
++ * validation it would otherwise do.
++ *
++ * The protocol flags are not a formality either. The GDK documents them as a
++ * WINHTTP_FLAG_SECURE_PROTOCOL_* mask to be handed straight to
++ * WinHttpSetOption( WINHTTP_OPTION_SECURE_PROTOCOLS ), and a title that does
++ * exactly that with the zero this used to report tells WinHttp that no TLS
++ * version is permitted. Say the modern two instead, which is what a machine
++ * with a current policy allows and what every service the titles here talk to
++ * negotiates. */
++static const XNetworkingSecurityInformation default_security_information =
++{
++    WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3,
++};
+ 
+ static HRESULT security_information_result( XAsyncBlock *async, SIZE_T buffer_size, SIZE_T *buffer_used,
+                                             UINT8 *buffer, XNetworkingSecurityInformation **ptr_to_buffer )

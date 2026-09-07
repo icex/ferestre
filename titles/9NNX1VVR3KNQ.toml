@@ -84,12 +84,20 @@
 # crash in Minecraft). Establishing a title claim for a title whose config does
 # not name an MSA app is the next piece of work.
 #
-# Two smaller things found on the way, neither of them the cause:
-#   * `xodus-cli xbl-check` looks for MicrosoftGame.config; Forza ships
-#     MicrosoftGame.Config, and the client does not try both spellings.
-#   * the crash is not caused by pressing Start Game. It happens on its own
-#     about thirty seconds in as often as not; the earlier report that Start
-#     Game triggered it was the two coinciding.
+# Two smaller things found on the way, both fixed, neither the cause:
+#   * `xodus-cli xbl-check` looked only for MicrosoftGame.config; Forza ships
+#     MicrosoftGame.Config, which on a case-sensitive filesystem is a different
+#     file. patches/xodus-cli/0013.
+#   * XNetworkingQuerySecurityInformationForUrl reported a TLS protocol mask of
+#     zero, which the GDK documents as being passed straight to
+#     WinHttpSetOption( WINHTTP_OPTION_SECURE_PROTOCOLS ) -- so a title doing
+#     what the documentation says had configured its session to allow no TLS
+#     version at all. patches/xgameruntime/0013.
+#
+# And one thing worth knowing before testing it: the crash is not caused by
+# pressing Start Game. Across eight unattended runs it landed at about six
+# seconds in as often as thirty-seven, with and without a press; the earlier
+# report that Start Game triggered it was the two coinciding.
 #
 # Not taken past the welcome screen, so this is `menus` and not `playable`.
 # Loading into a race, saves and multiplayer are all unverified.
@@ -123,6 +131,7 @@ requires = [
     "xgameruntime.speech-voice-enumeration",
     "xgameruntime.async-provider-completed-in-begin",
     "xgameruntime.save-provider-default-scid",
+    "xnetworking.tls-protocol-flags",
 ]
 
 [status]

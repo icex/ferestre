@@ -479,3 +479,29 @@ its own terms."""
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "reporting the running game as a product" },
 ]
+
+[[capability]]
+name = "xnetworking.tls-protocol-flags"
+summary = """
+XNetworkingQuerySecurityInformationForUrl reports the TLS versions the HTTP \
+stack may use, instead of a mask with nothing set."""
+provided-by = ["patches/xgameruntime/0013-report-the-tls-versions-the-http-stack-may-use.patch"]
+symptom-if-missing = "a title that follows the documented pattern configures its WinHTTP session to permit no TLS version at all"
+note = """
+The GDK documents `enabledHttpSecurityProtocolFlags` as a \
+WINHTTP_FLAG_SECURE_PROTOCOL_* mask to be passed straight to \
+WinHttpSetOption( WINHTTP_OPTION_SECURE_PROTOCOLS ) for the URL it was asked \
+about. Reporting zero is not "no preference", it is "no protocol is allowed", \
+and a title doing exactly what the documentation says with it has configured \
+its session to refuse every handshake.
+
+TLS 1.2 and 1.3, which is what a current policy allows and what the services \
+these titles talk to negotiate. There are still no thumbprints, because there \
+is nothing to pin: XNetworkingVerifyServerCertificate accepts the connection \
+and the caller does its ordinary validation.
+
+Found while chasing Forza Horizon 5 and it did not change its outcome; kept \
+because a mask of zero is wrong on its own terms."""
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "XNetworkingQuerySecurityInformationForUrlUtf16Async" },
+]

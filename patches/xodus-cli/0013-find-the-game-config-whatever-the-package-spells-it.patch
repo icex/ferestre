@@ -1,0 +1,53 @@
+diff --git a/crates/xodus-cli/src/commands/xblcheck.rs b/crates/xodus-cli/src/commands/xblcheck.rs
+--- a/crates/xodus-cli/src/commands/xblcheck.rs
++++ b/crates/xodus-cli/src/commands/xblcheck.rs
+@@ -73,7 +73,26 @@ impl TitleIdentity {
+ /// The config spells TitleId in hexadecimal and every Xbox endpoint wants it
+ /// decimal, which is a conversion worth doing in exactly one place.
+ pub fn identity_from_game_dir(dir: &Path) -> Result<TitleIdentity, String> {
++    // The GDK documents the file as MicrosoftGame.config, but a package is
++    // free to ship any spelling of it and Forza Horizon 5 ships
++    // MicrosoftGame.Config. On the case-sensitive filesystem a Linux install
++    // lives on that is a different file, so look for the documented name and
++    // then for whatever the directory actually holds.
+     let path = dir.join("MicrosoftGame.config");
++    let path = if path.is_file() {
++        path
++    } else {
++        std::fs::read_dir(dir)
++            .ok()
++            .and_then(|entries| {
++                entries.filter_map(Result::ok).find(|e| {
++                    e.file_name()
++                        .to_str()
++                        .is_some_and(|n| n.eq_ignore_ascii_case("MicrosoftGame.config"))
++                })
++            })
++            .map_or(path, |e| e.path())
++    };
+     let xml =
+         std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+     let element = |name: &str| -> Option<String> {
+@@ -253,6 +272,22 @@ mod tests {
+         assert_eq!(id.scid(), "00000000-0000-0000-0000-000069c7aa31");
+     }
+ 
++    #[test]
++    fn the_config_is_found_whatever_the_package_spells_it() {
++        // Forza Horizon 5 ships MicrosoftGame.Config, which on the
++        // case-sensitive filesystem a Linux install lives on is a different
++        // file from the one the GDK documents.
++        let dir = tempfile::tempdir().expect("tempdir");
++        std::fs::write(
++            dir.path().join("MicrosoftGame.Config"),
++            "<Game><TitleId>7900C3C7</TitleId><MSAAppId>an-app-id</MSAAppId></Game>",
++        )
++        .expect("write");
++        let id = identity_from_game_dir(dir.path()).expect("parsed");
++        assert_eq!(id.title_id, 0x7900_C3C7);
++        assert_eq!(id.client_id, "an-app-id");
++    }
++
+     #[test]
+     fn a_config_missing_the_app_id_says_which_one_is_missing() {
+         let dir = tempfile::tempdir().expect("tempdir");
