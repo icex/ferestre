@@ -47,6 +47,7 @@ your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 | Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. | 2026-09-06 |
 | Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable, with issues | Boots and plays; the online features do not work. | 2026-09-06 |
 | Forza Horizon 5 | `9NNX1VVR3KNQ` | Does not run | Direct call sites are elided from about a third of its functions and the title's own restorer declines to put them back, so it dies calling one during static initialisation. Stops at: an illegal instruction (0xc000001d) at ForzaHorizon5.exe+0x53d5cec, reached through ucrtbase's _initterm, with no GDK call made first. | 2026-09-07 |
+| Halo Infinite | `9PP5G1F0C2B6` | Does not run | Gets through EasyAntiCheat's checks and into its Linux loader, which fetches its linux64 module and then cannot find the game binary. Stops at: EasyAntiCheat bootstrapper exit 207, 'Failed to locate the game binary (Wine)', after 'Starting Wine module mapping, Wine version: 11.0'. | 2026-09-07 |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.
 

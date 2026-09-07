@@ -1,0 +1,101 @@
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -4902,6 +4902,33 @@
+ 
+     if (alloc_size) FIXME( "alloc_size not supported\n" );
+ 
++    /* An image handed over through WINE_DLL_FILE_MAP exists decrypted only
++     * behind a file descriptor; the path it is named by still holds the
++     * encrypted bytes. Windows has no such split -- the Store's filter driver
++     * decrypts on read -- so a title that opens its own payload through the
++     * file API rather than the loader sees plaintext there and expects to.
++     *
++     * Halo Infinite is the case in point. Its EasyAntiCheat bootstrapper reads
++     * game\HaloInfinite.exe and calls GetBinaryTypeW on it before starting
++     * anything, gets ciphertext, and refuses with "Invalid game executable
++     * path!" -- naming a file that is plainly there.
++     *
++     * So answer reads of a mapped image from the descriptor. Only for opening
++     * something that already exists, and only when no write is asked for:
++     * anything that intends to modify the file wants the real one on disk, and
++     * silently giving it a private copy would lose the write.
++     */
++    if (disposition == FILE_OPEN && !(options & (FILE_DIRECTORY_FILE | FILE_OPEN_BY_FILE_ID)) &&
++        !(access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA |
++                    FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA | DELETE | WRITE_DAC | WRITE_OWNER)) &&
++        !open_mapped_image_file( attr->ObjectName, handle ))
++    {
++        TRACE( "%s served from the mapped image descriptor\n", debugstr_us(attr->ObjectName) );
++        io->Information = FILE_OPENED;
++        io->Status = STATUS_SUCCESS;
++        return STATUS_SUCCESS;
++    }
++
+     new_attr = *attr;
+     if (options & FILE_OPEN_BY_FILE_ID)
+     {
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1617,6 +1617,40 @@
+ 
+ 
+ /***********************************************************************
++ *           mapped_fd_to_handle
++ *
++ * Wrap one of the WINE_DLL_FILE_MAP descriptors in a file handle that has a
++ * file offset of its own.
++ *
++ * Handing the mapped descriptor to the server directly would share its offset
++ * with every other handle on it, and with the loader's own use of it. That is
++ * fine for one read of a PE header and wrong for anything else: Halo Infinite's
++ * EasyAntiCheat bootstrapper reads all 83 MB of the game executable to validate
++ * it, which would leave the next open positioned at end of file. Reopening
++ * through /proc/self/fd gives a new open file description on the same object,
++ * so each caller starts at zero.
++ *
++ * If /proc is not there, fall back to the descriptor itself rather than fail:
++ * a shared offset is still better than no image at all, and that is what this
++ * did before.
++ */
++static NTSTATUS mapped_fd_to_handle( int fd, HANDLE *handle )
++{
++    char path[32];
++    NTSTATUS status;
++    int own_fd;
++
++    snprintf( path, sizeof(path), "/proc/self/fd/%d", fd );
++    if ((own_fd = open( path, O_RDONLY )) == -1)
++        return wine_server_fd_to_handle( fd, GENERIC_READ | SYNCHRONIZE, 0, handle );
++
++    status = wine_server_fd_to_handle( own_fd, GENERIC_READ | SYNCHRONIZE, 0, handle );
++    close( own_fd );
++    return status;
++}
++
++
++/***********************************************************************
+  *           open_mapped_image_file
+  *
+  * Like open_mapped_dll_file(), but hands back a plain file handle for the
+@@ -1627,6 +1661,10 @@
+  * exists behind WINE_DLL_FILE_MAP. Without this, only DLLs can be loaded
+  * from the map -- a main executable is rejected before the child process's
+  * open_main_image() ever runs.
++ *
++ * NtCreateFile() uses it too, so that a title which opens its own payload
++ * through the ordinary file API reads the decrypted image rather than the
++ * still-encrypted bytes on disk.
+  */
+ NTSTATUS open_mapped_image_file( const UNICODE_STRING *nt_name, HANDLE *handle )
+ {
+@@ -1669,7 +1707,7 @@
+         len = end - sep - 1;
+         if (len != allocLen || strncmp( sep + 1, utf8_name, len )) continue;
+ 
+-        return wine_server_fd_to_handle( fd, GENERIC_READ | SYNCHRONIZE, 0, handle );
++        return mapped_fd_to_handle( fd, handle );
+     }
+     return STATUS_DLL_NOT_FOUND;
+ }
