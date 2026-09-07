@@ -274,24 +274,72 @@ honestly marked as unproven rather than planned.
       record is a JSON file anybody can edit, and `remove_dir_all` on a bad path
       is the one thing here that cannot be undone.
 
-- [ ] **Appx and Msix packages — the other 95%.** This runtime opens MSIXVC,
-      the container Xbox GDK titles ship in. Everything else in a typical Store
-      library is UWP: `Appx`, `AppxBundle`, `Msix`, `MsixBundle` and the
-      `E`-prefixed encrypted variants. Measured on a real account, that is 95 of
-      102 owned titles, and the window currently holds all of them back behind a
-      switch that says why.
+- [ ] **Appx and Msix packages.** This runtime opens MSIXVC, the container Xbox
+      GDK titles ship in. The rest of a Store library is `Appx`, `AppxBundle`,
+      `Msix`, `MsixBundle` and their `E`-prefixed encrypted variants, and the
+      window holds all of them back behind a switch that says why.
 
-      Not a small item, and worth being honest about the shape of it. A UWP app
-      is not a Win32 executable with a manifest beside it: it expects the
-      Windows app model -- package identity, an activation host, WinRT brokers,
-      the app container -- which is a different thing to stand up than the GDK
-      surface this project already builds. Some of that work exists in Wine and
-      in this fork already (package identity, `RegionPolicyEvaluator`), which is
-      the argument for it being possible rather than the argument for it being
-      quick.
+      **What it is actually worth, measured.** This used to say "95 of 102 owned
+      titles", which is true and misleading: on the development account the
+      non-MSIXVC set is 106 of 114 distinct products, and almost all of it is
+      *utilities* -- Windows Terminal, Python, iTunes, Netflix, the Ubuntu WSL
+      images, Lenovo and MSI tooling. The games in it are few and worth naming,
+      because they are the whole return on this item:
 
-      Worth doing in the order the library suggests: `AppxBundle` first, since
-      it is the single largest group.
+      | Game | Format |
+      |---|---|
+      | Forza Horizon 4 (and its demo, and the Forza Motorsport 7 demo) | `EAppxBundle` / `EAppx` |
+      | Asphalt 8, Microsoft Solitaire Collection, Microsoft Sudoku | `MsixBundle` |
+      | Hill Climb Racing, Perfect Piano | `AppxBundle` |
+      | Candy Crush Saga, Minecraft (the old UWP one), Forza Motorsport 6: Apex | `Appx` |
+
+      So the prize is Forza Horizon 4 plus a handful of casual titles -- not a
+      95% expansion of the library. Worth doing, worth not overselling. Note
+      also that Forza Horizon 5 is already recorded as `broken` for reasons
+      inside its own code protection, which is a caution about how far the
+      Forza entries would get even once they download.
+
+      **Downloading them is a different service, not a different file
+      extension.** Measured: `packagespc.xboxlive.com/GetBasePackage/<contentId>`
+      answers `{"PackageFound": false, "PackageFiles": []}` for Forza Horizon 4.
+      That service only ever serves XVD containers. Appx and Msix come from
+      Windows Update's delivery service, addressed by the `WuCategoryId` the
+      display catalog carries per SKU (`DisplaySkuAvailabilities[].Sku.
+      Properties.FulfillmentData.WuCategoryId`) -- so the work is the FE3 SOAP
+      flow (`GetCookie`, `SyncUpdates`, `GetExtendedUpdateInfo2`), not another
+      arm on the existing download path.
+
+      **And that service is behind a private PKI.** `fe3.delivery.mp.microsoft.com`
+      presents `*.delivery.mp.microsoft.com`, issued by `Microsoft Update Secure
+      Server CA 2.1`, issued in turn by `Microsoft Root Certificate Authority
+      2011` -- which is not in any public CA bundle, so the TLS handshake fails
+      before a single request is sent. `openssl verify -partial_chain -trusted`
+      against the intermediate says `OK`, so the chain is sound and the only
+      missing piece is trusting that root deliberately for that host. Worth
+      knowing up front: it presents as a certificate error, which reads like a
+      broken machine rather than like a design decision.
+
+      **One thing blocks it even earlier.** `get_content_id` in the client
+      accepts only a package whose `PlatformDependencies` name `Windows.Desktop`.
+      A UWP product declares `Windows.Universal`, so it never reaches the
+      delivery step at all -- it falls through to an interactive picker, which
+      in a launcher's non-interactive context fails as "Selection failed". The
+      launcher's own catalog code already knows the wider set
+      (`catalog::PC_PLATFORMS`); the two disagree.
+
+      **Running them is a second, separable half**, and it splits in a way the
+      format does not show. A package whose manifest says
+      `EntryPoint="Windows.FullTrustApplication"` is an ordinary Win32
+      executable in Store packaging -- the desktop bridge -- and this runtime
+      already provides most of what it needs, package identity included. A true
+      UWP app expects the app model: an activation host, WinRT brokers, the app
+      container. The first group is close; the second is a project.
+
+      So, in order: widen the platform check, trust the update root, implement
+      FE3 far enough to fetch one unencrypted `AppxBundle`, unpack it (it is an
+      OPC zip), and classify it from its manifest. That answers "which of these
+      are Win32 in disguise" with evidence instead of estimates, and it is the
+      point at which the size of the remaining work is knowable.
 
 - [x] **Differential updates — answered.** The roadmap said not to promise this
       until two builds of one large title had settled it. That experiment turned

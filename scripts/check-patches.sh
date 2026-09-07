@@ -150,7 +150,14 @@ if [ -d "$CLIENT_REPO/.git" ]; then
     if git -C "$CLIENT_REPO" cat-file -e "$CLIENT_BASE^{commit}" 2>/dev/null; then
         git -C "$CLIENT_REPO" worktree add -q --detach "$WORK/client" "$CLIENT_BASE"
         # In order: each is written against the tree the previous one leaves.
-        for p in "$REPO_DIR"/patches/xodus-cli/000[2-9]-*.patch; do
+        #
+        # Every patch except 0001, which is an earlier export of work that 0002
+        # already contains and fails to apply alongside it. Expressed as "skip
+        # 0001" rather than as a numeric range: the range that used to be here
+        # was 000[2-9], which stopped checking anything from 0010 onwards --
+        # silently, and exactly when a tenth patch was added.
+        for p in "$REPO_DIR"/patches/xodus-cli/*.patch; do
+            case $(basename "$p") in 0001-*) continue ;; esac
             name=$(basename "$p")
             if git -C "$WORK/client" apply --check "$p" 2>/dev/null; then
                 git -C "$WORK/client" apply "$p"

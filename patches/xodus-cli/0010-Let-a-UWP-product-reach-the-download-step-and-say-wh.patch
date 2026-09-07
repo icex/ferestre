@@ -1,0 +1,140 @@
+From 250b2c678d5104ab4d55208efb8b5a615e31c594 Mon Sep 17 00:00:00 2001
+From: Ice <icex@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 07:43:58 +0300
+Subject: [PATCH] Let a UWP product reach the download step, and say what it
+ found there
+
+Two changes, both about the same thing: a Store product that is not an
+MSIXVC currently fails in a way that describes something other than what
+is wrong.
+
+`get_content_id` accepted only a package declaring `Windows.Desktop`. A
+UWP product declares `Windows.Universal` (or, for older ones,
+`Windows.Windows8x`) and has no Desktop package at all, so it fell
+through to an interactive picker -- which, in a launcher's
+non-interactive context, is not a picker but "Selection failed". The
+launcher's own catalog code has known the wider set all along
+(`catalog::PC_PLATFORMS`); the two simply disagreed. Desktop still wins
+where a product ships both; the others are a fallback, taken only when
+there is no Desktop package to take.
+
+And the streaming path's "No .msixvc file found" now lists what the
+package response did hold. Measured while writing this:
+`packagespc.xboxlive.com/GetBasePackage` answers `PackageFound: false`
+with an empty file list for every Appx and Msix product -- Forza Horizon 4
+included -- because that service only ever serves XVD containers. Those
+packages come from Windows Update's delivery service instead. "No .msixvc
+file found" reads as "this product is broken"; "the package list came back
+empty" points at the real gap.
+
+Neither change downloads an Appx. They move the failure to where the work
+actually is, which docs/ROADMAP.md now describes with the measurements
+behind it.
+---
+ crates/xodus-cli/src/commands/streaming.rs | 20 ++++++++++++--
+ crates/xodus-cli/src/package.rs            | 31 +++++++++++++++++-----
+ 2 files changed, 42 insertions(+), 9 deletions(-)
+
+diff --git a/crates/xodus-cli/src/commands/streaming.rs b/crates/xodus-cli/src/commands/streaming.rs
+index 03d19b1..89bcd3d 100644
+--- a/crates/xodus-cli/src/commands/streaming.rs
++++ b/crates/xodus-cli/src/commands/streaming.rs
+@@ -104,7 +104,20 @@ pub async fn run(
+                 .iter()
+                 .find(|p| p.file_name.ends_with(".msixvc"))
+             else {
+-                eprintln!("No .msixvc file found");
++                // Name what was there instead. Every Store product resolves to
++                // a package list; only some of those lists hold an XVD
++                // container. The rest are Appx/Msix packages -- ordinary OPC
++                // zips, or their encrypted E-prefixed variants -- which this
++                // streaming path cannot open, and "No .msixvc file found" reads
++                // as "the product is broken" rather than "it ships in another
++                // format".
++                eprintln!("No .msixvc file found. This product ships as:");
++                for f in &package.package_files {
++                    eprintln!("  {}", f.file_name);
++                }
++                if package.package_files.is_empty() {
++                    eprintln!("  (nothing at all -- the package list came back empty)");
++                }
+                 return ExitCode::FAILURE;
+             };
+             format!(
+@@ -332,7 +345,10 @@ where
+         "open the download cache",
+         streaming::PrefixCacheFile::new(reader, l, cache_path.clone()).await,
+     );
+-    let remote_xvd = or_stop("read the package header", XvdFile::parse(&mut remote_file).await);
++    let remote_xvd = or_stop(
++        "read the package header",
++        XvdFile::parse(&mut remote_file).await,
++    );
+     let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
+     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
+ 
+diff --git a/crates/xodus-cli/src/package.rs b/crates/xodus-cli/src/package.rs
+index b2cbecf..fbaf948 100644
+--- a/crates/xodus-cli/src/package.rs
++++ b/crates/xodus-cli/src/package.rs
+@@ -21,17 +21,33 @@ pub async fn get_content_id(
+     let product_details = displaycatalog.product;
+ 
+     let mut found_package = None;
++    let mut fallback_package = None;
+     let mut subprods: Vec<String> = vec![];
+     'o: for availability in &product_details.display_sku_availabilities {
+         for package in &availability.sku.properties.packages {
+-            if package
+-                .platform_dependencies
+-                .iter()
+-                .any(|dep| dep.platform_name == "Windows.Desktop")
+-            {
++            let platform = |name: &str| {
++                package
++                    .platform_dependencies
++                    .iter()
++                    .any(|dep| dep.platform_name == name)
++            };
++            if platform("Windows.Desktop") {
+                 found_package = Some(package);
+                 break 'o;
+             }
++            // A UWP product declares Windows.Universal (or, for the older ones,
++            // Windows.Windows8x) and no Windows.Desktop package at all. Taking
++            // only Desktop meant every such product fell through to the picker
++            // below -- which, in a launcher's non-interactive context, is not a
++            // picker but a failure reading "Selection failed".
++            //
++            // Second, not first: where a product ships both, the Desktop
++            // package is the one to fetch, and the loop above still wins.
++            if fallback_package.is_none()
++                && (platform("Windows.Universal") || platform("Windows.Windows8x"))
++            {
++                fallback_package = Some(package);
++            }
+         }
+         for availability in &availability.availabilities {
+             if let Some(licensing_data) = &availability.licensing_data {
+@@ -49,7 +65,7 @@ pub async fn get_content_id(
+     subprods.sort();
+     subprods.dedup();
+ 
+-    let Some(package) = found_package else {
++    let Some(package) = found_package.or(fallback_package) else {
+         if !subprods.is_empty() {
+             let Ok(item) = Select::new("Select files to download", subprods)
+                 .with_page_size(30)
+@@ -61,7 +77,8 @@ pub async fn get_content_id(
+         }
+ 
+         return Err(Box::new(std::io::Error::other(
+-            "Windows.Desktop package not found, if you believe this is an error, please report it",
++            "no PC package found (Windows.Desktop, Windows.Universal or Windows.Windows8x); \
++             if you believe this is an error, please report it",
+         )));
+     };
+ 
+-- 
+2.55.0
+
