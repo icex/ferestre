@@ -46,7 +46,7 @@ your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
 | Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. | 2026-09-06 |
 | Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable, with issues | Boots and plays; the online features do not work. | 2026-09-06 |
-| Forza Horizon 5 | `9NNX1VVR3KNQ` | Does not run | Downloads and decrypts; dies inside its own code protection before any runtime API is reached. Stops at: an illegal instruction (0xc000001d) at ForzaHorizon5.exe+0x53d5cec, reached through ucrtbase -- the C++ static-initialiser path -- with no GDK call made first. | 2026-09-05 |
+| Forza Horizon 5 | `9NNX1VVR3KNQ` | Does not run | Downloads and decrypts; 4.33% of its functions are not executable code in the image we produce, and it dies calling one of them. Stops at: an illegal instruction (0xc000001d) at ForzaHorizon5.exe+0x53d5cec, reached through ucrtbase -- the C++ static-initialiser path -- with no GDK call made first. | 2026-09-07 |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.
 

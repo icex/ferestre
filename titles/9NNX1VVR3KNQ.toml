@@ -1,10 +1,39 @@
 # Forza Horizon 5 (Microsoft Store)
 #
-# Downloads and decrypts correctly and does not run. The failure is inside the
-# title's own code protection, before it calls anything this project implements,
-# so there is nothing here to fix and no capability that would change it. The
-# recipe exists so the launch path is ready if the title ever changes, and so
-# the compatibility matrix can say precisely where it stops instead of "no".
+# Downloads, decrypts and does not run. What follows is measured, because the
+# earlier wording here ("in-binary code protection that refuses to run here")
+# asserted a mechanism that the evidence does not support.
+#
+# The container decrypt is sound. Against the decrypted image:
+#   * all 459,561 .pdata entries are ordered and in range;
+#   * 23 of 24 runs of CC padding are followed by a 16-byte-aligned byte, so
+#     function alignment is intact;
+#   * 95.67% of function entries begin with textbook MSVC prologue bytes
+#     (0x48 x166,526, 0x40 x92,352, 0x4c x4,732).
+# A wrong key does not produce that.
+#
+# The other 4.33% is the problem: 19,878 function bodies are not x86-64 code.
+# They are not random either -- two of them at different addresses decrypt from
+# completely different ciphertext (0/88 bytes shared) to near-identical
+# plaintext (82/88 bytes shared), so the cipher is doing genuine
+# position-dependent work and that content is really what is there.
+#
+# The crash is a linker-emitted direct `call rel32` into one of them, which
+# .pdata confirms is a function entry (0x53d5cec..0x53d5e5c).
+#
+# Three things that would explain it, and do not:
+#   * TLS callbacks. Both run and return normally (WINE_TRACE_TLS=1).
+#   * A lazy unpacker keyed off the fault. The title's own vectored handler is
+#     called for the illegal instruction and returns 0 -- it declines it.
+#   * An unpacker at all. Nothing in the process ever calls
+#     NtProtectVirtualMemory over those addresses, so nothing intends to write
+#     them.
+# And .xbld holds only GRDK build strings; .detourc/.detourd are empty Detours
+# scaffolding. There is no protection stub here doing anything.
+#
+# So: a second encryption layer that the container decrypt does not undo, and
+# that nothing in the process undoes either. Where that layer comes from is the
+# open question -- the next place to look is the container, not the title.
 
 schema = 1
 
@@ -34,14 +63,14 @@ requires = ["loader.memfd-main-image"]
 
 [status]
 state         = "broken"
-blocked-by    = "title-protection"
-summary       = "Downloads and decrypts; dies inside its own code protection before any runtime API is reached."
+blocked-by    = "unknown"
+summary       = "Downloads and decrypts; 4.33% of its functions are not executable code in the image we produce, and it dies calling one of them."
 stops-at      = "an illegal instruction (0xc000001d) at ForzaHorizon5.exe+0x53d5cec, reached through ucrtbase -- the C++ static-initialiser path -- with no GDK call made first"
-last-verified = 2026-09-05
-verified-with = "scripts/launch-fh5.sh with WINEDEBUG=+seh; the backtrace ends in the title's own code"
+last-verified = 2026-09-07
+verified-with = "ferestre run fh5 with WINEDEBUG=+seh and WINE_TRACE_TLS=1; the decrypted image read back from the client's memfd and checked against its own .pdata"
 
 [[issues]]
 symptom   = "the game exits seconds after launch with no window; the log ends in an unhandled illegal instruction inside ForzaHorizon5.exe"
-cause     = "in-binary code protection that refuses to run here; it is not a missing Windows API"
-fix       = "none known. Do not report this as a runtime gap without a trace that shows a GDK call failing first"
+cause     = "unknown. 19,878 of 459,561 functions decrypt to something that is not x86-64 code, consistently and reproducibly, and nothing in the process ever writes those pages"
+fix       = "none known. It is not a missing Windows API -- no GDK call is made first -- and it is not an unpacker this runtime prevents, because there is no unpacker. Look at the container before the title"
 log-match = "Unhandled illegal instruction at address .* \\(thread"
