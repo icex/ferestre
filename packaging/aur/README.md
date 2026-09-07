@@ -196,46 +196,33 @@ detected and not included". Those are the documented gaps, not oversights.
 
 ## The client fork, pinned
 
-**This package cannot build today.** Its patch sources are raw URLs into this
-repository, and this repository is private, so `makepkg` gets a 404 for every
-one of them. That is a visibility setting, not a packaging problem, and nothing
-else in `packaging/` depends on it.
+`ferestre-client` pins upstream commit `3e75c9f` and applies patches `0002`
+through `0015` in order. The patch sources are public URLs pinned to a Ferestre
+commit, with SHA-256 checksums. Patch `0001` is an earlier overlapping export
+and is deliberately excluded.
 
-`ferestre-client` does not track upstream. It pins upstream commit `3e75c9f` and
-applies four of the five patches in `patches/xodus-cli/`. That is not
-arbitrary — it was verified by applying them, in order, into a clean worktree
-at that commit, and type-checking the result:
+The PKGBUILD uses one `_patches` array for downloading, applying and installing
+the corresponding source. Client patch `0014` supplies metadata-driven title
+authentication and service discovery; `0015` keeps diagnostic memfd labels within
+Linux's length limit. Updating only the runtime does not install these fixes.
 
-- upstream `3e75c9f` + `0002` reproduces the fork's working tree **byte for
-  byte, except `Cargo.lock`** (and the patch's lock is the better of the two: it
-  carries the `p256`/`rand_core`/`base64` entries the fork's committed lock is
-  missing, so `cargo build --locked` works after patching).
-- `0003`, `0004` and `0005` apply cleanly on top of that, in that order.
-- `0001` is an earlier export of work `0002` already contains. Applying both
-  fails. It is not in the source array.
+Validation on 2026-09-07 applied the complete series to a clean upstream
+worktree, reproduced every modified client file, built the release CLI/service,
+and passed 48 offline client tests. All 14 pinned patch URLs were fetched and
+matched their package checksums. Live title discovery passed for Windows and
+SISU titles, including cache reuse after switching titles. This is not a clean
+Arch build-chroot result.
 
-`0004` had the same disease as `0001` and was re-exported to cure it: it was cut
-from a commit that had swept in the then-uncommitted collections work, so it
-carried `0003`'s changes and could not apply after it. Exporting a patch from a
-dirty tree is how this series keeps acquiring overlaps, and applying it into a
-clean worktree is the only check that catches them.
-
-Two consequences worth stating plainly. First, `patches/xodus-cli/` is not a
-clean series against one base — `0001` applies to today's upstream `main`,
-`0002` and `0003` to a base three commits older — and packaging it is what
-exposed that. Second, bumping the pin means rebasing the patches by hand, which
-is the maintenance cost the roadmap's open question 3 ("how the client is
-carried — vendored, submodule, or a maintained fork") is really about. **When
-the fork becomes a repository, this PKGBUILD loses `prepare()` and both patch
-sources and becomes six lines shorter.**
+Bumping the upstream pin requires rebasing and rechecking the series. Bumping
+`_patchrev` requires regenerating checksums and `.SRCINFO`, then verifying the
+public URLs. A local working tree cannot prove those remote sources exist.
 
 ## What is not done here
 
 - **No release exists**, so `ferestre-runtime-bin` cannot be built as written. Its
   checksum is a placeholder and everything else about it is real.
-- **The client was not built.** Patch application was verified; the compile was
-  not. `0003` in particular arrived as a patch file with no corresponding commit
-  in the client checkout.
+- **No complete client package build in an Arch chroot.** The patched release
+  CLI/service build and focused tests pass on the development system.
 - **No `namcap` run.** It is not installed on the development machine.
 - **No systemd user unit for `xodus-service`.** `launch-gdk.sh` starts it with
   `nohup` if `pgrep` does not find it, and a unit would be a second way to do

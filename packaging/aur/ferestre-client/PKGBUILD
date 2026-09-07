@@ -23,7 +23,7 @@
 
 pkgname=ferestre-client
 pkgver=0.1.0.r130.g3e75c9f
-pkgrel=1
+pkgrel=2
 pkgdesc='Xodus client for Microsoft Store titles, with the ferestre patches (sign-in, licences, MSIXVC download and decrypt)'
 arch=('x86_64')
 url='https://github.com/xodus-gaming/xodus'
@@ -80,19 +80,32 @@ _commit=3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
 # happened once already. If the history is ever rewritten again, repin here and
 # in .SRCINFO, and regenerate the sha256sums -- the patch files themselves may
 # have changed too.
-_patchrev=9e9925fda3eb98e039fa40bf11bcf896b496697b
+_patchrev=bc6c9c3fb273074f2eef3d5f6893ec804bbb83c3
 _patchurl="https://raw.githubusercontent.com/icex/ferestre/$_patchrev/patches/xodus-cli"
 
-source=(
-  "xodus::git+https://github.com/xodus-gaming/xodus.git#commit=$_commit"
-  "$_patchurl/0002-relying-party-device-claim-and-no-panic.patch"
-  "$_patchurl/0003-owned-title-enumeration.patch"
-  "$_patchurl/0004-account-and-probe-headers.patch"
-  "$_patchurl/0005-win32-path-for-the-mapped-main-image.patch"
-  "$_patchurl/0006-streaming-progress-a-launcher-can-read-behind-XODUS_.patch"
-  "$_patchurl/0007-streaming-report-a-failed-download-instead-of-panick.patch"
-  "$_patchurl/0008-streaming-cached_len-must-mean-on-disk-not-accepted-.patch"
+# Every patch after 0001 is part of one ordered series. Keep the downloaded,
+# applied and installed corresponding source lists together.
+_patches=(
+  "0002-relying-party-device-claim-and-no-panic.patch"
+  "0003-owned-title-enumeration.patch"
+  "0004-account-and-probe-headers.patch"
+  "0005-win32-path-for-the-mapped-main-image.patch"
+  "0006-streaming-progress-a-launcher-can-read-behind-XODUS_.patch"
+  "0007-streaming-report-a-failed-download-instead-of-panick.patch"
+  "0008-streaming-cached_len-must-mean-on-disk-not-accepted-.patch"
+  "0009-xsts-mint-the-token-with-the-running-title-s-claim-n.patch"
+  "0010-Let-a-UWP-product-reach-the-download-step-and-say-wh.patch"
+  "0011-extract-a-container-that-stops-short-is-not-a-crash.patch"
+  "0012-name-the-mapped-image-descriptor-after-its-file.patch"
+  "0013-find-the-game-config-whatever-the-package-spells-it.patch"
+  "0014-metadata-driven-title-authentication-and-service-discovery.patch"
+  "0015-bound-memfd-diagnostic-labels.patch"
 )
+source=("xodus::git+https://github.com/xodus-gaming/xodus.git#commit=$_commit")
+for _patch in "${_patches[@]}"; do
+  source+=("$_patchurl/$_patch")
+done
+unset _patch
 sha256sums=(
   'SKIP'
   '20d613add707a69f488b50041e53c60f8a0096132c05338b66d594fa8963c918'
@@ -102,26 +115,23 @@ sha256sums=(
   'ab51b007ed0b8802785be1b000ba78185f25760850174de55e2667ed64ac4a2d'
   'fae49957d9fb4725627c16c7c80224601c2102d772cfa54bb3dd9cb9dc996a0d'
   'f5943458e255ec7894c92b464db214f183f5681287f3d0189d31bb8771b908c1'
+  'a45372720aa4e3363a87f7a69e27cf448c76d2801d25b30b561f28828a8d51f0'
+  'b0e6618c9d86ed312cc1eeb43d124ae6cba591ad70b7151f907f7bcb41c89ca6'
+  '7dd5152e24b082d55f9a942e2f2698efe5de6d7c3ac80390d23d5239c858964a'
+  '46f134e88343abf8cffaead28ed3295bb061aa9a9a8139e17190322f89b29c1f'
+  'e8a57479b49ddd74d4822536012728424b0c42188d7c3d76eee03d46f1d417f6'
+  '70a2d6ba71e8834213fb3cb2e7bd423e9b9e243a7d78c1832854e006b1810ee9'
+  '986af4b4508f2887ce7851b046145d5652db746052a40f659efa10136c8e7b84'
 )
 
 prepare() {
   cd "$srcdir/xodus"
 
-  # In order, and the order is load-bearing: 0004 was cut from a tree that
-  # already had 0003, and 0005 changes a line 0002 does not touch. Verified by
-  # applying all five onto 3e75c9f in a clean worktree and type-checking.
-  #
-  # 0006 is what lets a launcher draw a progress bar: without it the client's
-  # own bar hides itself whenever stdout is not a terminal, and a front end has
-  # a multi-gigabyte download and nothing to show for it.
-  git apply -v \
-    "$srcdir/0002-relying-party-device-claim-and-no-panic.patch" \
-    "$srcdir/0003-owned-title-enumeration.patch" \
-    "$srcdir/0004-account-and-probe-headers.patch" \
-    "$srcdir/0005-win32-path-for-the-mapped-main-image.patch" \
-    "$srcdir/0006-streaming-progress-a-launcher-can-read-behind-XODUS_.patch" \
-    "$srcdir/0007-streaming-report-a-failed-download-instead-of-panick.patch" \
-    "$srcdir/0008-streaming-cached_len-must-mean-on-disk-not-accepted-.patch"
+  # Apply in order: each patch targets the tree left by its predecessor.
+  local patch
+  for patch in "${_patches[@]}"; do
+    git apply -v "$srcdir/$patch"
+  done
 
   # Fetch after patching: the patches change Cargo.toml and Cargo.lock, and the
   # build below is offline.
@@ -159,18 +169,9 @@ package() {
 
   # The corresponding source for a GPL-3.0 binary is upstream plus these; ship
   # them so the package carries its own provenance.
-  install -Dm644 "$srcdir/0002-relying-party-device-claim-and-no-panic.patch" \
-    "$pkgdir/usr/share/licenses/$pkgname/patches/0002-relying-party-device-claim-and-no-panic.patch"
-  install -Dm644 "$srcdir/0003-owned-title-enumeration.patch" \
-    "$pkgdir/usr/share/licenses/$pkgname/patches/0003-owned-title-enumeration.patch"
-  install -Dm644 "$srcdir/0004-account-and-probe-headers.patch" \
-    "$pkgdir/usr/share/licenses/$pkgname/patches/0004-account-and-probe-headers.patch"
-  install -Dm644 "$srcdir/0005-win32-path-for-the-mapped-main-image.patch" \
-    "$pkgdir/usr/share/licenses/$pkgname/patches/0005-win32-path-for-the-mapped-main-image.patch"
-  install -Dm644 "$srcdir/0006-streaming-progress-a-launcher-can-read-behind-XODUS_.patch" \
-    "$pkgdir/usr/share/licenses/$pkgname/patches/0006-streaming-progress-a-launcher-can-read-behind-XODUS_.patch"
-  install -Dm644 "$srcdir/0007-streaming-report-a-failed-download-instead-of-panick.patch" \
-    "$pkgdir/usr/share/licenses/$pkgname/patches/0007-streaming-report-a-failed-download-instead-of-panick.patch"
-  install -Dm644 "$srcdir/0008-streaming-cached_len-must-mean-on-disk-not-accepted-.patch" \
-    "$pkgdir/usr/share/licenses/$pkgname/patches/0008-streaming-cached_len-must-mean-on-disk-not-accepted-.patch"
+  local patch
+  for patch in "${_patches[@]}"; do
+    install -Dm644 "$srcdir/$patch" \
+      "$pkgdir/usr/share/licenses/$pkgname/patches/$patch"
+  done
 }
