@@ -26,7 +26,7 @@
 # image answer from its descriptor, and gives each handle a file offset of its
 # own so an 83 MB read does not leave the loader's next open at end of file.
 #
-# WHERE IT STOPS NOW
+# WHERE IT STOPS NOW, AND WHY
 #
 # With that in place the bootstrapper gets through its checks and runs EAC's
 # Linux path properly:
@@ -39,22 +39,37 @@
 #   Starting Wine module mapping, Wine version: 11.0.
 #   Launcher finished with: 207, 'Failed to locate the game binary (Wine)'.
 #
-# It fetches its 9.7 MB linux64 module and begins Wine module mapping, then
-# cannot find the game binary. Not yet measured which half of that is ours:
+# It fetches its 9.7 MB linux64 module, maps it, and then cannot find the game
+# binary. Two milliseconds into "Starting Wine module mapping" it does this:
 #
-#   * This Proton fork has no anti-cheat runtime support at all. Nothing in the
-#     `proton` script mentions EasyAntiCheat, and PROTON_EAC_RUNTIME -- which
-#     upstream uses to point the module at the runtime it needs -- is not among
-#     the variables it reads. No EasyAntiCheat Runtime is installed here either.
-#   * EAC's native module may be opening the game binary through Linux rather
-#     than through Wine, in which case it reaches the encrypted bytes on disk
-#     and patch 0009 cannot help it, because it never goes through NtCreateFile.
+#   open("/proc/16452/maps", O_RDONLY) = 49
 #
-# Those are distinguishable -- strace the launch and see whether the Unix path
-# is opened natively -- and that is the next thing to do, not a guess to record
-# as a cause.
+# and that is the whole answer. EasyAntiCheat locates the game binary by
+# looking for a mapping backed by it. Against a Steam install it finds
+# ".../HaloInfinite.exe" there, which is why the Steam build of this game runs
+# under Proton. Against ours it finds this:
 #
-# Two further walls are visible and neither has been reached yet: the multiplayer
+#   140000000-140001000 r--p ... /memfd:xodus (deleted)
+#   140001000-14022a000 r-xp ... (anonymous, no name at all)
+#
+# The decrypted image only exists behind a descriptor, so the executable pages
+# are anonymous and the base carries a memfd name rather than a path. Nowhere
+# in /proc/<pid>/maps does the game's path appear.
+#
+# Naming the descriptor after the file it holds was worth trying and is not
+# enough: with "/memfd:HaloInfinite.exe (deleted)" in the map it still stops
+# with the same 207, so EAC is matching the path and not the leaf. That change
+# is kept anyway (patches/xodus-cli/0012) because it makes a process with
+# several images mapped legible while debugging.
+#
+# So no Wine-side change can answer this. patches/wine/0009 fixed everything
+# that goes through the file API; this does not. The image has to be mapped
+# from a real file at its real path, which means presenting the decrypted
+# bytes there -- a view over the install directory rather than plaintext
+# written to disk. That is a component this project does not have yet, and it
+# would fix any title that inspects its own mappings, not just this one.
+#
+# Two further walls are visible and neither has been reached: the multiplayer
 # side needs EAC to actually attach, and subgames\CampaignS1 ships a
 # start_protected_game.exe, which is a Denuvo launcher.
 
@@ -86,11 +101,11 @@ requires = [
 
 [status]
 state         = "broken"
-blocked-by    = "runtime-gap"
-summary       = "Gets through EasyAntiCheat's checks and into its Linux loader, which fetches its linux64 module and then cannot find the game binary."
+blocked-by    = "client-gap"
+summary       = "Gets through EasyAntiCheat's checks and into its Linux loader, which then cannot find the game binary: it looks in /proc/<pid>/maps, and a decrypted image mapped from a descriptor has no path there."
 stops-at      = "EasyAntiCheat bootstrapper exit 207, 'Failed to locate the game binary (Wine)', after 'Starting Wine module mapping, Wine version: 11.0'"
 last-verified = 2026-09-07
-verified-with = "ferestre run halo-infinite with WINEDEBUG=+file; the bootstrapper's own anticheatlauncher.log under AppData/Roaming/EasyAntiCheat in the prefix"
+verified-with = "ferestre run halo-infinite under strace -f -e trace=%file; the bootstrapper's own anticheatlauncher.log in the prefix; and /proc/<pid>/maps of the running process"
 
 [[issues]]
 symptom   = "the launcher window appears and reports an invalid game executable path, naming a file that exists"
@@ -100,6 +115,6 @@ log-match = "Invalid game executable path"
 
 [[issues]]
 symptom   = "the launcher window appears, downloads for a moment, then stops with nothing started"
-cause     = "unmeasured. EasyAntiCheat's Linux module maps and then reports it cannot locate the game binary. This Proton fork has no anti-cheat runtime support, and EAC may also be opening the binary natively rather than through Wine, where it is still encrypted"
-fix       = "none yet. Establish first whether the Unix path is opened natively (strace the launch); if it is, no Wine-side change can answer it and the image would have to be presented at that path"
+cause     = "EasyAntiCheat reads /proc/<pid>/maps to find the game binary. The decrypted image is mapped from a memfd, so its executable pages are anonymous and its base is named /memfd:... rather than the game's path, and EAC finds nothing to match"
+fix       = "none in Wine: this never goes through the file API, so patches/wine/0009 cannot reach it, and naming the descriptor after the executable is not enough either (tried; still 207). It needs the image mapped from a real file at the real path -- a decrypting view over the install directory"
 log-match = "Failed to locate the game binary"

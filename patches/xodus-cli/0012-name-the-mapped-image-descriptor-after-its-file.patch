@@ -1,0 +1,53 @@
+diff --git a/crates/xodus-cli/src/commands/run.rs b/crates/xodus-cli/src/commands/run.rs
+index 5a052e7..26bde19 100644
+--- a/crates/xodus-cli/src/commands/run.rs
++++ b/crates/xodus-cli/src/commands/run.rs
+@@ -18,14 +18,36 @@ use xodus::tokens::TokenManager;
+ 
+ use crate::license::get_license;
+ 
++/// Name the descriptor after the file it holds.
++///
++/// A memfd's name is what /proc/<pid>/maps and /proc/<pid>/fd show for it, and
++/// with every image called "xodus" a process with several of them mapped is
++/// unreadable while debugging: the main image, the subgames and the tools all
++/// look alike. Naming each one after its own file costs nothing and is the
++/// truth about what the descriptor contains.
++///
++/// It is a name and not a path, so it does not make the image findable. That
++/// was worth checking, because EasyAntiCheat reads /proc/<pid>/maps two
++/// milliseconds into "Starting Wine module mapping" looking for the game
++/// binary. With "/memfd:HaloInfinite.exe (deleted)" in the map it still stops
++/// with 'Failed to locate the game binary (Wine)', so it is matching the path
++/// rather than the leaf -- and nothing that maps from a descriptor can satisfy
++/// that. Only an image mapped from a real file at the real path can.
+ #[cfg(target_os = "linux")]
+-fn make_temp_file(_folder: &str) -> std::io::Result<std::fs::File> {
+-    let fd = memfd_create("xodus", MemfdFlags::CLOEXEC).map_err(std::io::Error::from)?;
++fn make_temp_file(_folder: &str, name: &str) -> std::io::Result<std::fs::File> {
++    // memfd names may not contain '/', and the package spells its paths with
++    // backslashes, so take the last component either way.
++    let leaf = name
++        .rsplit(['\\', '/'])
++        .next()
++        .filter(|s| !s.is_empty())
++        .unwrap_or("xodus");
++    let fd = memfd_create(leaf, MemfdFlags::CLOEXEC).map_err(std::io::Error::from)?;
+     Ok(std::fs::File::from(fd))
+ }
+ 
+ #[cfg(not(target_os = "linux"))]
+-fn make_temp_file(folder: &str) -> std::io::Result<std::fs::File> {
++fn make_temp_file(folder: &str, _name: &str) -> std::io::Result<std::fs::File> {
+     if folder.is_empty() {
+         tempfile()
+     } else {
+@@ -189,7 +211,7 @@ pub async fn run(
+         if !file.1.keep_encrypted {
+             continue;
+         }
+-        let mut game_exe = File::from_std(make_temp_file(&mount_dir).unwrap());
++        let mut game_exe = File::from_std(make_temp_file(&mount_dir, file.0).unwrap());
+ 
+         let source_path = out.join(file.0.replace("\\", "/"));
+ 
