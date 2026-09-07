@@ -1,26 +1,45 @@
 diff --git a/dlls/concrt140/details.c b/dlls/concrt140/details.c
 --- a/dlls/concrt140/details.c
 +++ b/dlls/concrt140/details.c
-@@ -824,6 +824,26 @@
+@@ -528,7 +528,20 @@
+     last_block = (this->segment == this->storage ? STORAGE_SIZE : SEGMENT_SIZE);
+     for(i = 0; i < last_block; i++)
+     {
+-        if(!this->segment[i])
++        /* A segment holding SEGMENT_ALLOC_MARKER is not capacity: another
++         * thread is allocating it and there is nowhere to put an element yet.
++         * Counting it stops _Internal_reserve() short -- it returns as soon as
++         * the requested size fits the capacity reported here -- and every
++         * caller that then indexes this->segment[] gets the marker instead of
++         * a pointer. _Internal_push_back() hands it straight back to the
++         * application, which writes through 1; _Internal_grow_by(),
++         * _Internal_copy() and _Internal_assign() copy into it.
++         *
++         * Reporting less while an allocation is in flight is the honest
++         * answer, and it makes _Internal_reserve() call
++         * concurrent_vector_alloc_segment(), which waits for the other thread
++         * to finish before anyone derives an address from the segment. */
++        if(!this->segment[i] || this->segment[i] == SEGMENT_ALLOC_MARKER)
+             return !i ? 0 : 1 << i;
+     }
+     return 1 << i;
+@@ -824,6 +837,23 @@
                  element_size, ~(size_t)0 / element_size);
      } while(InterlockedCompareExchangeSizeT(&this->early_size, index + 1, index) != index);
      seg = _vector_base_v4__Segment_index_of(index);
 +
-+    /* _Internal_reserve above may have returned without allocating anything.
-+     * It asks _Internal_capacity() first, and that counts a segment as present
-+     * when it is merely non-NULL -- which includes SEGMENT_ALLOC_MARKER, the
-+     * value another thread leaves there while it is allocating. So two threads
-+     * pushing at once can leave this one computing an element address from the
-+     * marker: 1 + element_size * 0, i.e. 1, which the caller then writes
-+     * through. Forza Horizon 5 does exactly that during startup and dies on an
-+     * access violation writing to 0x9, being 1 + the offset of the field it
-+     * stores first.
++    /* The address about to be derived is handed straight to the application,
++     * which writes through it, so check rather than assume. _Internal_capacity()
++     * no longer counts a segment that is still being allocated, so
++     * _Internal_reserve() above should have settled this one -- if it has not,
++     * returning the marker would show up as an access violation writing to
++     * address 1 plus whatever field the caller stores first, a long way from
++     * here and impossible to read.
 +     *
-+     * So make sure the segment is real before deriving a pointer from it.
-+     * concurrent_vector_alloc_segment() already waits out the marker,
-+     * allocates if the segment is absent, and raises the documented exception
-+     * if allocation failed; it returns immediately when the segment is a
-+     * pointer already, which is the ordinary case. */
++     * concurrent_vector_alloc_segment() returns immediately when the segment is
++     * already a pointer, which is every ordinary call, and otherwise waits out
++     * the marker, allocates an absent segment and raises the documented
++     * exception if allocation failed. */
 +    if(!this->segment[seg] || this->segment[seg] == SEGMENT_ALLOC_MARKER)
 +        WARN("segment %Iu is not usable yet; settling it before returning an element\n", seg);
 +    concurrent_vector_alloc_segment(this, seg, element_size);

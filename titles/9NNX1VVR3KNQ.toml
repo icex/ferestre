@@ -107,9 +107,13 @@
 # the 1 that reaches Proton, with no fatal signal anywhere in the process tree,
 # no crash report written, and no unhandled exception.
 #
-# A second failure alternates with it, run to run: a read fault inside
-# RtlWakeAddressAll (ntdll+0x3a880, +0x88) on an address that has gone away.
-# That is a race and probably a separate bug.
+# It is at least reproducible now. Before the concrt140 capacity fix the same
+# launch alternated between 219 and 7,735 GDK calls run to run, and sometimes
+# died instead on a read fault inside RtlWakeAddressAll (ntdll+0x3a880, +0x88)
+# on an address that had gone away. Four consecutive runs since: 7747, 7735,
+# 7735, 7735 calls, all reaching the same place, with the push_back guard never
+# firing -- so reserve is settling the segments upstream, and both the varying
+# depth and that fault look like they were the same corruption downstream.
 
 schema = 1
 
@@ -141,7 +145,7 @@ requires = [
 state         = "broken"
 blocked-by    = "unknown"
 summary       = "Opens a window, renders its splash screen and loads real game data, then polls for something 939 times and exits."
-stops-at      = "exit_group(4353) after 939 XPackageGetCurrentProcessPackageIdentifier/XPackageIsPackagedProcess iterations, with no crash report and no fatal signal"
+stops-at      = "exit_group(4353) after 939 XPackageGetCurrentProcessPackageIdentifier/XPackageIsPackagedProcess iterations, reproducibly, with no crash report and no fatal signal"
 last-verified = 2026-09-07
 verified-with = "ferestre run fh5 with WINEDEBUG=+seh; tools/pe-holes.py over the decrypted image, with an ordinary DLL as the control"
 
