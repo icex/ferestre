@@ -46,16 +46,48 @@
 # That is the restorer doing exactly what it is for, several hundred thousand
 # times, on a title that previously did not survive the first one.
 #
+# THE SECOND THING IT HIT
+#
+# With the code restored, it got as far as a null write during startup and
+# left its own crash report behind, which is far more useful than a backtrace:
+#
+#   EXCEPTION      ACCESS_VIOLATION_WRITE
+#   EXCEPTION_INFO 0x0000000000000009
+#   STACK_TRACE    0x4f43b30,0x4f44427,0x4f493a2,0x4f64785,0x4b42852,0x8fdd96
+#   VRAM_BUDGET    14114820096          <- adapter enumeration already worked
+#   D3D_HR_ERROR   0x00000000
+#
+# The faulting instruction is `mov [rax+8], r15`, two instructions after an
+# import call whose result it treats as a pointer:
+#
+#   mov  edx, 0x10
+#   call qword [rip+0x15435bb]     ; CONCRT140.dll _Internal_push_back
+#   mov  rsi, rax
+#   mov  [rax+8], r15              ; faults, rax = 1
+#
+# That import is Concurrency::details::_Concurrent_vector_base_v4::
+# _Internal_push_back, which returns a pointer to the new element -- and Wine
+# returned 1. 1 is SEGMENT_ALLOC_MARKER, the value Wine's own concrt140 leaves
+# in the segment table while another thread allocates that segment.
+#
+# The race: _Internal_push_back calls _Internal_reserve, which asks
+# _Internal_capacity first, and that counts a segment as present when it is
+# merely non-NULL -- the marker included. So reserve returns early, push_back
+# computes `segment[seg] + element_size * 0`, gets 1, and hands that back. The
+# caller writes the first field at +8. 1 + 8 = 9, which is exactly the address
+# in the crash report. patches/wine/0011 makes push_back settle the segment
+# before deriving a pointer from it.
+#
+# That is a Wine bug rather than anything to do with this project, and worth
+# sending upstream: any multithreaded user of concurrent_vector can hit it.
+#
 # WHERE IT STOPS NOW
 #
-# Not diagnosed yet. The process exits 1 during initialisation with no window.
-# It gets a long way first -- bcrypt, cryptasn, dinput joystick probing, OpenXR,
-# OLE -- and the visible complaints are not obviously fatal: openxr
-# get_vulkan_extensions cannot create a key, ole ensure_mta fails 0x800401f0,
-# and a service device-notify thread reports RPC_S_SERVER_UNAVAILABLE. No d3d
-# or vulkan call is reached, so it stops before it renders anything.
-#
-# Naming that is the next job, and it should be named rather than guessed at.
+# It draws. A window appears -- "Forza Horizon 5", 5120x1440, confirmed through
+# KWin's window list and not just seen -- and the splash screen renders. Then
+# the process exits 1, quietly: no crash report, no unhandled exception, and an
+# orderly PROCESS_DETACH through every DLL, so it is deciding to quit rather
+# than dying. Why is the next question.
 
 schema = 1
 
@@ -79,13 +111,14 @@ executable = 'ForzaHorizon5.exe'
 requires = [
     "loader.memfd-main-image",
     "loader.section-name-for-mapped-image",
+    "concrt140.concurrent-vector-push-back",
 ]
 
 [status]
 state         = "broken"
 blocked-by    = "unknown"
-summary       = "Restores its own elided call sites correctly now -- 323,811 faults, all resumed -- and then exits during initialisation without drawing a window."
-stops-at      = "process exit 1 during startup, after OpenXR and OLE initialisation and before any d3d or vulkan call; no window"
+summary       = "Restores its own elided call sites, opens a window and renders its splash screen, then exits quietly during startup."
+stops-at      = "process exit 1 after the splash screen, with no crash report and an orderly PROCESS_DETACH through every DLL"
 last-verified = 2026-09-07
 verified-with = "ferestre run fh5 with WINEDEBUG=+seh; tools/pe-holes.py over the decrypted image, with an ordinary DLL as the control"
 
@@ -96,6 +129,12 @@ fix       = "fixed by patches/wine/0010: answer MemoryMappedFilenameInformation 
 log-match = "Unhandled illegal instruction at address .* \\(thread"
 
 [[issues]]
-symptom   = "the game runs for several seconds, compiles nothing, draws no window, and exits with 1"
-cause     = "unknown. It reaches OpenXR and OLE initialisation and stops before any d3d or vulkan call"
+symptom   = "the game exits during startup having drawn nothing, and leaves Upload_CrashReport.xml naming ACCESS_VIOLATION_WRITE at 0x0000000000000009"
+cause     = "concrt140's _Internal_push_back returned SEGMENT_ALLOC_MARKER (1) instead of a pointer to the new element, because _Internal_reserve counts a segment another thread is still allocating as capacity and returns early"
+fix       = "fixed by patches/wine/0011: settle the segment before deriving an element pointer from it"
+log-match = "ACCESS_VIOLATION_WRITE"
+
+[[issues]]
+symptom   = "the splash screen appears and the window closes again; the process exits 1"
+cause     = "unknown. There is no crash report and no unhandled exception, and every DLL gets an orderly PROCESS_DETACH, so the title is choosing to exit"
 fix       = "none yet, and not yet investigated"

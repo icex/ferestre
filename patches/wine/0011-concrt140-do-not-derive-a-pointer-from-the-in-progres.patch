@@ -1,0 +1,30 @@
+diff --git a/dlls/concrt140/details.c b/dlls/concrt140/details.c
+--- a/dlls/concrt140/details.c
++++ b/dlls/concrt140/details.c
+@@ -824,6 +824,26 @@
+                 element_size, ~(size_t)0 / element_size);
+     } while(InterlockedCompareExchangeSizeT(&this->early_size, index + 1, index) != index);
+     seg = _vector_base_v4__Segment_index_of(index);
++
++    /* _Internal_reserve above may have returned without allocating anything.
++     * It asks _Internal_capacity() first, and that counts a segment as present
++     * when it is merely non-NULL -- which includes SEGMENT_ALLOC_MARKER, the
++     * value another thread leaves there while it is allocating. So two threads
++     * pushing at once can leave this one computing an element address from the
++     * marker: 1 + element_size * 0, i.e. 1, which the caller then writes
++     * through. Forza Horizon 5 does exactly that during startup and dies on an
++     * access violation writing to 0x9, being 1 + the offset of the field it
++     * stores first.
++     *
++     * So make sure the segment is real before deriving a pointer from it.
++     * concurrent_vector_alloc_segment() already waits out the marker,
++     * allocates if the segment is absent, and raises the documented exception
++     * if allocation failed; it returns immediately when the segment is a
++     * pointer already, which is the ordinary case. */
++    if(!this->segment[seg] || this->segment[seg] == SEGMENT_ALLOC_MARKER)
++        WARN("segment %Iu is not usable yet; settling it before returning an element\n", seg);
++    concurrent_vector_alloc_segment(this, seg, element_size);
++
+     segment_base = (seg == 0) ? 0 : (1 << seg);
+     data = (BYTE*)this->segment[seg] + element_size * (index - segment_base);
+     *idx = index;

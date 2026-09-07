@@ -298,3 +298,21 @@ than about its process."""
 verify = [
     { file = "files/lib/wine/x86_64-unix/ntdll.so", contains = "is the main image and has no section name" },
 ]
+
+[[capability]]
+name = "concrt140.concurrent-vector-push-back"
+summary = """
+Concurrency::details::_Concurrent_vector_base_v4::_Internal_push_back returns \
+a pointer to the new element even when another thread is allocating that \
+segment, rather than the in-progress marker."""
+provided-by = ["patches/wine/0011-concrt140-do-not-derive-a-pointer-from-the-in-progres.patch"]
+symptom-if-missing = "an access violation writing to 0x9 during startup, from a `mov [rax+8], reg` two instructions after the _Internal_push_back call; Forza Horizon 5 records it in its own Upload_CrashReport.xml as ACCESS_VIOLATION_WRITE with EXCEPTION_INFO 0x0000000000000009"
+note = """
+A Wine bug rather than anything specific to this project, and worth sending \
+upstream: _Internal_reserve asks _Internal_capacity whether a segment is \
+present, and that treats SEGMENT_ALLOC_MARKER as present, so it returns \
+without allocating and push_back derives an element pointer from the marker. \
+1 + 8 = 9. Any multithreaded user of concurrent_vector can reach it."""
+verify = [
+    { file = "files/lib/wine/x86_64-windows/concrt140.dll", contains = "settling it before returning an element" },
+]
