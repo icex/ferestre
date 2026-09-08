@@ -160,6 +160,31 @@ pub fn installed(dir: &Path) -> Vec<InstalledRuntime> {
     runtimes
 }
 
+/// Pick the requested runtime, or the newest compatible installed runtime.
+/// A path is only accepted when it names one of the discovered installs; this
+/// prevents a stale title override from silently running an arbitrary Proton.
+pub fn select<'a>(
+    recipe: &Recipe,
+    runtimes: &'a [InstalledRuntime],
+    requested: Option<&Path>,
+    registry: Option<&Registry>,
+) -> anyhow::Result<&'a InstalledRuntime> {
+    let mut candidates = runtimes
+        .iter()
+        .filter(|rt| assess(recipe, rt, registry).is_satisfied());
+    if let Some(path) = requested {
+        return candidates.find(|rt| rt.path == path).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}: selected runtime is unavailable or incompatible",
+                path.display()
+            )
+        });
+    }
+    candidates
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no installed runtime satisfies {}", recipe.title.name))
+}
+
 fn read_capabilities(dir: &Path) -> anyhow::Result<(BTreeSet<Capability>, CapabilitySource)> {
     let manifest = dir.join(MANIFEST_PATH);
     if manifest.is_file() {
@@ -816,6 +841,37 @@ hangs"""
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].version.as_deref(), Some("11.0.2"));
         assert_eq!(found[1].version.as_deref(), Some("11.0.1"));
+    }
+
+    #[test]
+    fn selection_prefers_the_newest_compatible_runtime_and_honours_an_override() {
+        let old = fake_runtime("select-old", true, false);
+        let new = fake_runtime("select-new", true, false);
+        old.write("version", "11.0.1\n");
+        new.write("version", "11.0.2\n");
+        old.write(
+            MANIFEST_PATH,
+            r#"["loader.memfd-main-image", "gameinput.v2"]"#,
+        );
+        new.write(
+            MANIFEST_PATH,
+            r#"["loader.memfd-main-image", "gameinput.v2"]"#,
+        );
+        let runtimes = vec![
+            InstalledRuntime::at(new.path()).unwrap(),
+            InstalledRuntime::at(old.path()).unwrap(),
+        ];
+        let recipe = Recipe::parse(RECIPE).unwrap();
+        assert_eq!(
+            select(&recipe, &runtimes, None, None).unwrap().path,
+            new.path()
+        );
+        assert_eq!(
+            select(&recipe, &runtimes, Some(old.path()), None)
+                .unwrap()
+                .path,
+            old.path()
+        );
     }
 
     // --- assessment ----------------------------------------------------------
