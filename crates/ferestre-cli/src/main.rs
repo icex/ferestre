@@ -1585,6 +1585,13 @@ fn doctor_checks(paths: &Paths) -> Vec<Check> {
         );
     }
 
+    checks.push(if has_i386_loader(Path::new("/lib/ld-linux.so.2")) {
+        Check::ok("supporting", "32-bit Linux loader available")
+    } else {
+        Check::fail("supporting", "32-bit Linux support is required")
+            .with_hint("install the 32-bit compatibility libraries: https://github.com/icex/ferestre/blob/main/docs/DEPENDENCIES.md")
+    });
+
     match paths.xodus_cli().filter(|p| p.is_file()) {
         Some(path) => {
             checks.push(Check::ok("client", "xodus-cli").with_detail(path.display().to_string()))
@@ -1696,6 +1703,10 @@ fn doctor_checks(paths: &Paths) -> Vec<Check> {
     }
 
     checks
+}
+
+fn has_i386_loader(path: &Path) -> bool {
+    path.is_file()
 }
 
 /// Writable is tested by writing. Permissions bits lie on NFS, on a full disk,
@@ -2517,6 +2528,12 @@ summary = "Runs."
         assert_eq!(v["status"], "warn");
         // Absent, not null: a GUI should not have to distinguish the two.
         assert!(v.get("hint").is_none());
+    }
+
+    #[test]
+    fn the_32_bit_loader_check_names_the_real_loader_file() {
+        assert!(has_i386_loader(Path::new("Cargo.toml")));
+        assert!(!has_i386_loader(Path::new("/this/path/does/not/exist")));
     }
 
     #[test]
