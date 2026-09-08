@@ -48,7 +48,7 @@ both, so nobody has to know the structure to install it.
 ## Where things go
 
 ```
-/usr/bin/ferestre                                   front end (placeholder today)
+/usr/bin/ferestre                                   front end
 /usr/bin/xodus-cli, /usr/bin/xodus-service      client
 /usr/lib/ferestre/scripts/                          the launch path
 /usr/lib/ferestre/patches/                          read by `ferestre install-runtime`
@@ -58,10 +58,8 @@ both, so nobody has to know the structure to install it.
 ```
 
 The layout under `/usr/lib/ferestre` is the AppImage's AppDir layout, deliberately:
-`packaging/appimage/ferestre-placeholder.sh` finds its scripts through
-`$0/../lib/ferestre/scripts`, so the same command behaves identically whether it
-came from an AppImage or from pacman. **When `build-appimage.sh` starts staging
-another directory, stage it here too** — `titles/` is the obvious next one.
+The launcher finds its scripts through `$0/../lib/ferestre/scripts`, so the same
+command behaves identically whether it came from an AppImage or from pacman.
 
 ### One thing the packaging cannot do for you
 
@@ -219,8 +217,9 @@ public URLs. A local working tree cannot prove those remote sources exist.
 
 ## What is not done here
 
-- **No release exists**, so `ferestre-runtime-bin` cannot be built as written. Its
-  checksum is a placeholder and everything else about it is real.
+- **No runtime release exists yet**, so `ferestre-runtime-bin` cannot be built
+  as written. Its checksum remains a placeholder until a `runtime-*` tag
+  publishes the matching asset.
 - **No complete client package build in an Arch chroot.** The patched release
   CLI/service build and focused tests pass on the development system.
 - **No `namcap` run.** It is not installed on the development machine.

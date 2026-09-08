@@ -2,20 +2,15 @@
 
 # The front end.
 #
-# Today that is the repository's shell scripts plus the `ferestre` command from
-# packaging/appimage/ferestre-placeholder.sh, which is a thin, honest wrapper over
-# them with the subcommand names the real launcher will use. When the Rust
-# binary lands (docs/ROADMAP.md, phase 2) this PKGBUILD builds and installs it
-# instead, with no other change: build() and package() already look for it.
-#
-# It is a -git package because there are no tags yet. A tagged release gets a
-# sibling `ferestre` package that drops the pkgver() and takes a tarball.
+# This package builds and installs the Rust launcher plus its launch scripts.
+# It remains a -git package; tagged releases are distributed as AppImages and
+# portable archives while the non-git AUR package is prepared.
 #
 # The layout deliberately matches the AppImage's AppDir (usr/bin/ferestre,
 # usr/lib/ferestre/scripts, usr/lib/ferestre/patches, usr/lib/ferestre/VERSION) so the same
 # command behaves identically however it was installed. In particular the
-# placeholder finds its scripts through $0/../lib/ferestre/scripts, which is why
-# they go to /usr/lib/ferestre and not /usr/share.
+# the launcher finds its scripts through ../lib/ferestre, which is why they go
+# to /usr/lib/ferestre and not /usr/share.
 
 pkgname=ferestre-git
 pkgver=0.0.0.r18.g88a0378
@@ -41,7 +36,7 @@ depends=(
   # as a side effect of ferestre-runtime-bin needing python for the proton script.
   'python'
 )
-makedepends=('git')
+makedepends=('git' 'cargo')
 optdepends=(
   'steam: Proton wants STEAM_COMPAT_CLIENT_INSTALL_PATH, and a title can be added as a non-Steam shortcut'
   'vulkan-tools: `vulkaninfo`, for checking the GPU side before blaming the launcher'
@@ -82,11 +77,6 @@ pkgver() {
 build() {
   cd "$srcdir/$pkgname"
 
-  # Nothing to compile until the launcher crate exists. Keeping this guarded
-  # rather than commented out means the package starts shipping the real binary
-  # the moment the crate lands, without a packaging change.
-  [[ -f Cargo.toml ]] || return 0
-
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
@@ -112,22 +102,10 @@ package() {
   cp -a titles   "$pkgdir/usr/lib/ferestre/titles"
   find "$pkgdir/usr/lib/ferestre/scripts" -name '*.sh' -exec chmod 0755 {} +
 
-  # The placeholder reads this as $SCRIPTS/../VERSION, so a packaged command
-  # cannot disagree with the version of the package it came from.
+  # The launcher reads this beside the packaged resources.
   printf '%s\n' "$pkgver" > "$pkgdir/usr/lib/ferestre/VERSION"
 
-  # The `ferestre` command: the real binary once it exists, the placeholder that
-  # drives the shell scripts until then. A package with neither is not worth
-  # installing, so say so loudly instead of shipping a directory of scripts and
-  # no way to run them.
-  if [[ -x target/release/ferestre ]]; then
-    install -Dm755 target/release/ferestre "$pkgdir/usr/bin/ferestre"
-  elif [[ -f packaging/appimage/ferestre-placeholder.sh ]]; then
-    install -Dm755 packaging/appimage/ferestre-placeholder.sh "$pkgdir/usr/bin/ferestre"
-  else
-    printf '==> ERROR: no launcher binary and no packaging/appimage/ferestre-placeholder.sh\n' >&2
-    return 1
-  fi
+  install -Dm755 target/release/ferestre "$pkgdir/usr/bin/ferestre"
 
   # Desktop integration is shared with the AppImage, which owns these files.
   # It is not load-bearing for a command-line tool, so a rename over there

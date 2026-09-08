@@ -10,6 +10,7 @@ pkgbase = ferestre-git
 	license = GPL-3.0-only
 	license = BSD-3-Clause
 	makedepends = git
+	makedepends = cargo
 	depends = bash
 	depends = ferestre-client
 	depends = ferestre-runtime-bin

@@ -5,12 +5,10 @@ project, and exactly where the ones that fail stop.
 
 ## Read this first
 
-**Most titles will not work, and that is the expected result today.** Three
-have been tried. The GDK runtime here is written against the *observable*
-behaviour of the API — task queues, async, users, storage, networking, save
-games, packages — so it covers what those three titles happened to call.
-A fourth title will call something else. That is not a bug in the report, it is
-the state of the work.
+**Many titles remain untested, and an untested title may expose another runtime
+gap.** Ten titles have been run. The GDK runtime is written against the
+*observable* behaviour of the API — task queues, async, users, storage,
+networking, save games, packages — so each new title remains useful evidence.
 
 There are two separate reasons a title fails, and telling them apart is most of
 the value of a report:
@@ -23,8 +21,8 @@ the value of a report:
   that twice -- it dies in a static initialiser before reaching any runtime API,
   inside code whose direct calls have been replaced by deliberately invalid
   bytes -- and both times the real cause was this project telling it something
-  untrue about itself. It now drives with a restored Windows profile; online
-  connectivity remains unresolved. The fixes supplied the filename and image
+  untrue about itself. It now drives with a restored Windows profile and uses
+  its online services. The fixes supplied the filename and image
   bytes its handler expected, then corrected the runtime's async return value
   and package identifier.
 
@@ -51,7 +49,7 @@ your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 | Minecraft for Windows | `9NBLGGH2JHXJ` | Playable | Signs in to Xbox Live, loads the profile, plays, and joins third-party servers from the in-game list. | 2026-09-06 |
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
 | Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. | 2026-09-06 |
-| Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable, with issues | Boots and plays; the online features do not work. | 2026-09-06 |
+| Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable, with issues | Boots and plays; online connectivity is being verified. | 2026-09-06 |
 | Halo Infinite | `9PP5G1F0C2B6` | Does not run | Gets through EasyAntiCheat's checks and into its Linux loader, which then cannot find the game binary: it looks in /proc/<pid>/maps, and a decrypted image mapped from a descriptor has no path there. Stops at: EasyAntiCheat bootstrapper exit 207, 'Failed to locate the game binary (Wine)', after 'Starting Wine module mapping, Wine version: 11.0'. | 2026-09-07 |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.

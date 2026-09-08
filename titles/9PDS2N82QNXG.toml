@@ -33,7 +33,7 @@ requires = [
 
 [status]
 state   = "playable-with-issues"
-summary = "Boots and plays; the online features do not work."
+summary = "Boots and plays; online connectivity is being verified."
 last-verified = 2026-09-06
 
 [[issues]]

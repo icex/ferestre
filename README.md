@@ -72,9 +72,9 @@ not inferred from the fact that it downloaded:
 | **Stardew Valley** | Game Pass | Playable |
 | **DOOM 64** | Game Pass | Playable |
 | **Overthrown** | Game Pass | Playable |
-| **Goat Simulator 3** | Game Pass | Boots and plays; online features do not work |
-| **Age of Empires Definitive Edition** | Game Pass | Installs; still crashes at startup |
-| **Forza Horizon 5** | Store | Plays with a restored Windows profile, vehicle and livery; Forza Online reports its server is currently unavailable |
+| **Goat Simulator 3** | Game Pass | Playable; online connectivity is being verified |
+| **Age of Empires Definitive Edition** | Game Pass | Playable — boots, starts a custom game, and plays |
+| **Forza Horizon 5** | Store | Playable with restored Windows saves; Forza Online and the live Festival Playlist work |
 
 Notes worth having before you try your own library:
 
