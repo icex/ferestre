@@ -241,6 +241,7 @@ fn build_ui(app: &adw::Application) {
                 model.page = 0;
             }
             render(&ui);
+            refresh_updates(&ui);
         }
     ));
 
@@ -1883,6 +1884,42 @@ fn refresh_account(ui: &Ui) {
                 model.avatar = avatar;
             }
             render_account_button(&ui);
+        }
+    });
+}
+
+fn refresh_updates(ui: &Ui) {
+    let (client, records) = {
+        let model = ui.model.borrow();
+        (model.xodus_cli(), model.records.values().cloned().collect::<Vec<_>>())
+    };
+    let Some(client) = client else { return };
+    if records.is_empty() || !begin(ui) {
+        return;
+    }
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let checked = gio::spawn_blocking(move || {
+            let mut available = BTreeMap::new();
+            for record in records {
+                let Some(content_id) = record.content_ids.first() else { continue };
+                let output = std::process::Command::new(&client)
+                    .args(["update", content_id, "--json"])
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .ok()?;
+                if !output.status.success() { continue }
+                let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+                if let Some(version) = value["version"].as_str().filter(|version| !version.is_empty()) {
+                    available.insert(record.product_id.to_ascii_uppercase(), version.to_string());
+                }
+            }
+            Some(available)
+        }).await;
+        finish(&ui);
+        if let Ok(Some(available)) = checked {
+            ui.model.borrow_mut().available = available;
+            render(&ui);
         }
     });
 }

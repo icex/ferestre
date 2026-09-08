@@ -137,6 +137,10 @@ enum Cmd {
         dir: Option<PathBuf>,
     },
 
+    /// Check installed MSIXVC packages against the authenticated update service.
+    Updates,
+
+
     /// Remove an installed title: its files and the launcher's record of it.
     #[command(alias = "remove")]
     Uninstall {
@@ -215,6 +219,7 @@ fn dispatch(cli: &Cli) -> Result<ExitCode> {
             args,
         } => cmd_run(cli, title, *dry_run, *force, *steam, args),
         Cmd::Install { product_id, dir } => cmd_install(cli, product_id, dir.as_deref()),
+        Cmd::Updates => cmd_updates(cli),
         Cmd::Uninstall {
             product_id,
             keep_files,
@@ -377,6 +382,57 @@ fn cmd_library(cli: &Cli, all: bool, refresh: bool, offline: bool) -> Result<Exi
             "\n{} row(s) filtered out; --all shows them with the reason",
             skipped.len()
         );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn update_command(xodus_cli: &Path, content_id: &str) -> Command {
+    let mut command = Command::new(xodus_cli);
+    command.arg("update").arg(content_id).arg("--json");
+    command
+}
+
+fn cmd_updates(cli: &Cli) -> Result<ExitCode> {
+    let paths = Paths::from_env()?;
+    let xodus_cli = paths
+        .xodus_cli()
+        .ok_or_else(|| anyhow!("no xodus-cli found; set XODUS_CLI_DIR (see: ferestre doctor)"))?;
+    let records: Vec<_> = install::all(paths.state_dir())
+        .into_iter()
+        .filter(|record| !record.is_stale())
+        .collect();
+    let mut results = Vec::new();
+    for record in records {
+        let Some(content_id) = record.content_ids.first() else {
+            continue;
+        };
+        let output = update_command(&xodus_cli, content_id)
+            .output()
+            .with_context(|| format!("running {} update", xodus_cli.display()))?;
+        if !output.status.success() {
+            eprintln!("-- {}: update service unavailable", record.product_id);
+            continue;
+        }
+        let value: Value = serde_json::from_slice(&output.stdout)
+            .context("the update client returned invalid JSON")?;
+        let version = value["version"].as_str().unwrap_or_default().to_string();
+        let available = record.update_available(Some(&version));
+        results.push(json!({
+            "product_id": record.product_id,
+            "installed_version": record.package_version,
+            "available_version": version,
+            "update_available": available,
+        }));
+    }
+    if cli.json {
+        print_json(&json!({ "schema": JSON_SCHEMA, "updates": results }));
+    } else if results.is_empty() {
+        println!("no installed packages could be checked");
+    } else {
+        for result in results {
+            let state = if result["update_available"] == Value::Bool(true) { "update available" } else { "up to date" };
+            println!("{}: {}", result["product_id"].as_str().unwrap_or("package"), state);
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1993,6 +2049,16 @@ fn print_json(value: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_command_asks_the_client_for_json() {
+        let command = update_command(Path::new("/opt/xodus/xodus-cli"), "content-id");
+        assert_eq!(command.get_program(), Path::new("/opt/xodus/xodus-cli"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec!["update", "content-id", "--json"]
+        );
+    }
     use clap::CommandFactory;
     use ferestre_core::capability::Match;
     use ferestre_core::runtime::CapabilitySource;

@@ -1,0 +1,94 @@
+diff --git a/crates/xodus-cli/src/main.rs b/crates/xodus-cli/src/main.rs
+index 7befc57..c5f2674 100644
+--- a/crates/xodus-cli/src/main.rs
++++ b/crates/xodus-cli/src/main.rs
+@@ -78,6 +78,13 @@ enum SubCommand {
+         #[arg(long, help = "The title's MSAAppId, instead of reading the game directory")]
+         title_client_id: Option<String>,
+     },
++    #[command(about = "Report the available version for an installed MSIXVC package")]
++    Update {
++        #[arg(help = "ContentId from the installed package header")]
++        content_id: String,
++        #[arg(long, help = "Emit JSON")]
++        json: bool,
++    },
+     #[command(about = "Download msixvc or xsp files fo given game")]
+     Download {
+         product: String,
+@@ -330,6 +337,31 @@ async fn main() -> ExitCode {
+                 }
+             }
+         }
++        SubCommand::Update { content_id, json } => {
++            match package::get_packages(&client, &tokens, content_id.clone()).await {
++                Ok(package) => match package::available_version(&package) {
++                    Some(version) => {
++                        if json {
++                            println!("{}", serde_json::json!({
++                                "content_id": content_id,
++                                "version": version,
++                            }));
++                        } else {
++                            println!("{version}");
++                        }
++                        ExitCode::SUCCESS
++                    }
++                    None => {
++                        eprintln!("update service returned no usable package version");
++                        ExitCode::FAILURE
++                    }
++                },
++                Err(error) => {
++                    eprintln!("could not check for an update: {error}");
++                    ExitCode::FAILURE
++                }
++            }
++        }
+         SubCommand::Collections {
+             url,
+             body,
+diff --git a/crates/xodus-cli/src/package.rs b/crates/xodus-cli/src/package.rs
+index fbaf948..b27ad50 100644
+--- a/crates/xodus-cli/src/package.rs
++++ b/crates/xodus-cli/src/package.rs
+@@ -5,6 +5,14 @@ use xodus::models::packagespc::{PackageDetails, PackageResponse};
+ use xodus::models::secrets::Token;
+ use xodus::tokens::TokenManager;
+ 
++/// The build version the authenticated update service is offering.
++///
++/// DisplayCatalog reports every package as version `0`; this field is the one
++/// that changes when Microsoft publishes a new MSIXVC build.
++pub fn available_version(package: &PackageDetails) -> Option<&str> {
++    (!package.version.trim().is_empty() && package.version != "0").then_some(&package.version)
++}
++
+ pub async fn get_content_id(
+     client: &reqwest::Client,
+     product: String,
+@@ -130,3 +138,24 @@ pub async fn get_packages(
+     };
+     Ok(package)
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn available_version_comes_from_the_authenticated_package_response() {
++        let package = PackageDetails {
++            package_found: true,
++            content_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
++            version_id: "version-id".into(),
++            package_files: Vec::new(),
++            version: "1.26.4600.0".into(),
++            hash_of_hashes: None,
++            update_predownload: false,
++            availability_date: "2026-09-08T00:00:00Z".into(),
++        };
++
++        assert_eq!(available_version(&package), Some("1.26.4600.0"));
++    }
++}
