@@ -80,7 +80,7 @@ _commit=3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
 # happened once already. If the history is ever rewritten again, repin here and
 # in .SRCINFO, and regenerate the sha256sums -- the patch files themselves may
 # have changed too.
-_patchrev=bc6c9c3fb273074f2eef3d5f6893ec804bbb83c3
+_patchrev=9b87d64b3c877a1a277a75a4e818180f783c5069
 _patchurl="https://raw.githubusercontent.com/icex/ferestre/$_patchrev/patches/xodus-cli"
 
 # Every patch after 0001 is part of one ordered series. Keep the downloaded,
@@ -100,6 +100,7 @@ _patches=(
   "0013-find-the-game-config-whatever-the-package-spells-it.patch"
   "0014-metadata-driven-title-authentication-and-service-discovery.patch"
   "0015-bound-memfd-diagnostic-labels.patch"
+  "0016-query-the-authenticated-package-version.patch"
 )
 source=("xodus::git+https://github.com/xodus-gaming/xodus.git#commit=$_commit")
 for _patch in "${_patches[@]}"; do
@@ -122,6 +123,7 @@ sha256sums=(
   'e8a57479b49ddd74d4822536012728424b0c42188d7c3d76eee03d46f1d417f6'
   '70a2d6ba71e8834213fb3cb2e7bd423e9b9e243a7d78c1832854e006b1810ee9'
   '986af4b4508f2887ce7851b046145d5652db746052a40f659efa10136c8e7b84'
+  '4448515542dfaa88b8d070a79544b32f2043b66091d61e5083426b0d7a1ff738'
 )
 
 prepare() {

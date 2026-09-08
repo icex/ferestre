@@ -49,10 +49,10 @@ index 7befc57..c5f2674 100644
              url,
              body,
 diff --git a/crates/xodus-cli/src/package.rs b/crates/xodus-cli/src/package.rs
-index fbaf948..b27ad50 100644
+index fbaf948..1a32e59 100644
 --- a/crates/xodus-cli/src/package.rs
 +++ b/crates/xodus-cli/src/package.rs
-@@ -5,6 +5,14 @@ use xodus::models::packagespc::{PackageDetails, PackageResponse};
+@@ -5,6 +5,20 @@ use xodus::models::packagespc::{PackageDetails, PackageResponse};
  use xodus::models::secrets::Token;
  use xodus::tokens::TokenManager;
  
@@ -61,13 +61,19 @@ index fbaf948..b27ad50 100644
 +/// DisplayCatalog reports every package as version `0`; this field is the one
 +/// that changes when Microsoft publishes a new MSIXVC build.
 +pub fn available_version(package: &PackageDetails) -> Option<&str> {
-+    (!package.version.trim().is_empty() && package.version != "0").then_some(&package.version)
++    let version = package.version.trim();
++    let fields: Vec<&str> = version.split('.').take(4).collect();
++    if fields.len() != 4 || fields.iter().any(|field| field.is_empty() || !field.bytes().all(|b| b.is_ascii_digit())) {
++        return None;
++    }
++    let prefix_len = fields.iter().map(|field| field.len()).sum::<usize>() + 3;
++    Some(&version[..prefix_len])
 +}
 +
  pub async fn get_content_id(
      client: &reqwest::Client,
      product: String,
-@@ -130,3 +138,24 @@ pub async fn get_packages(
+@@ -130,3 +144,28 @@ pub async fn get_packages(
      };
      Ok(package)
  }
@@ -90,5 +96,9 @@ index fbaf948..b27ad50 100644
 +        };
 +
 +        assert_eq!(available_version(&package), Some("1.26.4600.0"));
++
++        let mut with_build_id = package;
++        with_build_id.version = "3.688.109.0.3b6b700a-992b-45fc-b16b-4ea65141d98c".into();
++        assert_eq!(available_version(&with_build_id), Some("3.688.109.0"));
 +    }
 +}
