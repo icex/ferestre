@@ -123,6 +123,7 @@ jobs:
           git clone --quiet https://github.com/xodus-gaming/xodus.git xodus
           git -C xodus checkout --quiet 3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
           for patch in patches/xodus-cli/*.patch; do
+              case "$(basename "$patch")" in 0001-*) continue ;; esac
               git -C xodus apply "$GITHUB_WORKSPACE/$patch"
           done
           cargo build --release --manifest-path xodus/Cargo.toml \
