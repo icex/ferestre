@@ -31,6 +31,13 @@ export PATH="$APPDIR/usr/bin:$PATH"
 # invoking usr/bin/ferestre directly out of an extracted AppDir.
 export FERESTRE_SCRIPTS_DIR="${FERESTRE_SCRIPTS_DIR:-$APPDIR/usr/lib/ferestre/scripts}"
 
+# The executable is built before the release tag is known. Keep the tag in the
+# staged file and let the command report it, so `ferestre version` identifies
+# the AppImage somebody actually downloaded.
+if [ -r "$APPDIR/usr/lib/ferestre/VERSION" ]; then
+    export FERESTRE_PACKAGE_VERSION="${FERESTRE_PACKAGE_VERSION:-$(cat "$APPDIR/usr/lib/ferestre/VERSION")}"
+fi
+
 # The release image contains the GPL client and the patched Proton runtime. A
 # caller can still override either path for development, but a fresh machine
 # must not need a second package before it can sign in or run a title.

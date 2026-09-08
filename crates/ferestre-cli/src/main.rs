@@ -236,16 +236,26 @@ fn dispatch(cli: &Cli) -> Result<ExitCode> {
 // ---------------------------------------------------------------------------
 
 fn cmd_version(cli: &Cli) -> Result<ExitCode> {
+    let packaged = std::env::var("FERESTRE_PACKAGE_VERSION").ok();
+    let version = package_version(packaged.as_deref());
     if cli.json {
         print_json(&json!({
             "schema": JSON_SCHEMA,
             "name": "ferestre",
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": version,
         }));
     } else {
-        println!("{}", env!("CARGO_PKG_VERSION"));
+        println!("{version}");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// AppRun supplies the release tag from the staged `VERSION` file. A normal
+/// checkout has no such wrapper, so its compiled Cargo version remains useful.
+fn package_version(packaged: Option<&str>) -> &str {
+    packaged
+        .filter(|version| !version.is_empty())
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
 fn cmd_doctor(cli: &Cli) -> Result<ExitCode> {
@@ -2128,6 +2138,13 @@ summary = "Runs."
         // as a panic on someone else's machine: a duplicate short flag, a
         // positional after a variadic, an alias shadowing a command.
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn a_packaged_release_reports_its_staged_version() {
+        assert_eq!(package_version(Some("0.1.2")), "0.1.2");
+        assert_eq!(package_version(Some("")), env!("CARGO_PKG_VERSION"));
+        assert_eq!(package_version(None), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
