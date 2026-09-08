@@ -209,18 +209,36 @@ impl Paths {
         // The resolved Steam directory comes first, which is how a Flatpak
         // Steam gets found: it is the fourth Steam candidate but not one of the
         // three compat-tool candidates xodus-env.sh lists.
-        let runtime = env.path("XODUS_PROTON_DIR").or_else(|| {
-            let mut candidates: Vec<PathBuf> = steam.iter().map(|s| s.join(COMPAT_TOOL)).collect();
-            candidates.extend([
-                home.join(".steam/steam").join(COMPAT_TOOL),
-                home.join(".local/share/Steam").join(COMPAT_TOOL),
-                home.join(".steam/root").join(COMPAT_TOOL),
-            ]);
-            env.first_existing(candidates)
-        });
+        let runtime = env
+            .path("XODUS_PROTON_DIR")
+            // Release archives keep the runtime beside the packaged scripts.
+            // Prefer it over a Steam compatibility-tool install: the archive
+            // is a coherent client/runtime pair and needs no post-install step.
+            .or_else(|| {
+                repo.as_ref()
+                    .map(|r| r.join("runtime"))
+                    .filter(|r| env.exists(r))
+            })
+            .or_else(|| {
+                let mut candidates: Vec<PathBuf> =
+                    steam.iter().map(|s| s.join(COMPAT_TOOL)).collect();
+                candidates.extend([
+                    home.join(".steam/steam").join(COMPAT_TOOL),
+                    home.join(".local/share/Steam").join(COMPAT_TOOL),
+                    home.join(".steam/root").join(COMPAT_TOOL),
+                ]);
+                env.first_existing(candidates)
+            });
 
         let cli_dir = env
             .path("XODUS_CLI_DIR")
+            // The AppImage exports this explicitly. The archive cannot, so
+            // discover its client from the packaged tree as well.
+            .or_else(|| {
+                repo.as_ref()
+                    .map(|r| r.join("client"))
+                    .filter(|r| env.exists(r))
+            })
             .or_else(|| env.on_path("xodus-cli"))
             .or_else(|| {
                 let mut candidates = vec![home.join("src/xodus-cli/target/release")];
@@ -699,6 +717,32 @@ summary = "Runs."
         assert_eq!(
             checkout.tree_dir(),
             Some(Path::new("/home/tester/src/ferestre"))
+        );
+    }
+
+    #[test]
+    fn a_release_archive_uses_its_bundled_client_and_runtime() {
+        let root = "/opt/ferestre/usr/lib/ferestre";
+        let p = Paths::resolve(
+            &env(&[("PATH", "/usr/bin")])
+                .with_exe("/opt/ferestre/usr/bin/ferestre")
+                .with_existing([
+                    format!("{root}/scripts"),
+                    format!("{root}/client"),
+                    format!("{root}/runtime"),
+                    "/usr/bin/xodus-cli".to_string(),
+                ]),
+        )
+        .unwrap();
+
+        assert_eq!(p.tree_dir(), Some(Path::new(root)));
+        assert_eq!(
+            p.cli_dir(),
+            Some(Path::new("/opt/ferestre/usr/lib/ferestre/client"))
+        );
+        assert_eq!(
+            p.runtime_dir(),
+            Some(Path::new("/opt/ferestre/usr/lib/ferestre/runtime"))
         );
     }
 
