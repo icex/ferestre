@@ -145,6 +145,21 @@ impl InstalledRuntime {
     }
 }
 
+/// Every valid runtime in a directory of versioned runtime installs. Invalid
+/// entries are ignored: an interrupted download must not make all older,
+/// working runtimes disappear from the selector.
+pub fn installed(dir: &Path) -> Vec<InstalledRuntime> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut runtimes: Vec<_> = entries
+        .flatten()
+        .filter_map(|entry| InstalledRuntime::at(&entry.path()).ok())
+        .collect();
+    runtimes.sort_by(|a, b| b.version.cmp(&a.version).then_with(|| a.path.cmp(&b.path)));
+    runtimes
+}
+
 fn read_capabilities(dir: &Path) -> anyhow::Result<(BTreeSet<Capability>, CapabilitySource)> {
     let manifest = dir.join(MANIFEST_PATH);
     if manifest.is_file() {
@@ -782,6 +797,25 @@ hangs"""
         let err = InstalledRuntime::discover(&paths).unwrap_err().to_string();
         assert!(err.contains("XODUS_PROTON_DIR"), "{err}");
         assert!(err.contains("install-runtime"), "{err}");
+    }
+
+    #[test]
+    fn runtime_inventory_keeps_valid_versions_and_skips_partial_downloads() {
+        let root = TempDir::new("runtime-inventory");
+        let older = root.path().join("11.0.1");
+        let newer = root.path().join("11.0.2");
+        std::fs::create_dir_all(&older).unwrap();
+        std::fs::create_dir_all(&newer).unwrap();
+        std::fs::write(older.join("proton"), "#!/bin/sh\nclose_fds=False\n").unwrap();
+        std::fs::write(newer.join("proton"), "#!/bin/sh\nclose_fds=False\n").unwrap();
+        std::fs::write(older.join("version"), "11.0.1\n").unwrap();
+        std::fs::write(newer.join("version"), "11.0.2\n").unwrap();
+        std::fs::create_dir_all(root.path().join("partial")).unwrap();
+
+        let found = installed(root.path());
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].version.as_deref(), Some("11.0.2"));
+        assert_eq!(found[1].version.as_deref(), Some("11.0.1"));
     }
 
     // --- assessment ----------------------------------------------------------
