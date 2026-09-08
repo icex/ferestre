@@ -196,7 +196,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           packaging/appimage/build-appimage.sh \
-            --bin target/release/ferestre-gui \
+            --bin target/release/ferestre \
             --client xodus/target/release/xodus-cli \
             --version "$VERSION" \
             --out out
