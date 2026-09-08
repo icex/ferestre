@@ -762,6 +762,87 @@ fn render_rows(
     }
 }
 
+fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
+    let (paths, runtimes, current) = {
+        let model = ui.model.borrow();
+        let Some(paths) = model.paths.clone() else {
+            return;
+        };
+        (
+            paths.clone(),
+            model.runtimes.clone(),
+            ferestre_core::runtime::selected(paths.config_dir(), product_id),
+        )
+    };
+    let dialog = gtk::Dialog::builder()
+        .transient_for(&ui.window)
+        .modal(true)
+        .title(format!("Runtime for {title}"))
+        .default_width(520)
+        .build();
+    let content = dialog.content_area();
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    content.set_spacing(8);
+    let automatic = gtk::Button::with_label("Automatic (newest compatible)");
+    let automatic_ui = ui.clone();
+    let automatic_dialog = dialog.clone();
+    let automatic_paths = paths.clone();
+    let automatic_product = product_id.to_string();
+    automatic.connect_clicked(move |_| {
+        if let Err(error) = ferestre_core::runtime::set_selected(
+            automatic_paths.config_dir(),
+            &automatic_product,
+            None,
+        ) {
+            automatic_ui.toasts.add_toast(adw::Toast::new(&format!(
+                "Could not save runtime choice: {error}"
+            )));
+        } else {
+            automatic_dialog.close();
+            automatic_ui
+                .toasts
+                .add_toast(adw::Toast::new("Runtime selection reset to automatic"));
+        }
+    });
+    content.append(&automatic);
+    for runtime in runtimes {
+        let selected = current.as_deref() == Some(runtime.path.as_path());
+        let label = if selected {
+            format!("{} (selected)", runtime.label())
+        } else {
+            runtime.label()
+        };
+        let choice = gtk::Button::with_label(&label);
+        let selected_ui = ui.clone();
+        let selected_dialog = dialog.clone();
+        let selected_paths = paths.clone();
+        let selected_product = product_id.to_string();
+        let path = runtime.path.clone();
+        choice.connect_clicked(move |_| {
+            if let Err(error) = ferestre_core::runtime::set_selected(
+                selected_paths.config_dir(),
+                &selected_product,
+                Some(&path),
+            ) {
+                selected_ui.toasts.add_toast(adw::Toast::new(&format!(
+                    "Could not save runtime choice: {error}"
+                )));
+            } else {
+                selected_dialog.close();
+                selected_ui
+                    .toasts
+                    .add_toast(adw::Toast::new("Runtime selected for this title"));
+            }
+        });
+        content.append(&choice);
+    }
+    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+    dialog.present();
+}
+
 fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
     // A title is a name, not markup, and the flag has to be set before the text
     // is: left as markup, "Minecraft: Java & Bedrock Edition for PC" fails to
@@ -838,6 +919,21 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
     // disk is another, because `run` writes a recipe from the package manifest
     // on its way past.
     if row.has_recipe || row.installed {
+        let runtime = gtk::Button::builder()
+            .icon_name("applications-engineering-symbolic")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .tooltip_text("Choose the Proton runtime for this title")
+            .build();
+        let product_id = row.product_id.clone();
+        let name = row.name.clone();
+        runtime.connect_clicked(glib::clone!(
+            #[strong]
+            ui,
+            move |_| choose_runtime(&ui, &product_id, &name)
+        ));
+        action_row.add_suffix(&runtime);
+
         let to_steam = gtk::Button::builder()
             .icon_name("list-add-symbolic")
             .valign(gtk::Align::Center)
