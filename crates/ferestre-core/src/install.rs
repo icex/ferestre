@@ -27,6 +27,7 @@
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Written beside the state directory, one file per title.
@@ -371,6 +372,38 @@ pub fn looks_installed(dir: &Path) -> bool {
             .any(|name| dir.join(name).is_file())
 }
 
+/// Product ids named by installed packages below a games directory.
+///
+/// Install directories are deliberately not used as identities. Older client
+/// versions, manually moved games, and recipes all choose useful directory
+/// names such as `fh5`; the Store catalogue names the same package by its
+/// `<StoreId>` in `MicrosoftGame.Config`. Reading that identity is what lets a
+/// Game Pass row recognise an existing install before offering another one.
+pub fn installed_products(games_dir: &Path) -> BTreeSet<String> {
+    std::fs::read_dir(games_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|dir| dir.is_dir() && looks_installed(dir))
+        .filter_map(|dir| store_id(&dir))
+        .collect()
+}
+
+fn store_id(install_dir: &Path) -> Option<String> {
+    // Microsoft has shipped both spellings. The package runs on Windows where
+    // they are equivalent, so recognising only one creates false installs.
+    let config = ["MicrosoftGame.config", "MicrosoftGame.Config"]
+        .iter()
+        .map(|name| install_dir.join(name))
+        .find(|path| path.is_file())?;
+    let text = std::fs::read_to_string(config).ok()?;
+    let open = "<StoreId>";
+    let start = text.find(open)? + open.len();
+    let value = text[start..].split_once("</StoreId>")?.0.trim();
+    (!value.is_empty()).then(|| value.to_ascii_uppercase())
+}
+
 /// Build a record for a title already on disk that nothing recorded.
 ///
 /// Exact, not assumed: everything comes from the install itself. Returns `None`
@@ -501,6 +534,25 @@ mod tests {
         std::fs::write(dir.join(CONTAINER), b"header").expect("write");
         assert!(looks_installed(&dir));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn installed_products_uses_the_package_store_id_not_the_directory_name() {
+        let root = std::env::temp_dir().join(format!("ferestre-products-{}", std::process::id()));
+        let game = root.join("a-legacy-directory-name");
+        std::fs::create_dir_all(&game).expect("temp dir");
+        std::fs::write(game.join(CONTAINER), b"header").expect("write");
+        std::fs::write(
+            game.join("MicrosoftGame.Config"),
+            "<Game><StoreId>9ZZTESTGAME</StoreId></Game>",
+        )
+        .expect("config");
+
+        assert_eq!(
+            installed_products(&root).into_iter().collect::<Vec<_>>(),
+            vec!["9ZZTESTGAME"]
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     fn record(content_ids: &[&str]) -> Record {

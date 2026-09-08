@@ -5,7 +5,7 @@
 //! should go with them. Anything that cost a network round trip -- the account,
 //! the library, the catalog, the icons -- lives here and survives a redraw.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use ferestre_core::account::Account;
@@ -75,6 +75,10 @@ pub struct Model {
     pub runtime: Option<InstalledRuntime>,
     pub registry: Option<Registry>,
     pub records: BTreeMap<String, Record>,
+    /// Store product ids read from package metadata below `games_dir`. This is
+    /// separate from records because a title can have been installed before
+    /// Ferestre existed, or live in a human-named directory.
+    pub installed_products: BTreeSet<String>,
 
     /// Fetched, not loaded: these survive a rebuild.
     pub ownership: Ownership,
@@ -145,6 +149,10 @@ impl Model {
             })
             .unwrap_or_default();
         let records = adopt_existing(paths.as_ref(), &recipes, records);
+        let installed_products = paths
+            .as_ref()
+            .map(|p| install::installed_products(p.games_dir()))
+            .unwrap_or_default();
 
         // The last listing, and whatever the catalog already knows about it.
         // Both come off disk, so the window opens showing a library instead of
@@ -222,6 +230,7 @@ impl Model {
             runtime,
             registry,
             records,
+            installed_products,
             ownership,
             catalog,
             icons,
@@ -313,10 +322,13 @@ impl Model {
     /// starts, so this answered yes for a title that was 2% downloaded, and the
     /// row called itself installed and offered to set it up.
     pub fn product_is_installed(&self, product_id: &str) -> bool {
-        self.paths
-            .as_ref()
-            .map(|p| p.games_dir().join(product_id.to_ascii_lowercase()))
-            .is_some_and(|dir| install::looks_installed(&dir))
+        self.installed_products
+            .contains(&product_id.to_ascii_uppercase())
+            || self
+                .paths
+                .as_ref()
+                .map(|p| p.games_dir().join(product_id.to_ascii_lowercase()))
+                .is_some_and(|dir| install::looks_installed(&dir))
     }
 
     /// The entry point the installed package declares, if it is on disk.
