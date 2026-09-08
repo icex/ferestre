@@ -80,7 +80,7 @@ _commit=3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
 # happened once already. If the history is ever rewritten again, repin here and
 # in .SRCINFO, and regenerate the sha256sums -- the patch files themselves may
 # have changed too.
-_patchrev=9b87d64b3c877a1a277a75a4e818180f783c5069
+_patchrev=643b790ce7a5a7e8fb5b199080d9b1cfd08d99f5
 _patchurl="https://raw.githubusercontent.com/icex/ferestre/$_patchrev/patches/xodus-cli"
 
 # Every patch after 0001 is part of one ordered series. Keep the downloaded,

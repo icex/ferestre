@@ -681,10 +681,9 @@ fn installed_status(
             format!("{version}  ·  not recorded, so updates cannot be checked")
         }
         None if product.is_none() => format!("{version}  ·  check the library to see updates"),
-        // A record and a catalog entry, and still no answer: the version on
-        // offer is not published anonymously. Saying so is the point -- the
-        // failure this wording exists to prevent is silence reading as "fine".
-        None => format!("{version}  ·  update checking is not wired up yet"),
+        // A record and a catalog entry, and still no answer: checking could not
+        // reach the authenticated service. Silence would read as "fine".
+        None => format!("{version}  ·  update service unavailable"),
     }
 }
 
@@ -2026,7 +2025,7 @@ mod tests {
             None,
             None,
         );
-        let not_wired_up = installed_status(
+        let service_unavailable = installed_status(
             Some(&record("9ZZTESTGAME1", &["content-a"])),
             Some(&product("9ZZTESTGAME1", "T", &[])),
             None,
@@ -2036,9 +2035,12 @@ mod tests {
         assert!(up_to_date.contains("up to date"), "{up_to_date}");
         assert!(stale.contains("update available"), "{stale}");
         assert!(unrecorded.contains("cannot be checked"), "{unrecorded}");
-        assert!(not_wired_up.contains("not wired up"), "{not_wired_up}");
+        assert!(
+            service_unavailable.contains("service unavailable"),
+            "{service_unavailable}"
+        );
 
-        let all = [&up_to_date, &stale, &unrecorded, &not_wired_up];
+        let all = [&up_to_date, &stale, &unrecorded, &service_unavailable];
         let distinct: BTreeSet<&String> = all.iter().copied().collect();
         assert_eq!(
             distinct.len(),

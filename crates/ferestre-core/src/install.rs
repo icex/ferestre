@@ -15,9 +15,8 @@
 //! So the update key is the package version, and the content ids are kept only
 //! because they are the path component a download needs. What the anonymous
 //! catalog cannot supply is the *available* version -- it reports `"0"` for
-//! everything -- so until the authenticated update endpoint is wired up, the
-//! honest answer to "is there an update" is "cannot tell", and that is what
-//! this returns. See docs/ROADMAP.md for the endpoint and the plan format.
+//! everything -- so the launcher asks `GetBasePackage` on the authenticated
+//! update service for the available version. See docs/ROADMAP.md for delivery.
 //!
 //! The install does not have to be taken on trust, either. The client leaves the
 //! package header on disk as `.xodus-streaming.msixvc`, and the GUID in it *is*
@@ -581,7 +580,7 @@ mod tests {
 
     /// Neither "up to date" nor "stale" is honest with nothing to compare, and
     /// a launcher that guesses either way either nags or hides a real update.
-    /// Today the available version is never known, so this is the normal case.
+    /// This is normal only while the update service is unavailable.
     #[test]
     fn nothing_to_compare_is_unknown_not_a_verdict() {
         let installed = record(&["content-a"]);

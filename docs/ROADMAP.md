@@ -192,6 +192,13 @@ honestly marked as unproven rather than planned.
       a title installed before this launcher existed is adopted exactly, from a
       4 KiB read, with nothing assumed and nothing to ask.
 
+      The launcher asks authenticated `GetBasePackage` for the offered version.
+      Its Update action uses the same resumable streaming path as install: it
+      compares package segment hashes, retains matching data and downloads only
+      changed segments. The Wine prefix, WGS saves and settings are outside the
+      package tree and are untouched; after a successful delivery the new
+      package version is recorded.
+
       Two things had to be right or it would have been worse than useless.
       **The catalog set is filtered to `Windows.Desktop`**: most titles ship an
       Xbox package beside the desktop one with its own content id, and comparing
@@ -511,18 +518,10 @@ These are judgement calls, not engineering ones:
   install is treated as stale -- but the underlying behaviour is the client's,
   and this is a check around it rather than a fix.
 
-- **Update detection does not work yet, and the reason was a wrong premise.**
-  It compared *content ids*, on the belief that a rebuild produces a new one. It
-  does not: 26 published patch plans spanning 26 builds of three titles carry
-  three content ids, one per title. A content id names the package; the version
-  names the build. Detection is keyed on the version now, but the *available*
-  version is not published anonymously — the catalog reports `"0"` for
-  everything — so every installed title honestly reads "update checking is not
-  wired up yet" until `GetBasePackage` on update.xboxlive.com is called with an
-  XSTS token. That endpoint also returns the patch plans, so it is the same
-  piece of work as the item above.
-- **There are no delta updates.** MSIXVC downloads are resumable but not
-  differential, so "update" currently means re-downloading the title. That is
-  ~2.5 GB for Bedrock but tens of gigabytes for a large title, which makes
-  update detection close to useless until it is solved. Epic's chunked manifests
-  give Heroic deltas for free; this has no equivalent yet.
+- **Page-granular XSP plans remain an optimisation.** Delivery already compares
+  encrypted file segments and keeps unchanged data. Microsoft also publishes
+  `.xsp` plans that can reuse individual 4 KiB pages; applying those plans can
+  reduce transfer sizes where the publisher provides a non-fallback plan. The
+  parser exists, but the streaming path deliberately keeps its proven
+  segment-level recovery and verification until a page-plan writer provides the
+  same interruption safety.

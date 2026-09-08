@@ -446,8 +446,8 @@ fn draw_list(
         ownership: &model.ownership,
         catalog: &model.catalog,
         records: &model.records,
-        // Empty until something asks the update service what it is offering.
-        // See `Inputs::available` and docs/ROADMAP.md.
+        // Filled by `refresh_updates` after every reload. See
+        // `Inputs::available` and docs/ROADMAP.md.
         available: &model.available,
         installed: &installed,
         installed_version: &installed_version,
@@ -1891,7 +1891,10 @@ fn refresh_account(ui: &Ui) {
 fn refresh_updates(ui: &Ui) {
     let (client, records) = {
         let model = ui.model.borrow();
-        (model.xodus_cli(), model.records.values().cloned().collect::<Vec<_>>())
+        (
+            model.xodus_cli(),
+            model.records.values().cloned().collect::<Vec<_>>(),
+        )
     };
     let Some(client) = client else { return };
     if records.is_empty() || !begin(ui) {
@@ -1902,20 +1905,28 @@ fn refresh_updates(ui: &Ui) {
         let checked = gio::spawn_blocking(move || {
             let mut available = BTreeMap::new();
             for record in records {
-                let Some(content_id) = record.content_ids.first() else { continue };
+                let Some(content_id) = record.content_ids.first() else {
+                    continue;
+                };
                 let output = std::process::Command::new(&client)
                     .args(["update", content_id, "--json"])
                     .stderr(std::process::Stdio::null())
                     .output()
                     .ok()?;
-                if !output.status.success() { continue }
+                if !output.status.success() {
+                    continue;
+                }
                 let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-                if let Some(version) = value["version"].as_str().filter(|version| !version.is_empty()) {
+                if let Some(version) = value["version"]
+                    .as_str()
+                    .filter(|version| !version.is_empty())
+                {
                     available.insert(record.product_id.to_ascii_uppercase(), version.to_string());
                 }
             }
             Some(available)
-        }).await;
+        })
+        .await;
         finish(&ui);
         if let Ok(Some(available)) = checked {
             ui.model.borrow_mut().available = available;

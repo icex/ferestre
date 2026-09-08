@@ -140,7 +140,6 @@ enum Cmd {
     /// Check installed MSIXVC packages against the authenticated update service.
     Updates,
 
-
     /// Remove an installed title: its files and the launcher's record of it.
     #[command(alias = "remove")]
     Uninstall {
@@ -392,6 +391,18 @@ fn update_command(xodus_cli: &Path, content_id: &str) -> Command {
     command
 }
 
+/// The client's streaming command is also its update delivery command.
+///
+/// It compares the package's segment metadata with the tree already in
+/// `destination`, keeps matching files, and downloads only changed segments.
+/// Keeping this construction in one place means the GUI's Update action and
+/// `ferestre install PRODUCT` share the same safe, resumable path.
+fn streaming_command(xodus_cli: &Path, product_id: &str, destination: &Path) -> Command {
+    let mut command = Command::new(xodus_cli);
+    command.arg("streaming").arg(product_id).arg(destination);
+    command
+}
+
 fn cmd_updates(cli: &Cli) -> Result<ExitCode> {
     let paths = Paths::from_env()?;
     let xodus_cli = paths
@@ -430,8 +441,16 @@ fn cmd_updates(cli: &Cli) -> Result<ExitCode> {
         println!("no installed packages could be checked");
     } else {
         for result in results {
-            let state = if result["update_available"] == Value::Bool(true) { "update available" } else { "up to date" };
-            println!("{}: {}", result["product_id"].as_str().unwrap_or("package"), state);
+            let state = if result["update_available"] == Value::Bool(true) {
+                "update available"
+            } else {
+                "up to date"
+            };
+            println!(
+                "{}: {}",
+                result["product_id"].as_str().unwrap_or("package"),
+                state
+            );
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -563,8 +582,7 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
         (None, None) => paths.games_dir().join(product_id.to_ascii_lowercase()),
     };
 
-    let mut command = Command::new(&xodus_cli);
-    command.arg("streaming").arg(&product_id).arg(&dest);
+    let command = streaming_command(&xodus_cli, &product_id, &dest);
 
     if cli.json {
         print_json(&json!({
@@ -2134,6 +2152,20 @@ summary = "Runs."
     fn download_is_still_accepted_as_a_name_for_install() {
         let cli = Cli::try_parse_from(["ferestre", "download", "9NBLGGH2JHXJ"]).unwrap();
         assert!(matches!(cli.command, Cmd::Install { .. }));
+    }
+
+    #[test]
+    fn installing_an_existing_destination_uses_the_incremental_streaming_path() {
+        let command = streaming_command(
+            Path::new("/opt/xodus/xodus-cli"),
+            "9NBLGGH2JHXJ",
+            Path::new("/games/bedrock"),
+        );
+        assert_eq!(command.get_program(), Path::new("/opt/xodus/xodus-cli"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["streaming", "9NBLGGH2JHXJ", "/games/bedrock"]
+        );
     }
 
     #[test]
