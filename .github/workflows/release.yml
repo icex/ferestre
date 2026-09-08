@@ -78,6 +78,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libgtk-4-dev libadwaita-1-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev \
             fuse3 libfuse3-3 zstd
 
       - uses: dtolnay/rust-toolchain@stable
@@ -111,6 +112,44 @@ jobs:
 
       - name: Build
         run: cargo build --release --workspace
+
+      # A release that opens but cannot sign in is not a usable AppImage. Build
+      # the GPL client separately and ship it beside the MIT launcher; the two
+      # still communicate solely by process invocation. The same ordered patch
+      # series the AUR package applies is used here, so the binary in the image
+      # and its corresponding source diffs describe the same client.
+      - name: Build bundled Xodus client
+        run: |
+          set -euo pipefail
+          git clone --quiet https://github.com/xodus-gaming/xodus.git xodus
+          git -C xodus checkout --quiet 3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
+          for patch in patches/xodus-cli/*.patch; do
+              git -C xodus apply "$GITHUB_WORKSPACE/$patch"
+          done
+          cargo build --release --manifest-path xodus/Cargo.toml \
+              -p xodus-cli -p xodus-service
+
+      # The runtime is independently versioned and large, but it is required
+      # before a title can launch. Carry the latest published runtime in the
+      # AppImage so first start has every required component without asking a
+      # new user to find a second release or build Proton from source.
+      - name: Fetch bundled runtime
+        id: bundled-runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=$(gh release list --repo icex/ferestre --limit 100 | awk '$1 ~ /^runtime-/ { print $1; exit }')
+          test -n "$tag"
+          mkdir runtime-download
+          gh release download "$tag" --repo icex/ferestre \
+              --pattern 'ferestre-runtime-*.tar.xz' --dir runtime-download
+          archive=$(find runtime-download -maxdepth 1 -name 'ferestre-runtime-*.tar.xz' -print -quit)
+          test -n "$archive"
+          tar -xJf "$archive" -C runtime-download
+          runtime=$(find runtime-download -mindepth 1 -maxdepth 1 -type d -name 'ferestre-runtime-*' -print -quit)
+          test -n "$runtime"
+          echo "dir=$runtime" >> "$GITHUB_OUTPUT"
 
       # The layout an installed copy has: usr/bin/ferestre with
       # usr/lib/ferestre beside it. paths.rs looks for its repository root at
@@ -177,6 +216,8 @@ jobs:
         run: |
           packaging/appimage/build-appimage.sh \
             --bin target/release/ferestre-gui \
+            --client xodus/target/release/xodus-cli \
+            --runtime "${{ steps.bundled-runtime.outputs.dir }}" \
             --version "$VERSION" \
             --out out
 

@@ -79,6 +79,14 @@ pub struct Product {
     /// launcher can install and run today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package_format: Option<String>,
+    /// The Windows Update category for this package tier.
+    ///
+    /// MSIXVC packages come from the Xbox package service, while Appx and Msix
+    /// packages are delivered through Windows Update FE3. Its SOAP requests do
+    /// not take a Store product id or ContentId; they take this SKU-scoped
+    /// category id instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wu_category_id: Option<String>,
     /// Whether any package listed is one a PC can install.
     ///
     /// The distinction `has_packages` alone cannot make. Four owned titles --
@@ -207,6 +215,8 @@ struct SkuProperties {
     last_update: Option<String>,
     #[serde(rename = "Packages", default)]
     packages: Vec<Package>,
+    #[serde(rename = "FulfillmentData", default)]
+    fulfillment: Option<FulfillmentData>,
     /// The products a bundle is made of. A bundle carries no packages of its
     /// own, so this is the only route from "Minecraft: Java & Bedrock Edition
     /// for PC" to something with a size and a download.
@@ -219,6 +229,12 @@ struct SkuProperties {
     /// response for products that use the other.
     #[serde(rename = "BundledSkus", default)]
     bundled_skus: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct FulfillmentData {
+    #[serde(rename = "WuCategoryId", default)]
+    wu_category_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -432,6 +448,18 @@ pub fn parse(json: &str) -> Result<Vec<Product>> {
             let tier = PC_PLATFORMS
                 .iter()
                 .find(|platform| packages.iter().any(|p| p.runs_on(platform)));
+            // The category belongs to a SKU rather than an individual package.
+            // Pick it from the same preferred PC tier used for size and format,
+            // so a Universal package beside an old Windows 8 package does not
+            // route an FE3 request to the wrong update.
+            let wu_category_id = tier.and_then(|platform| {
+                raw.skus
+                    .iter()
+                    .filter_map(|sku| sku.sku.as_ref()?.properties.as_ref())
+                    .find(|properties| properties.packages.iter().any(|p| p.runs_on(platform)))
+                    .and_then(|properties| properties.fulfillment.as_ref()?.wu_category_id.clone())
+                    .filter(|id| !id.is_empty())
+            });
             let mut download_bytes = None;
             let mut package_format: Option<String> = None;
             let mut counted: Vec<&str> = Vec::new();
@@ -467,6 +495,7 @@ pub fn parse(json: &str) -> Result<Vec<Product>> {
                 content_ids,
                 has_packages,
                 package_format,
+                wu_category_id,
                 has_pc_package: tier.is_some(),
                 bundled_ids,
             })
@@ -486,7 +515,8 @@ pub fn parse(json: &str) -> Result<Vec<Product>> {
 /// being summed across them. A version-2 file has no size at all for a Windows 8
 /// store app and does not know a bundle has children, which reads as "the
 /// catalog does not give a size" for something the catalog answers fine.
-const CACHE_SCHEMA: u32 = 3;
+/// Version 4 adds `wu_category_id`, the routing key for Appx/Msix delivery.
+const CACHE_SCHEMA: u32 = 4;
 
 #[derive(Serialize, Deserialize)]
 struct CacheEntry {
@@ -756,7 +786,9 @@ mod tests {
         let both = r#"{"Products":[{
           "ProductId": "9NBLGGH4VVNH",
           "LocalizedProperties": [{"ProductTitle": "VLC UWP"}],
-          "DisplaySkuAvailabilities": [{"Sku": {"Properties": {"Packages": [
+          "DisplaySkuAvailabilities": [{"Sku": {"Properties": {
+            "FulfillmentData": {"WuCategoryId": "fe3-universal-category"},
+            "Packages": [
             {"ContentId": "content-universal", "MaxDownloadSizeInBytes": 100000000,
              "PackageFormat": "AppxBundle",
              "PlatformDependencies": [{"PlatformName": "Windows.Universal"}]},
@@ -778,6 +810,11 @@ mod tests {
             products[0].size_label(),
             "100 MB",
             "the tier that would be installed, not the sum of every tier"
+        );
+        assert_eq!(
+            products[0].wu_category_id.as_deref(),
+            Some("fe3-universal-category"),
+            "the Windows Update category follows the selected PC package tier"
         );
     }
 

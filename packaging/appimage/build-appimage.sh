@@ -76,6 +76,8 @@ usage() {
 options
   --out DIR          where the .AppImage lands       (default $REPO/out)
   --bin PATH         the launcher binary to package  (default: autodetect, else placeholder)
+  --client PATH      xodus-cli binary to bundle
+  --runtime DIR      patched Proton runtime directory to bundle
   --version V        version string                  (default: from Cargo.toml, else $DEFAULT_VERSION)
   --app-id ID        reverse-DNS application id      (default $DEFAULT_APP_ID)
   --update-info STR  appimagetool -u string; also writes a .zsync file
@@ -86,7 +88,7 @@ options
   -h, --help         this text
 
 environment
-  FERESTRE_BIN, FERESTRE_OUT_DIR, FERESTRE_VERSION, FERESTRE_APP_ID, FERESTRE_UPDATE_INFO
+  FERESTRE_BIN, FERESTRE_CLIENT_BIN, FERESTRE_RUNTIME_DIR, FERESTRE_OUT_DIR, FERESTRE_VERSION, FERESTRE_APP_ID, FERESTRE_UPDATE_INFO
   FERESTRE_CACHE_DIR         build-tool cache      (default \${XDG_CACHE_HOME:-\$HOME/.cache}/ferestre-appimage)
   FERESTRE_BUILD_DIR         AppDir staging        (default $REPO/build/appimage)
   FERESTRE_APPIMAGETOOL      a local appimagetool AppImage, instead of downloading
@@ -100,6 +102,8 @@ OUT_DIR=${FERESTRE_OUT_DIR:-$REPO/out}
 BUILD_DIR=${FERESTRE_BUILD_DIR:-$REPO/build/appimage}
 CACHE_DIR=${FERESTRE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/ferestre-appimage}
 LAUNCHER_BIN=${FERESTRE_BIN:-}
+CLIENT_BIN=${FERESTRE_CLIENT_BIN:-}
+BUNDLED_RUNTIME=${FERESTRE_RUNTIME_DIR:-}
 VERSION=${FERESTRE_VERSION:-}
 APP_ID=${FERESTRE_APP_ID:-$DEFAULT_APP_ID}
 UPDATE_INFO=${FERESTRE_UPDATE_INFO:-}
@@ -109,6 +113,8 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --out)          OUT_DIR=${2:?--out needs a directory}; shift 2 ;;
         --bin)          LAUNCHER_BIN=${2:?--bin needs a path}; shift 2 ;;
+        --client)       CLIENT_BIN=${2:?--client needs a path}; shift 2 ;;
+        --runtime)      BUNDLED_RUNTIME=${2:?--runtime needs a directory}; shift 2 ;;
         --version)      VERSION=${2:?--version needs a value}; shift 2 ;;
         --app-id)       APP_ID=${2:?--app-id needs a value}; shift 2 ;;
         --update-info)  UPDATE_INFO=${2:?--update-info needs a value}; shift 2 ;;
@@ -302,6 +308,22 @@ mkdir -p "$APPDIR/usr/bin" \
 
 install -m 0755 "$HERE/AppRun"      "$APPDIR/AppRun"
 install -m 0755 "$LAUNCHER_BIN"     "$APPDIR/usr/bin/ferestre"
+if [ -n "$CLIENT_BIN" ]; then
+    [ -x "$CLIENT_BIN" ] || die "--client is not an executable: $CLIENT_BIN"
+    say "client: $CLIENT_BIN"
+    install -Dm755 "$CLIENT_BIN" "$APPDIR/usr/lib/ferestre/client/xodus-cli"
+    if [ -x "$(dirname "$CLIENT_BIN")/xodus-service" ]; then
+        install -Dm755 "$(dirname "$CLIENT_BIN")/xodus-service" \
+            "$APPDIR/usr/lib/ferestre/client/xodus-service"
+    fi
+fi
+if [ -n "$BUNDLED_RUNTIME" ]; then
+    [ -d "$BUNDLED_RUNTIME" ] || die "--runtime is not a directory: $BUNDLED_RUNTIME"
+    say "runtime: $BUNDLED_RUNTIME"
+    cp -a "$BUNDLED_RUNTIME" "$APPDIR/usr/lib/ferestre/runtime"
+    [ -f "$APPDIR/usr/lib/ferestre/runtime/files/lib/wine/x86_64-windows/xgameruntime.dll" ] || die \
+        "--runtime does not look like a ferestre runtime: $BUNDLED_RUNTIME"
+fi
 if [ -n "$GUI_BIN" ]; then
     say "window: $GUI_BIN"
     install -m 0755 "$GUI_BIN"      "$APPDIR/usr/bin/ferestre-gui"

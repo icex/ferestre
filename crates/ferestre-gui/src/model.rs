@@ -531,7 +531,8 @@ impl LibraryRow {
     }
 }
 
-/// Every title worth a row: everything owned, plus everything described.
+/// Every title worth a row: everything owned, plus everything described once
+/// an account has supplied a library, plus what is installed on disk.
 ///
 /// The union rather than the intersection, deliberately. A recipe for something
 /// this account does not own still belongs on screen -- it is how someone finds
@@ -541,9 +542,19 @@ impl LibraryRow {
 pub fn library(inputs: &Inputs) -> Vec<LibraryRow> {
     let mut rows: BTreeMap<String, LibraryRow> = BTreeMap::new();
 
+    // A packaged recipe is a compatibility description, not proof that this
+    // machine owns or installed the game. Showing all of them before sign-in
+    // made a fresh AppImage look like it had populated somebody's library.
+    // Keep a recipe-backed row for an on-disk record, and otherwise wait for
+    // the account listing that turns a catalogue of support into a library.
     for recipe in inputs.recipes {
         let key = recipe.title.product_id.to_ascii_uppercase();
-        rows.insert(key.clone(), described_row(inputs, recipe, &key));
+        if !matches!(inputs.ownership, Ownership::Unknown)
+            || (inputs.installed)(recipe)
+            || inputs.records.contains_key(&key)
+        {
+            rows.insert(key.clone(), described_row(inputs, recipe, &key));
+        }
     }
 
     if let Ownership::Known(entries) = inputs.ownership {
@@ -1083,6 +1094,7 @@ mod tests {
             // which the catalog would never return.
             has_packages: true,
             package_format: Some("MSIXVC".into()),
+            wu_category_id: None,
             has_pc_package: true,
             bundled_ids: Vec::new(),
         }
@@ -1141,7 +1153,7 @@ mod tests {
     fn a_playable_title_that_is_not_on_disk_offers_to_install_it() {
         let recipes = vec![recipe("9ZZTESTGAME1", "playable", &[])];
         let rt = runtime_with(&[], CapabilitySource::Manifest);
-        let own = Ownership::Unknown;
+        let own = Ownership::Known(entries(&["9ZZTESTGAME1"]));
         let rows = library(&inputs(&recipes, Some(&rt), &own, NOTHING_INSTALLED));
         assert_eq!(rows[0].action, Action::Install);
         assert_eq!(
@@ -1266,7 +1278,7 @@ mod tests {
             &["loader.memfd-main-image"],
         )];
         let rt = runtime_with(&["loader.memfd-main-image"], CapabilitySource::Probed);
-        let own = Ownership::Unknown;
+        let own = Ownership::Known(entries(&["9ZZTESTGAME1"]));
         let rows = library(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
         assert_eq!(rows[0].action, Action::Play);
         assert!(
@@ -1439,6 +1451,38 @@ mod tests {
             owned_not_described.subtitle.contains("no recipe"),
             "{}",
             owned_not_described.subtitle
+        );
+    }
+
+    #[test]
+    fn an_unsigned_machine_shows_only_titles_that_are_actually_installed() {
+        let recipes = vec![recipe("9ZZTESTGAME1", "playable", &[])];
+        let record = record("9ZZTESTDISK2", &["content-a"]);
+        let records = [(record.product_id.clone(), record)].into();
+        let catalog = BTreeMap::new();
+        let available = BTreeMap::new();
+        let unknown = Ownership::Unknown;
+        let rows = library(&Inputs {
+            recipes: &recipes,
+            runtime: None,
+            registry: None,
+            ownership: &unknown,
+            catalog: &catalog,
+            records: &records,
+            available: &available,
+            installed: NOTHING_INSTALLED,
+            installed_version: NO_VERSION_ON_DISK,
+            installed_product: NOT_ON_DISK,
+            product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            installing: NOTHING_INSTALLING,
+            running: NOTHING_RUNNING,
+        });
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.product_id.as_str())
+                .collect::<Vec<_>>(),
+            ["9ZZTESTDISK2"],
+            "packaged recipes describe support; they are not this machine's library"
         );
     }
 

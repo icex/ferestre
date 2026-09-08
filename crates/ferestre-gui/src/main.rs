@@ -1493,6 +1493,27 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
     }
     let program = cli_binary();
     let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let runtime_install = owned == ["install-runtime"];
+    let tick = if runtime_install {
+        // A source-built runtime has no byte total to report, but a visible
+        // pulsing bar is still better than a toast that appears frozen through
+        // Wine's long configure and link steps.
+        ui.download
+            .start("runtime", "Patched runtime", "Installing");
+        let ticker = ui.clone();
+        Some(glib::timeout_add_local(
+            std::time::Duration::from_millis(250),
+            move || {
+                if ticker.download.current.borrow().is_none() {
+                    return glib::ControlFlow::Break;
+                }
+                ticker.download.tick();
+                glib::ControlFlow::Continue
+            },
+        ))
+    } else {
+        None
+    };
     ui.toasts
         .add_toast(adw::Toast::new(&format!("{what} — this can take a while")));
 
@@ -1507,6 +1528,10 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
                 .map_err(|e| format!("{}: {e}", program.display()))
         })
         .await;
+        if let Some(tick) = tick {
+            tick.remove();
+            ui.download.stop();
+        }
         finish(&ui);
         match result {
             Ok(Ok(status)) if status.success() => {

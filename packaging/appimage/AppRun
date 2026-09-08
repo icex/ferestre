@@ -31,6 +31,16 @@ export PATH="$APPDIR/usr/bin:$PATH"
 # invoking usr/bin/ferestre directly out of an extracted AppDir.
 export FERESTRE_SCRIPTS_DIR="${FERESTRE_SCRIPTS_DIR:-$APPDIR/usr/lib/ferestre/scripts}"
 
+# The release image contains the GPL client and the patched Proton runtime. A
+# caller can still override either path for development, but a fresh machine
+# must not need a second package before it can sign in or run a title.
+if [ -x "$APPDIR/usr/lib/ferestre/client/xodus-cli" ]; then
+    export XODUS_CLI_DIR="${XODUS_CLI_DIR:-$APPDIR/usr/lib/ferestre/client}"
+fi
+if [ -d "$APPDIR/usr/lib/ferestre/runtime" ]; then
+    export XODUS_PROTON_DIR="${XODUS_PROTON_DIR:-$APPDIR/usr/lib/ferestre/runtime}"
+fi
+
 # No arguments means somebody clicked the icon, so open the window; arguments
 # mean they typed a command, so run the CLI. Desktop integrators rewrite a
 # .desktop `Exec=` to the AppImage's own path and drop the binary name, so this
