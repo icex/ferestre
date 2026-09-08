@@ -162,6 +162,13 @@ enum Cmd {
     /// Build and install the patched Proton runtime.
     InstallRuntime,
 
+    /// Inspect an Appx or Msix archive without extracting or launching it.
+    InspectPackage {
+        /// The .appx, .msix, .appxbundle, or .msixbundle archive.
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+    },
+
     /// Print the resolved XODUS_* paths.
     Env,
 
@@ -227,6 +234,7 @@ fn dispatch(cli: &Cli) -> Result<ExitCode> {
             yes,
         } => cmd_uninstall(cli, product_id, *keep_files, *prefix, *yes),
         Cmd::InstallRuntime => cmd_install_runtime(cli),
+        Cmd::InspectPackage { path } => cmd_inspect_package(cli, path),
         Cmd::Env => cmd_env(cli),
         Cmd::Version => cmd_version(cli),
     }
@@ -235,6 +243,39 @@ fn dispatch(cli: &Cli) -> Result<ExitCode> {
 // ---------------------------------------------------------------------------
 // commands
 // ---------------------------------------------------------------------------
+
+fn cmd_inspect_package(cli: &Cli, path: &Path) -> Result<ExitCode> {
+    let package = ferestre_core::appx::inspect_archive(path)?;
+    if cli.json {
+        print_json(&json!({
+            "schema": JSON_SCHEMA,
+            "path": path.display().to_string(),
+            "package": package,
+        }));
+    } else {
+        let identity = package.identity.as_deref().unwrap_or("unknown identity");
+        let version = package.version.as_deref().unwrap_or("unknown version");
+        println!("{identity} {version}");
+        println!(
+            "  executable: {}",
+            package.executable.as_deref().unwrap_or("not declared")
+        );
+        println!(
+            "  entry point: {}",
+            package.entry_point.as_deref().unwrap_or("not declared")
+        );
+        println!(
+            "  model: {}",
+            match package.kind {
+                ferestre_core::appx::PackageKind::DesktopBridge =>
+                    "desktop bridge (candidate; launch support is not implemented yet)",
+                ferestre_core::appx::PackageKind::Uwp => "UWP (requires app-model support)",
+                ferestre_core::appx::PackageKind::Unknown => "unknown",
+            }
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
 
 fn cmd_version(cli: &Cli) -> Result<ExitCode> {
     let packaged = std::env::var("FERESTRE_PACKAGE_VERSION").ok();
@@ -2228,6 +2269,7 @@ summary = "Runs."
             vec!["ferestre", "run", "bedrock"],
             vec!["ferestre", "install", "9NBLGGH2JHXJ"],
             vec!["ferestre", "install-runtime"],
+            vec!["ferestre", "inspect-package", "/tmp/example.appx"],
             vec!["ferestre", "env"],
             vec!["ferestre", "version"],
         ] {
