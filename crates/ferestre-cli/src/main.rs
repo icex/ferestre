@@ -525,7 +525,7 @@ fn cmd_run(
     let assessment = runtime::assess(recipe, runtime, registry.as_ref());
     let verdict = gate(&assessment);
     if verdict == Gate::Refused && !force {
-        bail!("{}", refusal(&assessment, &runtime));
+        bail!("{}", refusal(&assessment, runtime));
     }
     for line in warnings(recipe, &assessment, verdict, force) {
         eprintln!("{line}");

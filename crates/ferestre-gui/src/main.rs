@@ -774,18 +774,20 @@ fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
             ferestre_core::runtime::selected(paths.config_dir(), product_id),
         )
     };
-    let dialog = gtk::Dialog::builder()
+    let dialog = gtk::Window::builder()
         .transient_for(&ui.window)
         .modal(true)
         .title(format!("Runtime for {title}"))
         .default_width(520)
         .build();
-    let content = dialog.content_area();
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
-    content.set_spacing(8);
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(18)
+        .margin_bottom(18)
+        .margin_start(18)
+        .margin_end(18)
+        .build();
     let automatic = gtk::Button::with_label("Automatic (newest compatible)");
     let automatic_ui = ui.clone();
     let automatic_dialog = dialog.clone();
@@ -839,7 +841,11 @@ fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
         });
         content.append(&choice);
     }
-    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+    let cancel = gtk::Button::with_label("Cancel");
+    let cancel_dialog = dialog.clone();
+    cancel.connect_clicked(move |_| cancel_dialog.close());
+    content.append(&cancel);
+    dialog.set_child(Some(&content));
     dialog.present();
 }
 
