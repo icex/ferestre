@@ -285,7 +285,15 @@ fn build_ui(app: &adw::Application) {
     // whose library is this -- so it is asked without being told to. The
     // library is not: it signs in, pages through collections and can take
     // seconds, so it waits to be asked.
-    refresh_account(&ui);
+    if ui.model.borrow().runtime.is_none() {
+        // A fresh AppImage has the small launcher and client, while the large
+        // runtime follows its own release train. Make that first download an
+        // ordinary visible operation instead of an error the person has to
+        // diagnose before their first launch.
+        spawn_cli_tracked(&ui, &["install-runtime"], "Downloading the runtime");
+    } else {
+        refresh_account(&ui);
+    }
 
     window.present();
 }
@@ -364,17 +372,34 @@ fn render_runtime(ui: &Ui, page: &adw::PreferencesPage) {
         let install = gtk::Button::builder()
             .label("Install")
             .valign(gtk::Align::Center)
-            .tooltip_text("ferestre install-runtime — builds a patched Proton, which takes a while")
+            .tooltip_text("Download the current patched Proton runtime")
             .build();
         install.connect_clicked(glib::clone!(
             #[strong]
             ui,
-            move |_| spawn_cli_tracked(&ui, &["install-runtime"], "Building the runtime")
+            move |_| spawn_cli_tracked(&ui, &["install-runtime"], "Downloading the runtime")
         ));
         row.add_suffix(&install);
     }
     group.add(&row);
     page.add(&group);
+
+    if model.runtimes.len() > 1 {
+        let versions = adw::PreferencesGroup::builder()
+            .title("Installed versions")
+            .description("New launches use the newest compatible version. A title-specific choice is kept locally.")
+            .build();
+        for runtime in &model.runtimes {
+            versions.add(
+                &adw::ActionRow::builder()
+                    .title(runtime.label())
+                    .subtitle(runtime.path.display().to_string())
+                    .subtitle_lines(2)
+                    .build(),
+            );
+        }
+        page.add(&versions);
+    }
 
     if let Some(runtime) = &model.runtime {
         let capabilities = adw::PreferencesGroup::builder()
@@ -1495,9 +1520,9 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
     let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     let runtime_install = owned == ["install-runtime"];
     let tick = if runtime_install {
-        // A source-built runtime has no byte total to report, but a visible
-        // pulsing bar is still better than a toast that appears frozen through
-        // Wine's long configure and link steps.
+        // A runtime archive is large and GitHub cannot provide a stable byte
+        // total before the redirect. Keep progress visibly moving throughout
+        // discovery, download and unpacking.
         ui.download
             .start("runtime", "Patched runtime", "Installing");
         let ticker = ui.clone();

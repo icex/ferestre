@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ferestre_core::catalog;
+use ferestre_core::http;
 use ferestre_core::install;
 use ferestre_core::launch;
 use ferestre_core::library;
@@ -512,9 +513,16 @@ fn cmd_run(
     // Checked before anything is started, because the alternative is a title
     // that exits 1 with an empty log and someone guessing which of eleven
     // patches is missing.
-    let runtime = InstalledRuntime::discover(&paths)?;
+    let runtimes = runtime::all(&paths);
+    let requested_runtime = runtime::selected(paths.config_dir(), &recipe.title.product_id);
+    let runtime = runtime::select(
+        recipe,
+        &runtimes,
+        requested_runtime.as_deref(),
+        registry_for(&paths).as_ref(),
+    )?;
     let registry = registry_for(&paths);
-    let assessment = runtime::assess(recipe, &runtime, registry.as_ref());
+    let assessment = runtime::assess(recipe, runtime, registry.as_ref());
     let verdict = gate(&assessment);
     if verdict == Gate::Refused && !force {
         bail!("{}", refusal(&assessment, &runtime));
@@ -528,10 +536,10 @@ fn cmd_run(
     // there is nothing to do -- reading one file -- and it is the difference
     // between a patched runtime working and merely existing.
     if let Some(registry) = &registry {
-        register_winrt_classes(&paths, recipe, registry, &runtime);
+        register_winrt_classes(&paths, recipe, registry, runtime);
     }
 
-    let dirs = launch_dirs(&paths)?;
+    let dirs = launch_dirs_for_runtime(&paths, &runtime.path)?;
     let options = launch::Options {
         steam_integration: steam,
         xuid: paths.var("XGR_XUID").map(str::to_string),
@@ -967,33 +975,80 @@ fn installed_summary(record: &install::Record) -> String {
     }
 }
 
+/// GitHub's release feed is public. Runtime tags share the same repository as
+/// the small launcher releases, and `runtime::latest_release` filters the two
+/// deliberately rather than relying on a mutable "latest" link.
+const RELEASES_API: &str = "https://api.github.com/repos/icex/ferestre/releases?per_page=30";
+
 fn cmd_install_runtime(cli: &Cli) -> Result<ExitCode> {
     let paths = Paths::from_env()?;
-    let scripts = paths
-        .scripts_dir()
-        .ok_or_else(|| anyhow!("cannot find the scripts directory; set XODUS_REPO_DIR"))?;
-    let script = scripts.join("install-xodus-proton.sh");
-    if !script.is_file() {
-        bail!("{} is missing", script.display());
-    }
-    if !paths.build_dir().is_dir() {
-        // It builds inside a container from a Proton tree no package can carry,
-        // so say where that has to be rather than failing deep in the script.
-        bail!(
-            "no Proton build tree at {} -- the runtime is built from source, not shipped: \
-             see docs/RECIPES.md section 1, then set XODUS_BUILD_DIR",
-            paths.build_dir().display()
+    eprintln!("-- checking for the latest Ferestre runtime");
+    let release = runtime::latest_release(&http::get_text(RELEASES_API)?)?;
+    let version = release
+        .tag
+        .strip_prefix("runtime-")
+        .filter(|version| {
+            !version.is_empty()
+                && version
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        })
+        .ok_or_else(|| anyhow!("runtime release has an unsafe version: {}", release.tag))?;
+    let destination = paths.runtimes_dir().join(version);
+    if InstalledRuntime::at(&destination).is_ok() {
+        println!(
+            "-- runtime {version} is already installed at {}",
+            destination.display()
         );
+        return Ok(ExitCode::SUCCESS);
     }
-
     if cli.json {
         print_json(&json!({
             "schema": JSON_SCHEMA,
-            "plan": { "program": script.display().to_string(), "args": [] },
+            "release": release.tag,
+            "asset": release.asset_name,
+            "destination": destination,
         }));
         return Ok(ExitCode::SUCCESS);
     }
-    Ok(ExitCode::from(run_inherited(Command::new(script))?))
+
+    let archive = paths.cache_dir().join("runtime").join(&release.asset_name);
+    eprintln!("-- downloading runtime {version} (this is a one-time download)");
+    http::download_large(&release.url, &archive)?;
+    eprintln!("-- unpacking runtime {version}");
+    std::fs::create_dir_all(paths.runtimes_dir())?;
+    let temporary = paths
+        .runtimes_dir()
+        .join(format!(".{version}.installing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temporary);
+    std::fs::create_dir_all(&temporary)?;
+    let mut unpack = Command::new("tar");
+    unpack
+        .args(["-xJf"])
+        .arg(&archive)
+        .arg("-C")
+        .arg(&temporary);
+    let code = run_inherited(unpack)?;
+    if code != 0 {
+        let _ = std::fs::remove_dir_all(&temporary);
+        bail!("could not unpack {}; tar exited {code}", archive.display());
+    }
+    let unpacked = temporary.join(format!("ferestre-runtime-{version}"));
+    InstalledRuntime::at(&unpacked)?;
+    if destination.exists() {
+        let _ = std::fs::remove_dir_all(&temporary);
+        bail!(
+            "{} appeared while the runtime was downloading; try again",
+            destination.display()
+        );
+    }
+    std::fs::rename(&unpacked, &destination)?;
+    let _ = std::fs::remove_dir_all(&temporary);
+    println!(
+        "-- installed runtime {version} at {}",
+        destination.display()
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_env(cli: &Cli) -> Result<ExitCode> {
@@ -1065,16 +1120,20 @@ fn registry_for(paths: &Paths) -> Option<Registry> {
 }
 
 fn launch_dirs(paths: &Paths) -> Result<launch::Dirs> {
+    let runtime = paths
+        .runtime_dir()
+        .ok_or_else(|| anyhow!("no patched Proton found; run: ferestre install-runtime"))?;
+    launch_dirs_for_runtime(paths, runtime)
+}
+
+fn launch_dirs_for_runtime(paths: &Paths, runtime: &Path) -> Result<launch::Dirs> {
     Ok(launch::Dirs {
         games_dir: paths.games_dir().to_path_buf(),
         cli_dir: paths
             .cli_dir()
             .ok_or_else(|| anyhow!("no xodus-cli found; set XODUS_CLI_DIR (see: ferestre doctor)"))?
             .to_path_buf(),
-        proton_dir: paths
-            .runtime_dir()
-            .ok_or_else(|| anyhow!("no patched Proton found; run: ferestre install-runtime"))?
-            .to_path_buf(),
+        proton_dir: runtime.to_path_buf(),
         // launch-gdk.sh falls back to the conventional path rather than leaving
         // STEAM_COMPAT_CLIENT_INSTALL_PATH empty, and Proton wants *something*.
         steam_dir: paths

@@ -20,6 +20,8 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 /// A ceiling, so a wrong URL that streams forever cannot fill a disk.
 const MAX_DOWNLOAD: u64 = 16 * 1024 * 1024;
+/// Runtime archives are large, while still bounded to protect the state disk.
+const MAX_LARGE_DOWNLOAD: u64 = 4 * 1024 * 1024 * 1024;
 
 fn agent(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
@@ -102,6 +104,16 @@ pub fn get_text(url: &str) -> Result<String> {
 /// then loads and fails on -- a corruption that outlives the thing that caused
 /// it and looks like a bug in the drawing code.
 pub fn download(url: &str, dest: &Path) -> Result<()> {
+    download_limited(url, dest, MAX_DOWNLOAD)
+}
+
+/// Fetch a deliberately large, known artifact such as a runtime release.
+/// The separate entry point makes callers opt into the larger disk budget.
+pub fn download_large(url: &str, dest: &Path) -> Result<()> {
+    download_limited(url, dest, MAX_LARGE_DOWNLOAD)
+}
+
+fn download_limited(url: &str, dest: &Path, limit: u64) -> Result<()> {
     if dest.is_file() {
         return Ok(());
     }
@@ -114,7 +126,7 @@ pub fn download(url: &str, dest: &Path) -> Result<()> {
         .map_err(|e| anyhow!("{url}: {e}"))?
         .into_body()
         .into_reader()
-        .take(MAX_DOWNLOAD);
+        .take(limit);
 
     let temporary = dest.with_extension("part");
     let mut file = std::fs::File::create(&temporary)?;

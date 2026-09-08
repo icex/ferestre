@@ -11,9 +11,9 @@
 #                                       extract anything.
 #   SHA256SUMS                          for both, so a download can be checked.
 #
-# The runtime still has its own build train and tags, but the launcher release
-# embeds its latest verified artifact. A fresh installation must be able to
-# sign in and run a title without separately locating a client or Proton build.
+# The runtime has its own build train and tag. The GUI downloads its published
+# release on first start, so updating the launcher never requires rebuilding
+# or embedding a 300 MB Proton archive.
 #
 # Cutting a release:
 #
@@ -129,28 +129,6 @@ jobs:
           cargo build --release --manifest-path xodus/Cargo.toml \
               -p xodus-cli -p xodus-service
 
-      # The runtime is independently versioned and large, but it is required
-      # before a title can launch. Carry the latest published runtime in the
-      # AppImage so first start has every required component without asking a
-      # new user to find a second release or build Proton from source.
-      - name: Fetch bundled runtime
-        id: bundled-runtime
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tag=$(gh release list --repo icex/ferestre --limit 100 | awk '$1 ~ /^runtime-/ { print $1; exit }')
-          test -n "$tag"
-          mkdir runtime-download
-          gh release download "$tag" --repo icex/ferestre \
-              --pattern 'ferestre-runtime-*.tar.xz' --dir runtime-download
-          archive=$(find runtime-download -maxdepth 1 -name 'ferestre-runtime-*.tar.xz' -print -quit)
-          test -n "$archive"
-          tar -xJf "$archive" -C runtime-download
-          runtime=$(find runtime-download -mindepth 1 -maxdepth 1 -type d -name 'ferestre-runtime-*' -print -quit)
-          test -n "$runtime"
-          echo "dir=$runtime" >> "$GITHUB_OUTPUT"
-
       # The layout an installed copy has: usr/bin/ferestre with
       # usr/lib/ferestre beside it. paths.rs looks for its repository root at
       # <binary>/../lib/ferestre before it looks at /usr/lib/ferestre, so this
@@ -171,9 +149,6 @@ jobs:
               "$root/usr/lib/ferestre/client/xodus-cli"
           install -Dm755 xodus/target/release/xodus-service \
               "$root/usr/lib/ferestre/client/xodus-service"
-          cp -a "${{ steps.bundled-runtime.outputs.dir }}" \
-              "$root/usr/lib/ferestre/runtime"
-
           # Not documentation: launch-gdk.sh is the launch path and
           # proton-wine-shim.sh is what the client execs as its "wine".
           # patches/ travels with them because install-xodus-proton.sh reads
@@ -223,7 +198,6 @@ jobs:
           packaging/appimage/build-appimage.sh \
             --bin target/release/ferestre-gui \
             --client xodus/target/release/xodus-cli \
-            --runtime "${{ steps.bundled-runtime.outputs.dir }}" \
             --version "$VERSION" \
             --out out
 

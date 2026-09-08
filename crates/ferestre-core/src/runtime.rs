@@ -19,7 +19,7 @@
 use crate::capability::{self, Capability, Match};
 use crate::paths::Paths;
 use crate::recipe::Recipe;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -145,6 +145,47 @@ impl InstalledRuntime {
     }
 }
 
+/// A published runtime archive, found from the normal GitHub release feed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Release {
+    pub tag: String,
+    pub asset_name: String,
+    pub url: String,
+}
+
+#[derive(Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    assets: Vec<GithubAsset>,
+}
+
+#[derive(Deserialize)]
+struct GithubAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+/// Select the newest runtime release in GitHub's reverse-chronological release
+/// feed. It deliberately ignores launcher releases and checksum files.
+pub fn latest_release(json: &str) -> anyhow::Result<Release> {
+    let releases: Vec<GithubRelease> = serde_json::from_str(json)?;
+    for release in releases {
+        if !release.tag_name.starts_with("runtime-") {
+            continue;
+        }
+        if let Some(asset) = release.assets.into_iter().find(|asset| {
+            asset.name.starts_with("ferestre-runtime-") && asset.name.ends_with(".tar.xz")
+        }) {
+            return Ok(Release {
+                tag: release.tag_name,
+                asset_name: asset.name,
+                url: asset.browser_download_url,
+            });
+        }
+    }
+    anyhow::bail!("no runtime archive was published in the Ferestre releases")
+}
+
 /// Every valid runtime in a directory of versioned runtime installs. Invalid
 /// entries are ignored: an interrupted download must not make all older,
 /// working runtimes disappear from the selector.
@@ -158,6 +199,73 @@ pub fn installed(dir: &Path) -> Vec<InstalledRuntime> {
         .collect();
     runtimes.sort_by(|a, b| b.version.cmp(&a.version).then_with(|| a.path.cmp(&b.path)));
     runtimes
+}
+
+/// All usable runtimes known on this machine. A legacy configured runtime
+/// remains visible alongside managed releases, which makes adopting Ferestre
+/// non-destructive for an existing Steam compatibility-tool installation.
+pub fn all(paths: &Paths) -> Vec<InstalledRuntime> {
+    let mut runtimes = installed(&paths.runtimes_dir());
+    if let Some(path) = paths.runtime_dir() {
+        if let Ok(runtime) = InstalledRuntime::at(path) {
+            if !runtimes.iter().any(|known| known.path == runtime.path) {
+                runtimes.push(runtime);
+            }
+        }
+    }
+    runtimes.sort_by(|a, b| b.version.cmp(&a.version).then_with(|| a.path.cmp(&b.path)));
+    runtimes
+}
+
+/// Per-title runtime choices kept outside shipped recipes. A release can update
+/// the compatibility matrix without overwriting the runtime a person chose.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Selections {
+    #[serde(default)]
+    titles: BTreeMap<String, PathBuf>,
+}
+
+fn selections_file(config_dir: &Path) -> PathBuf {
+    config_dir.join("runtime-selections.toml")
+}
+
+/// Read a local runtime choice for a Store product id.
+pub fn selected(config_dir: &Path, product_id: &str) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(selections_file(config_dir)).ok()?;
+    let selections: Selections = toml::from_str(&text).ok()?;
+    selections
+        .titles
+        .get(&product_id.to_ascii_uppercase())
+        .cloned()
+}
+
+/// Persist a local runtime choice. Passing `None` restores automatic selection.
+pub fn set_selected(
+    config_dir: &Path,
+    product_id: &str,
+    path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let file = selections_file(config_dir);
+    let mut selections: Selections = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|text| toml::from_str(&text).ok())
+        .unwrap_or_default();
+    match path {
+        Some(path) => {
+            selections
+                .titles
+                .insert(product_id.to_ascii_uppercase(), path.to_path_buf());
+        }
+        None => {
+            selections.titles.remove(&product_id.to_ascii_uppercase());
+        }
+    }
+    std::fs::create_dir_all(config_dir)?;
+    let temporary = file.with_extension("toml.part");
+    std::fs::write(&temporary, toml::to_string_pretty(&selections)?)?;
+    std::fs::rename(temporary, file)?;
+    Ok(())
 }
 
 /// Pick the requested runtime, or the newest compatible installed runtime.
@@ -825,6 +933,22 @@ hangs"""
     }
 
     #[test]
+    fn release_discovery_ignores_launcher_assets_and_finds_the_runtime_archive() {
+        let release = latest_release(
+            r#"[
+              {"tag_name":"v0.1.2","assets":[{"name":"ferestre-0.1.2.AppImage","browser_download_url":"https://example.invalid/gui"}]},
+              {"tag_name":"runtime-11.0.20260908","assets":[
+                {"name":"SHA256SUMS","browser_download_url":"https://example.invalid/sums"},
+                {"name":"ferestre-runtime-11.0.20260908.tar.xz","browser_download_url":"https://example.invalid/runtime"}
+              ]}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(release.tag, "runtime-11.0.20260908");
+        assert_eq!(release.url, "https://example.invalid/runtime");
+    }
+
+    #[test]
     fn runtime_inventory_keeps_valid_versions_and_skips_partial_downloads() {
         let root = TempDir::new("runtime-inventory");
         let older = root.path().join("11.0.1");
@@ -841,6 +965,19 @@ hangs"""
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].version.as_deref(), Some("11.0.2"));
         assert_eq!(found[1].version.as_deref(), Some("11.0.1"));
+    }
+
+    #[test]
+    fn a_title_runtime_choice_round_trips_without_touching_the_recipe() {
+        let config = TempDir::new("runtime-choice");
+        let chosen = Path::new("/opt/ferestre/runtimes/11.0.2");
+        set_selected(config.path(), "9nnx1vvr3knq", Some(chosen)).unwrap();
+        assert_eq!(
+            selected(config.path(), "9NNX1VVR3KNQ").as_deref(),
+            Some(chosen)
+        );
+        set_selected(config.path(), "9NNX1VVR3KNQ", None).unwrap();
+        assert_eq!(selected(config.path(), "9NNX1VVR3KNQ"), None);
     }
 
     #[test]

@@ -15,7 +15,7 @@ use ferestre_core::install::{self, Record};
 use ferestre_core::library;
 use ferestre_core::paths::Paths;
 use ferestre_core::recipe::Recipe;
-use ferestre_core::runtime::{InstalledRuntime, Registry};
+use ferestre_core::runtime::{self, InstalledRuntime, Registry};
 
 use crate::model::Ownership;
 
@@ -72,7 +72,10 @@ impl Section {
 pub struct Model {
     pub paths: Option<Paths>,
     pub recipes: Vec<Recipe>,
+    /// The automatic default, used for compatibility rows.
     pub runtime: Option<InstalledRuntime>,
+    /// Every runtime the person can choose from on this machine.
+    pub runtimes: Vec<InstalledRuntime>,
     pub registry: Option<Registry>,
     pub records: BTreeMap<String, Record>,
     /// Store product ids read from package metadata below `games_dir`. This is
@@ -133,9 +136,8 @@ impl Model {
             .as_ref()
             .and_then(Paths::titles_dir)
             .and_then(|dir| Registry::load(&dir.join("capabilities.toml")).ok());
-        let runtime = paths
-            .as_ref()
-            .and_then(|p| InstalledRuntime::discover(p).ok());
+        let runtimes = paths.as_ref().map(runtime::all).unwrap_or_default();
+        let runtime = runtimes.first().cloned();
         let records: BTreeMap<String, Record> = paths
             .as_ref()
             .map(|p| {
@@ -228,6 +230,7 @@ impl Model {
             paths,
             recipes,
             runtime,
+            runtimes,
             registry,
             records,
             installed_products,
