@@ -11,10 +11,9 @@
 #                                       extract anything.
 #   SHA256SUMS                          for both, so a download can be checked.
 #
-# The patched Proton runtime is deliberately NOT here. It is 300 MB
-# compressed, it versions independently, and tying a 3 MB application to a
-# 300 MB release train would mean a 300 MB download for a typo fix.
-# It has its own workflow (runtime.yml) and its own tags.
+# The runtime still has its own build train and tags, but the launcher release
+# embeds its latest verified artifact. A fresh installation must be able to
+# sign in and run a title without separately locating a client or Proton build.
 #
 # Cutting a release:
 #
@@ -167,6 +166,12 @@ jobs:
           install -d "$root/usr/bin" "$root/usr/lib/ferestre"
           install -Dm755 target/release/ferestre     "$root/usr/bin/ferestre"
           install -Dm755 target/release/ferestre-gui "$root/usr/bin/ferestre-gui"
+          install -Dm755 xodus/target/release/xodus-cli \
+              "$root/usr/lib/ferestre/client/xodus-cli"
+          install -Dm755 xodus/target/release/xodus-service \
+              "$root/usr/lib/ferestre/client/xodus-service"
+          cp -a "${{ steps.bundled-runtime.outputs.dir }}" \
+              "$root/usr/lib/ferestre/runtime"
 
           # Not documentation: launch-gdk.sh is the launch path and
           # proton-wine-shim.sh is what the client execs as its "wine".
@@ -253,11 +258,10 @@ jobs:
           | \`ferestre-$VERSION-x86_64.tar.zst\` | The same tree an installed copy has. Extract anywhere and run \`usr/bin/ferestre\`. |
           | \`SHA256SUMS\` | Checksums for both. |
 
-          The patched Proton runtime is **not** in this release. It versions
-          separately, under the \`runtime-*\` tags, because it is 300 MB and
-          changes only when Wine or the GDK runtime does. Install it with
-          \`ferestre install-runtime\`, or from the \`ferestre-runtime-bin\`
-          AUR package.
+          The AppImage and tarball include the Xodus client and a patched Proton
+          runtime, so a fresh installation can sign in and launch titles at
+          first start. The runtime is still released independently under
+          \`runtime-*\` tags for maintainers and AUR users.
 
           You need to own the games. This downloads and runs what your own
           Microsoft account is licensed for, and nothing else.

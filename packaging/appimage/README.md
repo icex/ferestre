@@ -10,7 +10,7 @@ packaging/appimage/build-appimage.sh
 ```
 
 That is the whole thing. It downloads two pinned build tools on first run, then
-produces `out/ferestre-<version>-x86_64.AppImage` (about 1.1 MB) and runs it twice
+produces `out/ferestre-<version>-x86_64.AppImage` and runs it twice
 to prove it works before telling you it is done.
 
 The build host needs `bash`, `curl` or `wget`, coreutils and network access the
@@ -22,6 +22,8 @@ Useful options:
 | | |
 |---|---|
 | `--bin PATH` | package a real launcher binary instead of the placeholder |
+| `--client PATH` | bundle `xodus-cli` (and its sibling `xodus-service`) |
+| `--runtime DIR` | bundle a patched Proton runtime |
 | `--out DIR` | where the `.AppImage` lands (default `out/`) |
 | `--version V` | override the version string |
 | `--app-id ID` | reverse-DNS id, for a fork publishing its own builds |
@@ -38,19 +40,17 @@ offline-capable.
 ```
 AppRun                        four lines, and deliberately so (below)
 usr/bin/ferestre                  the launcher, or the placeholder shell command
+usr/lib/ferestre/client/          xodus-cli and xodus-service
+usr/lib/ferestre/runtime/         patched Proton, including xgameruntime.dll
 usr/lib/ferestre/scripts/         the launch path: launch-gdk.sh, proton-wine-shim.sh, …
 usr/lib/ferestre/patches/         so install-runtime works, and RECIPES.md is followable
 usr/share/{applications,icons,metainfo,doc}
 ```
 
-**The patched Proton runtime is not in there.** It is ~264 MiB compressed,
-versions independently, and would tie a 1 MB application to a 264 MB release
-train. It is built or downloaded separately; `ferestre doctor` says whether it is
-installed and `ferestre install-runtime` builds it.
-
-Nor is `xodus-cli`. It is GPL-3.0, it needs a Rust toolchain and it is what
-signs in — carrying it is a decision for the launcher, not for the packaging.
-`doctor` reports it as a hard requirement.
+Release images include the GPL-3.0 client and the independently-built runtime.
+`AppRun` selects their bundled paths automatically, so a fresh machine can sign
+in and launch without a second installer. Local development builds may omit
+both and retain the old `ferestre doctor` diagnostics.
 
 ## The placeholder
 
