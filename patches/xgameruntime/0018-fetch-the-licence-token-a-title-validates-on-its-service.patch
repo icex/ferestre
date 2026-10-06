@@ -1,0 +1,395 @@
+diff --git a/Makefile.in b/Makefile.in
+index 466ddb6..f1de79d 100644
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -1,6 +1,6 @@
+ MODULE    = xgameruntime.dll
+ UNIXLIB   = xgameruntime.so
+-IMPORTS   = combase bcrypt
++IMPORTS   = combase bcrypt winhttp
+ 
+ SOURCES = \
+ 	main.c \
+diff --git a/xstore.c b/xstore.c
+index 6106784..75c70e7 100644
+--- a/xstore.c
++++ b/xstore.c
+@@ -20,6 +20,15 @@
+  */
+ 
+ #include "private.h"
++#include "unixlib.h"
++
++/* the Store's licence-token endpoint is reached over HTTPS, and this side has
++ * no HTTP client of its own */
++#include <winhttp.h>
++
++#ifndef ARRAY_SIZE
++#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
++#endif
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+ 
+@@ -27,10 +36,15 @@ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+  * Store, from the point of view of one locally-installed, fully-owned game
+  * playing offline: the base game licence is active and perpetual, there are no
+  * add-ons or entitled products, nothing is a trial, and no updates are pending.
+- * The server-backed identifiers (collections id, purchase id, licence token)
+- * come back empty, which is correct for a title that never reaches Xbox Live.
+- * These are the answers that let a title get past its startup licence check
+- * instead of dying on an E_NOTIMPL.
++ * The local identifiers (collections id, purchase id) come back empty, which is
++ * correct for a title that never reaches Xbox Live.
++ *
++ * The licence token is the one answer that cannot be invented: a title sends it
++ * to its own service, which validates the Microsoft signature on it and answers
++ * with the licences the account holds. An empty token is not a degraded answer
++ * there but a failed check, and a title that owns the game refuses to sign in
++ * -- so it is fetched from the Store's licensing endpoint, authenticated with
++ * the signed-in account's own Xbox Live token (see XStoreQueryLicenseTokenAsync).
+  */
+ 
+ struct x_store_context
+@@ -510,35 +524,335 @@ static HRESULT WINAPI x_store_XStoreGetUserPurchaseIdResult( IXStoreImpl6 *iface
+     return hr;
+ }
+ 
++/* The endpoint a title's licence token comes from. XGR_LICENSE_TOKEN_URL
++ * points the call at a fixture: the suite has no way to reach Microsoft, and an
++ * endpoint that cannot be exercised offline is an endpoint that can only be
++ * tested by hand. */
++static const char *license_token_url( void )
++{
++    const char *url = getenv( "XGR_LICENSE_TOKEN_URL" );
++
++    return (url && url[0]) ? url : "https://licensing.mp.microsoft.com/v8.0/licenseToken";
++}
++
++/* The ids and the custom string go into a JSON document, so a quote or a
++ * backslash would have to be escaped. Neither ever carries one -- Store ids are
++ * alphanumeric and the custom string is the title's own -- and quietly mangling
++ * a request is worse than refusing it. */
++static BOOL license_token_text_safe( const char *text )
++{
++    const char *p;
++
++    for (p = text; *p; p++)
++        if (*p == '"' || *p == '\\' || (unsigned char)*p < 0x20) return FALSE;
++    return TRUE;
++}
++
++/* Append formatted text, refusing a body that would not fit rather than
++ * silently truncating one that must be exact. */
++static BOOL license_token_append( char *body, SIZE_T size, SIZE_T *len, const char *fmt, ... )
++{
++    va_list ap;
++    int n;
++
++    va_start( ap, fmt );
++    n = vsnprintf( body + *len, size - *len, fmt, ap );
++    va_end( ap );
++    if (n < 0 || (SIZE_T)n >= size - *len) return FALSE;
++    *len += n;
++    return TRUE;
++}
++
++/* The request body, or NULL if the package does not say what it is selling.
++ *
++ * relatedProductIds is a JSON *string* that holds a JSON array, not an array:
++ * that is the shape the endpoint takes, and the shape a title sends it. */
++static char *license_token_body( const char **product_ids, SIZE_T count, const char *custom )
++{
++    char store_id[64];
++    SIZE_T i, size, len = 0;
++    char *body;
++
++    if (!xgr_config_element( "StoreId", store_id, sizeof(store_id) ) || !store_id[0])
++    {
++        WARN( "MicrosoftGame.config has no StoreId; a licence token cannot name its product.\n" );
++        return NULL;
++    }
++
++    /* 102 bytes of fixed JSON, plus both strings and one escaped pair per id */
++    size = strlen( store_id ) + (custom ? strlen( custom ) : 0) + 128;
++    for (i = 0; i < count; i++) size += strlen( product_ids[i] ) * 2 + 8;
++    if (!(body = malloc( size ))) return NULL;
++
++    if (!license_token_append( body, size, &len,
++                               "{\"parentProductId\":\"%s\",\"enforceSellableBy\":true,"
++                               "\"relatedProductIds\":\"[", store_id ))
++        goto too_long;
++    for (i = 0; i < count; i++)
++        if (!license_token_append( body, size, &len, "%s\\\"%s\\\"", i ? "," : "", product_ids[i] ))
++            goto too_long;
++    if (!license_token_append( body, size, &len, "]\"" ))
++        goto too_long;
++    if (custom && custom[0] &&
++        !license_token_append( body, size, &len, ",\"customDeveloperString\":\"%s\"", custom ))
++        goto too_long;
++    if (!license_token_append( body, size, &len, "}" ))
++        goto too_long;
++    return body;
++
++too_long:
++    WARN( "licence token request body does not fit %Iu bytes.\n", size );
++    free( body );
++    return NULL;
++}
++
++/* POST the body and take the licenceToken string out of the JSON answer.
++ *
++ * WinHTTP because this side has no HTTP client; the call blocks the asking
++ * thread for one round trip, exactly like the identity request that produced
++ * the token above it. */
++static HRESULT license_token_request( const struct xsts_token_params *token, const char *body, char **out )
++{
++    URL_COMPONENTS parts = {0};
++    WCHAR url[512], *host = NULL, *path = NULL;
++    WCHAR headers[XGR_TOKEN_MAX + XGR_SIGNATURE_MAX + 256];
++    WCHAR token_w[XGR_TOKEN_MAX], signature_w[XGR_SIGNATURE_MAX] = {0};
++    HINTERNET session = NULL, connection = NULL, request = NULL;
++    char *answer = NULL, *value, *closing, *grown;
++    DWORD status = 0, status_size = sizeof(status), available, read;
++    SIZE_T length = 0, host_len = 0, path_len = 0, headers_len;
++    HRESULT hr = E_FAIL;
++    int written;
++
++    *out = NULL;
++
++    if (!MultiByteToWideChar( CP_UTF8, 0, token->url, -1, url, ARRAY_SIZE(url) ))
++    {
++        WARN( "licence token URL is not usable UTF-8.\n" );
++        return E_INVALIDARG;
++    }
++
++    /* CrackUrl returns views into the URL, not strings; both are needed as
++     * strings, and the path must keep its query if the fixture has one. */
++    parts.dwStructSize = sizeof(parts);
++    parts.dwSchemeLength = parts.dwHostNameLength = parts.dwUrlPathLength = parts.dwExtraInfoLength = (DWORD)-1;
++    if (!WinHttpCrackUrl( url, 0, 0, &parts ))
++    {
++        hr = HRESULT_FROM_WIN32( GetLastError() );
++        WARN( "could not parse %s (%#lx).\n", debugstr_a( token->url ), hr );
++        goto done;
++    }
++
++    host_len = parts.dwHostNameLength;
++    path_len = parts.dwUrlPathLength + parts.dwExtraInfoLength;
++    if (!(host = malloc( (host_len + 1) * sizeof(*host) ))) goto done;
++    memcpy( host, parts.lpszHostName, host_len * sizeof(*host) );
++    host[host_len] = 0;
++
++    if (!(path = malloc( (path_len + 1) * sizeof(*path) ))) goto done;
++    memcpy( path, parts.lpszUrlPath, parts.dwUrlPathLength * sizeof(*path) );
++    if (parts.dwExtraInfoLength)
++        memcpy( path + parts.dwUrlPathLength, parts.lpszExtraInfo, parts.dwExtraInfoLength * sizeof(*path) );
++    path[path_len] = 0;
++
++    if (!MultiByteToWideChar( CP_UTF8, 0, token->token, -1, token_w, ARRAY_SIZE(token_w) )) goto done;
++    if (token->signature[0] &&
++        !MultiByteToWideChar( CP_UTF8, 0, token->signature, -1, signature_w, ARRAY_SIZE(signature_w) )) goto done;
++
++    written = swprintf( headers, ARRAY_SIZE(headers),
++                        L"Authorization: %s\r\nContent-Type: application/json; charset=UTF-8\r\n"
++                        L"Cache-Control: no-cache\r\n",
++                        token_w );
++    if (written < 0) goto done;
++    headers_len = written;
++    if (token->signature[0])
++    {
++        written = swprintf( headers + headers_len, ARRAY_SIZE(headers) - headers_len,
++                            L"Signature: %s\r\n", signature_w );
++        if (written < 0) goto done;
++        headers_len += written;
++    }
++
++    if (!(session = WinHttpOpen( L"XboxGameRuntime", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
++                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0 )) ||
++        !(connection = WinHttpConnect( session, host, parts.nPort, 0 )) ||
++        !(request = WinHttpOpenRequest( connection, L"POST", path, NULL, WINHTTP_NO_REFERER,
++                                        WINHTTP_DEFAULT_ACCEPT_TYPES,
++                                        parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0 )))
++    {
++        hr = HRESULT_FROM_WIN32( GetLastError() );
++        WARN( "could not open %s (%#lx).\n", debugstr_a( token->url ), hr );
++        goto done;
++    }
++
++    /* A title is waiting on its sign-in: a stalled endpoint has to fail the
++     * call rather than park the thread that asked. */
++    WinHttpSetTimeouts( session, 10000, 10000, 15000, 15000 );
++
++    if (!WinHttpSendRequest( request, headers, headers_len, (void *)body, strlen( body ),
++                             strlen( body ), 0 ) ||
++        !WinHttpReceiveResponse( request, NULL ))
++    {
++        hr = HRESULT_FROM_WIN32( GetLastError() );
++        WARN( "licence token request to %s failed (%#lx).\n", debugstr_a( token->url ), hr );
++        goto done;
++    }
++
++    /* The answers are a few kilobytes; anything in the megabytes is not one. */
++    if (!WinHttpQueryHeaders( request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
++                              WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size, WINHTTP_NO_HEADER_INDEX ))
++    {
++        hr = HRESULT_FROM_WIN32( GetLastError() );
++        goto done;
++    }
++    if (status != 200)
++    {
++        WARN( "licence token request to %s answered HTTP %lu.\n", debugstr_a( token->url ), status );
++        hr = HRESULT_FROM_WIN32( ERROR_NOT_FOUND );
++        goto done;
++    }
++
++    for (;;)
++    {
++        if (!WinHttpQueryDataAvailable( request, &available ))
++        {
++            hr = HRESULT_FROM_WIN32( GetLastError() );
++            goto done;
++        }
++        if (!available) break;
++        if (length + available > 65536)
++        {
++            WARN( "licence token answer is larger than any real one.\n" );
++            goto done;
++        }
++        if (!(grown = realloc( answer, length + available + 1 ))) goto done;
++        answer = grown;
++        if (!WinHttpReadData( request, answer + length, available, &read ))
++        {
++            hr = HRESULT_FROM_WIN32( GetLastError() );
++            goto done;
++        }
++        length += read;
++        answer[length] = 0;
++        if (!read) break;
++    }
++    if (!answer)
++    {
++        WARN( "licence token request to %s answered nothing.\n", debugstr_a( token->url ) );
++        goto done;
++    }
++
++    /* {"licenseToken":"<jwt>"} -- a JWT is base64url and dots, so the value
++     * needs no unescaping, and a shared endpoint is not reason enough to carry
++     * a JSON parser into this DLL. */
++    if (!(value = strstr( answer, "\"licenseToken\"" )) ||
++        !(value = strchr( value + strlen( "\"licenseToken\"" ), ':' )) ||
++        !(value = strchr( value, '"' )) ||
++        !(closing = strchr( ++value, '"' )))
++    {
++        WARN( "licence token answer carries no licenseToken: %.80s\n", debugstr_a( answer ) );
++        goto done;
++    }
++    *closing = 0;
++    if (!(*out = malloc( closing - value + 1 )))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    memcpy( *out, value, closing - value + 1 );
++    hr = S_OK;
++
++done:
++    free( answer );
++    free( path );
++    free( host );
++    if (request) WinHttpCloseHandle( request );
++    if (connection) WinHttpCloseHandle( connection );
++    if (session) WinHttpCloseHandle( session );
++    return hr;
++}
++
+ static HRESULT WINAPI x_store_XStoreQueryLicenseTokenAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, const char **productIds, SIZE_T productIdsCount, const char *customDeveloperString, XAsyncBlock *async )
+ {
++    struct xsts_token_params params = {0};
++    char title_id[64], title_client_id[64], *body, *token = NULL;
++    SIZE_T i;
++    HRESULT hr;
++
+     TRACE( "iface %p, storeContextHandle %p, productIdsCount %Iu, customDeveloperString %s, async %p.\n",
+            iface, storeContextHandle, productIdsCount, debugstr_a( customDeveloperString ), async );
++
+     if (!async) return E_INVALIDARG;
+-    xgr_async_complete( async, S_OK, NULL );
++    if (productIdsCount && !productIds) return E_INVALIDARG;
++    for (i = 0; i < productIdsCount; i++)
++        if (!productIds[i] || !productIds[i][0] || !license_token_text_safe( productIds[i] ))
++            return E_INVALIDARG;
++    if (customDeveloperString && !license_token_text_safe( customDeveloperString )) return E_INVALIDARG;
++
++    if (!(body = license_token_body( productIds, productIdsCount, customDeveloperString )))
++    {
++        xgr_async_complete( async, HRESULT_FROM_WIN32( ERROR_NOT_FOUND ), NULL );
++        return S_OK;
++    }
++
++    /* The endpoint is authenticated with the caller's own Xbox Live identity,
++     * and the signature covers this exact POST -- which is why the body has to
++     * exist before the token is asked for. */
++    params.url = license_token_url();
++    params.method = "POST";
++    params.body = body;
++    params.body_size = strlen( body );
++    xgr_title_identity( title_id, sizeof(title_id), title_client_id, sizeof(title_client_id) );
++    params.title_id = title_id;
++    params.title_client_id = title_client_id;
++    if (XGR_UNIX_CALL( xsts_token, &params ))
++    {
++        WARN( "no Xbox Live token for %s; the account may not be signed in.\n", debugstr_a( params.url ) );
++        free( body );
++        xgr_async_complete( async, HRESULT_FROM_WIN32( ERROR_NOT_FOUND ), NULL );
++        return S_OK;
++    }
++
++    hr = license_token_request( &params, body, &token );
++    free( body );
++    if (FAILED(hr))
++    {
++        xgr_async_complete( async, hr, NULL );
++        return S_OK;
++    }
++
++    TRACE( "fetched a %Iu-byte licence token.\n", strlen( token ) );
++    xgr_async_complete_ex( async, S_OK, token, strlen( token ) + 1 );
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI x_store_XStoreQueryLicenseTokenResultSize( IXStoreImpl6 *iface, XAsyncBlock *async, SIZE_T *size )
+ {
+     HRESULT hr;
++    void *payload;
+ 
+     TRACE( "iface %p, async %p, size %p.\n", iface, async, size );
+     if (!size) return E_INVALIDARG;
+-    if (!xgr_async_completed( async, &hr, NULL )) return E_PENDING;
+-    *size = 1; /* empty token: just the NUL terminator */
+-    return hr;
++    if (!xgr_async_completed( async, &hr, &payload )) return E_PENDING;
++    if (FAILED(hr)) return hr;
++    *size = payload ? strlen( payload ) + 1 : 1;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI x_store_XStoreQueryLicenseTokenResult( IXStoreImpl6 *iface, XAsyncBlock *async, SIZE_T size, char *result )
+ {
+     HRESULT hr;
++    void *payload;
++    SIZE_T needed;
+ 
+     TRACE( "iface %p, async %p, size %Iu, result %p.\n", iface, async, size, result );
+     if (!result || !size) return E_INVALIDARG;
+-    if (!xgr_async_completed( async, &hr, NULL )) return E_PENDING;
+-    result[0] = 0;
+-    return hr;
++    if (!xgr_async_completed( async, &hr, &payload )) return E_PENDING;
++    if (FAILED(hr)) return hr;
++    needed = payload ? strlen( payload ) + 1 : 1;
++    if (size < needed) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++    memcpy( result, payload, needed );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI __PADDING__( IXStoreImpl6 *iface )

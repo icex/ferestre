@@ -23,6 +23,7 @@ INCUBE=$REPO_DIR/tools/in-container.sh
 # directory has to live there too, not under /tmp.
 WORK=$(mktemp -d "$BUILD_DIR/.xgr-tests.XXXXXX")
 cleanup() {
+    [ -n "${FIXTURE_PID:-}" ] && kill -TERM "$FIXTURE_PID" 2>/dev/null
     [ -n "${WINE:-}" ] && WINEPREFIX="$WORK/prefix" "$WINE"server -k 2>/dev/null
     rm -rf "$WORK" 2>/dev/null
 }
@@ -87,15 +88,44 @@ export WINEDEBUG=-all,fixme-all
 export XGR_WGS_ROOT="Z:$(echo "$WORK/wgs" | sed 's#/#\\#g')"
 export XGR_EXPECTED_FAMILY=$EXPECTED_FAMILY
 
+# The licence-token test needs a service to sign its POST and an endpoint to
+# answer it; both are a fixture, so the suite stays offline and account-free.
+say "starting the licence-token fixture"
+export XDG_RUNTIME_DIR="$WORK/rt"
+mkdir -p "$XDG_RUNTIME_DIR"
+FIXTURE_TRANSCRIPT="$WORK/license-token-transcript.txt"
+python3 "$REPO_DIR/tests/license_token_server.py" "$XDG_RUNTIME_DIR" "$FIXTURE_TRANSCRIPT" "$WORK/license-token-url.txt" &
+FIXTURE_PID=$!
+for _ in $(seq 1 100); do [ -s "$WORK/license-token-url.txt" ] && break; sleep 0.1; done
+[ -s "$WORK/license-token-url.txt" ] || fail "licence-token fixture did not come up"
+export XGR_LICENSE_TOKEN_URL=$(cat "$WORK/license-token-url.txt")
+
 
 ( cd "$WORK" && timeout 180 "$WINE" "$WORK/xgr_tests.exe" ) 2>/dev/null | \
     grep -avE '^ntsync|radv is not|^wine:|wineserver' | tee "$WORK/out.txt"
 rc=${PIPESTATUS[0]}
 
+# The fixture asserts the request the runtime built; its status is part of the
+# result, and its transcript says what it saw when it is not happy.
+kill -TERM "$FIXTURE_PID" 2>/dev/null
+wait "$FIXTURE_PID" 2>/dev/null
+fixture_rc=$?
+FIXTURE_PID=
+if [ "$fixture_rc" = "0" ] &&
+   ! grep -qF "service: token for POST $XGR_LICENSE_TOKEN_URL" "$FIXTURE_TRANSCRIPT"; then
+    printf '\033[31m!! the fixture never signed a POST for %s\033[0m\n' "$XGR_LICENSE_TOKEN_URL"
+    fixture_rc=1
+fi
+if [ "$fixture_rc" != "0" ]; then
+    echo
+    printf '\033[31m!! the licence-token fixture did not see what the test expects\033[0m\n'
+    cat "$FIXTURE_TRANSCRIPT" 2>/dev/null
+fi
+
 echo
-if [ "$rc" = "0" ] && grep -q "^PASSED" "$WORK/out.txt"; then
+if [ "$rc" = "0" ] && [ "$fixture_rc" = "0" ] && grep -q "^PASSED" "$WORK/out.txt"; then
     printf '\033[32m==> ALL TESTS PASSED\033[0m\n'
     exit 0
 fi
-printf '\033[31m==> TESTS FAILED (rc=%s)\033[0m\n' "$rc"
+printf '\033[31m==> TESTS FAILED (rc=%s fixture=%s)\033[0m\n' "$rc" "$fixture_rc"
 exit 1

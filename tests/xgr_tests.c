@@ -337,13 +337,37 @@ static void test_xstore(void)
     hr = IXStoreImpl6_XStoreQueryAddOnLicensesResultCount( store, &async, &addons );
     CHECK( SUCCEEDED( hr ) && addons == 0, "no add-on licences (%u)", addons );
 
-    /* licence token: empty but valid-sized */
-    memset( &async, 0, sizeof(async) );
-    IXStoreImpl6_XStoreQueryLicenseTokenAsync( store, ctx, NULL, 0, "test", &async );
-    hr = IXStoreImpl6_XStoreQueryLicenseTokenResultSize( store, &async, &size );
-    CHECK( SUCCEEDED( hr ) && size >= 1, "licence token size >= 1 (%zu)", (size_t)size );
-    hr = IXStoreImpl6_XStoreQueryLicenseTokenResult( store, &async, sizeof(buf), buf );
-    CHECK( SUCCEEDED( hr ), "licence token result succeeds (0x%08lx)", hr );
+    /* licence token: fetched from the endpoint, not invented here.
+     * tests/license_token_server.py stands in for both the service that signs
+     * the POST and the Store that answers it, and asserts the request the
+     * runtime built; this side asserts what came back and that a buffer too
+     * small is refused rather than truncated. */
+    {
+        static const char *ids[] = { "9TESTSTORE0ID", "9TESTADDON00" };
+        static const char expected[] = "eyJhbGciOiJSUzI1NiJ9.Zml4dHVyZS1saWNlbmNlLXRva2Vu.c2lnbmF0dXJl";
+
+        memset( &async, 0, sizeof(async) );
+        hr = IXStoreImpl6_XStoreQueryLicenseTokenAsync( store, ctx, ids, 2, "regression-test", &async );
+        CHECK( SUCCEEDED( hr ), "QueryLicenseTokenAsync starts (0x%08lx)", hr );
+        hr = IXStoreImpl6_XStoreQueryLicenseTokenResultSize( store, &async, &size );
+        CHECK( SUCCEEDED( hr ) && size == strlen( expected ) + 1,
+               "licence token size is the endpoint's answer (%zu)", (size_t)size );
+        hr = IXStoreImpl6_XStoreQueryLicenseTokenResult( store, &async, sizeof(buf), buf );
+        CHECK( SUCCEEDED( hr ) && !strcmp( buf, expected ),
+               "licence token is the endpoint's answer ('%s')", buf );
+        hr = IXStoreImpl6_XStoreQueryLicenseTokenResult( store, &async, 4, buf );
+        CHECK( hr == HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER ),
+               "a buffer too small is refused, not truncated (0x%08lx)", hr );
+
+        /* An endpoint that refuses is a failed call, not an empty token: an
+         * empty one reads as "not licensed" at the title's service, which is
+         * how a title that owns the game ends up refusing to sign in. The
+         * fixture serves its first request and refuses later ones. */
+        memset( &async, 0, sizeof(async) );
+        IXStoreImpl6_XStoreQueryLicenseTokenAsync( store, ctx, ids, 2, "regression-test", &async );
+        hr = IXStoreImpl6_XStoreQueryLicenseTokenResultSize( store, &async, &size );
+        CHECK( FAILED( hr ), "an endpoint that refuses fails the call (0x%08lx)", hr );
+    }
 
     /* entitled products: an empty, enumerable, single-page query */
     memset( &async, 0, sizeof(async) );
