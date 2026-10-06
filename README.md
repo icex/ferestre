@@ -67,6 +67,7 @@ not inferred from the fact that it downloaded:
 | Title | Source | State |
 |---|---|---|
 | **Minecraft for Windows** (Bedrock) | Store | Playable. Signs in to Xbox Live, loads the profile, and **joins third-party servers from the in-game list** |
+| **Minecraft Dungeons II** | Store | Playable — signs in, fetches its entitlements, and loads the character |
 | **Clair Obscur: Expedition 33** | Store / Game Pass | Playable — saves, video, full game |
 | **DREDGE** | Game Pass | Playable |
 | **Stardew Valley** | Game Pass | Playable |
