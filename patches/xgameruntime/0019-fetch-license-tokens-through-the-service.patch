@@ -1,0 +1,295 @@
+diff --git a/unixlib.c b/unixlib.c
+index a15f8f8..9d10b4b 100644
+--- a/unixlib.c
++++ b/unixlib.c
+@@ -30,6 +30,8 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <errno.h>
++#include <poll.h>
++#include <time.h>
+ #include <sys/socket.h>
+ #include <sys/un.h>
+ 
+@@ -345,9 +347,117 @@ static NTSTATUS xsts_token( void *args )
+     return status;
+ }
+ 
++/* A dedicated request keeps account authorization and HTTP inside the service.
++ * The XML request uses base64 for custom text (XML normalizes controls). The
++ * response frame contains only the validated ASCII JWT, or is empty on error.
++ * Old services reply with an unknown-message frame; reject it, never fall back
++ * to a successful empty token. Bound the entire IPC exchange, including reads. */
++static long long license_now_ms( void )
++{
++    struct timespec ts;
++    clock_gettime( CLOCK_MONOTONIC, &ts );
++    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
++}
++
++static BOOL license_io( int fd, void *buffer, SIZE_T size, BOOL writing, long long deadline )
++{
++    char *p = buffer;
++    struct pollfd pollfd = { fd, writing ? POLLOUT : POLLIN, 0 };
++    long long left;
++    ssize_t n;
++    int ret;
++
++    while (size)
++    {
++        left = deadline - license_now_ms();
++        if (left <= 0) { errno = ETIMEDOUT; return FALSE; }
++        ret = poll( &pollfd, 1, left );
++        if (!ret) { errno = ETIMEDOUT; return FALSE; }
++        if (ret < 0) { if (errno == EINTR) continue; return FALSE; }
++        n = writing ? send( fd, p, size, MSG_NOSIGNAL ) : recv( fd, p, size, 0 );
++        if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
++        if (n <= 0) return FALSE;
++        size -= n;
++        p += n;
++    }
++    return TRUE;
++}
++
++static NTSTATUS license_token( void *args )
++{
++    struct license_token_params *params = args;
++    const char *runtime_dir = getenv( "XDG_RUNTIME_DIR" );
++    struct sockaddr_un addr = { .sun_family = AF_UNIX };
++    char *custom = NULL, *request = NULL, *parent = NULL, *title = NULL, *client = NULL, *id;
++    unsigned char header[8];
++    unsigned int size, i;
++    int fd = -1, n, used, error;
++    socklen_t error_size = sizeof(error);
++    struct pollfd pollfd;
++    long long deadline = license_now_ms() + 50000;
++    NTSTATUS status = STATUS_UNSUCCESSFUL;
++
++    params->token[0] = 0;
++    if (!runtime_dir || snprintf( addr.sun_path, sizeof(addr.sun_path), "%s/xodus.sock", runtime_dir ) >= (int)sizeof(addr.sun_path))
++        return STATUS_NOT_FOUND;
++    if (!(custom = base64_encode( params->custom, strlen(params->custom) )) ||
++        !(parent = xml_escape( params->store_id )) || !(title = xml_escape( params->title_id )) ||
++        !(client = xml_escape( params->title_client_id )) || !(request = malloc( 65536 )))
++    { status = STATUS_NO_MEMORY; goto done; }
++    n = snprintf( request, 65536, "<LicenseTokenRequest><ParentProductId>%s</ParentProductId>"
++                  "<CustomBase64>%s</CustomBase64><TitleId>%s</TitleId>"
++                  "<TitleClientId>%s</TitleClientId><ProductIds>", parent, custom, title, client );
++    if (n < 0 || n >= 65536) goto done;
++    used = n;
++    for (i = 0; i < params->count; i++)
++    {
++        if (!(id = xml_escape( params->ids[i] ))) { status = STATUS_NO_MEMORY; goto done; }
++        n = snprintf( request + used, 65536 - used, "<ProductId>%s</ProductId>", id );
++        free( id );
++        if (n < 0 || n >= 65536 - used) goto done;
++        used += n;
++    }
++    n = snprintf( request + used, 65536 - used, "</ProductIds></LicenseTokenRequest>" );
++    if (n < 0 || n >= 65536 - used) goto done;
++    used += n;
++    if ((fd = socket( AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0 )) < 0) goto done;
++    if (connect( fd, (struct sockaddr *)&addr, sizeof(addr) ))
++    {
++        if (errno != EINPROGRESS) goto done;
++        pollfd.fd = fd; pollfd.events = POLLOUT; pollfd.revents = 0;
++        if (poll( &pollfd, 1, 50000 ) <= 0 || getsockopt( fd, SOL_SOCKET, SO_ERROR, &error, &error_size ) || error)
++            goto done;
++    }
++    header[0] = 'X'; header[1] = 'S'; header[2] = 'D'; header[3] = 'X';
++    header[4] = 7; header[5] = 0;
++    header[6] = used & 0xff; header[7] = used >> 8;
++    if (!license_io( fd, header, sizeof(header), TRUE, deadline ) ||
++        !license_io( fd, request, used, TRUE, deadline ) ||
++        !license_io( fd, header, sizeof(header), FALSE, deadline ))
++    { if (errno == ETIMEDOUT) status = STATUS_IO_TIMEOUT; goto done; }
++    if (memcmp( header, "XSDX", 4 ) || header[4] != 8 || header[5]) goto done;
++    size = header[6] | (header[7] << 8);
++    if (!size || size >= sizeof(params->token)) goto done;
++    if (!license_io( fd, params->token, size, FALSE, deadline ))
++    { if (errno == ETIMEDOUT) status = STATUS_IO_TIMEOUT; goto done; }
++    for (i = 0; i < size; i++)
++        if (!((params->token[i] >= 'a' && params->token[i] <= 'z') ||
++              (params->token[i] >= 'A' && params->token[i] <= 'Z') ||
++              (params->token[i] >= '0' && params->token[i] <= '9') ||
++              params->token[i] == '-' || params->token[i] == '_' || params->token[i] == '.')) goto done;
++    params->token[size] = 0;
++    status = STATUS_SUCCESS;
++done:
++    if (status) params->token[0] = 0;
++    if (fd >= 0) close( fd );
++    free( request ); free( custom ); free( parent ); free( title ); free( client );
++    return status;
++}
++
+ const unixlib_entry_t __wine_unix_call_funcs[] =
+ {
+     xsts_token,
++    license_token,
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
+diff --git a/unixlib.h b/unixlib.h
+index e9086ec..07a1e75 100644
+--- a/unixlib.h
++++ b/unixlib.h
+@@ -59,9 +59,20 @@ struct xsts_token_params
+     INT64 expiry;                           /* out: unix time the token expires */
+ };
+ 
++#define XGR_LICENSE_TOKEN_MAX 60001
++struct license_token_params
++{
++    const char **ids;
++    unsigned int count;
++    const char *custom;
++    char store_id[64], title_id[64], title_client_id[64];
++    char token[XGR_LICENSE_TOKEN_MAX];
++};
++
+ enum xgr_funcs
+ {
+     unix_xsts_token,
++    unix_license_token,
+     unix_funcs_count,
+ };
+ 
+diff --git a/xstore.c b/xstore.c
+index 6106784..d753831 100644
+--- a/xstore.c
++++ b/xstore.c
+@@ -19,7 +19,10 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
+ #include "private.h"
++#include "unixlib.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+ 
+@@ -27,8 +30,9 @@ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+  * Store, from the point of view of one locally-installed, fully-owned game
+  * playing offline: the base game licence is active and perpetual, there are no
+  * add-ons or entitled products, nothing is a trial, and no updates are pending.
+- * The server-backed identifiers (collections id, purchase id, licence token)
++ * The server-backed identifiers (collections id, purchase id)
+  * come back empty, which is correct for a title that never reaches Xbox Live.
++ * Licence tokens are fetched asynchronously by the credential-owning service.
+  * These are the answers that let a title get past its startup licence check
+  * instead of dying on an E_NOTIMPL.
+  */
+@@ -510,35 +514,95 @@ static HRESULT WINAPI x_store_XStoreGetUserPurchaseIdResult( IXStoreImpl6 *iface
+     return hr;
+ }
+ 
+-static HRESULT WINAPI x_store_XStoreQueryLicenseTokenAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, const char **productIds, SIZE_T productIdsCount, const char *customDeveloperString, XAsyncBlock *async )
++static const char license_token_identity;
++
++static void license_token_free( struct license_token_params *params )
+ {
+-    TRACE( "iface %p, storeContextHandle %p, productIdsCount %Iu, customDeveloperString %s, async %p.\n",
+-           iface, storeContextHandle, productIdsCount, debugstr_a( customDeveloperString ), async );
+-    if (!async) return E_INVALIDARG;
+-    xgr_async_complete( async, S_OK, NULL );
+-    return S_OK;
++    unsigned int i;
++    for (i = 0; i < params->count; i++) free( (void *)params->ids[i] );
++    free( params->ids );
++    free( (void *)params->custom );
++    free( params );
+ }
+ 
+-static HRESULT WINAPI x_store_XStoreQueryLicenseTokenResultSize( IXStoreImpl6 *iface, XAsyncBlock *async, SIZE_T *size )
++static HRESULT CALLBACK license_token_provider( XAsyncOp op, const XAsyncProviderData *data )
+ {
++    struct license_token_params *params = data->context;
++    NTSTATUS status;
+     HRESULT hr;
+ 
+-    TRACE( "iface %p, async %p, size %p.\n", iface, async, size );
+-    if (!size) return E_INVALIDARG;
+-    if (!xgr_async_completed( async, &hr, NULL )) return E_PENDING;
+-    *size = 1; /* empty token: just the NUL terminator */
+-    return hr;
++    switch (op)
++    {
++    case XAsyncOp_Begin:
++        return IXThreadingImpl_XAsyncSchedule( x_threading_impl, data->async, 0 );
++    case XAsyncOp_DoWork:
++        status = XGR_UNIX_CALL( license_token, params );
++        hr = status == STATUS_IO_TIMEOUT ? HRESULT_FROM_WIN32( ERROR_TIMEOUT ) :
++             status ? HRESULT_FROM_WIN32( ERROR_NOT_FOUND ) : S_OK;
++        IXThreadingImpl_XAsyncComplete( x_threading_impl, data->async, hr,
++                                        SUCCEEDED(hr) ? strlen(params->token) + 1 : 0 );
++        /* Completion may release the context on another thread. */
++        return E_PENDING;
++    case XAsyncOp_GetResult:
++        memcpy( data->buffer, params->token, strlen(params->token) + 1 );
++        return S_OK;
++    case XAsyncOp_Cleanup:
++        license_token_free( params );
++        return S_OK;
++    default:
++        return S_OK;
++    }
+ }
+ 
+-static HRESULT WINAPI x_store_XStoreQueryLicenseTokenResult( IXStoreImpl6 *iface, XAsyncBlock *async, SIZE_T size, char *result )
++static HRESULT WINAPI x_store_XStoreQueryLicenseTokenAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, const char **productIds, SIZE_T productIdsCount, const char *customDeveloperString, XAsyncBlock *async )
+ {
++    struct license_token_params *params;
++    SIZE_T i, j, size;
+     HRESULT hr;
+ 
+-    TRACE( "iface %p, async %p, size %Iu, result %p.\n", iface, async, size, result );
+-    if (!result || !size) return E_INVALIDARG;
+-    if (!xgr_async_completed( async, &hr, NULL )) return E_PENDING;
+-    result[0] = 0;
++    TRACE( "iface %p, context %p, count %Iu, async %p.\n", iface, storeContextHandle, productIdsCount, async );
++    if (!async || !storeContextHandle || !customDeveloperString || !customDeveloperString[0] ||
++        strnlen( customDeveloperString, 16385 ) > 16384 || productIdsCount > 256 ||
++        (productIdsCount && !productIds)) return E_INVALIDARG;
++    for (i = 0; i < productIdsCount; i++)
++    {
++        if (!productIds[i] || !(size = strnlen(productIds[i], 65)) || size > 64) return E_INVALIDARG;
++        for (j = 0; j < size; j++)
++            if (!((productIds[i][j] >= '0' && productIds[i][j] <= '9') ||
++                  (productIds[i][j] >= 'A' && productIds[i][j] <= 'Z') ||
++                  (productIds[i][j] >= 'a' && productIds[i][j] <= 'z'))) return E_INVALIDARG;
++    }
++    if (!(params = calloc( 1, sizeof(*params) ))) return E_OUTOFMEMORY;
++    if (!xgr_config_element( "StoreId", params->store_id, sizeof(params->store_id) ) || !params->store_id[0])
++    { free( params ); return HRESULT_FROM_WIN32( ERROR_NOT_FOUND ); }
++    xgr_title_identity( params->title_id, sizeof(params->title_id), params->title_client_id, sizeof(params->title_client_id) );
++    if (!(params->custom = strdup( customDeveloperString ))) goto out_of_memory;
++    if (productIdsCount)
++    {
++        if (!(params->ids = calloc( productIdsCount, sizeof(*params->ids) ))) goto out_of_memory;
++        params->count = productIdsCount;
++        for (i = 0; i < productIdsCount; i++)
++            if (!(params->ids[i] = strdup( productIds[i] ))) goto out_of_memory;
++    }
++    hr = IXThreadingImpl_XAsyncBegin( x_threading_impl, async, params, &license_token_identity,
++                                     "XStoreQueryLicenseToken", license_token_provider );
++    if (FAILED(hr)) license_token_free( params );
+     return hr;
++out_of_memory:
++    license_token_free( params );
++    return E_OUTOFMEMORY;
++}
++
++static HRESULT WINAPI x_store_XStoreQueryLicenseTokenResultSize( IXStoreImpl6 *iface, XAsyncBlock *async, SIZE_T *size )
++{
++    return IXThreadingImpl_XAsyncGetResultSize( x_threading_impl, async, size );
++}
++
++static HRESULT WINAPI x_store_XStoreQueryLicenseTokenResult( IXStoreImpl6 *iface, XAsyncBlock *async, SIZE_T size, char *result )
++{
++    if (!result || !size) return E_INVALIDARG;
++    return IXThreadingImpl_XAsyncGetResult( x_threading_impl, async, &license_token_identity,
++                                          size, result, NULL );
+ }
+ 
+ static HRESULT WINAPI __PADDING__( IXStoreImpl6 *iface )

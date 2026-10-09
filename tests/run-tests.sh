@@ -23,6 +23,7 @@ INCUBE=$REPO_DIR/tools/in-container.sh
 # directory has to live there too, not under /tmp.
 WORK=$(mktemp -d "$BUILD_DIR/.xgr-tests.XXXXXX")
 cleanup() {
+    if [ -n "${FIXTURE_PID:-}" ]; then kill -TERM "$FIXTURE_PID" 2>/dev/null; wait "$FIXTURE_PID" 2>/dev/null; fi
     [ -n "${WINE:-}" ] && WINEPREFIX="$WORK/prefix" "$WINE"server -k 2>/dev/null
     rm -rf "$WORK" 2>/dev/null
 }
@@ -31,12 +32,12 @@ trap cleanup EXIT
 say() { printf '\033[1m:: %s\033[0m\n' "$*"; }
 fail() { printf '\033[31m!! %s\033[0m\n' "$*" >&2; exit 1; }
 
-DLL=$OBJ/dlls/xgameruntime/x86_64-windows/xgameruntime.dll
+DLL=${XGR_TEST_DLL:-$OBJ/dlls/xgameruntime/x86_64-windows/xgameruntime.dll}
 
 if [ "${REBUILD:-0}" != "0" ]; then
     say "rebuilding xgameruntime.dll"
     rsync -a --exclude .git "$WINE_SRC/dlls/xgameruntime/" "$BUILD_DIR/src-wine/dlls/xgameruntime/"
-    echo "WORKDIR=$OBJ $INCUBE make -j$(nproc) dlls/xgameruntime/x86_64-windows/xgameruntime.dll" \
+    echo "WORKDIR=$OBJ $INCUBE make -j$(nproc) dlls/xgameruntime/x86_64-windows/xgameruntime.dll dlls/xgameruntime/xgameruntime.so" \
         | newgrp docker || fail "build failed"
 fi
 [ -f "$DLL" ] || fail "$DLL not found (run with REBUILD=1)"
@@ -79,6 +80,10 @@ cp -al "$TOOL_DIR/files" "$WORK/wine" || fail "could not hardlink-copy the wine 
 BUILTIN=$WORK/wine/lib/wine/x86_64-windows/xgameruntime.dll
 rm -f "$BUILTIN"
 cp "$DLL" "$BUILTIN"
+# The new IPC function changes the DLL/Unix-library pair; always stage both.
+UNIXLIB=$WORK/wine/lib/wine/x86_64-unix/xgameruntime.so
+rm -f "$UNIXLIB"
+cp "$OBJ/dlls/xgameruntime/xgameruntime.so" "$UNIXLIB" || fail "missing matching Unix library"
 WINE=$WORK/wine/bin/wine
 
 say "running tests"
@@ -88,9 +93,23 @@ export XGR_WGS_ROOT="Z:$(echo "$WORK/wgs" | sed 's#/#\\#g')"
 export XGR_EXPECTED_FAMILY=$EXPECTED_FAMILY
 
 
+say "starting the synthetic license service"
+SERVICE_TEST_BIN=${SERVICE_TEST_BIN:-$("$REPO_DIR/tests/build-license-service-fixture.sh")} || fail "service fixture build failed"
+export XDG_RUNTIME_DIR="$WORK/rt"
+python3 "$REPO_DIR/tests/license_token_fixture.py" "$XDG_RUNTIME_DIR" "$SERVICE_TEST_BIN" "$WORK/license-transcript.json" &
+FIXTURE_PID=$!
+for _ in $(seq 1 100); do [ -f "$XDG_RUNTIME_DIR/ready" ] && break; sleep 0.1; done
+[ -f "$XDG_RUNTIME_DIR/ready" ] || fail "service fixture did not start"
+
 ( cd "$WORK" && timeout 180 "$WINE" "$WORK/xgr_tests.exe" ) 2>/dev/null | \
     grep -avE '^ntsync|radv is not|^wine:|wineserver' | tee "$WORK/out.txt"
 rc=${PIPESTATUS[0]}
+kill -TERM "$FIXTURE_PID" 2>/dev/null
+wait "$FIXTURE_PID"
+fixture_rc=$?
+FIXTURE_PID=
+cat "$WORK/license-transcript.json"
+[ "$fixture_rc" = 0 ] || rc=1
 
 echo
 if [ "$rc" = "0" ] && grep -q "^PASSED" "$WORK/out.txt"; then

@@ -58,6 +58,11 @@ tests/run-appmodel-tests.sh
 ```
 
 These build against the current sources and run under the locally built runtime.
+The GDK suite also builds a test-only `xodus-service` executable from the patched
+client sources (`CLIENT_REPO=/path/to/xodus` overrides the default). It drives
+licensing through local IPC and HTTP fixtures, without an account or network
+access to Microsoft. The fixture mode is not compiled into the shipped service.
+See [the licensing design and tests](notes/license-token-service.md).
 A change to the GDK DLL that does not keep them green is not ready.
 
 There is also an unattended end-to-end harness, `tools/auto-join.py`, which
