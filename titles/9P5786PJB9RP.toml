@@ -1,0 +1,54 @@
+schema = 1
+
+[title]
+product-id = "9P5786PJB9RP"
+name = "Minecraft Dungeons II"
+slug = "minecraft-dungeons-ii"
+publisher = "Microsoft Studios"
+package-identity = "Microsoft.MinecraftDungeons2"
+title-id = "6B9DE498"
+install-size-gb = 9.2
+
+[install]
+dir = "minecraft-dungeons-ii"
+
+[launch]
+# Keep the package bootstrap: it offers the bundled Visual C++ redistributable
+# on a fresh prefix before launching the WinGDK shipping executable.
+executable = "Dungeons.exe"
+
+[runtime]
+requires = [
+    "loader.memfd-main-image",
+    "appmodel.state-change-notification",
+    "xgameruntime.taskqueue",
+    "xgameruntime.user",
+    "xgameruntime.networking",
+    "xgameruntime.gamesave",
+    "xgameruntime.store-license-token",
+    "winhttp.ipv6-fast-fallback-option",
+]
+wants = ["media.real-video"]
+
+[[saves]]
+kind = "wgs"
+windows = '%LOCALAPPDATA%\Packages\Microsoft.MinecraftDungeons2_8wekyb3d8bbwe\SystemAppData\wgs'
+prefix = 'drive_c/users/steamuser/AppData/Local/Packages/Microsoft.MinecraftDungeons2_8wekyb3d8bbwe/SystemAppData/wgs'
+note = "Local XGameSave containers; cloud synchronization and transfer to Windows have not been qualified."
+
+[status]
+state = "playable"
+summary = "Account sign-in, Store licence verification and Squid Coast gameplay work with the matching updated runtime. Long-session, multiplayer and cloud-save behavior are untested."
+last-verified = 2026-10-10
+verified-with = "Game Pass Ultimate, package 1.1.2.0, service licence IPC and upstream WinHTTP option 140 backport"
+
+[[issues]]
+symptom = "login fails with error 0063 before a Store licence request"
+cause = "older Wine rejects WINHTTP_OPTION_IPV6_FAST_FALLBACK and Microsoft's XCurl abandons initialization"
+fix = "update the runtime and service together; keep Microsoft's original XCurl.dll"
+log-match = "unimplemented option 140"
+
+[[issues]]
+symptom = "first launch asks for Visual C++ 2015-2022 (x64)"
+cause = "the new Wine prefix has not installed the game's bundled redistributable"
+fix = "accept the bootstrap's install prompt and finish the bundled installer, then launch again if necessary"

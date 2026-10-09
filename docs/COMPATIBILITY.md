@@ -46,6 +46,7 @@ your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 | DOOM 64 | `9MXND4PQLK3W` | Playable | Plays. | 2026-09-06 |
 | DREDGE | `9MSVVM5NS9L6` | Playable | Plays. | 2026-09-06 |
 | Forza Horizon 5 | `9NNX1VVR3KNQ` | Playable | Plays with a restored Windows career; title services and the live Festival Playlist load after generic authentication and endpoint-discovery fixes. Player confirmed the online fix. | 2026-09-07 |
+| Minecraft Dungeons II | `9P5786PJB9RP` | Playable | Account sign-in, Store licence verification and Squid Coast gameplay work with the matching updated runtime. Long-session, multiplayer and cloud-save behavior are untested. | 2026-10-10 |
 | Minecraft for Windows | `9NBLGGH2JHXJ` | Playable | Signs in to Xbox Live, loads the profile, plays, and joins third-party servers from the in-game list. | 2026-09-06 |
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
 | Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. | 2026-09-06 |

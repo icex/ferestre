@@ -233,10 +233,10 @@ jobs:
           | \`ferestre-$VERSION-x86_64.tar.zst\` | The same tree an installed copy has. Extract anywhere and run \`usr/bin/ferestre\`. |
           | \`SHA256SUMS\` | Checksums for both. |
 
-          The AppImage and tarball include the Xodus client and a patched Proton
-          runtime, so a fresh installation can sign in and launch titles at
-          first start. The runtime is still released independently under
-          \`runtime-*\` tags for maintainers and AUR users.
+          The AppImage and tarball include the Xodus client. The patched Proton
+          runtime is downloaded separately on first start and is released
+          under \`runtime-*\` tags. Update both launcher and runtime for
+          Minecraft Dungeons II support.
 
           You need to own the games. This downloads and runs what your own
           Microsoft account is licensed for, and nothing else.

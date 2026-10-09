@@ -195,6 +195,45 @@ static void test_xuser(void)
             hr = IXUserImpl6_XUserCheckPrivilege( u6, user, 0, XUserPrivilege_CrossPlay, &has, &reason );
             CHECK( SUCCEEDED( hr ) && has, "user holds the cross-play privilege" );
             CHECK( IXUserImpl6_XUserIsStoreUser( u6, user ), "user is a store user" );
+
+            /* The fixture returns ASCII token/signature strings over IPC. The
+             * UTF-16 entry point must return actual wide strings to the game. */
+            {
+                XAsyncBlock token_async = {0};
+                XUserGetTokenAndSignatureUtf16Data *wide = NULL;
+                XUserGetTokenAndSignatureData *narrow = NULL;
+                BYTE *buffer = malloc(512);
+                SIZE_T size = 0, used = 0;
+                SIZE_T expected = sizeof(*wide) + sizeof(L"fixture-auth") + sizeof(L"fixture-signature");
+
+                hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Async( u6, user, 0, L"GET",
+                        L"https://fixture.invalid/", 0, NULL, 0, NULL, &token_async );
+                CHECK( hr == S_OK, "UTF-16 token request starts" );
+                hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16ResultSize( u6, &token_async, &size );
+                CHECK( hr == S_OK && size == expected, "UTF-16 result size includes wide strings (%Iu)", size );
+                memset(buffer, 0x5a, 512);
+                hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Result( u6, &token_async, expected - 1,
+                        buffer, &wide, &used );
+                CHECK( hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && buffer[0] == 0x5a,
+                        "short UTF-16 buffer is rejected without writing" );
+                hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Result( u6, &token_async, 512,
+                        buffer, &wide, &used );
+                CHECK( hr == S_OK && wide == (void *)buffer && used == expected,
+                        "UTF-16 result reports the bytes written" );
+                CHECK( hr == S_OK && wide && wide->tokenCount == sizeof(L"fixture-auth") &&
+                        !memcmp(wide->token, L"fixture-auth", sizeof(L"fixture-auth")),
+                        "UTF-16 token is a terminated wide string with a byte count" );
+                CHECK( hr == S_OK && wide && wide->signatureCount == sizeof(L"fixture-signature") &&
+                        !memcmp(wide->signature, L"fixture-signature", sizeof(L"fixture-signature")),
+                        "UTF-16 signature is a terminated wide string with a byte count" );
+                CHECK( buffer[expected] == 0x5a, "UTF-16 result leaves the tail untouched" );
+                /* Retrieving the Unicode form must not corrupt the cached UTF-8 payload. */
+                hr = IXUserImpl6_XUserGetTokenAndSignatureResult( u6, &token_async, 512,
+                        buffer, &narrow, &used );
+                CHECK( hr == S_OK && narrow && !strcmp(narrow->token, "fixture-auth") &&
+                        !strcmp(narrow->signature, "fixture-signature"), "UTF-8 payload remains intact" );
+                free(buffer);
+            }
         }
         else CHECK( 0, "query IXUserImpl6" );
     }
@@ -337,13 +376,61 @@ static void test_xstore(void)
     hr = IXStoreImpl6_XStoreQueryAddOnLicensesResultCount( store, &async, &addons );
     CHECK( SUCCEEDED( hr ) && addons == 0, "no add-on licences (%u)", addons );
 
-    /* licence token: empty but valid-sized */
-    memset( &async, 0, sizeof(async) );
-    IXStoreImpl6_XStoreQueryLicenseTokenAsync( store, ctx, NULL, 0, "test", &async );
-    hr = IXStoreImpl6_XStoreQueryLicenseTokenResultSize( store, &async, &size );
-    CHECK( SUCCEEDED( hr ) && size >= 1, "licence token size >= 1 (%zu)", (size_t)size );
-    hr = IXStoreImpl6_XStoreQueryLicenseTokenResult( store, &async, sizeof(buf), buf );
-    CHECK( SUCCEEDED( hr ), "licence token result succeeds (0x%08lx)", hr );
+    /* This exercises the actual DLL -> Rust serializer -> HTTP -> result path.
+     * The only injected component is the account/signing identity. */
+    {
+        static const struct { const char *custom; BOOL success; } cases[] = {
+            { "regression-test", TRUE }, { "{\"nonce\":\"a\\b\"}\n\t", TRUE },
+            { "română", TRUE }, { "slow", TRUE }, { "timeout", FALSE },
+            { "refused", FALSE }, { "empty", FALSE }, { "null", FALSE },
+            { "nested", FALSE }, { "malformed", FALSE }, { "truncated", FALSE },
+            { "oversize", FALSE }, { "redirect-302", FALSE },
+            { "redirect-307", FALSE }, { "redirect-308", FALSE },
+            { "ipc-old-service", FALSE }, { "ipc-disconnect", FALSE },
+            { "ipc-truncated", FALSE }, { "ipc-oversize", FALSE }, { "ipc-stall", FALSE },
+        };
+        static const char expected[] = "eyJhbGciOiJSUzI1NiJ9.Zml4dHVyZS1saWNlbmNlLXRva2Vu.c2lnbmF0dXJl";
+        unsigned int i, waited;
+        for (i = 0; i < sizeof(cases)/sizeof(cases[0]); i++)
+        {
+            char id1[32] = "9TESTSTORE0ID", id2[32] = "9TESTADDON00", custom[128];
+            const char *ids[] = { id1, id2 };
+            ULONGLONG started, elapsed;
+            strcpy(custom, cases[i].custom);
+            memset(&async, 0, sizeof(async));
+            started = GetTickCount64();
+            hr = IXStoreImpl6_XStoreQueryLicenseTokenAsync(store, ctx, ids, 2, custom, &async);
+            elapsed = GetTickCount64() - started;
+            CHECK(hr == S_OK, "license case %u starts (0x%08lx)", i, hr);
+            /* Inputs may cease to exist immediately after the API returns. */
+            memset(custom, '!', sizeof(custom)); memset(id1, '!', sizeof(id1)); memset(id2, '!', sizeof(id2));
+            if (!strcmp(cases[i].custom, "slow"))
+                CHECK(elapsed < 250, "license call returns before the 500-ms HTTP reply (%llu ms)", elapsed);
+            if (FAILED(hr)) continue;
+            for (waited = 0; waited < 6000; waited++)
+            {
+                hr = IXThreadingImpl_XAsyncGetStatus(threading, &async, FALSE);
+                if (hr != E_PENDING) break;
+                Sleep(10);
+            }
+            CHECK(hr != E_PENDING, "license case %u completes", i);
+            if (!strcmp(cases[i].custom, "ipc-stall"))
+                CHECK(hr == HRESULT_FROM_WIN32(ERROR_TIMEOUT) && GetTickCount64() - started >= 45000 &&
+                      GetTickCount64() - started < 55000, "stalled IPC fails at its 50-second deadline");
+            hr = IXStoreImpl6_XStoreQueryLicenseTokenResultSize(store, &async, &size);
+            if (!cases[i].success)
+            {
+                CHECK(FAILED(hr) && hr != E_PENDING, "license case %u refuses bad response (0x%08lx)", i, hr);
+                continue;
+            }
+            CHECK(hr == S_OK && size == sizeof(expected), "license case %u has exact token size", i);
+            memset(buf, '!', sizeof(buf));
+            hr = IXStoreImpl6_XStoreQueryLicenseTokenResult(store, &async, 4, buf);
+            CHECK(hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && buf[0] == '!', "short buffer is not written or consumed");
+            hr = IXStoreImpl6_XStoreQueryLicenseTokenResult(store, &async, sizeof(buf), buf);
+            CHECK(hr == S_OK && !strcmp(buf, expected) && buf[sizeof(expected)] == '!', "license case %u returns only the token and terminator", i);
+        }
+    }
 
     /* entitled products: an empty, enumerable, single-page query */
     memset( &async, 0, sizeof(async) );
@@ -569,6 +656,27 @@ static HRESULT CALLBACK provider_fails_in_begin( XAsyncOp op, const XAsyncProvid
     return op == XAsyncOp_Begin ? E_FAIL : S_OK;
 }
 
+static volatile LONG failed_work_finished, failed_work_cleanup_safe;
+static HRESULT work_completion_result = E_FAIL;
+static HRESULT CALLBACK provider_fails_in_work( XAsyncOp op, const XAsyncProviderData *data )
+{
+    switch (op)
+    {
+    case XAsyncOp_Begin:
+        return IXThreadingImpl_XAsyncSchedule(threading_for_provider, data->async, 0);
+    case XAsyncOp_DoWork:
+        IXThreadingImpl_XAsyncComplete(threading_for_provider, data->async, work_completion_result, 0);
+        Sleep(30); /* The callback may free the user's block before work exits. */
+        InterlockedExchange((LONG *)&failed_work_finished, 1);
+        return E_PENDING;
+    case XAsyncOp_Cleanup:
+        if (failed_work_finished) InterlockedExchange((LONG *)&failed_work_cleanup_safe, 1);
+        return provider_fails_in_begin(op, data);
+    default:
+        return S_OK;
+    }
+}
+
 static HRESULT CALLBACK provider_completes_then_fails( XAsyncOp op, const XAsyncProviderData *data )
 {
     HRESULT hr = provider_completes_in_begin( op, data );
@@ -579,13 +687,14 @@ static HRESULT CALLBACK provider_completes_without_payload( XAsyncOp op, const X
 {
     if (op == XAsyncOp_Begin)
         IXThreadingImpl_XAsyncComplete( threading_for_provider, data->async, S_OK, 0 );
+    if (op == XAsyncOp_Cleanup) InterlockedIncrement((LONG *)&failed_begin_cleanups);
     return S_OK;
 }
 
 static void CALLBACK failed_begin_cb( XAsyncBlock *async )
 {
     HRESULT hr = IXThreadingImpl_XAsyncGetStatus( threading_for_provider, async, FALSE );
-    if (hr == E_FAIL && !failed_begin_cleanups)
+    if (hr == work_completion_result && !failed_begin_cleanups)
         InterlockedExchange( (LONG *)&failed_begin_callback_ok, 1 );
     VirtualFree( async, 0, MEM_RELEASE );
     InterlockedExchange( (LONG *)&completion_ran, 1 );
@@ -811,6 +920,53 @@ static void test_xthreading(void)
     }
 
     {
+        XAsyncBlock *block = VirtualAlloc(NULL, sizeof(*block), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        int waited;
+        CHECK(block != NULL, "allocate a disposable failed-work block");
+        if (!block) return;
+        block->callback = failed_begin_cb;
+        block->context = &failed_begin_cookie;
+        InterlockedExchange((LONG *)&completion_ran, 0);
+        InterlockedExchange((LONG *)&failed_begin_cleanups, 0);
+        InterlockedExchange((LONG *)&failed_begin_callback_ok, 0);
+        InterlockedExchange((LONG *)&failed_begin_cleanup_context_ok, 0);
+        InterlockedExchange((LONG *)&failed_work_finished, 0);
+        InterlockedExchange((LONG *)&failed_work_cleanup_safe, 0);
+        hr = IXThreadingImpl_XAsyncBegin(threading, block, NULL, provider_fails_in_work,
+                                        "fails-in-work", provider_fails_in_work);
+        CHECK(hr == S_OK, "background failure starts successfully");
+        for (waited = 0; waited < 200 && !failed_begin_cleanups; waited++) Sleep(10);
+        CHECK(completion_ran && failed_begin_callback_ok, "background failure reports status before cleanup");
+        CHECK(failed_begin_cleanups == 1 && failed_work_cleanup_safe,
+              "background failure cleans up once, after worker and callback, without GetResult");
+        CHECK(failed_begin_cleanup_context_ok, "background cleanup uses a saved block after callback frees the original");
+    }
+
+    {
+        XAsyncBlock *block = VirtualAlloc(NULL, sizeof(*block), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        int waited;
+
+        work_completion_result = S_OK;
+        block->context = &failed_begin_cookie;
+        block->callback = failed_begin_cb;
+        InterlockedExchange((LONG *)&completion_ran, 0);
+        InterlockedExchange((LONG *)&failed_begin_cleanups, 0);
+        InterlockedExchange((LONG *)&failed_begin_callback_ok, 0);
+        InterlockedExchange((LONG *)&failed_begin_cleanup_context_ok, 0);
+        InterlockedExchange((LONG *)&failed_work_finished, 0);
+        InterlockedExchange((LONG *)&failed_work_cleanup_safe, 0);
+        hr = IXThreadingImpl_XAsyncBegin(threading, block, NULL, provider_fails_in_work,
+                                        "successful-work-without-result", provider_fails_in_work);
+        CHECK(hr == S_OK, "zero-result background operation starts");
+        for (waited = 0; waited < 200 && !failed_begin_cleanups; waited++) Sleep(10);
+        CHECK(completion_ran && failed_begin_callback_ok, "zero-result success reports status before cleanup");
+        CHECK(failed_begin_cleanups == 1 && failed_work_cleanup_safe,
+              "zero-result success releases its provider once after work without GetResult");
+        CHECK(failed_begin_cleanup_context_ok, "zero-result cleanup survives callback freeing the original block");
+        work_completion_result = E_FAIL;
+    }
+
+    {
         XAsyncBlock block = {0};
         UINT32 value = 0;
 
@@ -826,8 +982,15 @@ static void test_xthreading(void)
         CHECK( hr == E_FAIL, "failed result remains readable after automatic cleanup (0x%08lx)", hr );
 
         memset( &block, 0, sizeof(block) );
+        InterlockedExchange((LONG *)&failed_begin_cleanups, 0);
         IXThreadingImpl_XAsyncBegin( threading, &block, NULL, provider_completes_without_payload,
                                      "older-zero-payload", provider_completes_without_payload );
+        CHECK(failed_begin_cleanups == 1, "inline zero-result success cleans up without a callback or result read");
+        {
+            SIZE_T used = 99;
+            hr = IXThreadingImpl_XAsyncGetResult(threading, &block, provider_completes_without_payload, 0, NULL, &used);
+            CHECK(hr == S_OK && used == 0, "detached zero-result success remains readable with zero bytes used");
+        }
         block.context = &failed_begin_cookie;
         IXThreadingImpl_XAsyncBegin( threading, &block, NULL, provider_fails_in_begin,
                                      "newer-failed-begin", provider_fails_in_begin );

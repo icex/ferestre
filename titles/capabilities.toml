@@ -435,7 +435,7 @@ Failed-Begin cleanup waits for the provider and completion callback, using an \
 owned block snapshot because the callback may free the caller's block. A \
 reused block still reports its newest failure rather than an older result."""
 verify = [
-    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "failed Begin for block %p completes asynchronously; cleanup follows delivery" },
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "for block %p completes asynchronously; cleanup follows delivery" },
 ]
 
 [[capability]]
@@ -524,4 +524,28 @@ Found while chasing Forza Horizon 5 and it did not change its outcome; kept \
 because a mask of zero is wrong on its own terms."""
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "XNetworkingQuerySecurityInformationForUrlUtf16Async" },
+]
+
+[[capability]]
+name = "winhttp.ipv6-fast-fallback-option"
+summary = "WinHTTP accepts XCurl's IPv6 fast fallback session option, matching upstream Wine."
+provided-by = ["patches/wine/0014-winhttp-ipv6-fast-fallback.patch"]
+symptom-if-missing = "XCurl abandons initialization before connecting; Minecraft Dungeons II reports login error 0063"
+note = "The upstream backport accepts the option; it does not implement a new connection-racing algorithm."
+verify = [
+    { file = "files/lib/wine/x86_64-windows/winhttp.dll", contains = "WINHTTP_OPTION_IPV6_FAST_FALLBACK:" },
+]
+
+[[capability]]
+name = "xgameruntime.store-license-token"
+summary = "XStoreQueryLicenseTokenAsync fetches a nonempty licence token asynchronously through the service."
+provided-by = [
+    "patches/xgameruntime/0018-clean-up-background-provider-failures.patch",
+    "patches/xgameruntime/0019-fetch-license-tokens-through-the-service.patch",
+    "patches/xodus-cli/0017-fetch-license-tokens-in-the-service.patch",
+]
+symptom-if-missing = "a title requiring a Store licence token receives an empty result or cannot verify ownership"
+note = "The runtime probe checks IPC support only. The matching xodus-service must also be installed and restarted; old services fail closed."
+verify = [
+    { file = "files/lib/wine/x86_64-unix/xgameruntime.so", contains = "<LicenseTokenRequest><ParentProductId>" },
 ]

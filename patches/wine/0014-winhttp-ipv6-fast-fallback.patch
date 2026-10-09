@@ -1,0 +1,33 @@
+From cefdd9ebe60188f3f021d9eb85b0fe7df01ad13a Mon Sep 17 00:00:00 2001
+From: Hans Leidekker <hans@codeweavers.com>
+Date: Thu, 9 Apr 2026 10:59:11 +0200
+Subject: [PATCH] winhttp: Stub
+ WinHttpSetOption(WINHTTP_OPTION_IPV6_FAST_FALLBACK).
+
+Upstream: https://github.com/wine-mirror/wine/commit/cefdd9ebe60188f3f021d9eb85b0fe7df01ad13a
+Backported to the pinned Wine tree; only surrounding context changed.
+
+---
+ dlls/winhttp/session.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/dlls/winhttp/session.c b/dlls/winhttp/session.c
+index ca9e628660ad..666a72c47e1a 100644
+--- a/dlls/winhttp/session.c
++++ b/dlls/winhttp/session.c
+@@ -281,6 +281,15 @@ static BOOL session_set_option( struct object_header *hdr, DWORD option, void *b
+         return TRUE;
+     }
+ 
++    case WINHTTP_OPTION_IPV6_FAST_FALLBACK:
++        if (buflen != sizeof(BOOL))
++        {
++            SetLastError( ERROR_INSUFFICIENT_BUFFER );
++            return FALSE;
++        }
++        FIXME( "WINHTTP_OPTION_IPV6_FAST_FALLBACK: %d\n", *(BOOL *)buffer );
++        return TRUE;
++
+     default:
+         FIXME( "unimplemented option %lu\n", option );
+         SetLastError( ERROR_WINHTTP_INVALID_OPTION );
