@@ -14,3 +14,4 @@ __pycache__/
 target/
 tools/*.exe
 tools/winestack
+.worktrees/

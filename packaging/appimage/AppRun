@@ -38,16 +38,12 @@ if [ -r "$APPDIR/usr/lib/ferestre/VERSION" ]; then
     export FERESTRE_PACKAGE_VERSION="${FERESTRE_PACKAGE_VERSION:-$(cat "$APPDIR/usr/lib/ferestre/VERSION")}"
 fi
 
-# The release image contains the GPL client and the patched Proton runtime. A
-# caller can still override either path for development, but a fresh machine
-# must not need a second package before it can sign in or run a title.
+# The release image contains the GPL client. The patched Proton runtime is a
+# separately versioned release that Ferestre downloads into its state directory
+# on first start, so it can be upgraded without replacing this AppImage.
 if [ -x "$APPDIR/usr/lib/ferestre/client/xodus-cli" ]; then
     export XODUS_CLI_DIR="${XODUS_CLI_DIR:-$APPDIR/usr/lib/ferestre/client}"
 fi
-if [ -d "$APPDIR/usr/lib/ferestre/runtime" ]; then
-    export XODUS_PROTON_DIR="${XODUS_PROTON_DIR:-$APPDIR/usr/lib/ferestre/runtime}"
-fi
-
 # No arguments means somebody clicked the icon, so open the window; arguments
 # mean they typed a command, so run the CLI. Desktop integrators rewrite a
 # .desktop `Exec=` to the AppImage's own path and drop the binary name, so this

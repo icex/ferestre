@@ -310,9 +310,16 @@ impl Paths {
         self.steam.as_deref()
     }
 
-    /// The patched Proton, installed as a Steam compatibility tool.
+    /// The patched Proton found through the legacy environment and Steam paths.
     pub fn runtime_dir(&self) -> Option<&Path> {
         self.runtime.as_deref()
+    }
+
+    /// Independently downloaded runtime releases. Each child is a versioned
+    /// Proton compatibility tool, so an interrupted update cannot replace the
+    /// runtime a title is currently using.
+    pub fn runtimes_dir(&self) -> PathBuf {
+        self.state.join("runtimes")
     }
 
     /// The capability list a runtime build is expected to publish

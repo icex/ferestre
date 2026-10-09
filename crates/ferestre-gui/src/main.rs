@@ -285,7 +285,15 @@ fn build_ui(app: &adw::Application) {
     // whose library is this -- so it is asked without being told to. The
     // library is not: it signs in, pages through collections and can take
     // seconds, so it waits to be asked.
-    refresh_account(&ui);
+    if ui.model.borrow().runtime.is_none() {
+        // A fresh AppImage has the small launcher and client, while the large
+        // runtime follows its own release train. Make that first download an
+        // ordinary visible operation instead of an error the person has to
+        // diagnose before their first launch.
+        spawn_cli_tracked(&ui, &["install-runtime"], "Downloading the runtime");
+    } else {
+        refresh_account(&ui);
+    }
 
     window.present();
 }
@@ -364,17 +372,34 @@ fn render_runtime(ui: &Ui, page: &adw::PreferencesPage) {
         let install = gtk::Button::builder()
             .label("Install")
             .valign(gtk::Align::Center)
-            .tooltip_text("ferestre install-runtime — builds a patched Proton, which takes a while")
+            .tooltip_text("Download the current patched Proton runtime")
             .build();
         install.connect_clicked(glib::clone!(
             #[strong]
             ui,
-            move |_| spawn_cli_tracked(&ui, &["install-runtime"], "Building the runtime")
+            move |_| spawn_cli_tracked(&ui, &["install-runtime"], "Downloading the runtime")
         ));
         row.add_suffix(&install);
     }
     group.add(&row);
     page.add(&group);
+
+    if model.runtimes.len() > 1 {
+        let versions = adw::PreferencesGroup::builder()
+            .title("Installed versions")
+            .description("New launches use the newest compatible version. A title-specific choice is kept locally.")
+            .build();
+        for runtime in &model.runtimes {
+            versions.add(
+                &adw::ActionRow::builder()
+                    .title(runtime.label())
+                    .subtitle(runtime.path.display().to_string())
+                    .subtitle_lines(2)
+                    .build(),
+            );
+        }
+        page.add(&versions);
+    }
 
     if let Some(runtime) = &model.runtime {
         let capabilities = adw::PreferencesGroup::builder()
@@ -737,6 +762,93 @@ fn render_rows(
     }
 }
 
+fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
+    let (paths, runtimes, current) = {
+        let model = ui.model.borrow();
+        let Some(paths) = model.paths.clone() else {
+            return;
+        };
+        (
+            paths.clone(),
+            model.runtimes.clone(),
+            ferestre_core::runtime::selected(paths.config_dir(), product_id),
+        )
+    };
+    let dialog = gtk::Window::builder()
+        .transient_for(&ui.window)
+        .modal(true)
+        .title(format!("Runtime for {title}"))
+        .default_width(520)
+        .build();
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(18)
+        .margin_bottom(18)
+        .margin_start(18)
+        .margin_end(18)
+        .build();
+    let automatic = gtk::Button::with_label("Automatic (newest compatible)");
+    let automatic_ui = ui.clone();
+    let automatic_dialog = dialog.clone();
+    let automatic_paths = paths.clone();
+    let automatic_product = product_id.to_string();
+    automatic.connect_clicked(move |_| {
+        if let Err(error) = ferestre_core::runtime::set_selected(
+            automatic_paths.config_dir(),
+            &automatic_product,
+            None,
+        ) {
+            automatic_ui.toasts.add_toast(adw::Toast::new(&format!(
+                "Could not save runtime choice: {error}"
+            )));
+        } else {
+            automatic_dialog.close();
+            automatic_ui
+                .toasts
+                .add_toast(adw::Toast::new("Runtime selection reset to automatic"));
+        }
+    });
+    content.append(&automatic);
+    for runtime in runtimes {
+        let selected = current.as_deref() == Some(runtime.path.as_path());
+        let label = if selected {
+            format!("{} (selected)", runtime.label())
+        } else {
+            runtime.label()
+        };
+        let choice = gtk::Button::with_label(&label);
+        let selected_ui = ui.clone();
+        let selected_dialog = dialog.clone();
+        let selected_paths = paths.clone();
+        let selected_product = product_id.to_string();
+        let path = runtime.path.clone();
+        choice.connect_clicked(move |_| {
+            if let Err(error) = ferestre_core::runtime::set_selected(
+                selected_paths.config_dir(),
+                &selected_product,
+                Some(&path),
+            ) {
+                selected_ui.toasts.add_toast(adw::Toast::new(&format!(
+                    "Could not save runtime choice: {error}"
+                )));
+            } else {
+                selected_dialog.close();
+                selected_ui
+                    .toasts
+                    .add_toast(adw::Toast::new("Runtime selected for this title"));
+            }
+        });
+        content.append(&choice);
+    }
+    let cancel = gtk::Button::with_label("Cancel");
+    let cancel_dialog = dialog.clone();
+    cancel.connect_clicked(move |_| cancel_dialog.close());
+    content.append(&cancel);
+    dialog.set_child(Some(&content));
+    dialog.present();
+}
+
 fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
     // A title is a name, not markup, and the flag has to be set before the text
     // is: left as markup, "Minecraft: Java & Bedrock Edition for PC" fails to
@@ -813,6 +925,21 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
     // disk is another, because `run` writes a recipe from the package manifest
     // on its way past.
     if row.has_recipe || row.installed {
+        let runtime = gtk::Button::builder()
+            .icon_name("applications-engineering-symbolic")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .tooltip_text("Choose the Proton runtime for this title")
+            .build();
+        let product_id = row.product_id.clone();
+        let name = row.name.clone();
+        runtime.connect_clicked(glib::clone!(
+            #[strong]
+            ui,
+            move |_| choose_runtime(&ui, &product_id, &name)
+        ));
+        action_row.add_suffix(&runtime);
+
         let to_steam = gtk::Button::builder()
             .icon_name("list-add-symbolic")
             .valign(gtk::Align::Center)
@@ -1495,9 +1622,9 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
     let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     let runtime_install = owned == ["install-runtime"];
     let tick = if runtime_install {
-        // A source-built runtime has no byte total to report, but a visible
-        // pulsing bar is still better than a toast that appears frozen through
-        // Wine's long configure and link steps.
+        // A runtime archive is large and GitHub cannot provide a stable byte
+        // total before the redirect. Keep progress visibly moving throughout
+        // discovery, download and unpacking.
         ui.download
             .start("runtime", "Patched runtime", "Installing");
         let ticker = ui.clone();

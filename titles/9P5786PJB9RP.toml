@@ -38,14 +38,14 @@ note = "Local XGameSave containers; cloud synchronization and transfer to Window
 
 [status]
 state = "playable"
-summary = "Account sign-in, Store licence verification and Squid Coast gameplay work with the bundled runtime. Long-session, multiplayer and cloud-save behavior are untested."
+summary = "Account sign-in, Store licence verification and Squid Coast gameplay work with the matching updated runtime. Long-session, multiplayer and cloud-save behavior are untested."
 last-verified = 2026-10-10
 verified-with = "Game Pass Ultimate, package 1.1.2.0, service licence IPC and upstream WinHTTP option 140 backport"
 
 [[issues]]
 symptom = "login fails with error 0063 before a Store licence request"
 cause = "older Wine rejects WINHTTP_OPTION_IPV6_FAST_FALLBACK and Microsoft's XCurl abandons initialization"
-fix = "update the bundled runtime and service together; keep Microsoft's original XCurl.dll"
+fix = "update the runtime and service together; keep Microsoft's original XCurl.dll"
 log-match = "unimplemented option 140"
 
 [[issues]]
