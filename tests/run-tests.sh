@@ -87,7 +87,7 @@ cp "$OBJ/dlls/xgameruntime/xgameruntime.so" "$UNIXLIB" || fail "missing matching
 WINE=$WORK/wine/bin/wine
 
 say "running tests"
-export WINEPREFIX=${WINEPREFIX:-$WORK/prefix}
+export WINEPREFIX="$WORK/prefix"
 export WINEDEBUG=-all,fixme-all
 export XGR_WGS_ROOT="Z:$(echo "$WORK/wgs" | sed 's#/#\\#g')"
 export XGR_EXPECTED_FAMILY=$EXPECTED_FAMILY
