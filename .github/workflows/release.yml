@@ -139,16 +139,28 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag=$(gh release list --repo icex/ferestre --limit 100 | awk '$1 ~ /^runtime-/ { print $1; exit }')
+          tag=$(gh release list --repo icex/ferestre --limit 100 \
+              --json tagName,isDraft,isPrerelease \
+              --jq '[.[] | select(.isDraft == false and .isPrerelease == false and (.tagName | startswith("runtime-")))][0].tagName // empty')
           test -n "$tag"
           mkdir runtime-download
           gh release download "$tag" --repo icex/ferestre \
-              --pattern 'ferestre-runtime-*.tar.xz' --dir runtime-download
+              --pattern 'ferestre-runtime-*.tar.xz' --pattern SHA256SUMS --dir runtime-download
+          (cd runtime-download && sha256sum --check SHA256SUMS)
           archive=$(find runtime-download -maxdepth 1 -name 'ferestre-runtime-*.tar.xz' -print -quit)
           test -n "$archive"
           tar -xJf "$archive" -C runtime-download
           runtime=$(find runtime-download -mindepth 1 -maxdepth 1 -type d -name 'ferestre-runtime-*' -print -quit)
           test -n "$runtime"
+          python3 - "$runtime/files/share/ferestre/capabilities.json" <<'PY_CHECK'
+          import json, sys
+          with open(sys.argv[1]) as f:
+              manifest = json.load(f)
+          required = {"xgameruntime.store-license-token", "winhttp.ipv6-fast-fallback-option"}
+          missing = required - set(manifest["capabilities"])
+          if missing:
+              raise SystemExit("Runtime release lacks required capabilities: " + ", ".join(sorted(missing)))
+          PY_CHECK
           echo "dir=$runtime" >> "$GITHUB_OUTPUT"
 
       # The layout an installed copy has: usr/bin/ferestre with

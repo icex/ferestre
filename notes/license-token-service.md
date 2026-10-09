@@ -24,7 +24,9 @@ for checking Microsoft's JWT signature and the account's entitlements.
 
 ## IPC and compatibility
 
-This requires the matching **client patch 0017 and runtime patches 0018–0019**.
+Licence IPC requires matching **client patch 0017 and runtime patches 0018–0019**.
+The qualified Dungeons II build additionally includes runtime patches 0020–0021
+and Wine patch 0014.
 Rebuild/restart the service when deploying the runtime. The installed DLL and
 Unix library must also come from the same build.
 
@@ -98,6 +100,17 @@ error 0063 before calling the licence API. Two additional runtime findings:
   needed for this observed path. The replacement experiment still gave 0063
   and was reverted.
 
-Gameplay, save/relaunch and normal exit qualification are still in progress.
+Live gameplay reached Squid Coast with movement, combat and objective progression;
+the maintainer took control for gameplay. Initial shutdown hung in
+`xbox::services::GlobalState::CleanupAsync`. Runtime patch 0021 releases successful
+zero-payload providers automatically, preserving ownership through the worker and
+completion callback. This follows the zero-payload lifetime in Microsoft's
+[AsyncLib implementation](https://github.com/microsoft/libHttpClient/blob/main/Source/Task/AsyncLib.cpp).
+The previous DLL fails the two new background-cleanup assertions; the fix passes
+the full 194-check HTTPS suite, including callback-frees-block and inline/no-callback
+coverage. The subsequent live run exited with rc=0 and no remaining game process.
+A second launch restored the saved hero. Choosing Quit and confirming Exit to
+Desktop returned rc=0 again, with no remaining game process and no forced shutdown.
+This verifies local profile persistence; cloud-save synchronization remains untested.
 The new release must include the matching service, runtime and WinHTTP backport.
 Private traces contain authentication material and must not be uploaded raw.

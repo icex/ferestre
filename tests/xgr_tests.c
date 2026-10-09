@@ -657,6 +657,7 @@ static HRESULT CALLBACK provider_fails_in_begin( XAsyncOp op, const XAsyncProvid
 }
 
 static volatile LONG failed_work_finished, failed_work_cleanup_safe;
+static HRESULT work_completion_result = E_FAIL;
 static HRESULT CALLBACK provider_fails_in_work( XAsyncOp op, const XAsyncProviderData *data )
 {
     switch (op)
@@ -664,7 +665,7 @@ static HRESULT CALLBACK provider_fails_in_work( XAsyncOp op, const XAsyncProvide
     case XAsyncOp_Begin:
         return IXThreadingImpl_XAsyncSchedule(threading_for_provider, data->async, 0);
     case XAsyncOp_DoWork:
-        IXThreadingImpl_XAsyncComplete(threading_for_provider, data->async, E_FAIL, 0);
+        IXThreadingImpl_XAsyncComplete(threading_for_provider, data->async, work_completion_result, 0);
         Sleep(30); /* The callback may free the user's block before work exits. */
         InterlockedExchange((LONG *)&failed_work_finished, 1);
         return E_PENDING;
@@ -686,13 +687,14 @@ static HRESULT CALLBACK provider_completes_without_payload( XAsyncOp op, const X
 {
     if (op == XAsyncOp_Begin)
         IXThreadingImpl_XAsyncComplete( threading_for_provider, data->async, S_OK, 0 );
+    if (op == XAsyncOp_Cleanup) InterlockedIncrement((LONG *)&failed_begin_cleanups);
     return S_OK;
 }
 
 static void CALLBACK failed_begin_cb( XAsyncBlock *async )
 {
     HRESULT hr = IXThreadingImpl_XAsyncGetStatus( threading_for_provider, async, FALSE );
-    if (hr == E_FAIL && !failed_begin_cleanups)
+    if (hr == work_completion_result && !failed_begin_cleanups)
         InterlockedExchange( (LONG *)&failed_begin_callback_ok, 1 );
     VirtualFree( async, 0, MEM_RELEASE );
     InterlockedExchange( (LONG *)&completion_ran, 1 );
@@ -941,6 +943,30 @@ static void test_xthreading(void)
     }
 
     {
+        XAsyncBlock *block = VirtualAlloc(NULL, sizeof(*block), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        int waited;
+
+        work_completion_result = S_OK;
+        block->context = &failed_begin_cookie;
+        block->callback = failed_begin_cb;
+        InterlockedExchange((LONG *)&completion_ran, 0);
+        InterlockedExchange((LONG *)&failed_begin_cleanups, 0);
+        InterlockedExchange((LONG *)&failed_begin_callback_ok, 0);
+        InterlockedExchange((LONG *)&failed_begin_cleanup_context_ok, 0);
+        InterlockedExchange((LONG *)&failed_work_finished, 0);
+        InterlockedExchange((LONG *)&failed_work_cleanup_safe, 0);
+        hr = IXThreadingImpl_XAsyncBegin(threading, block, NULL, provider_fails_in_work,
+                                        "successful-work-without-result", provider_fails_in_work);
+        CHECK(hr == S_OK, "zero-result background operation starts");
+        for (waited = 0; waited < 200 && !failed_begin_cleanups; waited++) Sleep(10);
+        CHECK(completion_ran && failed_begin_callback_ok, "zero-result success reports status before cleanup");
+        CHECK(failed_begin_cleanups == 1 && failed_work_cleanup_safe,
+              "zero-result success releases its provider once after work without GetResult");
+        CHECK(failed_begin_cleanup_context_ok, "zero-result cleanup survives callback freeing the original block");
+        work_completion_result = E_FAIL;
+    }
+
+    {
         XAsyncBlock block = {0};
         UINT32 value = 0;
 
@@ -956,8 +982,15 @@ static void test_xthreading(void)
         CHECK( hr == E_FAIL, "failed result remains readable after automatic cleanup (0x%08lx)", hr );
 
         memset( &block, 0, sizeof(block) );
+        InterlockedExchange((LONG *)&failed_begin_cleanups, 0);
         IXThreadingImpl_XAsyncBegin( threading, &block, NULL, provider_completes_without_payload,
                                      "older-zero-payload", provider_completes_without_payload );
+        CHECK(failed_begin_cleanups == 1, "inline zero-result success cleans up without a callback or result read");
+        {
+            SIZE_T used = 99;
+            hr = IXThreadingImpl_XAsyncGetResult(threading, &block, provider_completes_without_payload, 0, NULL, &used);
+            CHECK(hr == S_OK && used == 0, "detached zero-result success remains readable with zero bytes used");
+        }
         block.context = &failed_begin_cookie;
         IXThreadingImpl_XAsyncBegin( threading, &block, NULL, provider_fails_in_begin,
                                      "newer-failed-begin", provider_fails_in_begin );

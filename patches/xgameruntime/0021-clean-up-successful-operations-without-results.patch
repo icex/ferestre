@@ -1,0 +1,91 @@
+diff --git a/xthreading.c b/xthreading.c
+--- a/xthreading.c
++++ b/xthreading.c
+@@ -151,7 +151,7 @@
+ };
+ 
+ static struct list async_ops = LIST_INIT( async_ops );
+-static const char failed_begin_marker;
++static const char no_result_marker;
+ static CRITICAL_SECTION async_ops_cs;
+ static CRITICAL_SECTION_DEBUG async_ops_cs_debug =
+ {
+@@ -216,11 +216,11 @@
+ static void store_async_result( XAsyncBlock *async, HRESULT hr, void *payload, SIZE_T result_size );
+ static void deliver_async_completion( XAsyncBlock *async, struct x_async_op *keep_alive );
+ 
+-/* A provider failure is an async outcome with no payload. Its caller
++/* A terminal outcome without a payload needs no GetResult. Its caller
+  * may only read GetStatus and never call GetResult, so retain the provider
+  * through Begin/work and the callback, then clean it up without a result read.
+  * An inline completion wins over the later return value. */
+-static void complete_provider_failure( struct x_async_op *op, HRESULT hr )
++static void complete_without_result( struct x_async_op *op, HRESULT hr )
+ {
+     BOOL drop = FALSE;
+ 
+@@ -231,12 +231,12 @@
+         op->result = hr;
+         op->required_size = 0;
+         op->deliver_pending = TRUE;
+-        store_async_result( op->async, hr, (void *)&failed_begin_marker, 0 );
++        store_async_result( op->async, hr, (void *)&no_result_marker, 0 );
+         op->cleanup_async = *op->async;
+-        op->cleanup_on_release = TRUE;
++        op->cleanup_on_release = op->provider != NULL;
+         list_remove( &op->entry );
+         drop = TRUE;
+-        TRACE( "failed provider for block %p completes asynchronously; cleanup follows delivery.\n", op->async );
++        TRACE( "provider for block %p completes asynchronously; cleanup follows delivery.\n", op->async );
+     }
+     LeaveCriticalSection( &async_ops_cs );
+     if (drop) release_async_op( op );
+@@ -258,15 +258,15 @@
+     struct x_async_op *op, *drop = NULL;
+     BOOL defer = FALSE;
+ 
+-    /* Failed operations have no result to consume. Keep the provider alive
+-     * through its worker and completion callback, then clean it up even when
+-     * the caller only reads status. The same ownership rule applies to Begin
+-     * and to a background provider failure. */
+-    if (FAILED(result))
++    /* A success with no payload, like a failure, needs no GetResult. Retaining
++     * these providers leaks their contexts and leaves XSAPI CleanupAsync
++     * waiting forever for HTTP operations that have already completed.
++     * Keep ownership through the worker and callback before Cleanup. */
++    if (FAILED(result) || !required_size)
+     {
+         BOOL deliver;
+         if (!(op = acquire_async_op( async ))) return;
+-        complete_provider_failure( op, result );
++        complete_without_result( op, result );
+         EnterCriticalSection( &async_ops_cs );
+         deliver = !op->begin_running && op->deliver_pending;
+         if (deliver) op->deliver_pending = FALSE;
+@@ -561,7 +561,7 @@
+      * the completion we accepted is still queued. An already completed
+      * operation keeps its first result. */
+     if (FAILED(hr) && hr != E_PENDING)
+-        complete_provider_failure( op, hr );
++        complete_without_result( op, hr );
+ 
+     EnterCriticalSection( &async_ops_cs );
+     op->begin_running = FALSE;
+@@ -622,13 +622,13 @@
+     if (!asyncBlock) return E_INVALIDARG;
+ 
+     EnterCriticalSection( &async_ops_cs );
+-    /* A failed Begin was detached because it needs no result read. Older
+-     * zero-payload operations can still be listed at this reused address;
+-     * none of them may replace the current block's recorded failure. */
++    /* Outcomes without a payload are detached after completion. Return the
++     * block's current status without finding an older operation at its address. */
+     if (asyncBlock->internal[0] == XGR_ASYNC_MAGIC &&
+-        asyncBlock->internal[2] == &failed_begin_marker)
++        asyncBlock->internal[2] == &no_result_marker)
+     {
+         hr = (HRESULT)(ULONG_PTR)asyncBlock->internal[1];
++        if (bufferUsed) *bufferUsed = 0;
+         LeaveCriticalSection( &async_ops_cs );
+         return hr;
+     }
