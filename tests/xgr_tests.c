@@ -195,6 +195,45 @@ static void test_xuser(void)
             hr = IXUserImpl6_XUserCheckPrivilege( u6, user, 0, XUserPrivilege_CrossPlay, &has, &reason );
             CHECK( SUCCEEDED( hr ) && has, "user holds the cross-play privilege" );
             CHECK( IXUserImpl6_XUserIsStoreUser( u6, user ), "user is a store user" );
+
+            /* The fixture returns ASCII token/signature strings over IPC. The
+             * UTF-16 entry point must return actual wide strings to the game. */
+            {
+                XAsyncBlock token_async = {0};
+                XUserGetTokenAndSignatureUtf16Data *wide = NULL;
+                XUserGetTokenAndSignatureData *narrow = NULL;
+                BYTE *buffer = malloc(512);
+                SIZE_T size = 0, used = 0;
+                SIZE_T expected = sizeof(*wide) + sizeof(L"fixture-auth") + sizeof(L"fixture-signature");
+
+                hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Async( u6, user, 0, L"GET",
+                        L"https://fixture.invalid/", 0, NULL, 0, NULL, &token_async );
+                CHECK( hr == S_OK, "UTF-16 token request starts" );
+                hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16ResultSize( u6, &token_async, &size );
+                CHECK( hr == S_OK && size == expected, "UTF-16 result size includes wide strings (%Iu)", size );
+                memset(buffer, 0x5a, 512);
+                hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Result( u6, &token_async, expected - 1,
+                        buffer, &wide, &used );
+                CHECK( hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && buffer[0] == 0x5a,
+                        "short UTF-16 buffer is rejected without writing" );
+                hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Result( u6, &token_async, 512,
+                        buffer, &wide, &used );
+                CHECK( hr == S_OK && wide == (void *)buffer && used == expected,
+                        "UTF-16 result reports the bytes written" );
+                CHECK( hr == S_OK && wide && wide->tokenCount == sizeof(L"fixture-auth") &&
+                        !memcmp(wide->token, L"fixture-auth", sizeof(L"fixture-auth")),
+                        "UTF-16 token is a terminated wide string with a byte count" );
+                CHECK( hr == S_OK && wide && wide->signatureCount == sizeof(L"fixture-signature") &&
+                        !memcmp(wide->signature, L"fixture-signature", sizeof(L"fixture-signature")),
+                        "UTF-16 signature is a terminated wide string with a byte count" );
+                CHECK( buffer[expected] == 0x5a, "UTF-16 result leaves the tail untouched" );
+                /* Retrieving the Unicode form must not corrupt the cached UTF-8 payload. */
+                hr = IXUserImpl6_XUserGetTokenAndSignatureResult( u6, &token_async, 512,
+                        buffer, &narrow, &used );
+                CHECK( hr == S_OK && narrow && !strcmp(narrow->token, "fixture-auth") &&
+                        !strcmp(narrow->signature, "fixture-signature"), "UTF-8 payload remains intact" );
+                free(buffer);
+            }
         }
         else CHECK( 0, "query IXUserImpl6" );
     }

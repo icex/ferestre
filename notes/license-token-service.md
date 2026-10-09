@@ -73,7 +73,31 @@ Existing service signer tests separately verify method/path/body/authorization
 binding and account/title/issuer isolation. The test-only fixture cannot mint
 real credentials; the shipped service cannot enable its fixture mode.
 
-These tests qualify the implementation and failure behavior. They do not prove
-that Microsoft's live endpoint accepts this authentication flow or that Minecraft
-Dungeons II is playable. Real-game testing is unavailable on the maintainer's
-current entitlement. No new compatibility/playability claim is added.
+## Live qualification (2026-10-10)
+
+Forza Horizon 5 received a real 1,894-byte licence token through the service in
+2.61 seconds, retrieved it through the DLL, and continued into the garage and
+free-roam driving. Acceleration, braking and the game's Exit to Desktop were
+exercised; the launcher returned zero and the test processes stopped. This is
+functional evidence, not a performance benchmark or independent JWT validation.
+
+Minecraft Dungeons II 1.1.2.0 was installed with a Game Pass Ultimate entitlement.
+Both the original PR #1 runtime and the initial PR #2 runtime stopped at login
+error 0063 before calling the licence API. Two additional runtime findings:
+
+- The UTF-16 user-token result API reinterpreted UTF-8 bytes as WCHAR strings.
+  Runtime patch 0020 converts the strings into the caller's buffer. The added
+  tests fail five assertions against the old DLL and pass against the fix
+  (188 checks total). This correction alone did not remove error 0063.
+- Microsoft's XCurl abandoned initialization when Wine rejected
+  `WINHTTP_OPTION_IPV6_FAST_FALLBACK` (140). Wine patch 0014 backports upstream
+  commit `cefdd9ebe60188f3f021d9eb85b0fe7df01ad13a`, with context adjusted for
+  the pinned tree. With the original XCurl and this backport, login proceeded,
+  the game requested a licence token for its three product IDs, received 1,894
+  bytes in 1.48 seconds, and reached first-run setup. No XCurl substitution is
+  needed for this observed path. The replacement experiment still gave 0063
+  and was reverted.
+
+Gameplay, save/relaunch and normal exit qualification are still in progress.
+The new release must include the matching service, runtime and WinHTTP backport.
+Private traces contain authentication material and must not be uploaded raw.
