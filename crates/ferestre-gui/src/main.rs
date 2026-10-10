@@ -305,6 +305,16 @@ fn build_ui(app: &adw::Application) {
 // --- rendering ------------------------------------------------------------
 
 fn render(ui: &Ui) {
+    // A clicked button keeps the focus, and every title action redraws the
+    // row it sits on. Destroying the focused widget makes GTK hand the focus to
+    // the first widget left in the rebuilt list after the next paint, and the
+    // viewport scrolls to the top to show it. Let go of the focus first, so the
+    // library stays where the person was looking. (Named trait calls: RootExt
+    // has a `focus` and `set_focus` of its own.)
+    let window = &ui.window;
+    if GtkWindowExt::focus(window).is_some_and(|focus| focus.is_ancestor(&ui.content)) {
+        GtkWindowExt::set_focus(window, None::<&gtk::Widget>);
+    }
     while let Some(child) = ui.content.first_child() {
         ui.content.remove(&child);
     }
@@ -489,6 +499,7 @@ fn draw_list(
     let installed_version = |r: &Recipe| model.installed_version(r);
     let installed_product = |id: &str| model.product_is_installed(id);
     let describes_itself = |id: &str| model.product_executable(id).is_some();
+    let game_dir = |r: &Recipe| model.game_dir(r);
     let inputs = Inputs {
         recipes: &model.recipes,
         runtime: model.runtime.as_ref(),
@@ -505,6 +516,7 @@ fn draw_list(
         product_describes_itself: &describes_itself,
         installing: &installing,
         running: &running,
+        game_dir: &game_dir,
     };
     // The Game Pass section is a different list, not a filter over the same
     // one: its rows come from a public catalogue listing rather than from what

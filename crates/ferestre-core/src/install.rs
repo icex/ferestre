@@ -389,14 +389,34 @@ pub fn installed_products(games_dir: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-fn store_id(install_dir: &Path) -> Option<String> {
-    // Microsoft has shipped both spellings. The package runs on Windows where
-    // they are equivalent, so recognising only one creates false installs.
-    let config = ["MicrosoftGame.config", "MicrosoftGame.Config"]
+/// The package's `MicrosoftGame.config`, whatever its case.
+///
+/// Microsoft has shipped both `.config` and `.Config`, and the package runs on
+/// Windows where every spelling is the same file, so recognising only some
+/// creates false answers. The two known spellings are tried first because they
+/// cost a stat each; anything else costs one directory listing.
+pub fn game_config(install_dir: &Path) -> Option<PathBuf> {
+    const NAME: &str = "MicrosoftGame.config";
+    ["MicrosoftGame.config", "MicrosoftGame.Config"]
         .iter()
         .map(|name| install_dir.join(name))
-        .find(|path| path.is_file())?;
-    let text = std::fs::read_to_string(config).ok()?;
+        .find(|path| path.is_file())
+        .or_else(|| {
+            std::fs::read_dir(install_dir)
+                .ok()?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.eq_ignore_ascii_case(NAME))
+                        && path.is_file()
+                })
+        })
+}
+
+fn store_id(install_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(game_config(install_dir)?).ok()?;
     let open = "<StoreId>";
     let start = text.find(open)? + open.len();
     let value = text[start..].split_once("</StoreId>")?.0.trim();
@@ -532,6 +552,16 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(dir.join(CONTAINER), b"header").expect("write");
         assert!(looks_installed(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_game_config_is_found_whatever_its_case() {
+        let dir = std::env::temp_dir().join(format!("ferestre-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert_eq!(game_config(&dir), None);
+        std::fs::write(dir.join("MICROSOFTGAME.CONFIG"), "<Game/>").expect("config");
+        assert_eq!(game_config(&dir), Some(dir.join("MICROSOFTGAME.CONFIG")));
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -282,6 +282,15 @@ impl Paths {
             .filter(|v| !v.is_empty())
     }
 
+    /// A variable exactly as the process had it, an empty value included.
+    ///
+    /// For the few settings where empty is an answer rather than an absence.
+    /// `VKD3D_CONFIG=` is how somebody says "no backend flags, not even the
+    /// ones you would infer", and [`Paths::var`] would read that as unset.
+    pub fn var_raw(&self, name: &str) -> Option<&str> {
+        self.vars.get(name).map(String::as_str)
+    }
+
     pub fn home(&self) -> &Path {
         &self.home
     }
@@ -619,6 +628,16 @@ summary = "Runs."
         let p = paths(&[("XODUS_GAMES_DIR", ""), ("XODUS_CLI_DIR", "")]);
         assert_eq!(p.games_dir(), Path::new("/home/tester/xbox-games"));
         assert_eq!(p.cli_dir(), None);
+    }
+
+    #[test]
+    fn an_empty_variable_is_still_present_when_presence_is_the_question() {
+        // A path variable set to "" means unset; a backend flag list set to ""
+        // means "none". The launcher has to be able to tell that from absent.
+        let p = paths(&[("VKD3D_CONFIG", "")]);
+        assert_eq!(p.var("VKD3D_CONFIG"), None);
+        assert_eq!(p.var_raw("VKD3D_CONFIG"), Some(""));
+        assert_eq!(p.var_raw("DXVK_CONFIG"), None);
     }
 
     #[test]

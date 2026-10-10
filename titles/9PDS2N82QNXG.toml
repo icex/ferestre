@@ -31,19 +31,30 @@ requires = [
     "xgameruntime.analytics-info",
     "xgameruntime.analytics-device-family",
     "xgameruntime.store-product-lifetime",
+    "xgameruntime.gamesave-interface4-legacy",
 ]
 
 [status]
 state = "playable-with-issues"
-summary = "Offline gameplay works, confirmed by the player. Online sign-in succeeds, but an online-enabled new-world loading test stalled; online co-op remains unqualified."
+summary = "Offline play saves and resumes across relaunches. Online-enabled play reaches the world but then stalls; quitting after a session leaves the process running."
 last-verified = 2026-10-10
-verified-with = "Game Pass package; player-confirmed offline gameplay; isolated online-enabled prefix signed in through Xbox/PlayFab and native Party initialization passed, but new-world loading stalled"
+verified-with = "Game Pass package; player-confirmed offline gameplay; automated clean-prefix runs: offline new save loads in about 30 s, autosaves, and the save reloads after relaunch with progress; the same steps with online features enabled loaded in about 3 minutes and then advanced only every few minutes"
 
 [[issues]]
-symptom = "A new San Angora save remained on the loading screen in the online-enabled isolated test"
-cause = "Not established. The loading run repeatedly requested an unsupported save interface, IID ab4ae4fb-6508-4950-a032-45fd4bf8c43b."
-fix = "Investigation paused. Compare offline and online-enabled loading under the same conditions, then verify the native save interface ABI if it remains implicated. Offline gameplay works; online co-op is unqualified."
+symptom = "Progress is not kept: after a relaunch every San Angora slot reads New Save"
+cause = "The game asks for the save interface IXGameSaveImpl4 (IID ab4ae4fb-6508-4950-a032-45fd4bf8c43b). Without it, it plays on but never writes a save."
+fix = "Update the runtime to one providing xgameruntime.gamesave-interface4-legacy. Saves made before that do not exist to recover; nothing was written."
 log-match = "ab4ae4fb-6508-4950-a032-45fd4bf8c43b"
+
+[[issues]]
+symptom = "With online features enabled, a world takes minutes to load and then barely advances or responds"
+cause = "Not established. The same steps with online features off run normally on the same runtime and prefix."
+fix = "Answer No to online mode, or switch to offline in Settings. Online play, peer joining and voice remain unqualified."
+
+[[issues]]
+symptom = "Quit Game closes the window but the process keeps running"
+cause = "Not established. Seen after playing a world, with online features off, on both the current and the previous runtime."
+fix = "Stop the title from the launcher after quitting. The save is already written by then."
 
 [[issues]]
 symptom = "Online sign-in reports unknown network error GS3-NF-2"

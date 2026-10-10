@@ -111,13 +111,17 @@ jobs:
       # The client is a submodule pinned at the commit the series targets.
       # The Proton submodule is not initialised: its Wine tree is too large
       # to clone per push, and the wine series stays a local check. The
-      # xgameruntime tree is small, so it is cloned into the place the
-      # submodule would put it.
+      # xgameruntime and vkd3d-proton trees are small enough, so they are
+      # cloned into the places the submodule would put them.
       - name: Fetch the repositories the patches target
         run: |
           git submodule update --init --quiet third_party/xodus-cli
           git clone --quiet https://github.com/xodus-gaming/xgameruntime \
             third_party/xodus-proton/wine/dlls/xgameruntime
+          # Without blobs: the history is needed to find the pinned base, but
+          # only that commit's files are ever read, and they arrive on demand.
+          git clone --quiet --filter=blob:none https://github.com/HansKristian-Work/vkd3d-proton \
+            third_party/xodus-proton/vkd3d-proton
 
       - name: Patches apply
         run: scripts/check-patches.sh
@@ -134,12 +138,11 @@ jobs:
 
       - name: Apply the client series and test the service offline
         run: |
-          git -C "$HOME/src/xodus-cli" checkout --detach 3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
           for patch in "$GITHUB_WORKSPACE"/patches/xodus-cli/*.patch; do
             case "$(basename "$patch")" in 0001-*) continue ;; esac
-            git -C "$HOME/src/xodus-cli" apply "$patch"
+            git -C third_party/xodus-cli apply "$patch"
           done
-          cd "$HOME/src/xodus-cli"
+          cd third_party/xodus-cli
           cargo test --locked -p xodus-service
 
   gui:

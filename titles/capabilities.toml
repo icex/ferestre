@@ -595,3 +595,22 @@ symptom-if-missing = "Goat Simulator 3 retains a pointer to expired stack data a
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "query-owned product" },
 ]
+
+[[capability]]
+name = "xgameruntime.gamesave-interface4-legacy"
+summary = "IXGameSaveImpl4 is exposed with its complete GDK 2510 layout, so legacy local save calls made through it keep their slots; its PlayFab cloud methods return E_NOTIMPL."
+provided-by = ["patches/xgameruntime/0027-expose-legacy-save-apis-through-the-complete-interface4.patch"]
+symptom-if-missing = "A title that asks for IXGameSaveImpl4 gets E_NOINTERFACE, and every save call after it fails; Retro Classics logs XGameSaveFilesGetFolderWithUiAsync failed with 0x80004002"
+# A string compiled into the DLL for this check, not a diagnostic's wording.
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "xgameruntime.gamesave-interface4-legacy" },
+]
+
+[[capability]]
+name = "d3d12.recording-allocator-lifetime"
+summary = "VKD3D_CONFIG=retain_recording_allocators keeps an allocator released while a command list records from it alive until the list's next Reset or destruction; without it the list is invalidated and Close fails."
+provided-by = ["patches/vkd3d-proton/0001-retain-retired-recording-allocators-for-engine-compatibility.patch"]
+symptom-if-missing = "An engine that releases an allocator mid-recording faults in vkEndCommandBuffer on a null command buffer when it closes the list"
+verify = [
+    { file = "files/lib/wine/vkd3d-proton/x86_64-windows/d3d12core.dll", contains = "retain_recording_allocators" },
+]

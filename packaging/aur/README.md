@@ -157,7 +157,7 @@ repacking to the release contract before publishing.
 
 After publishing the asset, update `pkgver`, run `updpkgsums` against the actual
 asset, and regenerate `.SRCINFO` with `makepkg --printsrcinfo`. Runtime
-11.0.20261010.1 has a recorded checksum; never publish an archive checksum of
+11.0.20261010.2 has a recorded checksum; never publish an archive checksum of
 `SKIP` to the AUR.
 
 ## Publishing

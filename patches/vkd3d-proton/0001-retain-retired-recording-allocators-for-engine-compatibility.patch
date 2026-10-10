@@ -1,0 +1,180 @@
+Subject: [PATCH] vkd3d: Optionally retain an allocator released while a list records
+
+Some engines release a command allocator while a list recorded from it is
+still open, then close and submit the list. The allocator owns the recording
+VkCommandBuffer, so the list was left pointing at freed state and Close ended
+a null VkCommandBuffer.
+
+By default, invalidate the list when its allocator goes away, so Close fails
+and ExecuteCommandLists refuses it, and report it once per list with the
+setting that avoids it. With VKD3D_CONFIG=retain_recording_allocators, the
+list instead holds one internal reference to that allocator until its next
+successful Reset onto another allocator or its destruction. Public COM
+reference counts are unchanged. Recording calls between the release and Close
+are still unprotected without the setting.
+
+diff --git a/include/private/config_flag_decl.h b/include/private/config_flag_decl.h
+index 338ef7a..a7f115b 100644
+--- a/include/private/config_flag_decl.h
++++ b/include/private/config_flag_decl.h
+@@ -24,6 +24,7 @@ VKD3D_DECL_CONFIG("pipeline_library_ignore_spirv", PIPELINE_LIBRARY_IGNORE_SPIRV
+ VKD3D_DECL_CONFIG("mutable_single_set", MUTABLE_SINGLE_SET)
+ VKD3D_DECL_CONFIG("memory_allocator_skip_clear", MEMORY_ALLOCATOR_SKIP_CLEAR)
+ VKD3D_DECL_CONFIG("recycle_command_pools", RECYCLE_COMMAND_POOLS)
++VKD3D_DECL_CONFIG("retain_recording_allocators", RETAIN_RECORDING_ALLOCATORS)
+ VKD3D_DECL_CONFIG("pipeline_library_ignore_mismatch_driver", PIPELINE_LIBRARY_IGNORE_MISMATCH_DRIVER)
+ VKD3D_DECL_CONFIG("breadcrumbs", BREADCRUMBS)
+ VKD3D_DECL_CONFIG("pipeline_library_app_cache", PIPELINE_LIBRARY_APP_CACHE_ONLY)
+diff --git a/include/private/config_flags.h b/include/private/config_flags.h
+index 1a6a462..772f367 100644
+--- a/include/private/config_flags.h
++++ b/include/private/config_flags.h
+@@ -31,7 +31,7 @@ struct vkd3d_config_flags_bitfield
+ 	 * we may end up with stray uninitialized bits which can subtly break bitwise operations later.
+ 	 * Adding more configs will cause the static assert below to fail,
+ 	 * which indicates the need to subtract a reserved bit. */
+-	uint32_t reserved0 : 26;
++	uint32_t reserved0 : 25;
+ };
+ 
+ STATIC_ASSERT(sizeof(struct vkd3d_config_flags_bitfield) == 12);
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 611e373..f4f6859 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -2816,6 +2816,21 @@ static void d3d12_command_list_allocator_destroyed(struct d3d12_command_list *li
+ {
+     TRACE("list %p.\n", list);
+ 
++    /* The allocator owns the recording VkCommandBuffer, which is gone with it.
++     * Leave the list closed and invalid, so Close fails instead of ending a null
++     * VkCommandBuffer, ExecuteCommandLists refuses it because it has no submit
++     * allocator, and Reset may start again. Recording calls made between the
++     * release and Close are not protected: they still reach the zeroed command
++     * state below. retain_recording_allocators avoids all of this by keeping
++     * the allocator alive (see d3d12_command_allocator_Release). */
++    if (list->is_recording && !list->reported_allocator_loss)
++    {
++        ERR("allocator released while command list %p was recording; list invalidated "
++                "(set VKD3D_CONFIG=retain_recording_allocators).\n", list);
++        list->reported_allocator_loss = true;
++    }
++    list->is_recording = false;
++    list->is_valid = false;
+     list->allocator = NULL;
+     list->submit_allocator = NULL;
+     memset(&list->cmd, 0, sizeof(list->cmd));
+@@ -3038,22 +3053,40 @@ static ULONG STDMETHODCALLTYPE d3d12_command_allocator_Release(ID3D12CommandAllo
+ {
+     struct d3d12_command_allocator *allocator = impl_from_ID3D12CommandAllocator(iface);
+     unsigned int refcount = InterlockedDecrement(&allocator->refcount);
+-    unsigned int pending;
++    unsigned int pending, retained = 0;
+ 
+     TRACE("%p decreasing refcount to %u.\n", allocator, refcount);
+ 
+     if (!refcount)
+     {
+         struct d3d12_device *device = allocator->device;
+-
++        struct d3d12_command_list *list = allocator->current_command_list;
++
++        /* Some engines release an allocator while a list is still recording from
++         * it, then Close the list. With retain_recording_allocators, the list
++         * takes one internal reference instead, so the recording VkCommandBuffer
++         * survives until the list's next successful Reset or its destruction.
++         * Public COM reference counts are unchanged, and only this one allocator
++         * per list is kept. */
++        if (VKD3D_CONFIG_FLAG_IS_SET(RETAIN_RECORDING_ALLOCATORS) &&
++                list && list->is_recording && !list->retained_recording_allocator)
++        {
++            FIXME_ONCE("Retaining allocator %p released while command list %p was recording.\n",
++                    allocator, list);
++            list->retained_recording_allocator = allocator;
++            d3d12_command_allocator_inc_ref(allocator);
++            retained = 1;
++        }
+         d3d_destruction_notifier_notify(&allocator->destruction_notifier);
+         pending = d3d12_command_allocator_dec_ref(allocator);
+ 
+-        /* If this does not go to zero, it means that there are still command lists in flight. */
+-        if (pending != 0)
++        /* Anything left beyond a retained list's reference is a submission still
++         * in flight. */
++        if (pending > retained)
+         {
+             ERR("Released all public references, but there are still %u pending command lists "
+-                "awaiting execution from command allocator iface %p! Deferring release.\n", pending, iface);
++                "awaiting execution from command allocator iface %p! Deferring release.\n",
++                pending - retained, iface);
+         }
+ 
+         d3d12_device_release(device);
+@@ -6730,6 +6763,25 @@ ULONG STDMETHODCALLTYPE d3d12_command_list_AddRef(d3d12_command_list_iface *ifac
+     return refcount;
+ }
+ 
++/* Drop the internal reference a list holds on a retired allocator, unless the
++ * list has just been reset onto that same allocator: an application may still
++ * Reset with the pointer it released, and the list then records into it again,
++ * so the lease is all that keeps it alive. A released allocator's public count
++ * cannot legitimately rise again, so identity is enough to tell. The lease ends
++ * at the next Reset onto anything else, or when the list is destroyed
++ * (next == NULL). */
++static void d3d12_command_list_release_retained_allocator(struct d3d12_command_list *list,
++        struct d3d12_command_allocator *next)
++{
++    struct d3d12_command_allocator *retired = list->retained_recording_allocator;
++
++    if (!retired || retired == next)
++        return;
++
++    list->retained_recording_allocator = NULL;
++    d3d12_command_allocator_dec_ref(retired);
++}
++
+ ULONG STDMETHODCALLTYPE d3d12_command_list_Release(d3d12_command_list_iface *iface)
+ {
+     struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
+@@ -6766,6 +6818,7 @@ ULONG STDMETHODCALLTYPE d3d12_command_list_Release(d3d12_command_list_iface *ifa
+         hash_map_free(&list->query_resolve_lut);
+         d3d12_command_list_free_rtas_batch(list);
+ 
++        d3d12_command_list_release_retained_allocator(list, NULL);
+         vkd3d_free_aligned(list);
+ 
+         d3d12_device_release(device);
+@@ -7391,6 +7444,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_Reset(d3d12_command_list_ifa
+     {
+         list->allocator = allocator_impl;
+         d3d12_command_list_reset_state(list, initial_pipeline_state);
++        d3d12_command_list_release_retained_allocator(list, allocator_impl);
+     }
+ 
+     return hr;
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 5f94cfc..f6f0dd9 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3362,6 +3362,8 @@ struct d3d12_command_list
+     bool is_valid;
+     bool debug_capture;
+     bool has_replaced_shaders;
++    /* Set once the list has reported losing its allocator mid-recording. */
++    bool reported_allocator_loss;
+ 
+     struct vkd3d_index_buffer index_buffer;
+     struct vkd3d_dgc_batch dgc_batch;
+@@ -3428,6 +3430,12 @@ struct d3d12_command_list
+ 
+     struct d3d12_command_allocator *allocator;
+     struct d3d12_command_allocator *submit_allocator;
++    /* With retain_recording_allocators, an allocator whose last public reference
++     * was released while this list recorded from it. Owns exactly one internal
++     * reference, dropped by d3d12_command_list_release_retained_allocator().
++     * Like the rest of the list, it relies on the application's external
++     * synchronization: D3D12 does not allow a list to be used from two threads. */
++    struct d3d12_command_allocator *retained_recording_allocator;
+     struct d3d12_device *device;
+ 
+     VkBuffer so_buffers[D3D12_SO_BUFFER_SLOT_COUNT];

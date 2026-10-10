@@ -276,10 +276,12 @@ impl Model {
     }
 
     pub fn is_installed(&self, recipe: &Recipe) -> bool {
-        self.paths
-            .as_ref()
-            .and_then(|p| p.install_dir(recipe).ok())
-            .is_some_and(|dir| dir.is_dir())
+        self.game_dir(recipe).is_some_and(|dir| dir.is_dir())
+    }
+
+    /// Where a title is, or would be, installed.
+    pub fn game_dir(&self, recipe: &Recipe) -> Option<PathBuf> {
+        self.paths.as_ref()?.install_dir(recipe).ok()
     }
 
     /// The version in the package manifest on disk, if the title is there.
