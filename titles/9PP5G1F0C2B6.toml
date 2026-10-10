@@ -1,120 +1,67 @@
-# Halo Infinite (Microsoft Store)
-#
-# Downloads, decrypts, and gets as far as EasyAntiCheat's own Linux path before
-# stopping. That is further than expected: EAC's Linux support is switched on
-# for this title's deployment, which is not true of every EAC game.
-#
-# The executable named in MicrosoftGame.Config is not the game. It is the
-# EasyAntiCheat bootstrapper, which reads Settings.json, validates the real
-# binary at game\HaloInfinite.exe, and only then starts it.
-#
-# WHAT WAS FIXED
-#
-# The bootstrapper opened game\HaloInfinite.exe, read all 83,673,088 bytes of
-# it and called GetBinaryTypeW. Both executables in this package are encrypted
-# on disk -- HaloInfinite.exe begins 15 78 and game\HaloInfinite.exe begins
-# d0 9a, neither of them MZ -- and the decrypted images existed only behind the
-# descriptors in WINE_DLL_FILE_MAP, which until now only the loader consulted.
-# So the check read ciphertext and the bootstrapper refused:
-#
-#   Launcher finished with: 201, 'Invalid game executable path!
-#   Z:\home\...\9pp5g1f0c2b6\game\HaloInfinite.exe.'
-#
-# -- naming a file that is plainly there. Windows has no such split: the
-# Store's filter driver decrypts on read, so anything that opens a package
-# executable sees a PE. patches/wine/0009 makes read-only opens of a mapped
-# image answer from its descriptor, and gives each handle a file offset of its
-# own so an 83 MB read does not leave the loader's next open at end of file.
-#
-# WHERE IT STOPS NOW, AND WHY
-#
-# With that in place the bootstrapper gets through its checks and runs EAC's
-# Linux path properly:
-#
-#   System name: 'linux64'.
-#   Loader initializing with bootstrapper version 1.9.3, architecture: x86-64.
-#   [Connection] Connecting to URL: https://modules-cdn.eac-prod.on.epicgames.com/
-#       modules/e48c1c0bfcb640b1b2e1ee4e54393182/673b2d583a024283b8a63d6347b2b078/linux64
-#   [Connection] Connect result: No error (0) Response Code: 200
-#   Starting Wine module mapping, Wine version: 11.0.
-#   Launcher finished with: 207, 'Failed to locate the game binary (Wine)'.
-#
-# It fetches its 9.7 MB linux64 module, maps it, and then cannot find the game
-# binary. Two milliseconds into "Starting Wine module mapping" it does this:
-#
-#   open("/proc/16452/maps", O_RDONLY) = 49
-#
-# and that is the whole answer. EasyAntiCheat locates the game binary by
-# looking for a mapping backed by it. Against a Steam install it finds
-# ".../HaloInfinite.exe" there, which is why the Steam build of this game runs
-# under Proton. Against ours it finds this:
-#
-#   140000000-140001000 r--p ... /memfd:xodus (deleted)
-#   140001000-14022a000 r-xp ... (anonymous, no name at all)
-#
-# The decrypted image only exists behind a descriptor, so the executable pages
-# are anonymous and the base carries a memfd name rather than a path. Nowhere
-# in /proc/<pid>/maps does the game's path appear.
-#
-# Naming the descriptor after the file it holds was worth trying and is not
-# enough: with "/memfd:HaloInfinite.exe (deleted)" in the map it still stops
-# with the same 207, so EAC is matching the path and not the leaf. That change
-# is kept anyway (patches/xodus-cli/0012) because it makes a process with
-# several images mapped legible while debugging.
-#
-# So no Wine-side change can answer this. patches/wine/0009 fixed everything
-# that goes through the file API; this does not. The image has to be mapped
-# from a real file at its real path, which means presenting the decrypted
-# bytes there -- a view over the install directory rather than plaintext
-# written to disk. That is a component this project does not have yet, and it
-# would fix any title that inspects its own mappings, not just this one.
-#
-# Two further walls are visible and neither has been reached: the multiplayer
-# side needs EAC to actually attach, and subgames\CampaignS1 ships a
-# start_protected_game.exe, which is a Denuvo launcher.
-
+# Halo Infinite -- Microsoft Store / Game Pass Ultimate.
+# Keep the package's EasyAntiCheat bootstrapper and original executable bytes.
+# Licensed images are visible at their installed paths only in a private tmpfs
+# mount namespace; the encrypted installation on disk is never rewritten.
 schema = 1
 
 [title]
-product-id       = "9PP5G1F0C2B6"
-name             = "Halo Infinite"
-slug             = "halo-infinite"
-publisher        = "Microsoft Studios"
+product-id = "9PP5G1F0C2B6"
+name = "Halo Infinite"
+slug = "halo-infinite"
+publisher = "Microsoft Studios"
 package-identity = "Microsoft.254428597CFE2"
-title-id         = "79C6D2A0"
+title-id = "79C6D2A0"
 
 [install]
-dir-env    = "HALO_INFINITE_DIR"
+dir-env = "HALO_INFINITE_DIR"
 prefix-env = "HALO_INFINITE_PREFIX"
 
 [launch]
-# The bootstrapper, as MicrosoftGame.Config declares it. Pointing this at
-# game\HaloInfinite.exe would skip EasyAntiCheat rather than satisfy it, which
-# is not a fix and would not survive contact with the game's own checks.
 executable = 'HaloInfinite.exe'
+env = { FERESTRE_IMAGE_VIEW = "real-path", XGR_STRICT_MANUAL_QUEUES = "1" }
 
 [runtime]
 requires = [
     "loader.memfd-main-image",
-    "loader.mapped-image-through-file-api",
+    "appmodel.package-identity",
+    "xgameruntime.user",
+    "xgameruntime.networking",
+    "xgameruntime.gamesave",
+    "xgameruntime.user-handle-result-size",
+    "xgameruntime.save-result-sizes",
+    "xgameruntime.manual-queue-thread-affinity",
 ]
 
+[[saves]]
+kind = "wgs"
+windows = '%LOCALAPPDATA%\Packages\Microsoft.254428597CFE2_8wekyb3d8bbwe\SystemAppData\wgs'
+prefix = 'drive_c/users/steamuser/AppData/Local/Packages/Microsoft.254428597CFE2_8wekyb3d8bbwe/SystemAppData/wgs'
+note = "Local campaign checkpoints and settings. Cloud synchronization has not been qualified."
+
 [status]
-state         = "broken"
-blocked-by    = "client-gap"
-summary       = "Gets through EasyAntiCheat's checks and into its Linux loader, which then cannot find the game binary: it looks in /proc/<pid>/maps, and a decrypted image mapped from a descriptor has no path there."
-stops-at      = "EasyAntiCheat bootstrapper exit 207, 'Failed to locate the game binary (Wine)', after 'Starting Wine module mapping, Wine version: 11.0'"
-last-verified = 2026-09-07
-verified-with = "ferestre run halo-infinite under strace -f -e trace=%file; the bootstrapper's own anticheatlauncher.log in the prefix; and /proc/<pid>/maps of the running process"
+state = "playable"
+summary = "Campaign, Academy training and multiplayer run; campaign save restoration was confirmed locally. Intermittent offline display remains under investigation."
+last-verified = 2026-10-10
+verified-with = "Game Pass Ultimate, package 1.4206.46191.0; live Warship Gbraakon gameplay, user-confirmed saving, campaign handoff/relaunch and clean process exit; 216 general and 46 manual-queue checks"
 
 [[issues]]
-symptom   = "the launcher window appears and reports an invalid game executable path, naming a file that exists"
-cause     = "the EasyAntiCheat bootstrapper validates game\\HaloInfinite.exe by reading it, and the bytes on disk are still XVC-encrypted; only the loader consulted WINE_DLL_FILE_MAP"
-fix       = "fixed by patches/wine/0009: a read-only open of a mapped image is served from its descriptor, with a file offset of its own"
-log-match = "Invalid game executable path"
-
-[[issues]]
-symptom   = "the launcher window appears, downloads for a moment, then stops with nothing started"
-cause     = "EasyAntiCheat reads /proc/<pid>/maps to find the game binary. The decrypted image is mapped from a memfd, so its executable pages are anonymous and its base is named /memfd:... rather than the game's path, and EAC finds nothing to match"
-fix       = "none in Wine: this never goes through the file API, so patches/wine/0009 cannot reach it, and naming the descriptor after the executable is not enough either (tried; still 207). It needs the image mapped from a real file at the real path -- a decrypting view over the install directory"
+symptom = "EasyAntiCheat reports Failed to locate the game binary (Wine)"
+cause = "Its Linux module looks for the installed executable path in /proc mappings; a memfd mapping has no matching file path."
+fix = "The real-path image view requires Python 3, util-linux and unprivileged user/mount namespaces. Update the launcher and runtime together."
 log-match = "Failed to locate the game binary"
+
+[[issues]]
+symptom = "Campaign aborts while loading with Thread not registered"
+cause = "Async work submitted to a Manual queue ran on an unrelated thread-pool thread."
+fix = "Use a runtime providing manual-queue-thread-affinity and this recipe's XGR_STRICT_MANUAL_QUEUES=1 setting."
+log-match = "Thread not registered"
+
+[[issues]]
+symptom = "The game sometimes displays the account as offline"
+cause = "Not established. Captured sign-in, presence, profile and session requests succeeded; the observed HTTP 400s were image requests."
+fix = "Under investigation; no proven workaround."
+
+[[issues]]
+symptom = "A startup dialog says the Microsoft Store and Xbox Live users differ"
+cause = "Microsoft Store account and purchase integration is incomplete in the replacement runtime."
+fix = "Dismiss the dialog to play. Real-money purchases are not qualified."

@@ -29,18 +29,30 @@ executable = 'Goat2\Binaries\WinGDK\Goat2-WinGDK-Shipping.exe'
 requires = [
     "loader.memfd-main-image",
     "xgameruntime.analytics-info",
+    "xgameruntime.analytics-device-family",
+    "xgameruntime.store-product-lifetime",
 ]
 
 [status]
-state   = "playable-with-issues"
-summary = "Boots and plays; online connectivity is being verified."
-last-verified = 2026-09-06
+state = "menus"
+stops-at = "San Angora world loading; menus and online sign-in succeeded"
+summary = "Menus and online sign-in work with the updated runtime; San Angora world loading remains stuck. Gameplay and co-op are not qualified on this build."
+last-verified = 2026-10-10
+verified-with = "Game Pass package, isolated prefix; Xbox/PlayFab sign-in and session requests succeeded, native Party initialization passed; world loading did not complete"
 
 [[issues]]
-symptom = "Online features do not work."
-cause = """
-The title polls the user state in a tight loop and never gets what it wants: one \
-run counted 27,932 XUserDuplicateHandle and 27,931 XUserCloseHandle calls beside \
-9,333 XUserGetId, which is a retry that never succeeds rather than a title doing \
-work. What it is waiting for has not been established."""
-fix = "none known"
+symptom = "Starting San Angora remains on the loading screen"
+cause = "Not established. The loading run repeatedly requested an unsupported save interface, IID ab4ae4fb-6508-4950-a032-45fd4bf8c43b."
+fix = "Investigation paused. Verify the native save interface ABI before implementing it; successful sign-in does not qualify world loading."
+log-match = "ab4ae4fb-6508-4950-a032-45fd4bf8c43b"
+
+[[issues]]
+symptom = "Online sign-in reports unknown network error GS3-NF-2"
+cause = "The runtime truncated Windows.Desktop to Windows, which the shipped PlayFab Party library did not recognize."
+fix = "Update the runtime to one providing analytics-device-family. Peer joining and voice remain untested."
+log-match = "GS3-NF-2"
+
+[[issues]]
+symptom = "The game crashes while processing owned Store products"
+cause = "Product callbacks received stack data that expired before the game finished using it."
+fix = "Update the runtime to one providing store-product-lifetime; product data now remains valid until its query handle closes."

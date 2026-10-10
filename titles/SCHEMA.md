@@ -61,7 +61,7 @@ Where the title and its prefix live, relative to `XODUS_GAMES_DIR`.
 |---|---|---|---|
 | `executable` | string | required | Backslash path **relative to the install directory**, as Windows writes it. Use a TOML literal string (single quotes) so backslashes stay backslashes. |
 | `arguments` | array of string | optional | |
-| `environment` | table | optional | Extra environment, on top of what the launcher sets for every title. Only put something here that is genuinely this title's. |
+| `env` (alias `environment`) | table | optional | Extra environment, on top of what the launcher sets for every title. Only put something here that is genuinely this title's. |
 
 The executable named in `MicrosoftGame.Config` is not always the one to run —
 Expedition 33 declares a wrapper — so this is the observed path, not a copy of

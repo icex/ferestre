@@ -236,7 +236,7 @@ jobs:
           The AppImage and tarball include the Xodus client. The patched Proton
           runtime is downloaded separately on first start and is released
           under \`runtime-*\` tags. Update both launcher and runtime for
-          Minecraft Dungeons II support.
+          Halo Infinite campaign support. See docs/RELEASE-0.1.5.md for the tested scope.
 
           You need to own the games. This downloads and runs what your own
           Microsoft account is licensed for, and nothing else.

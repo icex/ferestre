@@ -35,6 +35,7 @@ depends=(
   # python3 script and refuses the swap without it. Today this is satisfied only
   # as a side effect of ferestre-runtime-bin needing python for the proton script.
   'python'
+  'util-linux'             # private executable views use unshare/mount/umount
 )
 makedepends=('git' 'cargo')
 optdepends=(

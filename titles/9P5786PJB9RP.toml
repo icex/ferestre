@@ -34,7 +34,7 @@ wants = ["media.real-video"]
 kind = "wgs"
 windows = '%LOCALAPPDATA%\Packages\Microsoft.MinecraftDungeons2_8wekyb3d8bbwe\SystemAppData\wgs'
 prefix = 'drive_c/users/steamuser/AppData/Local/Packages/Microsoft.MinecraftDungeons2_8wekyb3d8bbwe/SystemAppData/wgs'
-note = "Local XGameSave containers; cloud synchronization and transfer to Windows have not been qualified."
+note = "Local XGameSave settings and authentication containers. Online hero data is also retrieved from Minecraft services; cross-platform transfer has not been qualified."
 
 [status]
 state = "playable"
@@ -52,3 +52,8 @@ log-match = "unimplemented option 140"
 symptom = "first launch asks for Visual C++ 2015-2022 (x64)"
 cause = "the new Wine prefix has not installed the game's bundled redistributable"
 fix = "accept the bootstrap's install prompt and finish the bundled installer, then launch again if necessary"
+
+[[issues]]
+symptom = "Quitting during the opening Squid Coast tutorial returns the player to its beginning"
+cause = "In the observed session, progression persisted after completing the tutorial; saving the local settings alone did not preserve the mid-tutorial position."
+fix = "Complete the opening tutorial before quitting. Post-tutorial saving was confirmed by the player on 2026-10-10."

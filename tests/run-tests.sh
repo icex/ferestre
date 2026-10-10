@@ -104,6 +104,11 @@ for _ in $(seq 1 100); do [ -f "$XDG_RUNTIME_DIR/ready" ] && break; sleep 0.1; d
 ( cd "$WORK" && timeout 180 "$WINE" "$WORK/xgr_tests.exe" ) 2>/dev/null | \
     grep -avE '^ntsync|radv is not|^wine:|wineserver' | tee "$WORK/out.txt"
 rc=${PIPESTATUS[0]}
+if [ "$rc" = 0 ]; then
+    ( cd "$WORK" && XGR_STRICT_MANUAL_QUEUES=1 timeout 30 "$WINE" "$WORK/xgr_tests.exe" --manual-queues ) 2>/dev/null | \
+        grep -avE '^ntsync|radv is not|^wine:|wineserver' | tee "$WORK/manual-out.txt"
+    rc=${PIPESTATUS[0]}
+fi
 kill -TERM "$FIXTURE_PID" 2>/dev/null
 wait "$FIXTURE_PID"
 fixture_rc=$?

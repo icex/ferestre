@@ -347,6 +347,24 @@ def main():
     # or write into one. It also means the run starts from the state a new user
     # has, which is the state most worth testing.
     home = tempfile.mkdtemp(prefix="ferestre-gui-smoke-")
+    recipes_dir = os.path.join(home, "titles")
+    shutil.copytree(os.path.join(os.getcwd(), "titles"), recipes_dir)
+    # A fixed fixture keeps this warning check independent of live compatibility.
+    with open(os.path.join(recipes_dir, "9ZZBROKEN001.toml"), "w") as f:
+        f.write('''schema = 1
+[title]
+product-id = "9ZZBROKEN001"
+name = "Smoke Test Broken Game"
+slug = "smoke-broken-game"
+[launch]
+executable = "Game.exe"
+[status]
+state = "broken"
+summary = "Synthetic failure fixture"
+stops-at = "Synthetic startup failure"
+blocked-by = "unknown"
+last-verified = 2026-10-10
+''')
     env = dict(os.environ)
     env.update(
         {
@@ -355,7 +373,7 @@ def main():
             "XDG_STATE_HOME": os.path.join(home, "state"),
             "XDG_CONFIG_HOME": os.path.join(home, "config"),
             "GTK_A11Y": "atspi",
-            "FERESTRE_TITLES": os.path.join(os.getcwd(), "titles"),
+            "FERESTRE_TITLES": recipes_dir,
             # Recipes come from the checkout, but nothing else should: no Steam,
             # no runtime, no client.
             "XODUS_GAMES_DIR": os.path.join(home, "games"),
@@ -378,10 +396,10 @@ def main():
         f.write("0 smoke-test-runtime\n")
     wanted = set()
     recipe_count = 0
-    for name in os.listdir(os.path.join(os.getcwd(), "titles")):
+    for name in os.listdir(recipes_dir):
         if not name.endswith(".toml") or name == "capabilities.toml":
             continue
-        with open(os.path.join(os.getcwd(), "titles", name), "rb") as f:
+        with open(os.path.join(recipes_dir, name), "rb") as f:
             recipe = tomllib.load(f)
         recipe_count += 1
         wanted |= set(recipe.get("runtime", {}).get("requires", []))
@@ -575,7 +593,7 @@ print(":: done", flush=True)
             frame,
         )
         check(
-            any("Forza Horizon 5" in label for label in labels),
+            any("Smoke Test Broken Game" in label for label in labels),
             "a broken title is listed rather than hidden",
             frame,
         )
