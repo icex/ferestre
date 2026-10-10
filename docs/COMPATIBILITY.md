@@ -35,10 +35,10 @@ real contribution even — especially — when the answer is that it does not ru
 **Before you paste anything: a session log contains your gamertag, your XUID and
 your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 
-Current release qualification: [0.1.5](RELEASE-0.1.5.md). Halo is playable,
-with an intermittent offline indicator still unresolved. Goat offline gameplay is player-confirmed. Its automated online-enabled
-new-world loading test stalled despite successful sign-in; online co-op remains
-unqualified.
+Current release qualification: [0.1.6](RELEASE-0.1.6.md). Retro Classics is
+playable (player-confirmed). Goat Simulator 3 saves and reloads offline progress
+on runtime 11.0.20261010.2; online-enabled play still stalls after loading. Halo
+is playable, with an intermittent offline indicator still unresolved.
 
 ## The matrix
 

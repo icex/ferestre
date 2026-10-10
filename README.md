@@ -61,8 +61,9 @@ Pronounced roughly *feh-RESS-treh*.
 
 ## Status
 
-Release **0.1.5** pairs with runtime **11.0.20261010.1**. Update both for Halo
-Infinite campaign support. See [release qualification](docs/RELEASE-0.1.5.md)
+Release **0.1.6** pairs with runtime **11.0.20261010.2**. Update both: the
+runtime adds Retro Classics, keeps Goat Simulator 3 saves, and carries everything
+0.1.5 added for Halo Infinite. See [release qualification](docs/RELEASE-0.1.6.md)
 for the tested scope and remaining gaps.
 
 Honest version, because this is early. Every row here was run on a real machine,
