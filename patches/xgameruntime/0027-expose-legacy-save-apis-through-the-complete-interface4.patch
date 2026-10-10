@@ -1,8 +1,17 @@
+Subject: [PATCH] Expose legacy save APIs through the complete IXGameSaveImpl4
+
+A title can ask for IXGameSaveImpl4 before its legacy XGameSave calls, and
+was answered E_NOINTERFACE. Implement the revision with its full fifty-slot
+layout, numbered as in the Microsoft.GDK.PC 2510.3.6286 XGameSave and
+PFXGameSave headers, so the inherited legacy methods keep their slots. The
+seventeen PFXGameSave methods fail with E_NOTIMPL: PlayFab cloud saves are not
+implemented, and none of them reports success.
+
 diff --git a/xgamesave.c b/xgamesave.c
-index a2b46d9..142a000 100644
+index a2b46d9..70d710f 100644
 --- a/xgamesave.c
 +++ b/xgamesave.c
-@@ -1605,27 +1605,28 @@ static HRESULT queue_op( struct XGameSaveUpdate *update, const char *blob_name,
+@@ -1605,27 +1605,37 @@ static HRESULT queue_op( struct XGameSaveUpdate *update, const char *blob_name,
  
  struct x_game_save
  {
@@ -19,6 +28,12 @@ index a2b46d9..142a000 100644
  }
  
 -static HRESULT WINAPI x_game_save_QueryInterface( IXGameSaveImpl3 *iface, REFIID iid, void **out )
++/* Ferestre's runtime capability check looks for this text in the built DLL
++ * (titles/capabilities.toml, xgameruntime.gamesave-interface4-legacy). It is
++ * referenced below rather than left unused, so no compiler or linker drops it,
++ * and it does not depend on the wording of any diagnostic. */
++static const char interface4_marker[] = "xgameruntime.gamesave-interface4-legacy";
++
 +static HRESULT WINAPI x_game_save_QueryInterface( IXGameSaveImpl4 *iface, REFIID iid, void **out )
  {
 -    struct x_game_save *impl = impl_from_IXGameSaveImpl3( iface );
@@ -26,6 +41,9 @@ index a2b46d9..142a000 100644
  
      TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
  
++    if (IsEqualGUID( iid, &IID_IXGameSaveImpl4 ))
++        TRACE( "%s: returning the complete interface; PlayFab methods fail.\n", interface4_marker );
++
      if (IsEqualGUID( iid, &IID_IUnknown        ) ||
          IsEqualGUID( iid, &IID_IXGameSaveImpl  ) ||
          IsEqualGUID( iid, &IID_IXGameSaveImpl2 ) ||
@@ -38,7 +56,7 @@ index a2b46d9..142a000 100644
          return S_OK;
      }
  
-@@ -1634,23 +1635,23 @@ static HRESULT WINAPI x_game_save_QueryInterface( IXGameSaveImpl3 *iface, REFIID
+@@ -1634,23 +1644,23 @@ static HRESULT WINAPI x_game_save_QueryInterface( IXGameSaveImpl3 *iface, REFIID
      return E_NOINTERFACE;
  }
  
@@ -67,7 +85,7 @@ index a2b46d9..142a000 100644
  {
      TRACE( "iface %p, requestingUser %p, configurationId %s, syncOnDemand %d, provider %p.\n", iface, requestingUser, debugstr_a( configurationId ), syncOnDemand, provider );
  
-@@ -1658,7 +1659,7 @@ static HRESULT WINAPI x_game_save_XGameSaveInitializeProvider( IXGameSaveImpl3 *
+@@ -1658,7 +1668,7 @@ static HRESULT WINAPI x_game_save_XGameSaveInitializeProvider( IXGameSaveImpl3 *
      return create_provider( requestingUser, configurationId, provider );
  }
  
@@ -76,7 +94,7 @@ index a2b46d9..142a000 100644
  {
      struct XGameSaveProvider *provider = NULL;
      HRESULT hr;
-@@ -1674,7 +1675,7 @@ static HRESULT WINAPI x_game_save_XGameSaveInitializeProviderAsync( IXGameSaveIm
+@@ -1674,7 +1684,7 @@ static HRESULT WINAPI x_game_save_XGameSaveInitializeProviderAsync( IXGameSaveIm
      return S_OK;
  }
  
@@ -85,7 +103,7 @@ index a2b46d9..142a000 100644
  {
      HRESULT hr;
      void *payload;
-@@ -1687,14 +1688,14 @@ static HRESULT WINAPI x_game_save_XGameSaveInitializeProviderResult( IXGameSaveI
+@@ -1687,14 +1697,14 @@ static HRESULT WINAPI x_game_save_XGameSaveInitializeProviderResult( IXGameSaveI
      return hr;
  }
  
@@ -102,7 +120,7 @@ index a2b46d9..142a000 100644
  {
      HRESULT hr;
  
-@@ -1707,7 +1708,7 @@ static HRESULT WINAPI x_game_save_XGameSaveGetRemainingQuota( IXGameSaveImpl3 *i
+@@ -1707,7 +1717,7 @@ static HRESULT WINAPI x_game_save_XGameSaveGetRemainingQuota( IXGameSaveImpl3 *i
      return hr;
  }
  
@@ -111,7 +129,7 @@ index a2b46d9..142a000 100644
  {
      INT64 *remaining;
      HRESULT hr;
-@@ -1726,7 +1727,7 @@ static HRESULT WINAPI x_game_save_XGameSaveGetRemainingQuotaAsync( IXGameSaveImp
+@@ -1726,7 +1736,7 @@ static HRESULT WINAPI x_game_save_XGameSaveGetRemainingQuotaAsync( IXGameSaveImp
      return S_OK;
  }
  
@@ -120,7 +138,7 @@ index a2b46d9..142a000 100644
  {
      INT64 *remaining;
      HRESULT hr;
-@@ -1743,7 +1744,7 @@ static HRESULT WINAPI x_game_save_XGameSaveGetRemainingQuotaResult( IXGameSaveIm
+@@ -1743,7 +1753,7 @@ static HRESULT WINAPI x_game_save_XGameSaveGetRemainingQuotaResult( IXGameSaveIm
      return S_OK;
  }
  
@@ -129,7 +147,7 @@ index a2b46d9..142a000 100644
  {
      HRESULT hr;
  
-@@ -1757,7 +1758,7 @@ static HRESULT WINAPI x_game_save_XGameSaveDeleteContainer( IXGameSaveImpl3 *ifa
+@@ -1757,7 +1767,7 @@ static HRESULT WINAPI x_game_save_XGameSaveDeleteContainer( IXGameSaveImpl3 *ifa
      return hr;
  }
  
@@ -138,7 +156,7 @@ index a2b46d9..142a000 100644
  {
      HRESULT hr;
  
-@@ -1769,7 +1770,7 @@ static HRESULT WINAPI x_game_save_XGameSaveDeleteContainerAsync( IXGameSaveImpl3
+@@ -1769,7 +1779,7 @@ static HRESULT WINAPI x_game_save_XGameSaveDeleteContainerAsync( IXGameSaveImpl3
      return S_OK;
  }
  
@@ -147,7 +165,7 @@ index a2b46d9..142a000 100644
  {
      HRESULT hr;
  
-@@ -1779,7 +1780,7 @@ static HRESULT WINAPI x_game_save_XGameSaveDeleteContainerResult( IXGameSaveImpl
+@@ -1779,7 +1789,7 @@ static HRESULT WINAPI x_game_save_XGameSaveDeleteContainerResult( IXGameSaveImpl
      return hr;
  }
  
@@ -156,7 +174,7 @@ index a2b46d9..142a000 100644
  {
      struct wgs_container *c;
      WCHAR *name;
-@@ -1839,21 +1840,21 @@ static HRESULT enumerate_containers( struct XGameSaveProvider *provider, const c
+@@ -1839,21 +1849,21 @@ static HRESULT enumerate_containers( struct XGameSaveProvider *provider, const c
      return hr;
  }
  
@@ -181,7 +199,7 @@ index a2b46d9..142a000 100644
  {
      struct XGameSaveContainer *container;
  
-@@ -1875,7 +1876,7 @@ static HRESULT WINAPI x_game_save_XGameSaveCreateContainer( IXGameSaveImpl3 *ifa
+@@ -1875,7 +1885,7 @@ static HRESULT WINAPI x_game_save_XGameSaveCreateContainer( IXGameSaveImpl3 *ifa
      return S_OK;
  }
  
@@ -190,7 +208,7 @@ index a2b46d9..142a000 100644
  {
      struct x_string_entry *e, *next;
  
-@@ -1943,21 +1944,21 @@ static HRESULT enumerate_blobs( struct XGameSaveContainer *container, const char
+@@ -1943,21 +1953,21 @@ static HRESULT enumerate_blobs( struct XGameSaveContainer *container, const char
      return hr;
  }
  
@@ -215,7 +233,7 @@ index a2b46d9..142a000 100644
  {
      HRESULT hr;
  
-@@ -1970,7 +1971,7 @@ static HRESULT WINAPI x_game_save_XGameSaveReadBlobData( IXGameSaveImpl3 *iface,
+@@ -1970,7 +1980,7 @@ static HRESULT WINAPI x_game_save_XGameSaveReadBlobData( IXGameSaveImpl3 *iface,
      return hr;
  }
  
@@ -224,7 +242,7 @@ index a2b46d9..142a000 100644
  {
      struct read_request *req;
      SIZE_T required = 0;
-@@ -2013,7 +2014,7 @@ static HRESULT WINAPI x_game_save_XGameSaveReadBlobDataAsync( IXGameSaveImpl3 *i
+@@ -2013,7 +2023,7 @@ static HRESULT WINAPI x_game_save_XGameSaveReadBlobDataAsync( IXGameSaveImpl3 *i
      return S_OK;
  }
  
@@ -233,7 +251,7 @@ index a2b46d9..142a000 100644
  {
      struct read_request *req;
      UINT32 n;
-@@ -2039,7 +2040,7 @@ static HRESULT WINAPI x_game_save_XGameSaveReadBlobDataResult( IXGameSaveImpl3 *
+@@ -2039,7 +2049,7 @@ static HRESULT WINAPI x_game_save_XGameSaveReadBlobDataResult( IXGameSaveImpl3 *
      return hr;
  }
  
@@ -242,7 +260,7 @@ index a2b46d9..142a000 100644
  {
      struct XGameSaveUpdate *update;
  
-@@ -2058,7 +2059,7 @@ static HRESULT WINAPI x_game_save_XGameSaveCreateUpdate( IXGameSaveImpl3 *iface,
+@@ -2058,7 +2068,7 @@ static HRESULT WINAPI x_game_save_XGameSaveCreateUpdate( IXGameSaveImpl3 *iface,
      return S_OK;
  }
  
@@ -251,7 +269,7 @@ index a2b46d9..142a000 100644
  {
      struct wgs_op *op, *next;
  
-@@ -2074,7 +2075,7 @@ static void WINAPI x_game_save_XGameSaveCloseUpdate( IXGameSaveImpl3 *iface, XGa
+@@ -2074,7 +2084,7 @@ static void WINAPI x_game_save_XGameSaveCloseUpdate( IXGameSaveImpl3 *iface, XGa
      free( context );
  }
  
@@ -260,7 +278,7 @@ index a2b46d9..142a000 100644
  {
      TRACE( "iface %p, updateContext %p, blobName %s, data %p, byteCount %Iu.\n", iface, updateContext, debugstr_a( blobName ), data, byteCount );
  
-@@ -2082,7 +2083,7 @@ static HRESULT WINAPI x_game_save_XGameSaveSubmitBlobWrite( IXGameSaveImpl3 *ifa
+@@ -2082,7 +2092,7 @@ static HRESULT WINAPI x_game_save_XGameSaveSubmitBlobWrite( IXGameSaveImpl3 *ifa
      return queue_op( updateContext, blobName, FALSE, data, byteCount );
  }
  
@@ -269,7 +287,7 @@ index a2b46d9..142a000 100644
  {
      TRACE( "iface %p, updateContext %p, blobName %s.\n", iface, updateContext, debugstr_a( blobName ) );
  
-@@ -2090,7 +2091,7 @@ static HRESULT WINAPI x_game_save_XGameSaveSubmitBlobDelete( IXGameSaveImpl3 *if
+@@ -2090,7 +2100,7 @@ static HRESULT WINAPI x_game_save_XGameSaveSubmitBlobDelete( IXGameSaveImpl3 *if
      return queue_op( updateContext, blobName, TRUE, NULL, 0 );
  }
  
@@ -278,7 +296,7 @@ index a2b46d9..142a000 100644
  {
      HRESULT hr;
  
-@@ -2103,7 +2104,7 @@ static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdate( IXGameSaveImpl3 *iface,
+@@ -2103,7 +2113,7 @@ static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdate( IXGameSaveImpl3 *iface,
      return hr;
  }
  
@@ -287,7 +305,7 @@ index a2b46d9..142a000 100644
  {
      HRESULT hr;
  
-@@ -2115,7 +2116,7 @@ static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdateAsync( IXGameSaveImpl3 *i
+@@ -2115,7 +2125,7 @@ static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdateAsync( IXGameSaveImpl3 *i
      return S_OK;
  }
  
@@ -296,7 +314,7 @@ index a2b46d9..142a000 100644
  {
      HRESULT hr;
  
-@@ -2127,7 +2128,7 @@ static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdateResult( IXGameSaveImpl3 *
+@@ -2127,7 +2137,7 @@ static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdateResult( IXGameSaveImpl3 *
  
  /* XGameSaveFiles: a plain folder the title reads and writes itself. It sits
   * inside the same per-user directory so everything for one title stays put. */
@@ -305,7 +323,7 @@ index a2b46d9..142a000 100644
  {
      struct XGameSaveProvider *provider;
      WCHAR *dir;
-@@ -2149,7 +2150,7 @@ static HRESULT WINAPI x_game_save_XGameSaveFilesGetFolderWithUiAsync( IXGameSave
+@@ -2149,7 +2159,7 @@ static HRESULT WINAPI x_game_save_XGameSaveFilesGetFolderWithUiAsync( IXGameSave
      return S_OK;
  }
  
@@ -314,7 +332,7 @@ index a2b46d9..142a000 100644
  {
      char *folder;
      SIZE_T len;
-@@ -2168,7 +2169,7 @@ static HRESULT WINAPI x_game_save_XGameSaveFilesGetFolderWithUiResult( IXGameSav
+@@ -2168,7 +2178,7 @@ static HRESULT WINAPI x_game_save_XGameSaveFilesGetFolderWithUiResult( IXGameSav
      return S_OK;
  }
  
@@ -323,13 +341,13 @@ index a2b46d9..142a000 100644
  {
      struct XGameSaveProvider *provider;
      HRESULT hr;
-@@ -2184,7 +2185,111 @@ static HRESULT WINAPI x_game_save_XGameSaveFilesGetRemainingQuota( IXGameSaveImp
+@@ -2184,7 +2194,111 @@ static HRESULT WINAPI x_game_save_XGameSaveFilesGetRemainingQuota( IXGameSaveImp
      return S_OK;
  }
  
 -static const struct IXGameSaveImpl3Vtbl x_game_save_vtbl =
-+/* The interface revision is shared by legacy and PlayFab save APIs. Keep its
-+ * complete ABI while rejecting unsupported cloud operations explicitly. */
++/* The PlayFab half of IXGameSaveImpl4. Each method fails with E_NOTIMPL rather
++ * than reporting success, so a title never believes a cloud save happened. */
 +static HRESULT WINAPI x_game_save_PFXGameSaveInitializeConfig( IXGameSaveImpl4 *iface, struct PFXGameSaveConfigRequest *request, PFXGameSaveConfigHandle *config )
 +{
 +    FIXME( "PFXGameSaveInitializeConfig: PlayFab cloud saves are unsupported.\n" );
@@ -436,7 +454,7 @@ index a2b46d9..142a000 100644
  {
      x_game_save_QueryInterface,
      x_game_save_AddRef,
-@@ -2221,6 +2326,23 @@ static const struct IXGameSaveImpl3Vtbl x_game_save_vtbl =
+@@ -2221,6 +2335,23 @@ static const struct IXGameSaveImpl3Vtbl x_game_save_vtbl =
      x_game_save_XGameSaveFilesGetFolderWithUiAsync,
      x_game_save_XGameSaveFilesGetFolderWithUiResult,
      x_game_save_XGameSaveFilesGetRemainingQuota,
@@ -460,23 +478,26 @@ index a2b46d9..142a000 100644
  };
  
  static struct x_game_save x_game_save =
-@@ -2229,4 +2351,4 @@ static struct x_game_save x_game_save =
+@@ -2229,4 +2360,4 @@ static struct x_game_save x_game_save =
      0,
  };
  
 -IXGameSaveImpl *x_game_save_impl = (IXGameSaveImpl *)&x_game_save.IXGameSaveImpl3_iface;
 +IXGameSaveImpl *x_game_save_impl = (IXGameSaveImpl *)&x_game_save.IXGameSaveImpl4_iface;
 diff --git a/xgamesave.idl b/xgamesave.idl
-index e065e10..6309f7f 100644
+index e065e10..dd904d9 100644
 --- a/xgamesave.idl
 +++ b/xgamesave.idl
-@@ -118,12 +118,45 @@ interface IXGameSaveImpl3 : IXGameSaveImpl2
+@@ -118,12 +118,48 @@ interface IXGameSaveImpl3 : IXGameSaveImpl2
  {
  }
  
-+/* GDK 2504+ queries this revision for legacy save calls as well. Keep the
-+ * complete PFXGameSave tail from the public Microsoft GDK 2510 ABI, even
-+ * though PlayFab cloud storage itself is unsupported. */
++/* IXGameSaveImpl4 appends the PFXGameSave methods. Slot numbers follow the
++ * Microsoft.GDK.PC 2510.3.6286 XGameSave/PFXGameSave headers: the methods
++ * inherited from IXGameSaveImpl3 keep slots 3-32, and the seventeen PFXGameSave
++ * methods take slots 33-49. A title may ask for this revision before its legacy
++ * save calls, so the complete layout is exposed even though PlayFab cloud
++ * storage itself is unsupported. */
 +typedef struct PFXGameSaveConfig *PFXGameSaveConfigHandle;
 +struct PFXGameSaveConfigRequest;
 +struct PFXGameSaveUiCallbacks;

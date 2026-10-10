@@ -26,6 +26,7 @@
 #define COBJMACROS
 #include <windows.h>
 #include <initguid.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,10 @@
 #include "xsystem.h"
 #include "xnetworking.h"
 #include "xasyncprovider.h"
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#endif
 
 #define E_GS_INVALID_CONTAINER_NAME    ((HRESULT)0x80830001L)
 #define E_GS_PROVIDED_BUFFER_TOO_SMALL ((HRESULT)0x80830007L)
@@ -1334,76 +1339,166 @@ static void test_manual_queues(void)
     IXThreadingImpl_XTaskQueueCloseHandle( threading, parent );
 }
 
+/* Slots of IXGameSaveImpl4 as numbered in the Microsoft.GDK.PC 2510.3.6286
+ * XGameSave and PFXGameSave headers, written out by hand so that a method
+ * added, dropped or reordered in xgamesave.idl fails here instead of calling
+ * the wrong function in a title. */
+static const struct
+{
+    const char *name;
+    size_t offset;
+    unsigned int slot;
+} gamesave4_slots[] =
+{
+    { "XGameSaveInitializeProvider", offsetof( IXGameSaveImpl4Vtbl, XGameSaveInitializeProvider ), 3 },
+    { "XGameSaveSubmitUpdateResult", offsetof( IXGameSaveImpl4Vtbl, XGameSaveSubmitUpdateResult ), 29 },
+    { "XGameSaveFilesGetFolderWithUiAsync", offsetof( IXGameSaveImpl4Vtbl, XGameSaveFilesGetFolderWithUiAsync ), 30 },
+    { "XGameSaveFilesGetFolderWithUiResult", offsetof( IXGameSaveImpl4Vtbl, XGameSaveFilesGetFolderWithUiResult ), 31 },
+    { "XGameSaveFilesGetRemainingQuota", offsetof( IXGameSaveImpl4Vtbl, XGameSaveFilesGetRemainingQuota ), 32 },
+    { "PFXGameSaveInitializeConfig", offsetof( IXGameSaveImpl4Vtbl, PFXGameSaveInitializeConfig ), 33 },
+    { "PFXGameSaveSetActiveDeviceChangedCallback", offsetof( IXGameSaveImpl4Vtbl, PFXGameSaveSetActiveDeviceChangedCallback ), 49 },
+};
+
 static void test_gamesave_interface4( const char *scid )
 {
-    IXGameSaveImpl4 *modern = NULL;
-    IXGameSaveImpl3 *legacy = NULL;
-    PFXGameSaveConfigHandle config = (PFXGameSaveConfigHandle)0x1234;
+    static const char payload[] = "saved through IXGameSaveImpl4";
     XGameSaveProviderHandle provider = NULL;
-    XAsyncBlock async = {0};
-    SIZE_T size = 0;
-    INT64 quota = -1;
-    UINT32 state = 0;
+    XGameSaveContainerHandle container = NULL;
+    XGameSaveUpdateHandle update = NULL;
+    PFXGameSaveConfigHandle config = (PFXGameSaveConfigHandle)0x1234;
+    IXGameSaveImpl4 *modern = NULL, *again = NULL;
+    IXGameSaveImpl3 *legacy = NULL;
+    IUnknown *unknown = NULL;
+    XAsyncBlock async = { 0 };
+    XGameSaveBlob *blobs;
+    UINT32 count, state = 0;
     UINT64 current = 0, total = 0;
-    char *folder = NULL, filename[MAX_PATH], readback[8] = {0};
-    HANDLE file;
-    DWORD written = 0, read = 0;
+    INT64 quota = -1;
+    SIZE_T size = 0;
+    char *folder;
+    unsigned int i;
     HRESULT hr;
 
-    printf("# Modern SDK save interface: legacy APIs and explicit cloud failure\n");
-    hr = g_query(&CLSID_XGameSaveImpl, &IID_IXGameSaveImpl4, (void **)&modern);
-    CHECK(SUCCEEDED(hr) && modern, "new save interface is available (%#lx)", hr);
+    printf( "# XGameSave through IXGameSaveImpl4\n" );
+
+    hr = g_query( &CLSID_XGameSaveImpl, &IID_IXGameSaveImpl4, (void **)&modern );
+    CHECK( SUCCEEDED(hr) && modern, "IXGameSaveImpl4 is available (0x%08lx)", hr );
     if (!modern) return;
-    CHECK(sizeof(IXGameSaveImpl4Vtbl) == 50 * sizeof(void *), "full GDK 2510 fifty-slot vtable");
-    hr = IXGameSaveImpl4_QueryInterface(modern, &IID_IXGameSaveImpl3, (void **)&legacy);
-    CHECK(SUCCEEDED(hr) && (void *)legacy == (void *)modern, "legacy interface identity is preserved");
-    if (legacy) IXGameSaveImpl3_Release(legacy);
-    hr = IXGameSaveImpl4_XGameSaveInitializeProvider(modern, user, scid, FALSE, &provider);
-    CHECK(SUCCEEDED(hr) && provider, "classic provider opens through new IID (%#lx)", hr);
-    if (provider) {
-        hr = IXGameSaveImpl4_XGameSaveGetRemainingQuota(modern, provider, &quota);
-        CHECK(SUCCEEDED(hr) && quota > 0, "classic quota uses the correct slot");
-        IXGameSaveImpl4_XGameSaveCloseProvider(modern, provider);
+
+    CHECK( sizeof(IXGameSaveImpl4Vtbl) == 50 * sizeof(void *), "the vtable has fifty slots (%Iu)",
+           sizeof(IXGameSaveImpl4Vtbl) / sizeof(void *) );
+    for (i = 0; i < ARRAY_SIZE(gamesave4_slots); i++)
+        CHECK( gamesave4_slots[i].offset == gamesave4_slots[i].slot * sizeof(void *), "%s is slot %u (%Iu)",
+               gamesave4_slots[i].name, gamesave4_slots[i].slot, gamesave4_slots[i].offset / sizeof(void *) );
+
+    hr = IXGameSaveImpl4_QueryInterface( modern, &IID_IXGameSaveImpl3, (void **)&legacy );
+    CHECK( SUCCEEDED(hr) && (void *)legacy == (void *)modern, "IXGameSaveImpl3 is the same object" );
+    if (legacy)
+    {
+        hr = IXGameSaveImpl3_QueryInterface( legacy, &IID_IXGameSaveImpl4, (void **)&again );
+        CHECK( SUCCEEDED(hr) && again == modern, "IXGameSaveImpl3 answers IXGameSaveImpl4 with the same object" );
+        if (again) IXGameSaveImpl4_Release( again );
+        IXGameSaveImpl3_Release( legacy );
     }
-    hr = IXGameSaveImpl4_XGameSaveFilesGetFolderWithUiAsync(modern, user, scid, &async);
-    CHECK(SUCCEEDED(hr), "legacy Files API starts through new IID (%#lx)",hr);
-    hr = IXThreadingImpl_XAsyncGetResultSize(threading,&async,&size);
-    CHECK(SUCCEEDED(hr) && size > 1 && size < MAX_PATH,"Files result publishes its actual size");
-    if (size > 1 && size < MAX_PATH) {
-        folder = malloc(size);
-        hr = IXGameSaveImpl4_XGameSaveFilesGetFolderWithUiResult(modern,&async,size,folder);
-        CHECK(SUCCEEDED(hr) && strlen(folder)+1 == size,"Files result returns a terminated Windows path");
-        if (SUCCEEDED(hr)) {
-            snprintf(filename,sizeof(filename),"%s\\interface4-test.dat",folder);
-            file=CreateFileA(filename,GENERIC_WRITE|GENERIC_READ,0,NULL,CREATE_ALWAYS,0,NULL);
-            CHECK(file != INVALID_HANDLE_VALUE,"returned folder accepts ordinary Win32 file IO");
-            if(file != INVALID_HANDLE_VALUE) {
-                CHECK(WriteFile(file,"saved",6,&written,NULL) && written==6,"write save content");
-                SetFilePointer(file,0,NULL,FILE_BEGIN);
-                CHECK(ReadFile(file,readback,6,&read,NULL) && read==6 && !memcmp(readback,"saved",6),"read saved content back");
-                CloseHandle(file); DeleteFileA(filename);
-            }
+    hr = IXGameSaveImpl4_QueryInterface( modern, &IID_IUnknown, (void **)&unknown );
+    CHECK( SUCCEEDED(hr) && (void *)unknown == (void *)modern, "IUnknown is the same object" );
+    if (unknown)
+    {
+        again = NULL;
+        hr = IUnknown_QueryInterface( unknown, &IID_IXGameSaveImpl4, (void **)&again );
+        CHECK( SUCCEEDED(hr) && again == modern, "IUnknown answers IXGameSaveImpl4 with the same object" );
+        if (again) IXGameSaveImpl4_Release( again );
+        IUnknown_Release( unknown );
+    }
+
+    /* A legacy round trip, every call through the new interface. */
+    hr = IXGameSaveImpl4_XGameSaveInitializeProvider( modern, user, scid, FALSE, &provider );
+    CHECK( SUCCEEDED(hr) && provider, "InitializeProvider succeeds through IXGameSaveImpl4 (0x%08lx)", hr );
+    if (provider)
+    {
+        hr = IXGameSaveImpl4_XGameSaveGetRemainingQuota( modern, provider, &quota );
+        CHECK( SUCCEEDED(hr) && quota > 0, "GetRemainingQuota reaches its slot (0x%08lx)", hr );
+        hr = IXGameSaveImpl4_XGameSaveCreateContainer( modern, provider, "interface4_container", &container );
+        CHECK( SUCCEEDED(hr) && container, "CreateContainer succeeds (0x%08lx)", hr );
+    }
+    if (container)
+    {
+        hr = IXGameSaveImpl4_XGameSaveCreateUpdate( modern, container, "Interface 4", &update );
+        CHECK( SUCCEEDED(hr), "CreateUpdate succeeds (0x%08lx)", hr );
+        hr = IXGameSaveImpl4_XGameSaveSubmitBlobWrite( modern, update, BLOB_NAME, (UINT8 *)payload, sizeof(payload) );
+        CHECK( SUCCEEDED(hr), "SubmitBlobWrite succeeds (0x%08lx)", hr );
+        hr = IXGameSaveImpl4_XGameSaveSubmitUpdate( modern, update );
+        CHECK( SUCCEEDED(hr), "SubmitUpdate succeeds (0x%08lx)", hr );
+        IXGameSaveImpl4_XGameSaveCloseUpdate( modern, update );
+
+        size = sizeof(XGameSaveBlob) + sizeof(payload) + 64;
+        blobs = malloc( size );
+        CHECK( blobs != NULL, "allocated the read buffer" );
+        if (blobs)
+        {
+            count = 1;
+            hr = IXGameSaveImpl4_XGameSaveReadBlobData( modern, container, NULL, &count, size, blobs );
+            CHECK( SUCCEEDED(hr) && count == 1 && blobs[0].info.size == sizeof(payload) &&
+                   !memcmp( blobs[0].data, payload, sizeof(payload) ),
+                   "ReadBlobData returns what was written (0x%08lx, %u)", hr, count );
+            free( blobs );
         }
-        free(folder);
+        IXGameSaveImpl4_XGameSaveCloseContainer( modern, container );
+        hr = IXGameSaveImpl4_XGameSaveDeleteContainer( modern, provider, "interface4_container" );
+        CHECK( SUCCEEDED(hr), "DeleteContainer succeeds (0x%08lx)", hr );
     }
-    CHECK(IXGameSaveImpl4_PFXGameSaveInitializeConfig(modern,NULL,&config)==E_NOTIMPL && !config,"cloud config refuses support and clears its output");
-    IXGameSaveImpl4_PFXGameSaveFreeConfig(modern,NULL);
-    CHECK(IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiAsync(modern,NULL,&async)==E_NOTIMPL,"cloud folder does not fake async success");
-    CHECK(IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult(modern,&async,0,NULL)==E_NOTIMPL,"cloud result remains unsupported");
-    CHECK(IXGameSaveImpl4_PFXGameSaveFilesGetRemainingQuota(modern,NULL,&quota)==E_NOTIMPL,"cloud quota remains unsupported");
-    CHECK(IXGameSaveImpl4_PFXGameSaveSetUiCallbacks(modern,NULL)==E_NOTIMPL,"cloud UI callbacks are not falsely registered");
-    CHECK(IXGameSaveImpl4_PFXGameSaveProgressUiGetProgress(modern,user,&state,&current,&total)==E_NOTIMPL,"cloud sync is not reported complete");
-    CHECK(IXGameSaveImpl4_PFXGameSaveSetProgressUiResponse(modern,user,0)==E_NOTIMPL,"progress response ABI slot");
-    CHECK(IXGameSaveImpl4_PFXGameSaveSetSyncFailedUiResponse(modern,user,0)==E_NOTIMPL,"sync response ABI slot");
-    CHECK(IXGameSaveImpl4_PFXGameSaveSetActiveDeviceContentionUiResponse(modern,user,0)==E_NOTIMPL,"device contention ABI slot");
-    CHECK(IXGameSaveImpl4_PFXGameSaveSetConflictUiResponse(modern,user,0)==E_NOTIMPL,"conflict response ABI slot");
-    CHECK(IXGameSaveImpl4_PFXGameSaveSetOutOfStorageUiResponse(modern,user,0)==E_NOTIMPL,"storage response ABI slot");
-    CHECK(IXGameSaveImpl4_PFXGameSaveFilesUploadWithUiAsync(modern,NULL,0,&async)==E_NOTIMPL,"upload does not fake success");
-    CHECK(IXGameSaveImpl4_PFXGameSaveFilesUploadWithUiResult(modern,&async)==E_NOTIMPL,"upload result remains unsupported");
-    CHECK(IXGameSaveImpl4_PFXGameSaveFilesSetSaveDescriptionAsync(modern,NULL,"test",&async)==E_NOTIMPL,"cloud description remains unsupported");
-    CHECK(IXGameSaveImpl4_PFXGameSaveFilesSetSaveDescriptionResult(modern,&async)==E_NOTIMPL,"description result ABI slot");
-    CHECK(IXGameSaveImpl4_PFXGameSaveSetActiveDeviceChangedCallback(modern,NULL,NULL)==E_NOTIMPL,"device callback ABI slot");
-    IXGameSaveImpl4_Release(modern);
+    if (provider) IXGameSaveImpl4_XGameSaveCloseProvider( modern, provider );
+
+    /* XGameSaveFiles: slots 30 and 31, with a real wait before the size. */
+    hr = IXGameSaveImpl4_XGameSaveFilesGetFolderWithUiAsync( modern, user, scid, &async );
+    CHECK( SUCCEEDED(hr), "FilesGetFolderWithUiAsync starts (0x%08lx)", hr );
+    hr = IXThreadingImpl_XAsyncGetStatus( threading, &async, TRUE );
+    CHECK( SUCCEEDED(hr), "FilesGetFolderWithUiAsync completes (0x%08lx)", hr );
+    size = 0;
+    hr = IXThreadingImpl_XAsyncGetResultSize( threading, &async, &size );
+    CHECK( SUCCEEDED(hr) && size > 1 && size < MAX_PATH, "the folder result has a plausible size (%Iu)", size );
+    if (SUCCEEDED(hr) && size > 1 && size < MAX_PATH)
+    {
+        folder = malloc( size );
+        CHECK( folder != NULL, "allocated the folder buffer" );
+        if (folder)
+        {
+            hr = IXGameSaveImpl4_XGameSaveFilesGetFolderWithUiResult( modern, &async, size, folder );
+            CHECK( SUCCEEDED(hr) && strlen( folder ) + 1 == size, "the folder is a terminated path (0x%08lx)", hr );
+            free( folder );
+        }
+    }
+
+    /* PlayFab cloud saves: every method fails, none fakes success. */
+    memset( &async, 0, sizeof(async) );
+    hr = IXGameSaveImpl4_PFXGameSaveInitializeConfig( modern, NULL, &config );
+    CHECK( hr == E_NOTIMPL && !config, "PFXGameSaveInitializeConfig fails and clears its output (0x%08lx)", hr );
+    IXGameSaveImpl4_PFXGameSaveFreeConfig( modern, NULL );
+    {
+        const struct { const char *name; HRESULT hr; } cloud[] =
+        {
+            { "PFXGameSaveFilesGetFolderWithUiAsync", IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiAsync( modern, NULL, &async ) },
+            { "PFXGameSaveFilesGetFolderWithUiResult", IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult( modern, &async, 0, NULL ) },
+            { "PFXGameSaveFilesGetRemainingQuota", IXGameSaveImpl4_PFXGameSaveFilesGetRemainingQuota( modern, NULL, &quota ) },
+            { "PFXGameSaveSetUiCallbacks", IXGameSaveImpl4_PFXGameSaveSetUiCallbacks( modern, NULL ) },
+            { "PFXGameSaveProgressUiGetProgress", IXGameSaveImpl4_PFXGameSaveProgressUiGetProgress( modern, user, &state, &current, &total ) },
+            { "PFXGameSaveSetProgressUiResponse", IXGameSaveImpl4_PFXGameSaveSetProgressUiResponse( modern, user, 0 ) },
+            { "PFXGameSaveSetSyncFailedUiResponse", IXGameSaveImpl4_PFXGameSaveSetSyncFailedUiResponse( modern, user, 0 ) },
+            { "PFXGameSaveSetActiveDeviceContentionUiResponse", IXGameSaveImpl4_PFXGameSaveSetActiveDeviceContentionUiResponse( modern, user, 0 ) },
+            { "PFXGameSaveSetConflictUiResponse", IXGameSaveImpl4_PFXGameSaveSetConflictUiResponse( modern, user, 0 ) },
+            { "PFXGameSaveSetOutOfStorageUiResponse", IXGameSaveImpl4_PFXGameSaveSetOutOfStorageUiResponse( modern, user, 0 ) },
+            { "PFXGameSaveFilesUploadWithUiAsync", IXGameSaveImpl4_PFXGameSaveFilesUploadWithUiAsync( modern, NULL, 0, &async ) },
+            { "PFXGameSaveFilesUploadWithUiResult", IXGameSaveImpl4_PFXGameSaveFilesUploadWithUiResult( modern, &async ) },
+            { "PFXGameSaveFilesSetSaveDescriptionAsync", IXGameSaveImpl4_PFXGameSaveFilesSetSaveDescriptionAsync( modern, NULL, "test", &async ) },
+            { "PFXGameSaveFilesSetSaveDescriptionResult", IXGameSaveImpl4_PFXGameSaveFilesSetSaveDescriptionResult( modern, &async ) },
+            { "PFXGameSaveSetActiveDeviceChangedCallback", IXGameSaveImpl4_PFXGameSaveSetActiveDeviceChangedCallback( modern, NULL, NULL ) },
+        };
+
+        for (i = 0; i < ARRAY_SIZE(cloud); i++)
+            CHECK( cloud[i].hr == E_NOTIMPL, "%s returns E_NOTIMPL (0x%08lx)", cloud[i].name, cloud[i].hr );
+    }
+
+    IXGameSaveImpl4_Release( modern );
 }
 
 int main(int argc, char **argv)
