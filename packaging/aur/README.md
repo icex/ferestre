@@ -8,7 +8,7 @@ by a compatibility tool showing up in `compatibilitytools.d`.
 
 | package | what it is | size | changes when |
 |---|---|---|---|
-| [`ferestre-runtime-bin`](ferestre-runtime-bin/) | the patched Proton, prebuilt, into `/usr/share/steam/compatibilitytools.d/ferestre` | ~264 MiB download, ~1.4 GB installed | Wine or `xgameruntime.dll` changes |
+| [`ferestre-runtime-bin`](ferestre-runtime-bin/) | the patched Proton, prebuilt, into `/usr/share/steam/compatibilitytools.d/ferestre` | ~344 MiB download, ~1.4 GB installed | Wine or `xgameruntime.dll` changes |
 | [`ferestre-client`](ferestre-client/) | the Xodus client with our patches: `xodus-cli`, `xodus-service` | ~15 MB | the fork rebases |
 | [`ferestre-git`](ferestre-git/) | the front end: `ferestre`, the launch scripts, the docs | ~400 KB | constantly |
 
@@ -20,7 +20,7 @@ the rest.
 ### Why not one package
 
 Three release trains with wildly different sizes and cadences. A single package
-would mean a 264 MiB download to fix a typo in a shell script, and a full
+would mean a runtime download to fix a typo in a shell script, and a full
 container build of Wine to change a dependency. The roadmap already treats them
 as three, for the same reason.
 
@@ -137,10 +137,10 @@ moment to decide whether to ship the 32-bit tree at all.
 PKGBUILD assumes a shape. The contract:
 
 - **Tag** `runtime-<pkgver>`, where `pkgver` is `<proton major>.<minor>.<date>`
-  — `11.0.20260803`. Upstream's own version string
+  — `11.0.20261010.1` (a same-day revision may append `.1`). Upstream's own version string
   (`xodus-bleeding-edge-11.0-20260803-3-g7c0b4354`, in the tool's `version`
   file) cannot be a `pkgver`: hyphens are not allowed.
-- **Asset** `ferestre-runtime-<pkgver>-x86_64.tar.zst`, containing exactly one
+- **Asset** `ferestre-runtime-<pkgver>.tar.xz`, containing exactly one
   top-level directory named `ferestre-runtime-<pkgver>`, which *is* the
   compatibility tool: `proton`, `toolmanifest.vdf`, `compatibilitytool.vdf`,
   `version`, `files/`.
@@ -150,21 +150,15 @@ PKGBUILD assumes a shape. The contract:
   if `xgameruntime.dll` is missing. Both have been shipped broken before by
   hand; both look like the title crashing rather than like a packaging mistake.
 
-`scripts/package-runtime.sh` produces exactly that shape from an installed
-runtime, and asserts every point of the contract above before writing the
-tarball. It also slims and strips: 1416 MB installed becomes 968 MB, 187 MB
-compressed. Run it, then upload `out/*.tar.zst` as the release asset.
+The runtime workflow produces the release `.tar.xz` shape used by both the
+launcher installer and this package. The local `scripts/package-runtime.sh`
+remains an alternative slimming tool that emits `.tar.zst`; its output needs
+repacking to the release contract before publishing.
 
-Then, in `ferestre-runtime-bin/`:
-
-```sh
-updpkgsums                        # replaces the sha256sums SKIP placeholder
-makepkg --printsrcinfo > .SRCINFO
-```
-
-**`sha256sums=('SKIP')` is a placeholder and must not reach the AUR.** No
-release exists yet, and inventing a hash would fail later with a confusing
-message rather than a clear one.
+After publishing the asset, update `pkgver`, run `updpkgsums` against the actual
+asset, and regenerate `.SRCINFO` with `makepkg --printsrcinfo`. Runtime
+11.0.20261010.1 has a recorded checksum; never publish an archive checksum of
+`SKIP` to the AUR.
 
 ## Publishing
 
@@ -217,13 +211,13 @@ public URLs. A local working tree cannot prove those remote sources exist.
 
 ## What is not done here
 
-- **No runtime release exists yet**, so `ferestre-runtime-bin` cannot be built
-  as written. Its checksum remains a placeholder until a `runtime-*` tag
-  publishes the matching asset.
+- Runtime releases exist and `ferestre-runtime-bin` names the current release
+  with its measured checksum. A full Arch chroot build remains unqualified.
 - **No complete client package build in an Arch chroot.** The patched release
   CLI/service build and focused tests pass on the development system.
 - **No `namcap` run.** It is not installed on the development machine.
 - **No systemd user unit for `xodus-service`.** `launch-gdk.sh` starts it with
   `nohup` if `pgrep` does not find it, and a unit would be a second way to do
   the same thing. Worth revisiting when the launcher stops being shell.
-- **No `ferestre` (tagged, non-`-git`) package.** Nothing to tag yet.
+- **No `ferestre` (tagged, non-`-git`) AUR package.** Launcher tags and AppImages
+  are published; an AUR package for tagged launcher releases remains future work.

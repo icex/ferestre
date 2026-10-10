@@ -17,6 +17,7 @@ pkgbase = ferestre-git
 	depends = curl
 	depends = unzip
 	depends = python
+	depends = util-linux
 	optdepends = steam: Proton wants STEAM_COMPAT_CLIENT_INSTALL_PATH, and a title can be added as a non-Steam shortcut
 	optdepends = vulkan-tools: `vulkaninfo`, for checking the GPU side before blaming the launcher
 	optdepends = docker: building the patched Proton runtime yourself (ferestre install-runtime)
