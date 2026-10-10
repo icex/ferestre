@@ -44,11 +44,11 @@ pub const XGAMERUNTIME_DLL: &str = "files/lib/wine/x86_64-windows/xgameruntime.d
 /// function. It cannot tell a stale build from a current one, which is the
 /// reason a published manifest is preferred over a probe.
 const XGAMERUNTIME_CAPABILITIES: [&str; 5] = [
-    "xgameruntime.gamesave",
-    "xgameruntime.networking",
-    "xgameruntime.package",
-    "xgameruntime.taskqueue",
-    "xgameruntime.user",
+    capability::XGAMERUNTIME_GAMESAVE,
+    capability::XGAMERUNTIME_NETWORKING,
+    capability::XGAMERUNTIME_PACKAGE,
+    capability::XGAMERUNTIME_TASKQUEUE,
+    capability::XGAMERUNTIME_USER,
 ];
 
 /// Proton's `run_proc()` closes inherited fds. The decrypted main image lives
@@ -59,7 +59,7 @@ const CLOSE_FDS_MARKER: &[u8] = b"close_fds=False";
 /// image from `WINE_DLL_FILE_MAP`, and nothing on disk shows whether the Wine
 /// build carries it -- so the probe reports this on the evidence of the Proton
 /// half alone. It is the closest honest answer a probe has.
-const MEMFD_CAPABILITY: &str = "loader.memfd-main-image";
+const MEMFD_CAPABILITY: &str = capability::MEMFD_MAIN_IMAGE;
 
 /// How we learned what a runtime provides. It qualifies every answer derived
 /// from it, so it travels with the answer rather than being logged and lost.

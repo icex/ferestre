@@ -1,6 +1,6 @@
 pkgbase = ferestre-runtime-bin
 	pkgdesc = Patched Proton with the ferestre Xbox GDK runtime implementation, prebuilt
-	pkgver = 11.0.20261010.1
+	pkgver = 11.0.20261010.2
 	pkgrel = 1
 	url = https://github.com/icex/ferestre
 	install = ferestre-runtime-bin.install
@@ -63,7 +63,7 @@ pkgbase = ferestre-runtime-bin
 	options = !strip
 	options = !debug
 	options = emptydirs
-	source = https://github.com/icex/ferestre/releases/download/runtime-11.0.20261010.1/ferestre-runtime-11.0.20261010.1.tar.xz
-	sha256sums = 05d50dfebbf9ce8e364e92804af0a2c0282a7f42f2296ae7bf5ece1b34889b85
+	source = https://github.com/icex/ferestre/releases/download/runtime-11.0.20261010.2/ferestre-runtime-11.0.20261010.2.tar.xz
+	sha256sums = 10e6709f69dd38603d1792bb874732649ebf44652dbe1541692942ee583312ce
 
 pkgname = ferestre-runtime-bin

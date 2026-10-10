@@ -31,6 +31,10 @@ CLIENT_BASE=${CLIENT_BASE:-3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60}
 # whatever upstream has moved on to, which is how this check went red for five
 # commits while every patch applied perfectly to the tree it was written for.
 XGR_BASE=${XGR_BASE:-64aebcabb8c66121eae25d3bf0ace4b582ebb0da}
+# And for vkd3d-proton, which has no fork: this must equal the commit Proton
+# pins its vkd3d-proton submodule to, because that is the tree the runtime
+# build applies the series to. Move it only together with that pin.
+VKD3D_BASE=${VKD3D_BASE:-651f17762e439feeef22dbb4ee7eff167ee503d4}
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -42,10 +46,16 @@ done
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/ferestre-patch-check.XXXXXX")
 FAILED=0
+# Counted so that a run which found none of the repositories cannot report
+# success: "all patch series apply" after checking nothing is how a broken
+# environment looks green.
+CHECKED=0
+SKIPPED=0
 cleanup() {
     [ -d "$WORK/wine" ] && git -C "$WINE_REPO" worktree remove --force "$WORK/wine" 2>/dev/null
     [ -d "$WORK/xgr" ] && git -C "$WINE_REPO/dlls/xgameruntime" worktree remove --force "$WORK/xgr" 2>/dev/null
     [ -d "$WORK/client" ] && git -C "$CLIENT_REPO" worktree remove --force "$WORK/client" 2>/dev/null
+    [ -d "$WORK/vkd3d" ] && git -C "$VKD3D_REPO" worktree remove --force "$WORK/vkd3d" 2>/dev/null
     rm -rf "$WORK" 2>/dev/null
 }
 trap cleanup EXIT
@@ -61,6 +71,7 @@ bad()  { printf '   \033[31m!!\033[0m   %s\n' "$*"; FAILED=$((FAILED + 1)); }
 # worktree is the only place the question means anything.
 if [ -d "$WINE_REPO/.git" ] || [ -f "$WINE_REPO/.git" ]; then
     say "wine series against $(git -C "$WINE_REPO" rev-parse --short HEAD)"
+    CHECKED=$((CHECKED + 1))
     git -C "$WINE_REPO" worktree add -q --detach "$WORK/wine" HEAD
     for p in "$REPO_DIR"/patches/wine/*.patch; do
         name=$(basename "$p")
@@ -100,6 +111,7 @@ if [ -d "$WINE_REPO/.git" ] || [ -f "$WINE_REPO/.git" ]; then
     fi
 else
     say "wine series: skipped, no repository at $WINE_REPO"
+    SKIPPED=$((SKIPPED + 1))
 fi
 
 # --- the xgameruntime series ----------------------------------------------
@@ -117,6 +129,7 @@ if [ -e "$XGR_REPO/.git" ]; then
 fi
 if [ -n "${XGR_BASE:-}" ] && [ -e "$XGR_REPO/.git" ]; then
     say "xgameruntime series against ${XGR_BASE:0:8}"
+    CHECKED=$((CHECKED + 1))
     git -C "$XGR_REPO" worktree add -q --detach "$WORK/xgr" "$XGR_BASE"
     for p in "$REPO_DIR"/patches/xgameruntime/*.patch; do
         name=$(basename "$p")
@@ -139,6 +152,30 @@ if [ -n "${XGR_BASE:-}" ] && [ -e "$XGR_REPO/.git" ]; then
     fi
 else
     say "xgameruntime series: skipped, submodule not checked out"
+    SKIPPED=$((SKIPPED + 1))
+fi
+
+# --- vkd3d-proton: same pinned submodule as the runtime workflow ----------
+VKD3D_REPO=${VKD3D_REPO:-$(dirname "$WINE_REPO")/vkd3d-proton}
+if [ -e "$VKD3D_REPO/.git" ]; then
+    if git -C "$VKD3D_REPO" cat-file -e "$VKD3D_BASE^{commit}" 2>/dev/null; then
+        say "vkd3d-proton series against ${VKD3D_BASE:0:8}"
+        CHECKED=$((CHECKED + 1))
+        git -C "$VKD3D_REPO" worktree add -q --detach "$WORK/vkd3d" "$VKD3D_BASE"
+        for p in "$REPO_DIR"/patches/vkd3d-proton/*.patch; do
+            if git -C "$WORK/vkd3d" apply --check "$p" 2>/dev/null; then
+                git -C "$WORK/vkd3d" apply "$p"
+                ok "$(basename "$p")"
+            else
+                bad "$(basename "$p") does not apply"
+            fi
+        done
+    else
+        bad "vkd3d-proton base $VKD3D_BASE is not available (fetch it first)"
+    fi
+else
+    say "vkd3d-proton series: skipped, no repository at $VKD3D_REPO"
+    SKIPPED=$((SKIPPED + 1))
 fi
 
 # --- the client series ----------------------------------------------------
@@ -147,6 +184,7 @@ fi
 # patches are published for other people to apply to upstream.
 if [ -d "$CLIENT_REPO/.git" ]; then
     say "client series against upstream ${CLIENT_BASE:0:8}"
+    CHECKED=$((CHECKED + 1))
     if git -C "$CLIENT_REPO" cat-file -e "$CLIENT_BASE^{commit}" 2>/dev/null; then
         git -C "$CLIENT_REPO" worktree add -q --detach "$WORK/client" "$CLIENT_BASE"
         # In order: each is written against the tree the previous one leaves.
@@ -171,12 +209,16 @@ if [ -d "$CLIENT_REPO/.git" ]; then
     fi
 else
     say "client series: skipped, no repository at $CLIENT_REPO"
+    SKIPPED=$((SKIPPED + 1))
 fi
 
 echo
-if [ "$FAILED" -eq 0 ]; then
-    printf '\033[32mall patch series apply\033[0m\n'
-else
-    printf '\033[31m%s problem(s)\033[0m\n' "$FAILED" >&2
+if [ "$FAILED" -ne 0 ]; then
+    printf '\033[31m%s problem(s); %s series checked, %s skipped\033[0m\n' "$FAILED" "$CHECKED" "$SKIPPED" >&2
+    exit "$FAILED"
 fi
-exit "$FAILED"
+if [ "$CHECKED" -eq 0 ]; then
+    printf '\033[31mno patch series checked (%s skipped); point the script at the repositories\033[0m\n' "$SKIPPED" >&2
+    exit 1
+fi
+printf '\033[32m%s patch series apply\033[0m (%s skipped)\n' "$CHECKED" "$SKIPPED"

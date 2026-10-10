@@ -29,6 +29,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use ferestre_core::autofix;
+use ferestre_core::capability;
 use ferestre_core::catalog;
 use ferestre_core::http;
 use ferestre_core::install;
@@ -502,17 +504,22 @@ fn cmd_run(
         )
     })?;
 
+    // A title without a tested recipe can still share an engine with one that
+    // has been debugged. The same inference feeds the window's verdict.
+    let inferred = autofix::infer(recipe, Some(&paths.install_dir(recipe)?));
+
     // Checked before anything is started, because the alternative is a title
     // that exits 1 with an empty log and someone guessing which of eleven
     // patches is missing.
     let runtimes = runtime::all(&paths);
     let requested_runtime = runtime::selected(paths.config_dir(), &recipe.title.product_id);
     let runtime = runtime::select(
-        recipe,
+        &inferred.recipe,
         &runtimes,
         requested_runtime.as_deref(),
         registry_for(&paths).as_ref(),
     )?;
+    let recipe = &engine_defaults(inferred, runtime, &paths);
     let registry = registry_for(&paths);
     let assessment = runtime::assess(recipe, runtime, registry.as_ref());
     let verdict = gate(&assessment);
@@ -566,6 +573,54 @@ fn cmd_run(
     start_service(&dirs)?;
 
     run_teed(plan.to_command(), &launch::log_path(recipe, &dirs))
+}
+
+/// The recipe a launch uses once a detected engine's defaults are settled,
+/// with one line saying what happened to them.
+///
+/// Said whatever the outcome, short of no engine at all: someone comparing a
+/// run with and without a flag needs to know whether the launcher added it, and
+/// someone who opted out needs to see that the opt-out was honoured.
+fn engine_defaults(
+    inferred: autofix::Inferred,
+    runtime: &InstalledRuntime,
+    paths: &Paths,
+) -> Recipe {
+    let mut recipe = inferred.recipe.into_owned();
+    let Some(profile) = inferred.profile else {
+        return recipe;
+    };
+    let (key, token) = profile.setting();
+    // Raw, not `var`: an empty value is the opt-out, not an absence.
+    let outcome = autofix::apply(
+        &mut recipe,
+        Some(profile),
+        &runtime.provides,
+        paths.var_raw(key),
+    );
+    let (engine, effect) = (profile.engine(), profile.effect());
+    match outcome {
+        autofix::Outcome::NotDetected => {}
+        autofix::Outcome::Applied => {
+            eprintln!("-- detected {engine}: enabled {effect} ({key}={token})")
+        }
+        autofix::Outcome::Merged { previous } => {
+            eprintln!(
+                "-- detected {engine}: enabled {effect} by adding {token} to {key}={previous}"
+            )
+        }
+        autofix::Outcome::AlreadyPresent => {
+            eprintln!("-- detected {engine}: {key} already enables {effect}")
+        }
+        autofix::Outcome::SkippedExplicitEmpty => {
+            eprintln!("-- detected {engine}: {key} is set and empty, so {effect} stays off")
+        }
+        autofix::Outcome::RuntimeLacks => eprintln!(
+            "-- detected {engine}: this runtime does not provide {}, so {effect} is unavailable",
+            profile.capability()
+        ),
+    }
+    recipe
 }
 
 fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCode> {
@@ -926,8 +981,45 @@ fn write_detected_recipe(paths: &Paths, product_id: &str, dest: &Path) -> Result
     if let Ok(relative) = dest.strip_prefix(paths.games_dir()) {
         recipe.install.dir = Some(relative.to_string_lossy().into_owned());
     }
+    detected_requirements(&mut recipe, dest);
     let path = recipe.save_to(&paths.user_titles_dir())?;
     Ok(Some(path))
+}
+
+/// What a recipe written from a package can honestly ask of the runtime.
+///
+/// `requires` only names what every runtime this launcher would pick can be
+/// seen to provide, because `runtime::select` refuses a runtime that misses a
+/// requirement before the gate ever gets to say "could not be verified". A
+/// runtime that publishes nothing is probed, and the probe can see the
+/// inherited-fd change and our `xgameruntime.dll` but never package identity.
+/// So:
+///
+/// - every package is an encrypted MSIXVC image, which cannot start without
+///   the memfd main image: required, and the probe can confirm it;
+/// - a GDK package (it has `MicrosoftGame.config`) signs a user in through
+///   our `xgameruntime.dll`: required, and the probe can confirm that too;
+/// - the same package asks Wine who it is, which a probe cannot see: wanted,
+///   so a published list that lacks it still warns, and a probed runtime is
+///   not refused for something nobody could check.
+///
+/// The engine's own wants go in as well, so the file shows what the launcher
+/// will ask for.
+fn detected_requirements(recipe: &mut Recipe, dest: &Path) {
+    recipe.runtime.requires = vec![capability::MEMFD_MAIN_IMAGE.into()];
+    if install::game_config(dest).is_some() {
+        recipe
+            .runtime
+            .requires
+            .push(capability::XGAMERUNTIME_USER.into());
+        recipe
+            .runtime
+            .wants
+            .push(capability::PACKAGE_IDENTITY.into());
+    }
+    if let Some(profile) = autofix::detect(dest, &recipe.launch.executable) {
+        autofix::add_wants(recipe, profile);
+    }
 }
 
 /// Write down what was just installed, so an update can be detected later.
@@ -2648,6 +2740,97 @@ summary = "Runs."
         assert_eq!(exit_code_from(None, None), EXIT_FAILURE);
         assert_eq!(exit_code_from(Some(-1), None), EXIT_FAILURE);
         assert_eq!(exit_code_from(None, Some(200)), EXIT_FAILURE);
+    }
+
+    // -- recipes written from a package ------------------------------------
+
+    fn package(name: &str, files: &[&str]) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ferestre-detected-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for file in files {
+            std::fs::write(dir.join(file), b"").expect("write");
+        }
+        dir
+    }
+
+    fn detected(dir: &Path, executable: &str) -> Recipe {
+        let mut recipe = Recipe::blank("9ZZDETECTED1", "Detected");
+        recipe.launch.executable = executable.into();
+        detected_requirements(&mut recipe, dir);
+        recipe
+    }
+
+    #[test]
+    fn a_package_without_a_game_config_only_requires_the_main_image() {
+        let dir = package("plain", &["Game.exe"]);
+        let recipe = detected(&dir, "Game.exe");
+        assert_eq!(recipe.runtime.requires, [capability::MEMFD_MAIN_IMAGE]);
+        assert!(recipe.runtime.wants.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_gdk_package_requires_what_a_probe_can_see_and_wants_the_rest() {
+        // Any case of the config name is the same file to the package.
+        let dir = package("gdk", &["Game.exe", "microsoftgame.CONFIG"]);
+        let recipe = detected(&dir, "Game.exe");
+        assert_eq!(
+            recipe.runtime.requires,
+            [capability::MEMFD_MAIN_IMAGE, capability::XGAMERUNTIME_USER]
+        );
+        assert_eq!(recipe.runtime.wants, [capability::PACKAGE_IDENTITY]);
+
+        // The point of the split: a runtime that publishes nothing is still
+        // selected, and the name the probe cannot see becomes a warning.
+        let probed = InstalledRuntime {
+            path: PathBuf::from("/opt/probed"),
+            version: None,
+            provides: names(&[
+                capability::MEMFD_MAIN_IMAGE,
+                capability::XGAMERUNTIME_GAMESAVE,
+                capability::XGAMERUNTIME_NETWORKING,
+                capability::XGAMERUNTIME_PACKAGE,
+                capability::XGAMERUNTIME_TASKQUEUE,
+                capability::XGAMERUNTIME_USER,
+            ]),
+            source: CapabilitySource::Probed,
+        };
+        let runtimes = [probed];
+        let selected = runtime::select(&recipe, &runtimes, None, None).expect("selected");
+        assert_eq!(
+            gate(&runtime::assess(&recipe, selected, None)),
+            Gate::Degraded
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_package_with_a_known_engine_records_its_want() {
+        let dir = package(
+            "engine",
+            &[
+                "RetroClassics.exe",
+                "MicrosoftGame.Config",
+                "Ultralight.dll",
+                "UltralightCore.dll",
+                "WebCore.dll",
+            ],
+        );
+        let recipe = detected(&dir, "RetroClassics.exe");
+        assert_eq!(
+            recipe.runtime.wants,
+            [
+                capability::PACKAGE_IDENTITY,
+                capability::RECORDING_ALLOCATOR_LIFETIME
+            ]
+        );
+        // A default inferred at launch is not written down as configuration.
+        assert!(recipe.launch.env.is_empty());
+        let text = recipe.to_toml().expect("serialises");
+        Recipe::parse(&text).expect("and reads back");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // -- the repository's own data -----------------------------------------

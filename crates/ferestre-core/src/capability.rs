@@ -12,6 +12,35 @@ use std::collections::BTreeSet;
 /// A capability identifier, e.g. `loader.memfd-main-image`.
 pub type Capability = String;
 
+// The names the launcher itself reasons about, as opposed to the ones it only
+// passes from a recipe to a runtime. Kept together so that a rename in
+// `titles/capabilities.toml` breaks one test here rather than silently turning
+// a probe or an inferred default into a name no runtime will ever publish.
+
+/// Proton keeps the inherited fd that holds the decrypted main image.
+pub const MEMFD_MAIN_IMAGE: &str = "loader.memfd-main-image";
+/// Wine reports the running package's identity to the title.
+pub const PACKAGE_IDENTITY: &str = "appmodel.package-identity";
+pub const XGAMERUNTIME_GAMESAVE: &str = "xgameruntime.gamesave";
+pub const XGAMERUNTIME_NETWORKING: &str = "xgameruntime.networking";
+pub const XGAMERUNTIME_PACKAGE: &str = "xgameruntime.package";
+pub const XGAMERUNTIME_TASKQUEUE: &str = "xgameruntime.taskqueue";
+pub const XGAMERUNTIME_USER: &str = "xgameruntime.user";
+/// vkd3d-proton can keep an allocator retired mid-recording alive.
+pub const RECORDING_ALLOCATOR_LIFETIME: &str = "d3d12.recording-allocator-lifetime";
+
+/// Every name above, for the test that holds them to the registry.
+pub const KNOWN: [&str; 8] = [
+    MEMFD_MAIN_IMAGE,
+    PACKAGE_IDENTITY,
+    XGAMERUNTIME_GAMESAVE,
+    XGAMERUNTIME_NETWORKING,
+    XGAMERUNTIME_PACKAGE,
+    XGAMERUNTIME_TASKQUEUE,
+    XGAMERUNTIME_USER,
+    RECORDING_ALLOCATOR_LIFETIME,
+];
+
 /// The outcome of checking a recipe's needs against a runtime's offer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Match {
@@ -76,6 +105,33 @@ mod tests {
         let m = check(["a"], ["b"], &provided(&["a"]));
         assert!(m.is_satisfied());
         assert_eq!(m.missing_wanted, provided(&["b"]));
+    }
+
+    #[test]
+    fn every_name_the_launcher_or_a_recipe_uses_is_registered() {
+        // titles/validate.py checks recipes in CI; this also covers the names
+        // compiled into the launcher, which no script can see.
+        let titles = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../titles");
+        if !titles.exists() {
+            return; // packaged crate without the repository around it
+        }
+        let registry = crate::runtime::Registry::load(&titles.join("capabilities.toml"))
+            .expect("the registry parses");
+        for name in KNOWN {
+            assert!(
+                registry.get(name).is_some(),
+                "{name} is not in capabilities.toml"
+            );
+        }
+        for recipe in crate::recipe::Recipe::load_dir(&titles).expect("recipes parse") {
+            for name in recipe.runtime.requires.iter().chain(&recipe.runtime.wants) {
+                assert!(
+                    registry.get(name).is_some(),
+                    "{} names {name}, which is not in capabilities.toml",
+                    recipe.title.product_id
+                );
+            }
+        }
     }
 
     #[test]
