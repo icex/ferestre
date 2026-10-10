@@ -305,6 +305,16 @@ fn build_ui(app: &adw::Application) {
 // --- rendering ------------------------------------------------------------
 
 fn render(ui: &Ui) {
+    // A clicked button keeps the focus, and every title action redraws the
+    // row it sits on. Destroying the focused widget makes GTK hand the focus to
+    // the first widget left in the rebuilt list after the next paint, and the
+    // viewport scrolls to the top to show it. Let go of the focus first, so the
+    // library stays where the person was looking. (Named trait calls: RootExt
+    // has a `focus` and `set_focus` of its own.)
+    let window = &ui.window;
+    if GtkWindowExt::focus(window).is_some_and(|focus| focus.is_ancestor(&ui.content)) {
+        GtkWindowExt::set_focus(window, None::<&gtk::Widget>);
+    }
     while let Some(child) = ui.content.first_child() {
         ui.content.remove(&child);
     }

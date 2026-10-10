@@ -20,6 +20,8 @@ without a rerun.
 """
 
 import argparse
+import ctypes
+import ctypes.util
 import glob
 import json
 import os
@@ -211,6 +213,104 @@ def click(node):
             return target
     action.do_action(0)
     return target
+
+
+def window_origin(pid):
+    """Where on the X screen the window this process mapped begins.
+
+    GTK 4 reports every extent relative to its own window and answers zero for
+    screen coordinates, so a pointer event cannot be aimed from AT-SPI alone.
+    The X server knows where the window went; ask it, by the same process id
+    the application was found by.
+    """
+    x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XDefaultRootWindow.restype = ctypes.c_ulong
+    x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    x11.XInternAtom.restype = ctypes.c_ulong
+    x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    x11.XQueryTree.argtypes = [ctypes.c_void_p, ctypes.c_ulong] + [ctypes.c_void_p] * 4
+    x11.XGetWindowProperty.argtypes = (
+        [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long, ctypes.c_long]
+        + [ctypes.c_int, ctypes.c_ulong]
+        + [ctypes.c_void_p] * 5
+    )
+    x11.XTranslateCoordinates.argtypes = (
+        [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_int]
+        + [ctypes.c_void_p] * 3
+    )
+    x11.XFree.argtypes = [ctypes.c_void_p]
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+
+    display = x11.XOpenDisplay(None)
+    if not display:
+        raise Failure("cannot open the X display to aim the pointer; is DISPLAY set?")
+    try:
+        root = x11.XDefaultRootWindow(display)
+        wm_pid = x11.XInternAtom(display, b"_NET_WM_PID", 1)
+
+        def owner(window):
+            kind, fmt = ctypes.c_ulong(), ctypes.c_int()
+            count, left = ctypes.c_ulong(), ctypes.c_ulong()
+            data = ctypes.POINTER(ctypes.c_ulong)()
+            if x11.XGetWindowProperty(
+                display, window, wm_pid, 0, 1, 0, 0,
+                ctypes.byref(kind), ctypes.byref(fmt), ctypes.byref(count),
+                ctypes.byref(left), ctypes.byref(data),
+            ) != 0 or not data:
+                return None
+            try:
+                return data[0] if count.value else None
+            finally:
+                x11.XFree(data)
+
+        def search(window):
+            if owner(window) == pid:
+                return window
+            root_out, parent = ctypes.c_ulong(), ctypes.c_ulong()
+            children = ctypes.POINTER(ctypes.c_ulong)()
+            count = ctypes.c_uint()
+            if not x11.XQueryTree(
+                display, window, ctypes.byref(root_out), ctypes.byref(parent),
+                ctypes.byref(children), ctypes.byref(count),
+            ):
+                return None
+            try:
+                for i in range(count.value):
+                    found = search(children[i])
+                    if found:
+                        return found
+            finally:
+                if children:
+                    x11.XFree(children)
+            return None
+
+        window = search(root) if wm_pid else None
+        if window is None:
+            raise Failure(f"no X window belongs to pid {pid}")
+        x, y, child = ctypes.c_int(), ctypes.c_int(), ctypes.c_ulong()
+        x11.XTranslateCoordinates(
+            display, window, root, 0, 0, ctypes.byref(x), ctypes.byref(y), ctypes.byref(child)
+        )
+        return x.value, y.value
+    finally:
+        x11.XCloseDisplay(display)
+
+
+def press(node, pid):
+    """Click a widget with the pointer, the way a person does.
+
+    Not the same as `click`. An accessibility action activates a button and
+    leaves the keyboard focus where it was; a real click gives the button the
+    focus first. The window has to survive that button being destroyed under
+    its own focus, and only a pointer click puts it in that position.
+    """
+    origin_x, origin_y = window_origin(pid)
+    box = node.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+    x = origin_x + box.x + box.width // 2
+    y = origin_y + box.y + box.height // 2
+    Atspi.generate_mouse_event(x, y, "b1c")
 
 
 # A GtkLabel advertises clipboard and selection actions. They are real, and
@@ -542,6 +642,11 @@ last-verified = 2026-10-10
         f.write(
             """#!/usr/bin/env python3
 import json, os, sys, time
+if sys.argv[1:2] == ["run"]:
+    # Long enough that starting and exiting are separate redraws, as they are
+    # for a real title: each one rebuilds the row the person just clicked.
+    time.sleep(2)
+    sys.exit(0)
 if sys.argv[1:2] != ["install"]:
     sys.exit(0)
 if os.environ.get("XODUS_PROGRESS") != "json":
@@ -671,10 +776,28 @@ print(":: done", flush=True)
         check(position > 50, f"the library is scrolled before the click ({position})", frame)
         play = row_button(frame, "Minecraft for Windows", "Play")
         check(play is not None, "the installed fixture can be selected to play", frame)
-        click(play)
+        # With the pointer, not an action: the click focuses the button, the
+        # redraw destroys it, and GTK hands the focus to the first widget left
+        # in the list -- scrolling the library to the top to show it.
+        press(play, gui.pid)
+        wait_for(
+            frame,
+            lambda root: row_button(root, "Minecraft for Windows", "Stop"),
+            "the row to say the title is running",
+            time.monotonic() + TIMEOUT,
+        )
         time.sleep(0.5)
         after = scroll_value().get_current_value()
-        check(abs(after - position) < 2, f"a title action keeps the scroll position ({position} -> {after})", frame)
+        check(abs(after - position) < 2, f"starting a title keeps the scroll position ({position} -> {after})", frame)
+        wait_for(
+            frame,
+            lambda root: row_button(root, "Minecraft for Windows", "Play"),
+            "the title to exit",
+            time.monotonic() + TIMEOUT,
+        )
+        time.sleep(0.5)
+        after = scroll_value().get_current_value()
+        check(abs(after - position) < 2, f"and so does its exit ({position} -> {after})", frame)
 
         select_in_list(frame, "Runtime")
         wait_for(frame, lambda root: "Ferestre release" in texts(root), "section navigation", time.monotonic() + TIMEOUT)
