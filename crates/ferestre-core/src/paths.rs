@@ -241,9 +241,14 @@ impl Paths {
             })
             .or_else(|| env.on_path("xodus-cli"))
             .or_else(|| {
-                let mut candidates = vec![home.join("src/xodus-cli/target/release")];
-                // A checkout beside this one, which is where it is when both
-                // are being worked on at once.
+                let mut candidates = Vec::new();
+                // The client is a submodule of this repository, built in
+                // place; a checkout from before that layout had it beside
+                // this one in ~/src instead.
+                if let Some(r) = repo.as_ref() {
+                    candidates.push(r.join("third_party/xodus-cli/target/release"));
+                }
+                candidates.push(home.join("src/xodus-cli/target/release"));
                 if let Some(beside) = repo.as_ref().and_then(|r| r.parent()) {
                     candidates.push(beside.join("xodus-cli/target/release"));
                 }
@@ -678,6 +683,22 @@ summary = "Runs."
         assert_eq!(
             p.cli_dir(),
             Some(Path::new("/home/tester/src/xodus-cli/target/release"))
+        );
+
+        // The submodule built in place wins over a checkout beside the tree.
+        let e = env(&[])
+            .with_exe("/home/tester/src/ferestre/target/debug/ferestre")
+            .with_existing([
+                "/home/tester/src/ferestre/scripts",
+                "/home/tester/src/ferestre/third_party/xodus-cli/target/release",
+                "/home/tester/src/xodus-cli/target/release",
+            ]);
+        let p = Paths::resolve(&e).unwrap();
+        assert_eq!(
+            p.cli_dir(),
+            Some(Path::new(
+                "/home/tester/src/ferestre/third_party/xodus-cli/target/release"
+            ))
         );
     }
 

@@ -108,12 +108,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The client is a submodule pinned at the commit the series targets.
+      # The Proton submodule is not initialised: its Wine tree is too large
+      # to clone per push, and the wine series stays a local check. The
+      # xgameruntime tree is small, so it is cloned into the place the
+      # submodule would put it.
       - name: Fetch the repositories the patches target
         run: |
-          mkdir -p "$HOME/src"
-          git clone --quiet https://github.com/xodus-gaming/xodus.git "$HOME/src/xodus-cli"
+          git submodule update --init --quiet third_party/xodus-cli
           git clone --quiet https://github.com/xodus-gaming/xgameruntime \
-            "$HOME/src/xodus-proton/wine/dlls/xgameruntime"
+            third_party/xodus-proton/wine/dlls/xgameruntime
 
       - name: Patches apply
         run: scripts/check-patches.sh

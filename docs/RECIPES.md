@@ -12,10 +12,11 @@ to one machine. Override any of these in your shell profile to relocate things:
 | variable | meaning | default |
 |---|---|---|
 | `XODUS_GAMES_DIR` | decrypted games, Proton prefixes, logs | `~/xbox-games` |
-| `XODUS_CLI_DIR` | directory holding `xodus-cli` / `xodus-service` | auto (`PATH`, then `~/src/xodus-cli/target/release`) |
+| `XODUS_CLI_DIR` | directory holding `xodus-cli` / `xodus-service` | auto (`PATH`, then `third_party/xodus-cli/target/release`) |
 | `XODUS_PROTON_DIR` | the installed Xodus Proton compat tool | auto (Steam's `compatibilitytools.d/xodus`) |
 | `XODUS_STEAM_DIR` | a Steam install (Proton wants `STEAM_COMPAT_CLIENT_INSTALL_PATH`) | auto (`~/.steam/steam`, `~/.local/share/Steam`, Flatpak) |
 | `XODUS_BUILD_DIR` | the Proton build tree | `~/src/xodus-build` |
+| `XODUS_SRC_DIR` | where the `xodus-proton` and `xodus-cli` trees live | `third_party/` in this repo |
 | `XGR_XUID` | optional: XUID your Windows saves were made under | unset |
 
 Run `sh -c '. scripts/xodus-env.sh; env | grep ^XODUS_'` to see what resolves
@@ -42,27 +43,37 @@ on your machine before starting.
 
 ## 1. Build and install the patched Xodus Proton
 
-```bash
-# the runtime fork, with submodules (git-lfs bypass: don't fetch gigabytes of
-# gstreamer test media, which otherwise leaves wine/ and openfst/ empty)
-git clone -b xodus/bleeding-edge https://github.com/xodus-gaming/proton ~/src/xodus-proton
-cd ~/src/xodus-proton
-git -c filter.lfs.smudge= -c filter.lfs.process= submodule update --init --force --recursive
+The runtime fork and the client are submodules of this repository, pinned at
+the commits the patch series is written against: `third_party/xodus-proton`
+(xodus-gaming/Proton, which pins its own Wine and xgameruntime trees) and
+`third_party/xodus-cli` (xodus-gaming/xodus).
 
+```bash
 # this repo, with the patches and scripts
 git clone https://github.com/icex/ferestre ~/src/ferestre
+cd ~/src/ferestre
+
+# the runtime fork, with its submodules (git-lfs bypass: don't fetch gigabytes
+# of gstreamer test media, which otherwise leaves wine/ and openfst/ empty)
+git -c filter.lfs.smudge= -c filter.lfs.process= \
+    submodule update --init --force --recursive third_party/xodus-proton
 
 # apply the local patches (they are plain git diffs against the fork)
-cd ~/src/xodus-proton/wine
+cd third_party/xodus-proton/wine
 git apply ~/src/ferestre/patches/wine/*.patch
 git -C dlls/xgameruntime apply ~/src/ferestre/patches/xgameruntime/*.patch
 # the proton script patch is re-applied by the installer after every install
 
 # configure the build tree once (Xodus' own instructions), then build+install:
 mkdir -p ~/src/xodus-build && cd ~/src/xodus-build
-../xodus-proton/configure.sh --build-name=xodus --container-engine=docker
+~/src/ferestre/third_party/xodus-proton/configure.sh --build-name=xodus --container-engine=docker
 ~/src/ferestre/scripts/install-xodus-proton.sh
 ```
+
+The build tree stays where it was configured: Wine's generated Makefiles
+inside it carry its absolute path hundreds of thousands of times, so moving it
+means a full rebuild. Moving the *source* is fine -- only the top-level
+`Makefile`'s `SRCDIR` line names it.
 
 `install-xodus-proton.sh` invalidates the stale build stamps (editing the
 submodule alone changes nothing otherwise), builds, installs into Steam's
@@ -74,7 +85,7 @@ installed `xgameruntime.dll` is stale.
 
 ```bash
 cd ~/src/xodus-build
-rsync -a --exclude .git ~/src/xodus-proton/wine/dlls/kernelbase/ src-wine/dlls/kernelbase/
+rsync -a --exclude .git ~/src/ferestre/third_party/xodus-proton/wine/dlls/kernelbase/ src-wine/dlls/kernelbase/
 echo "WORKDIR=$PWD/obj-wine-x86_64 ~/src/ferestre/tools/in-container.sh \
   make -j$(nproc) dlls/kernelbase/x86_64-windows/kernelbase.dll" | newgrp docker
 # the installed copy is read-only; replace it explicitly
@@ -89,8 +100,13 @@ not the installed one.
 ## 2. Build xodus-cli and sign in
 
 ```bash
-git clone https://github.com/xodus-gaming/xodus-cli ~/src/xodus-cli
-cd ~/src/xodus-cli && cargo build --release      # ~/src/xodus-cli/target/release/{xodus-cli,xodus-service}
+cd ~/src/ferestre
+git submodule update --init third_party/xodus-cli
+cd third_party/xodus-cli
+# the client series, skipping 0001 (an earlier export that 0002 contains)
+for p in ../../patches/xodus-cli/*.patch; do
+    case $(basename "$p") in 0001-*) continue ;; esac; git apply "$p"; done
+cargo build --release                            # target/release/{xodus-cli,xodus-service}
 ./target/release/xodus-cli login                 # Microsoft sign-in in a window
 ```
 

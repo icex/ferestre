@@ -492,7 +492,11 @@ These are judgement calls, not engineering ones:
 2. **Name.** Something that does not imply endorsement by Microsoft, Mojang,
    Valve or Xodus.
 3. **How the client is carried** — vendored, submodule, or a maintained fork —
-   given upstream will not take these changes.
+   given upstream will not take these changes. Since 2026-09-14 it is a
+   submodule (`third_party/xodus-cli`, pinned at the upstream commit the
+   series targets) with the patches applied on top, and the Proton fork is
+   carried the same way (`third_party/xodus-proton`). The licensing question
+   stands; the layout is settled.
 
 ## Known gaps, stated plainly
 

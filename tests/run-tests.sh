@@ -14,13 +14,14 @@
 set -uo pipefail
 
 REPO_DIR=${REPO_DIR:-$(cd "$(dirname "$0")/.." && pwd)}
-BUILD_DIR=${BUILD_DIR:-${XODUS_SRC_DIR:-$HOME/src}/xodus-build}
-WINE_SRC=${WINE_SRC:-${XODUS_SRC_DIR:-$HOME/src}/xodus-proton/wine}
+. "$REPO_DIR/scripts/xodus-env.sh"
+BUILD_DIR=${BUILD_DIR:-$XODUS_BUILD_DIR}
+WINE_SRC=${WINE_SRC:-$XODUS_SRC_DIR/xodus-proton/wine}
 TOOL_DIR=${TOOL_DIR:-${XODUS_STEAM_DIR:-$HOME/.steam/steam}/compatibilitytools.d/xodus}
 OBJ=$BUILD_DIR/obj-wine-x86_64
 INCUBE=$REPO_DIR/tools/in-container.sh
-# The build container only mounts ${XODUS_SRC_DIR:-$HOME/src}, so the compiler's output
-# directory has to live there too, not under /tmp.
+# The build container only mounts the repository, source and build trees, so
+# the compiler's output directory has to live in one of them, not under /tmp.
 WORK=$(mktemp -d "$BUILD_DIR/.xgr-tests.XXXXXX")
 cleanup() {
     if [ -n "${FIXTURE_PID:-}" ]; then kill -TERM "$FIXTURE_PID" 2>/dev/null; wait "$FIXTURE_PID" 2>/dev/null; fi

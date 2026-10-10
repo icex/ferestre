@@ -21,8 +21,9 @@
 set -euo pipefail
 
 REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
-WINE_REPO=${WINE_REPO:-${XODUS_SRC_DIR:-$HOME/src}/xodus-proton/wine}
-CLIENT_REPO=${CLIENT_REPO:-${XODUS_SRC_DIR:-$HOME/src}/xodus-cli}
+. "$REPO_DIR/scripts/xodus-env.sh"
+WINE_REPO=${WINE_REPO:-$XODUS_SRC_DIR/xodus-proton/wine}
+CLIENT_REPO=${CLIENT_REPO:-$XODUS_SRC_DIR/xodus-cli}
 # The upstream commit the client series is written against. Documented in
 # packaging/aur/ferestre-client/PKGBUILD, and pinned here so the two agree.
 CLIENT_BASE=${CLIENT_BASE:-3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60}

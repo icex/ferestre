@@ -120,13 +120,14 @@ jobs:
       - name: Build bundled Xodus client
         run: |
           set -euo pipefail
-          git clone --quiet https://github.com/xodus-gaming/xodus.git xodus
-          git -C xodus checkout --quiet 3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
+          # The submodule pin is the upstream commit the series is written
+          # against; scripts/check-patches.sh and the AUR package name the same one.
+          git submodule update --init --quiet third_party/xodus-cli
           for patch in patches/xodus-cli/*.patch; do
               case "$(basename "$patch")" in 0001-*) continue ;; esac
-              git -C xodus apply "$GITHUB_WORKSPACE/$patch"
+              git -C third_party/xodus-cli apply "$GITHUB_WORKSPACE/$patch"
           done
-          cargo build --release --manifest-path xodus/Cargo.toml \
+          cargo build --release --manifest-path third_party/xodus-cli/Cargo.toml \
               -p xodus-cli -p xodus-service
 
       # The layout an installed copy has: usr/bin/ferestre with
@@ -145,9 +146,9 @@ jobs:
           install -d "$root/usr/bin" "$root/usr/lib/ferestre"
           install -Dm755 target/release/ferestre     "$root/usr/bin/ferestre"
           install -Dm755 target/release/ferestre-gui "$root/usr/bin/ferestre-gui"
-          install -Dm755 xodus/target/release/xodus-cli \
+          install -Dm755 third_party/xodus-cli/target/release/xodus-cli \
               "$root/usr/lib/ferestre/client/xodus-cli"
-          install -Dm755 xodus/target/release/xodus-service \
+          install -Dm755 third_party/xodus-cli/target/release/xodus-service \
               "$root/usr/lib/ferestre/client/xodus-service"
           # Not documentation: launch-gdk.sh is the launch path and
           # proton-wine-shim.sh is what the client execs as its "wine".
@@ -197,7 +198,7 @@ jobs:
         run: |
           packaging/appimage/build-appimage.sh \
             --bin target/release/ferestre \
-            --client xodus/target/release/xodus-cli \
+            --client third_party/xodus-cli/target/release/xodus-cli \
             --version "$VERSION" \
             --out out
 
