@@ -4,15 +4,25 @@ The goal is something a person can install and use: sign in, see the titles they
 own, download one, keep it updated, and play it — the role mcpelauncher plays
 for Bedrock on Android, for Microsoft Store titles on Linux.
 
+## Current qualification
+
+Release 0.1.5 and runtime 11.0.20261010.1 add Halo campaign support and tested
+GDK async, queue, analytics and Store lifetime fixes. Halo gameplay and saving
+have live confirmation. Dungeons saving was confirmed after its tutorial.
+Goat Simulator 3 works offline (player-confirmed) and signs in online. An
+online-enabled new-world test stalled; compare offline/online loading and verify
+the save interface ABI before further implementation.
+See [release qualification](RELEASE-0.1.5.md).
+
 ## Where the work already is
 
-Three layers. Two exist.
+Three layers are implemented.
 
 | Layer | Does | State |
 |---|---|---|
 | Client | Microsoft sign-in, licences and content keys, MSIXVC download and decrypt | Exists upstream (Xodus), plus local fixes |
 | Runtime | Patched Proton/Wine + `xgameruntime.dll`, the GDK implementation | Exists here. ~1.4 GB installed |
-| Launcher | Library, install, update, configure, launch | **Does not exist** |
+| Launcher | Library, install, update, configure, launch | CLI and GTK4 GUI shipped |
 
 One constraint shapes everything: a title's executable is encrypted on disk and
 only exists decrypted inside a memfd passed to Wine. Nothing can start a title

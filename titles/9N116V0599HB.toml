@@ -1,0 +1,23 @@
+# Written by the ferestre launcher. Edits here win over the packaged
+# recipe of the same product id, and survive an upgrade.
+#
+# If this makes a title work, the most useful thing you can do with
+# it is open an issue with this file attached.
+schema = 1
+
+[title]
+product-id = "9N116V0599HB"
+name = "Hollow Knight: Silksong"
+slug = "hollow-knight-silksong"
+
+[launch]
+executable = "Hollow Knight Silksong.exe"
+
+[runtime]
+requires = ["loader.memfd-main-image", "appmodel.package-identity"]
+
+[status]
+state = "playable"
+summary = "Playable, confirmed by the player on the local Game Pass installation."
+last-verified = 2026-10-10
+verified-with = "Player confirmation; locally installed launcher/runtime. Saving and online features were not separately qualified."

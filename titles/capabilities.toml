@@ -549,3 +549,49 @@ note = "The runtime probe checks IPC support only. The matching xodus-service mu
 verify = [
     { file = "files/lib/wine/x86_64-unix/xgameruntime.so", contains = "<LicenseTokenRequest><ParentProductId>" },
 ]
+
+[[capability]]
+name = "xgameruntime.user-handle-result-size"
+summary = "XUserAddAsync exposes the user handle through the generic async size and result APIs."
+provided-by = ["patches/xgameruntime/0022-report-the-user-handle-async-result-size.patch"]
+symptom-if-missing = "Halo's native sign-in wrapper sees a zero-byte result and dereferences a missing user handle"
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "user handle async result:" },
+]
+
+[[capability]]
+name = "xgameruntime.save-result-sizes"
+summary = "Save provider and remaining quota operations expose correctly sized generic async results."
+provided-by = ["patches/xgameruntime/0023-report-save-provider-and-quota-result-sizes.patch"]
+symptom-if-missing = "Halo sees a successful but empty save-provider result and crashes before loading gameplay"
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "save provider async result:" },
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "save quota async result:" },
+]
+
+[[capability]]
+name = "xgameruntime.manual-queue-thread-affinity"
+summary = "With XGR_STRICT_MANUAL_QUEUES=1, Manual work and completion ports run only when their owning endpoint is dispatched."
+provided-by = ["patches/xgameruntime/0024-dispatch-async-work-on-the-requested-manual-port.patch"]
+symptom-if-missing = "Halo campaign aborts with Thread not registered when its async work runs on an unrelated thread-pool thread"
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "XGR_STRICT_MANUAL_QUEUES" },
+]
+
+[[capability]]
+name = "xgameruntime.analytics-device-family"
+summary = "System analytics preserves the full Windows.Desktop device family used by native PlayFab Party to identify its platform."
+provided-by = ["patches/xgameruntime/0025-preserve-the-complete-analytics-device-family.patch"]
+symptom-if-missing = "Party initialization fails with unmapped platform error and Goat Simulator 3 reports GS3-NF-2"
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "returning complete analytics device family" },
+]
+
+[[capability]]
+name = "xgameruntime.store-product-lifetime"
+summary = "Enumerated Store products and their metadata remain valid until the query handle closes."
+provided-by = ["patches/xgameruntime/0026-keep-store-products-alive-for-the-query-lifetime.patch"]
+symptom-if-missing = "Goat Simulator 3 retains a pointer to expired stack data and crashes while processing owned products"
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "query-owned product" },
+]

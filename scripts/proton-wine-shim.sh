@@ -46,4 +46,22 @@ export VKD3D_SHADER_CACHE_PATH="${VKD3D_SHADER_CACHE_PATH:-$XODUS_GAMES_DIR/shad
 export DXVK_STATE_CACHE_PATH="${DXVK_STATE_CACHE_PATH:-$XODUS_GAMES_DIR/shadercache}"
 mkdir -p "$STEAM_COMPAT_DATA_PATH" "$VKD3D_SHADER_CACHE_PATH"
 
+# A package bootstrapper can launch its game from a subdirectory. Windows
+# carries the package identity into that child; Wine otherwise searches only
+# beside the child's executable and reports APPMODEL_ERROR_NO_PACKAGE.
+if [ -z "${WINE_PACKAGE_MANIFEST:-}" ]; then
+    for manifest in "$PWD/appxmanifest.xml" "$PWD/AppxManifest.xml" \
+                    "$PWD/MicrosoftGame.config" "$PWD/MicrosoftGame.Config"; do
+        if [ -f "$manifest" ]; then
+            WINE_PACKAGE_MANIFEST="Z:$(printf '%s' "$manifest" | sed 's,/,\\,g')"
+            export WINE_PACKAGE_MANIFEST
+            break
+        fi
+    done
+fi
+
+if [ "${FERESTRE_IMAGE_VIEW:-}" = "real-path" ]; then
+    exec python3 "$(dirname "$0")/real-path-image-view.py" -- "$PROTON_DIR/proton" run "$@"
+fi
+
 exec "$PROTON_DIR/proton" run "$@"

@@ -6,7 +6,7 @@ project, and exactly where the ones that fail stop.
 ## Read this first
 
 **Many titles remain untested, and an untested title may expose another runtime
-gap.** Ten titles have been run. The GDK runtime is written against the
+gap.** Twelve titles have been run. The GDK runtime is written against the
 *observable* behaviour of the API — task queues, async, users, storage,
 networking, save games, packages — so each new title remains useful evidence.
 
@@ -35,6 +35,11 @@ real contribution even — especially — when the answer is that it does not ru
 **Before you paste anything: a session log contains your gamertag, your XUID and
 your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 
+Current release qualification: [0.1.5](RELEASE-0.1.5.md). Halo is playable,
+with an intermittent offline indicator still unresolved. Goat offline gameplay is player-confirmed. Its automated online-enabled
+new-world loading test stalled despite successful sign-in; online co-op remains
+unqualified.
+
 ## The matrix
 
 <!-- BEGIN GENERATED MATRIX (.github/scripts/gen-compatibility.py) -->
@@ -46,12 +51,13 @@ your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 | DOOM 64 | `9MXND4PQLK3W` | Playable | Plays. | 2026-09-06 |
 | DREDGE | `9MSVVM5NS9L6` | Playable | Plays. | 2026-09-06 |
 | Forza Horizon 5 | `9NNX1VVR3KNQ` | Playable | Plays with a restored Windows career; title services and the live Festival Playlist load after generic authentication and endpoint-discovery fixes. Player confirmed the online fix. | 2026-09-07 |
+| Halo Infinite | `9PP5G1F0C2B6` | Playable | Campaign, Academy training and multiplayer run; campaign save restoration was confirmed locally. Intermittent offline display remains under investigation. | 2026-10-10 |
+| Hollow Knight: Silksong | `9N116V0599HB` | Playable | Playable, confirmed by the player on the local Game Pass installation. | 2026-10-10 |
 | Minecraft Dungeons II | `9P5786PJB9RP` | Playable | Account sign-in, Store licence verification and Squid Coast gameplay work with the matching updated runtime. Long-session, multiplayer and cloud-save behavior are untested. | 2026-10-10 |
 | Minecraft for Windows | `9NBLGGH2JHXJ` | Playable | Signs in to Xbox Live, loads the profile, plays, and joins third-party servers from the in-game list. | 2026-09-06 |
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
 | Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. | 2026-09-06 |
-| Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable, with issues | Boots and plays; online connectivity is being verified. | 2026-09-06 |
-| Halo Infinite | `9PP5G1F0C2B6` | Does not run | Gets through EasyAntiCheat's checks and into its Linux loader, which then cannot find the game binary: it looks in /proc/<pid>/maps, and a decrypted image mapped from a descriptor has no path there. Stops at: EasyAntiCheat bootstrapper exit 207, 'Failed to locate the game binary (Wine)', after 'Starting Wine module mapping, Wine version: 11.0'. | 2026-09-07 |
+| Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable, with issues | Offline gameplay works, confirmed by the player. Online sign-in succeeds, but an online-enabled new-world loading test stalled; online co-op remains unqualified. | 2026-10-10 |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.
 

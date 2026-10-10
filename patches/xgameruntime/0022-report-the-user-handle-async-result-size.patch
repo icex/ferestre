@@ -1,0 +1,34 @@
+diff --git a/xuser.c b/xuser.c
+index 9426f32..934de38 100644
+--- a/xuser.c
++++ b/xuser.c
+@@ -104,6 +104,10 @@ static struct x_local_user local_user =
+     .local_id = { .value = 1 },
+ };
+ 
++/* Keep the result bytes separate from the object the handle points to.
++ * XAsyncGetResult copies those bytes, while XUserAddResult returns the handle. */
++static XUserHandle local_user_result = (XUserHandle)&local_user;
++
+ static XUserHandle local_user_handle( void )
+ {
+     return (XUserHandle)&local_user;
+@@ -227,7 +231,8 @@ static HRESULT WINAPI x_user_XUserAddAsync( IXUserImpl6 *iface, XUserAddOptions
+     if (!async) return E_INVALIDARG;
+ 
+     /* Nothing to negotiate for a local user, so complete before returning. */
+-    xgr_async_complete( async, S_OK, local_user_handle() );
++    TRACE( "user handle async result: %Iu bytes.\n", sizeof(local_user_result) );
++    xgr_async_complete_ex( async, S_OK, &local_user_result, sizeof(local_user_result) );
+     return S_OK;
+ }
+ 
+@@ -243,7 +248,7 @@ static HRESULT WINAPI x_user_XUserAddResult( IXUserImpl6 *iface, XAsyncBlock *as
+     if (FAILED(hr)) return hr;
+ 
+     InterlockedIncrement( &local_user.ref );
+-    *newUser = payload;
++    *newUser = *(XUserHandle *)payload;
+     return S_OK;
+ }
+ 

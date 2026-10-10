@@ -160,6 +160,8 @@ static void test_xpackage(void)
 static void test_xuser(void)
 {
     XAsyncBlock async = { 0 };
+    SIZE_T result_size = 0, used = 0;
+    XUserHandle generic_user = NULL;
     XUserState state = 99;
     XUserLocalId local = { 0 };
     BOOLEAN guest = TRUE;
@@ -169,8 +171,20 @@ static void test_xuser(void)
     printf( "# XUser\n" );
     hr = IXUserImpl_XUserAddAsync( users, XUserAddOptions_AddDefaultUserSilently, &async );
     CHECK( SUCCEEDED( hr ), "XUserAddAsync succeeds (0x%08lx)", hr );
+    hr = IXThreadingImpl_XAsyncGetResultSize( threading, &async, &result_size );
+    CHECK( SUCCEEDED( hr ) && result_size == sizeof(XUserHandle),
+           "XUserAdd advertises the handle result size (%Iu bytes)", result_size );
+    hr = IXThreadingImpl_XAsyncGetResult( threading, &async, NULL, sizeof(generic_user) - 1,
+                                        &generic_user, &used );
+    CHECK( hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && !generic_user,
+           "a short generic user-result buffer is rejected without writing it" );
+    hr = IXThreadingImpl_XAsyncGetResult( threading, &async, NULL, sizeof(generic_user),
+                                        &generic_user, &used );
+    CHECK( SUCCEEDED( hr ) && generic_user && used == sizeof(generic_user),
+           "generic async retrieval returns the user handle bytes" );
     hr = IXUserImpl_XUserAddResult( users, &async, &user );
     CHECK( SUCCEEDED( hr ) && user, "XUserAddResult returns a user (0x%08lx)", hr );
+    CHECK( user == generic_user, "typed and generic user results identify the same user" );
     if (!user) return;
 
     hr = IXUserImpl_XUserGetState( users, user, &state );
@@ -256,7 +270,8 @@ static BOOLEAN __stdcall find_container( const XGameSaveContainerInfo *info, voi
 
 static void test_xgamesave( const char *scid )
 {
-    XGameSaveProviderHandle provider = NULL;
+    XGameSaveProviderHandle provider = NULL, generic_provider = NULL;
+    SIZE_T result_size = 0, used = 0;
     XGameSaveContainerHandle container = NULL;
     XGameSaveUpdateHandle update = NULL;
     XAsyncBlock async = { 0 };
@@ -271,8 +286,32 @@ static void test_xgamesave( const char *scid )
     blob_expected_hash = hash_bytes( blob_payload, sizeof(blob_payload) );
 
     hr = IXGameSaveImpl3_XGameSaveInitializeProviderAsync( gs, user, scid, FALSE, &async );
+    hr = IXThreadingImpl_XAsyncGetResultSize( threading, &async, &result_size );
+    CHECK( SUCCEEDED(hr) && result_size == sizeof(XGameSaveProviderHandle),
+           "save initialization advertises a provider handle result (%Iu bytes)", result_size );
+    hr = IXThreadingImpl_XAsyncGetResult( threading, &async, NULL, sizeof(generic_provider),
+                                        &generic_provider, &used );
+    CHECK( SUCCEEDED(hr) && generic_provider && used == sizeof(generic_provider),
+           "generic async retrieval returns the save provider handle" );
     hr = IXGameSaveImpl3_XGameSaveInitializeProviderResult( gs, &async, &provider );
     CHECK( SUCCEEDED( hr ) && provider, "InitializeProvider succeeds (0x%08lx)", hr );
+    CHECK( provider == generic_provider, "typed and generic save provider results agree" );
+    if (provider)
+    {
+        XAsyncBlock quota_async = {0};
+        INT64 generic_quota = -1, typed_quota = -1;
+        hr = IXGameSaveImpl3_XGameSaveGetRemainingQuotaAsync( gs, provider, &quota_async );
+        CHECK( SUCCEEDED(hr), "remaining quota starts asynchronously" );
+        hr = IXThreadingImpl_XAsyncGetResultSize( threading, &quota_async, &result_size );
+        CHECK( SUCCEEDED(hr) && result_size == sizeof(INT64), "quota result advertises an INT64" );
+        hr = IXThreadingImpl_XAsyncGetResult( threading, &quota_async, NULL, sizeof(generic_quota),
+                                            &generic_quota, &used );
+        CHECK( SUCCEEDED(hr) && generic_quota >= 0 && used == sizeof(generic_quota),
+               "generic async retrieval returns quota bytes" );
+        hr = IXGameSaveImpl3_XGameSaveGetRemainingQuotaResult( gs, &quota_async, &typed_quota );
+        CHECK( SUCCEEDED(hr) && typed_quota == generic_quota, "typed and generic quota results agree" );
+    }
+
     if (!provider) return;
 
     IXGameSaveImpl3_XGameSaveGetRemainingQuota( gs, provider, &quota_before );
@@ -339,6 +378,68 @@ static BOOLEAN __stdcall count_product( const XStoreProduct *product, void *cont
 {
     (*(int *)context)++;
     return TRUE;
+}
+
+struct retained_product
+{
+    const XStoreProduct *product;
+    const char *store_id;
+    char expected_id[64];
+};
+
+static BOOLEAN CALLBACK retain_product( const XStoreProduct *product, void *context )
+{
+    struct retained_product *retained = context;
+    retained->product = product;
+    retained->store_id = product->storeId;
+    snprintf( retained->expected_id, sizeof(retained->expected_id), "%s", product->storeId );
+    return TRUE;
+}
+
+static volatile unsigned int scrub_sum;
+static void __attribute__((noinline)) scrub_callback_stack(void)
+{
+    volatile BYTE scratch[4096];
+    unsigned int i, sum = 0;
+    for (i = 0; i < sizeof(scratch); ++i) { scratch[i] = 0x5a; sum += scratch[i]; }
+    scrub_sum = sum;
+}
+
+static void test_store_product_lifetime(void)
+{
+    XStoreContextHandle context = NULL;
+    XStoreProductQueryHandle query = NULL, other = NULL;
+    XAsyncBlock block = {0};
+    struct retained_product retained = {0}, second = {0};
+    HRESULT hr;
+    IXStoreImpl6_XStoreCreateContext( store, NULL, &context );
+    hr = IXStoreImpl6_XStoreQueryProductForCurrentGameAsync( store, context, &block );
+    if (hr == S_OK) hr = IXStoreImpl6_XStoreQueryProductForCurrentGameResult( store, &block, &query );
+    CHECK( hr == S_OK && query, "create a current-product query for lifetime checks" );
+    if (query)
+    {
+        hr = IXStoreImpl6_XStoreEnumerateProductsQuery( store, query, &retained, retain_product );
+        CHECK( hr == S_OK && retained.product, "enumeration exposes an owned product record" );
+        scrub_callback_stack();
+        if (retained.product)
+        {
+            BOOL stable = retained.product->storeId == retained.store_id;
+            CHECK( stable && !strncmp(retained.store_id, retained.expected_id, sizeof(retained.expected_id)),
+                   "product and identity survive callback stack reuse" );
+            memset( &block, 0, sizeof(block) );
+            IXStoreImpl6_XStoreQueryProductForCurrentGameAsync( store, context, &block );
+            IXStoreImpl6_XStoreQueryProductForCurrentGameResult( store, &block, &other );
+            IXStoreImpl6_XStoreEnumerateProductsQuery( store, other, &second, retain_product );
+            IXStoreImpl6_XStoreCloseProductsQueryHandle( store, other );
+            scrub_callback_stack();
+            stable = retained.product->storeId == retained.store_id;
+            CHECK( stable && !strncmp(retained.store_id, retained.expected_id, sizeof(retained.expected_id)) &&
+                   retained.product->productKind == XStoreProductKind_Game && retained.product->skusCount == 0,
+                   "closing another query preserves the retained product until its own query closes" );
+        }
+        IXStoreImpl6_XStoreCloseProductsQueryHandle( store, query );
+    }
+    IXStoreImpl6_XStoreCloseContextHandle( store, context );
 }
 
 static void test_xstore(void)
@@ -537,6 +638,40 @@ static void test_storage_and_system(void)
         CHECK( SUCCEEDED( hr ) && buf[0], "console id returned" );
     }
     else CHECK( 0, "query XSystem" );
+
+    {
+        IXSystemAnalyticsImpl *analytics = NULL;
+        struct { UINT64 before; XSystemAnalyticsInfo info; UINT64 after; } guarded;
+        HMODULE combase = LoadLibraryA( "combase.dll" );
+        HRESULT (WINAPI *ro_init)( UINT32 ) = (void *)GetProcAddress( combase, "RoInitialize" );
+        void (WINAPI *ro_uninit)( void ) = (void *)GetProcAddress( combase, "RoUninitialize" );
+        unsigned int iteration;
+        BOOL initialized = FALSE;
+
+        hr = query( &CLSID_XSystemAnalyticsImpl, &IID_IXSystemAnalyticsImpl, (void **)&analytics );
+        CHECK( hr == S_OK && analytics, "query system analytics interface" );
+        if (analytics)
+        {
+            for (iteration = 0; iteration < 2; ++iteration)
+            {
+                XSystemAnalyticsInfo *result;
+                if (iteration && ro_init) initialized = SUCCEEDED( ro_init( 1 ) );
+                memset( &guarded, 0xa5, sizeof(guarded) );
+                result = analytics->lpVtbl->XSystemGetAnalyticsInfo( analytics, &guarded.info );
+                CHECK( result == &guarded.info && guarded.before == 0xa5a5a5a5a5a5a5a5ULL &&
+                       guarded.after == 0xa5a5a5a5a5a5a5a5ULL, "analytics preserves its aggregate return buffer %u", iteration );
+                CHECK( !strcmp( guarded.info.family, "Windows.Desktop" ) &&
+                       !strcmp( guarded.info.form, "Desktop" ),
+                       "analytics reports the complete family accepted by native Party %u", iteration );
+                CHECK( guarded.info.osVersion.major &&
+                       !memcmp( &guarded.info.osVersion, &guarded.info.hostingOsVersion, sizeof(XVersion) ),
+                       "analytics returns initialized, consistent OS versions %u", iteration );
+                if (initialized && ro_uninit) ro_uninit();
+            }
+            IXSystemAnalyticsImpl_Release( analytics );
+        }
+        if (combase) FreeLibrary( combase );
+    }
 
     {
         IXNetworkingImpl2 *net = NULL;
@@ -1059,7 +1194,147 @@ static void test_xthreading(void)
     }
 }
 
-int main(void)
+
+struct manual_probe
+{
+    LONG work_thread, completion_thread, cleaned, direct_thread;
+};
+
+static HRESULT CALLBACK manual_provider( XAsyncOp operation, const XAsyncProviderData *data )
+{
+    struct manual_probe *probe = data->context;
+    if (operation == XAsyncOp_DoWork)
+    {
+        InterlockedExchange( &probe->work_thread, GetCurrentThreadId() );
+        IXThreadingImpl_XAsyncComplete( threading, data->async, S_OK, sizeof(UINT32) );
+        return E_PENDING;
+    }
+    if (operation == XAsyncOp_GetResult) *(UINT32 *)data->buffer = 0x11223344;
+    if (operation == XAsyncOp_Cleanup) InterlockedIncrement( &probe->cleaned );
+    return S_OK;
+}
+
+static void CALLBACK manual_completed( XAsyncBlock *block )
+{
+    struct manual_probe *probe = block->context;
+    InterlockedExchange( &probe->completion_thread, GetCurrentThreadId() );
+}
+
+static void CALLBACK manual_direct( void *context, BOOLEAN canceled )
+{
+    struct manual_probe *probe = context;
+    InterlockedExchange( &probe->direct_thread, canceled ? -1 : GetCurrentThreadId() );
+}
+
+static void test_manual_queues(void)
+{
+    XTaskQueueHandle parent = NULL, other = NULL, composite = NULL, saved = NULL;
+    XTaskQueuePortHandle work_port = NULL, completion_port = NULL;
+    struct manual_probe probe = {0}, retained = {0};
+    XAsyncBlock block = {0};
+    DWORD owner = GetCurrentThreadId();
+    UINT32 value = 0;
+    HRESULT hr;
+    unsigned int iteration;
+
+    printf( "# Manual queue thread, port, and composite routing\n" );
+    hr = IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_Manual,
+                                          XTaskQueueDispatchMode_Manual, &parent );
+    CHECK( hr == S_OK && parent, "create the caller-dispatched queue" );
+    hr = IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_Manual,
+                                          XTaskQueueDispatchMode_Manual, &other );
+    CHECK( hr == S_OK && other, "create a distinct queue" );
+    if (!parent || !other) return;
+    IXThreadingImpl_XTaskQueueGetCurrentProcessTaskQueue( threading, &saved );
+
+    for (iteration = 0; iteration < 4; ++iteration)
+    {
+        memset( &probe, 0, sizeof(probe) );
+        memset( &block, 0, sizeof(block) );
+        block.context = &probe;
+        block.callback = manual_completed;
+        block.queue = parent;
+        if (iteration == 1)
+        {
+            IXThreadingImpl_XTaskQueueGetPort( threading, parent, XTaskQueuePort_Work, &work_port );
+            IXThreadingImpl_XTaskQueueGetPort( threading, other, XTaskQueuePort_Completion, &completion_port );
+            hr = IXThreadingImpl_XTaskQueueCreateComposite( threading, work_port, completion_port, &composite );
+            CHECK( hr == S_OK && composite, "composite retains the original port identities" );
+            block.queue = composite;
+        }
+        if (iteration == 3)
+        {
+            IXThreadingImpl_XTaskQueueSetCurrentProcessTaskQueue( threading, parent );
+            block.queue = NULL;
+        }
+        hr = IXThreadingImpl_XAsyncBegin( threading, &block, &probe, manual_provider, "manual-probe", manual_provider );
+        CHECK( hr == S_OK, "begin manual operation %u", iteration );
+        hr = IXThreadingImpl_XAsyncSchedule( threading, &block, iteration == 2 ? 10 : 0 );
+        CHECK( hr == S_OK, "schedule manual operation %u", iteration );
+        Sleep( 40 );
+        CHECK( !probe.work_thread && !probe.completion_thread,
+               "operation %u stays queued until the caller dispatches", iteration );
+        IXThreadingImpl_XTaskQueueDispatch( threading, other, XTaskQueuePort_Work, 0 );
+        IXThreadingImpl_XTaskQueueDispatch( threading, parent, XTaskQueuePort_Completion, 0 );
+        CHECK( !probe.work_thread, "the wrong queue and port cannot run work %u", iteration );
+        IXThreadingImpl_XTaskQueueDispatch( threading, parent, XTaskQueuePort_Work, 0 );
+        CHECK( probe.work_thread == owner && !probe.completion_thread,
+               "work %u runs on the dispatching thread and leaves completion queued", iteration );
+        IXThreadingImpl_XTaskQueueDispatch( threading, iteration == 1 ? parent : other,
+                                          XTaskQueuePort_Completion, 0 );
+        CHECK( !probe.completion_thread, "the wrong completion port cannot run callback %u", iteration );
+        IXThreadingImpl_XTaskQueueDispatch( threading, iteration == 1 ? other : parent,
+                                          XTaskQueuePort_Completion, 0 );
+        CHECK( probe.completion_thread == owner, "completion %u runs on the owning dispatch thread", iteration );
+        hr = IXThreadingImpl_XAsyncGetResult( threading, &block, manual_provider, sizeof(value), &value, NULL );
+        CHECK( hr == S_OK && value == 0x11223344 && probe.cleaned == 1,
+               "operation %u returns its result and cleans up exactly once", iteration );
+    }
+    IXThreadingImpl_XTaskQueueSetCurrentProcessTaskQueue( threading, saved );
+    memset( &probe, 0, sizeof(probe) );
+    hr = IXThreadingImpl_XTaskQueueSubmitCallback( threading, parent, XTaskQueuePort_Work, &probe, manual_direct );
+    Sleep( 30 );
+    CHECK( hr == S_OK && !probe.direct_thread, "a direct callback also waits for manual dispatch" );
+    IXThreadingImpl_XTaskQueueDispatch( threading, parent, XTaskQueuePort_Work, 0 );
+    CHECK( probe.direct_thread == owner, "a direct callback runs on the registered caller thread" );
+    memset( &probe, 0, sizeof(probe) );
+    hr = IXThreadingImpl_XTaskQueueSubmitDelayedCallback( threading, other, XTaskQueuePort_Work,
+                                                         1000, &probe, manual_direct );
+    CHECK( hr == S_OK, "accept delayed manual work" );
+    CHECK( !IXThreadingImpl_XTaskQueueDispatch( threading, other, XTaskQueuePort_Work, 0 ) &&
+           !probe.direct_thread, "manual work cannot run before its delay" );
+    hr = IXThreadingImpl_XTaskQueueTerminate( threading, other, TRUE, NULL, NULL );
+    CHECK( hr == S_OK && probe.direct_thread == -1,
+           "termination cancels delayed manual work before returning" );
+    probe.direct_thread = 0;
+    Sleep( 1100 );
+    CHECK( !IXThreadingImpl_XTaskQueueDispatch( threading, other, XTaskQueuePort_Work, 0 ) &&
+           !probe.direct_thread, "no timer can deliver work after termination" );
+    hr = IXThreadingImpl_XTaskQueueSubmitDelayedCallback( threading, other, XTaskQueuePort_Work,
+                                                         1, &probe, manual_direct );
+    CHECK( hr == E_ABORT, "a terminated queue rejects delayed work" );
+    if (composite)
+    {
+        memset( &probe, 0, sizeof(probe) );
+        hr = IXThreadingImpl_XTaskQueueSubmitCallback( threading, parent, XTaskQueuePort_Work,
+                                                      &retained, manual_direct );
+        CHECK( hr == S_OK, "queue parent work on a shared endpoint" );
+        hr = IXThreadingImpl_XTaskQueueSubmitDelayedCallback( threading, composite, XTaskQueuePort_Work,
+                                                             1000, &probe, manual_direct );
+        CHECK( hr == S_OK, "queue composite work on the shared endpoint" );
+        hr = IXThreadingImpl_XTaskQueueTerminate( threading, composite, TRUE, NULL, NULL );
+        CHECK( hr == S_OK && probe.direct_thread == -1 && !retained.direct_thread,
+               "terminating a composite cancels only its own callbacks" );
+        IXThreadingImpl_XTaskQueueDispatch( threading, parent, XTaskQueuePort_Work, 0 );
+        CHECK( retained.direct_thread == owner, "parent work survives composite termination" );
+    }
+    if (composite) IXThreadingImpl_XTaskQueueCloseHandle( threading, composite );
+    if (saved) IXThreadingImpl_XTaskQueueCloseHandle( threading, saved );
+    IXThreadingImpl_XTaskQueueCloseHandle( threading, other );
+    IXThreadingImpl_XTaskQueueCloseHandle( threading, parent );
+}
+
+int main(int argc, char **argv)
 {
     HMODULE mod;
     HRESULT (WINAPI *init)( ULONG, ULONG );
@@ -1093,9 +1368,22 @@ int main(void)
         return 100;
     }
 
+    if (argc > 1 && !strcmp(argv[1], "--store-lifetime"))
+    {
+        test_store_product_lifetime();
+        printf( "%s: %d checks, %d failed\n", g_failed ? "FAILED" : "PASSED", g_run, g_failed );
+        return g_failed;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--manual-queues"))
+    {
+        test_manual_queues();
+        printf( "%s: %d checks, %d failed\n", g_failed ? "FAILED" : "PASSED", g_run, g_failed );
+        return g_failed;
+    }
     test_xpackage();
     test_xuser();
     test_xstore();
+    test_store_product_lifetime();
     test_xgameui();
     test_storage_and_system();
     test_xthreading();

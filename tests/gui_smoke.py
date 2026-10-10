@@ -347,6 +347,24 @@ def main():
     # or write into one. It also means the run starts from the state a new user
     # has, which is the state most worth testing.
     home = tempfile.mkdtemp(prefix="ferestre-gui-smoke-")
+    recipes_dir = os.path.join(home, "titles")
+    shutil.copytree(os.path.join(os.getcwd(), "titles"), recipes_dir)
+    # A fixed fixture keeps this warning check independent of live compatibility.
+    with open(os.path.join(recipes_dir, "9ZZBROKEN001.toml"), "w") as f:
+        f.write('''schema = 1
+[title]
+product-id = "9ZZBROKEN001"
+name = "Smoke Test Broken Game"
+slug = "smoke-broken-game"
+[launch]
+executable = "Game.exe"
+[status]
+state = "broken"
+summary = "Synthetic failure fixture"
+stops-at = "Synthetic startup failure"
+blocked-by = "unknown"
+last-verified = 2026-10-10
+''')
     env = dict(os.environ)
     env.update(
         {
@@ -355,7 +373,7 @@ def main():
             "XDG_STATE_HOME": os.path.join(home, "state"),
             "XDG_CONFIG_HOME": os.path.join(home, "config"),
             "GTK_A11Y": "atspi",
-            "FERESTRE_TITLES": os.path.join(os.getcwd(), "titles"),
+            "FERESTRE_TITLES": recipes_dir,
             # Recipes come from the checkout, but nothing else should: no Steam,
             # no runtime, no client.
             "XODUS_GAMES_DIR": os.path.join(home, "games"),
@@ -378,10 +396,10 @@ def main():
         f.write("0 smoke-test-runtime\n")
     wanted = set()
     recipe_count = 0
-    for name in os.listdir(os.path.join(os.getcwd(), "titles")):
+    for name in os.listdir(recipes_dir):
         if not name.endswith(".toml") or name == "capabilities.toml":
             continue
-        with open(os.path.join(os.getcwd(), "titles", name), "rb") as f:
+        with open(os.path.join(recipes_dir, name), "rb") as f:
             recipe = tomllib.load(f)
         recipe_count += 1
         wanted |= set(recipe.get("runtime", {}).get("requires", []))
@@ -575,7 +593,7 @@ print(":: done", flush=True)
             frame,
         )
         check(
-            any("Forza Horizon 5" in label for label in labels),
+            any("Smoke Test Broken Game" in label for label in labels),
             "a broken title is listed rather than hidden",
             frame,
         )
@@ -637,6 +655,33 @@ print(":: done", flush=True)
             time.monotonic() + TIMEOUT,
         )
         check(True, "and the switch turns them back off")
+
+        print("scroll position on title actions")
+        def scroll_value():
+            for node in find_all(frame, role="scroll bar"):
+                value = node.get_value_iface()
+                if value is not None and value.get_maximum_value() > 200:
+                    return value
+            return None
+        value = scroll_value()
+        check(value is not None, "the library has a scrollable title list", frame)
+        value.set_current_value(200)
+        time.sleep(0.25)
+        position = value.get_current_value()
+        check(position > 50, f"the library is scrolled before the click ({position})", frame)
+        play = row_button(frame, "Minecraft for Windows", "Play")
+        check(play is not None, "the installed fixture can be selected to play", frame)
+        click(play)
+        time.sleep(0.5)
+        after = scroll_value().get_current_value()
+        check(abs(after - position) < 2, f"a title action keeps the scroll position ({position} -> {after})", frame)
+
+        select_in_list(frame, "Runtime")
+        wait_for(frame, lambda root: "Ferestre release" in texts(root), "section navigation", time.monotonic() + TIMEOUT)
+        time.sleep(0.2)
+        check(scroll_value().get_current_value() == 0, "a different section starts at the top", frame)
+        select_in_list(frame, "Library")
+        wait_for(frame, lambda root: "Minecraft for Windows" in texts(root), "return to library", time.monotonic() + TIMEOUT)
 
         print("installing asks before it downloads")
         install = row_button(frame, "Smoke Test Racer", "Install")

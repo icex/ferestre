@@ -220,6 +220,44 @@ found. The confirmed restoration used a read-only source backup and a local
 copy, not an automatic import feature. No account-specific folder name is
 needed in this recipe.
 
+### Halo Infinite — **playable; intermittent offline display unresolved**
+
+Use launcher 0.1.5 with runtime 11.0.20261010.1, a licensed Store/Game Pass
+installation and the shipped `9PP5G1F0C2B6.toml` recipe. Keep the original
+`HaloInfinite.exe` bootstrapper and anti-cheat files. The recipe enables
+`FERESTRE_IMAGE_VIEW=real-path` and `XGR_STRICT_MANUAL_QUEUES=1`.
+
+The image view needs Python 3, util-linux and enabled unprivileged user/mount
+namespaces. Licensed executable images live in private tmpfs mounts for the
+launch and its campaign handoff; the encrypted installation stays intact.
+The launch inherits its package manifest into child processes.
+
+Campaign, Academy and multiplayer have live confirmation, as does local saving.
+Intermittent offline display is unresolved. Cloud saves and purchases are not
+qualified. A Store/Xbox account mismatch dialog can be dismissed to play.
+Remove an older personal Halo recipe override, or update it to match the shipped
+recipe, since personal overrides take precedence.
+
+### Minecraft Dungeons II — **playable**
+
+Use the shipped `9P5786PJB9RP.toml` recipe and matching updated runtime/service.
+Complete the Squid Coast tutorial before evaluating campaign progress after a
+restart: the user confirmed saving after tutorial completion. Mid-tutorial
+restarts alone did not establish a save failure. Cloud sync and multiplayer
+remain unqualified. Accept the bundled Visual C++ installer on a fresh prefix.
+
+### Goat Simulator 3 — **offline playable; online loading unresolved**
+
+The latest runtime fixes PlayFab Party platform classification and retains
+Store product data for the lifetime of its query. Online sign-in and session
+requests succeeded in a clean isolated run. San Angora then remained on its
+loading screen with repeated requests for an unsupported save interface.
+The player confirmed offline gameplay works. The stalled loading run had online
+features enabled; it does not establish an offline gameplay failure. Compare
+offline and online loading before attributing the stall to the save interface.
+Investigation is paused; peer joining, voice and save restoration remain
+unqualified. See `titles/9PDS2N82QNXG.toml` for current issues.
+
 ## 5. Troubleshooting (every error we actually hit, and its fix)
 
 | symptom | cause | fix |

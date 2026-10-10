@@ -61,6 +61,10 @@ Pronounced roughly *feh-RESS-treh*.
 
 ## Status
 
+Release **0.1.5** pairs with runtime **11.0.20261010.1**. Update both for Halo
+Infinite campaign support. See [release qualification](docs/RELEASE-0.1.5.md)
+for the tested scope and remaining gaps.
+
 Honest version, because this is early. Every row here was run on a real machine,
 not inferred from the fact that it downloaded:
 
@@ -68,11 +72,14 @@ not inferred from the fact that it downloaded:
 |---|---|---|
 | **Minecraft for Windows** (Bedrock) | Store | Playable. Signs in to Xbox Live, loads the profile, and **joins third-party servers from the in-game list** |
 | **Clair Obscur: Expedition 33** | Store / Game Pass | Playable — saves, video, full game |
+| **Hollow Knight: Silksong** | Game Pass | Playable — player-confirmed |
 | **DREDGE** | Game Pass | Playable |
 | **Stardew Valley** | Game Pass | Playable |
 | **DOOM 64** | Game Pass | Playable |
 | **Overthrown** | Game Pass | Playable |
-| **Goat Simulator 3** | Game Pass | Playable; online connectivity is being verified |
+| **Minecraft Dungeons II** | Game Pass Ultimate | Playable — sign-in and gameplay work; saving confirmed after finishing the tutorial |
+| **Halo Infinite** | Store / Game Pass Ultimate | Playable — campaign, training and multiplayer; intermittent offline display under investigation |
+| **Goat Simulator 3** | Game Pass | Offline gameplay works; online sign-in fixed, online-enabled world loading remains under investigation |
 | **Age of Empires Definitive Edition** | Game Pass | Playable — boots, starts a custom game, and plays |
 | **Forza Horizon 5** | Store | Playable with restored Windows saves; Forza Online and the live Festival Playlist work |
 

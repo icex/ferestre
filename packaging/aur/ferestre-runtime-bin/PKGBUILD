@@ -15,7 +15,7 @@
 pkgname=ferestre-runtime-bin
 # Upstream's own version string is 'xodus-bleeding-edge-11.0-<date>-<n>-g<sha>';
 # pkgver cannot hold the hyphens, so a release is <proton major>.<minor>.<date>.
-pkgver=11.0.20260803
+pkgver=11.0.20261010.1
 pkgrel=1
 pkgdesc='Patched Proton with the ferestre Xbox GDK runtime implementation, prebuilt'
 arch=('x86_64')
@@ -103,17 +103,14 @@ install="$pkgname.install"
 options=('!strip' '!debug' 'emptydirs')
 
 # RELEASE CONTRACT -- see ../README.md, "Cutting a runtime release".
-# The asset is a zstd tarball whose single top-level directory is named exactly
+# The asset is an xz tarball whose single top-level directory is named exactly
 # like the tarball's stem, and it is the installable compatibility tool: proton,
 # toolmanifest.vdf, compatibilitytool.vdf, version, files/.
-_tarball="ferestre-runtime-$pkgver-x86_64.tar.zst"
+_tarball="ferestre-runtime-$pkgver.tar.xz"
 source=("$url/releases/download/runtime-$pkgver/$_tarball")
 
-# SKIP is a placeholder, and the only honest value while no release exists: a
-# made-up hash would fail with a confusing message instead of a clear one.
-# Whoever cuts the first release replaces it by running `updpkgsums` in this
-# directory, then regenerates .SRCINFO. Do not publish to the AUR with SKIP.
-sha256sums=('SKIP')
+# Verified against the published release asset.
+sha256sums=('05d50dfebbf9ce8e364e92804af0a2c0282a7f42f2296ae7bf5ece1b34889b85')
 
 package() {
   local src="$srcdir/ferestre-runtime-$pkgver"
