@@ -34,16 +34,15 @@ requires = [
 ]
 
 [status]
-state = "menus"
-stops-at = "San Angora world loading; menus and online sign-in succeeded"
-summary = "Menus and online sign-in work with the updated runtime; San Angora world loading remains stuck. Gameplay and co-op are not qualified on this build."
+state = "playable-with-issues"
+summary = "Offline gameplay works, confirmed by the player. Online sign-in succeeds, but an online-enabled new-world loading test stalled; online co-op remains unqualified."
 last-verified = 2026-10-10
-verified-with = "Game Pass package, isolated prefix; Xbox/PlayFab sign-in and session requests succeeded, native Party initialization passed; world loading did not complete"
+verified-with = "Game Pass package; player-confirmed offline gameplay; isolated online-enabled prefix signed in through Xbox/PlayFab and native Party initialization passed, but new-world loading stalled"
 
 [[issues]]
-symptom = "Starting San Angora remains on the loading screen"
+symptom = "A new San Angora save remained on the loading screen in the online-enabled isolated test"
 cause = "Not established. The loading run repeatedly requested an unsupported save interface, IID ab4ae4fb-6508-4950-a032-45fd4bf8c43b."
-fix = "Investigation paused. Verify the native save interface ABI before implementing it; successful sign-in does not qualify world loading."
+fix = "Investigation paused. Compare offline and online-enabled loading under the same conditions, then verify the native save interface ABI if it remains implicated. Offline gameplay works; online co-op is unqualified."
 log-match = "ab4ae4fb-6508-4950-a032-45fd4bf8c43b"
 
 [[issues]]

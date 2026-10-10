@@ -36,9 +36,9 @@ real contribution even — especially — when the answer is that it does not ru
 your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 
 Current release qualification: [0.1.5](RELEASE-0.1.5.md). Halo is playable,
-with an intermittent offline indicator still unresolved. Goat is currently
-qualified only through menus and online sign-in; its older gameplay report
-does not establish gameplay on the current build.
+with an intermittent offline indicator still unresolved. Goat offline gameplay is player-confirmed. Its automated online-enabled
+new-world loading test stalled despite successful sign-in; online co-op remains
+unqualified.
 
 ## The matrix
 
@@ -56,7 +56,7 @@ does not establish gameplay on the current build.
 | Minecraft for Windows | `9NBLGGH2JHXJ` | Playable | Signs in to Xbox Live, loads the profile, plays, and joins third-party servers from the in-game list. | 2026-09-06 |
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
 | Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. | 2026-09-06 |
-| Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Starts, menus only | Menus and online sign-in work with the updated runtime; San Angora world loading remains stuck. Gameplay and co-op are not qualified on this build. Stops at: San Angora world loading; menus and online sign-in succeeded. | 2026-10-10 |
+| Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable, with issues | Offline gameplay works, confirmed by the player. Online sign-in succeeds, but an online-enabled new-world loading test stalled; online co-op remains unqualified. | 2026-10-10 |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.
 

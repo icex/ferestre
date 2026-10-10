@@ -26,7 +26,7 @@ Halo Infinite. The runtime uses the same pinned Proton/Wine sources as
 |---|---|---|
 | Halo Infinite | Game Pass Ultimate package 1.4206.46191.0 reached Warship Gbraakon gameplay; player confirmed campaign, multiplayer and saving; campaign handoff/relaunch and normal process exit were observed | Intermittent offline display is unresolved; purchases, cloud sync and long-session reliability are unqualified |
 | Minecraft Dungeons II | Sign-in, Store licence checks and Squid Coast gameplay worked; player confirmed saving after finishing the tutorial | Mid-tutorial restart was not a demonstrated save defect; multiplayer and cloud sync remain unqualified |
-| Goat Simulator 3 | Native Party initialization succeeded after failing on the previous analytics family; clean online sign-in/session requests succeeded; Store lifetime regression passed | San Angora world loading remained stuck. Repeated unsupported save-interface requests are a lead, not a proven root cause. Gameplay, co-op, voice and saving are unqualified |
+| Goat Simulator 3 | Offline gameplay works, confirmed by the player. Native Party initialization and clean online sign-in/session requests succeeded; Store lifetime regression passed | The online-enabled San Angora new-world test stalled. Compare offline/online loading before assigning a cause; unsupported save-interface requests remain a lead. Co-op, voice and saving are unqualified |
 
 PR #1 had no save/checkpoint fix. Dungeons requires no additional save patch
 based on the completed tutorial and the player's confirmation.

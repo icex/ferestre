@@ -9,8 +9,9 @@ for Bedrock on Android, for Microsoft Store titles on Linux.
 Release 0.1.5 and runtime 11.0.20261010.1 add Halo campaign support and tested
 GDK async, queue, analytics and Store lifetime fixes. Halo gameplay and saving
 have live confirmation. Dungeons saving was confirmed after its tutorial.
-Goat Simulator 3 reaches menus and signs in, but world loading remains stuck;
-its save interface needs ABI verification before further implementation.
+Goat Simulator 3 works offline (player-confirmed) and signs in online. An
+online-enabled new-world test stalled; compare offline/online loading and verify
+the save interface ABI before further implementation.
 See [release qualification](RELEASE-0.1.5.md).
 
 ## Where the work already is

@@ -246,14 +246,17 @@ restart: the user confirmed saving after tutorial completion. Mid-tutorial
 restarts alone did not establish a save failure. Cloud sync and multiplayer
 remain unqualified. Accept the bundled Visual C++ installer on a fresh prefix.
 
-### Goat Simulator 3 — **menus and sign-in; world loading unresolved**
+### Goat Simulator 3 — **offline playable; online loading unresolved**
 
 The latest runtime fixes PlayFab Party platform classification and retains
 Store product data for the lifetime of its query. Online sign-in and session
 requests succeeded in a clean isolated run. San Angora then remained on its
 loading screen with repeated requests for an unsupported save interface.
-Investigation is paused; no gameplay, peer joining, voice or save restoration
-claim is made for this build. See `titles/9PDS2N82QNXG.toml` for current issues.
+The player confirmed offline gameplay works. The stalled loading run had online
+features enabled; it does not establish an offline gameplay failure. Compare
+offline and online loading before attributing the stall to the save interface.
+Investigation is paused; peer joining, voice and save restoration remain
+unqualified. See `titles/9PDS2N82QNXG.toml` for current issues.
 
 ## 5. Troubleshooting (every error we actually hit, and its fix)
 
