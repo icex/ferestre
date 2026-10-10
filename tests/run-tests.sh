@@ -48,6 +48,13 @@ say "compiling the test binary"
     2>&1 | grep -viE 'COBJMACROS redefined|this is the location|note:' || true
 [ -f "$WORK/xgr_tests.exe" ] || fail "test binary did not build"
 
+# Compiled, never run here: it needs a Vulkan GPU. Building it on every run is
+# what keeps a test nobody runs routinely from quietly stopping compiling.
+say "compiling the D3D12 allocator lifetime test (not run: it needs a GPU)"
+"$INCUBE" x86_64-w64-mingw32-gcc -O1 -o "$WORK/d3d12_allocator_lifetime.exe" \
+    "$REPO_DIR/tests/d3d12_allocator_lifetime.c" 2>&1 | grep -v 'note:' || true
+[ -f "$WORK/d3d12_allocator_lifetime.exe" ] || fail "the D3D12 allocator lifetime test did not build"
+
 # Fixtures: a MicrosoftGame.config in the cwd, and a scratch save root.
 cp "$REPO_DIR/tests/fixtures/MicrosoftGame.config" "$WORK/"
 cp "$DLL" "$WORK/xgameruntime.dll"
