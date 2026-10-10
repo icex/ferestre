@@ -361,6 +361,7 @@ def main():
             "XODUS_GAMES_DIR": os.path.join(home, "games"),
             "XODUS_STEAM_DIR": os.path.join(home, "steam"),
             "XODUS_PROTON_DIR": os.path.join(home, "runtime"),
+            "FERESTRE_PACKAGE_VERSION": "0.1.3-smoke",
             "XODUS_CLI_DIR": os.path.join(home, "client"),
         }
     )
@@ -705,6 +706,17 @@ print(":: done", flush=True)
         check(
             any("smoke-test-runtime" in t for t in labels),
             "the runtime it found is named",
+            frame,
+        )
+
+        check(
+            "Ferestre release" in labels and "0.1.3-smoke" in labels,
+            "the launcher release uses the packaged version",
+            frame,
+        )
+        check(
+            labels.index("Ferestre release") < labels.index("Patched Proton"),
+            "the launcher release appears before the Proton runtime",
             frame,
         )
 

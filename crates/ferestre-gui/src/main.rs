@@ -358,6 +358,16 @@ fn render(ui: &Ui) {
 }
 
 fn render_runtime(ui: &Ui, page: &adw::PreferencesPage) {
+    let packaged = std::env::var("FERESTRE_PACKAGE_VERSION").ok();
+    let release = adw::PreferencesGroup::new();
+    release.add(
+        &adw::ActionRow::builder()
+            .title("Ferestre release")
+            .subtitle(ferestre_core::package_version(packaged.as_deref()))
+            .build(),
+    );
+    page.add(&release);
+
     let model = ui.model.borrow();
     let (title, subtitle) = model::runtime_summary(model.runtime.as_ref());
     let group = adw::PreferencesGroup::builder()
