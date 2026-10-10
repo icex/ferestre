@@ -1,3 +1,15 @@
+# Retro Classics -- Game Pass
+#
+# A catalogue of streamed classic games whose interface is drawn by Ultralight
+# (WebCore). That renderer releases a D3D12 command allocator while a list
+# recorded from it is still open, then closes the list. The runtime's
+# vkd3d-proton keeps such an allocator alive under
+# VKD3D_CONFIG=retain_recording_allocators, and the launcher adds that token on
+# its own when it finds Ultralight.dll, UltralightCore.dll and WebCore.dll beside
+# the executable (docs/AUTODETECTION.md). It is not set here: a recipe's env
+# replaces the variable outright, and would drop any flags set by whoever runs
+# the title.
+
 schema = 1
 
 [title]
@@ -10,7 +22,6 @@ title-id = "6FBADC96"
 
 [launch]
 executable = "RetroClassics.exe"
-env = { VKD3D_CONFIG = "retain_recording_allocators" }
 
 [runtime]
 requires = [
@@ -22,19 +33,19 @@ requires = [
 ]
 
 [status]
-state = "playable-with-issues"
-summary = "Signs in, loads the catalogue and streams Tennis with the matching runtime. Broader game/controller coverage remains unqualified."
+state = "playable"
+summary = "Playable, confirmed by the player. Signs in, loads the catalogue and streams Tennis; broader game, controller and save-restore coverage is not separately qualified."
 last-verified = 2026-10-10
-verified-with = "Game Pass package 3.3.15.0; native catalogue and Tennis stream in an isolated prefix; allocator lifetime before/after reproducer and legacy save API regression"
+verified-with = "Player confirmation on Game Pass package 3.3.15.0 (2026-10-10); catalogue and Tennis stream in an isolated prefix; manual D3D12 allocator-lifetime reproducer before and after the vkd3d-proton patch; IXGameSaveImpl4 regression in tests/xgr_tests.c"
 
 [[issues]]
-symptom = "The application exits at startup with a vkEndCommandBuffer null-buffer fault"
-cause = "The engine retires a command allocator while a list is recording; the backend invalidates the recording buffer before the engine closes the list."
-fix = "Use a runtime providing recording-allocator-lifetime and the retain_recording_allocators compatibility setting."
-log-match = "vkEndCommandBuffer Exception"
+symptom = "The application exits at startup with a vkEndCommandBuffer null-buffer fault; on a patched runtime without the setting, the log reports a command list invalidated while recording instead"
+cause = "Ultralight releases a command allocator while a list is recording from it; the allocator owns the recording command buffer."
+fix = "Use a runtime providing d3d12.recording-allocator-lifetime and launch through ferestre, which adds retain_recording_allocators to VKD3D_CONFIG. Setting VKD3D_CONFIG to an empty value turns that off."
+log-match = 'was recording; list invalidated|vkEndCommandBuffer Exception'
 
 [[issues]]
 symptom = "Save initialization reports E_NOINTERFACE"
-cause = "Newer GDK wrappers request IXGameSaveImpl4 even for the legacy save API."
-fix = "Use a runtime providing gamesave-interface4-legacy. New PlayFab cloud APIs remain unsupported; this does not claim cloud synchronization."
-log-match = "XGameSaveFilesGetFolderWithUiAsync failed with: 0x80004002"
+cause = "The title asks the runtime for IXGameSaveImpl4 before its legacy local save calls, and older runtimes do not expose that interface."
+fix = "Use a runtime providing xgameruntime.gamesave-interface4-legacy. Its PlayFab cloud methods return E_NOTIMPL; cloud synchronization is not claimed."
+log-match = 'XGameSaveFilesGetFolderWithUiAsync failed with: 0x80004002'

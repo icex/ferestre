@@ -72,7 +72,7 @@ not inferred from the fact that it downloaded:
 |---|---|---|
 | **Minecraft for Windows** (Bedrock) | Store | Playable. Signs in to Xbox Live, loads the profile, and **joins third-party servers from the in-game list** |
 | **Clair Obscur: Expedition 33** | Store / Game Pass | Playable — saves, video, full game |
-| **Retro Classics** | Game Pass | Catalogue and Tennis stream work with the matching newer runtime; broader coverage unqualified |
+| **Retro Classics** | Game Pass | Playable — player-confirmed; needs a runtime with the allocator-lifetime and save-interface fixes |
 | **Hollow Knight: Silksong** | Game Pass | Playable — player-confirmed |
 | **DREDGE** | Game Pass | Playable |
 | **Stardew Valley** | Game Pass | Playable |
