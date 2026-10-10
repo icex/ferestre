@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use ferestre_core::autofix;
 use ferestre_core::catalog;
 use ferestre_core::http;
 use ferestre_core::install;
@@ -502,12 +503,9 @@ fn cmd_run(
         )
     })?;
 
-    // New installs can share an engine failure without sharing a tested recipe.
-    let profiles =
-        ferestre_core::autofix::detect(&paths.install_dir(recipe)?, &recipe.launch.executable);
-    let mut inferred = recipe.clone();
-    ferestre_core::autofix::add_wants(&mut inferred, &profiles);
-    let recipe = &inferred;
+    // A title without a tested recipe can still share an engine with one that
+    // has been debugged. The same inference feeds the window's verdict.
+    let inferred = autofix::infer(recipe, Some(&paths.install_dir(recipe)?));
 
     // Checked before anything is started, because the alternative is a title
     // that exits 1 with an empty log and someone guessing which of eleven
@@ -515,21 +513,12 @@ fn cmd_run(
     let runtimes = runtime::all(&paths);
     let requested_runtime = runtime::selected(paths.config_dir(), &recipe.title.product_id);
     let runtime = runtime::select(
-        recipe,
+        &inferred.recipe,
         &runtimes,
         requested_runtime.as_deref(),
         registry_for(&paths).as_ref(),
     )?;
-    let mut configured = recipe.clone();
-    if ferestre_core::autofix::apply(
-        &mut configured,
-        &profiles,
-        &runtime.provides,
-        paths.var("VKD3D_CONFIG").is_some(),
-    ) {
-        eprintln!("-- detected Ultralight: enabled recording allocator lifetime compatibility");
-    }
-    let recipe = &configured;
+    let recipe = &engine_defaults(inferred, runtime, &paths);
     let registry = registry_for(&paths);
     let assessment = runtime::assess(recipe, runtime, registry.as_ref());
     let verdict = gate(&assessment);
@@ -583,6 +572,54 @@ fn cmd_run(
     start_service(&dirs)?;
 
     run_teed(plan.to_command(), &launch::log_path(recipe, &dirs))
+}
+
+/// The recipe a launch uses once a detected engine's defaults are settled,
+/// with one line saying what happened to them.
+///
+/// Said whatever the outcome, short of no engine at all: someone comparing a
+/// run with and without a flag needs to know whether the launcher added it, and
+/// someone who opted out needs to see that the opt-out was honoured.
+fn engine_defaults(
+    inferred: autofix::Inferred,
+    runtime: &InstalledRuntime,
+    paths: &Paths,
+) -> Recipe {
+    let mut recipe = inferred.recipe.into_owned();
+    let Some(profile) = inferred.profile else {
+        return recipe;
+    };
+    let (key, token) = profile.setting();
+    // Raw, not `var`: an empty value is the opt-out, not an absence.
+    let outcome = autofix::apply(
+        &mut recipe,
+        Some(profile),
+        &runtime.provides,
+        paths.var_raw(key),
+    );
+    let (engine, effect) = (profile.engine(), profile.effect());
+    match outcome {
+        autofix::Outcome::NotDetected => {}
+        autofix::Outcome::Applied => {
+            eprintln!("-- detected {engine}: enabled {effect} ({key}={token})")
+        }
+        autofix::Outcome::Merged { previous } => {
+            eprintln!(
+                "-- detected {engine}: enabled {effect} by adding {token} to {key}={previous}"
+            )
+        }
+        autofix::Outcome::AlreadyPresent => {
+            eprintln!("-- detected {engine}: {key} already enables {effect}")
+        }
+        autofix::Outcome::SkippedExplicitEmpty => {
+            eprintln!("-- detected {engine}: {key} is set and empty, so {effect} stays off")
+        }
+        autofix::Outcome::RuntimeLacks => eprintln!(
+            "-- detected {engine}: this runtime does not provide {}, so {effect} is unavailable",
+            profile.capability()
+        ),
+    }
+    recipe
 }
 
 fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCode> {
@@ -950,8 +987,9 @@ fn write_detected_recipe(paths: &Paths, product_id: &str, dest: &Path) -> Result
             "xgameruntime.user".into(),
         ]);
     }
-    let profiles = ferestre_core::autofix::detect(dest, &recipe.launch.executable);
-    ferestre_core::autofix::add_wants(&mut recipe, &profiles);
+    if let Some(profile) = autofix::detect(dest, &recipe.launch.executable) {
+        autofix::add_wants(&mut recipe, profile);
+    }
     let path = recipe.save_to(&paths.user_titles_dir())?;
     Ok(Some(path))
 }

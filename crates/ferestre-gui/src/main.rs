@@ -489,6 +489,7 @@ fn draw_list(
     let installed_version = |r: &Recipe| model.installed_version(r);
     let installed_product = |id: &str| model.product_is_installed(id);
     let describes_itself = |id: &str| model.product_executable(id).is_some();
+    let game_dir = |r: &Recipe| model.game_dir(r);
     let inputs = Inputs {
         recipes: &model.recipes,
         runtime: model.runtime.as_ref(),
@@ -505,6 +506,7 @@ fn draw_list(
         product_describes_itself: &describes_itself,
         installing: &installing,
         running: &running,
+        game_dir: &game_dir,
     };
     // The Game Pass section is a different list, not a filter over the same
     // one: its rows come from a public catalogue listing rather than from what

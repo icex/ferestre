@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use ferestre_core::autofix;
 use ferestre_core::catalog::Product;
 use ferestre_core::gamepass;
 use ferestre_core::install::Record;
@@ -189,6 +190,10 @@ pub struct Inputs<'a> {
     /// launcher has a version and no record, and showing "Installed" when the
     /// tree plainly says 1.26.4501.0 is throwing away an answer we have.
     pub installed_version: &'a dyn Fn(&Recipe) -> Option<String>,
+    /// Where the title is installed, when that is known. Handed to
+    /// [`autofix::infer`] so a row is assessed against the same recipe `ferestre
+    /// run` will use, engine defaults included.
+    pub game_dir: &'a dyn Fn(&Recipe) -> Option<PathBuf>,
 }
 
 /// Work out the button and the words for one recipe.
@@ -276,7 +281,9 @@ fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
         return blocked("install the patched runtime first".into());
     };
 
-    let assessment = runtime::assess(recipe, runtime, inputs.registry);
+    let game_dir = (inputs.game_dir)(recipe);
+    let inferred = autofix::infer(recipe, game_dir.as_deref());
+    let assessment = runtime::assess(&inferred.recipe, runtime, inputs.registry);
     if !assessment.is_satisfied() {
         // `assess` writes a paragraph for a terminal. A row gets one line.
         let line = row_sized(&assessment.explanation, &recipe.title.name);
@@ -1055,6 +1062,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         }
     }
 
@@ -1123,6 +1131,8 @@ mod tests {
     const NO_VERSION_ON_DISK: &dyn Fn(&Recipe) -> Option<String> = &|_| None;
     /// And where the window has not started anything.
     const NOTHING_RUNNING: &dyn Fn(&str) -> bool = &|_| false;
+    /// And where no installed engine shapes the recipe.
+    const NO_GAME_DIR: &dyn Fn(&Recipe) -> Option<PathBuf> = &|_| None;
     /// And where an undescribed title is not on disk either.
     const NOT_ON_DISK: &dyn Fn(&str) -> bool = &|_| false;
     /// And so nothing on disk describes itself.
@@ -1324,6 +1334,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert_eq!(rows[0].action, Action::Update);
         assert!(
@@ -1424,6 +1435,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
 
         let by_id: BTreeMap<&str, &LibraryRow> =
@@ -1476,6 +1488,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert_eq!(
             rows.iter()
@@ -1520,6 +1533,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         let by_id: BTreeMap<&str, &LibraryRow> =
             rows.iter().map(|r| (r.product_id.as_str(), r)).collect();
@@ -1578,6 +1592,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert!(
             rows[0].subtitle.contains("No PC version"),
@@ -1624,6 +1639,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         let row = rows
             .iter()
@@ -1683,6 +1699,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert!(
             rows[0].subtitle.contains("Bundle of 1 title"),
@@ -1731,6 +1748,7 @@ mod tests {
                 product_describes_itself: NOTHING_DESCRIBES_ITSELF,
                 installing: NOTHING_INSTALLING,
                 running: NOTHING_RUNNING,
+                game_dir: NO_GAME_DIR,
             },
             &listing,
             &gamepass::Tiers::default(),
@@ -1795,6 +1813,7 @@ mod tests {
             product_describes_itself: describes,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert_eq!(rows.len(), 1, "the row exists at all");
         assert_eq!(rows[0].name, "Only On Disk");
@@ -1826,6 +1845,7 @@ mod tests {
             product_describes_itself: with_manifest,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert_eq!(rows[0].action, Action::Play);
 
@@ -1843,6 +1863,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert_eq!(
             rows[0].action,
@@ -1885,6 +1906,7 @@ mod tests {
                 product_describes_itself: NOTHING_DESCRIBES_ITSELF,
                 installing: NOTHING_INSTALLING,
                 running: NOTHING_RUNNING,
+                game_dir: NO_GAME_DIR,
             },
             &listing,
             &tiers,
@@ -1938,6 +1960,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: downloading,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert_eq!(rows[0].action, Action::Installing);
         assert_eq!(rows[0].action.label(), "Installing…");
@@ -1977,6 +2000,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["aardvark", "Zebra", "9ZZTESTNEW3"]);
@@ -2009,6 +2033,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert_eq!(rows[0].action, Action::Update);
         assert_eq!(rows[0].update, Some(true));
@@ -2041,6 +2066,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert_eq!(rows[0].update, None);
         assert_eq!(rows[0].action, Action::Play, "not nagged, not hidden");
@@ -2158,6 +2184,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running,
+            game_dir: NO_GAME_DIR,
         });
         assert_eq!(rows[0].action, Action::Stop);
         assert_eq!(rows[0].action.label(), "Stop");
