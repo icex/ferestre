@@ -56,6 +56,7 @@ git clone https://github.com/icex/ferestre ~/src/ferestre
 cd ~/src/xodus-proton/wine
 git apply ~/src/ferestre/patches/wine/*.patch
 git -C dlls/xgameruntime apply ~/src/ferestre/patches/xgameruntime/*.patch
+git -C ../vkd3d-proton apply ~/src/ferestre/patches/vkd3d-proton/*.patch
 # the proton script patch is re-applied by the installer after every install
 
 # configure the build tree once (Xodus' own instructions), then build+install:
@@ -257,6 +258,20 @@ features enabled; it does not establish an offline gameplay failure. Compare
 offline and online loading before attributing the stall to the save interface.
 Investigation is paused; peer joining, voice and save restoration remain
 unqualified. See `titles/9PDS2N82QNXG.toml` for current issues.
+
+### Retro Classics — **catalogue and Tennis stream tested**
+
+Use `titles/9MTVJ3HHTQGS.toml` with a runtime providing
+`d3d12.recording-allocator-lifetime` and `xgameruntime.gamesave-interface4-legacy`.
+The recipe enables `VKD3D_CONFIG=retain_recording_allocators`. Package 3.3.15.0
+retired allocators while command lists were recording, which crashed the older
+backend during `Close`. The compatibility setting retains the affected allocator
+until reset/destruction. Catalogue loading and a Tennis stream were verified.
+
+The same profile is detected automatically for complete Ultralight/WebCore
+installations without a tested recipe. See [autodetection](AUTODETECTION.md).
+Cloud save synchronization, save restoration and broad game/controller coverage
+remain unqualified.
 
 ## 5. Troubleshooting (every error we actually hit, and its fix)
 

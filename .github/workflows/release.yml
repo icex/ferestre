@@ -169,7 +169,7 @@ jobs:
                   "$root/usr/share/icons/hicolor/scalable/apps/$id.svg"
           fi
 
-          for doc in README.md NOTICE docs/RECIPES.md docs/ROADMAP.md docs/COMPATIBILITY.md; do
+          for doc in README.md NOTICE docs/*.md; do
               install -Dm644 "$doc" "$root/usr/share/doc/ferestre/$(basename "$doc")"
           done
           for lic in LICENSE LICENSE.LGPL-2.1; do

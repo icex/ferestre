@@ -31,6 +31,7 @@ CLIENT_BASE=${CLIENT_BASE:-3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60}
 # whatever upstream has moved on to, which is how this check went red for five
 # commits while every patch applied perfectly to the tree it was written for.
 XGR_BASE=${XGR_BASE:-64aebcabb8c66121eae25d3bf0ace4b582ebb0da}
+VKD3D_BASE=${VKD3D_BASE:-651f17762e439feeef22dbb4ee7eff167ee503d4}
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -46,6 +47,7 @@ cleanup() {
     [ -d "$WORK/wine" ] && git -C "$WINE_REPO" worktree remove --force "$WORK/wine" 2>/dev/null
     [ -d "$WORK/xgr" ] && git -C "$WINE_REPO/dlls/xgameruntime" worktree remove --force "$WORK/xgr" 2>/dev/null
     [ -d "$WORK/client" ] && git -C "$CLIENT_REPO" worktree remove --force "$WORK/client" 2>/dev/null
+    [ -d "$WORK/vkd3d" ] && git -C "$VKD3D_REPO" worktree remove --force "$WORK/vkd3d" 2>/dev/null
     rm -rf "$WORK" 2>/dev/null
 }
 trap cleanup EXIT
@@ -139,6 +141,27 @@ if [ -n "${XGR_BASE:-}" ] && [ -e "$XGR_REPO/.git" ]; then
     fi
 else
     say "xgameruntime series: skipped, submodule not checked out"
+fi
+
+# --- vkd3d-proton: same pinned submodule as the runtime workflow ----------
+VKD3D_REPO=${VKD3D_REPO:-$(dirname "$WINE_REPO")/vkd3d-proton}
+if [ -e "$VKD3D_REPO/.git" ]; then
+    if git -C "$VKD3D_REPO" cat-file -e "$VKD3D_BASE^{commit}" 2>/dev/null; then
+        say "vkd3d-proton series against ${VKD3D_BASE:0:8}"
+        git -C "$VKD3D_REPO" worktree add -q --detach "$WORK/vkd3d" "$VKD3D_BASE"
+        for p in "$REPO_DIR"/patches/vkd3d-proton/*.patch; do
+            if git -C "$WORK/vkd3d" apply --check "$p"; then
+                git -C "$WORK/vkd3d" apply "$p"
+                ok "$(basename "$p")"
+            else
+                bad "$(basename "$p") does not apply"
+            fi
+        done
+    else
+        bad "vkd3d-proton base $VKD3D_BASE is not available (fetch it first)"
+    fi
+else
+    say "vkd3d-proton series: skipped, no repository at $VKD3D_REPO"
 fi
 
 # --- the client series ----------------------------------------------------

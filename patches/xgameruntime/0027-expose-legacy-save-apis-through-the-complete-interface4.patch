@@ -1,0 +1,519 @@
+diff --git a/xgamesave.c b/xgamesave.c
+index a2b46d9..142a000 100644
+--- a/xgamesave.c
++++ b/xgamesave.c
+@@ -1605,27 +1605,28 @@ static HRESULT queue_op( struct XGameSaveUpdate *update, const char *blob_name,
+ 
+ struct x_game_save
+ {
+-    IXGameSaveImpl3 IXGameSaveImpl3_iface;
++    IXGameSaveImpl4 IXGameSaveImpl4_iface;
+     LONG ref;
+ };
+ 
+-static inline struct x_game_save *impl_from_IXGameSaveImpl3( IXGameSaveImpl3 *iface )
++static inline struct x_game_save *impl_from_IXGameSaveImpl4( IXGameSaveImpl4 *iface )
+ {
+-    return CONTAINING_RECORD( iface, struct x_game_save, IXGameSaveImpl3_iface );
++    return CONTAINING_RECORD( iface, struct x_game_save, IXGameSaveImpl4_iface );
+ }
+ 
+-static HRESULT WINAPI x_game_save_QueryInterface( IXGameSaveImpl3 *iface, REFIID iid, void **out )
++static HRESULT WINAPI x_game_save_QueryInterface( IXGameSaveImpl4 *iface, REFIID iid, void **out )
+ {
+-    struct x_game_save *impl = impl_from_IXGameSaveImpl3( iface );
++    struct x_game_save *impl = impl_from_IXGameSaveImpl4( iface );
+ 
+     TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
+ 
+     if (IsEqualGUID( iid, &IID_IUnknown        ) ||
+         IsEqualGUID( iid, &IID_IXGameSaveImpl  ) ||
+         IsEqualGUID( iid, &IID_IXGameSaveImpl2 ) ||
+-        IsEqualGUID( iid, &IID_IXGameSaveImpl3 ))
++        IsEqualGUID( iid, &IID_IXGameSaveImpl3 ) ||
++        IsEqualGUID( iid, &IID_IXGameSaveImpl4 ))
+     {
+-        IXGameSaveImpl_AddRef( *out = &impl->IXGameSaveImpl3_iface );
++        IXGameSaveImpl_AddRef( *out = &impl->IXGameSaveImpl4_iface );
+         return S_OK;
+     }
+ 
+@@ -1634,23 +1635,23 @@ static HRESULT WINAPI x_game_save_QueryInterface( IXGameSaveImpl3 *iface, REFIID
+     return E_NOINTERFACE;
+ }
+ 
+-static ULONG WINAPI x_game_save_AddRef( IXGameSaveImpl3 *iface )
++static ULONG WINAPI x_game_save_AddRef( IXGameSaveImpl4 *iface )
+ {
+-    struct x_game_save *impl = impl_from_IXGameSaveImpl3( iface );
++    struct x_game_save *impl = impl_from_IXGameSaveImpl4( iface );
+     ULONG ref = InterlockedIncrement( &impl->ref );
+     TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );
+     return ref;
+ }
+ 
+-static ULONG WINAPI x_game_save_Release( IXGameSaveImpl3 *iface )
++static ULONG WINAPI x_game_save_Release( IXGameSaveImpl4 *iface )
+ {
+-    struct x_game_save *impl = impl_from_IXGameSaveImpl3( iface );
++    struct x_game_save *impl = impl_from_IXGameSaveImpl4( iface );
+     ULONG ref = InterlockedDecrement( &impl->ref );
+     TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
+     return ref;
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveInitializeProvider( IXGameSaveImpl3 *iface, XUserHandle requestingUser, const char *configurationId, BOOLEAN syncOnDemand, XGameSaveProviderHandle *provider )
++static HRESULT WINAPI x_game_save_XGameSaveInitializeProvider( IXGameSaveImpl4 *iface, XUserHandle requestingUser, const char *configurationId, BOOLEAN syncOnDemand, XGameSaveProviderHandle *provider )
+ {
+     TRACE( "iface %p, requestingUser %p, configurationId %s, syncOnDemand %d, provider %p.\n", iface, requestingUser, debugstr_a( configurationId ), syncOnDemand, provider );
+ 
+@@ -1658,7 +1659,7 @@ static HRESULT WINAPI x_game_save_XGameSaveInitializeProvider( IXGameSaveImpl3 *
+     return create_provider( requestingUser, configurationId, provider );
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveInitializeProviderAsync( IXGameSaveImpl3 *iface, XUserHandle requestingUser, const char *configurationId, BOOLEAN syncOnDemand, XAsyncBlock *async )
++static HRESULT WINAPI x_game_save_XGameSaveInitializeProviderAsync( IXGameSaveImpl4 *iface, XUserHandle requestingUser, const char *configurationId, BOOLEAN syncOnDemand, XAsyncBlock *async )
+ {
+     struct XGameSaveProvider *provider = NULL;
+     HRESULT hr;
+@@ -1674,7 +1675,7 @@ static HRESULT WINAPI x_game_save_XGameSaveInitializeProviderAsync( IXGameSaveIm
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveInitializeProviderResult( IXGameSaveImpl3 *iface, XAsyncBlock *async, XGameSaveProviderHandle *provider )
++static HRESULT WINAPI x_game_save_XGameSaveInitializeProviderResult( IXGameSaveImpl4 *iface, XAsyncBlock *async, XGameSaveProviderHandle *provider )
+ {
+     HRESULT hr;
+     void *payload;
+@@ -1687,14 +1688,14 @@ static HRESULT WINAPI x_game_save_XGameSaveInitializeProviderResult( IXGameSaveI
+     return hr;
+ }
+ 
+-static void WINAPI x_game_save_XGameSaveCloseProvider( IXGameSaveImpl3 *iface, XGameSaveProviderHandle provider )
++static void WINAPI x_game_save_XGameSaveCloseProvider( IXGameSaveImpl4 *iface, XGameSaveProviderHandle provider )
+ {
+     TRACE( "iface %p, provider %p.\n", iface, provider );
+ 
+     if (provider) provider_release( provider );
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveGetRemainingQuota( IXGameSaveImpl3 *iface, XGameSaveProviderHandle provider, INT64 *remainingQuota )
++static HRESULT WINAPI x_game_save_XGameSaveGetRemainingQuota( IXGameSaveImpl4 *iface, XGameSaveProviderHandle provider, INT64 *remainingQuota )
+ {
+     HRESULT hr;
+ 
+@@ -1707,7 +1708,7 @@ static HRESULT WINAPI x_game_save_XGameSaveGetRemainingQuota( IXGameSaveImpl3 *i
+     return hr;
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveGetRemainingQuotaAsync( IXGameSaveImpl3 *iface, XGameSaveProviderHandle provider, XAsyncBlock *async )
++static HRESULT WINAPI x_game_save_XGameSaveGetRemainingQuotaAsync( IXGameSaveImpl4 *iface, XGameSaveProviderHandle provider, XAsyncBlock *async )
+ {
+     INT64 *remaining;
+     HRESULT hr;
+@@ -1726,7 +1727,7 @@ static HRESULT WINAPI x_game_save_XGameSaveGetRemainingQuotaAsync( IXGameSaveImp
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveGetRemainingQuotaResult( IXGameSaveImpl3 *iface, XAsyncBlock *async, INT64 *remainingQuota )
++static HRESULT WINAPI x_game_save_XGameSaveGetRemainingQuotaResult( IXGameSaveImpl4 *iface, XAsyncBlock *async, INT64 *remainingQuota )
+ {
+     INT64 *remaining;
+     HRESULT hr;
+@@ -1743,7 +1744,7 @@ static HRESULT WINAPI x_game_save_XGameSaveGetRemainingQuotaResult( IXGameSaveIm
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveDeleteContainer( IXGameSaveImpl3 *iface, XGameSaveProviderHandle provider, const char *containerName )
++static HRESULT WINAPI x_game_save_XGameSaveDeleteContainer( IXGameSaveImpl4 *iface, XGameSaveProviderHandle provider, const char *containerName )
+ {
+     HRESULT hr;
+ 
+@@ -1757,7 +1758,7 @@ static HRESULT WINAPI x_game_save_XGameSaveDeleteContainer( IXGameSaveImpl3 *ifa
+     return hr;
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveDeleteContainerAsync( IXGameSaveImpl3 *iface, XGameSaveProviderHandle provider, const char *containerName, XAsyncBlock *async )
++static HRESULT WINAPI x_game_save_XGameSaveDeleteContainerAsync( IXGameSaveImpl4 *iface, XGameSaveProviderHandle provider, const char *containerName, XAsyncBlock *async )
+ {
+     HRESULT hr;
+ 
+@@ -1769,7 +1770,7 @@ static HRESULT WINAPI x_game_save_XGameSaveDeleteContainerAsync( IXGameSaveImpl3
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveDeleteContainerResult( IXGameSaveImpl3 *iface, XAsyncBlock *async )
++static HRESULT WINAPI x_game_save_XGameSaveDeleteContainerResult( IXGameSaveImpl4 *iface, XAsyncBlock *async )
+ {
+     HRESULT hr;
+ 
+@@ -1779,7 +1780,7 @@ static HRESULT WINAPI x_game_save_XGameSaveDeleteContainerResult( IXGameSaveImpl
+     return hr;
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveGetContainerInfo( IXGameSaveImpl3 *iface, XGameSaveProviderHandle provider, const char *containerName, void *context, XGameSaveContainerInfoCallback *callback )
++static HRESULT WINAPI x_game_save_XGameSaveGetContainerInfo( IXGameSaveImpl4 *iface, XGameSaveProviderHandle provider, const char *containerName, void *context, XGameSaveContainerInfoCallback *callback )
+ {
+     struct wgs_container *c;
+     WCHAR *name;
+@@ -1839,21 +1840,21 @@ static HRESULT enumerate_containers( struct XGameSaveProvider *provider, const c
+     return hr;
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveEnumerateContainerInfo( IXGameSaveImpl3 *iface, XGameSaveProviderHandle provider, void *context, XGameSaveContainerInfoCallback *callback )
++static HRESULT WINAPI x_game_save_XGameSaveEnumerateContainerInfo( IXGameSaveImpl4 *iface, XGameSaveProviderHandle provider, void *context, XGameSaveContainerInfoCallback *callback )
+ {
+     TRACE( "iface %p, provider %p, context %p, callback %p.\n", iface, provider, context, callback );
+ 
+     return enumerate_containers( provider, NULL, context, callback );
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveEnumerateContainerInfoByName( IXGameSaveImpl3 *iface, XGameSaveProviderHandle provider, const char *containerNamePrefix, void *context, XGameSaveContainerInfoCallback *callback )
++static HRESULT WINAPI x_game_save_XGameSaveEnumerateContainerInfoByName( IXGameSaveImpl4 *iface, XGameSaveProviderHandle provider, const char *containerNamePrefix, void *context, XGameSaveContainerInfoCallback *callback )
+ {
+     TRACE( "iface %p, provider %p, containerNamePrefix %s, context %p, callback %p.\n", iface, provider, debugstr_a( containerNamePrefix ), context, callback );
+ 
+     return enumerate_containers( provider, containerNamePrefix, context, callback );
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveCreateContainer( IXGameSaveImpl3 *iface, XGameSaveProviderHandle provider, const char *containerName, XGameSaveContainerHandle *containerContext )
++static HRESULT WINAPI x_game_save_XGameSaveCreateContainer( IXGameSaveImpl4 *iface, XGameSaveProviderHandle provider, const char *containerName, XGameSaveContainerHandle *containerContext )
+ {
+     struct XGameSaveContainer *container;
+ 
+@@ -1875,7 +1876,7 @@ static HRESULT WINAPI x_game_save_XGameSaveCreateContainer( IXGameSaveImpl3 *ifa
+     return S_OK;
+ }
+ 
+-static void WINAPI x_game_save_XGameSaveCloseContainer( IXGameSaveImpl3 *iface, XGameSaveContainerHandle context )
++static void WINAPI x_game_save_XGameSaveCloseContainer( IXGameSaveImpl4 *iface, XGameSaveContainerHandle context )
+ {
+     struct x_string_entry *e, *next;
+ 
+@@ -1943,21 +1944,21 @@ static HRESULT enumerate_blobs( struct XGameSaveContainer *container, const char
+     return hr;
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveEnumerateBlobInfo( IXGameSaveImpl3 *iface, XGameSaveContainerHandle container, void *context, XGameSaveBlobInfoCallback *callback )
++static HRESULT WINAPI x_game_save_XGameSaveEnumerateBlobInfo( IXGameSaveImpl4 *iface, XGameSaveContainerHandle container, void *context, XGameSaveBlobInfoCallback *callback )
+ {
+     TRACE( "iface %p, container %p, context %p, callback %p.\n", iface, container, context, callback );
+ 
+     return enumerate_blobs( container, NULL, context, callback );
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveEnumerateBlobInfoByName( IXGameSaveImpl3 *iface, XGameSaveContainerHandle container, const char *blobNamePrefix, void *context, XGameSaveBlobInfoCallback *callback )
++static HRESULT WINAPI x_game_save_XGameSaveEnumerateBlobInfoByName( IXGameSaveImpl4 *iface, XGameSaveContainerHandle container, const char *blobNamePrefix, void *context, XGameSaveBlobInfoCallback *callback )
+ {
+     TRACE( "iface %p, container %p, blobNamePrefix %s, context %p, callback %p.\n", iface, container, debugstr_a( blobNamePrefix ), context, callback );
+ 
+     return enumerate_blobs( container, blobNamePrefix, context, callback );
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveReadBlobData( IXGameSaveImpl3 *iface, XGameSaveContainerHandle container, const char **blobNames, UINT32 *countOfBlobs, SIZE_T blobsSize, XGameSaveBlob *blobData )
++static HRESULT WINAPI x_game_save_XGameSaveReadBlobData( IXGameSaveImpl4 *iface, XGameSaveContainerHandle container, const char **blobNames, UINT32 *countOfBlobs, SIZE_T blobsSize, XGameSaveBlob *blobData )
+ {
+     HRESULT hr;
+ 
+@@ -1970,7 +1971,7 @@ static HRESULT WINAPI x_game_save_XGameSaveReadBlobData( IXGameSaveImpl3 *iface,
+     return hr;
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveReadBlobDataAsync( IXGameSaveImpl3 *iface, XGameSaveContainerHandle container, const char **blobNames, UINT32 countOfBlobs, XAsyncBlock *async )
++static HRESULT WINAPI x_game_save_XGameSaveReadBlobDataAsync( IXGameSaveImpl4 *iface, XGameSaveContainerHandle container, const char **blobNames, UINT32 countOfBlobs, XAsyncBlock *async )
+ {
+     struct read_request *req;
+     SIZE_T required = 0;
+@@ -2013,7 +2014,7 @@ static HRESULT WINAPI x_game_save_XGameSaveReadBlobDataAsync( IXGameSaveImpl3 *i
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveReadBlobDataResult( IXGameSaveImpl3 *iface, XAsyncBlock *async, SIZE_T blobsSize, XGameSaveBlob *blobData, UINT32 *countOfBlobs )
++static HRESULT WINAPI x_game_save_XGameSaveReadBlobDataResult( IXGameSaveImpl4 *iface, XAsyncBlock *async, SIZE_T blobsSize, XGameSaveBlob *blobData, UINT32 *countOfBlobs )
+ {
+     struct read_request *req;
+     UINT32 n;
+@@ -2039,7 +2040,7 @@ static HRESULT WINAPI x_game_save_XGameSaveReadBlobDataResult( IXGameSaveImpl3 *
+     return hr;
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveCreateUpdate( IXGameSaveImpl3 *iface, XGameSaveContainerHandle container, const char *containerDisplayName, XGameSaveUpdateHandle *updateContext )
++static HRESULT WINAPI x_game_save_XGameSaveCreateUpdate( IXGameSaveImpl4 *iface, XGameSaveContainerHandle container, const char *containerDisplayName, XGameSaveUpdateHandle *updateContext )
+ {
+     struct XGameSaveUpdate *update;
+ 
+@@ -2058,7 +2059,7 @@ static HRESULT WINAPI x_game_save_XGameSaveCreateUpdate( IXGameSaveImpl3 *iface,
+     return S_OK;
+ }
+ 
+-static void WINAPI x_game_save_XGameSaveCloseUpdate( IXGameSaveImpl3 *iface, XGameSaveUpdateHandle context )
++static void WINAPI x_game_save_XGameSaveCloseUpdate( IXGameSaveImpl4 *iface, XGameSaveUpdateHandle context )
+ {
+     struct wgs_op *op, *next;
+ 
+@@ -2074,7 +2075,7 @@ static void WINAPI x_game_save_XGameSaveCloseUpdate( IXGameSaveImpl3 *iface, XGa
+     free( context );
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveSubmitBlobWrite( IXGameSaveImpl3 *iface, XGameSaveUpdateHandle updateContext, const char *blobName, UINT8 *data, SIZE_T byteCount )
++static HRESULT WINAPI x_game_save_XGameSaveSubmitBlobWrite( IXGameSaveImpl4 *iface, XGameSaveUpdateHandle updateContext, const char *blobName, UINT8 *data, SIZE_T byteCount )
+ {
+     TRACE( "iface %p, updateContext %p, blobName %s, data %p, byteCount %Iu.\n", iface, updateContext, debugstr_a( blobName ), data, byteCount );
+ 
+@@ -2082,7 +2083,7 @@ static HRESULT WINAPI x_game_save_XGameSaveSubmitBlobWrite( IXGameSaveImpl3 *ifa
+     return queue_op( updateContext, blobName, FALSE, data, byteCount );
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveSubmitBlobDelete( IXGameSaveImpl3 *iface, XGameSaveUpdateHandle updateContext, const char *blobName )
++static HRESULT WINAPI x_game_save_XGameSaveSubmitBlobDelete( IXGameSaveImpl4 *iface, XGameSaveUpdateHandle updateContext, const char *blobName )
+ {
+     TRACE( "iface %p, updateContext %p, blobName %s.\n", iface, updateContext, debugstr_a( blobName ) );
+ 
+@@ -2090,7 +2091,7 @@ static HRESULT WINAPI x_game_save_XGameSaveSubmitBlobDelete( IXGameSaveImpl3 *if
+     return queue_op( updateContext, blobName, TRUE, NULL, 0 );
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdate( IXGameSaveImpl3 *iface, XGameSaveUpdateHandle updateContext )
++static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdate( IXGameSaveImpl4 *iface, XGameSaveUpdateHandle updateContext )
+ {
+     HRESULT hr;
+ 
+@@ -2103,7 +2104,7 @@ static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdate( IXGameSaveImpl3 *iface,
+     return hr;
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdateAsync( IXGameSaveImpl3 *iface, XGameSaveUpdateHandle updateContext, XAsyncBlock *async )
++static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdateAsync( IXGameSaveImpl4 *iface, XGameSaveUpdateHandle updateContext, XAsyncBlock *async )
+ {
+     HRESULT hr;
+ 
+@@ -2115,7 +2116,7 @@ static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdateAsync( IXGameSaveImpl3 *i
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdateResult( IXGameSaveImpl3 *iface, XAsyncBlock *async )
++static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdateResult( IXGameSaveImpl4 *iface, XAsyncBlock *async )
+ {
+     HRESULT hr;
+ 
+@@ -2127,7 +2128,7 @@ static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdateResult( IXGameSaveImpl3 *
+ 
+ /* XGameSaveFiles: a plain folder the title reads and writes itself. It sits
+  * inside the same per-user directory so everything for one title stays put. */
+-static HRESULT WINAPI x_game_save_XGameSaveFilesGetFolderWithUiAsync( IXGameSaveImpl3 *iface, XUserHandle requestingUser, const char *configurationId, XAsyncBlock *async )
++static HRESULT WINAPI x_game_save_XGameSaveFilesGetFolderWithUiAsync( IXGameSaveImpl4 *iface, XUserHandle requestingUser, const char *configurationId, XAsyncBlock *async )
+ {
+     struct XGameSaveProvider *provider;
+     WCHAR *dir;
+@@ -2149,7 +2150,7 @@ static HRESULT WINAPI x_game_save_XGameSaveFilesGetFolderWithUiAsync( IXGameSave
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveFilesGetFolderWithUiResult( IXGameSaveImpl3 *iface, XAsyncBlock *async, SIZE_T folderSize, char *folderResult )
++static HRESULT WINAPI x_game_save_XGameSaveFilesGetFolderWithUiResult( IXGameSaveImpl4 *iface, XAsyncBlock *async, SIZE_T folderSize, char *folderResult )
+ {
+     char *folder;
+     SIZE_T len;
+@@ -2168,7 +2169,7 @@ static HRESULT WINAPI x_game_save_XGameSaveFilesGetFolderWithUiResult( IXGameSav
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI x_game_save_XGameSaveFilesGetRemainingQuota( IXGameSaveImpl3 *iface, XUserHandle userContext, const char *configurationId, INT64 *remainingQuota )
++static HRESULT WINAPI x_game_save_XGameSaveFilesGetRemainingQuota( IXGameSaveImpl4 *iface, XUserHandle userContext, const char *configurationId, INT64 *remainingQuota )
+ {
+     struct XGameSaveProvider *provider;
+     HRESULT hr;
+@@ -2184,7 +2185,111 @@ static HRESULT WINAPI x_game_save_XGameSaveFilesGetRemainingQuota( IXGameSaveImp
+     return S_OK;
+ }
+ 
+-static const struct IXGameSaveImpl3Vtbl x_game_save_vtbl =
++/* The interface revision is shared by legacy and PlayFab save APIs. Keep its
++ * complete ABI while rejecting unsupported cloud operations explicitly. */
++static HRESULT WINAPI x_game_save_PFXGameSaveInitializeConfig( IXGameSaveImpl4 *iface, struct PFXGameSaveConfigRequest *request, PFXGameSaveConfigHandle *config )
++{
++    FIXME( "PFXGameSaveInitializeConfig: PlayFab cloud saves are unsupported.\n" );
++    if (config) *config = NULL;
++    return E_NOTIMPL;
++}
++
++static void WINAPI x_game_save_PFXGameSaveFreeConfig( IXGameSaveImpl4 *iface, PFXGameSaveConfigHandle config )
++{
++    FIXME( "PFXGameSaveFreeConfig: PlayFab cloud saves are unsupported.\n" );
++}
++
++static HRESULT WINAPI x_game_save_PFXGameSaveFilesGetFolderWithUiAsync( IXGameSaveImpl4 *iface, PFXGameSaveConfigHandle config, XAsyncBlock *async )
++{
++    FIXME( "PFXGameSaveFilesGetFolderWithUiAsync: PlayFab cloud saves are unsupported.\n" );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI x_game_save_PFXGameSaveFilesGetFolderWithUiResult( IXGameSaveImpl4 *iface, XAsyncBlock *async, SIZE_T folderSize, char *folderResult )
++{
++    FIXME( "PFXGameSaveFilesGetFolderWithUiResult: PlayFab cloud saves are unsupported.\n" );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI x_game_save_PFXGameSaveFilesGetRemainingQuota( IXGameSaveImpl4 *iface, PFXGameSaveConfigHandle config, INT64 *remainingQuota )
++{
++    FIXME( "PFXGameSaveFilesGetRemainingQuota: PlayFab cloud saves are unsupported.\n" );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI x_game_save_PFXGameSaveSetUiCallbacks( IXGameSaveImpl4 *iface, struct PFXGameSaveUiCallbacks *callbacks )
++{
++    FIXME( "PFXGameSaveSetUiCallbacks: PlayFab cloud saves are unsupported.\n" );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI x_game_save_PFXGameSaveProgressUiGetProgress( IXGameSaveImpl4 *iface, XUserHandle user, UINT32 *syncState, UINT64 *current, UINT64 *total )
++{
++    FIXME( "PFXGameSaveProgressUiGetProgress: PlayFab cloud saves are unsupported.\n" );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI x_game_save_PFXGameSaveSetProgressUiResponse( IXGameSaveImpl4 *iface, XUserHandle user, UINT32 response )
++{
++    FIXME( "PFXGameSaveSetProgressUiResponse: PlayFab cloud saves are unsupported.\n" );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI x_game_save_PFXGameSaveSetSyncFailedUiResponse( IXGameSaveImpl4 *iface, XUserHandle user, UINT32 response )
++{
++    FIXME( "PFXGameSaveSetSyncFailedUiResponse: PlayFab cloud saves are unsupported.\n" );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI x_game_save_PFXGameSaveSetActiveDeviceContentionUiResponse( IXGameSaveImpl4 *iface, XUserHandle user, UINT32 response )
++{
++    FIXME( "PFXGameSaveSetActiveDeviceContentionUiResponse: PlayFab cloud saves are unsupported.\n" );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI x_game_save_PFXGameSaveSetConflictUiResponse( IXGameSaveImpl4 *iface, XUserHandle user, UINT32 response )
++{
++    FIXME( "PFXGameSaveSetConflictUiResponse: PlayFab cloud saves are unsupported.\n" );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI x_game_save_PFXGameSaveSetOutOfStorageUiResponse( IXGameSaveImpl4 *iface, XUserHandle user, UINT32 response )
++{
++    FIXME( "PFXGameSaveSetOutOfStorageUiResponse: PlayFab cloud saves are unsupported.\n" );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI x_game_save_PFXGameSaveFilesUploadWithUiAsync( IXGameSaveImpl4 *iface, PFXGameSaveConfigHandle config, UINT32 options, XAsyncBlock *async )
++{
++    FIXME( "PFXGameSaveFilesUploadWithUiAsync: PlayFab cloud saves are unsupported.\n" );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI x_game_save_PFXGameSaveFilesUploadWithUiResult( IXGameSaveImpl4 *iface, XAsyncBlock *async )
++{
++    FIXME( "PFXGameSaveFilesUploadWithUiResult: PlayFab cloud saves are unsupported.\n" );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI x_game_save_PFXGameSaveFilesSetSaveDescriptionAsync( IXGameSaveImpl4 *iface, PFXGameSaveConfigHandle config, const char *description, XAsyncBlock *async )
++{
++    FIXME( "PFXGameSaveFilesSetSaveDescriptionAsync: PlayFab cloud saves are unsupported.\n" );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI x_game_save_PFXGameSaveFilesSetSaveDescriptionResult( IXGameSaveImpl4 *iface, XAsyncBlock *async )
++{
++    FIXME( "PFXGameSaveFilesSetSaveDescriptionResult: PlayFab cloud saves are unsupported.\n" );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI x_game_save_PFXGameSaveSetActiveDeviceChangedCallback( IXGameSaveImpl4 *iface, void *callback, void *context )
++{
++    FIXME( "PFXGameSaveSetActiveDeviceChangedCallback: PlayFab cloud saves are unsupported.\n" );
++    return E_NOTIMPL;
++}
++
++static const struct IXGameSaveImpl4Vtbl x_game_save_vtbl =
+ {
+     x_game_save_QueryInterface,
+     x_game_save_AddRef,
+@@ -2221,6 +2326,23 @@ static const struct IXGameSaveImpl3Vtbl x_game_save_vtbl =
+     x_game_save_XGameSaveFilesGetFolderWithUiAsync,
+     x_game_save_XGameSaveFilesGetFolderWithUiResult,
+     x_game_save_XGameSaveFilesGetRemainingQuota,
++    x_game_save_PFXGameSaveInitializeConfig,
++    x_game_save_PFXGameSaveFreeConfig,
++    x_game_save_PFXGameSaveFilesGetFolderWithUiAsync,
++    x_game_save_PFXGameSaveFilesGetFolderWithUiResult,
++    x_game_save_PFXGameSaveFilesGetRemainingQuota,
++    x_game_save_PFXGameSaveSetUiCallbacks,
++    x_game_save_PFXGameSaveProgressUiGetProgress,
++    x_game_save_PFXGameSaveSetProgressUiResponse,
++    x_game_save_PFXGameSaveSetSyncFailedUiResponse,
++    x_game_save_PFXGameSaveSetActiveDeviceContentionUiResponse,
++    x_game_save_PFXGameSaveSetConflictUiResponse,
++    x_game_save_PFXGameSaveSetOutOfStorageUiResponse,
++    x_game_save_PFXGameSaveFilesUploadWithUiAsync,
++    x_game_save_PFXGameSaveFilesUploadWithUiResult,
++    x_game_save_PFXGameSaveFilesSetSaveDescriptionAsync,
++    x_game_save_PFXGameSaveFilesSetSaveDescriptionResult,
++    x_game_save_PFXGameSaveSetActiveDeviceChangedCallback,
+ };
+ 
+ static struct x_game_save x_game_save =
+@@ -2229,4 +2351,4 @@ static struct x_game_save x_game_save =
+     0,
+ };
+ 
+-IXGameSaveImpl *x_game_save_impl = (IXGameSaveImpl *)&x_game_save.IXGameSaveImpl3_iface;
++IXGameSaveImpl *x_game_save_impl = (IXGameSaveImpl *)&x_game_save.IXGameSaveImpl4_iface;
+diff --git a/xgamesave.idl b/xgamesave.idl
+index e065e10..6309f7f 100644
+--- a/xgamesave.idl
++++ b/xgamesave.idl
+@@ -118,12 +118,45 @@ interface IXGameSaveImpl3 : IXGameSaveImpl2
+ {
+ }
+ 
++/* GDK 2504+ queries this revision for legacy save calls as well. Keep the
++ * complete PFXGameSave tail from the public Microsoft GDK 2510 ABI, even
++ * though PlayFab cloud storage itself is unsupported. */
++typedef struct PFXGameSaveConfig *PFXGameSaveConfigHandle;
++struct PFXGameSaveConfigRequest;
++struct PFXGameSaveUiCallbacks;
++
++[
++    local,
++    object,
++    uuid(ab4ae4fb-6508-4950-a032-45fd4bf8c43b)
++]
++interface IXGameSaveImpl4 : IXGameSaveImpl3
++{
++    HRESULT PFXGameSaveInitializeConfig( [in] struct PFXGameSaveConfigRequest *request, [out] PFXGameSaveConfigHandle *config );
++    void PFXGameSaveFreeConfig( [in] PFXGameSaveConfigHandle config );
++    HRESULT PFXGameSaveFilesGetFolderWithUiAsync( [in] PFXGameSaveConfigHandle config, [in, out] XAsyncBlock *async );
++    HRESULT PFXGameSaveFilesGetFolderWithUiResult( [in, out] XAsyncBlock *async, [in] SIZE_T folderSize, [out, size_is(folderSize)] char *folderResult );
++    HRESULT PFXGameSaveFilesGetRemainingQuota( [in] PFXGameSaveConfigHandle config, [out] INT64 *remainingQuota );
++    HRESULT PFXGameSaveSetUiCallbacks( [in] struct PFXGameSaveUiCallbacks *callbacks );
++    HRESULT PFXGameSaveProgressUiGetProgress( [in] XUserHandle user, [out] UINT32 *syncState, [out] UINT64 *current, [out] UINT64 *total );
++    HRESULT PFXGameSaveSetProgressUiResponse( [in] XUserHandle user, [in] UINT32 response );
++    HRESULT PFXGameSaveSetSyncFailedUiResponse( [in] XUserHandle user, [in] UINT32 response );
++    HRESULT PFXGameSaveSetActiveDeviceContentionUiResponse( [in] XUserHandle user, [in] UINT32 response );
++    HRESULT PFXGameSaveSetConflictUiResponse( [in] XUserHandle user, [in] UINT32 response );
++    HRESULT PFXGameSaveSetOutOfStorageUiResponse( [in] XUserHandle user, [in] UINT32 response );
++    HRESULT PFXGameSaveFilesUploadWithUiAsync( [in] PFXGameSaveConfigHandle config, [in] UINT32 options, [in, out] XAsyncBlock *async );
++    HRESULT PFXGameSaveFilesUploadWithUiResult( [in, out] XAsyncBlock *async );
++    HRESULT PFXGameSaveFilesSetSaveDescriptionAsync( [in] PFXGameSaveConfigHandle config, [in, string] const char *description, [in, out] XAsyncBlock *async );
++    HRESULT PFXGameSaveFilesSetSaveDescriptionResult( [in, out] XAsyncBlock *async );
++    HRESULT PFXGameSaveSetActiveDeviceChangedCallback( [in] void *callback, [in] void *context );
++}
++
+ [
+     uuid(704c3f58-e629-4cc2-b197-30511b996fe2)
+ ]
+ coclass XGameSaveImpl
+ {
+-    [default] interface IXGameSaveImpl3;
++    [default] interface IXGameSaveImpl4;
+ }
+ 
+ cpp_quote("#endif")

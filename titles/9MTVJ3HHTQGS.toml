@@ -1,0 +1,40 @@
+schema = 1
+
+[title]
+product-id = "9MTVJ3HHTQGS"
+name = "Retro Classics"
+slug = "retro-classics"
+publisher = "Microsoft Studios"
+package-identity = "Microsoft.Pleasantville"
+title-id = "6FBADC96"
+
+[launch]
+executable = "RetroClassics.exe"
+env = { VKD3D_CONFIG = "retain_recording_allocators" }
+
+[runtime]
+requires = [
+    "loader.memfd-main-image",
+    "appmodel.package-identity",
+    "xgameruntime.user",
+    "xgameruntime.gamesave-interface4-legacy",
+    "d3d12.recording-allocator-lifetime",
+]
+
+[status]
+state = "playable-with-issues"
+summary = "Signs in, loads the catalogue and streams Tennis with the matching runtime. Broader game/controller coverage remains unqualified."
+last-verified = 2026-10-10
+verified-with = "Game Pass package 3.3.15.0; native catalogue and Tennis stream in an isolated prefix; allocator lifetime before/after reproducer and legacy save API regression"
+
+[[issues]]
+symptom = "The application exits at startup with a vkEndCommandBuffer null-buffer fault"
+cause = "The engine retires a command allocator while a list is recording; the backend invalidates the recording buffer before the engine closes the list."
+fix = "Use a runtime providing recording-allocator-lifetime and the retain_recording_allocators compatibility setting."
+log-match = "vkEndCommandBuffer Exception"
+
+[[issues]]
+symptom = "Save initialization reports E_NOINTERFACE"
+cause = "Newer GDK wrappers request IXGameSaveImpl4 even for the legacy save API."
+fix = "Use a runtime providing gamesave-interface4-legacy. New PlayFab cloud APIs remain unsupported; this does not claim cloud synchronization."
+log-match = "XGameSaveFilesGetFolderWithUiAsync failed with: 0x80004002"

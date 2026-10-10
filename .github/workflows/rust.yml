@@ -114,6 +114,8 @@ jobs:
           git clone --quiet https://github.com/xodus-gaming/xodus.git "$HOME/src/xodus-cli"
           git clone --quiet https://github.com/xodus-gaming/xgameruntime \
             "$HOME/src/xodus-proton/wine/dlls/xgameruntime"
+          git clone --quiet https://github.com/HansKristian-Work/vkd3d-proton \
+            "$HOME/src/xodus-proton/vkd3d-proton"
 
       - name: Patches apply
         run: scripts/check-patches.sh

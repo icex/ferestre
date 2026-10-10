@@ -1,0 +1,111 @@
+diff --git a/include/private/config_flag_decl.h b/include/private/config_flag_decl.h
+index 338ef7a..a7f115b 100644
+--- a/include/private/config_flag_decl.h
++++ b/include/private/config_flag_decl.h
+@@ -24,6 +24,7 @@ VKD3D_DECL_CONFIG("pipeline_library_ignore_spirv", PIPELINE_LIBRARY_IGNORE_SPIRV
+ VKD3D_DECL_CONFIG("mutable_single_set", MUTABLE_SINGLE_SET)
+ VKD3D_DECL_CONFIG("memory_allocator_skip_clear", MEMORY_ALLOCATOR_SKIP_CLEAR)
+ VKD3D_DECL_CONFIG("recycle_command_pools", RECYCLE_COMMAND_POOLS)
++VKD3D_DECL_CONFIG("retain_recording_allocators", RETAIN_RECORDING_ALLOCATORS)
+ VKD3D_DECL_CONFIG("pipeline_library_ignore_mismatch_driver", PIPELINE_LIBRARY_IGNORE_MISMATCH_DRIVER)
+ VKD3D_DECL_CONFIG("breadcrumbs", BREADCRUMBS)
+ VKD3D_DECL_CONFIG("pipeline_library_app_cache", PIPELINE_LIBRARY_APP_CACHE_ONLY)
+diff --git a/include/private/config_flags.h b/include/private/config_flags.h
+index 1a6a462..772f367 100644
+--- a/include/private/config_flags.h
++++ b/include/private/config_flags.h
+@@ -31,7 +31,7 @@ struct vkd3d_config_flags_bitfield
+ 	 * we may end up with stray uninitialized bits which can subtly break bitwise operations later.
+ 	 * Adding more configs will cause the static assert below to fail,
+ 	 * which indicates the need to subtract a reserved bit. */
+-	uint32_t reserved0 : 26;
++	uint32_t reserved0 : 25;
+ };
+ 
+ STATIC_ASSERT(sizeof(struct vkd3d_config_flags_bitfield) == 12);
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 611e373..a703ae2 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -2816,6 +2816,12 @@ static void d3d12_command_list_allocator_destroyed(struct d3d12_command_list *li
+ {
+     TRACE("list %p.\n", list);
+ 
++    /* The allocator owns the recording buffer. Once it is gone, Close must
++     * fail instead of submitting a null buffer, and Reset may start anew. */
++    if (list->is_recording)
++        WARN("Command allocator destroyed during recording; invalidating command list.\n");
++    list->is_recording = false;
++    list->is_valid = false;
+     list->allocator = NULL;
+     list->submit_allocator = NULL;
+     memset(&list->cmd, 0, sizeof(list->cmd));
+@@ -3039,6 +3045,7 @@ static ULONG STDMETHODCALLTYPE d3d12_command_allocator_Release(ID3D12CommandAllo
+     struct d3d12_command_allocator *allocator = impl_from_ID3D12CommandAllocator(iface);
+     unsigned int refcount = InterlockedDecrement(&allocator->refcount);
+     unsigned int pending;
++    bool retained_recording = false;
+ 
+     TRACE("%p decreasing refcount to %u.\n", allocator, refcount);
+ 
+@@ -3046,11 +3053,23 @@ static ULONG STDMETHODCALLTYPE d3d12_command_allocator_Release(ID3D12CommandAllo
+     {
+         struct d3d12_device *device = allocator->device;
+ 
++        /* Some engines replace allocators while a list is still recording.
++         * Retain only that retired allocator, without changing public COM
++         * reference counts. The list drops the lease on Reset or destruction. */
++        if (VKD3D_CONFIG_FLAG_IS_SET(RETAIN_RECORDING_ALLOCATORS) &&
++                allocator->current_command_list && allocator->current_command_list->is_recording &&
++                !allocator->current_command_list->retained_recording_allocator)
++        {
++            allocator->current_command_list->retained_recording_allocator = allocator;
++            d3d12_command_allocator_inc_ref(allocator);
++            retained_recording = true;
++            TRACE("Retaining retired recording allocator %p.\n", allocator);
++        }
+         d3d_destruction_notifier_notify(&allocator->destruction_notifier);
+         pending = d3d12_command_allocator_dec_ref(allocator);
+ 
+         /* If this does not go to zero, it means that there are still command lists in flight. */
+-        if (pending != 0)
++        if (pending != 0 && !retained_recording)
+         {
+             ERR("Released all public references, but there are still %u pending command lists "
+                 "awaiting execution from command allocator iface %p! Deferring release.\n", pending, iface);
+@@ -6766,6 +6785,8 @@ ULONG STDMETHODCALLTYPE d3d12_command_list_Release(d3d12_command_list_iface *ifa
+         hash_map_free(&list->query_resolve_lut);
+         d3d12_command_list_free_rtas_batch(list);
+ 
++        if (list->retained_recording_allocator)
++            d3d12_command_allocator_dec_ref(list->retained_recording_allocator);
+         vkd3d_free_aligned(list);
+ 
+         d3d12_device_release(device);
+@@ -7391,6 +7412,14 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_Reset(d3d12_command_list_ifa
+     {
+         list->allocator = allocator_impl;
+         d3d12_command_list_reset_state(list, initial_pipeline_state);
++        if (list->retained_recording_allocator &&
++                (list->retained_recording_allocator != allocator_impl ||
++                 vkd3d_atomic_uint32_load_explicit(&allocator_impl->refcount, vkd3d_memory_order_acquire)))
++        {
++            struct d3d12_command_allocator *retired = list->retained_recording_allocator;
++            list->retained_recording_allocator = NULL;
++            d3d12_command_allocator_dec_ref(retired);
++        }
+     }
+ 
+     return hr;
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 5f94cfc..91a97c0 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3428,6 +3428,7 @@ struct d3d12_command_list
+ 
+     struct d3d12_command_allocator *allocator;
+     struct d3d12_command_allocator *submit_allocator;
++    struct d3d12_command_allocator *retained_recording_allocator;
+     struct d3d12_device *device;
+ 
+     VkBuffer so_buffers[D3D12_SO_BUFFER_SLOT_COUNT];

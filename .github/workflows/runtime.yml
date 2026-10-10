@@ -136,6 +136,10 @@ jobs:
               echo ":: xgameruntime $(basename "$p")"
               git -C wine/dlls/xgameruntime apply "$p"
           done
+          for p in "$GITHUB_WORKSPACE"/ferestre/patches/vkd3d-proton/*.patch; do
+              echo ":: vkd3d-proton $(basename "$p")"
+              git -C vkd3d-proton apply "$p"
+          done
 
       - name: Configure
         run: |

@@ -26,8 +26,12 @@ J=${J:-16}
 
 cd "$BUILD_DIR"
 
-echo ":: invalidating the wine source and build stamps"
+echo ":: invalidating Wine and vkd3d-proton source/build stamps"
 rm -f .wine-source .wine-x86_64-build .wine-x86_64-post-build .wine-x86_64-dist
+rm -f .vkd3d-proton-source .vkd3d-proton-post-source
+for arch in i386 x86_64; do
+    rm -f ".vkd3d-proton-$arch-build" ".vkd3d-proton-$arch-post-build" ".vkd3d-proton-$arch-dist"
+done
 
 # Dropping the stamps makes the source stage run again; it does not make the
 # compiler run again. That stage rsyncs the submodule over $BUILD_DIR/src-wine
@@ -45,7 +49,7 @@ rm -f .wine-source .wine-x86_64-build .wine-x86_64-post-build .wine-x86_64-dist
 # before the rsync copies them. Touching them in src-wine is no good: the
 # refresh overwrites those timestamps on the way in.
 echo ":: marking patched sources for rebuild"
-WINE_SRC=${WINE_SRC:-$XODUS_SRC_DIR/xodus-proton/wine}
+WINE_SRC=${WINE_SRC:-${XODUS_SRC_DIR:-$HOME/src}/xodus-proton/wine}
 if [ -d "$WINE_SRC" ]; then
     # `if`, not `[ -f ] && touch`: under `set -e` a false test as the last
     # command of a loop body ends the script, so a patch naming a file that has
@@ -66,6 +70,8 @@ if [ -d "$WINE_SRC" ]; then
     }
     touch_series "$WINE_SRC" "$REPO_DIR"/patches/wine/*.patch
     touch_series "$WINE_SRC/dlls/xgameruntime" "$REPO_DIR"/patches/xgameruntime/*.patch
+    VKD3D_SRC=${VKD3D_SRC:-$(dirname "$WINE_SRC")/vkd3d-proton}
+    touch_series "$VKD3D_SRC" "$REPO_DIR"/patches/vkd3d-proton/*.patch
     echo "   $touched files"
 else
     echo "   !! no wine tree at $WINE_SRC; set WINE_SRC if the build ships a stale runtime" >&2

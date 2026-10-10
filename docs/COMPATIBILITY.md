@@ -6,7 +6,7 @@ project, and exactly where the ones that fail stop.
 ## Read this first
 
 **Many titles remain untested, and an untested title may expose another runtime
-gap.** Twelve titles have been run. The GDK runtime is written against the
+gap.** Thirteen titles have been run. The GDK runtime is written against the
 *observable* behaviour of the API — task queues, async, users, storage,
 networking, save games, packages — so each new title remains useful evidence.
 
@@ -58,6 +58,7 @@ unqualified.
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
 | Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. | 2026-09-06 |
 | Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable, with issues | Offline gameplay works, confirmed by the player. Online sign-in succeeds, but an online-enabled new-world loading test stalled; online co-op remains unqualified. | 2026-10-10 |
+| Retro Classics | `9MTVJ3HHTQGS` | Playable, with issues | Signs in, loads the catalogue and streams Tennis with the matching runtime. Broader game/controller coverage remains unqualified. | 2026-10-10 |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.
 

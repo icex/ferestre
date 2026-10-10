@@ -81,3 +81,7 @@ Trademarks
   Test fixtures under tests/fixtures/ are hand-written and carry only the
   identifier fields the tests need. No game content, package, licence or key is
   present in this repository, and none will be.
+
+The vkd3d-proton patches in patches/vkd3d-proton/ modify the LGPL-2.1-or-later
+backend at its pinned upstream commit. Microsoft's SDK headers and libraries
+used to validate interface layouts are not redistributed.

@@ -502,6 +502,13 @@ fn cmd_run(
         )
     })?;
 
+    // New installs can share an engine failure without sharing a tested recipe.
+    let profiles =
+        ferestre_core::autofix::detect(&paths.install_dir(recipe)?, &recipe.launch.executable);
+    let mut inferred = recipe.clone();
+    ferestre_core::autofix::add_wants(&mut inferred, &profiles);
+    let recipe = &inferred;
+
     // Checked before anything is started, because the alternative is a title
     // that exits 1 with an empty log and someone guessing which of eleven
     // patches is missing.
@@ -513,6 +520,16 @@ fn cmd_run(
         requested_runtime.as_deref(),
         registry_for(&paths).as_ref(),
     )?;
+    let mut configured = recipe.clone();
+    if ferestre_core::autofix::apply(
+        &mut configured,
+        &profiles,
+        &runtime.provides,
+        paths.var("VKD3D_CONFIG").is_some(),
+    ) {
+        eprintln!("-- detected Ultralight: enabled recording allocator lifetime compatibility");
+    }
+    let recipe = &configured;
     let registry = registry_for(&paths);
     let assessment = runtime::assess(recipe, runtime, registry.as_ref());
     let verdict = gate(&assessment);
@@ -926,6 +943,15 @@ fn write_detected_recipe(paths: &Paths, product_id: &str, dest: &Path) -> Result
     if let Ok(relative) = dest.strip_prefix(paths.games_dir()) {
         recipe.install.dir = Some(relative.to_string_lossy().into_owned());
     }
+    recipe.runtime.requires = vec!["loader.memfd-main-image".into()];
+    if dest.join("MicrosoftGame.config").is_file() || dest.join("MicrosoftGame.Config").is_file() {
+        recipe.runtime.requires.extend([
+            "appmodel.package-identity".into(),
+            "xgameruntime.user".into(),
+        ]);
+    }
+    let profiles = ferestre_core::autofix::detect(dest, &recipe.launch.executable);
+    ferestre_core::autofix::add_wants(&mut recipe, &profiles);
     let path = recipe.save_to(&paths.user_titles_dir())?;
     Ok(Some(path))
 }

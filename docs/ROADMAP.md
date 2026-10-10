@@ -14,6 +14,11 @@ online-enabled new-world test stalled; compare offline/online loading and verify
 the save interface ABI before further implementation.
 See [release qualification](RELEASE-0.1.5.md).
 
+Engine-based defaults now cover unknown Ultralight/WebCore installations, and
+newly detected GDK recipes declare their minimum runtime requirements. Retro
+Classics catalogue and Tennis streaming were tested with the allocator and newer
+save-interface fixes. See [autodetection](AUTODETECTION.md).
+
 ## Where the work already is
 
 Three layers are implemented.
