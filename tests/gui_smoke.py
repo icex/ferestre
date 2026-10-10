@@ -656,6 +656,33 @@ print(":: done", flush=True)
         )
         check(True, "and the switch turns them back off")
 
+        print("scroll position on title actions")
+        def scroll_value():
+            for node in find_all(frame, role="scroll bar"):
+                value = node.get_value_iface()
+                if value is not None and value.get_maximum_value() > 200:
+                    return value
+            return None
+        value = scroll_value()
+        check(value is not None, "the library has a scrollable title list", frame)
+        value.set_current_value(200)
+        time.sleep(0.25)
+        position = value.get_current_value()
+        check(position > 50, f"the library is scrolled before the click ({position})", frame)
+        play = row_button(frame, "Minecraft for Windows", "Play")
+        check(play is not None, "the installed fixture can be selected to play", frame)
+        click(play)
+        time.sleep(0.5)
+        after = scroll_value().get_current_value()
+        check(abs(after - position) < 2, f"a title action keeps the scroll position ({position} -> {after})", frame)
+
+        select_in_list(frame, "Runtime")
+        wait_for(frame, lambda root: "Ferestre release" in texts(root), "section navigation", time.monotonic() + TIMEOUT)
+        time.sleep(0.2)
+        check(scroll_value().get_current_value() == 0, "a different section starts at the top", frame)
+        select_in_list(frame, "Library")
+        wait_for(frame, lambda root: "Minecraft for Windows" in texts(root), "return to library", time.monotonic() + TIMEOUT)
+
         print("installing asks before it downloads")
         install = row_button(frame, "Smoke Test Racer", "Install")
         check(install is not None, "an owned MSIXVC title offers an install", frame)

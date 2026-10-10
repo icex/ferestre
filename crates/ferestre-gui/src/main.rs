@@ -37,6 +37,7 @@ struct Ui {
     window: adw::ApplicationWindow,
     toasts: adw::ToastOverlay,
     content: gtk::Box,
+    scroll: gtk::ScrolledWindow,
     account_button: gtk::Button,
     title: adw::WindowTitle,
     search: gtk::SearchEntry,
@@ -207,6 +208,7 @@ fn build_ui(app: &adw::Application) {
         window: window.clone(),
         toasts,
         content,
+        scroll,
         account_button: account_button.clone(),
         title,
         search: search.clone(),
@@ -240,6 +242,7 @@ fn build_ui(app: &adw::Application) {
                 model.section = section;
                 model.page = 0;
             }
+            ui.scroll.vadjustment().set_value(0.0);
             render(&ui);
             refresh_updates(&ui);
         }
@@ -258,6 +261,7 @@ fn build_ui(app: &adw::Application) {
                 model.query = text;
                 model.page = 0;
             }
+            ui.scroll.vadjustment().set_value(0.0);
             render(&ui);
         }
     ));
@@ -313,15 +317,26 @@ fn render(ui: &Ui) {
     ));
     render_account_button(ui);
 
-    let page = adw::PreferencesPage::new();
-    ui.content.append(&page);
+    // PreferencesPage owns a second ScrolledWindow. Recreating it for a
+    // title action resets that inner viewport to zero. Keep one persistent
+    // outer viewport and put the preference groups in ordinary content.
+    let page = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(24)
+        .margin_top(24)
+        .margin_bottom(24)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    let clamp = adw::Clamp::builder().child(&page).build();
+    ui.content.append(&clamp);
 
     if let Some(problem) = ui.model.borrow().problem.clone() {
         let group = adw::PreferencesGroup::builder().title("Not ready").build();
         let row = adw::ActionRow::builder().title(&problem).build();
         row.add_css_class("error");
         group.add(&row);
-        page.add(&group);
+        page.append(&group);
     }
 
     match section {
@@ -357,7 +372,7 @@ fn render(ui: &Ui) {
     }
 }
 
-fn render_runtime(ui: &Ui, page: &adw::PreferencesPage) {
+fn render_runtime(ui: &Ui, page: &gtk::Box) {
     let packaged = std::env::var("FERESTRE_PACKAGE_VERSION").ok();
     let release = adw::PreferencesGroup::new();
     release.add(
@@ -366,7 +381,7 @@ fn render_runtime(ui: &Ui, page: &adw::PreferencesPage) {
             .subtitle(ferestre_core::package_version(packaged.as_deref()))
             .build(),
     );
-    page.add(&release);
+    page.append(&release);
 
     let model = ui.model.borrow();
     let (title, subtitle) = model::runtime_summary(model.runtime.as_ref());
@@ -392,7 +407,7 @@ fn render_runtime(ui: &Ui, page: &adw::PreferencesPage) {
         row.add_suffix(&install);
     }
     group.add(&row);
-    page.add(&group);
+    page.append(&group);
 
     if model.runtimes.len() > 1 {
         let versions = adw::PreferencesGroup::builder()
@@ -408,7 +423,7 @@ fn render_runtime(ui: &Ui, page: &adw::PreferencesPage) {
                     .build(),
             );
         }
-        page.add(&versions);
+        page.append(&versions);
     }
 
     if let Some(runtime) = &model.runtime {
@@ -432,7 +447,7 @@ fn render_runtime(ui: &Ui, page: &adw::PreferencesPage) {
                     .build(),
             );
         }
-        page.add(&capabilities);
+        page.append(&capabilities);
     }
 }
 
@@ -574,7 +589,7 @@ fn draw_list(
 /// title, which is not the same as this account being able to install it, and
 /// leaving that unsaid would make every licence refusal look like a bug in the
 /// launcher.
-fn render_gamepass(ui: &Ui, page: &adw::PreferencesPage) {
+fn render_gamepass(ui: &Ui, page: &gtk::Box) {
     let (held, listing, market) = {
         let model = ui.model.borrow();
         (
@@ -612,7 +627,7 @@ fn render_gamepass(ui: &Ui, page: &adw::PreferencesPage) {
         .build();
     row.add_css_class("dim-label");
     group.add(&row);
-    page.add(&group);
+    page.append(&group);
 
     let show_all = ui.model.borrow().show_unsupported;
     render_rows(
@@ -623,12 +638,7 @@ fn render_gamepass(ui: &Ui, page: &adw::PreferencesPage) {
     );
 }
 
-fn render_rows(
-    ui: &Ui,
-    page: &adw::PreferencesPage,
-    keep: impl Fn(&LibraryRow) -> bool,
-    empty_message: &str,
-) {
+fn render_rows(ui: &Ui, page: &gtk::Box, keep: impl Fn(&LibraryRow) -> bool, empty_message: &str) {
     let section = ui.model.borrow().section;
     let downloading = ui
         .download
@@ -669,7 +679,7 @@ fn render_rows(
             group.add(&library_row(ui, row));
         }
     }
-    page.add(&group);
+    page.append(&group);
 
     // Only in the library: the other sections list installed or updatable
     // titles, which are runnable by construction.
@@ -712,7 +722,7 @@ fn render_rows(
         });
         let group = adw::PreferencesGroup::builder().margin_top(18).build();
         group.add(&row);
-        page.add(&group);
+        page.append(&group);
     }
 
     // Only when there is more than one page: a pager under a list that already
@@ -742,6 +752,7 @@ fn render_rows(
                     let mut model = ui.model.borrow_mut();
                     model.page = model.page.saturating_sub(1);
                 }
+                ui.scroll.vadjustment().set_value(0.0);
                 render(&ui);
             }
         ));
@@ -750,6 +761,7 @@ fn render_rows(
             ui,
             move |_| {
                 ui.model.borrow_mut().page += 1;
+                ui.scroll.vadjustment().set_value(0.0);
                 render(&ui);
             }
         ));

@@ -6,7 +6,7 @@ project, and exactly where the ones that fail stop.
 ## Read this first
 
 **Many titles remain untested, and an untested title may expose another runtime
-gap.** Eleven titles have been run. The GDK runtime is written against the
+gap.** Twelve titles have been run. The GDK runtime is written against the
 *observable* behaviour of the API — task queues, async, users, storage,
 networking, save games, packages — so each new title remains useful evidence.
 
@@ -52,6 +52,7 @@ unqualified.
 | DREDGE | `9MSVVM5NS9L6` | Playable | Plays. | 2026-09-06 |
 | Forza Horizon 5 | `9NNX1VVR3KNQ` | Playable | Plays with a restored Windows career; title services and the live Festival Playlist load after generic authentication and endpoint-discovery fixes. Player confirmed the online fix. | 2026-09-07 |
 | Halo Infinite | `9PP5G1F0C2B6` | Playable | Campaign, Academy training and multiplayer run; campaign save restoration was confirmed locally. Intermittent offline display remains under investigation. | 2026-10-10 |
+| Hollow Knight: Silksong | `9N116V0599HB` | Playable | Playable, confirmed by the player on the local Game Pass installation. | 2026-10-10 |
 | Minecraft Dungeons II | `9P5786PJB9RP` | Playable | Account sign-in, Store licence verification and Squid Coast gameplay work with the matching updated runtime. Long-session, multiplayer and cloud-save behavior are untested. | 2026-10-10 |
 | Minecraft for Windows | `9NBLGGH2JHXJ` | Playable | Signs in to Xbox Live, loads the profile, plays, and joins third-party servers from the in-game list. | 2026-09-06 |
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |

@@ -17,6 +17,8 @@ Halo Infinite. The runtime uses the same pinned Proton/Wine sources as
   default completion behavior.
 - Analytics returns the full Windows.Desktop device family expected by PlayFab
   Party. Store product data lives until the product query handle closes.
+- Title actions and background redraws preserve the library scroll position by
+  retaining one viewport. Changing sections, searches or pages starts at the top.
 - Recipe parsing and validation agree on the canonical `env` key and its
   documented `environment` alias.
 
@@ -25,6 +27,7 @@ Halo Infinite. The runtime uses the same pinned Proton/Wine sources as
 | Title | Observed result | Remaining scope |
 |---|---|---|
 | Halo Infinite | Game Pass Ultimate package 1.4206.46191.0 reached Warship Gbraakon gameplay; player confirmed campaign, multiplayer and saving; campaign handoff/relaunch and normal process exit were observed | Intermittent offline display is unresolved; purchases, cloud sync and long-session reliability are unqualified |
+| Hollow Knight: Silksong | Playable, confirmed by the player on the local installation | Saving and online features were not separately qualified |
 | Minecraft Dungeons II | Sign-in, Store licence checks and Squid Coast gameplay worked; player confirmed saving after finishing the tutorial | Mid-tutorial restart was not a demonstrated save defect; multiplayer and cloud sync remain unqualified |
 | Goat Simulator 3 | Offline gameplay works, confirmed by the player. Native Party initialization and clean online sign-in/session requests succeeded; Store lifetime regression passed | The online-enabled San Angora new-world test stalled. Compare offline/online loading before assigning a cause; unsupported save-interface requests remain a lead. Co-op, voice and saving are unqualified |
 
@@ -48,7 +51,8 @@ runtime workflow at this release tag.
 The release qualification includes 255 Rust workspace tests, 216 GDK checks in
 compatibility mode, 46 strict manual-queue checks, five real namespace/lifecycle
 tests and a manifest-inheritance shim test. The built GTK GUI passed its accessibility smoke test, including Runtime release
-ordering. The AppImage mounted and reported the packaged version.
+ordering and a title-action scroll regression (200 → 0 before; 200 → 200 after).
+The AppImage mounted and reported the packaged version.
 The Store lifetime regression failed
 before the fix and passed afterward. Patched GDK translation units compile with
 Wine's `-Werror` flags. The full ordered GDK series is checked against its pinned
