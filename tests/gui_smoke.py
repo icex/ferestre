@@ -131,7 +131,12 @@ def texts(root):
 def wait_for(root, predicate, what, deadline):
     last = None
     while time.monotonic() < deadline:
-        last = predicate(root)
+        # A node can vanish between being listed and being asked about while
+        # the list it sits in is rebuilt; that is "not yet", not a failure.
+        try:
+            last = predicate(root)
+        except GLib.GError:
+            last = None
         if last:
             return last
         time.sleep(POLL)
@@ -654,10 +659,12 @@ if os.environ.get("XODUS_PROGRESS") != "json":
     # would then sit on an empty bar, and this is where that gets noticed.
     sys.exit("progress was not requested")
 total = 800_000_000
-# Four seconds of it: the estimate deliberately says nothing until it has a
-# couple of seconds to average over, so a shorter run would prove less.
-for step in range(1, 41):
-    print(json.dumps({"progress": {"done": total * step // 40, "total": total}}), flush=True)
+# Ten seconds of it: the estimate deliberately says nothing until it has a
+# couple of seconds to average over, and on a loaded machine one walk of the
+# accessibility tree can take most of a second, so a four-second run left the
+# check only a moment to see the rate before the download ended.
+for step in range(1, 101):
+    print(json.dumps({"progress": {"done": total * step // 100, "total": total}}), flush=True)
     time.sleep(0.1)
 print(":: done", flush=True)
 """
