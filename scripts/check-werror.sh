@@ -21,16 +21,16 @@
 # flags the Makefile already uses plus -Werror. About a minute against a warm
 # build tree, and it answers the same question.
 #
-# Needs a configured build tree ($XODUS_BUILD_DIR, default ~/src/xodus-proton/
-# build-ferestre) -- it reuses that tree's own Makefile rather than guessing at
-# include paths, which is the only way the flags are honestly the same.
+# Needs a configured build tree ($XODUS_BUILD_DIR, default ~/src/xodus-build)
+# -- it reuses that tree's own Makefile rather than guessing at include paths,
+# which is the only way the flags are honestly the same.
 
 set -euo pipefail
 . "$(dirname "$0")/xodus-env.sh"
 
 BUILD_DIR=${BUILD_DIR:-$XODUS_BUILD_DIR}
 OBJ_DIR=$BUILD_DIR/obj-wine-x86_64
-SRC_DIR=${XODUS_SRC_DIR:-$HOME/src}/xodus-proton
+SRC_DIR=$XODUS_SRC_DIR/xodus-proton
 IMAGE=${STEAMRT_IMAGE:-registry.gitlab.steamos.cloud/proton/steamrt4/sdk/x86_64:4.0.20260331.220802-0}
 
 if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
