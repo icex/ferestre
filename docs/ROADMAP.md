@@ -9,9 +9,7 @@ for Bedrock on Android, for Microsoft Store titles on Linux.
 Release 0.1.5 and runtime 11.0.20261010.1 add Halo campaign support and tested
 GDK async, queue, analytics and Store lifetime fixes. Halo gameplay and saving
 have live confirmation. Dungeons saving was confirmed after its tutorial.
-Goat Simulator 3 works offline (player-confirmed) and signs in online. An
-online-enabled new-world test stalled; compare offline/online loading and verify
-the save interface ABI before further implementation.
+Goat Simulator 3 works offline (player-confirmed) and signs in online.
 See [release qualification](RELEASE-0.1.5.md).
 
 Unreleased: Retro Classics is playable (player-confirmed) on a runtime with the
@@ -19,6 +17,11 @@ vkd3d-proton allocator-lifetime patch and the IXGameSaveImpl4 fix. Titles
 without a recipe that ship the same Ultralight/WebCore engine get the backend
 setting automatically, and recipes written from a package now require only what
 a probe can confirm. See [autodetection](AUTODETECTION.md).
+
+Unreleased: the same save-interface fix makes Goat Simulator 3 keep its saves;
+before it, the game played but never wrote one. Offline saves now reload after a
+relaunch. Online-enabled play still stalls after the world loads, and Quit Game
+after a session leaves the process running on every runtime tested.
 
 ## Where the work already is
 

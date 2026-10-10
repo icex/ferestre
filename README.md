@@ -80,7 +80,7 @@ not inferred from the fact that it downloaded:
 | **Overthrown** | Game Pass | Playable |
 | **Minecraft Dungeons II** | Game Pass Ultimate | Playable — sign-in and gameplay work; saving confirmed after finishing the tutorial |
 | **Halo Infinite** | Store / Game Pass Ultimate | Playable — campaign, training and multiplayer; intermittent offline display under investigation |
-| **Goat Simulator 3** | Game Pass | Offline gameplay works; online sign-in fixed, online-enabled world loading remains under investigation |
+| **Goat Simulator 3** | Game Pass | Offline play saves and resumes on the newer runtime; online-enabled play stalls after loading |
 | **Age of Empires Definitive Edition** | Game Pass | Playable — boots, starts a custom game, and plays |
 | **Forza Horizon 5** | Store | Playable with restored Windows saves; Forza Online and the live Festival Playlist work |
 

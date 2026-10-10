@@ -247,17 +247,21 @@ restart: the user confirmed saving after tutorial completion. Mid-tutorial
 restarts alone did not establish a save failure. Cloud sync and multiplayer
 remain unqualified. Accept the bundled Visual C++ installer on a fresh prefix.
 
-### Goat Simulator 3 — **offline playable; online loading unresolved**
+### Goat Simulator 3 — **offline playable with saves; online stalls**
 
-The latest runtime fixes PlayFab Party platform classification and retains
-Store product data for the lifetime of its query. Online sign-in and session
-requests succeeded in a clean isolated run. San Angora then remained on its
-loading screen with repeated requests for an unsupported save interface.
-The player confirmed offline gameplay works. The stalled loading run had online
-features enabled; it does not establish an offline gameplay failure. Compare
-offline and online loading before attributing the stall to the save interface.
-Investigation is paused; peer joining, voice and save restoration remain
-unqualified. See `titles/9PDS2N82QNXG.toml` for current issues.
+Use a runtime providing `xgameruntime.gamesave-interface4-legacy`. The game asks
+for `IXGameSaveImpl4` and, without it, plays on but never writes a save: a
+relaunch lists every San Angora slot as New Save. With the interface, a clean
+offline run loaded a new world in about 30 seconds, autosaved, and after a
+relaunch reloaded that save with its quest progress. Offline play is also
+player-confirmed.
+
+Answer **No** to online mode. With online features on, the same steps took
+about three minutes to load the world, which then advanced only every few
+minutes and stopped responding to input; the cause is not established. Quit Game
+after playing closes the window but leaves the process running, on this and the
+previous runtime, so stop the title from the launcher afterwards. Peer joining
+and voice are unqualified. See `titles/9PDS2N82QNXG.toml` for current issues.
 
 ### Retro Classics — **playable, player-confirmed**
 
