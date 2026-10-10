@@ -4,11 +4,12 @@
 #
 # Two things make this more than "make install":
 #
-#  - The build works from its own copy of the Wine tree ($OBJ/src-wine),
-#    refreshed from the submodule only when the .wine-source stamp is missing.
-#    Editing the submodule alone therefore changes nothing, and the stamps for
-#    the stages that consume it have to go too or the install silently ships
-#    the previous build.
+#  - The build works from its own copies of the Wine and vkd3d-proton trees
+#    ($BUILD_DIR/src-wine, $BUILD_DIR/src-vkd3d-proton), refreshed from the
+#    submodules only when their source stamps are missing. Editing a submodule
+#    alone therefore changes nothing, and the stamps for the stages that
+#    consume it have to go too or the install silently ships the previous
+#    build.
 #  - `make install` rsyncs dist/ over the compatibility tool with --delete,
 #    which replaces the `proton` script -- including the close_fds=False change
 #    that keeps the decrypted-image memfds alive. Without it every GDK title
@@ -28,14 +29,17 @@ cd "$BUILD_DIR"
 
 echo ":: invalidating Wine and vkd3d-proton source/build stamps"
 rm -f .wine-source .wine-x86_64-build .wine-x86_64-post-build .wine-x86_64-dist
+# Both architectures of vkd3d-proton rebuild on every install as a result. That
+# costs minutes, and is the price of never shipping a d3d12core.dll without
+# patches/vkd3d-proton.
 rm -f .vkd3d-proton-source .vkd3d-proton-post-source
 for arch in i386 x86_64; do
     rm -f ".vkd3d-proton-$arch-build" ".vkd3d-proton-$arch-post-build" ".vkd3d-proton-$arch-dist"
 done
 
 # Dropping the stamps makes the source stage run again; it does not make the
-# compiler run again. That stage rsyncs the submodule over $BUILD_DIR/src-wine
-# with -a, which preserves each file's modification time, so a source edited
+# compiler run again. That stage rsyncs each submodule over its copy in
+# $BUILD_DIR (src-wine, src-vkd3d-proton) with -a, which preserves each file's modification time, so a source edited
 # hours ago arrives older than the object built from the previous version and
 # make has nothing to do. The build then "succeeds" in seconds and installs
 # exactly what was already there.
@@ -46,35 +50,43 @@ done
 # verification problem rather than as the build not having happened.
 #
 # So give the files the series touches a current timestamp, in the submodule,
-# before the rsync copies them. Touching them in src-wine is no good: the
-# refresh overwrites those timestamps on the way in.
+# before the rsync copies them. Touching them in src-wine or src-vkd3d-proton is
+# no good: the refresh overwrites those timestamps on the way in.
 echo ":: marking patched sources for rebuild"
 WINE_SRC=${WINE_SRC:-${XODUS_SRC_DIR:-$HOME/src}/xodus-proton/wine}
+# A sibling of wine in the Proton tree, like every other Proton submodule.
+VKD3D_SRC=${VKD3D_SRC:-$(dirname "$WINE_SRC")/vkd3d-proton}
+
+# Touch every file a series patches, and say how many, per series: a count of
+# zero for a series that has patches is the stale build announcing itself.
+#
+# `if`, not `[ -f ] && touch`: under `set -e` a false test as the last command
+# of a loop body ends the script, so a patch naming a file that has since moved
+# would abort the install rather than be skipped.
+touch_series() {
+    local label=$1 dir=$2 p f n=0
+    shift 2
+    for p in "$@"; do
+        [ -e "$p" ] || continue
+        while read -r f; do
+            if [ -f "$dir/$f" ]; then
+                touch "$dir/$f"
+                n=$((n + 1))
+            fi
+        done < <(sed -n 's|^+++ b/\(.*\)$|\1|p' "$p")
+    done
+    echo "   $label: $n files"
+}
 if [ -d "$WINE_SRC" ]; then
-    # `if`, not `[ -f ] && touch`: under `set -e` a false test as the last
-    # command of a loop body ends the script, so a patch naming a file that has
-    # since moved would abort the install rather than be skipped.
-    touched=0
-    touch_series() {
-        local dir=$1 p f
-        shift
-        for p in "$@"; do
-            [ -e "$p" ] || continue
-            while read -r f; do
-                if [ -f "$dir/$f" ]; then
-                    touch "$dir/$f"
-                    touched=$((touched + 1))
-                fi
-            done < <(sed -n 's|^+++ b/\(.*\)$|\1|p' "$p")
-        done
-    }
-    touch_series "$WINE_SRC" "$REPO_DIR"/patches/wine/*.patch
-    touch_series "$WINE_SRC/dlls/xgameruntime" "$REPO_DIR"/patches/xgameruntime/*.patch
-    VKD3D_SRC=${VKD3D_SRC:-$(dirname "$WINE_SRC")/vkd3d-proton}
-    touch_series "$VKD3D_SRC" "$REPO_DIR"/patches/vkd3d-proton/*.patch
-    echo "   $touched files"
+    touch_series wine "$WINE_SRC" "$REPO_DIR"/patches/wine/*.patch
+    touch_series xgameruntime "$WINE_SRC/dlls/xgameruntime" "$REPO_DIR"/patches/xgameruntime/*.patch
 else
     echo "   !! no wine tree at $WINE_SRC; set WINE_SRC if the build ships a stale runtime" >&2
+fi
+if [ -d "$VKD3D_SRC" ]; then
+    touch_series vkd3d-proton "$VKD3D_SRC" "$REPO_DIR"/patches/vkd3d-proton/*.patch
+else
+    echo "   !! no vkd3d-proton tree at $VKD3D_SRC; set VKD3D_SRC if the build ships a stale d3d12core.dll" >&2
 fi
 
 echo ":: building and installing (log: $BUILD_DIR/install.log)"
@@ -99,6 +111,17 @@ if strings "$D" | grep -q "unrecognised index"; then
     echo ":: xgameruntime carries the XGameSave implementation"
 else
     echo "!! xgameruntime looks stale -- saves will not work" >&2
+    exit 1
+fi
+
+# The same check for the vkd3d-proton series: its option name is compiled into
+# d3d12core.dll's configuration table, so its absence means the build did not
+# include patches/vkd3d-proton.
+V=$TOOL_DIR/files/lib/wine/vkd3d-proton/x86_64-windows/d3d12core.dll
+if strings "$V" | grep -q "retain_recording_allocators"; then
+    echo ":: vkd3d-proton carries retain_recording_allocators"
+else
+    echo "!! vkd3d-proton looks stale -- engines that release a recording allocator will crash" >&2
     exit 1
 fi
 

@@ -114,7 +114,9 @@ jobs:
           git clone --quiet https://github.com/xodus-gaming/xodus.git "$HOME/src/xodus-cli"
           git clone --quiet https://github.com/xodus-gaming/xgameruntime \
             "$HOME/src/xodus-proton/wine/dlls/xgameruntime"
-          git clone --quiet https://github.com/HansKristian-Work/vkd3d-proton \
+          # Without blobs: the history is needed to find the pinned base, but
+          # only that commit's files are ever read, and they arrive on demand.
+          git clone --quiet --filter=blob:none https://github.com/HansKristian-Work/vkd3d-proton \
             "$HOME/src/xodus-proton/vkd3d-proton"
 
       - name: Patches apply
