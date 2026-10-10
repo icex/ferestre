@@ -14,10 +14,11 @@ online-enabled new-world test stalled; compare offline/online loading and verify
 the save interface ABI before further implementation.
 See [release qualification](RELEASE-0.1.5.md).
 
-Engine-based defaults now cover unknown Ultralight/WebCore installations, and
-newly detected GDK recipes declare their minimum runtime requirements. Retro
-Classics catalogue and Tennis streaming were tested with the allocator and newer
-save-interface fixes. See [autodetection](AUTODETECTION.md).
+Unreleased: Retro Classics is playable (player-confirmed) on a runtime with the
+vkd3d-proton allocator-lifetime patch and the IXGameSaveImpl4 fix. Titles
+without a recipe that ship the same Ultralight/WebCore engine get the backend
+setting automatically, and recipes written from a package now require only what
+a probe can confirm. See [autodetection](AUTODETECTION.md).
 
 ## Where the work already is
 

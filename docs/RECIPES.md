@@ -259,19 +259,24 @@ offline and online loading before attributing the stall to the save interface.
 Investigation is paused; peer joining, voice and save restoration remain
 unqualified. See `titles/9PDS2N82QNXG.toml` for current issues.
 
-### Retro Classics — **catalogue and Tennis stream tested**
+### Retro Classics — **playable, player-confirmed**
 
 Use `titles/9MTVJ3HHTQGS.toml` with a runtime providing
-`d3d12.recording-allocator-lifetime` and `xgameruntime.gamesave-interface4-legacy`.
-The recipe enables `VKD3D_CONFIG=retain_recording_allocators`. Package 3.3.15.0
-retired allocators while command lists were recording, which crashed the older
-backend during `Close`. The compatibility setting retains the affected allocator
-until reset/destruction. Catalogue loading and a Tennis stream were verified.
+`d3d12.recording-allocator-lifetime` and
+`xgameruntime.gamesave-interface4-legacy`. Package 3.3.15.0 releases a D3D12
+command allocator while a list is still recording from it, which crashed the
+older vkd3d-proton during `Close`, and asks for the newer save interface.
 
-The same profile is detected automatically for complete Ultralight/WebCore
-installations without a tested recipe. See [autodetection](AUTODETECTION.md).
-Cloud save synchronization, save restoration and broad game/controller coverage
-remain unqualified.
+The recipe does not set `VKD3D_CONFIG`. `ferestre run` recognises the
+Ultralight libraries beside `RetroClassics.exe` and appends
+`retain_recording_allocators` to whatever `VKD3D_CONFIG` is already in effect,
+when the selected runtime provides the capability. `VKD3D_CONFIG=` (empty)
+turns that off. Launching without the launcher needs the variable set by hand.
+[Autodetection](AUTODETECTION.md) has the exact order.
+
+The player confirmed it playable; an isolated run also reached the catalogue
+and streamed Tennis. Cloud save synchronization, save restoration and broad
+game/controller coverage are not separately qualified.
 
 ## 5. Troubleshooting (every error we actually hit, and its fix)
 

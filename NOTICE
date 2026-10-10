@@ -1,8 +1,8 @@
 Licensing map
 =============
 
-This repository mixes original work with modifications to three other projects,
-each under a different licence. Which applies depends on the directory.
+This repository mixes original work with modifications to four other projects,
+each under its own licence. Which applies depends on the directory.
 
 MIT (see LICENSE)
 -----------------
@@ -18,12 +18,12 @@ MIT (see LICENSE)
 
 LGPL-2.1-or-later (see LICENSE.LGPL-2.1)
 ----------------------------------------
-  patches/wine/      patches/xgameruntime/
+  patches/wine/      patches/xgameruntime/      patches/vkd3d-proton/
 
-  Modifications to Wine, distributed as plain git diffs. Wine is
-  LGPL-2.1-or-later, so a modification of it is too, and it stays that way
-  however it is redistributed. Ship binaries built from these and you must make
-  the corresponding source available.
+  Modifications to Wine and to vkd3d-proton, distributed as plain git diffs.
+  Both are LGPL-2.1-or-later, so a modification of either is too, and it stays
+  that way however it is redistributed. Ship binaries built from these and you
+  must make the corresponding source available.
 
 GPL-3.0-only
 ------------
@@ -64,6 +64,9 @@ Upstream projects
   Proton          https://github.com/ValveSoftware/Proton
                   Valve's top-level components are BSD-3-Clause; the Wine
                   inside it remains LGPL-2.1-or-later.
+  vkd3d-proton    https://github.com/HansKristian-Work/vkd3d-proton
+                  LGPL-2.1-or-later. The Direct3D 12 implementation inside
+                  Proton; the series targets the commit Proton pins.
   Xodus           https://github.com/xodus-gaming    GPL-3.0-only
                   The client that signs in, fetches a licence, and downloads
                   and decrypts a package. Not affiliated with this project.
@@ -82,6 +85,5 @@ Trademarks
   identifier fields the tests need. No game content, package, licence or key is
   present in this repository, and none will be.
 
-The vkd3d-proton patches in patches/vkd3d-proton/ modify the LGPL-2.1-or-later
-backend at its pinned upstream commit. Microsoft's SDK headers and libraries
-used to validate interface layouts are not redistributed.
+  Interface layouts are checked against Microsoft's GDK headers and libraries,
+  which are not redistributed here.
