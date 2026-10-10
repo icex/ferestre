@@ -58,7 +58,7 @@ is playable, with an intermittent offline indicator still unresolved.
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
 | Retro Classics | `9MTVJ3HHTQGS` | Playable | Playable, confirmed by the player. Signs in, loads the catalogue and streams Tennis; broader game, controller and save-restore coverage is not separately qualified. | 2026-10-10 |
 | Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. | 2026-09-06 |
-| Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable, with issues | Offline play saves and resumes across relaunches. Online-enabled play reaches the world but then stalls; quitting after a session leaves the process running. | 2026-10-10 |
+| Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable, with issues | Offline and online-enabled play save and resume across relaunches, and Quit Game exits. Peer joining and voice are untested. | 2026-10-11 |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.
 

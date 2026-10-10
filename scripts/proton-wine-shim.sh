@@ -60,6 +60,24 @@ if [ -z "${WINE_PACKAGE_MANIFEST:-}" ]; then
     done
 fi
 
+# Before loading gameplatformservices.dll, PlayFab Party (and anything else
+# built on the GDK's loader for it) waits for Microsoft Gaming Services'
+# watchdog for up to HKLM\Microsoft\GamingServices\ServiceRetryTimeout, 60 s
+# when unset. Wine has no Gaming Services, so every such wait ran out: Goat
+# Simulator 3 took minutes to load a world with online features on, and its
+# Quit Game never returned. With 0 the lookup fails at once and the title
+# carries on. Written once per prefix, by Proton so that a new prefix is
+# created first; a value already there, whatever it is, is left alone.
+SYSTEM_REG="$STEAM_COMPAT_DATA_PATH/pfx/system.reg"
+if ! awk '/^\[/ { in_key = ($0 ~ /^\[Microsoft\\\\GamingServices\]/) }
+          in_key && /^"ServiceRetryTimeout"=/ { found = 1 }
+          END { exit !found }' "$SYSTEM_REG" 2>/dev/null; then
+    env -u WINE_DLL_FILE_MAP -u WINE_PACKAGE_MANIFEST \
+        "$PROTON_DIR/proton" run reg add 'HKLM\Microsoft\GamingServices' \
+        /v ServiceRetryTimeout /t REG_DWORD /d 0 /f >/dev/null 2>&1 ||
+        echo "-- could not set ServiceRetryTimeout in the prefix; titles using Party may wait 60 s for Gaming Services" >&2
+fi
+
 if [ "${FERESTRE_IMAGE_VIEW:-}" = "real-path" ]; then
     exec python3 "$(dirname "$0")/real-path-image-view.py" -- "$PROTON_DIR/proton" run "$@"
 fi

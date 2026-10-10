@@ -36,9 +36,9 @@ requires = [
 
 [status]
 state = "playable-with-issues"
-summary = "Offline play saves and resumes across relaunches. Online-enabled play reaches the world but then stalls; quitting after a session leaves the process running."
-last-verified = 2026-10-10
-verified-with = "Game Pass package; player-confirmed offline gameplay; automated clean-prefix runs: offline new save loads in about 30 s, autosaves, and the save reloads after relaunch with progress; the same steps with online features enabled loaded in about 3 minutes and then advanced only every few minutes"
+summary = "Offline and online-enabled play save and resume across relaunches, and Quit Game exits. Peer joining and voice are untested."
+last-verified = 2026-10-11
+verified-with = "Game Pass package; player-confirmed offline gameplay; automated clean-prefix runs on runtime 11.0.20261010.2: offline and online-enabled new saves reach the world in under 40 s (online measured at 60 fps), autosave, reload after a relaunch with progress, and Quit Game exits in seconds"
 
 [[issues]]
 symptom = "Progress is not kept: after a relaunch every San Angora slot reads New Save"
@@ -47,14 +47,9 @@ fix = "Update the runtime to one providing xgameruntime.gamesave-interface4-lega
 log-match = "ab4ae4fb-6508-4950-a032-45fd4bf8c43b"
 
 [[issues]]
-symptom = "With online features enabled, a world takes minutes to load and then barely advances or responds"
-cause = "Not established. The same steps with online features off run normally on the same runtime and prefix."
-fix = "Answer No to online mode, or switch to offline in Settings. Online play, peer joining and voice remain unqualified."
-
-[[issues]]
-symptom = "Quit Game closes the window but the process keeps running"
-cause = "Not established. Seen after playing a world, with online features off, on both the current and the previous runtime."
-fix = "Stop the title from the launcher after quitting. The save is already written by then."
+symptom = "With online features enabled a world takes minutes to load and then barely responds; Quit Game closes the window but the process keeps running"
+cause = "The shipped PlayFab Party library waits for Microsoft Gaming Services before loading gameplatformservices.dll, for up to HKLM\\Microsoft\\GamingServices\\ServiceRetryTimeout (60 s when unset). Wine has no Gaming Services, so each wait ran out: repeatedly in online mode, and on shutdown, where the main thread stayed parked in Party."
+fix = "Update the launcher to 0.1.7 or later, which sets ServiceRetryTimeout to 0 in the prefix before launching. With an older launcher, run `reg add HKLM\\Microsoft\\GamingServices /v ServiceRetryTimeout /t REG_DWORD /d 0 /f` in the prefix."
 
 [[issues]]
 symptom = "Online sign-in reports unknown network error GS3-NF-2"
