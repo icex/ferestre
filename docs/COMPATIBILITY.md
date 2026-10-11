@@ -35,10 +35,10 @@ real contribution even — especially — when the answer is that it does not ru
 **Before you paste anything: a session log contains your gamertag, your XUID and
 your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 
-Current release qualification: [0.1.6](RELEASE-0.1.6.md). Retro Classics is
-playable (player-confirmed). Goat Simulator 3 saves and reloads offline progress
-on runtime 11.0.20261010.2; online-enabled play still stalls after loading. Halo
-is playable, with an intermittent offline indicator still unresolved.
+Current release qualification: [0.1.7](RELEASE-0.1.7.md). Retro Classics is
+playable (player-confirmed). Goat Simulator 3 saves and reloads progress on
+runtime 11.0.20261010.2, offline and, from launcher 0.1.7, online. Halo is
+playable, with an intermittent offline indicator still unresolved.
 
 ## The matrix
 
@@ -58,7 +58,7 @@ is playable, with an intermittent offline indicator still unresolved.
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
 | Retro Classics | `9MTVJ3HHTQGS` | Playable | Playable, confirmed by the player. Signs in, loads the catalogue and streams Tennis; broader game, controller and save-restore coverage is not separately qualified. | 2026-10-10 |
 | Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. | 2026-09-06 |
-| Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable, with issues | Offline play saves and resumes across relaunches. Online-enabled play reaches the world but then stalls; quitting after a session leaves the process running. | 2026-10-10 |
+| Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable, with issues | Offline and online-enabled play save and resume across relaunches, and Quit Game exits. Peer joining and voice are untested. | 2026-10-11 |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.
 

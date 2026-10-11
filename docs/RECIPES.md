@@ -263,7 +263,7 @@ restart: the user confirmed saving after tutorial completion. Mid-tutorial
 restarts alone did not establish a save failure. Cloud sync and multiplayer
 remain unqualified. Accept the bundled Visual C++ installer on a fresh prefix.
 
-### Goat Simulator 3 — **offline playable with saves; online stalls**
+### Goat Simulator 3 — **playable offline and online, with saves**
 
 Use a runtime providing `xgameruntime.gamesave-interface4-legacy`. The game asks
 for `IXGameSaveImpl4` and, without it, plays on but never writes a save: a
@@ -272,12 +272,17 @@ offline run loaded a new world in about 30 seconds, autosaved, and after a
 relaunch reloaded that save with its quest progress. Offline play is also
 player-confirmed.
 
-Answer **No** to online mode. With online features on, the same steps took
-about three minutes to load the world, which then advanced only every few
-minutes and stopped responding to input; the cause is not established. Quit Game
-after playing closes the window but leaves the process running, on this and the
-previous runtime, so stop the title from the launcher afterwards. Peer joining
-and voice are unqualified. See `titles/9PDS2N82QNXG.toml` for current issues.
+Online mode needs launcher 0.1.7 or later. The PlayFab Party library the game
+ships waits for Microsoft Gaming Services before loading
+`gameplatformservices.dll`, for up to
+`HKLM\Microsoft\GamingServices\ServiceRetryTimeout` (60 s when unset). Wine has
+no Gaming Services, so every wait ran out: with online features on a world took
+about three minutes to load and then barely responded, and Quit Game left the
+process running in either mode. The launcher's Proton shim now sets the timeout
+to 0 in each prefix that has no value of its own. On a clean prefix, online
+mode then reached the world in under 20 seconds at 60 fps, saved and reloaded
+like offline play, and Quit Game exited in a few seconds. Peer joining and voice
+are untested. See `titles/9PDS2N82QNXG.toml` for current issues.
 
 ### Retro Classics — **playable, player-confirmed**
 

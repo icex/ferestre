@@ -6,14 +6,18 @@ for Bedrock on Android, for Microsoft Store titles on Linux.
 
 ## Current qualification
 
-Release 0.1.6 and runtime 11.0.20261010.2 add Retro Classics (player-confirmed)
+Release 0.1.7 keeps runtime 11.0.20261010.2 and sets
+`HKLM\Microsoft\GamingServices\ServiceRetryTimeout` to 0 in each prefix. PlayFab
+Party otherwise waits up to a minute for Gaming Services, which Wine lacks, every
+time it looks for `gameplatformservices.dll`; that was Goat Simulator 3's online
+stall and its Quit Game hang. Online mode now loads, plays and saves, and Quit
+Game exits. See [release qualification](RELEASE-0.1.7.md).
+
+0.1.6 and runtime 11.0.20261010.2 added Retro Classics (player-confirmed)
 through the vkd3d-proton allocator-lifetime patch and the IXGameSaveImpl4 save
-interface. The same interface makes Goat Simulator 3 keep its saves; before it,
-the game played but never wrote one, and offline saves now reload after a
-relaunch. Titles without a recipe that ship Retro's Ultralight/WebCore engine get
-the backend setting automatically. Goat's online-enabled play still stalls after
-the world loads, and its Quit Game leaves the process running.
-See [release qualification](RELEASE-0.1.6.md).
+interface, which also makes Goat Simulator 3 keep its saves. Titles without a
+recipe that ship Retro's Ultralight/WebCore engine get the backend setting
+automatically. See [0.1.6 qualification](RELEASE-0.1.6.md).
 
 0.1.5 and runtime 11.0.20261010.1 added Halo campaign support; Halo gameplay and
 saving have live confirmation, and Dungeons saving was confirmed after its

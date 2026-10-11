@@ -61,10 +61,13 @@ Pronounced roughly *feh-RESS-treh*.
 
 ## Status
 
-Release **0.1.6** pairs with runtime **11.0.20261010.2**. Update both: the
-runtime adds Retro Classics, keeps Goat Simulator 3 saves, and carries everything
-0.1.5 added for Halo Infinite. See [release qualification](docs/RELEASE-0.1.6.md)
-for the tested scope and remaining gaps.
+Release **0.1.7** pairs with runtime **11.0.20261010.2**. It stops titles that
+use PlayFab Party waiting a minute at a time for Gaming Services, which Wine does
+not have: Goat Simulator 3's online mode now loads and plays, and its Quit Game
+exits. The runtime adds Retro Classics, keeps Goat Simulator 3 saves, and carries
+everything 0.1.5 added for Halo Infinite. See
+[release qualification](docs/RELEASE-0.1.7.md) for the tested scope and remaining
+gaps.
 
 Honest version, because this is early. Every row here was run on a real machine,
 not inferred from the fact that it downloaded:
@@ -81,7 +84,7 @@ not inferred from the fact that it downloaded:
 | **Overthrown** | Game Pass | Playable |
 | **Minecraft Dungeons II** | Game Pass Ultimate | Playable — sign-in and gameplay work; saving confirmed after finishing the tutorial |
 | **Halo Infinite** | Store / Game Pass Ultimate | Playable — campaign, training and multiplayer; intermittent offline display under investigation |
-| **Goat Simulator 3** | Game Pass | Offline play saves and resumes on the newer runtime; online-enabled play stalls after loading |
+| **Goat Simulator 3** | Game Pass | Offline and online play save and resume; peer joining and voice untested |
 | **Age of Empires Definitive Edition** | Game Pass | Playable — boots, starts a custom game, and plays |
 | **Forza Horizon 5** | Store | Playable with restored Windows saves; Forza Online and the live Festival Playlist work |
 
