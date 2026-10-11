@@ -253,7 +253,7 @@ Campaign, Academy and multiplayer have live confirmation, as does local saving.
 Intermittent offline display is unresolved. Cloud saves and purchases are not
 qualified. A Store/Xbox account mismatch dialog can be dismissed to play.
 Remove an older personal Halo recipe override, or update it to match the shipped
-recipe, since personal overrides take precedence.
+recipe, since personal overrides take precedence (see Troubleshooting).
 
 ### Minecraft Dungeons II — **playable**
 
@@ -263,7 +263,7 @@ restart: the user confirmed saving after tutorial completion. Mid-tutorial
 restarts alone did not establish a save failure. Cloud sync and multiplayer
 remain unqualified. Accept the bundled Visual C++ installer on a fresh prefix.
 
-### Goat Simulator 3 — **playable offline and online, with saves**
+### Goat Simulator 3 — **playable, player-confirmed offline and online**
 
 Use a runtime providing `xgameruntime.gamesave-interface4-legacy`. The game asks
 for `IXGameSaveImpl4` and, without it, plays on but never writes a save: a
@@ -281,8 +281,8 @@ about three minutes to load and then barely responded, and Quit Game left the
 process running in either mode. The launcher's Proton shim now sets the timeout
 to 0 in each prefix that has no value of its own. On a clean prefix, online
 mode then reached the world in under 20 seconds at 60 fps, saved and reloaded
-like offline play, and Quit Game exited in a few seconds. Peer joining and voice
-are untested. See `titles/9PDS2N82QNXG.toml` for current issues.
+like offline play, and Quit Game exited in a few seconds. The player confirmed
+online play on launcher 0.1.7. Peer joining and voice are untested. See `titles/9PDS2N82QNXG.toml` for current issues.
 
 ### Retro Classics — **playable, player-confirmed**
 
@@ -318,6 +318,7 @@ game/controller coverage are not separately qualified.
 | `newgrp docker` prompts / hangs | user not in the docker group | `sudo usermod -aG docker $USER`, log out and in |
 | game runs but no picture / colour bars in videos | Steam's ffmpeg has no H.264 outside Steam | launcher sets `PROTON_PREFER_SYSTEM_FFMPEG=1`; needs a system ffmpeg with H.264 |
 | several instances make everything slow | stray processes from testing | `scripts/kill-gdk.sh` |
+| a title keeps an old state, summary or setting after an upgrade | a recipe in `~/.config/ferestre/titles/` replaces the shipped recipe of the same product id as a whole, including its `[status]` | delete the personal copy, or bring it up to date with the shipped one. Launcher 0.1.8 finds a title installed under its product id from its install record, so a copy kept only for `[install] dir` is no longer needed |
 
 ## 6. Debugging a launch
 

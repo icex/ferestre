@@ -61,13 +61,15 @@ Pronounced roughly *feh-RESS-treh*.
 
 ## Status
 
-Release **0.1.7** pairs with runtime **11.0.20261010.2**. It stops titles that
-use PlayFab Party waiting a minute at a time for Gaming Services, which Wine does
-not have: Goat Simulator 3's online mode now loads and plays, and its Quit Game
-exits. The runtime adds Retro Classics, keeps Goat Simulator 3 saves, and carries
-everything 0.1.5 added for Halo Infinite. See
-[release qualification](docs/RELEASE-0.1.7.md) for the tested scope and remaining
-gaps.
+Release **0.1.8** pairs with runtime **11.0.20261010.2**. Goat Simulator 3 is
+playable offline and online, confirmed by the player on 0.1.7, which stopped
+titles that use PlayFab Party waiting a minute at a time for Gaming Services.
+0.1.8 also finds a title installed under its product id from the launcher's own
+install record, so a personal recipe copy no longer has to hold that directory
+and hide later updates to the shipped recipe. The runtime adds Retro Classics,
+keeps Goat Simulator 3 saves, and carries everything 0.1.5 added for Halo
+Infinite. See [release qualification](docs/RELEASE-0.1.8.md) for the tested
+scope and remaining gaps.
 
 Honest version, because this is early. Every row here was run on a real machine,
 not inferred from the fact that it downloaded:
@@ -84,7 +86,7 @@ not inferred from the fact that it downloaded:
 | **Overthrown** | Game Pass | Playable |
 | **Minecraft Dungeons II** | Game Pass Ultimate | Playable — sign-in and gameplay work; saving confirmed after finishing the tutorial |
 | **Halo Infinite** | Store / Game Pass Ultimate | Playable — campaign, training and multiplayer; intermittent offline display under investigation |
-| **Goat Simulator 3** | Game Pass | Offline and online play save and resume; peer joining and voice untested |
+| **Goat Simulator 3** | Game Pass | Playable — player-confirmed offline and online; saves resume; peer joining and voice untested |
 | **Age of Empires Definitive Edition** | Game Pass | Playable — boots, starts a custom game, and plays |
 | **Forza Horizon 5** | Store | Playable with restored Windows saves; Forza Online and the live Festival Playlist work |
 

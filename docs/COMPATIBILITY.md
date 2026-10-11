@@ -35,9 +35,9 @@ real contribution even — especially — when the answer is that it does not ru
 **Before you paste anything: a session log contains your gamertag, your XUID and
 your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 
-Current release qualification: [0.1.7](RELEASE-0.1.7.md). Retro Classics is
-playable (player-confirmed). Goat Simulator 3 saves and reloads progress on
-runtime 11.0.20261010.2, offline and, from launcher 0.1.7, online. Halo is
+Current release qualification: [0.1.8](RELEASE-0.1.8.md). Retro Classics and
+Goat Simulator 3 are playable (player-confirmed); Goat saves and reloads progress
+on runtime 11.0.20261010.2, offline and, from launcher 0.1.7, online. Halo is
 playable, with an intermittent offline indicator still unresolved.
 
 ## The matrix
@@ -51,6 +51,7 @@ playable, with an intermittent offline indicator still unresolved.
 | DOOM 64 | `9MXND4PQLK3W` | Playable | Plays. | 2026-09-06 |
 | DREDGE | `9MSVVM5NS9L6` | Playable | Plays. | 2026-09-06 |
 | Forza Horizon 5 | `9NNX1VVR3KNQ` | Playable | Plays with a restored Windows career; title services and the live Festival Playlist load after generic authentication and endpoint-discovery fixes. Player confirmed the online fix. | 2026-09-07 |
+| Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable | Playable, confirmed by the player offline and online. New games save and resume across relaunches, and Quit Game exits. Peer joining and voice are untested. | 2026-10-11 |
 | Halo Infinite | `9PP5G1F0C2B6` | Playable | Campaign, Academy training and multiplayer run; campaign save restoration was confirmed locally. Intermittent offline display remains under investigation. | 2026-10-10 |
 | Hollow Knight: Silksong | `9N116V0599HB` | Playable | Playable, confirmed by the player on the local Game Pass installation. | 2026-10-10 |
 | Minecraft Dungeons II | `9P5786PJB9RP` | Playable | Account sign-in, Store licence verification and Squid Coast gameplay work with the matching updated runtime. Long-session, multiplayer and cloud-save behavior are untested. | 2026-10-10 |
@@ -58,7 +59,6 @@ playable, with an intermittent offline indicator still unresolved.
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
 | Retro Classics | `9MTVJ3HHTQGS` | Playable | Playable, confirmed by the player. Signs in, loads the catalogue and streams Tennis; broader game, controller and save-restore coverage is not separately qualified. | 2026-10-10 |
 | Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. | 2026-09-06 |
-| Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable, with issues | Offline and online-enabled play save and resume across relaunches, and Quit Game exits. Peer joining and voice are untested. | 2026-10-11 |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.
 
