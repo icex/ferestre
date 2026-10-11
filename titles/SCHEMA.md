@@ -50,7 +50,7 @@ Where the title and its prefix live, relative to `XODUS_GAMES_DIR`.
 
 | key | type | | meaning |
 |---|---|---|---|
-| `dir` | string | optional | Default: the slug. Forward slashes, must stay inside the games directory. |
+| `dir` | string | optional | Default: where the launcher recorded installing the title, while that directory exists, otherwise the slug. Forward slashes, must stay inside the games directory. |
 | `dir-env` | string | optional | An environment variable that overrides `dir`, for compatibility with the existing scripts. |
 | `prefix` | string | optional | Default: `<slug>-proton`. |
 | `prefix-env` | string | optional | As `dir-env`, for the prefix. |

@@ -425,9 +425,23 @@ impl Paths {
     /// drive", so it is deliberately not confined to the games directory. The
     /// path from the recipe is, because a recipe is data from a file that may
     /// not be ours.
+    ///
+    /// A recipe that names no directory falls back to where the launcher
+    /// recorded installing the title, while that directory is still there. A
+    /// title downloaded before it had a recipe went to `<product id>`, not to
+    /// the slug a recipe shipped later defaults to; without this, the only way
+    /// to find it was a copy of the recipe in the user's titles directory, and
+    /// that copy then hid every later change to the shipped one.
     pub fn install_dir(&self, recipe: &Recipe) -> Result<PathBuf> {
         if let Some(dir) = self.recipe_env(recipe.install.dir_env.as_deref()) {
             return Ok(dir);
+        }
+        if recipe.install.dir.is_none() {
+            if let Some(record) = crate::install::load(&self.state, &recipe.title.product_id) {
+                if record.dir.is_dir() {
+                    return Ok(record.dir);
+                }
+            }
         }
         self.under_games(recipe.install_dir(), "install dir", recipe)
     }
@@ -809,6 +823,41 @@ summary = "Runs."
             p.log_file(&r).unwrap(),
             Path::new("/home/tester/xbox-games/example-launch.log")
         );
+    }
+
+    #[test]
+    fn a_recorded_install_is_found_without_a_recipe_naming_its_directory() {
+        let root = std::env::temp_dir().join(format!("ferestre-recorded-{}", std::process::id()));
+        let downloaded = root.join("games/9nblggh2jhxj");
+        std::fs::create_dir_all(&downloaded).unwrap();
+        let state = root.join("state");
+        let p = paths(&[
+            ("XDG_STATE_HOME", state.to_str().unwrap()),
+            ("XODUS_GAMES_DIR", root.join("games").to_str().unwrap()),
+        ]);
+        let record = crate::install::Record {
+            product_id: "9NBLGGH2JHXJ".into(),
+            dir: downloaded.clone(),
+            content_ids: Vec::new(),
+            installed_at: None,
+            package_version: None,
+        };
+        crate::install::save(p.state_dir(), &record).unwrap();
+
+        assert_eq!(p.install_dir(&recipe("")).unwrap(), downloaded);
+        // A directory the recipe names is still where the recipe says.
+        assert_eq!(
+            p.install_dir(&recipe("[install]\ndir = \"elsewhere\""))
+                .unwrap(),
+            root.join("games/elsewhere")
+        );
+        // A record whose directory has gone is not followed.
+        std::fs::remove_dir_all(&downloaded).unwrap();
+        assert_eq!(
+            p.install_dir(&recipe("")).unwrap(),
+            root.join("games/example")
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
