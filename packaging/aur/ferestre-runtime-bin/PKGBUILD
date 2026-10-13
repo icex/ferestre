@@ -15,7 +15,7 @@
 pkgname=ferestre-runtime-bin
 # Upstream's own version string is 'xodus-bleeding-edge-11.0-<date>-<n>-g<sha>';
 # pkgver cannot hold the hyphens, so a release is <proton major>.<minor>.<date>.
-pkgver=11.0.20261010.2
+pkgver=11.0.20261013.3
 pkgrel=1
 pkgdesc='Patched Proton with the ferestre Xbox GDK runtime implementation, prebuilt'
 arch=('x86_64')
@@ -110,7 +110,7 @@ _tarball="ferestre-runtime-$pkgver.tar.xz"
 source=("$url/releases/download/runtime-$pkgver/$_tarball")
 
 # Verified against the published release asset.
-sha256sums=('10e6709f69dd38603d1792bb874732649ebf44652dbe1541692942ee583312ce')
+sha256sums=('eb95f5a2db169a557e4df8dab3c3140aaea3e5a812c25480dd5f390b27aca690')
 
 package() {
   local src="$srcdir/ferestre-runtime-$pkgver"
