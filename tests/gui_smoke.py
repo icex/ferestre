@@ -779,10 +779,30 @@ print(":: done", flush=True)
         check(value is not None, "the library has a scrollable title list", frame)
         value.set_current_value(200)
         time.sleep(0.25)
-        position = value.get_current_value()
-        check(position > 50, f"the library is scrolled before the click ({position})", frame)
         play = row_button(frame, "Minecraft for Windows", "Play")
         check(play is not None, "the installed fixture can be selected to play", frame)
+        # The title list grows with the recipe set. A fixed offset does not
+        # guarantee this button is in the viewport; pointer events aimed at an
+        # offscreen accessible hit another widget or empty space.
+        component = play.get_component_iface()
+        component.scroll_to(Atspi.ScrollType.ANYWHERE)
+        time.sleep(0.25)
+        play = row_button(frame, "Minecraft for Windows", "Play")
+        position = scroll_value().get_current_value()
+        check(position > 50, f"the library is scrolled before the click ({position})", frame)
+        # Check the target against its viewport before generating the pointer
+        # event. This still tests a real focus-changing click, not activation.
+        viewport = play.get_parent()
+        while viewport is not None and viewport.get_role_name() != "scroll pane":
+            viewport = viewport.get_parent()
+        check(viewport is not None, "the Play button belongs to the title viewport", frame)
+        button_box = play.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+        view_box = viewport.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+        check(
+            view_box.y <= button_box.y + button_box.height // 2 < view_box.y + view_box.height,
+            f"the pointer target is visible (button y={button_box.y}, viewport y={view_box.y}, height={view_box.height})",
+            frame,
+        )
         # With the pointer, not an action: the click focuses the button, the
         # redraw destroys it, and GTK hands the focus to the first widget left
         # in the list -- scrolling the library to the top to show it.
