@@ -784,18 +784,28 @@ print(":: done", flush=True)
         # The title list grows with the recipe set. A fixed offset does not
         # guarantee this button is in the viewport; pointer events aimed at an
         # offscreen accessible hit another widget or empty space.
-        component = play.get_component_iface()
-        component.scroll_to(Atspi.ScrollType.ANYWHERE)
-        time.sleep(0.25)
-        play = row_button(frame, "Minecraft for Windows", "Play")
-        position = scroll_value().get_current_value()
-        check(position > 50, f"the library is scrolled before the click ({position})", frame)
         # Check the target against its viewport before generating the pointer
         # event. This still tests a real focus-changing click, not activation.
         viewport = play.get_parent()
         while viewport is not None and viewport.get_role_name() != "scroll pane":
             viewport = viewport.get_parent()
         check(viewport is not None, "the Play button belongs to the title viewport", frame)
+        # GTK4's AT-SPI ScrollTo method is unsupported. Use the same exposed
+        # scrollbar Value interface as the rest of this check, aiming from the
+        # target's current geometry instead of guessing a catalog-size offset.
+        for _ in range(3):
+            play = row_button(frame, "Minecraft for Windows", "Play")
+            button_box = play.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+            view_box = viewport.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+            center = button_box.y + button_box.height // 2
+            if view_box.y <= center < view_box.y + view_box.height:
+                break
+            value = scroll_value()
+            target = value.get_current_value() + center - (view_box.y + view_box.height // 2)
+            value.set_current_value(max(0, min(target, value.get_maximum_value())))
+            time.sleep(0.25)
+        position = scroll_value().get_current_value()
+        check(position > 50, f"the library is scrolled before the click ({position})", frame)
         button_box = play.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
         view_box = viewport.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
         check(
