@@ -478,6 +478,17 @@ last-verified = 2026-10-10
             "XDG_STATE_HOME": os.path.join(home, "state"),
             "XDG_CONFIG_HOME": os.path.join(home, "config"),
             "GTK_A11Y": "atspi",
+            # Startup now refreshes the public catalog. Keep this fixture
+            # offline: a refused local proxy exercises cached fallback and
+            # prevents real Microsoft data from replacing its seeded rows.
+            "HTTPS_PROXY": "http://127.0.0.1:9",
+            "https_proxy": "http://127.0.0.1:9",
+            "HTTP_PROXY": "http://127.0.0.1:9",
+            "http_proxy": "http://127.0.0.1:9",
+            "ALL_PROXY": "http://127.0.0.1:9",
+            "all_proxy": "http://127.0.0.1:9",
+            "NO_PROXY": "",
+            "no_proxy": "",
             "FERESTRE_TITLES": recipes_dir,
             # Recipes come from the checkout, but nothing else should: no Steam,
             # no runtime, no client.
