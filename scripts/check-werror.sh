@@ -100,6 +100,10 @@ for o in "${OBJECTS[@]}"; do printf '   %s\n' "$o" >&2; done
 # nothing passes for the wrong reason.
 ( cd "$OBJ_DIR" && rm -f "${OBJECTS[@]}" )
 
+CCACHE_DIR=${CCACHE_DIR:-$BUILD_DIR/.ccache-check-werror}
+mkdir -p "$CCACHE_DIR"
+export CCACHE_DIR
+
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
 if docker run --rm \

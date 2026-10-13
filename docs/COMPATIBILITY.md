@@ -6,7 +6,7 @@ project, and exactly where the ones that fail stop.
 ## Read this first
 
 **Many titles remain untested, and an untested title may expose another runtime
-gap.** Thirteen titles have been run. The GDK runtime is written against the
+gap.** Fifteen titles have been run. The GDK runtime is written against the
 *observable* behaviour of the API — task queues, async, users, storage,
 networking, save games, packages — so each new title remains useful evidence.
 
@@ -50,7 +50,9 @@ playable, with an intermittent offline indicator still unresolved.
 | Clair Obscur: Expedition 33 | `9PPT8K6GQHRZ` | Playable | Playable start to finish, with working saves and video. | 2026-09-06 |
 | DOOM 64 | `9MXND4PQLK3W` | Playable | Plays. | 2026-09-06 |
 | DREDGE | `9MSVVM5NS9L6` | Playable | Plays. | 2026-09-06 |
+| Dune: Awakening | `9PJ6FV3130QZ` | Playable | Gameplay confirmed by the player. | 2026-10-13 |
 | Forza Horizon 5 | `9NNX1VVR3KNQ` | Playable | Plays with a restored Windows career; title services and the live Festival Playlist load after generic authentication and endpoint-discovery fixes. Player confirmed the online fix. | 2026-09-07 |
+| Forza Horizon 6 | `9NR1R1XWLCNB` | Playable | Gameplay and Continue with saved progress confirmed by the player. The in-game marketplace is currently unavailable. | 2026-10-13 |
 | Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable | Playable, confirmed by the player offline and online. New games save and resume across relaunches, and Quit Game exits. Peer joining and voice are untested. | 2026-10-11 |
 | Halo Infinite | `9PP5G1F0C2B6` | Playable | Campaign, Academy training and multiplayer run; campaign save restoration was confirmed locally. Intermittent offline display remains under investigation. | 2026-10-10 |
 | Hollow Knight: Silksong | `9N116V0599HB` | Playable | Playable, confirmed by the player on the local Game Pass installation. | 2026-10-10 |

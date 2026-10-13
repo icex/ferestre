@@ -150,6 +150,7 @@ jobs:
               "$root/usr/lib/ferestre/client/xodus-cli"
           install -Dm755 third_party/xodus-cli/target/release/xodus-service \
               "$root/usr/lib/ferestre/client/xodus-service"
+          sha256sum "$root/usr/lib/ferestre/client/xodus-service" | cut -d' ' -f1 > "$root/usr/lib/ferestre/client/SERVICE_ID"
           # Not documentation: launch-gdk.sh is the launch path and
           # proton-wine-shim.sh is what the client execs as its "wine".
           # patches/ travels with them because install-xodus-proton.sh reads
@@ -170,7 +171,7 @@ jobs:
                   "$root/usr/share/icons/hicolor/scalable/apps/$id.svg"
           fi
 
-          for doc in README.md NOTICE docs/RECIPES.md docs/ROADMAP.md docs/COMPATIBILITY.md docs/AUTODETECTION.md; do
+          for doc in README.md NOTICE docs/RELEASE-0.1.9.md docs/RECIPES.md docs/ROADMAP.md docs/COMPATIBILITY.md docs/AUTODETECTION.md; do
               install -Dm644 "$doc" "$root/usr/share/doc/ferestre/$(basename "$doc")"
           done
           for lic in LICENSE LICENSE.LGPL-2.1; do
@@ -236,10 +237,12 @@ jobs:
 
           The AppImage and tarball include the Xodus client. The patched Proton
           runtime is downloaded separately on first start and is released
-          under \`runtime-*\` tags. Use runtime 11.0.20261010.2. This release
-          finds titles installed under their product id without a personal
-          recipe copy, and marks Goat Simulator 3 playable.
-          See docs/RELEASE-0.1.8.md for the tested scope.
+          under \`runtime-*\` tags. Use runtime 11.0.20261013.3. Forza Horizon 6
+          gameplay and Continue with saved progress are player-confirmed;
+          marketplace recovery remains unconfirmed. Dune: Awakening is marked
+          playable from player confirmation. Catalog/tier refresh, complete
+          search/paging and install-button state are improved.
+          See docs/RELEASE-0.1.9.md for tested scope.
 
           You need to own the games. This downloads and runs what your own
           Microsoft account is licensed for, and nothing else.

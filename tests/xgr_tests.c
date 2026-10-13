@@ -251,6 +251,19 @@ static void test_xuser(void)
                         buffer, &narrow, &used );
                 CHECK( hr == S_OK && narrow && !strcmp(narrow->token, "fixture-auth") &&
                         !strcmp(narrow->signature, "fixture-signature"), "UTF-8 payload remains intact" );
+                {
+                    BYTE *large = malloc(100000);
+                    unsigned int n;
+                    for (n = 0; n < 100000; n++) large[n] = n % 251;
+                    memset(&token_async, 0, sizeof(token_async));
+                    hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Async(u6, user, 0, L"POST",
+                            L"https://fixture.invalid/large", 0, NULL, 100000, large, &token_async);
+                    CHECK(hr == S_OK, "100 KB signing request crosses the extended IPC frame intact");
+                    hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Result(u6, &token_async, 512, buffer, &wide, &used);
+                    CHECK(hr == S_OK && wide && !wcscmp(wide->signature, L"fixture-signature"),
+                          "extended signing request returns the service signature");
+                    free(large);
+                }
                 free(buffer);
             }
         }
@@ -1339,6 +1352,124 @@ static void test_manual_queues(void)
     IXThreadingImpl_XTaskQueueCloseHandle( threading, parent );
 }
 
+
+/* ABI fixture results are synthetic; they exercise the facade, not cloud access. */
+static LONG pfx_progress_calls;
+static void WINAPI pfx_test_progress(XUserHandle u, UINT32 state, void *context)
+{
+    if (u == user && state == 3 && context == &pfx_progress_calls)
+        InterlockedIncrement(&pfx_progress_calls);
+}
+static void test_pfx_backend(void)
+{
+    IXGameSaveImpl4 *modern = NULL;
+    HMODULE core = LoadLibraryA("PlayFabCore.dll"), save = LoadLibraryA("PlayFabGameSave.dll");
+    LONG (WINAPI *closed_users)(void), (*final_uploads)(void);
+    struct PFXGameSaveConfigRequest request = { user, "4D5E6F70", "https://fixture.invalid", 0, NULL, NULL, NULL };
+    struct PFXGameSaveUiCallbacks ui = { 0 };
+    PFXGameSaveConfigHandle config = NULL;
+    XAsyncBlock a = { 0 };
+    HKEY key;
+    DWORD marker = 9, value = 0, bytes = sizeof(value);
+    SIZE_T size;
+    INT64 quota = -1;
+    char folder[128], small[2];
+    LONG before;
+    UINT32 state;
+    UINT64 current, total;
+    HRESULT hr;
+    printf("# PFX native SDK boundary (synthetic)\n");
+    CHECK(sizeof(request) == 56 && offsetof(struct PFXGameSaveConfigRequest, fileLocation) == 48, "configuration matches the public x64 GDK ABI");
+    CHECK(sizeof(struct PFXGameSaveDescriptor) == 64 && offsetof(struct PFXGameSaveDescriptor, time) == 40, "descriptor matches the public x64 GDK ABI");
+    CHECK(sizeof(ui) == 112, "UI callback table matches the public x64 GDK ABI");
+    CHECK(core && save, "native ABI fixtures load");
+    if (!core || !save) return;
+    {
+        HRESULT (WINAPI *register_runtime)(void) = (void *)GetProcAddress(GetModuleHandleA("xgameruntime.dll"), "DllRegisterServer");
+        HKEY discovery;
+        CHECK(register_runtime && register_runtime() == S_OK, "matching native save SDK registers the PFX facade");
+        hr = RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OneSettings\\xbox\\GamingRuntimeServices\\Settings",
+                0, KEY_READ, &discovery);
+        CHECK(hr == ERROR_SUCCESS, "native SDK can discover the available PFX facade");
+        if (hr == ERROR_SUCCESS) RegCloseKey(discovery);
+    }
+    closed_users = (void *)GetProcAddress(core, "PFFixtureClosedUsers");
+    final_uploads = (void *)GetProcAddress(core, "PFFixtureFinalUploads");
+    hr = g_query(&CLSID_XGameSaveImpl, &IID_IXGameSaveImpl4, (void **)&modern);
+    CHECK(hr == S_OK && modern, "PFX interface is available");
+    if (!modern) return;
+    RegCreateKeyExA(HKEY_LOCAL_MACHINE, "Software\\Microsoft\\GamingServices", 0, NULL, 0,
+                    KEY_ALL_ACCESS, NULL, &key, NULL);
+    RegSetValueExA(key, "ForceUseInprocGameSaves", 0, REG_DWORD, (BYTE *)&marker, sizeof(marker));
+    hr = IXGameSaveImpl4_PFXGameSaveInitializeConfig(modern, &request, &config);
+    CHECK(hr == S_OK && config, "valid configuration initializes the native backend (0x%08lx)", hr);
+    RegQueryValueExA(key, "ForceUseInprocGameSaves", NULL, NULL, (BYTE *)&value, &bytes);
+    CHECK(value == marker, "temporary provider override restores the pre-existing setting");
+    RegCloseKey(key);
+    if (!config) { IXGameSaveImpl4_Release(modern); return; }
+    ui.progressCallback = pfx_test_progress; ui.progressContext = &pfx_progress_calls;
+    hr = IXGameSaveImpl4_PFXGameSaveSetUiCallbacks(modern, &ui);
+    memset(&ui, 0, sizeof(ui));
+    CHECK(hr == S_OK, "callback registration copies caller-owned storage");
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiAsync(modern, config, &a);
+    CHECK(hr == S_OK, "native folder synchronization starts");
+    CHECK(IXThreadingImpl_XAsyncGetStatus(threading, &a, FALSE) == E_PENDING, "folder remains pending until native completion");
+    CHECK(IXThreadingImpl_XAsyncGetStatus(threading, &a, TRUE) == S_OK, "folder synchronization completes");
+    CHECK(pfx_progress_calls == 1, "native progress routes the correct Xbox user and context");
+    size = 0;
+    hr = IXThreadingImpl_XAsyncGetResultSize(threading, &a, &size);
+    CHECK(hr == S_OK && size == sizeof("C:\\pfx-fixture\\account-save"), "folder size is the native result size");
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult(modern, &a, sizeof(small), small);
+    CHECK(hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER), "small folder buffer retains the result for retry");
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult(modern, &a, sizeof(folder), folder);
+    CHECK(hr == S_OK && !strcmp(folder, "C:\\pfx-fixture\\account-save"), "folder retry returns the native path");
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetRemainingQuota(modern, config, &quota);
+    CHECK(hr == S_OK && quota == 987654321, "quota comes from the SDK");
+    hr = IXGameSaveImpl4_PFXGameSaveProgressUiGetProgress(modern, user, &state, &current, &total);
+    CHECK(hr == S_OK && state == 3 && current == 12 && total == 42, "native progress counters are preserved");
+    SetEnvironmentVariableA("PFX_FIXTURE_RESULT", "89237007");
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetRemainingQuota(modern, config, &quota);
+    CHECK(hr == (HRESULT)0x89237007, "quota preserves the backend error");
+    memset(&a, 0, sizeof(a));
+    hr = IXGameSaveImpl4_PFXGameSaveFilesUploadWithUiAsync(modern, config, 0, &a);
+    CHECK(hr == S_OK && IXThreadingImpl_XAsyncGetStatus(threading, &a, TRUE) == (HRESULT)0x89237007,
+          "upload completes with the real backend failure");
+    CHECK(IXGameSaveImpl4_PFXGameSaveFilesUploadWithUiResult(modern, &a) == (HRESULT)0x89237007,
+          "upload result preserves the backend failure");
+    SetEnvironmentVariableA("PFX_FIXTURE_RESULT", NULL);
+    SetEnvironmentVariableA("PFX_FIXTURE_OFFLINE", "1");
+    memset(&a, 0, sizeof(a));
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiAsync(modern, config, &a);
+    CHECK(hr == S_OK && IXThreadingImpl_XAsyncGetStatus(threading, &a, TRUE) == (HRESULT)0x80830004,
+          "offline synchronization reports the GRTS offline status");
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult(modern, &a, sizeof(folder), folder);
+    CHECK(hr == (HRESULT)0x80830004 && !strcmp(folder, "C:\\pfx-fixture\\account-save"),
+          "offline result includes usable local folder without claiming cloud success");
+    SetEnvironmentVariableA("PFX_FIXTURE_OFFLINE", NULL);
+    memset(&a, 0, sizeof(a));
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiAsync(modern, config, &a);
+    CHECK(hr == S_OK && IXThreadingImpl_XAsyncGetStatus(threading, &a, TRUE) == S_OK,
+          "user reconnects before final cloud synchronization");
+    IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult(modern, &a, sizeof(folder), folder);
+    before = closed_users();
+    memset(&a, 0, sizeof(a));
+    hr = IXGameSaveImpl4_PFXGameSaveFilesSetSaveDescriptionAsync(modern, config, "test", &a);
+    CHECK(hr == S_OK, "description operation starts");
+    IXGameSaveImpl4_PFXGameSaveFreeConfig(modern, config);
+    IXGameSaveImpl4_PFXGameSaveFreeConfig(modern, config);
+    CHECK(closed_users() == before, "pending operation retains the native user after repeated close");
+    CHECK(IXThreadingImpl_XAsyncGetStatus(threading, &a, TRUE) == S_OK &&
+          IXGameSaveImpl4_PFXGameSaveFilesSetSaveDescriptionResult(modern, &a) == S_OK,
+          "pending description survives config close");
+    { unsigned int attempts; for (attempts = 0; attempts < 200 && closed_users() == before; attempts++) Sleep(10); }
+    CHECK(final_uploads() == 1, "config close requests one final upload releasing the active device");
+    CHECK(closed_users() == before + 1, "final operation releases the native user exactly once");
+    CHECK(IXGameSaveImpl4_PFXGameSaveFilesGetRemainingQuota(modern, config, &quota) == E_INVALIDARG,
+          "closed config cannot access the backend");
+    IXGameSaveImpl4_Release(modern);
+}
+
 /* Slots of IXGameSaveImpl4 as numbered in the Microsoft.GDK.PC 2510.3.6286
  * XGameSave and PFXGameSave headers, written out by hand so that a method
  * added, dropped or reordered in xgamesave.idl fails here instead of calling
@@ -1469,42 +1600,75 @@ static void test_gamesave_interface4( const char *scid )
         }
     }
 
-    /* PlayFab cloud saves: every method fails, none fakes success. */
+    /* Invalid PFX calls must fail before loading a backend. */
     memset( &async, 0, sizeof(async) );
     hr = IXGameSaveImpl4_PFXGameSaveInitializeConfig( modern, NULL, &config );
-    CHECK( hr == E_NOTIMPL && !config, "PFXGameSaveInitializeConfig fails and clears its output (0x%08lx)", hr );
+    CHECK( hr == E_INVALIDARG && !config, "PFXGameSaveInitializeConfig fails and clears its output (0x%08lx)", hr );
     IXGameSaveImpl4_PFXGameSaveFreeConfig( modern, NULL );
     {
-        const struct { const char *name; HRESULT hr; } cloud[] =
+        const struct { const char *name; HRESULT hr; HRESULT expected; } cloud[] =
         {
-            { "PFXGameSaveFilesGetFolderWithUiAsync", IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiAsync( modern, NULL, &async ) },
-            { "PFXGameSaveFilesGetFolderWithUiResult", IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult( modern, &async, 0, NULL ) },
-            { "PFXGameSaveFilesGetRemainingQuota", IXGameSaveImpl4_PFXGameSaveFilesGetRemainingQuota( modern, NULL, &quota ) },
-            { "PFXGameSaveSetUiCallbacks", IXGameSaveImpl4_PFXGameSaveSetUiCallbacks( modern, NULL ) },
-            { "PFXGameSaveProgressUiGetProgress", IXGameSaveImpl4_PFXGameSaveProgressUiGetProgress( modern, user, &state, &current, &total ) },
-            { "PFXGameSaveSetProgressUiResponse", IXGameSaveImpl4_PFXGameSaveSetProgressUiResponse( modern, user, 0 ) },
-            { "PFXGameSaveSetSyncFailedUiResponse", IXGameSaveImpl4_PFXGameSaveSetSyncFailedUiResponse( modern, user, 0 ) },
-            { "PFXGameSaveSetActiveDeviceContentionUiResponse", IXGameSaveImpl4_PFXGameSaveSetActiveDeviceContentionUiResponse( modern, user, 0 ) },
-            { "PFXGameSaveSetConflictUiResponse", IXGameSaveImpl4_PFXGameSaveSetConflictUiResponse( modern, user, 0 ) },
-            { "PFXGameSaveSetOutOfStorageUiResponse", IXGameSaveImpl4_PFXGameSaveSetOutOfStorageUiResponse( modern, user, 0 ) },
-            { "PFXGameSaveFilesUploadWithUiAsync", IXGameSaveImpl4_PFXGameSaveFilesUploadWithUiAsync( modern, NULL, 0, &async ) },
-            { "PFXGameSaveFilesUploadWithUiResult", IXGameSaveImpl4_PFXGameSaveFilesUploadWithUiResult( modern, &async ) },
-            { "PFXGameSaveFilesSetSaveDescriptionAsync", IXGameSaveImpl4_PFXGameSaveFilesSetSaveDescriptionAsync( modern, NULL, "test", &async ) },
-            { "PFXGameSaveFilesSetSaveDescriptionResult", IXGameSaveImpl4_PFXGameSaveFilesSetSaveDescriptionResult( modern, &async ) },
-            { "PFXGameSaveSetActiveDeviceChangedCallback", IXGameSaveImpl4_PFXGameSaveSetActiveDeviceChangedCallback( modern, NULL, NULL ) },
+            { "PFXGameSaveFilesGetFolderWithUiAsync", IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiAsync( modern, NULL, &async ), E_INVALIDARG },
+            { "PFXGameSaveFilesGetFolderWithUiResult", IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult( modern, &async, 0, NULL ), E_INVALIDARG },
+            { "PFXGameSaveFilesGetRemainingQuota", IXGameSaveImpl4_PFXGameSaveFilesGetRemainingQuota( modern, NULL, &quota ), E_INVALIDARG },
+            { "PFXGameSaveSetUiCallbacks", IXGameSaveImpl4_PFXGameSaveSetUiCallbacks( modern, NULL ), E_INVALIDARG },
+            { "PFXGameSaveProgressUiGetProgress", IXGameSaveImpl4_PFXGameSaveProgressUiGetProgress( modern, user, &state, &current, &total ), E_INVALIDARG },
+            { "PFXGameSaveSetProgressUiResponse", IXGameSaveImpl4_PFXGameSaveSetProgressUiResponse( modern, user, 0 ), E_INVALIDARG },
+            { "PFXGameSaveSetSyncFailedUiResponse", IXGameSaveImpl4_PFXGameSaveSetSyncFailedUiResponse( modern, user, 0 ), E_INVALIDARG },
+            { "PFXGameSaveSetActiveDeviceContentionUiResponse", IXGameSaveImpl4_PFXGameSaveSetActiveDeviceContentionUiResponse( modern, user, 0 ), E_INVALIDARG },
+            { "PFXGameSaveSetConflictUiResponse", IXGameSaveImpl4_PFXGameSaveSetConflictUiResponse( modern, user, 0 ), E_INVALIDARG },
+            { "PFXGameSaveSetOutOfStorageUiResponse", IXGameSaveImpl4_PFXGameSaveSetOutOfStorageUiResponse( modern, user, 0 ), E_INVALIDARG },
+            { "PFXGameSaveFilesUploadWithUiAsync", IXGameSaveImpl4_PFXGameSaveFilesUploadWithUiAsync( modern, NULL, 0, &async ), E_INVALIDARG },
+            { "PFXGameSaveFilesUploadWithUiResult", IXGameSaveImpl4_PFXGameSaveFilesUploadWithUiResult( modern, &async ), E_PENDING },
+            { "PFXGameSaveFilesSetSaveDescriptionAsync", IXGameSaveImpl4_PFXGameSaveFilesSetSaveDescriptionAsync( modern, NULL, "test", &async ), E_INVALIDARG },
+            { "PFXGameSaveFilesSetSaveDescriptionResult", IXGameSaveImpl4_PFXGameSaveFilesSetSaveDescriptionResult( modern, &async ), E_PENDING },
+            { "PFXGameSaveSetActiveDeviceChangedCallback", IXGameSaveImpl4_PFXGameSaveSetActiveDeviceChangedCallback( modern, NULL, NULL ), S_OK },
         };
 
         for (i = 0; i < ARRAY_SIZE(cloud); i++)
-            CHECK( cloud[i].hr == E_NOTIMPL, "%s returns E_NOTIMPL (0x%08lx)", cloud[i].name, cloud[i].hr );
+            CHECK( cloud[i].hr == cloud[i].expected, "%s validates its arguments/status (0x%08lx)", cloud[i].name, cloud[i].hr );
     }
 
     IXGameSaveImpl4_Release( modern );
 }
 
+static void test_runtime_discovery( HMODULE mod )
+{
+    HRESULT (WINAPI *register_runtime)(void) = (void *)GetProcAddress( mod, "DllRegisterServer" );
+    const UINT64 expected = ((UINT64)35 << 48) | ((UINT64)112 << 32) | ((UINT64)20003 << 16);
+    static const WCHAR key[] = L"Software\\Microsoft\\GamingServices";
+    UINT64 current = 0, available = 0;
+    DWORD size, type;
+    LONG status;
+
+    printf( "# Gaming Services runtime discovery\n" );
+    CHECK( register_runtime != NULL, "runtime discovery can be registered before initialization" );
+    if (!register_runtime) return;
+    CHECK( register_runtime() == S_OK, "registering the emulated runtime succeeds" );
+    {
+        HKEY discovery;
+        LONG result = RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OneSettings\\xbox\\GamingRuntimeServices\\Settings",
+                0, KEY_READ, &discovery);
+        CHECK(result == ERROR_FILE_NOT_FOUND, "legacy registration does not advertise a missing native save backend");
+        if (!result) RegCloseKey(discovery);
+    }
+    size = sizeof(current);
+    status = RegGetValueW( HKEY_LOCAL_MACHINE, key, L"CurrentVersion", RRF_RT_REG_QWORD,
+                          &type, &current, &size );
+    CHECK( status == ERROR_SUCCESS && type == REG_QWORD && size == sizeof(current) && current == expected,
+           "current runtime version has the SDK's package-version QWORD layout" );
+    size = sizeof(available);
+    status = RegGetValueW( HKEY_LOCAL_MACHINE, key, L"AvailableVersion", RRF_RT_REG_QWORD,
+                          &type, &available, &size );
+    CHECK( status == ERROR_SUCCESS && type == REG_QWORD && available == current,
+           "available runtime version matches the installed implementation" );
+}
+
 int main(int argc, char **argv)
 {
     HMODULE mod;
-    HRESULT (WINAPI *init)( ULONG, ULONG );
+    HRESULT (WINAPI *init)( UINT64, UINT64 );
     HRESULT (WINAPI *query)( REFCLSID, REFIID, void ** );
     const char *scid = "00000000-0000-0000-0000-000000000001";
     HRESULT hr;
@@ -1522,6 +1686,7 @@ int main(int argc, char **argv)
     query = (void *)GetProcAddress( mod, "QueryApiImpl" );
     if (!init || !query) { printf( "Bail out! missing exports\n" ); return 100; }
     g_query = query;
+    test_runtime_discovery( mod );
     init( 10002, 7822 );
 
     if (FAILED( hr = query( &CLSID_XPackageImpl, &IID_IXPackageImpl3, (void **)&pkg ) ) ||
@@ -1545,6 +1710,13 @@ int main(int argc, char **argv)
     {
         test_manual_queues();
         printf( "%s: %d checks, %d failed\n", g_failed ? "FAILED" : "PASSED", g_run, g_failed );
+        return g_failed;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--pfx"))
+    {
+        test_xuser();
+        test_pfx_backend();
+        printf("%s: %d checks, %d failed\n", g_failed ? "FAILED" : "PASSED", g_run, g_failed);
         return g_failed;
     }
     test_xpackage();

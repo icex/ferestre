@@ -104,11 +104,13 @@ pub fn parse(json: &str) -> Result<Vec<String>> {
         }
     }
 
+    let mut seen = std::collections::BTreeSet::new();
     let ids: Vec<String> = items
         .iter()
         .filter_map(|item| item.get("id")?.as_str())
         .filter(|id| !id.is_empty())
-        .map(str::to_string)
+        .map(str::to_ascii_uppercase)
+        .filter(|id| seen.insert(id.clone()))
         .collect();
     if ids.is_empty() {
         return Err(anyhow!("the collection listed no products"));
@@ -233,6 +235,25 @@ pub fn fetch_tiers(market: &str, language: &str) -> Result<Tiers> {
 pub fn fetch(market: &str, language: &str) -> Result<Vec<String>> {
     let body = crate::http::get_text(&url(ALL_PC_GAMES, market, language))?;
     parse(&body)
+}
+
+/// The merchandised "All PC Games" list can omit installable PC products.
+/// Forza Horizon 6 (9NR1R1XWLCNB) was absent from that feed while its
+/// PCSubMetadata said Included. Supplement it using explicit PC inclusion;
+/// console-only metadata must never expand the PC catalogue.
+pub fn complete_listing(ids: &[String], tiers: &Tiers) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    ids.iter()
+        .map(|id| id.to_ascii_uppercase())
+        .chain(
+            tiers
+                .included
+                .iter()
+                .filter(|(_, keys)| keys.iter().any(|key| key == "PCSubMetadata"))
+                .map(|(id, _)| id.to_ascii_uppercase()),
+        )
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
 }
 
 /// The listing as it was last written down.
@@ -403,6 +424,26 @@ mod tests {
         "PCSubMetadata": {"Included": false}
       }
     }"#;
+
+    #[test]
+    fn listing_includes_pc_titles_missing_from_the_merchandised_feed() {
+        let tiers = parse_tiers(
+            r#"{
+            "9NR1R1XWLCNB": {"PCSubMetadata":{"Included":true}},
+            "9ZZCONSOLE01": {"ConsoleSubMetadata":{"Included":true}},
+            "9ZZLISTED001": {"PCSubMetadata":{"Included":true}},
+            "9ZZREMOVED01": {"PCSubMetadata":{"Included":false}}
+        }"#,
+        )
+        .unwrap();
+        let listing = complete_listing(&["9zzlisted001".into(), "9ZZLISTED001".into()], &tiers);
+        assert_eq!(listing, vec!["9ZZLISTED001", "9NR1R1XWLCNB"]);
+        assert_eq!(
+            complete_listing(&[], &tiers).len(),
+            2,
+            "a failed sigl still permits the PC feed"
+        );
+    }
 
     #[test]
     fn the_tier_map_keeps_only_what_a_tier_actually_includes() {

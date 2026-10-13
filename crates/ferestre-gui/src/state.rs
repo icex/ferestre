@@ -99,6 +99,7 @@ pub struct Model {
     /// first tells people they cannot install titles they can.
     pub gamepass: Vec<String>,
     pub subscriptions: Vec<&'static str>,
+    pub entitlements_checked: bool,
     /// Which subscription tiers include which products. Joined against
     /// `subscriptions` to warn before a download that would be refused.
     pub tiers: gamepass::Tiers,
@@ -118,6 +119,13 @@ pub struct Model {
 }
 
 impl Model {
+    /// Entitlements and the tier summary must change together.
+    pub fn set_ownership(&mut self, entries: Vec<library::Entry>) {
+        self.subscriptions = gamepass::active(&entries);
+        self.ownership = Ownership::Known(entries);
+        self.entitlements_checked = true;
+    }
+
     pub fn load() -> Self {
         let mut problem = None;
         let paths = match Paths::from_env() {
@@ -198,7 +206,10 @@ impl Model {
             .as_ref()
             .and_then(|p| gamepass::load_cache(p.state_dir(), &market));
         let (gamepass, tiers) = match cached {
-            Some(listing) => (listing.product_ids, listing.tiers),
+            Some(listing) => (
+                gamepass::complete_listing(&listing.product_ids, &listing.tiers),
+                listing.tiers,
+            ),
             None => (Vec::new(), gamepass::Tiers::default()),
         };
         let subscriptions = match &ownership {
@@ -242,6 +253,7 @@ impl Model {
             avatar,
             gamepass,
             subscriptions,
+            entitlements_checked: false,
             tiers,
             section: Section::Library,
             query: String::new(),
@@ -266,6 +278,7 @@ impl Model {
             avatar: self.avatar.take(),
             gamepass: std::mem::take(&mut self.gamepass),
             subscriptions: std::mem::take(&mut self.subscriptions),
+            entitlements_checked: self.entitlements_checked,
             tiers: std::mem::take(&mut self.tiers),
             section: self.section,
             query: std::mem::take(&mut self.query),

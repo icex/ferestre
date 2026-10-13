@@ -315,6 +315,7 @@ if [ -n "$CLIENT_BIN" ]; then
     if [ -x "$(dirname "$CLIENT_BIN")/xodus-service" ]; then
         install -Dm755 "$(dirname "$CLIENT_BIN")/xodus-service" \
             "$APPDIR/usr/lib/ferestre/client/xodus-service"
+        sha256sum "$APPDIR/usr/lib/ferestre/client/xodus-service" | cut -d' ' -f1 > "$APPDIR/usr/lib/ferestre/client/SERVICE_ID"
     fi
 fi
 if [ -n "$BUNDLED_RUNTIME" ]; then

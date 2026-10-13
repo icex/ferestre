@@ -1,0 +1,1117 @@
+Subject: [PATCH] Register runtime discovery and implement PFX file-save calls
+
+Preserve the complete legacy WGS interface and append a distinct PFX backend.
+Use an independent instance of the title-matched native PlayFab SDK for real
+login, manifest synchronization, quota, conflict and upload operations.
+Propagate errors and offline status; retain config handles during pending work.
+Registry provider overrides are restored before returning from initialization.
+
+Register the Gaming Services package version separately from the 64-bit GDK
+interface versions. Extend large signing requests while retaining the existing
+small-request IPC framing; requires the paired service patch for large bodies.
+
+The backend runs in-process and completes a final ReleaseDeviceAsActive upload
+before closing an online config. Upload after a crash/process exit and
+entity-only/custom-root configs remain unimplemented. This is a qualification
+candidate, not a claim of complete Gaming Services compatibility.
+
+diff --git a/Makefile.in b/Makefile.in
+index 466ddb6..10fe6e2 100644
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -1,9 +1,10 @@
+ MODULE    = xgameruntime.dll
+ UNIXLIB   = xgameruntime.so
+-IMPORTS   = combase bcrypt
++IMPORTS   = combase bcrypt advapi32 user32
+ 
+ SOURCES = \
+ 	main.c \
++	pfxgamesave.c \
+ 	unixlib.c \
+ 	xaccessibility.c \
+ 	xaccessibility.idl \
+diff --git a/main.c b/main.c
+index 60dc3ce..10c03ed 100644
+--- a/main.c
++++ b/main.c
+@@ -21,8 +21,71 @@
+ #include <initguid.h>
+ #include "private.h"
+ #include "unixlib.h"
++#include <rtlsupportapi.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(xgameruntime);
++WINE_DECLARE_DEBUG_CHANNEL(hctrace);
++WINE_DECLARE_DEBUG_CHANNEL(xgrfault);
++
++/* Opt-in read-only exception diagnostics. Games may deliberately raise a
++ * large number of handled illegal-instruction exceptions; tracing all SEH
++ * activity changes timing substantially. Capture only memory faults here. */
++static PVOID fault_trace_handler;
++
++static LONG CALLBACK trace_memory_fault(EXCEPTION_POINTERS *exception)
++{
++#ifdef __x86_64__
++    static LONG tracing, count;
++    CONTEXT context = *exception->ContextRecord;
++    ULONG_PTR frames[24], instruction[4];
++    SIZE_T read;
++    ULONG_PTR image_base;
++    PRUNTIME_FUNCTION function;
++    PVOID handler_data;
++    ULONG_PTR establisher;
++    unsigned int i, n = 0;
++    if (exception->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
++        InterlockedCompareExchange(&tracing, 1, 0)) return EXCEPTION_CONTINUE_SEARCH;
++    if (InterlockedIncrement(&count) <= 64)
++    {
++        TRACE_(xgrfault)("memory fault rip=%s rsp=%s rax=%s rbx=%s rcx=%s rdx=%s rsi=%s rdi=%s.\n",
++                        wine_dbgstr_longlong(context.Rip), wine_dbgstr_longlong(context.Rsp),
++                        wine_dbgstr_longlong(context.Rax), wine_dbgstr_longlong(context.Rbx),
++                        wine_dbgstr_longlong(context.Rcx), wine_dbgstr_longlong(context.Rdx),
++                        wine_dbgstr_longlong(context.Rsi), wine_dbgstr_longlong(context.Rdi));
++        if (ReadProcessMemory(GetCurrentProcess(), (void *)context.Rip, instruction, sizeof(instruction), &read))
++            for (i = 0; i < ARRAY_SIZE(instruction); i++)
++                TRACE_(xgrfault)("fault instruction word %u: %s.\n", i, wine_dbgstr_longlong(instruction[i]));
++        while (context.Rip && n < ARRAY_SIZE(frames))
++        {
++            frames[n++] = context.Rip;
++            function = RtlLookupFunctionEntry(context.Rip, &image_base, NULL);
++            if (function)
++                RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function,
++                                 &context, &handler_data, &establisher, NULL);
++            else
++            {
++                if (!ReadProcessMemory(GetCurrentProcess(), (void *)context.Rsp, &context.Rip, sizeof(context.Rip), &read)) break;
++                context.Rsp += sizeof(context.Rip);
++            }
++        }
++        for (i = 0; i < n; i++) TRACE_(xgrfault)("frame %u: %s.\n", i, wine_dbgstr_longlong(frames[i]));
++    }
++    InterlockedExchange(&tracing, 0);
++#endif
++    return EXCEPTION_CONTINUE_SEARCH;
++}
++
++static void enable_fault_trace(void)
++{
++    static LONG enabled;
++    if (getenv("XGR_TRACE_FAULTS") && !InterlockedCompareExchange(&enabled, 1, 0))
++    {
++        fault_trace_handler = AddVectoredExceptionHandler(1, trace_memory_fault);
++        TRACE_(xgrfault)("fault observer registered: %p.\n", fault_trace_handler);
++        if (!fault_trace_handler) InterlockedExchange(&enabled, 0);
++    }
++}
+ 
+ DWORD tlsIndex;
+ 
+@@ -43,6 +106,7 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, void *reserved )
+             TlsSetValue( tlsIndex, FALSE );
+             break;
+         case DLL_PROCESS_DETACH:
++            if (fault_trace_handler) RemoveVectoredExceptionHandler(fault_trace_handler);
+             TlsFree( tlsIndex );
+             break;
+     }
+@@ -72,7 +136,7 @@ char *xgr_game_config;
+ static void CALLBACK hc_trace_callback( const char *area, UINT32 level, UINT64 thread,
+                                         UINT64 timestamp, const char *message )
+ {
+-    TRACE( "libhttpclient: %s\n", debugstr_a( message ) );
++    TRACE_(hctrace)( "libhttpclient: %s\n", debugstr_a( message ) );
+ }
+ 
+ static DWORD WINAPI hc_trace_thread( void *arg )
+@@ -84,7 +148,9 @@ static DWORD WINAPI hc_trace_thread( void *arg )
+ 
+     for (i = 0; i < 1200 && !mod; i++)
+     {
+-        if (!(mod = GetModuleHandleA( "libHttpClient.GDK.dll" ))) Sleep( 100 );
++        mod = GetModuleHandleA( "libHttpClient.GDK.dll" );
++        if (!mod) mod = GetModuleHandleA( "libHttpClient.dll" );
++        if (!mod) Sleep( 100 );
+     }
+     if (!mod) { WARN( "libHttpClient never loaded; no trace.\n" ); return 0; }
+ 
+@@ -94,7 +160,7 @@ static DWORD WINAPI hc_trace_thread( void *arg )
+ 
+     set_callback( hc_trace_callback );
+     set_level( 5 );   /* Verbose */
+-    TRACE( "libHttpClient tracing enabled.\n" );
++    TRACE_(hctrace)( "libHttpClient tracing enabled.\n" );
+     return 0;
+ }
+ 
+@@ -113,10 +179,51 @@ static void enable_hc_trace_once(void)
+     InitOnceComplete( &once, 0, NULL );
+ }
+ 
+-HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, char mode, const struct initialize_options *options )
++/* XSystemGetRuntimeInfo is implemented in the statically linked GDK client.
++ * On desktop it reads these REG_QWORD values directly, including before API
++ * initialization. Their layout is package-version order (major in the high
++ * word), not XVersion's in-memory word order. Without registration the SDK
++ * reports zero, and Forza Horizon 6 refuses Start Game before it can exercise
++ * any other compatibility behavior. This is the Gaming Services package contract version (35.112.20003.0),
++ * distinct from the 10.0.x GDK/DLL interface versions passed to initialization;
++ * it does not assert that every API or title has been qualified. */
++HRESULT WINAPI DllRegisterServer( void )
++{
++    static const WCHAR key_name[] = L"Software\\Microsoft\\GamingServices";
++    const UINT64 version = ((UINT64)35 << 48) | ((UINT64)112 << 32) | ((UINT64)20003 << 16);
++    HKEY key;
++    LONG status;
++
++    if ((status = RegCreateKeyExW( HKEY_LOCAL_MACHINE, key_name, 0, NULL, 0,
++                                  KEY_SET_VALUE, NULL, &key, NULL )))
++        return HRESULT_FROM_WIN32( status );
++    status = RegSetValueExW( key, L"CurrentVersion", 0, REG_QWORD,
++                            (const BYTE *)&version, sizeof(version) );
++    if (!status)
++        status = RegSetValueExW( key, L"AvailableVersion", 0, REG_QWORD,
++                                (const BYTE *)&version, sizeof(version) );
++    RegCloseKey( key );
++    /* Advertise the PFX facade only to a title that has the matching native
++     * save backend loaded. Legacy titles keep their previous discovery path. */
++    if (!status && GetModuleHandleW(L"PlayFabGameSave.dll") && GetModuleHandleW(L"PlayFabCore.dll"))
++    {
++        status = RegCreateKeyExW(HKEY_LOCAL_MACHINE,
++                L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OneSettings\\xbox\\GamingRuntimeServices\\Settings",
++                0, NULL, 0, KEY_QUERY_VALUE, NULL, &key, NULL);
++        if (!status) RegCloseKey(key);
++    }
++    return status ? HRESULT_FROM_WIN32( status ) : S_OK;
++}
++
++HRESULT WINAPI InitializeApiImplEx2( UINT64 gdkVer, UINT64 gsVer, char mode, const struct initialize_options *options )
+ {
++    HRESULT registration;
+     enable_hc_trace_once();
+-    TRACE( "gdkVer %ld, gsVer %ld, mode %d, options %p.\n", gdkVer, gsVer, mode, options );
++    enable_fault_trace();
++    TRACE( "gdkVer %s, gsVer %s, mode %d, options %p.\n",
++           wine_dbgstr_longlong(gdkVer), wine_dbgstr_longlong(gsVer), mode, options );
++    if (FAILED(registration = DllRegisterServer()))
++        WARN( "runtime discovery registration failed, hr %#lx.\n", registration );
+ 
+     if (options)
+     {
+@@ -130,12 +237,12 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, char mode, const
+     return S_OK;
+ }
+ 
+-HRESULT WINAPI InitializeApiImplEx( ULONG gdkVer, ULONG gsVer, char mode )
++HRESULT WINAPI InitializeApiImplEx( UINT64 gdkVer, UINT64 gsVer, char mode )
+ {
+     return InitializeApiImplEx2( gdkVer, gsVer, mode, NULL );
+ }
+ 
+-HRESULT WINAPI InitializeApiImpl( ULONG gdkVer, ULONG gsVer )
++HRESULT WINAPI InitializeApiImpl( UINT64 gdkVer, UINT64 gsVer )
+ {
+     return InitializeApiImplEx2( gdkVer, gsVer, 0, NULL );
+ }
+diff --git a/pfxgamesave.c b/pfxgamesave.c
+new file mode 100644
+index 0000000..d0adbaa
+--- /dev/null
++++ b/pfxgamesave.c
+@@ -0,0 +1,570 @@
++/*
++ * PlayFab-backed Gaming Runtime file saves.
++ *
++ * The PFX ABI is separate from legacy XGameSave/WGS. Use the title's native
++ * PlayFab SDK for authenticated synchronization, manifests, conflicts and
++ * quotas. A private SDK instance avoids recursively selecting this GRTS
++ * facade. No successful cloud result is synthesized here.
++ *
++ * LGPL-2.1-or-later; same license as the surrounding Wine runtime.
++ */
++#include "private.h"
++#include "pfxgamesave.h"
++#include "wine/list.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(pfxgamesave);
++
++struct pf_init_args { XTaskQueueHandle queue; UINT64 options; const char *folder; };
++struct pf_descriptor
++{
++    INT64 time;
++    UINT64 total, uploaded;
++    char device_type[256], device_id[256], friendly_name[256], thumbnail[2048], description[4096];
++};
++struct pf_ui_callbacks
++{
++    void (WINAPI *progress)(void *, UINT32, void *); void *progress_context;
++    void (WINAPI *failed)(void *, UINT32, HRESULT, void *); void *failed_context;
++    void (WINAPI *contention)(void *, struct pf_descriptor *, struct pf_descriptor *, void *); void *contention_context;
++    void (WINAPI *conflict)(void *, struct pf_descriptor *, struct pf_descriptor *, void *); void *conflict_context;
++    void (WINAPI *storage)(void *, BOOLEAN, UINT64, void *); void *storage_context;
++};
++static struct
++{
++    HMODULE core, save;
++    HRESULT (WINAPI *create_service)(const char *, const char *, void **);
++    void (WINAPI *close_service)(void *);
++    HRESULT (WINAPI *create_user)(void *, XUserHandle, void *, void **);
++    void (WINAPI *close_user)(void *);
++    INT32 (WINAPI *compare_user)(void *, void *);
++    HRESULT (WINAPI *initialize)(struct pf_init_args *);
++    HRESULT (WINAPI *add_user)(void *, UINT32, XAsyncBlock *);
++    HRESULT (WINAPI *add_result)(XAsyncBlock *);
++    HRESULT (WINAPI *folder_size)(void *, SIZE_T *);
++    HRESULT (WINAPI *folder)(void *, SIZE_T, char *, SIZE_T *);
++    HRESULT (WINAPI *quota)(void *, INT64 *);
++    HRESULT (WINAPI *connected)(void *, BOOLEAN *);
++    HRESULT (WINAPI *upload)(void *, UINT32, XAsyncBlock *);
++    HRESULT (WINAPI *upload_result)(XAsyncBlock *);
++    HRESULT (WINAPI *description)(void *, const char *, XAsyncBlock *);
++    HRESULT (WINAPI *description_result)(XAsyncBlock *);
++    HRESULT (WINAPI *set_ui)(struct pf_ui_callbacks *);
++    HRESULT (WINAPI *progress)(void *, UINT32 *, UINT64 *, UINT64 *);
++    HRESULT (WINAPI *response[5])(void *, UINT32);
++    HRESULT (WINAPI *set_device)(XTaskQueueHandle, void *, void *);
++} api;
++
++struct PFXGameSaveConfig
++{
++    struct list entry;
++    LONG ref;
++    XUserHandle user;
++    void *service, *local_user;
++    UINT32 flags;
++    BOOL ready_online;
++};
++struct pfx_work
++{
++    XAsyncBlock inner;
++    XAsyncBlock *outer;
++    struct PFXGameSaveConfig *config;
++    UINT32 kind;
++};
++struct folder_result { char *folder; HRESULT status; };
++static struct list configs = LIST_INIT(configs);
++static struct PFXGameSaveUiCallbacks callbacks;
++static PFXGameSaveDeviceChangedCallback *device_callback;
++static void *device_context;
++static WCHAR backend_root[4096];
++static CRITICAL_SECTION pfx_cs;
++static CRITICAL_SECTION_DEBUG pfx_cs_debug =
++{
++    0, 0, &pfx_cs, { &pfx_cs_debug.ProcessLocksList, &pfx_cs_debug.ProcessLocksList },
++    0, 0, { (DWORD_PTR)(__FILE__ ": pfx_cs") }
++};
++static CRITICAL_SECTION pfx_cs = { &pfx_cs_debug, -1, 0, 0, 0, 0 };
++static INIT_ONCE backend_once = INIT_ONCE_STATIC_INIT;
++static HRESULT backend_status;
++
++static struct PFXGameSaveConfig *acquire_config( PFXGameSaveConfigHandle handle )
++{
++    struct PFXGameSaveConfig *c, *found = NULL;
++    EnterCriticalSection(&pfx_cs);
++    LIST_FOR_EACH_ENTRY(c, &configs, struct PFXGameSaveConfig, entry)
++        if (c == handle) { InterlockedIncrement(&c->ref); found = c; break; }
++    LeaveCriticalSection(&pfx_cs);
++    return found;
++}
++
++struct final_upload
++{
++    XAsyncBlock async;
++    HANDLE event;
++    LONG ref;
++    HRESULT result;
++};
++
++static void release_final_upload(struct final_upload *work)
++{
++    if (InterlockedDecrement(&work->ref)) return;
++    CloseHandle(work->event);
++    free(work);
++}
++
++static void CALLBACK final_upload_complete(XAsyncBlock *async)
++{
++    struct final_upload *work = async->context;
++    work->result = api.upload_result(async);
++    SetEvent(work->event);
++    release_final_upload(work);
++}
++
++/* GRTS owns a final synchronization after the title releases its config.
++ * This in-process bridge must finish it before the title tears down Core.
++ * Use a runtime-dispatched queue, never the title's possibly Manual queue. */
++static BOOL flush_before_close(struct PFXGameSaveConfig *config)
++{
++    struct final_upload *work;
++    HRESULT hr;
++    DWORD waited;
++    if (!config->ready_online) return TRUE;
++    if (!(work = calloc(1, sizeof(*work))))
++    { WARN("final save synchronization could not allocate its operation.\n"); return TRUE; }
++    work->event = CreateEventW(NULL, TRUE, FALSE, NULL);
++    if (!work->event) { free(work); return TRUE; }
++    work->ref = 2;
++    work->async.context = work; work->async.callback = final_upload_complete;
++    hr = api.upload(config->local_user, 1 /* ReleaseDeviceAsActive */, &work->async);
++    if (FAILED(hr))
++    {
++        WARN("final save upload did not start, hr %#lx; local saves retained.\n", hr);
++        release_final_upload(work); release_final_upload(work);
++        return TRUE;
++    }
++    waited = WaitForSingleObject(work->event, 30000);
++    if (waited != WAIT_OBJECT_0)
++    {
++        /* The SDK may still reference the user. Retain its config for process
++         * lifetime on timeout instead of freeing a pending operation's handles.
++         * No cloud success is reported; local game files remain untouched. */
++        WARN("final save upload did not finish before shutdown; local saves retained.\n");
++        release_final_upload(work);
++        return FALSE;
++    }
++    hr = work->result;
++    if (FAILED(hr)) WARN("final save upload failed, hr %#lx; local saves retained.\n", hr);
++    else TRACE("final save upload completed before config close.\n");
++    release_final_upload(work);
++    return TRUE;
++}
++
++static void release_config( struct PFXGameSaveConfig *c )
++{
++    if (InterlockedDecrement(&c->ref)) return;
++    if (!flush_before_close(c)) return;
++    if (c->local_user) api.close_user(c->local_user);
++    if (c->service) api.close_service(c->service);
++    if (c->user) IXUserImpl_XUserCloseHandle(x_user_impl, c->user);
++    free(c);
++}
++
++/* Do not call foreign SDK code while holding our registry lock. */
++static struct PFXGameSaveConfig *config_for_local_user( void *user )
++{
++    struct PFXGameSaveConfig *c, *items[32], *found = NULL;
++    SIZE_T count = 0, i;
++    EnterCriticalSection(&pfx_cs);
++    LIST_FOR_EACH_ENTRY(c, &configs, struct PFXGameSaveConfig, entry)
++        if (count < ARRAY_SIZE(items)) { InterlockedIncrement(&c->ref); items[count++] = c; }
++    LeaveCriticalSection(&pfx_cs);
++    for (i = 0; i < count; i++)
++    {
++        if (!found && !api.compare_user(user, items[i]->local_user)) found = items[i];
++        else release_config(items[i]);
++    }
++    return found;
++}
++
++static struct PFXGameSaveConfig *config_for_xuser( XUserHandle user )
++{
++    struct PFXGameSaveConfig *c, *found = NULL;
++    EnterCriticalSection(&pfx_cs);
++    LIST_FOR_EACH_ENTRY(c, &configs, struct PFXGameSaveConfig, entry)
++        if (c->user == user) { InterlockedIncrement(&c->ref); found = c; break; }
++    LeaveCriticalSection(&pfx_cs);
++    return found;
++}
++
++static BOOL make_dirs( WCHAR *path )
++{
++    WCHAR *p;
++    for (p = path + 3; *p; p++) if (*p == '\\')
++    {
++        *p = 0;
++        if (!CreateDirectoryW(path, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) { *p = '\\'; return FALSE; }
++        *p = '\\';
++    }
++    return CreateDirectoryW(path, NULL) || GetLastError() == ERROR_ALREADY_EXISTS;
++}
++
++static char *to_utf8( const WCHAR *wide )
++{
++    SIZE_T size = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
++    char *s = malloc(size);
++    if (s) WideCharToMultiByte(CP_UTF8, 0, wide, -1, s, size, NULL, NULL);
++    return s;
++}
++
++static HRESULT initialize_private_sdk( const char *root )
++{
++    static const WCHAR key_name[] = L"Software\\Microsoft\\GamingServices";
++    static const WCHAR name[] = L"ForceUseInprocGameSaves";
++    BYTE saved[256]; DWORD type = 0, size = sizeof(saved), one = 1;
++    LONG status, prior;
++    HKEY key;
++    HRESULT hr;
++    struct pf_init_args args = { NULL, 0, root };
++
++    /* The primary GDK SDK has already selected its GRTS provider before it
++     * calls PFXInitializeConfig. Only the private instance selects the native
++     * in-process sync engine here. Restore the prefix's exact setting even
++     * when initialization fails; never leave an override for older titles. */
++    status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, key_name, 0, NULL, 0,
++                            KEY_QUERY_VALUE | KEY_SET_VALUE, NULL, &key, NULL);
++    if (status) return HRESULT_FROM_WIN32(status);
++    prior = RegQueryValueExW(key, name, NULL, &type, saved, &size);
++    if (prior != ERROR_SUCCESS && prior != ERROR_FILE_NOT_FOUND)
++    { RegCloseKey(key); return HRESULT_FROM_WIN32(prior); }
++    status = RegSetValueExW(key, name, 0, REG_DWORD, (BYTE *)&one, sizeof(one));
++    hr = status ? HRESULT_FROM_WIN32(status) : api.initialize(&args);
++    if (prior == ERROR_SUCCESS) status = RegSetValueExW(key, name, 0, type, saved, size);
++    else status = RegDeleteValueW(key, name);
++    RegCloseKey(key);
++    if (status && status != ERROR_FILE_NOT_FOUND) return HRESULT_FROM_WIN32(status);
++    return hr;
++}
++
++static void WINAPI ui_progress(void *, UINT32, void *);
++static void WINAPI ui_failed(void *, UINT32, HRESULT, void *);
++static void WINAPI ui_contention(void *, struct pf_descriptor *, struct pf_descriptor *, void *);
++static void WINAPI ui_conflict(void *, struct pf_descriptor *, struct pf_descriptor *, void *);
++static void WINAPI ui_storage(void *, BOOLEAN, UINT64, void *);
++static void WINAPI device_changed(void *, struct pf_descriptor *, void *);
++
++static BOOL CALLBACK load_backend( INIT_ONCE *once, void *parameter, void **context )
++{
++    WCHAR source[4096], destination[4096], path[4096];
++    char *family = xgr_package_family(), *root = NULL;
++    HMODULE original = GetModuleHandleW(L"PlayFabGameSave.dll");
++    FILETIME modified;
++    WIN32_FILE_ATTRIBUTE_DATA attributes;
++    struct pf_ui_callbacks ui = { ui_progress, NULL, ui_failed, NULL, ui_contention, NULL,
++                                  ui_conflict, NULL, ui_storage, NULL };
++    backend_status = HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
++    api.core = GetModuleHandleW(L"PlayFabCore.dll");
++    if (!original || !api.core || !family) goto done;
++    if (!GetEnvironmentVariableW(L"LOCALAPPDATA", path, ARRAY_SIZE(path))) goto done;
++    if (wcslen(path) + strlen(family) + 100 >= ARRAY_SIZE(path))
++    { backend_status = E_INVALIDARG; goto done; }
++    swprintf(backend_root, ARRAY_SIZE(backend_root), L"%s\\Packages\\%S\\SystemAppData\\PFXGameSave", path, family);
++    if (!make_dirs(backend_root)) { backend_status = HRESULT_FROM_WIN32(GetLastError()); goto done; }
++    if (!GetModuleFileNameW(original, source, ARRAY_SIZE(source)) ||
++        !GetFileAttributesExW(source, GetFileExInfoStandard, &attributes)) goto done;
++    modified = attributes.ftLastWriteTime;
++    swprintf(path, ARRAY_SIZE(path), L"%s\\backend", backend_root);
++    if (!make_dirs(path)) { backend_status = HRESULT_FROM_WIN32(GetLastError()); goto done; }
++    swprintf(destination, ARRAY_SIZE(destination), L"%s\\pgs-%08lx-%08lx-%08lx.dll", path,
++             modified.dwHighDateTime, modified.dwLowDateTime, attributes.nFileSizeLow);
++    if (!CopyFileW(source, destination, TRUE) && GetLastError() != ERROR_FILE_EXISTS)
++    { backend_status = HRESULT_FROM_WIN32(GetLastError()); goto done; }
++    api.save = LoadLibraryExW(destination, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
++    if (!api.save) { backend_status = HRESULT_FROM_WIN32(GetLastError()); goto done; }
++#define LOAD(field, module, name) do { if (!(api.field = (void *)GetProcAddress(api.module, name))) \
++    { backend_status = HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND); goto done; } } while (0)
++    LOAD(create_service, core, "PFServiceConfigCreateHandle");
++    LOAD(close_service, core, "PFServiceConfigCloseHandle");
++    LOAD(create_user, core, "PFLocalUserCreateHandleWithXboxUser");
++    LOAD(close_user, core, "PFLocalUserCloseHandle");
++    LOAD(compare_user, core, "PFLocalUserHandleCompare");
++    LOAD(initialize, save, "PFGameSaveFilesInitialize");
++    LOAD(add_user, save, "PFGameSaveFilesAddUserWithUiAsync");
++    LOAD(add_result, save, "PFGameSaveFilesAddUserWithUiResult");
++    LOAD(folder_size, save, "PFGameSaveFilesGetFolderSize");
++    LOAD(folder, save, "PFGameSaveFilesGetFolder");
++    LOAD(quota, save, "PFGameSaveFilesGetRemainingQuota");
++    LOAD(connected, save, "PFGameSaveFilesIsConnectedToCloud");
++    LOAD(upload, save, "PFGameSaveFilesUploadWithUiAsync");
++    LOAD(upload_result, save, "PFGameSaveFilesUploadWithUiResult");
++    LOAD(description, save, "PFGameSaveFilesSetSaveDescriptionAsync");
++    LOAD(description_result, save, "PFGameSaveFilesSetSaveDescriptionResult");
++    LOAD(set_ui, save, "PFGameSaveFilesSetUiCallbacks");
++    LOAD(progress, save, "PFGameSaveFilesUiProgressGetProgress");
++    LOAD(response[0], save, "PFGameSaveFilesSetUiProgressResponse");
++    LOAD(response[1], save, "PFGameSaveFilesSetUiSyncFailedResponse");
++    LOAD(response[2], save, "PFGameSaveFilesSetUiActiveDeviceContentionResponse");
++    LOAD(response[3], save, "PFGameSaveFilesSetUiConflictResponse");
++    LOAD(response[4], save, "PFGameSaveFilesSetUiOutOfStorageResponse");
++    LOAD(set_device, save, "PFGameSaveFilesSetActiveDeviceChangedCallback");
++#undef LOAD
++    swprintf(path, ARRAY_SIZE(path), L"%s\\data", backend_root);
++    if (!make_dirs(path)) { backend_status = HRESULT_FROM_WIN32(GetLastError()); goto done; }
++    if (!(root = to_utf8(path))) { backend_status = E_OUTOFMEMORY; goto done; }
++    backend_status = initialize_private_sdk(root);
++    if (SUCCEEDED(backend_status)) backend_status = api.set_ui(&ui);
++    if (SUCCEEDED(backend_status)) backend_status = api.set_device(NULL, device_changed, NULL);
++done:
++    free(family); free(root);
++    if (FAILED(backend_status)) WARN("PlayFab backend initialization failed, hr %#lx.\n", backend_status);
++    else TRACE("authenticated native PlayFab save backend initialized.\n");
++    /* One process owns the loaded SDK instance. No library unload may race a
++     * callback; process teardown reclaims it after outstanding game operations. */
++    return TRUE;
++}
++
++HRESULT pfx_config_create( struct PFXGameSaveConfigRequest *request, PFXGameSaveConfigHandle *out )
++{
++    struct PFXGameSaveConfig *c;
++    HRESULT hr;
++    if (!out) return E_INVALIDARG;
++    *out = NULL;
++    if (!request || !request->requestingUser || !request->titleId || !*request->titleId ||
++        !request->apiUrl || strncmp(request->apiUrl, "https://", 8) || (request->flags & ~15u)) return E_INVALIDARG;
++    /* Entity-only clients require a distinct identity binding; don't silently
++     * authenticate them as the default Xbox account. */
++    if (request->flags & 4) return E_NOTIMPL;
++    InitOnceExecuteOnce(&backend_once, load_backend, NULL, NULL);
++    if (FAILED(backend_status)) return backend_status;
++    if (request->flags & 8) return E_NOTIMPL; /* custom roots need their own SDK instance */
++    if (!(c = calloc(1, sizeof(*c)))) return E_OUTOFMEMORY;
++    c->ref = 1; c->flags = request->flags;
++    hr = IXUserImpl_XUserDuplicateHandle(x_user_impl, request->requestingUser, &c->user);
++    if (SUCCEEDED(hr)) hr = api.create_service(request->apiUrl, request->titleId, &c->service);
++    if (SUCCEEDED(hr)) hr = api.create_user(c->service, c->user, NULL, &c->local_user);
++    if (FAILED(hr)) { release_config(c); return hr; }
++    EnterCriticalSection(&pfx_cs); list_add_tail(&configs, &c->entry); LeaveCriticalSection(&pfx_cs);
++    *out = c;
++    TRACE("created a PlayFab save configuration for title %s.\n", debugstr_a(request->titleId));
++    return S_OK;
++}
++
++void pfx_config_close( PFXGameSaveConfigHandle handle )
++{
++    struct PFXGameSaveConfig *c, *found = NULL;
++    EnterCriticalSection(&pfx_cs);
++    LIST_FOR_EACH_ENTRY(c, &configs, struct PFXGameSaveConfig, entry)
++        if (c == handle) { list_remove(&c->entry); found = c; break; }
++    LeaveCriticalSection(&pfx_cs);
++    if (found) release_config(found);
++}
++
++static void CALLBACK work_complete( XAsyncBlock *inner )
++{
++    struct pfx_work *w = inner->context;
++    struct PFXGameSaveConfig *c = w->config;
++    struct folder_result *result = NULL;
++    HRESULT hr;
++    SIZE_T size = 0;
++    BOOLEAN connected = FALSE;
++    if (w->kind == 0)
++    {
++        hr = api.add_result(inner);
++        if (SUCCEEDED(hr)) hr = api.folder_size(c->local_user, &size);
++        if (SUCCEEDED(hr) && (!size || size > 1024 * 1024)) hr = E_FAIL;
++        if (SUCCEEDED(hr))
++        {
++            if (!(result = calloc(1, sizeof(*result))) || !(result->folder = malloc(size))) hr = E_OUTOFMEMORY;
++            else hr = api.folder(c->local_user, size, result->folder, NULL);
++        }
++        if (SUCCEEDED(hr)) hr = api.connected(c->local_user, &connected);
++        c->ready_online = SUCCEEDED(hr) && connected;
++        if (SUCCEEDED(hr) && !connected) hr = (HRESULT)0x80830004; /* real offline outcome */
++        if (result) result->status = hr;
++        if (FAILED(hr) && hr != (HRESULT)0x80830004 && result)
++        { free(result->folder); free(result); result = NULL; }
++        xgr_async_complete_ex(w->outer, hr, result, result ? size : 0);
++    }
++    else
++    {
++        hr = w->kind == 1 ? api.upload_result(inner) : api.description_result(inner);
++        xgr_async_complete_ex(w->outer, hr, NULL, 0);
++    }
++    TRACE("PlayFab operation %u completed, hr %#lx.\n", w->kind, hr);
++    release_config(c); free(w);
++}
++
++static HRESULT start_work( PFXGameSaveConfigHandle handle, XAsyncBlock *outer, UINT32 kind,
++                           UINT32 options, const char *description )
++{
++    struct PFXGameSaveConfig *c;
++    struct pfx_work *w;
++    HRESULT hr;
++    if (!outer || (kind == 2 && !description)) return E_INVALIDARG;
++    if (!(c = acquire_config(handle))) return E_INVALIDARG;
++    if (!(w = calloc(1, sizeof(*w)))) { release_config(c); return E_OUTOFMEMORY; }
++    w->config = c; w->outer = outer; w->kind = kind;
++    w->inner.queue = outer->queue; w->inner.context = w; w->inner.callback = work_complete;
++    if (!kind) hr = api.add_user(c->local_user, c->flags & 3, &w->inner);
++    else if (kind == 1) hr = api.upload(c->local_user, options, &w->inner);
++    else hr = api.description(c->local_user, description, &w->inner);
++    if (FAILED(hr)) { release_config(c); free(w); }
++    return hr;
++}
++
++HRESULT pfx_folder_async( PFXGameSaveConfigHandle c, XAsyncBlock *a ) { return start_work(c, a, 0, 0, NULL); }
++HRESULT pfx_upload_async( PFXGameSaveConfigHandle c, UINT32 o, XAsyncBlock *a )
++{ return o > 1 ? E_INVALIDARG : start_work(c, a, 1, o, NULL); }
++HRESULT pfx_description_async( PFXGameSaveConfigHandle c, const char *s, XAsyncBlock *a )
++{ return !s || strlen(s) > 768 ? E_INVALIDARG : start_work(c, a, 2, 0, s); }
++
++HRESULT pfx_folder_result( XAsyncBlock *async, SIZE_T size, char *folder )
++{
++    struct folder_result *r;
++    HRESULT hr;
++    SIZE_T needed;
++    if (!async || !folder) return E_INVALIDARG;
++    if (!xgr_async_completed(async, &hr, (void **)&r)) return E_PENDING;
++    if (!r) return FAILED(hr) ? hr : E_FAIL;
++    needed = strlen(r->folder) + 1;
++    if (size < needed) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
++    memcpy(folder, r->folder, needed); hr = r->status;
++    free(r->folder); free(r); async->internal[2] = NULL;
++    return hr;
++}
++
++HRESULT pfx_status_result( XAsyncBlock *async )
++{
++    HRESULT hr;
++    if (!async) return E_INVALIDARG;
++    return xgr_async_completed(async, &hr, NULL) ? hr : E_PENDING;
++}
++
++HRESULT pfx_remaining_quota( PFXGameSaveConfigHandle handle, INT64 *quota )
++{
++    struct PFXGameSaveConfig *c;
++    HRESULT hr;
++    if (!quota || !(c = acquire_config(handle))) return E_INVALIDARG;
++    hr = api.quota(c->local_user, quota); release_config(c); return hr;
++}
++
++HRESULT pfx_set_ui( struct PFXGameSaveUiCallbacks *ui )
++{
++    if (!ui) return E_INVALIDARG;
++    EnterCriticalSection(&pfx_cs); callbacks = *ui; LeaveCriticalSection(&pfx_cs); return S_OK;
++}
++
++HRESULT pfx_set_device_callback( void *callback, void *context )
++{
++    EnterCriticalSection(&pfx_cs); device_callback = callback; device_context = context;
++    LeaveCriticalSection(&pfx_cs); return S_OK;
++}
++
++HRESULT pfx_progress( XUserHandle user, UINT32 *state, UINT64 *current, UINT64 *total )
++{
++    struct PFXGameSaveConfig *c = config_for_xuser(user);
++    HRESULT hr;
++    if (!c) return E_INVALIDARG;
++    hr = api.progress(c->local_user, state, current, total); release_config(c); return hr;
++}
++
++HRESULT pfx_ui_response( XUserHandle user, UINT32 kind, UINT32 response )
++{
++    static const UINT32 max_response[] = { 0, 2, 2, 2, 1 };
++    struct PFXGameSaveConfig *c;
++    HRESULT hr;
++    if (kind >= ARRAY_SIZE(max_response) || response > max_response[kind] ||
++        !(c = config_for_xuser(user))) return E_INVALIDARG;
++    hr = api.response[kind](c->local_user, response); release_config(c); return hr;
++}
++
++static struct PFXGameSaveUiCallbacks snapshot_ui(void)
++{
++    struct PFXGameSaveUiCallbacks ui;
++    EnterCriticalSection(&pfx_cs); ui = callbacks; LeaveCriticalSection(&pfx_cs); return ui;
++}
++
++static void convert_descriptor( struct pf_descriptor *p, struct PFXGameSaveDescriptor *out )
++{
++    memset(out, 0, sizeof(*out));
++    if (!p) return;
++    out->deviceType = p->device_type; out->deviceId = p->device_id; out->friendlyName = p->friendly_name;
++    out->thumbnailUri = p->thumbnail; out->shortSaveDescription = p->description;
++    out->time = p->time; out->totalBytes = p->total; out->uploadedBytes = p->uploaded;
++}
++
++static void WINAPI ui_progress( void *user, UINT32 state, void *context )
++{
++    struct PFXGameSaveConfig *c = config_for_local_user(user);
++    struct PFXGameSaveUiCallbacks ui = snapshot_ui();
++    if (c) { if (ui.progressCallback) ui.progressCallback(c->user, state, ui.progressContext); release_config(c); }
++}
++
++static void WINAPI ui_failed( void *user, UINT32 state, HRESULT error, void *context )
++{
++    struct PFXGameSaveConfig *c = config_for_local_user(user);
++    struct PFXGameSaveUiCallbacks ui = snapshot_ui();
++    int response;
++    if (!c) { api.response[1](user, 0); return; }
++    if (ui.syncFailedCallback) ui.syncFailedCallback(c->user, state, error, ui.syncFailedContext);
++    else
++    {
++        response = MessageBoxW(NULL, L"Cloud save synchronization failed. Retry?\nYes: retry. No: play with local saves offline. Cancel: stop.",
++                               L"Game Saves", MB_YESNOCANCEL | MB_ICONWARNING);
++        api.response[1](user, response == IDYES ? 1 : response == IDNO ? 2 : 0);
++    }
++    release_config(c);
++}
++
++static void descriptor_ui( void *user, struct pf_descriptor *local, struct pf_descriptor *remote, BOOL conflict )
++{
++    struct PFXGameSaveConfig *c = config_for_local_user(user);
++    struct PFXGameSaveUiCallbacks ui = snapshot_ui();
++    struct PFXGameSaveDescriptor l, r;
++    int response;
++    if (!c) { api.response[conflict ? 3 : 2](user, 0); return; }
++    convert_descriptor(local, &l); convert_descriptor(remote, &r);
++    if (conflict && ui.conflictWithDescriptorCallback) ui.conflictWithDescriptorCallback(c->user, &l, &r, ui.conflictWithDescriptorContext);
++    else if (!conflict && ui.activeDeviceContentionWithDescriptorCallback) ui.activeDeviceContentionWithDescriptorCallback(c->user, &l, &r, ui.activeDeviceContentionWithDescriptorContext);
++    else if (conflict && ui.conflictCallback) ui.conflictCallback(c->user, l.time, r.time, l.totalBytes, r.totalBytes, ui.conflictContext);
++    else if (!conflict && ui.activeDeviceContentionCallback) ui.activeDeviceContentionCallback(c->user, l.time, r.time, ui.activeDeviceContentionContext);
++    else if (conflict)
++    {
++        response = MessageBoxW(NULL, L"Cloud and local saves conflict. Load the cloud save?\nYes: cloud. No: local. Cancel: stop.", L"Game Saves", MB_YESNOCANCEL | MB_ICONWARNING);
++        api.response[3](user, response == IDYES ? 2 : response == IDNO ? 1 : 0);
++    }
++    else
++    {
++        response = MessageBoxW(NULL, L"Another device is active. Use its latest cloud save?", L"Game Saves", MB_OKCANCEL | MB_ICONWARNING);
++        api.response[2](user, response == IDOK ? 2 : 0);
++    }
++    release_config(c);
++}
++static void WINAPI ui_contention( void *u, struct pf_descriptor *l, struct pf_descriptor *r, void *c ) { descriptor_ui(u,l,r,FALSE); }
++static void WINAPI ui_conflict( void *u, struct pf_descriptor *l, struct pf_descriptor *r, void *c ) { descriptor_ui(u,l,r,TRUE); }
++
++static void WINAPI ui_storage( void *user, BOOLEAN partition, UINT64 bytes, void *context )
++{
++    struct PFXGameSaveConfig *c = config_for_local_user(user);
++    struct PFXGameSaveUiCallbacks ui = snapshot_ui();
++    int response;
++    if (!c) { api.response[4](user, 0); return; }
++    if (ui.outOfStorageCallback) ui.outOfStorageCallback(c->user, partition, bytes, ui.outOfStorageContext);
++    else
++    {
++        response = MessageBoxW(NULL, L"There is not enough storage for game saves. Free space and retry, or cancel.", L"Game Saves", MB_RETRYCANCEL | MB_ICONWARNING);
++        api.response[4](user, response == IDRETRY ? 1 : 0);
++    }
++    release_config(c);
++}
++
++static void WINAPI device_changed( void *user, struct pf_descriptor *device, void *context )
++{
++    struct PFXGameSaveConfig *c = config_for_local_user(user);
++    struct PFXGameSaveDescriptor descriptor;
++    PFXGameSaveDeviceChangedCallback *callback;
++    void *callback_context;
++    if (!c) return;
++    convert_descriptor(device, &descriptor);
++    EnterCriticalSection(&pfx_cs); callback = device_callback; callback_context = device_context; LeaveCriticalSection(&pfx_cs);
++    if (callback) callback(c->user, &descriptor, callback_context);
++    release_config(c);
++}
+diff --git a/pfxgamesave.h b/pfxgamesave.h
+new file mode 100644
+index 0000000..64336e9
+--- /dev/null
++++ b/pfxgamesave.h
+@@ -0,0 +1,13 @@
++/* PlayFab-backed GRTS implementation. Separate from the legacy WGS store. */
++HRESULT pfx_config_create( struct PFXGameSaveConfigRequest *request, PFXGameSaveConfigHandle *config );
++void pfx_config_close( PFXGameSaveConfigHandle config );
++HRESULT pfx_folder_async( PFXGameSaveConfigHandle config, XAsyncBlock *async );
++HRESULT pfx_folder_result( XAsyncBlock *async, SIZE_T size, char *folder );
++HRESULT pfx_remaining_quota( PFXGameSaveConfigHandle config, INT64 *quota );
++HRESULT pfx_set_ui( struct PFXGameSaveUiCallbacks *callbacks );
++HRESULT pfx_progress( XUserHandle user, UINT32 *state, UINT64 *current, UINT64 *total );
++HRESULT pfx_ui_response( XUserHandle user, UINT32 kind, UINT32 response );
++HRESULT pfx_upload_async( PFXGameSaveConfigHandle config, UINT32 options, XAsyncBlock *async );
++HRESULT pfx_status_result( XAsyncBlock *async );
++HRESULT pfx_description_async( PFXGameSaveConfigHandle config, const char *description, XAsyncBlock *async );
++HRESULT pfx_set_device_callback( void *callback, void *context );
+diff --git a/unixlib.c b/unixlib.c
+index 9d10b4b..5cc81dc 100644
+--- a/unixlib.c
++++ b/unixlib.c
+@@ -121,10 +121,17 @@ static char *base64_encode( const void *data, size_t len )
+     return out;
+ }
+ 
++/* Isolate a candidate service without changing desktop/audio discovery. */
++static const char *xodus_runtime_dir(void)
++{
++    const char *override = getenv("XODUS_RUNTIME_DIR");
++    return override && *override ? override : getenv("XDG_RUNTIME_DIR");
++}
++
+ static int connect_service( void )
+ {
+     struct sockaddr_un addr = { .sun_family = AF_UNIX };
+-    const char *runtime_dir = getenv( "XDG_RUNTIME_DIR" );
++    const char *runtime_dir = xodus_runtime_dir();
+     int fd;
+ 
+     if (!runtime_dir || !runtime_dir[0])
+@@ -214,6 +221,7 @@ static NTSTATUS xsts_token_once( void *args )
+ {
+     struct xsts_token_params *params = args;
+     char *request = NULL, header[8], *body = NULL, *body_b64 = NULL;
++    unsigned int extended_size;
+     char *url_esc = NULL, *method_esc = NULL, *title_esc = NULL, *client_esc = NULL;
+     unsigned int magic, size;
+     unsigned short type, len;
+@@ -229,6 +237,8 @@ static NTSTATUS xsts_token_once( void *args )
+ 
+     /* The signature covers the body, so it has to travel with the ask; base64
+      * keeps arbitrary bytes safe inside the XML. */
++    if (params->body_size > 6 * 1024 * 1024)
++    { status = STATUS_INVALID_BUFFER_SIZE; goto done; }
+     if (params->body && params->body_size)
+     {
+         if (!(body_b64 = base64_encode( params->body, params->body_size ))) goto done;
+@@ -257,27 +267,26 @@ static NTSTATUS xsts_token_once( void *args )
+                          url_esc, method_esc, title_esc, client_esc,
+                          body_b64 ? body_b64 : "" );
+     if (body_len < 0 || body_len >= (int)request_size) goto done;
+-    if (body_len > 0xffff)
+-    {
+-        WARN( "request body is too large to frame.\n" );
+-        goto done;
+-    }
++    if (body_len > 8 * 1024 * 1024)
++    { status = STATUS_INVALID_BUFFER_SIZE; goto done; }
+ 
+     magic = XODUS_XML_MAGIC;
+-    type = XODUS_XSTS_TOKEN_REQUEST;
+-    len = body_len;
++    type = XODUS_XSTS_TOKEN_REQUEST | (body_len > 0xffff ? 0x8000 : 0);
++    len = body_len > 0xffff ? 0xffff : body_len;
+     memcpy( header, &magic, 4 );
+     memcpy( header + 4, &type, 2 );
+     memcpy( header + 6, &len, 2 );
+ 
+     if (!write_all( fd, header, sizeof(header) )) goto done;
++    extended_size = body_len;
++    if (body_len > 0xffff && !write_all( fd, &extended_size, sizeof(extended_size) )) goto done;
+     if (!write_all( fd, request, body_len )) goto done;
+ 
+     if (!read_all( fd, header, sizeof(header) )) goto done;
+     memcpy( &magic, header, 4 );
+     memcpy( &type, header + 4, 2 );
+     memcpy( &len, header + 6, 2 );
+-    if (magic != XODUS_XML_MAGIC)
++    if (magic != XODUS_XML_MAGIC || type != XODUS_XSTS_TOKEN_REQUEST + 1)
+     {
+         WARN( "unexpected reply magic %#x.\n", magic );
+         goto done;
+@@ -386,7 +395,7 @@ static BOOL license_io( int fd, void *buffer, SIZE_T size, BOOL writing, long lo
+ static NTSTATUS license_token( void *args )
+ {
+     struct license_token_params *params = args;
+-    const char *runtime_dir = getenv( "XDG_RUNTIME_DIR" );
++    const char *runtime_dir = xodus_runtime_dir();
+     struct sockaddr_un addr = { .sun_family = AF_UNIX };
+     char *custom = NULL, *request = NULL, *parent = NULL, *title = NULL, *client = NULL, *id;
+     unsigned char header[8];
+diff --git a/xgameruntime.spec b/xgameruntime.spec
+index 354cf9d..1ecbe10 100644
+--- a/xgameruntime.spec
++++ b/xgameruntime.spec
+@@ -1,7 +1,8 @@
+ @ stub -private DllCanUnloadNow()
+-@ stdcall -private InitializeApiImpl(long long)
+-@ stdcall -private InitializeApiImplEx(long long long)
+-@ stdcall -private InitializeApiImplEx2(long long long ptr)
++@ stdcall -private DllRegisterServer()
++@ stdcall -private InitializeApiImpl(int64 int64)
++@ stdcall -private InitializeApiImplEx(int64 int64 long)
++@ stdcall -private InitializeApiImplEx2(int64 int64 long ptr)
+ @ stdcall -private QueryApiImpl(ptr ptr ptr)
+ @ stdcall -private UninitializeApiImpl()
+ @ stub -private XErrorReport(long str)
+diff --git a/xgamesave.c b/xgamesave.c
+index 70d710f..ce74d5c 100644
+--- a/xgamesave.c
++++ b/xgamesave.c
+@@ -39,6 +39,7 @@
+  */
+ 
+ #include "private.h"
++#include "pfxgamesave.h"
+ 
+ #include <objbase.h>
+ #include <bcrypt.h>
+@@ -2194,108 +2195,91 @@ static HRESULT WINAPI x_game_save_XGameSaveFilesGetRemainingQuota( IXGameSaveImp
+     return S_OK;
+ }
+ 
+-/* The PlayFab half of IXGameSaveImpl4. Each method fails with E_NOTIMPL rather
+- * than reporting success, so a title never believes a cloud save happened. */
++/* The PlayFab half delegates to its separate authenticated synchronization
++ * backend; legacy WGS behavior and interface slots remain unchanged. */
+ static HRESULT WINAPI x_game_save_PFXGameSaveInitializeConfig( IXGameSaveImpl4 *iface, struct PFXGameSaveConfigRequest *request, PFXGameSaveConfigHandle *config )
+ {
+-    FIXME( "PFXGameSaveInitializeConfig: PlayFab cloud saves are unsupported.\n" );
+-    if (config) *config = NULL;
+-    return E_NOTIMPL;
++    return pfx_config_create(request, config);
+ }
+ 
+ static void WINAPI x_game_save_PFXGameSaveFreeConfig( IXGameSaveImpl4 *iface, PFXGameSaveConfigHandle config )
+ {
+-    FIXME( "PFXGameSaveFreeConfig: PlayFab cloud saves are unsupported.\n" );
++    pfx_config_close(config);
+ }
+ 
+ static HRESULT WINAPI x_game_save_PFXGameSaveFilesGetFolderWithUiAsync( IXGameSaveImpl4 *iface, PFXGameSaveConfigHandle config, XAsyncBlock *async )
+ {
+-    FIXME( "PFXGameSaveFilesGetFolderWithUiAsync: PlayFab cloud saves are unsupported.\n" );
+-    return E_NOTIMPL;
++    return pfx_folder_async(config, async);
+ }
+ 
+ static HRESULT WINAPI x_game_save_PFXGameSaveFilesGetFolderWithUiResult( IXGameSaveImpl4 *iface, XAsyncBlock *async, SIZE_T folderSize, char *folderResult )
+ {
+-    FIXME( "PFXGameSaveFilesGetFolderWithUiResult: PlayFab cloud saves are unsupported.\n" );
+-    return E_NOTIMPL;
++    return pfx_folder_result(async, folderSize, folderResult);
+ }
+ 
+ static HRESULT WINAPI x_game_save_PFXGameSaveFilesGetRemainingQuota( IXGameSaveImpl4 *iface, PFXGameSaveConfigHandle config, INT64 *remainingQuota )
+ {
+-    FIXME( "PFXGameSaveFilesGetRemainingQuota: PlayFab cloud saves are unsupported.\n" );
+-    return E_NOTIMPL;
++    return pfx_remaining_quota(config, remainingQuota);
+ }
+ 
+ static HRESULT WINAPI x_game_save_PFXGameSaveSetUiCallbacks( IXGameSaveImpl4 *iface, struct PFXGameSaveUiCallbacks *callbacks )
+ {
+-    FIXME( "PFXGameSaveSetUiCallbacks: PlayFab cloud saves are unsupported.\n" );
+-    return E_NOTIMPL;
++    return pfx_set_ui(callbacks);
+ }
+ 
+ static HRESULT WINAPI x_game_save_PFXGameSaveProgressUiGetProgress( IXGameSaveImpl4 *iface, XUserHandle user, UINT32 *syncState, UINT64 *current, UINT64 *total )
+ {
+-    FIXME( "PFXGameSaveProgressUiGetProgress: PlayFab cloud saves are unsupported.\n" );
+-    return E_NOTIMPL;
++    return pfx_progress(user, syncState, current, total);
+ }
+ 
+ static HRESULT WINAPI x_game_save_PFXGameSaveSetProgressUiResponse( IXGameSaveImpl4 *iface, XUserHandle user, UINT32 response )
+ {
+-    FIXME( "PFXGameSaveSetProgressUiResponse: PlayFab cloud saves are unsupported.\n" );
+-    return E_NOTIMPL;
++    return pfx_ui_response(user, 0, response);
+ }
+ 
+ static HRESULT WINAPI x_game_save_PFXGameSaveSetSyncFailedUiResponse( IXGameSaveImpl4 *iface, XUserHandle user, UINT32 response )
+ {
+-    FIXME( "PFXGameSaveSetSyncFailedUiResponse: PlayFab cloud saves are unsupported.\n" );
+-    return E_NOTIMPL;
++    return pfx_ui_response(user, 1, response);
+ }
+ 
+ static HRESULT WINAPI x_game_save_PFXGameSaveSetActiveDeviceContentionUiResponse( IXGameSaveImpl4 *iface, XUserHandle user, UINT32 response )
+ {
+-    FIXME( "PFXGameSaveSetActiveDeviceContentionUiResponse: PlayFab cloud saves are unsupported.\n" );
+-    return E_NOTIMPL;
++    return pfx_ui_response(user, 2, response);
+ }
+ 
+ static HRESULT WINAPI x_game_save_PFXGameSaveSetConflictUiResponse( IXGameSaveImpl4 *iface, XUserHandle user, UINT32 response )
+ {
+-    FIXME( "PFXGameSaveSetConflictUiResponse: PlayFab cloud saves are unsupported.\n" );
+-    return E_NOTIMPL;
++    return pfx_ui_response(user, 3, response);
+ }
+ 
+ static HRESULT WINAPI x_game_save_PFXGameSaveSetOutOfStorageUiResponse( IXGameSaveImpl4 *iface, XUserHandle user, UINT32 response )
+ {
+-    FIXME( "PFXGameSaveSetOutOfStorageUiResponse: PlayFab cloud saves are unsupported.\n" );
+-    return E_NOTIMPL;
++    return pfx_ui_response(user, 4, response);
+ }
+ 
+ static HRESULT WINAPI x_game_save_PFXGameSaveFilesUploadWithUiAsync( IXGameSaveImpl4 *iface, PFXGameSaveConfigHandle config, UINT32 options, XAsyncBlock *async )
+ {
+-    FIXME( "PFXGameSaveFilesUploadWithUiAsync: PlayFab cloud saves are unsupported.\n" );
+-    return E_NOTIMPL;
++    return pfx_upload_async(config, options, async);
+ }
+ 
+ static HRESULT WINAPI x_game_save_PFXGameSaveFilesUploadWithUiResult( IXGameSaveImpl4 *iface, XAsyncBlock *async )
+ {
+-    FIXME( "PFXGameSaveFilesUploadWithUiResult: PlayFab cloud saves are unsupported.\n" );
+-    return E_NOTIMPL;
++    return pfx_status_result(async);
+ }
+ 
+ static HRESULT WINAPI x_game_save_PFXGameSaveFilesSetSaveDescriptionAsync( IXGameSaveImpl4 *iface, PFXGameSaveConfigHandle config, const char *description, XAsyncBlock *async )
+ {
+-    FIXME( "PFXGameSaveFilesSetSaveDescriptionAsync: PlayFab cloud saves are unsupported.\n" );
+-    return E_NOTIMPL;
++    return pfx_description_async(config, description, async);
+ }
+ 
+ static HRESULT WINAPI x_game_save_PFXGameSaveFilesSetSaveDescriptionResult( IXGameSaveImpl4 *iface, XAsyncBlock *async )
+ {
+-    FIXME( "PFXGameSaveFilesSetSaveDescriptionResult: PlayFab cloud saves are unsupported.\n" );
+-    return E_NOTIMPL;
++    return pfx_status_result(async);
+ }
+ 
+ static HRESULT WINAPI x_game_save_PFXGameSaveSetActiveDeviceChangedCallback( IXGameSaveImpl4 *iface, void *callback, void *context )
+ {
+-    FIXME( "PFXGameSaveSetActiveDeviceChangedCallback: PlayFab cloud saves are unsupported.\n" );
+-    return E_NOTIMPL;
++    return pfx_set_device_callback(callback, context);
+ }
+ 
+ static const struct IXGameSaveImpl4Vtbl x_game_save_vtbl =
+diff --git a/xgamesave.idl b/xgamesave.idl
+index dd904d9..d03dd08 100644
+--- a/xgamesave.idl
++++ b/xgamesave.idl
+@@ -121,12 +121,57 @@ interface IXGameSaveImpl3 : IXGameSaveImpl2
+ /* IXGameSaveImpl4 appends the PFXGameSave methods. Slot numbers follow the
+  * Microsoft.GDK.PC 2510.3.6286 XGameSave/PFXGameSave headers: the methods
+  * inherited from IXGameSaveImpl3 keep slots 3-32, and the seventeen PFXGameSave
+- * methods take slots 33-49. A title may ask for this revision before its legacy
+- * save calls, so the complete layout is exposed even though PlayFab cloud
+- * storage itself is unsupported. */
++ * methods take slots 33-49. Legacy calls retain their WGS implementation;
++ * PFX calls use the separate PlayFab save backend. */
+ typedef struct PFXGameSaveConfig *PFXGameSaveConfigHandle;
+-struct PFXGameSaveConfigRequest;
+-struct PFXGameSaveUiCallbacks;
++struct PFXGameSaveConfigRequest
++{
++    XUserHandle requestingUser;
++    const char *titleId;
++    const char *apiUrl;
++    UINT32 flags;
++    const char *entityId;
++    const char *entityToken;
++    const char *fileLocation;
++};
++
++struct PFXGameSaveDescriptor
++{
++    const char *deviceType;
++    const char *deviceId;
++    const char *friendlyName;
++    const char *thumbnailUri;
++    const char *shortSaveDescription;
++    INT64 time;
++    UINT64 totalBytes;
++    UINT64 uploadedBytes;
++};
++
++typedef void __stdcall PFXGameSaveProgressUiCallback( XUserHandle user, UINT32 state, void *context );
++typedef void __stdcall PFXGameSaveSyncFailedUiCallback( XUserHandle user, UINT32 state, HRESULT error, void *context );
++typedef void __stdcall PFXGameSaveContentionUiCallback( XUserHandle user, INT64 localTime, INT64 remoteTime, void *context );
++typedef void __stdcall PFXGameSaveConflictUiCallback( XUserHandle user, INT64 localTime, INT64 remoteTime, UINT64 localSize, UINT64 remoteSize, void *context );
++typedef void __stdcall PFXGameSaveStorageUiCallback( XUserHandle user, BOOLEAN userPartition, UINT64 requiredBytes, void *context );
++typedef void __stdcall PFXGameSaveDescriptorUiCallback( XUserHandle user, struct PFXGameSaveDescriptor *local, struct PFXGameSaveDescriptor *remote, void *context );
++typedef void __stdcall PFXGameSaveDeviceChangedCallback( XUserHandle user, struct PFXGameSaveDescriptor *device, void *context );
++
++struct PFXGameSaveUiCallbacks
++{
++    PFXGameSaveProgressUiCallback *progressCallback;
++    void *progressContext;
++    PFXGameSaveSyncFailedUiCallback *syncFailedCallback;
++    void *syncFailedContext;
++    PFXGameSaveContentionUiCallback *activeDeviceContentionCallback;
++    void *activeDeviceContentionContext;
++    PFXGameSaveConflictUiCallback *conflictCallback;
++    void *conflictContext;
++    PFXGameSaveStorageUiCallback *outOfStorageCallback;
++    void *outOfStorageContext;
++    PFXGameSaveDescriptorUiCallback *activeDeviceContentionWithDescriptorCallback;
++    void *activeDeviceContentionWithDescriptorContext;
++    PFXGameSaveDescriptorUiCallback *conflictWithDescriptorCallback;
++    void *conflictWithDescriptorContext;
++};
+ 
+ [
+     local,

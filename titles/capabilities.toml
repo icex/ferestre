@@ -598,7 +598,7 @@ verify = [
 
 [[capability]]
 name = "xgameruntime.gamesave-interface4-legacy"
-summary = "IXGameSaveImpl4 is exposed with its complete GDK 2510 layout, so legacy local save calls made through it keep their slots; its PlayFab cloud methods return E_NOTIMPL."
+summary = "IXGameSaveImpl4 is exposed with its complete GDK 2510 layout, so legacy local save calls made through it keep their slots; PlayFab file saves are a separate capability."
 provided-by = ["patches/xgameruntime/0027-expose-legacy-save-apis-through-the-complete-interface4.patch"]
 symptom-if-missing = "A title that asks for IXGameSaveImpl4 gets E_NOINTERFACE, and every save call after it fails; Retro Classics logs XGameSaveFilesGetFolderWithUiAsync failed with 0x80004002"
 # A string compiled into the DLL for this check, not a diagnostic's wording.
@@ -614,3 +614,40 @@ symptom-if-missing = "An engine that releases an allocator mid-recording faults 
 verify = [
     { file = "files/lib/wine/vkd3d-proton/x86_64-windows/d3d12core.dll", contains = "retain_recording_allocators" },
 ]
+
+[[capability]]
+name = "concrt140.concurrent-queue-iterator"
+summary = "Concurrent queue iterators preserve FIFO traversal, copying, assignment and page boundaries."
+provided-by = ["patches/wine/0015-implement-concurrent-queue-iterators.patch"]
+symptom-if-missing = "Forza Horizon 6 aborts on an unimplemented concurrent queue iterator constructor after compiling shaders"
+verify = [{ file = "files/lib/wine/x86_64-windows/concrt140.dll", contains = "_Concurrent_queue_iterator_base_v4__Advance" }]
+
+[[capability]]
+name = "xgameruntime.playfab-file-saves"
+summary = "PFX file-save calls use the title-matched native SDK for authentication, manifests, folders, quota and uploads."
+provided-by = ["patches/xgameruntime/0028-register-runtime-and-bridge-playfab-file-saves.patch"]
+symptom-if-missing = "New PlayFab save clients fail PFXGameSaveInitializeConfig before loading gameplay"
+note = "Runs in-process. Entity-only and custom-root configurations, and final upload after process exit are not implemented."
+verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "authenticated native PlayFab save backend initialized" }]
+
+[[capability]]
+name = "xgameruntime.service-socket-override"
+summary = "The runtime can connect to a separately versioned service without changing desktop or audio discovery."
+provided-by = ["patches/xgameruntime/0028-register-runtime-and-bridge-playfab-file-saves.patch"]
+symptom-if-missing = "An updated launcher cannot isolate its matching service from a still-running older session"
+verify = [{ file = "files/lib/wine/x86_64-unix/xgameruntime.so", contains = "XODUS_RUNTIME_DIR" }]
+
+[[capability]]
+name = "xgameruntime.playfab-shutdown-upload"
+summary = "Online PFX save configurations complete a final upload and release the active device before their native handles close."
+provided-by = ["patches/xgameruntime/0028-register-runtime-and-bridge-playfab-file-saves.patch"]
+symptom-if-missing = "Progress stays unsynced when a GRTS client releases its save configuration at exit"
+note = "Normal shutdown waits up to 30 seconds; failures retain local game files and do not claim successful cloud synchronization. Crash-time background upload remains unavailable."
+verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "final save upload completed before config close" }]
+[[capability]]
+name = "xgameruntime.store-catalog"
+summary = "Opt-in XStore product and associated-product queries return live Microsoft catalog data with retained SKU/image data and independent page handles."
+provided-by = ["patches/xgameruntime/0029-bridge-live-store-catalog.patch", "patches/xodus-cli/0019-serve-read-only-store-catalog.patch"]
+symptom-if-missing = "Forza Horizon 6 receives empty marketplace product listings"
+note = "Enable XGR_STORE_CATALOG=1 per title. Catalog data does not grant DLC ownership; purchasing remains unsupported."
+verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "catalog snapshot:" }, { file = "files/lib/wine/x86_64-unix/xgameruntime.so", contains = "CSDX" }]

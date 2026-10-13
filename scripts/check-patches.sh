@@ -108,7 +108,7 @@ if [ -d "$WINE_REPO/.git" ] || [ -f "$WINE_REPO/.git" ]; then
         bad "the series applies but does NOT reproduce the build tree:"
         { diff -rq --exclude=.git --exclude=xgameruntime "$WORK/wine/dlls" "$WINE_REPO/dlls" 2>/dev/null
           diff -rq --exclude=.git --exclude=dlls "$WORK/wine" "$WINE_REPO" 2>/dev/null
-        } | head -10 | sed 's/^/        /'
+        } | head -10 | sed 's/^/        /' || true
     fi
 else
     say "wine series: skipped, no repository at $WINE_REPO"
@@ -149,7 +149,7 @@ if [ -n "${XGR_BASE:-}" ] && [ -e "$XGR_REPO/.git" ]; then
         ok "the series reproduces the build tree exactly"
     else
         bad "the series applies but does NOT reproduce the build tree:"
-        diff -rq --exclude=.git "$WORK/xgr" "$XGR_REPO" 2>/dev/null | head -6 | sed 's/^/        /'
+        diff -rq --exclude=.git "$WORK/xgr" "$XGR_REPO" 2>/dev/null | head -6 | sed 's/^/        /' || true
     fi
 else
     say "xgameruntime series: skipped, submodule not checked out"
@@ -183,7 +183,7 @@ fi
 #
 # Against a pinned upstream commit rather than the fork's HEAD, because these
 # patches are published for other people to apply to upstream.
-if [ -d "$CLIENT_REPO/.git" ]; then
+if [ -e "$CLIENT_REPO/.git" ]; then
     say "client series against upstream ${CLIENT_BASE:0:8}"
     CHECKED=$((CHECKED + 1))
     if git -C "$CLIENT_REPO" cat-file -e "$CLIENT_BASE^{commit}" 2>/dev/null; then

@@ -545,7 +545,8 @@ fn cmd_run(
         game_dir: Some(paths.install_dir(recipe)?),
         prefix_dir: Some(paths.prefix_dir(recipe)?),
     };
-    let plan = launch::plan(recipe, &dirs, &options);
+    let mut plan = launch::plan(recipe, &dirs, &options);
+    let service_socket = plan_service_socket(&mut plan, &dirs, runtime)?;
 
     if dry_run {
         if cli.json {
@@ -570,7 +571,25 @@ fn cmd_run(
     run_setup(recipe, "every-launch", &dirs, &game_dir)?;
     std::fs::create_dir_all(launch::prefix_dir(recipe, &dirs, &options))
         .context("creating the Wine prefix directory")?;
-    start_service(&dirs)?;
+    if runtime.provides("xgameruntime.playfab-file-saves") {
+        if let Some(identity) = install::package_identity(&game_dir) {
+            let backups = paths
+                .state_dir()
+                .join("save-backups")
+                .join(&recipe.title.product_id);
+            for backup in ferestre_core::playfab::repair_package(
+                &launch::prefix_dir(recipe, &dirs, &options),
+                &identity,
+                &backups,
+            )? {
+                eprintln!(
+                    ":: preserved unsynced save cache at {}; saved progress will be rescanned",
+                    backup.display()
+                );
+            }
+        }
+    }
+    start_service(&dirs, service_socket.as_deref())?;
 
     run_teed(plan.to_command(), &launch::log_path(recipe, &dirs))
 }
@@ -1342,14 +1361,63 @@ fn tee<R: std::io::Read + Send + 'static>(
     })
 }
 
-/// Start `xodus-service` if it is not already up.
-///
-/// The GDK runtime's Xbox-side calls (sign-in, tokens) go through it, and a
-/// title sits on its sign-in screen without one. A stale socket is removed
-/// first: the service does not clean up after a crash, and a leftover socket
-/// makes the runtime think there is a service to talk to.
-fn start_service(dirs: &launch::Dirs) -> Result<()> {
-    if process_running("xodus-service") {
+const SERVICE_SOCKET_OVERRIDE: &str = "xgameruntime.service-socket-override";
+
+fn scoped_service_directory(supported: bool, id: &str, root: &Path) -> Result<Option<PathBuf>> {
+    if !supported {
+        return Ok(None);
+    }
+    let id = id.trim();
+    if id.len() != 64 || !id.bytes().all(|c| c.is_ascii_hexdigit()) {
+        bail!("invalid packaged Xbox service fingerprint");
+    }
+    // Keep the Unix socket path below sun_path limits (the full SHA remains
+    // in SERVICE_ID; 128 bits identify the namespace).
+    Ok(Some(root.join("ferestre-services").join(&id[..32])))
+}
+
+/// A capable runtime and its packaged service share a content-addressed socket
+/// directory. Replacing the AppImage can start the updated service without
+/// interrupting a game connected to the previous one. Older runtimes retain
+/// their existing socket because they do not understand the directory override.
+fn plan_service_socket(
+    plan: &mut launch::Plan,
+    dirs: &launch::Dirs,
+    runtime: &InstalledRuntime,
+) -> Result<Option<PathBuf>> {
+    if let Some(value) = plan.get("XODUS_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        return Ok(Some(PathBuf::from(value).join("xodus.sock")));
+    }
+    if let Some(value) = std::env::var_os("XODUS_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        return Ok(Some(PathBuf::from(value).join("xodus.sock")));
+    }
+    if runtime.provides(SERVICE_SOCKET_OVERRIDE) {
+        let metadata = dirs.cli_dir.join("SERVICE_ID");
+        match std::fs::read_to_string(&metadata) {
+            Ok(id) => {
+                if let Some(root) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+                    let directory = scoped_service_directory(true, &id, Path::new(&root))?.unwrap();
+                    plan.env_set.insert(
+                        "XODUS_RUNTIME_DIR".into(),
+                        directory.to_string_lossy().into_owned(),
+                    );
+                    return Ok(Some(directory.join("xodus.sock")));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", metadata.display()))
+            }
+        }
+    }
+    Ok(runtime_socket())
+}
+
+/// Start the service for this socket, preserving other running versions.
+fn start_service(dirs: &launch::Dirs, socket: Option<&Path>) -> Result<()> {
+    let socket =
+        socket.context("XDG_RUNTIME_DIR or XODUS_RUNTIME_DIR is required for Xbox services")?;
+    if service_socket_live(socket) {
         return Ok(());
     }
     let binary = dirs.xodus_service();
@@ -1359,60 +1427,77 @@ fn start_service(dirs: &launch::Dirs) -> Result<()> {
             binary.display()
         );
     }
-    if let Some(socket) = runtime_socket() {
-        let _ = std::fs::remove_file(socket);
+    let directory = socket
+        .parent()
+        .context("invalid service socket directory")?;
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("creating {}", directory.display()))?;
+    // Only remove an unreachable socket. An unrelated regular file is an error.
+    if let Ok(metadata) = std::fs::symlink_metadata(socket) {
+        use std::os::unix::fs::FileTypeExt;
+        if !metadata.file_type().is_socket() {
+            bail!("{} exists and is not a service socket", socket.display());
+        }
+        std::fs::remove_file(socket)
+            .with_context(|| format!("removing stale {}", socket.display()))?;
     }
-    let log = std::env::temp_dir().join("xodus-service.log");
-    let out = std::fs::File::create(&log).with_context(|| format!("creating {}", log.display()))?;
+    let log = directory.join("xodus-service.log");
+    use std::os::unix::fs::OpenOptionsExt;
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&log)
+        .with_context(|| format!("creating {}", log.display()))?;
     let errs = out
         .try_clone()
         .context("duplicating the service log handle")?;
-    Command::new(&binary)
+    let mut child = Command::new(&binary)
+        .env("XODUS_RUNTIME_DIR", directory)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(errs))
         .spawn()
         .with_context(|| format!("starting {}", binary.display()))?;
-    eprintln!(":: started xodus-service (log: {})", log.display());
-    // It has to be listening before the title asks it anything, and it offers
-    // nothing to wait on. Same two seconds launch-gdk.sh sleeps.
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    Ok(())
+    for _ in 0..100 {
+        if service_socket_live(socket) {
+            eprintln!(":: started xodus-service (log: {})", log.display());
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait().context("checking service startup")? {
+            bail!(
+                "Xbox service exited {status} before listening; log: {}",
+                log.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    bail!(
+        "Xbox service did not start listening; log: {}",
+        log.display()
+    )
+}
+
+fn runtime_socket_from(
+    override_dir: Option<std::ffi::OsString>,
+    runtime_dir: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    override_dir
+        .filter(|d| !d.is_empty())
+        .or_else(|| runtime_dir.filter(|d| !d.is_empty()))
+        .map(|d| PathBuf::from(d).join("xodus.sock"))
 }
 
 fn runtime_socket() -> Option<PathBuf> {
-    std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("xodus.sock"))
+    runtime_socket_from(
+        std::env::var_os("XODUS_RUNTIME_DIR"),
+        std::env::var_os("XDG_RUNTIME_DIR"),
+    )
 }
 
-/// Whether a process with this name is running, read from `/proc`.
-///
-/// `pgrep -x` is what the shell script uses; reading `/proc` avoids depending
-/// on procps being installed, which it is not in every container.
-fn process_running(name: &str) -> bool {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            // `Option::is_none_or` would say this better and is newer than the
-            // MSRV this workspace promises.
-            .map_or(true, |n| !n.bytes().all(|b| b.is_ascii_digit()))
-        {
-            continue;
-        }
-        if let Ok(comm) = std::fs::read_to_string(path.join("comm")) {
-            // /proc/PID/comm is truncated to 15 characters, so a long name is
-            // compared on the prefix the kernel kept.
-            let comm = comm.trim_end();
-            if comm == name || (comm.len() == 15 && name.starts_with(comm)) {
-                return true;
-            }
-        }
-    }
-    false
+fn service_socket_live(socket: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket).is_ok()
 }
 
 /// A recipe's `[[setup]]` steps for one moment in the title's life.
@@ -2231,6 +2316,63 @@ fn print_json(value: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packaged_service_versions_are_isolated_only_for_capable_runtimes() {
+        let root = Path::new("/desktop");
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        assert_ne!(
+            scoped_service_directory(true, &first, root).unwrap(),
+            scoped_service_directory(true, &second, root).unwrap()
+        );
+        assert_eq!(scoped_service_directory(false, &first, root).unwrap(), None);
+        assert_eq!(
+            scoped_service_directory(false, "legacy metadata", root).unwrap(),
+            None
+        );
+        assert!(scoped_service_directory(true, "../other", root).is_err());
+        let socket = scoped_service_directory(true, &first, Path::new("/run/user/1000"))
+            .unwrap()
+            .unwrap()
+            .join("xodus.sock");
+        assert!(
+            socket.as_os_str().len() < 108,
+            "service namespace must fit a Linux Unix socket path"
+        );
+    }
+
+    #[test]
+    fn service_directory_override_preserves_legacy_default() {
+        assert_eq!(
+            runtime_socket_from(Some("/candidate".into()), Some("/desktop".into())),
+            Some(PathBuf::from("/candidate/xodus.sock"))
+        );
+        assert_eq!(
+            runtime_socket_from(Some("".into()), Some("/desktop".into())),
+            Some(PathBuf::from("/desktop/xodus.sock"))
+        );
+        assert_eq!(
+            runtime_socket_from(None, Some("/desktop".into())),
+            Some(PathBuf::from("/desktop/xodus.sock"))
+        );
+        assert_eq!(runtime_socket_from(None, None), None);
+    }
+
+    #[test]
+    fn service_readiness_is_scoped_to_the_requested_socket() {
+        let directory =
+            std::env::temp_dir().join(format!("ferestre-service-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let first = directory.join("first.sock");
+        let other = directory.join("other.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&first).unwrap();
+        assert!(service_socket_live(&first));
+        assert!(!service_socket_live(&other));
+        drop(listener);
+        assert!(!service_socket_live(&first)); // A stale path is not a running service.
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn update_command_asks_the_client_for_json() {

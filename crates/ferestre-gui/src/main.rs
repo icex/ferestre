@@ -51,6 +51,7 @@ struct Ui {
     /// Set while the Game Pass listing is being fetched, so opening the section
     /// twice does not ask twice.
     fetching_gamepass: Rc<RefCell<bool>>,
+    fetching_entitlements: Rc<RefCell<bool>>,
     /// The bar along the bottom, and the download it is describing.
     download: DownloadBar,
     /// Titles this window started that have not exited, by product id, each
@@ -157,7 +158,7 @@ fn build_ui(app: &adw::Application) {
         .width_chars(26)
         .build();
     let refresh = gtk::Button::from_icon_name("view-refresh-symbolic");
-    refresh.set_tooltip_text(Some("Reload recipes and re-check the runtime"));
+    refresh.set_tooltip_text(Some("Refresh library, subscriptions and catalogue"));
     let spinner = gtk::Spinner::new();
 
     let content_header = adw::HeaderBar::new();
@@ -217,6 +218,7 @@ fn build_ui(app: &adw::Application) {
         running: Rc::new(RefCell::new(BTreeMap::new())),
         asked_names: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
         fetching_gamepass: Rc::new(RefCell::new(false)),
+        fetching_entitlements: Rc::new(RefCell::new(false)),
         download: download.clone(),
     };
 
@@ -244,6 +246,9 @@ fn build_ui(app: &adw::Application) {
             }
             ui.scroll.vadjustment().set_value(0.0);
             render(&ui);
+            if section == Section::GamePass {
+                refresh_entitlements(&ui);
+            }
             refresh_updates(&ui);
         }
     ));
@@ -271,10 +276,12 @@ fn build_ui(app: &adw::Application) {
         ui,
         move |_| {
             ui.model.borrow_mut().reload();
+            ui.asked_names.borrow_mut().clear();
             render(&ui);
             // Reload means "check again", and the Game Pass catalogue is a
             // thing that changes without anything here doing so.
             fetch_gamepass(&ui, true);
+            refresh_entitlements(&ui);
         }
     ));
 
@@ -300,6 +307,28 @@ fn build_ui(app: &adw::Application) {
     }
 
     window.present();
+    refresh_entitlements(&ui);
+    fetch_gamepass(&ui, true);
+    // Tier upgrades happen outside this window. Recheck without taking the
+    // download's busy flag or touching its process.
+    glib::timeout_add_seconds_local(
+        60,
+        glib::clone!(
+            #[weak]
+            window,
+            #[strong]
+            ui,
+            #[upgrade_or]
+            glib::ControlFlow::Break,
+            move || {
+                if !window.is_visible() {
+                    return glib::ControlFlow::Break;
+                }
+                refresh_entitlements(&ui);
+                glib::ControlFlow::Continue
+            }
+        ),
+    );
 }
 
 // --- rendering ------------------------------------------------------------
@@ -361,9 +390,7 @@ fn render(ui: &Ui) {
             )
         }
         Section::GamePass => {
-            // Fetched the first time the section is opened rather than at
-            // startup: it is a network round trip for a list most sessions
-            // never look at.
+            // A missing catalogue is fetched when this section opens too.
             fetch_gamepass(ui, false);
             render_gamepass(ui, &page)
         }
@@ -464,6 +491,7 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
 /// What one page of the list looks like, lifted out of the borrow so widgets
 /// can be built without holding the model.
 struct Drawn {
+    page: usize,
     rows: Vec<LibraryRow>,
     label: String,
     has_previous: bool,
@@ -493,8 +521,20 @@ fn draw_list(
     keep: impl Fn(&LibraryRow) -> bool,
 ) -> Drawn {
     let running = |product_id: &str| running.contains_key(&product_id.to_ascii_uppercase());
-    let installing =
-        |product_id: &str| downloading.is_some_and(|id| id.eq_ignore_ascii_case(product_id));
+    let installing = |product_id: &str| {
+        downloading.is_some_and(|id| {
+            id.eq_ignore_ascii_case(product_id)
+                || model
+                    .catalog
+                    .get(&product_id.to_ascii_uppercase())
+                    .is_some_and(|product| {
+                        product
+                            .bundled_ids
+                            .iter()
+                            .any(|child| child.eq_ignore_ascii_case(id))
+                    })
+        })
+    };
     let installed = |r: &Recipe| model.is_installed(r);
     let installed_version = |r: &Recipe| model.installed_version(r);
     let installed_product = |id: &str| model.product_is_installed(id);
@@ -521,15 +561,35 @@ fn draw_list(
     // The Game Pass section is a different list, not a filter over the same
     // one: its rows come from a public catalogue listing rather than from what
     // the account owns.
-    let rows: Vec<LibraryRow> = match section {
+    let mut rows: Vec<LibraryRow> = match section {
         Section::GamePass => {
-            let held: Vec<&str> = model.subscriptions.clone();
+            let held = if model.entitlements_checked {
+                model.subscriptions.clone()
+            } else {
+                Vec::new()
+            };
             model::gamepass(&inputs, &model.gamepass, &model.tiers, &held)
         }
         _ => model::library(&inputs),
     };
+    // Bundle rows install a child product. They still need to show the active
+    // download on their own row, regardless of which model branch built it.
+    for row in &mut rows {
+        if installing(&row.product_id) {
+            row.action = Action::Installing;
+            row.outside_tier = false;
+            row.unsupported = false;
+        }
+    }
     let unsupported = rows.iter().filter(|row| row.unsupported).count();
     let outside_tier = rows.iter().filter(|row| row.outside_tier).count();
+    // Resolve the whole list before filtering: unnamed off-page titles must
+    // be searchable, and learning their names must not depend on paging.
+    let unnamed_off_page: Vec<String> = rows
+        .iter()
+        .filter(|row| !row.is_named())
+        .map(|row| row.product_id.clone())
+        .collect();
     let rows: Vec<LibraryRow> = rows.into_iter().filter(|row| keep(row)).collect();
 
     let matching = model::search(&rows, &model.query);
@@ -538,17 +598,8 @@ fn draw_list(
     // the name, and a row nothing has looked up is still showing its product
     // id, so "age of" cannot match it. That was a search that found nothing
     // until you happened to page past the row, and then worked ever after.
-    let searching = !model.query.trim().is_empty();
-    let unnamed_off_page: Vec<String> = if searching {
-        rows.iter()
-            .filter(|row| !row.is_named())
-            .map(|row| row.product_id.clone())
-            .collect()
-    } else {
-        Vec::new()
-    };
-
     Drawn {
+        page: view.page,
         pending_names: unnamed_off_page.len(),
         want_names: unnamed_off_page
             .iter()
@@ -665,6 +716,9 @@ fn render_rows(ui: &Ui, page: &gtk::Box, keep: impl Fn(&LibraryRow) -> bool, emp
         section,
         keep,
     );
+    // Persist the clamped page. Otherwise Previous decrements a stale page
+    // number and keeps showing the last page after the list shrinks.
+    ui.model.borrow_mut().page = drawn.page;
 
     let group = adw::PreferencesGroup::builder().build();
     // Deliberately not an early return: an empty list is exactly when the
@@ -692,6 +746,14 @@ fn render_rows(ui: &Ui, page: &gtk::Box, keep: impl Fn(&LibraryRow) -> bool, emp
         }
     }
     page.append(&group);
+
+    if drawn.pending_names > 0 && !drawn.rows.is_empty() {
+        let progress = gtk::Label::builder()
+            .label(format!("Looking up {} title names…", drawn.pending_names))
+            .css_classes(["dim-label"])
+            .build();
+        page.append(&progress);
+    }
 
     // Only in the library: the other sections list installed or updatable
     // titles, which are runnable by construction.
@@ -1018,7 +1080,8 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
         .valign(gtk::Align::Center)
         .css_classes(["suggested-action"])
         .build();
-    button.set_sensitive(row.action.is_enabled());
+    let downloading = ui.download.current.borrow().is_some();
+    button.set_sensitive(row.action.is_enabled_during_download(downloading));
 
     match &row.action {
         Action::Blocked(reason) => button.set_tooltip_text(Some(reason)),
@@ -1310,6 +1373,7 @@ fn sign_out(ui: &Ui) {
                     model.avatar = None;
                     model.ownership = Ownership::Unknown;
                     model.subscriptions.clear();
+                    model.entitlements_checked = false;
                     if let Some(paths) = model.paths.as_ref() {
                         let _ = std::fs::remove_file(library::cache_path(paths.state_dir()));
                     }
@@ -1578,6 +1642,7 @@ fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&str>, what:
     }
 
     ui.download.start(product_id, name, what);
+    render(ui);
     let seen = Arc::clone(&ui.download.seen);
 
     // One timer for the life of the download, stopped when it ends. Attached
@@ -1628,13 +1693,11 @@ fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&str>, what:
         match result {
             Ok(Ok(status)) if status.success() => {
                 ui.model.borrow_mut().reload();
-                render(&ui);
                 ui.toasts
                     .add_toast(adw::Toast::new(&format!("{what} finished")));
             }
             Ok(Ok(status)) => {
                 ui.model.borrow_mut().reload();
-                render(&ui);
                 ui.toasts
                     .add_toast(adw::Toast::new(&format!("{what} exited {status}")));
             }
@@ -1643,6 +1706,7 @@ fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&str>, what:
                 .toasts
                 .add_toast(adw::Toast::new("The install could not be started")),
         }
+        render(&ui);
     });
 }
 
@@ -1723,6 +1787,11 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
 /// one on a single click -- with no size, no destination, and no way back --
 /// is not a thing to do to somebody's evening or their disk.
 fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
+    if ui.download.current.borrow().is_some() {
+        ui.toasts
+            .add_toast(adw::Toast::new("Another download is already running"));
+        return;
+    }
     let (default_dir, size, free) = {
         let model = ui.model.borrow();
         let dir = model.install_destination(product_id);
@@ -2070,6 +2139,7 @@ fn refresh_account(ui: &Ui) {
                 model.avatar = avatar;
             }
             render_account_button(&ui);
+            refresh_entitlements(&ui);
         }
     });
 }
@@ -2117,6 +2187,60 @@ fn refresh_updates(ui: &Ui) {
         if let Ok(Some(available)) = checked {
             ui.model.borrow_mut().available = available;
             render(&ui);
+        }
+    });
+}
+
+/// Read account access independently of downloads and catalogue artwork.
+/// A failed request retains the last successful snapshot.
+fn refresh_entitlements(ui: &Ui) {
+    if (*ui.busy.borrow() && ui.download.current.borrow().is_none())
+        || *ui.fetching_entitlements.borrow()
+    {
+        return;
+    }
+    let (client, state_dir, account) = {
+        let model = ui.model.borrow();
+        (
+            model.xodus_cli(),
+            model.paths.as_ref().map(|p| p.state_dir().to_path_buf()),
+            model.account.clone(),
+        )
+    };
+    let (Some(client), Some(state_dir)) = (client, state_dir) else {
+        return;
+    };
+    ui.fetching_entitlements.replace(true);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || {
+            let output = ferestre_core::library::library_command(&client, &Default::default())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            ferestre_core::library::parse(&String::from_utf8_lossy(&output.stdout)).ok()
+        })
+        .await;
+        ui.fetching_entitlements.replace(false);
+        if let Ok(Some(entries)) = result {
+            // Ignore a response for an account that signed out or changed
+            // while the query was in flight.
+            if ui.model.borrow().account != account {
+                return;
+            }
+            let changed = {
+                let model = ui.model.borrow();
+                !model.entitlements_checked || model.ownership != Ownership::Known(entries.clone())
+            };
+            let _ = ferestre_core::library::save_cache(&state_dir, &entries);
+            ui.model.borrow_mut().set_ownership(entries);
+            if changed {
+                fetch_gamepass(&ui, true);
+                render(&ui);
+            }
         }
     });
 }
@@ -2192,7 +2316,7 @@ fn refresh_library(ui: &Ui) {
                         let _ = ferestre_core::library::save_cache(&state_dir, &entries);
                     }
                     let mut model = ui.model.borrow_mut();
-                    model.ownership = Ownership::Known(entries);
+                    model.set_ownership(entries);
                     for product in products {
                         model
                             .catalog
@@ -2258,11 +2382,21 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
             let fetched = gio::spawn_blocking({
                 let market = market.clone();
                 move || {
-                    let ids = gamepass::fetch(&market, &language)?;
+                    let listing = gamepass::fetch(&market, &language);
                     // The tier map is a second request and a failure of it is
                     // not a failure of the listing: without it the section
                     // still works, it just cannot warn.
                     let tiers = gamepass::fetch_tiers(&market, &language).unwrap_or_default();
+                    let ids = match listing {
+                        Ok(ids) => gamepass::complete_listing(&ids, &tiers),
+                        Err(error) => {
+                            let ids = gamepass::complete_listing(&[], &tiers);
+                            if ids.is_empty() {
+                                return Err(error);
+                            }
+                            ids
+                        }
+                    };
                     Ok::<_, anyhow::Error>((ids, tiers))
                 }
             })
@@ -2284,9 +2418,7 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
             {
                 let mut model = ui.model.borrow_mut();
                 model.gamepass = ids;
-                if !tiers.included.is_empty() {
-                    model.tiers = tiers;
-                }
+                model.tiers = tiers;
             }
             if ui.model.borrow().section == Section::GamePass {
                 render(&ui);
@@ -2382,4 +2514,105 @@ fn fetch_icons(ui: &Ui, product_ids: Vec<String>) {
         ui.model.borrow_mut().icons.extend(fetched);
         render(&ui);
     });
+}
+
+#[cfg(test)]
+mod catalog_regressions {
+    use super::*;
+
+    fn fixture() -> Model {
+        Model {
+            paths: None,
+            recipes: Vec::new(),
+            runtime: None,
+            runtimes: Vec::new(),
+            registry: None,
+            records: BTreeMap::new(),
+            installed_products: Default::default(),
+            ownership: Ownership::Unknown,
+            catalog: BTreeMap::new(),
+            icons: BTreeMap::new(),
+            available: BTreeMap::new(),
+            account: None,
+            avatar: None,
+            gamepass: vec!["9NR1R1XWLCNB".into()],
+            subscriptions: Vec::new(),
+            entitlements_checked: false,
+            tiers: gamepass::parse_tiers(r#"{"9NR1R1XWLCNB":{"PCSubMetadata":{"Included":true}}}"#)
+                .unwrap(),
+            section: Section::GamePass,
+            query: String::new(),
+            page: 0,
+            show_unsupported: false,
+            problem: None,
+        }
+    }
+
+    fn snapshot(ultimate: bool) -> Vec<ferestre_core::library::Entry> {
+        ferestre_core::library::parse(if ultimate {
+            r#"[{"productId":"CFQ7TTC0P85B","status":"Revoked","productType":"Pass"},
+                 {"productId":"CFQ7TTC0KHS0","status":"Active","productType":"Pass"}]"#
+        } else {
+            r#"[{"productId":"CFQ7TTC0P85B","status":"Active","productType":"Pass"},
+                 {"productId":"CFQ7TTC0KHS0","status":"Revoked","productType":"Pass"}]"#
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn upgrade_updates_the_filtered_catalogue_without_a_restart() {
+        let mut model = fixture();
+        let running = BTreeMap::new();
+        model.subscriptions = vec!["Game Pass Premium"];
+        let draw = |model: &Model| {
+            draw_list(model, &running, None, Section::GamePass, |row| {
+                !row.known_uninstallable()
+            })
+        };
+        assert_eq!(
+            draw(&model).rows.len(),
+            1,
+            "unverified cached tiers must not hide games"
+        );
+        model.set_ownership(snapshot(false));
+        assert!(draw(&model).rows.is_empty());
+        model.set_ownership(snapshot(true));
+        let updated = draw(&model);
+        assert_eq!(model.subscriptions, vec!["Game Pass Ultimate"]);
+        assert_eq!(updated.rows.len(), 1);
+        assert!(!updated.rows[0].outside_tier);
+    }
+
+    #[test]
+    fn installing_title_survives_a_stale_tier_snapshot() {
+        let mut model = fixture();
+        model.set_ownership(snapshot(false));
+        let drawn = draw_list(
+            &model,
+            &BTreeMap::new(),
+            Some("9NR1R1XWLCNB"),
+            Section::GamePass,
+            |row| !row.known_uninstallable(),
+        );
+        assert_eq!(drawn.rows.len(), 1);
+        assert_eq!(drawn.rows[0].action, Action::Installing);
+        assert!(!drawn.rows[0].subtitle.contains("refused"));
+    }
+
+    #[test]
+    fn name_lookup_includes_hidden_and_off_page_products() {
+        let mut model = fixture();
+        model.set_ownership(snapshot(false));
+        model
+            .gamepass
+            .extend((0..50).map(|i| format!("9ZZTEST{i:05}")));
+        model.page = 99;
+        let drawn = draw_list(&model, &BTreeMap::new(), None, Section::GamePass, |row| {
+            !row.known_uninstallable()
+        });
+        assert_eq!(drawn.pending_names, 51);
+        assert!(drawn.want_names.contains(&"9NR1R1XWLCNB".into()));
+        assert!(drawn.page < 99);
+        assert!(!drawn.rows.is_empty());
+    }
 }

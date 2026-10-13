@@ -997,6 +997,21 @@ print(":: done", flush=True)
             time.monotonic() + TIMEOUT,
         )
         check(True, "the bar says what is being installed")
+        installing = row_button(frame, "Smoke Test Racer", "Installing..")
+        check(
+            installing is not None
+            and not installing.get_state_set().contains(Atspi.StateType.SENSITIVE),
+            "the active install immediately shows a disabled Installing.. button",
+            frame,
+        )
+        for button in find_all(frame, role="button"):
+            if any(node.get_role_name() == "label" and node.get_name() in {"Install", "Update"}
+                   for node, _ in walk(button)):
+                check(
+                    not button.get_state_set().contains(Atspi.StateType.SENSITIVE),
+                    "other games cannot be installed or updated during a download",
+                    frame,
+                )
         # The three things a progress bar is for. Waited for rather than read
         # once: the rate and the estimate deliberately say nothing until there
         # is enough history to divide by.
@@ -1017,6 +1032,12 @@ print(":: done", flush=True)
             time.monotonic() + TIMEOUT,
         )
         check(True, "and it disappears when the download finishes")
+        restored = row_button(frame, "Smoke Test Racer", "Install")
+        check(
+            restored is not None and restored.get_state_set().contains(Atspi.StateType.SENSITIVE),
+            "the Install button is enabled again after completion",
+            frame,
+        )
 
         print("the editor")
         select_in_list(frame, "Library")

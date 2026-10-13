@@ -23,6 +23,7 @@ pub mod install;
 pub mod launch;
 pub mod library;
 pub mod paths;
+pub mod playfab;
 pub mod recipe;
 pub mod runtime;
 pub mod steam;

@@ -415,6 +415,22 @@ pub fn game_config(install_dir: &Path) -> Option<PathBuf> {
         })
 }
 
+/// The package identity name in MicrosoftGame.config, independent of attribute order.
+pub fn package_identity(install_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(game_config(install_dir)?).ok()?;
+    let start = text.find("<Identity")?;
+    let element = text[start..].split_once('>')?.0;
+    let rest = element
+        .split_whitespace()
+        .find_map(|attribute| attribute.strip_prefix("Name="))?;
+    let quote = rest.chars().next()?;
+    if quote != '\"' && quote != '\'' {
+        return None;
+    }
+    let name = rest[1..].split_once(quote)?.0;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 fn store_id(install_dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(game_config(install_dir)?).ok()?;
     let open = "<StoreId>";
