@@ -9,6 +9,7 @@
 //!
 //! The client is never linked: Xodus is GPL-3.0-only, and the decrypted
 //! executable has to stay a child of the process that opened it.
+mod cancel;
 mod editor;
 mod model;
 mod progress;
@@ -44,7 +45,14 @@ struct Ui {
     spinner: gtk::Spinner,
     /// Set while a background task runs, so a second click cannot queue a
     /// duplicate sign-in or a duplicate library fetch.
-    busy: Rc<RefCell<bool>>,
+    busy: Rc<RefCell<Option<String>>>,
+    activity: gtk::Box,
+    activity_title: gtk::Label,
+    activity_detail: gtk::Label,
+    keep_open: gtk::Button,
+    closing: Rc<RefCell<bool>>,
+    close_dialog_open: Rc<RefCell<bool>>,
+    download_control: Rc<RefCell<Option<cancel::DownloadControl>>>,
     /// Product ids whose name has been looked up, so a lookup that came back
     /// with nothing is not repeated on every redraw.
     asked_names: Rc<RefCell<std::collections::BTreeSet<String>>>,
@@ -181,8 +189,31 @@ fn build_ui(app: &adw::Application) {
     // taking the scroll position and the keyboard focus with it.
     let download = DownloadBar::new();
 
+    let activity = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .margin_start(18)
+        .margin_end(18)
+        .margin_top(10)
+        .margin_bottom(10)
+        .visible(false)
+        .build();
+    let activity_title = gtk::Label::builder().xalign(0.0).wrap(true).build();
+    activity_title.add_css_class("heading");
+    let activity_detail = gtk::Label::builder().xalign(0.0).wrap(true).build();
+    activity_detail.add_css_class("dim-label");
+    let keep_open = gtk::Button::builder()
+        .label("Keep Window Open")
+        .halign(gtk::Align::Start)
+        .visible(false)
+        .build();
+    activity.append(&activity_title);
+    activity.append(&activity_detail);
+    activity.append(&keep_open);
+
     let content_view = adw::ToolbarView::new();
     content_view.add_top_bar(&content_header);
+    content_view.add_bottom_bar(&activity);
     content_view.add_bottom_bar(&download.root);
     content_view.set_content(Some(&toasts));
 
@@ -214,13 +245,34 @@ fn build_ui(app: &adw::Application) {
         title,
         search: search.clone(),
         spinner,
-        busy: Rc::new(RefCell::new(false)),
+        busy: Rc::new(RefCell::new(None)),
+        activity,
+        activity_title,
+        activity_detail,
+        keep_open: keep_open.clone(),
+        closing: Rc::new(RefCell::new(false)),
+        close_dialog_open: Rc::new(RefCell::new(false)),
+        download_control: Rc::new(RefCell::new(None)),
         running: Rc::new(RefCell::new(BTreeMap::new())),
         asked_names: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
         fetching_gamepass: Rc::new(RefCell::new(false)),
         fetching_entitlements: Rc::new(RefCell::new(false)),
         download: download.clone(),
     };
+
+    window.connect_close_request(glib::clone!(
+        #[strong]
+        ui,
+        move |_| request_close(&ui)
+    ));
+    keep_open.connect_clicked(glib::clone!(
+        #[strong]
+        ui,
+        move |_| {
+            *ui.closing.borrow_mut() = false;
+            show_activity(&ui);
+        }
+    ));
 
     // Activation and selection both, because they are not the same event:
     // clicking selects, but Enter and an assistive technology activate, and a
@@ -1348,7 +1400,8 @@ fn sign_out(ui: &Ui) {
             .add_toast(adw::Toast::new("The Xodus client was not found"));
         return;
     };
-    if !begin(ui) {
+    if !begin(ui, "Signing out") {
+        report_busy(ui);
         return;
     }
     let ui = ui.clone();
@@ -1630,11 +1683,12 @@ impl DownloadBar {
 /// second. A client too old to know about that simply prints nothing this can
 /// read, and the bar stays indeterminate rather than breaking.
 fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&str>, what: &str) {
-    if !begin(ui) {
-        ui.toasts
-            .add_toast(adw::Toast::new("Something is already running"));
+    if !begin(ui, &format!("{what} {name}")) {
+        report_busy(ui);
         return;
     }
+    let control = cancel::DownloadControl::default();
+    *ui.download_control.borrow_mut() = Some(control.clone());
     let program = cli_binary();
     let mut args = vec!["install".to_string(), product_id.to_string()];
     if let Some(dir) = dir.map(str::trim).filter(|d| !d.is_empty()) {
@@ -1658,14 +1712,16 @@ fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&str>, what:
 
     let ui = ui.clone();
     let what = what.to_string();
+    let name = name.to_string();
     glib::spawn_future_local(async move {
         let result = gio::spawn_blocking(move || {
-            let mut child = std::process::Command::new(&program)
+            let mut command = std::process::Command::new(&program);
+            command
                 .args(&args)
                 .env("XODUS_PROGRESS", "json")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .spawn()
+                .stdout(std::process::Stdio::piped());
+            let mut child = control
+                .spawn(&mut command)
                 .map_err(|e| format!("{}: {e}", program.display()))?;
 
             if let Some(out) = child.stdout.take() {
@@ -1689,17 +1745,30 @@ fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&str>, what:
 
         tick.remove();
         ui.download.stop();
+        let stopped = ui
+            .download_control
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.requested());
         finish(&ui);
         match result {
             Ok(Ok(status)) if status.success() => {
                 ui.model.borrow_mut().reload();
-                ui.toasts
-                    .add_toast(adw::Toast::new(&format!("{what} finished")));
+                ui.toasts.add_toast(adw::Toast::new(&format!(
+                    "Finished {} {name}",
+                    what.to_lowercase()
+                )));
+            }
+            _ if stopped => {
+                ui.model.borrow_mut().reload();
+                ui.toasts.add_toast(adw::Toast::new(
+                    "Download stopped. Downloaded files kept for resuming.",
+                ));
             }
             Ok(Ok(status)) => {
                 ui.model.borrow_mut().reload();
                 ui.toasts
-                    .add_toast(adw::Toast::new(&format!("{what} exited {status}")));
+                    .add_toast(adw::Toast::new(&format!("{what} {name} exited {status}")));
             }
             Ok(Err(e)) => ui.toasts.add_toast(adw::Toast::new(&e)),
             Err(_) => ui
@@ -1711,14 +1780,15 @@ fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&str>, what:
 }
 
 fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
-    if !begin(ui) {
-        ui.toasts
-            .add_toast(adw::Toast::new("Something is already running"));
+    if !begin(ui, what) {
+        report_busy(ui);
         return;
     }
     let program = cli_binary();
     let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     let runtime_install = owned == ["install-runtime"];
+    let control = runtime_install.then(cancel::DownloadControl::default);
+    *ui.download_control.borrow_mut() = control.clone();
     let tick = if runtime_install {
         // A runtime archive is large and GitHub cannot provide a stable byte
         // total before the redirect. Keep progress visibly moving throughout
@@ -1746,10 +1816,14 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
     let what = what.to_string();
     glib::spawn_future_local(async move {
         let result = gio::spawn_blocking(move || {
-            std::process::Command::new(&program)
-                .args(&owned)
-                .stdin(std::process::Stdio::null())
-                .status()
+            let mut command = std::process::Command::new(&program);
+            command.args(&owned).stdin(std::process::Stdio::null());
+            let child = match control {
+                Some(control) => control.spawn(&mut command),
+                None => command.spawn(),
+            };
+            child
+                .and_then(|mut child| child.wait())
                 .map_err(|e| format!("{}: {e}", program.display()))
         })
         .await;
@@ -1757,6 +1831,11 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
             tick.remove();
             ui.download.stop();
         }
+        let stopped = ui
+            .download_control
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.requested());
         finish(&ui);
         match result {
             Ok(Ok(status)) if status.success() => {
@@ -1766,6 +1845,10 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
                 render(&ui);
                 ui.toasts
                     .add_toast(adw::Toast::new(&format!("{what} finished")));
+            }
+            _ if stopped => {
+                ui.toasts
+                    .add_toast(adw::Toast::new("Runtime download stopped"));
             }
             Ok(Ok(status)) => {
                 ui.model.borrow_mut().reload();
@@ -1787,9 +1870,8 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
 /// one on a single click -- with no size, no destination, and no way back --
 /// is not a thing to do to somebody's evening or their disk.
 fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
-    if ui.download.current.borrow().is_some() {
-        ui.toasts
-            .add_toast(adw::Toast::new("Another download is already running"));
+    if ui.busy.borrow().is_some() || *ui.closing.borrow() {
+        report_busy(ui);
         return;
     }
     let (default_dir, size, free) = {
@@ -1857,6 +1939,10 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
 /// download or 45 GB of a game -- and because a launcher deleting a directory
 /// the person cannot see named is a launcher nobody should trust.
 fn confirm_remove(ui: &Ui, product_id: &str, name: &str) {
+    if ui.busy.borrow().is_some() || *ui.closing.borrow() {
+        report_busy(ui);
+        return;
+    }
     let dir = {
         let model = ui.model.borrow();
         model
@@ -2058,18 +2144,113 @@ fn account_pressed(ui: &Ui) {
 // --- background work -------------------------------------------------------
 
 /// Guard a background task so two clicks cannot start two of them.
-fn begin(ui: &Ui) -> bool {
-    if *ui.busy.borrow() {
+fn begin(ui: &Ui, what: &str) -> bool {
+    if ui.busy.borrow().is_some() || *ui.closing.borrow() {
         return false;
     }
-    *ui.busy.borrow_mut() = true;
+    *ui.busy.borrow_mut() = Some(what.to_string());
     ui.spinner.start();
+    show_activity(ui);
     true
 }
 
 fn finish(ui: &Ui) {
-    *ui.busy.borrow_mut() = false;
+    *ui.busy.borrow_mut() = None;
+    *ui.download_control.borrow_mut() = None;
     ui.spinner.stop();
+    show_activity(ui);
+    // Let the completion callback reload records before closing the window.
+    let ui = ui.clone();
+    glib::idle_add_local_once(move || {
+        if *ui.closing.borrow() && ui.busy.borrow().is_none() {
+            ui.window.close();
+        }
+    });
+}
+
+fn show_activity(ui: &Ui) {
+    let busy = ui.busy.borrow();
+    let closing = *ui.closing.borrow();
+    ui.activity.set_visible(busy.is_some());
+    ui.keep_open.set_visible(closing);
+    let Some(what) = busy.as_deref() else {
+        ui.spinner.set_tooltip_text(Some("No activity"));
+        return;
+    };
+    ui.activity_title.set_label(what);
+    let stopping = ui
+        .download_control
+        .borrow()
+        .as_ref()
+        .is_some_and(|c| c.requested());
+    let detail = if closing && stopping {
+        "Stopping the download and cleaning up. Ferestre will close when it is safe."
+    } else if stopping {
+        "Stopping the download and cleaning up. The window will stay open when cleanup finishes."
+    } else if closing {
+        "Finishing this operation. Ferestre will close when it is safe."
+    } else {
+        "Please wait for this to finish before starting another operation."
+    };
+    ui.activity_detail.set_label(detail);
+    ui.spinner
+        .set_tooltip_text(Some(&format!("{what}\n{detail}")));
+}
+
+fn report_busy(ui: &Ui) {
+    let message = if *ui.closing.borrow() {
+        "Ferestre is preparing to close. Choose Keep Window Open to continue.".to_string()
+    } else if let Some(what) = ui.busy.borrow().as_deref() {
+        format!("{what}. Please wait for it to finish, then try again.")
+    } else {
+        return;
+    };
+    ui.toasts.add_toast(adw::Toast::new(&message));
+}
+
+fn request_close(ui: &Ui) -> glib::Propagation {
+    let Some(what) = ui.busy.borrow().clone() else {
+        return glib::Propagation::Proceed;
+    };
+    if *ui.closing.borrow() || ui.close_dialog_open.replace(true) {
+        return glib::Propagation::Stop;
+    }
+    let downloading = ui.download_control.borrow().is_some();
+    let body = if downloading {
+        format!("{what} is still in progress. Closing will stop the download and wait for cleanup. Downloaded game files will be kept so you can resume later.")
+    } else {
+        format!("{what} is still in progress. Ferestre will finish this operation before closing. Please keep the app open while it finishes.")
+    };
+    let dialog = adw::AlertDialog::new(Some("Close Ferestre?"), Some(&body));
+    dialog.add_response("cancel", "Keep Open");
+    dialog.add_response(
+        "close",
+        if downloading {
+            "Stop Download and Close"
+        } else {
+            "Finish and Close"
+        },
+    );
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let window = ui.window.clone();
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, response| {
+        *ui.close_dialog_open.borrow_mut() = false;
+        if response != "close" {
+            return;
+        }
+        *ui.closing.borrow_mut() = true;
+        if let Some(control) = ui.download_control.borrow().as_ref() {
+            control.stop();
+        }
+        show_activity(&ui);
+        if ui.busy.borrow().is_none() {
+            ui.window.close();
+        }
+    });
+    dialog.present(Some(&window));
+    glib::Propagation::Stop
 }
 
 fn sign_in(ui: &Ui) {
@@ -2079,7 +2260,8 @@ fn sign_in(ui: &Ui) {
         ));
         return;
     };
-    if !begin(ui) {
+    if !begin(ui, "Signing in") {
+        report_busy(ui);
         return;
     }
     ui.toasts
@@ -2114,7 +2296,7 @@ fn refresh_account(ui: &Ui) {
     let (Some(client), Some(cache_dir)) = (client, cache_dir) else {
         return;
     };
-    if !begin(ui) {
+    if !begin(ui, "Refreshing account") {
         return;
     }
 
@@ -2153,7 +2335,7 @@ fn refresh_updates(ui: &Ui) {
         )
     };
     let Some(client) = client else { return };
-    if records.is_empty() || !begin(ui) {
+    if records.is_empty() || !begin(ui, "Checking for game updates") {
         return;
     }
     let ui = ui.clone();
@@ -2194,7 +2376,7 @@ fn refresh_updates(ui: &Ui) {
 /// Read account access independently of downloads and catalogue artwork.
 /// A failed request retains the last successful snapshot.
 fn refresh_entitlements(ui: &Ui) {
-    if (*ui.busy.borrow() && ui.download.current.borrow().is_none())
+    if (ui.busy.borrow().is_some() && ui.download.current.borrow().is_none())
         || *ui.fetching_entitlements.borrow()
     {
         return;
@@ -2255,7 +2437,8 @@ fn refresh_library(ui: &Ui) {
             .add_toast(adw::Toast::new("The Xodus client was not found"));
         return;
     };
-    if !begin(ui) {
+    if !begin(ui, "Refreshing your library") {
+        report_busy(ui);
         return;
     }
     let (market, language) = ui.model.borrow().market();

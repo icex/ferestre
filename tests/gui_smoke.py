@@ -657,7 +657,15 @@ last-verified = 2026-10-10
     with open(stub, "w") as f:
         f.write(
             """#!/usr/bin/env python3
-import json, os, sys, time
+import json, os, select, sys, time
+from pathlib import Path
+home = Path(os.environ["HOME"])
+if sys.argv[1:2] == ["uninstall"]:
+    (home / "removal-started").touch()
+    while not (home / "release-removal").exists():
+        time.sleep(0.05)
+    (home / "removal-finished").touch()
+    sys.exit(0)
 if sys.argv[1:2] == ["run"]:
     # Long enough that starting and exiting are separate redraws, as they are
     # for a real title: each one rebuilds the row the person just clicked.
@@ -669,6 +677,16 @@ if os.environ.get("XODUS_PROGRESS") != "json":
     # The real client only emits these when asked. A window that forgets to ask
     # would then sit on an empty bar, and this is where that gets noticed.
     sys.exit("progress was not requested")
+if (home / "hold-download").exists():
+    (home / "download-started").touch()
+    while not select.select([sys.stdin], [], [], 0.05)[0]:
+        pass
+    sys.stdin.buffer.read(1)
+    (home / "download-stopping").touch()
+    while not (home / "release-cleanup").exists():
+        time.sleep(0.05)
+    (home / "download-stopped").touch()
+    sys.exit(130)
 total = 800_000_000
 # Ten seconds of it: the estimate deliberately says nothing until it has a
 # couple of seconds to average over, and on a loaded machine one walk of the
@@ -1192,9 +1210,116 @@ print(":: done", flush=True)
             "and the packaged recipe is left alone",
         )
 
+        print("removal status and graceful close")
+        # Earlier checks deliberately used an unrecorded manifest-only title.
+        # Removal operates on the install record that a real download writes.
+        installed_records = os.path.join(state, "installed")
+        os.makedirs(installed_records, exist_ok=True)
+        with open(os.path.join(installed_records, "9NBLGGH2JHXJ.json"), "w") as f:
+            json.dump({"product_id": "9NBLGGH2JHXJ", "dir": unrecorded,
+                       "content_ids": [], "package_version": "9.9.9.9"}, f)
+        click_named(frame, "Refresh library, subscriptions and catalogue")
+        select_in_list(frame, "Installed")
+        time.sleep(0.5)
+        wait_for(frame, lambda root: not any("Checking for game updates" in t for t in texts(root)),
+                 "the automatic update check to finish", time.monotonic() + TIMEOUT)
+        remove = wait_for(
+            frame, lambda root: next(iter(find_all(root, role="button", name="Remove this title from disk")), None),
+            "the installed game's Remove button", time.monotonic() + TIMEOUT,
+        )
+        click(remove)
+        wait_for(frame, lambda root: any("Remove Minecraft for Windows?" in t for t in texts(root)),
+                 "the removal confirmation", time.monotonic() + TIMEOUT)
+        click_named(frame, "Remove")
+        wait_for(frame, lambda root: os.path.exists(os.path.join(home, "removal-started")),
+                 "the removal to start", time.monotonic() + TIMEOUT)
+        # Let the short starting toast expire: the persistent status must remain.
+        time.sleep(6)
+        check("Removing Minecraft for Windows" in texts(frame), "removal status remains visible", frame)
+        tooltip = wait_for(
+            frame, lambda root: next(iter(find_all(root, role="progress bar",
+                                                  name_contains="Removing Minecraft for Windows")), None),
+            "the spinner's activity tooltip", time.monotonic() + TIMEOUT,
+        )
+        check("Please wait" in tooltip.get_name(), "the spinner tooltip identifies the operation and game", frame)
+        select_in_list(frame, "Library")
+        click(row_button(frame, "Smoke Test Racer", "Install"))
+        wait_for(frame, lambda root: any("Removing Minecraft for Windows. Please wait" in t for t in texts(root)),
+                 "a specific busy message", time.monotonic() + TIMEOUT)
+        check(not os.path.exists(os.path.join(home, "download-started")), "busy click did not start another operation")
+        click_named(frame, "Close")
+        wait_for(frame, lambda root: bool(find_all(root, role="button", name="Finish and Close")),
+                 "the close confirmation during removal", time.monotonic() + TIMEOUT)
+        click_named(frame, "Keep Open")
+        wait_for(frame, lambda root: not find_all(root, role="dialog"),
+                 "the close dialog to dismiss", time.monotonic() + TIMEOUT)
+        check(gui.poll() is None, "cancelling close keeps the app open")
+        click_named(frame, "Close")
+        wait_for(frame, lambda root: bool(find_all(root, role="button", name="Finish and Close")),
+                 "the second close confirmation", time.monotonic() + TIMEOUT)
+        time.sleep(0.3)  # Let the dialog finish its opening animation.
+        click_named(frame, "Finish and Close")
+        wait_for(frame, lambda root: any("Ferestre will close when it is safe" in t for t in texts(root)),
+                 "the pending close status", time.monotonic() + TIMEOUT)
+        check(gui.poll() is None, "closing waits for the removal")
+        # Pending close is reversible while removal runs.
+        click_named(frame, "Keep Window Open")
+        click_named(frame, "Close")
+        wait_for(frame, lambda root: bool(find_all(root, role="button", name="Finish and Close")),
+                 "the close confirmation after keeping the window open", time.monotonic() + TIMEOUT)
+        time.sleep(0.3)  # Let the dialog finish its opening animation.
+        click_named(frame, "Finish and Close")
+        open(os.path.join(home, "release-removal"), "w").close()
+        check(gui.wait(timeout=TIMEOUT) == 0, "the app closes after removal finishes")
+        check(os.path.exists(os.path.join(home, "removal-finished")), "removal completed before exit")
+        stderr_before_restart = gui.stderr.read()
+
+        print("download cancellation waits for cleanup")
+        open(os.path.join(home, "hold-download"), "w").close()
+        gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        app = find_app(gui.pid, time.monotonic() + TIMEOUT)
+        frame = wait_for(app, lambda root: next(iter(find_all(root, role="frame")), None),
+                         "the restarted window", time.monotonic() + TIMEOUT)
+        select_in_list(frame, "Library")
+        wait_for(frame, lambda root: row_button(root, "Smoke Test Racer", "Install"),
+                 "the install action", time.monotonic() + TIMEOUT)
+        click(row_button(frame, "Smoke Test Racer", "Install"))
+        wait_for(frame, lambda root: bool(find_all(root, role="button", name="Install")),
+                 "install confirmation", time.monotonic() + TIMEOUT)
+        click_named(frame, "Install")
+        wait_for(frame, lambda root: os.path.exists(os.path.join(home, "download-started")),
+                 "the held download", time.monotonic() + TIMEOUT)
+        click_named(frame, "Close")
+        wait_for(frame, lambda root: bool(find_all(root, role="button", name="Stop Download and Close")),
+                 "download close confirmation", time.monotonic() + TIMEOUT)
+        click_named(frame, "Keep Open")
+        wait_for(frame, lambda root: not find_all(root, role="dialog"),
+                 "the close dialog to dismiss", time.monotonic() + TIMEOUT)
+        check(not os.path.exists(os.path.join(home, "download-stopping")), "dismissing close leaves the download running")
+        click_named(frame, "Close")
+        wait_for(frame, lambda root: bool(find_all(root, role="button", name="Stop Download and Close")),
+                 "the next close confirmation", time.monotonic() + TIMEOUT)
+        time.sleep(0.3)
+        click_named(frame, "Stop Download and Close")
+        wait_for(frame, lambda root: os.path.exists(os.path.join(home, "download-stopping")),
+                 "cancellation to reach the downloader", time.monotonic() + TIMEOUT)
+        check(gui.poll() is None, "the window stays alive during download cleanup")
+        check(any("Stopping the download and cleaning up" in t for t in texts(frame)),
+              "cleanup is explained while waiting", frame)
+        open(os.path.join(home, "release-cleanup"), "w").close()
+        check(gui.wait(timeout=TIMEOUT) == 0, "the app closes after download cleanup")
+        check(os.path.exists(os.path.join(home, "download-stopped")), "download cleanup completed before exit")
+        if b"panicked" in stderr_before_restart:
+            failures.append("the first window panicked")
+
     except Failure as e:
+        if "frame" in locals():
+            dump(frame, str(e))
         failures.append(str(e))
     finally:
+        # Release only this fixture's workers, even if an assertion failed.
+        for gate in ("release-removal", "release-cleanup"):
+            open(os.path.join(home, gate), "w").close()
         gui.terminate()
         try:
             gui.wait(timeout=5)

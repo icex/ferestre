@@ -61,12 +61,12 @@ Pronounced roughly *feh-RESS-treh*.
 
 ## Status
 
-Release **0.1.9** pairs with runtime **11.0.20261013.3**. Forza Horizon 6
+Release **0.1.10** pairs with runtime **11.0.20261013.3**. Forza Horizon 6
 is playable, with shader startup, native PlayFab saves and Continue confirmed.
 Its marketplace is still under qualification. Dune: Awakening is marked
 playable from player confirmation. Game Pass tiers refresh independently of
 the catalog, and searches and paging include the full PC catalog.
-See [the release qualification](docs/RELEASE-0.1.9.md) for tested scope.
+See [the release qualification](docs/RELEASE-0.1.10.md) for tested scope.
 
 Honest version, because this is early. Every row here was run on a real machine,
 not inferred from the fact that it downloaded:
@@ -106,6 +106,11 @@ sizes, lists what a Game Pass subscription includes, installs with a progress
 bar and a time remaining, detects updates, and launches. See
 [docs/ROADMAP.md](docs/ROADMAP.md) for what is still missing and
 [docs/RECIPES.md](docs/RECIPES.md) for doing any of it by hand.
+
+Active operations stay visible, and the top-right spinner's tooltip names the
+current task. Closing during a download or removal asks first: downloads stop
+and keep their game files for resuming, removals finish, and the window waits
+for cleanup before exiting.
 
 Two things the window is careful about, because both are easy to get wrong in a
 way that looks like it works. Titles whose package this runtime cannot open --

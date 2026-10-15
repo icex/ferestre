@@ -21,6 +21,8 @@
 //!     output here must be safe to paste into a bug report unedited, which is
 //!     the rule `tools/xsts_probe.py` already follows.
 
+mod cancel;
+
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -643,6 +645,7 @@ fn engine_defaults(
 }
 
 fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCode> {
+    let cancellation = cancel::Cancellation::from_gui();
     if !is_product_id(product_id) {
         return Err(usage(&format!(
             "'{product_id}' is not a Store product id (12 characters, letters and digits, \
@@ -683,7 +686,16 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
     let dest_existed = dest.is_dir();
     std::fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
     eprintln!(":: {product_id} -> {}", dest.display());
-    let code = run_inherited(command)?;
+    let code = cancellation.run(command)?;
+    // Keep partial files for the streaming client's resume path. In particular,
+    // never remove an existing installation when an update is stopped.
+    if cancellation.requested() {
+        eprintln!(
+            "-- download stopped; files kept at {} for resuming",
+            dest.display()
+        );
+        return Ok(ExitCode::from(130));
+    }
 
     // Checked whatever the exit code was, because both halves have been wrong.
     //
@@ -747,6 +759,7 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
 
     // Written last, and only on success, because a record for a download that
     // failed halfway would claim a build is installed that is not.
+    cancellation.check()?;
     match record_install(&paths, &product_id, &dest) {
         Ok(record) => eprintln!("{}", installed_summary(&record)),
         // The title is installed either way. Failing the command over the
@@ -1084,9 +1097,11 @@ fn installed_summary(record: &install::Record) -> String {
 const RELEASES_API: &str = "https://api.github.com/repos/icex/ferestre/releases?per_page=30";
 
 fn cmd_install_runtime(cli: &Cli) -> Result<ExitCode> {
+    let cancellation = cancel::Cancellation::from_gui();
     let paths = Paths::from_env()?;
     eprintln!("-- checking for the latest Ferestre runtime");
     let release = runtime::latest_release(&http::get_text(RELEASES_API)?)?;
+    cancellation.check()?;
     let version = release
         .tag
         .strip_prefix("runtime-")
@@ -1117,7 +1132,8 @@ fn cmd_install_runtime(cli: &Cli) -> Result<ExitCode> {
 
     let archive = paths.cache_dir().join("runtime").join(&release.asset_name);
     eprintln!("-- downloading runtime {version} (this is a one-time download)");
-    http::download_large(&release.url, &archive)?;
+    http::download_large_cancellable(&release.url, &archive, || cancellation.requested())?;
+    cancellation.check()?;
     eprintln!("-- unpacking runtime {version}");
     std::fs::create_dir_all(paths.runtimes_dir())?;
     let temporary = paths
@@ -1131,10 +1147,15 @@ fn cmd_install_runtime(cli: &Cli) -> Result<ExitCode> {
         .arg(&archive)
         .arg("-C")
         .arg(&temporary);
-    let code = run_inherited(unpack)?;
-    if code != 0 {
+    let code = cancellation.run(unpack);
+    if cancellation.requested() || !matches!(code, Ok(0)) {
         let _ = std::fs::remove_dir_all(&temporary);
-        bail!("could not unpack {}; tar exited {code}", archive.display());
+        cancellation.check()?;
+        bail!(
+            "could not unpack {}; tar exited {}",
+            archive.display(),
+            code?
+        );
     }
     let unpacked = temporary.join(format!("ferestre-runtime-{version}"));
     InstalledRuntime::at(&unpacked)?;

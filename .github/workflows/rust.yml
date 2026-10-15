@@ -22,6 +22,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'tests/gui_smoke.py'
+      - 'tests/test_download_cancel.py'
       - 'tools/xsts_probe.py'
       - 'tools/test_xsts_probe.py'
       - 'titles/**'
@@ -40,6 +41,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'tests/gui_smoke.py'
+      - 'tests/test_download_cancel.py'
       - 'tools/xsts_probe.py'
       - 'tools/test_xsts_probe.py'
       - 'titles/**'
@@ -87,6 +89,9 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      - name: Download cancellation (offline)
+        run: cargo build -p ferestre-cli && python3 tests/test_download_cancel.py
 
       - name: Launch helper tests
         run: python3 -m unittest discover -s tests -p 'test_*image_view.py' && python3 tests/test_proton_wine_shim.py

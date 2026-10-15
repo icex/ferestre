@@ -113,7 +113,25 @@ pub fn download_large(url: &str, dest: &Path) -> Result<()> {
     download_limited(url, dest, MAX_LARGE_DOWNLOAD)
 }
 
+pub fn download_large_cancellable(
+    url: &str,
+    dest: &Path,
+    cancelled: impl Fn() -> bool,
+) -> Result<()> {
+    download_with_cancel(url, dest, MAX_LARGE_DOWNLOAD, cancelled)
+}
+
 fn download_limited(url: &str, dest: &Path, limit: u64) -> Result<()> {
+    download_with_cancel(url, dest, limit, || false)
+}
+
+fn download_with_cancel(
+    url: &str,
+    dest: &Path,
+    limit: u64,
+    cancelled: impl Fn() -> bool,
+) -> Result<()> {
+    anyhow::ensure!(!cancelled(), "Download stopped");
     if dest.is_file() {
         return Ok(());
     }
@@ -130,7 +148,22 @@ fn download_limited(url: &str, dest: &Path, limit: u64) -> Result<()> {
 
     let temporary = dest.with_extension("part");
     let mut file = std::fs::File::create(&temporary)?;
-    let copied = std::io::copy(&mut reader, &mut file);
+    let copied = (|| -> std::io::Result<()> {
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            if cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "Download stopped",
+                ));
+            }
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                return Ok(());
+            }
+            std::io::Write::write_all(&mut file, &buffer[..count])?;
+        }
+    })();
     drop(file);
     match copied {
         Ok(_) => {
@@ -147,6 +180,31 @@ fn download_limited(url: &str, dest: &Path, limit: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopping_a_runtime_download_removes_the_partial_archive() {
+        use std::io::Write;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/runtime", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 262144\r\n\r\n");
+            let _ = stream.write_all(&[42; 262144]);
+        });
+        let dest =
+            std::env::temp_dir().join(format!("ferestre-cancel-{}.tar.xz", std::process::id()));
+        let checks = std::cell::Cell::new(0);
+        let result = download_large_cancellable(&url, &dest, || {
+            checks.set(checks.get() + 1);
+            checks.get() > 2
+        });
+        worker.join().unwrap();
+        assert!(result.is_err());
+        assert!(!dest.exists());
+        assert!(!dest.with_extension("part").exists());
+    }
 
     #[test]
     fn parameters_replace_rather_than_pile_up() {
