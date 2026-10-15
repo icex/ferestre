@@ -167,7 +167,11 @@ fn build_ui(app: &adw::Application) {
         .build();
     let refresh = gtk::Button::from_icon_name("view-refresh-symbolic");
     refresh.set_tooltip_text(Some("Refresh library, subscriptions and catalogue"));
-    let spinner = gtk::Spinner::new();
+    // Older GTK versions give Spinner a presentation role and omit its tooltip
+    // from the accessibility tree. Expose the activity consistently there too.
+    let spinner = gtk::Spinner::builder()
+        .accessible_role(gtk::AccessibleRole::ProgressBar)
+        .build();
 
     let content_header = adw::HeaderBar::new();
     content_header.set_title_widget(Some(&title));
@@ -2175,6 +2179,8 @@ fn show_activity(ui: &Ui) {
     ui.keep_open.set_visible(closing);
     let Some(what) = busy.as_deref() else {
         ui.spinner.set_tooltip_text(Some("No activity"));
+        ui.spinner
+            .update_property(&[gtk::accessible::Property::Label("No activity")]);
         return;
     };
     ui.activity_title.set_label(what);
@@ -2193,8 +2199,10 @@ fn show_activity(ui: &Ui) {
         "Please wait for this to finish before starting another operation."
     };
     ui.activity_detail.set_label(detail);
+    let tooltip = format!("{what}\n{detail}");
+    ui.spinner.set_tooltip_text(Some(&tooltip));
     ui.spinner
-        .set_tooltip_text(Some(&format!("{what}\n{detail}")));
+        .update_property(&[gtk::accessible::Property::Label(&tooltip)]);
 }
 
 fn report_busy(ui: &Ui) {

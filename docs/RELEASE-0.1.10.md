@@ -9,7 +9,8 @@ new runtime or game compatibility claims.
 - Active operations stay visible until they finish. Busy messages identify
   the operation and game that must finish before another action can start.
 - The top-right spinner's tooltip names the current task, including account,
-  library and update checks, and explains pending shutdown.
+  library and update checks, and explains pending shutdown. Its activity label
+  is exposed to assistive technologies across supported GTK versions.
 - Closing during work asks for confirmation. Downloads stop while retaining
   game files for resuming; removals finish before the window exits.
 - The window waits for the downloader to exit and for launcher cleanup before
