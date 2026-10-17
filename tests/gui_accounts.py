@@ -145,8 +145,16 @@ summary="Synthetic account fixture"
         def choose_player(dialog,label):
             combo=s.find_all(dialog,role="combo box")[1]
             s.click(s.find_all(combo,role="toggle button")[0])
-            candidate=s.wait_for(app,lambda root:next((node for node in s.find_all(root,name=label) if node.get_role_name()=="label" and node.get_parent().get_parent().get_role_name()=="list item"),None),"player choice",time.monotonic()+20)
-            s.press(candidate.get_parent().get_parent(),gui.pid)
+            def popup_row(root):
+                for node in s.find_all(root,name=label):
+                    if node.get_role_name()!="label":continue
+                    ancestor=node.get_parent()
+                    while ancestor is not None:
+                        if ancestor.get_role_name()=="list item":return ancestor
+                        ancestor=ancestor.get_parent()
+                return None
+            row=s.wait_for(app,popup_row,"player choice",time.monotonic()+20)
+            s.press(row,gui.pid)
             s.wait_for(dialog,lambda root:s.find_all(root,role="combo box",name=label),"selected player",time.monotonic()+20)
         choose_player(dialog,"Player Fixture")
         s.click_named(dialog,"Apply accounts")

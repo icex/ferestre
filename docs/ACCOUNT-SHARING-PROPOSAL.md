@@ -72,7 +72,8 @@ platform contract, not proof that Dungeons II accepts a particular account pair.
 - GTK through AT-SPI: cancelled login, adding/selecting Player B independently
   from Store A, visible roles, real launcher plan and service binding, separate
   prefix, changing selection while a game runs, Stop targeting the original
-  prefix and Player-only sign-out retaining the Store library.
+  prefix, Player-only sign-out retaining the Store library, old-runtime refusal
+  and refusing a signed-out Player without falling back to the Store identity.
 - Both 64-bit and 32-bit native probes: 47 checks each, including delayed async
   licensing, no fabricated grants, Store sign-out notifications, Player state
   changes and no callbacks after unregister. A previous production runtime fails

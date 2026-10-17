@@ -1738,7 +1738,13 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
                 })
                 .and_then(|profiles| roles.selected(profiles));
             if let Err(error) = result {
-                ui.toasts.add_toast(adw::Toast::new(&error.to_string()));
+                ui.toasts.add_toast(
+                    adw::Toast::builder()
+                        .title(error.to_string())
+                        .priority(adw::ToastPriority::High)
+                        .timeout(15)
+                        .build(),
+                );
                 return;
             }
             if roles.split() {
@@ -1765,7 +1771,7 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
                 if !supported {
                     ui.toasts.add_toast(adw::Toast::builder()
                         .title("Select an account-sharing runtime for this game using its runtime button, then try again.")
-                        .timeout(15).build());
+                        .priority(adw::ToastPriority::High).timeout(15).build());
                     return;
                 }
             }
