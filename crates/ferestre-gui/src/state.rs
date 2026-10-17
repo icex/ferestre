@@ -176,7 +176,7 @@ impl Model {
             .and_then(|p| library::load_cache(p.state_dir()))
             .map(Ownership::Known)
             .unwrap_or_default();
-        let catalog = match (&paths, &ownership) {
+        let mut catalog: BTreeMap<String, Product> = match (&paths, &ownership) {
             (Some(paths), _) => {
                 let cache = paths.catalog_cache();
                 let mut ids: Vec<String> = match &ownership {
@@ -188,6 +188,7 @@ impl Model {
                     Ownership::Unknown => Vec::new(),
                 };
                 ids.extend(recipes.iter().map(|r| r.title.product_id.clone()));
+                ids.extend(records.keys().cloned());
                 // Cache only: opening a window must not wait on a network.
                 cache
                     .split(&ids)
@@ -215,6 +216,17 @@ impl Model {
             ),
             None => (Vec::new(), gamepass::Tiers::default()),
         };
+        // Cached Game Pass rows must draw before background revalidation too.
+        if let Some(paths) = &paths {
+            catalog.extend(
+                paths
+                    .catalog_cache()
+                    .split(&gamepass)
+                    .0
+                    .into_iter()
+                    .map(|p| (p.product_id.to_ascii_uppercase(), p)),
+            );
+        }
         let subscriptions = match &ownership {
             Ownership::Known(entries) => gamepass::active(entries),
             Ownership::Unknown => Vec::new(),
@@ -244,6 +256,10 @@ impl Model {
             .as_ref()
             .and_then(|p| ferestre_core::account::load_cache(p.state_dir()));
         let entitlements_checked = ownership.is_known();
+        let available = paths
+            .as_ref()
+            .map(|p| ferestre_core::updates::available(p.state_dir(), records.values()))
+            .unwrap_or_default();
         Model {
             paths,
             recipes,
@@ -258,7 +274,7 @@ impl Model {
             ownership,
             catalog,
             icons,
-            available: BTreeMap::new(),
+            available,
             account,
             avatar,
             gamepass,
@@ -284,7 +300,6 @@ impl Model {
             ownership: std::mem::take(&mut self.ownership),
             catalog: std::mem::take(&mut self.catalog),
             icons: std::mem::take(&mut self.icons),
-            available: std::mem::take(&mut self.available),
             account: self.account.take(),
             avatar: self.avatar.take(),
             gamepass: std::mem::take(&mut self.gamepass),

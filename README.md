@@ -61,12 +61,12 @@ Pronounced roughly *feh-RESS-treh*.
 
 ## Status
 
-Release **0.1.10** pairs with runtime **11.0.20261013.3**. Forza Horizon 6
+Release **0.1.11** pairs with runtime **11.0.20261017.1**. Forza Horizon 6
 is playable, with shader startup, native PlayFab saves and Continue confirmed.
 Its marketplace is still under qualification. Dune: Awakening is marked
 playable from player confirmation. Game Pass tiers refresh independently of
 the catalog, and searches and paging include the full PC catalog.
-See [the release qualification](docs/RELEASE-0.1.10.md) for tested scope.
+See [the release qualification](docs/RELEASE-0.1.11.md) for tested scope.
 
 Honest version, because this is early. Every row here was run on a real machine,
 not inferred from the fact that it downloaded:
@@ -156,17 +156,34 @@ directly. Everything has to go through the client's `run` path.
 
 ## Library sizes and cached lists
 
-Every game row shows either measured disk usage for its game directory or the
+Library, Game Pass, Installed and Updates use the same two-line game rows:
+icon and title, then version/size/status details, with actions centered on the
+right. Sizes appear once. Every game row shows either measured disk usage for its game directory or the
 Store's PC download size. Wine prefixes and cached downloads are separate from
-the installed game total; unavailable sizes are labelled explicitly.
+the installed game total; unavailable sizes are labelled explicitly. Disk usage
+measurements persist across restarts and list refreshes for 24 hours. Install
+record, directory identity or manifest changes invalidate them; expired totals
+remain visible while a background scan updates them. Changes to existing files
+deep inside a game are picked up by that daily scan.
 
 Owned games, subscription access and the public Game Pass catalogue open from
-disk cache. Ownership checks are reused for five minutes and public Game Pass
-listings for 24 hours. The refresh button checks immediately. Account changes
+disk cache. Library/subscription lists, game-update checks, public Game Pass listings
+and product details are reused for 24 hours. Switching views does not repeat
+game-update queries. The top-right Refresh button forces an immediate check. Cached names and sizes appear
+immediately while stale details revalidate in the background. Changing market
+or language revalidates product details too. The refresh button bypasses cache
+freshness, including for already named games. Account changes
 invalidate cached ownership, and a detected subscription change refreshes the
 Game Pass listing. Failed or interrupted refreshes preserve the last complete
 snapshot. Closing during a list/account/update refresh exits immediately;
 downloads still stop with cleanup, and removals finish before closing.
+
+Add to Steam saves the persistent AppImage target and the game's icon, with
+portrait cover, landscape cover, hero banner and title logo when the Store
+provides them. Re-adding updates the existing shortcut by launch identity or
+name and retains its Steam ID, settings, play history and custom artwork.
+Downloads are cached, and copied artwork lives in Steam's own `config/grid`
+directory. Close Steam before adding or updating a shortcut.
 
 ## Documentation
 

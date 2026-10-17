@@ -17,7 +17,7 @@ mod state;
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -60,6 +60,8 @@ struct Ui {
     /// Set while the Game Pass listing is being fetched, so opening the section
     /// twice does not ask twice.
     fetching_gamepass: Rc<RefCell<bool>>,
+    fetching_names: Rc<Cell<bool>>,
+    catalog_generation: Rc<Cell<u64>>,
     fetching_entitlements: Rc<RefCell<bool>>,
     /// The bar along the bottom, and the download it is describing.
     download: DownloadBar,
@@ -262,6 +264,8 @@ fn build_ui(app: &adw::Application) {
         running: Rc::new(RefCell::new(BTreeMap::new())),
         asked_names: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
         fetching_gamepass: Rc::new(RefCell::new(false)),
+        fetching_names: Rc::new(Cell::new(false)),
+        catalog_generation: Rc::new(Cell::new(0)),
         fetching_entitlements: Rc::new(RefCell::new(false)),
         download: download.clone(),
     };
@@ -307,7 +311,7 @@ fn build_ui(app: &adw::Application) {
             if section == Section::GamePass {
                 refresh_entitlements(&ui, false);
             }
-            refresh_updates(&ui);
+            refresh_updates(&ui, false);
         }
     ));
 
@@ -334,12 +338,15 @@ fn build_ui(app: &adw::Application) {
         ui,
         move |_| {
             ui.model.borrow_mut().reload();
+            ui.catalog_generation
+                .set(ui.catalog_generation.get().wrapping_add(1));
             ui.asked_names.borrow_mut().clear();
             render(&ui);
             // Reload means "check again", and the Game Pass catalogue is a
             // thing that changes without anything here doing so.
             fetch_gamepass(&ui, true);
             refresh_entitlements(&ui, true);
+            refresh_updates(&ui, true);
         }
     ));
 
@@ -383,6 +390,7 @@ fn build_ui(app: &adw::Application) {
                     return glib::ControlFlow::Break;
                 }
                 refresh_entitlements(&ui, false);
+                refresh_updates(&ui, false);
                 glib::ControlFlow::Continue
             }
         ),
@@ -425,7 +433,11 @@ fn render(ui: &Ui) {
         .margin_start(12)
         .margin_end(12)
         .build();
-    let clamp = adw::Clamp::builder().child(&page).build();
+    let clamp = adw::Clamp::builder()
+        .maximum_size(1200)
+        .tightening_threshold(1000)
+        .child(&page)
+        .build();
     ui.content.append(&clamp);
 
     if let Some(problem) = ui.model.borrow().problem.clone() {
@@ -653,6 +665,8 @@ fn draw_list(
         })
         .map(|row| row.product_id.clone())
         .collect();
+    // Revalidation must include named, cached rows, including off-page ones.
+    let metadata_ids: Vec<String> = rows.iter().map(|row| row.product_id.clone()).collect();
     let rows: Vec<LibraryRow> = rows.into_iter().filter(|row| keep(row)).collect();
 
     let matching = model::search(&rows, &model.query);
@@ -664,9 +678,8 @@ fn draw_list(
     Drawn {
         page: view.page,
         pending_names: unnamed_off_page.len(),
-        want_names: unnamed_off_page
-            .iter()
-            .cloned()
+        want_names: metadata_ids
+            .into_iter()
             .chain(view.rows.iter().flat_map(|row| {
                 let mut wanted = Vec::new();
                 if !row.is_named() {
@@ -677,13 +690,7 @@ fn draw_list(
                 // are asked for alongside the names on this page rather than
                 // waiting for someone to open something.
                 if let Some(product) = model.catalog.get(&row.product_id.to_ascii_uppercase()) {
-                    wanted.extend(
-                        product
-                            .bundled_ids
-                            .iter()
-                            .filter(|id| !model.catalog.contains_key(&id.to_ascii_uppercase()))
-                            .cloned(),
-                    );
+                    wanted.extend(product.bundled_ids.iter().cloned());
                 }
                 wanted
             }))
@@ -764,11 +771,13 @@ fn render_gamepass(ui: &Ui, page: &gtk::Box) {
     );
 }
 
-/// Scan visible installed games off the GTK thread. Reload invalidates the
-/// totals, and a result from the previous generation cannot repopulate them.
+/// Reuse persistent disk measurements before drawing. Only missing/stale or
+/// changed installs need a walk, and that runs off the GTK thread. Results
+/// from a previous install generation cannot repopulate the model.
 fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
-    let (generation, wanted) = {
+    let (generation, cache_dir, wanted) = {
         let mut model = ui.model.borrow_mut();
+        let cache_dir = model.cache_dir().map(Path::to_path_buf);
         let wanted: Vec<_> = rows
             .iter()
             .filter(|row| row.installed)
@@ -782,11 +791,25 @@ fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
                         .recipe_for(&row.product_id)
                         .and_then(|recipe| model.game_dir(recipe))
                 });
+                let record = model.records.get(&key).cloned();
+                if let (Some(cache_dir), Some(dir)) = (&cache_dir, &dir) {
+                    if let Some((bytes, fresh)) = ferestre_core::install::cached_disk_usage(
+                        cache_dir,
+                        &key,
+                        dir,
+                        record.as_ref(),
+                    ) {
+                        model.disk_usage.insert(key.clone(), Some(bytes));
+                        if fresh {
+                            return None;
+                        }
+                    }
+                }
                 model.sizes_pending.insert(key.clone());
-                Some((key, dir))
+                Some((key, dir, record))
             })
             .collect();
-        (model.size_generation, wanted)
+        (model.size_generation, cache_dir, wanted)
     };
     if wanted.is_empty() {
         return;
@@ -796,8 +819,16 @@ fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
         let scanned = gio::spawn_blocking(move || {
             wanted
                 .into_iter()
-                .map(|(key, dir)| {
-                    let bytes = dir.and_then(|dir| ferestre_core::install::disk_usage(&dir));
+                .map(|(key, dir, record)| {
+                    let bytes = dir.and_then(|dir| match &cache_dir {
+                        Some(cache_dir) => ferestre_core::install::measure_disk_usage(
+                            cache_dir,
+                            &key,
+                            &dir,
+                            record.as_ref(),
+                        ),
+                        None => ferestre_core::install::disk_usage(&dir),
+                    });
                     (key, bytes)
                 })
                 .collect::<Vec<_>>()
@@ -810,7 +841,10 @@ fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
             }
             for (key, bytes) in scanned {
                 model.sizes_pending.remove(&key);
-                model.disk_usage.insert(key, bytes);
+                // Keep an expired measurement if the new walk failed.
+                if bytes.is_some() || !model.disk_usage.contains_key(&key) {
+                    model.disk_usage.insert(key, bytes);
+                }
             }
             drop(model);
             render(&ui);
@@ -1069,15 +1103,18 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
     // parse and the row draws with no title at all. The same goes for any
     // subtitle that names a title, which the bundle rows do.
     let action_row = adw::ActionRow::builder()
-        .subtitle_lines(2)
+        .title_lines(1)
+        .subtitle_lines(1)
         .tooltip_text(&row.product_id)
         .build();
     action_row.set_use_markup(false);
     action_row.set_title(&row.name);
-    action_row.set_subtitle(&row.subtitle);
 
     let icon = gtk::Image::builder()
-        .pixel_size(40)
+        .pixel_size(48)
+        .width_request(48)
+        .height_request(48)
+        .valign(gtk::Align::Center)
         .icon_name("applications-games-symbolic")
         .margin_top(6)
         .margin_bottom(6)
@@ -1108,28 +1145,41 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             .and_then(|p| p.download_bytes);
         model::game_size_label(row.installed, model.disk_usage.get(&key).copied(), download)
     };
-    let size = gtk::Label::builder()
-        .label(&size_text)
-        .css_classes(["dim-label", "caption"])
-        .valign(gtk::Align::Center)
-        .build();
-    size.set_tooltip_text(Some(if row.installed {
-        "Allocated space used by the game directory; Wine prefix and download cache are separate"
+    // One title line, one details line. Keep status and sizes beside the
+    // version instead of competing with the title and buttons for row width.
+    let (version, description) = if row.subtitle.starts_with("Version ") {
+        match row.subtitle.split_once("  ·  ") {
+            Some((version, rest)) => (Some(version), rest),
+            None => (Some(row.subtitle.as_str()), ""),
+        }
     } else {
-        "PC download size from the Microsoft Store; installed disk usage may differ"
-    }));
-    action_row.add_suffix(&size);
-
-    if let Some((text, css)) = row.badge {
-        let badge = gtk::Label::builder()
-            .label(text)
-            .css_classes([css, "caption"])
-            .valign(gtk::Align::Center)
-            .width_chars(12)
-            .xalign(1.0)
-            .build();
-        action_row.add_suffix(&badge);
+        (None, row.subtitle.as_str())
+    };
+    let mut details = Vec::new();
+    if let Some(version) = version {
+        details.push(version.to_string());
     }
+    details.push(size_text);
+    if let Some((badge, _)) = row.badge {
+        details.push(badge.to_string());
+    }
+    if !description.is_empty() {
+        details.push(description.to_string());
+    }
+    let details = details.join("  ·  ");
+    action_row.set_subtitle(&details);
+    action_row.set_tooltip_text(Some(&format!(
+        "{}\n{}\n{}",
+        row.name, details, row.product_id
+    )));
+
+    let actions = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .valign(gtk::Align::Center)
+        .margin_start(8)
+        .build();
+    action_row.add_suffix(&actions);
 
     let store = gtk::Button::builder()
         .icon_name("web-browser-symbolic")
@@ -1139,7 +1189,7 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
         .build();
     let store_url = format!("{STORE_PAGE}{}", row.product_id);
     store.connect_clicked(move |button| open_link(button, &store_url));
-    action_row.add_suffix(&store);
+    actions.append(&store);
 
     // Anything on disk can be removed, recipe or not -- and the rows that most
     // need it are the ones with no recipe, because a failed install leaves
@@ -1158,7 +1208,7 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             ui,
             move |_| confirm_remove(&ui, &product_id, &name)
         ));
-        action_row.add_suffix(&remove);
+        actions.append(&remove);
     }
 
     // A shortcut needs something that will launch. A recipe is one; a title on
@@ -1178,7 +1228,7 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             ui,
             move |_| choose_runtime(&ui, &product_id, &name)
         ));
-        action_row.add_suffix(&runtime);
+        actions.append(&runtime);
 
         let to_steam = gtk::Button::builder()
             .icon_name("list-add-symbolic")
@@ -1193,7 +1243,7 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             ui,
             move |_| add_to_steam(&ui, &product_id, &name)
         ));
-        action_row.add_suffix(&to_steam);
+        actions.append(&to_steam);
 
         let edit = gtk::Button::builder()
             .icon_name("document-edit-symbolic")
@@ -1208,19 +1258,20 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             ui,
             move |_| open_editor(&ui, &product_id, &name)
         ));
-        action_row.add_suffix(&edit);
+        actions.append(&edit);
     }
 
     // A greyed-out "Play" is a button that says a title might work if you found
     // the right thing to click. It never will: the reason is in the subtitle
     // and on the row, and the Store link beside it is the thing to press.
     if let Action::Blocked(reason) = &row.action {
-        action_row.set_tooltip_text(Some(reason));
+        action_row.set_tooltip_text(Some(&format!("{}\n{}\n{}", row.name, details, reason)));
         return action_row;
     }
 
     let button = gtk::Button::builder()
         .label(row.action.label())
+        .width_request(88)
         .valign(gtk::Align::Center)
         .css_classes(["suggested-action"])
         .build();
@@ -1293,7 +1344,7 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             ));
         }
     }
-    action_row.add_suffix(&button);
+    actions.append(&button);
     action_row.set_activatable_widget(Some(&button));
     action_row
 }
@@ -2241,30 +2292,118 @@ fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {
         return;
     }
 
+    if !begin(ui, &format!("Adding {name} to Steam")) {
+        report_busy(ui);
+        return;
+    }
+    let (cache, product, market, fallback_icon) = {
+        let model = ui.model.borrow();
+        let key = product_id.to_ascii_uppercase();
+        (
+            model.catalog_cache(),
+            model.catalog.get(&key).cloned(),
+            model.market(),
+            model.icons.get(&key).cloned(),
+        )
+    };
     let program = steam::shortcut_program(std::env::var_os("APPIMAGE").as_deref(), &cli_binary());
     let start_dir = program.parent().unwrap_or(Path::new("/")).to_path_buf();
     let shortcut = steam::Shortcut::new(name, &program, &start_dir, format!("run {product_id}"));
-
-    // Every account, because guessing which one a person uses and getting it
-    // wrong looks exactly like the feature not working.
-    let mut added = 0;
-    for file in &files {
-        let result = steam::load(file).and_then(|mut document| {
-            steam::upsert(&mut document, &shortcut)?;
-            steam::save(file, &document)
-        });
+    let product_id = product_id.to_string();
+    let name = name.to_string();
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || -> anyhow::Result<_> {
+            let mut failures = Vec::new();
+            let artwork = if let Some(cache) = cache {
+                // Older metadata caches have only the small list icon. Refresh
+                // this one title on demand to learn its larger library assets.
+                let mut product = product.or_else(|| cache.get(&product_id));
+                if product.as_ref().map_or(true, |p| p.artwork.is_empty()) {
+                    let (found, errors) =
+                        catalog::revalidate(&cache, &[product_id], &market.0, &market.1, true);
+                    failures.extend(errors);
+                    if let Some(fresh) = found.into_iter().next() {
+                        product = Some(fresh);
+                    }
+                }
+                if let Some(product) = product {
+                    let (files, errors) =
+                        steam::prepare_artwork(&cache, &product, fallback_icon.as_deref());
+                    failures.extend(errors);
+                    files
+                } else {
+                    steam::ArtworkFiles {
+                        icon: fallback_icon,
+                        ..Default::default()
+                    }
+                }
+            } else {
+                steam::ArtworkFiles {
+                    icon: fallback_icon,
+                    ..Default::default()
+                }
+            };
+            anyhow::ensure!(
+                !steam::is_running(),
+                "Close Steam first; it started while artwork was being fetched"
+            );
+            let mut added = 0;
+            let mut updated = 0;
+            for file in &files {
+                let result = steam::load(file).and_then(|mut document| {
+                    let mut shortcut = shortcut.clone();
+                    let app_id = steam::effective_app_id(&document, &shortcut);
+                    let previous_icon = steam::existing_shortcut(&document, &shortcut)
+                        .and_then(|entry| entry.get("icon"))
+                        .and_then(steam::Value::as_str)
+                        .filter(|path| {
+                            !path.is_empty()
+                                && Path::new(path).is_file()
+                                && *path != program.to_string_lossy()
+                        })
+                        .map(str::to_string);
+                    let (icon, errors) = steam::install_artwork(file, app_id, &artwork);
+                    failures.extend(errors);
+                    shortcut.icon = previous_icon
+                        .or_else(|| icon.map(|p| p.to_string_lossy().into_owned()))
+                        .unwrap_or_default();
+                    let replaced = steam::upsert(&mut document, &shortcut)?;
+                    steam::save(file, &document)?;
+                    Ok(replaced)
+                });
+                match result {
+                    Ok(true) => updated += 1,
+                    Ok(false) => added += 1,
+                    Err(error) => failures.push(format!("{}: {error}", file.display())),
+                }
+            }
+            Ok((added, updated, failures))
+        })
+        .await;
+        finish(&ui);
         match result {
-            Ok(()) => added += 1,
-            Err(e) => ui
+            Ok(Ok((added, updated, failures))) if added + updated > 0 => {
+                let action = if added == 0 { "Updated" } else { "Added" };
+                let detail = if failures.is_empty() {
+                    "Restart Steam to see it."
+                } else {
+                    "Some artwork was unavailable. Restart Steam to see it."
+                };
+                ui.toasts.add_toast(adw::Toast::new(&format!(
+                    "{action} \"{name}\" in Steam. {detail}"
+                )));
+            }
+            Ok(Ok((_, _, errors))) => ui.toasts.add_toast(adw::Toast::new(&format!(
+                "Could not add to Steam: {}",
+                errors.join("; ")
+            ))),
+            Ok(Err(error)) => ui.toasts.add_toast(adw::Toast::new(&error.to_string())),
+            Err(_) => ui
                 .toasts
-                .add_toast(adw::Toast::new(&format!("{}: {e}", file.display()))),
+                .add_toast(adw::Toast::new("Could not finish adding to Steam")),
         }
-    }
-    if added > 0 {
-        ui.toasts.add_toast(adw::Toast::new(&format!(
-            "Added \"{name}\" to Steam. Restart Steam to see it."
-        )));
-    }
+    });
 }
 
 fn account_pressed(ui: &Ui) {
@@ -2483,51 +2622,83 @@ fn refresh_account(ui: &Ui) {
             render(&ui);
             refresh_entitlements(&ui, false);
         }
+        refresh_updates(&ui, false);
     });
 }
 
-fn refresh_updates(ui: &Ui) {
-    let (client, records) = {
+fn refresh_updates(ui: &Ui, force: bool) {
+    let (client, state_dir, records) = {
         let model = ui.model.borrow();
-        (
-            model.xodus_cli(),
-            model.records.values().cloned().collect::<Vec<_>>(),
-        )
+        let state_dir = model.paths.as_ref().map(|p| p.state_dir().to_path_buf());
+        let records = model
+            .records
+            .values()
+            .filter(|record| !record.content_ids.is_empty())
+            .filter(|record| {
+                force
+                    || state_dir
+                        .as_ref()
+                        .map_or(true, |dir| !ferestre_core::updates::is_fresh(dir, record))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        (model.xodus_cli(), state_dir, records)
     };
-    let Some(client) = client else { return };
-    if records.is_empty() || !begin(ui, "Checking for game updates") {
+    let (Some(client), Some(state_dir)) = (client, state_dir) else {
+        return;
+    };
+    if records.is_empty() {
+        return;
+    }
+    if !begin(ui, "Checking for game updates") {
+        if force {
+            report_busy(ui);
+        }
         return;
     }
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let checked = gio::spawn_blocking(move || {
-            let mut available = BTreeMap::new();
+            let mut available = Vec::new();
             for record in records {
-                let Some(content_id) = record.content_ids.first() else {
-                    continue;
-                };
-                let output = std::process::Command::new(&client)
+                let content_id = &record.content_ids[0];
+                let version = std::process::Command::new(&client)
                     .args(["update", content_id, "--json"])
                     .stderr(std::process::Stdio::null())
                     .output()
-                    .ok()?;
-                if !output.status.success() {
-                    continue;
-                }
-                let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-                if let Some(version) = value["version"]
-                    .as_str()
-                    .filter(|version| !version.is_empty())
-                {
-                    available.insert(record.product_id.to_ascii_uppercase(), version.to_string());
-                }
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .and_then(|output| {
+                        serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()
+                    })
+                    .and_then(|value| {
+                        value["version"]
+                            .as_str()
+                            .filter(|v| !v.is_empty())
+                            .map(str::to_string)
+                    });
+                // Preserve last-known results on failure, but also throttle
+                // retries across restarts until tomorrow or manual Refresh.
+                let version = ferestre_core::updates::save(&state_dir, &record, version.clone())
+                    .unwrap_or(version);
+                available.push((record, version));
             }
-            Some(available)
+            available
         })
         .await;
         finish(&ui);
-        if let Ok(Some(available)) = checked {
-            ui.model.borrow_mut().available = available;
+        if let Ok(available) = checked {
+            let mut model = ui.model.borrow_mut();
+            for (record, version) in available {
+                let key = record.product_id.to_ascii_uppercase();
+                if model.records.get(&key) != Some(&record) {
+                    continue;
+                }
+                if let Some(version) = version {
+                    model.available.insert(key, version);
+                }
+            }
+            drop(model);
             render(&ui);
         }
     });
@@ -2704,11 +2875,6 @@ fn refresh_library(ui: &Ui) {
     });
 }
 
-/// Look up names for the rows currently on screen.
-///
-/// A page at a time, like the art, and each id is attempted once: a product the
-/// catalog does not answer for would otherwise be re-requested on every redraw,
-/// which is a request loop rather than a retry.
 /// Fetch the PC Game Pass listing, unless there is already one and `force` is
 /// not set.
 ///
@@ -2749,21 +2915,9 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
             let fetched = gio::spawn_blocking({
                 let market = market.clone();
                 move || {
-                    let listing = gamepass::fetch(&market, &language);
-                    // The tier map is a second request and a failure of it is
-                    // not a failure of the listing: without it the section
-                    // still works, it just cannot warn.
-                    let tiers = gamepass::fetch_tiers(&market, &language).unwrap_or_default();
-                    let ids = match listing {
-                        Ok(ids) => gamepass::complete_listing(&ids, &tiers),
-                        Err(error) => {
-                            let ids = gamepass::complete_listing(&[], &tiers);
-                            if ids.is_empty() {
-                                return Err(error);
-                            }
-                            ids
-                        }
-                    };
+                    let listing = gamepass::fetch(&market, &language)?;
+                    let tiers = gamepass::fetch_tiers(&market, &language)?;
+                    let ids = gamepass::complete_listing(&listing, &tiers);
                     Ok::<_, anyhow::Error>((ids, tiers))
                 }
             })
@@ -2794,7 +2948,13 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
     }
 }
 
+/// Display the cached metadata while one worker checks missing/stale entries.
+/// Each id is attempted once per window or explicit refresh, including names
+/// off-page, so failures cannot become a request loop on every redraw.
 fn fetch_names(ui: &Ui, product_ids: Vec<String>) {
+    if ui.fetching_names.get() {
+        return;
+    }
     let (cache, market, wanted) = {
         let model = ui.model.borrow();
         let mut asked = ui.asked_names.borrow_mut();
@@ -2809,6 +2969,8 @@ fn fetch_names(ui: &Ui, product_ids: Vec<String>) {
         return;
     }
 
+    ui.fetching_names.set(true);
+    let generation = ui.catalog_generation.get();
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let (market, language) = market;
@@ -2816,14 +2978,21 @@ fn fetch_names(ui: &Ui, product_ids: Vec<String>) {
         // rather than after every request has finished. Each chunk is several
         // batched lookups, so this is not a request per await.
         for chunk in wanted.chunks(catalog::BATCH * 5) {
+            if ui.catalog_generation.get() != generation {
+                break;
+            }
             let ids = chunk.to_vec();
             let (cache, market, language) = (cache.clone(), market.clone(), language.clone());
             let found = gio::spawn_blocking(move || {
-                let (products, _failures) = catalog::resolve(&cache, &ids, &market, &language);
+                let (products, _failures) =
+                    catalog::revalidate(&cache, &ids, &market, &language, generation != 0);
                 products
             })
             .await;
-            let Ok(found) = found else { return };
+            let Ok(found) = found else { break };
+            if ui.catalog_generation.get() != generation {
+                break;
+            }
             if found.is_empty() {
                 continue;
             }
@@ -2837,6 +3006,9 @@ fn fetch_names(ui: &Ui, product_ids: Vec<String>) {
             }
             render(&ui);
         }
+        ui.fetching_names.set(false);
+        // A section change or explicit refresh may have queued more ids.
+        render(&ui);
     });
 }
 

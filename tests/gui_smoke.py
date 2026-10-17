@@ -31,6 +31,7 @@ import shlex
 import http.server
 import threading
 import subprocess
+import struct
 import sys
 import tempfile
 import time
@@ -407,6 +408,49 @@ def row_button(root, title, label):
     return None
 
 
+def check_game_row_layout(root, title, size, action):
+    button = row_button(root, title, action)
+    check(button is not None, f"{title} keeps its {action} action", root)
+    bounds = lambda node: node.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+    viewport = button.get_parent()
+    while viewport and viewport.get_role_name() != "scroll pane":
+        viewport = viewport.get_parent()
+    # Offscreen label coordinates differ between GTK versions. Measure an
+    # actually visible row, using the same scrollbar path as pointer tests.
+    for _ in range(3):
+        control, view = bounds(button), bounds(viewport)
+        center = control.y + control.height / 2
+        if view.y <= center < view.y + view.height:
+            break
+        values = [node.get_value_iface() for node in find_all(root, role="scroll bar")]
+        value = next(v for v in values if v and v.get_maximum_value() > 200)
+        target = value.get_current_value() + center - (view.y + view.height / 2)
+        value.set_current_value(max(0, min(target, value.get_maximum_value())))
+        time.sleep(0.25)
+        button = row_button(root, title, action)
+    row = button.get_parent()
+    while row and row.get_role_name() != "list item":
+        row = row.get_parent()
+    check(row is not None, "the action belongs to a game row", root)
+    title_label = find_all(row, role="label", name=title)[0]
+    details = find_all(row, role="label", name_contains=size)
+    check(len(details) == 1 and details[0].get_name().count(size) == 1,
+          "size appears once, in the details line", row)
+    top, bottom, control, whole = bounds(title_label), bounds(details[0]), bounds(button), bounds(row)
+    check(top.height > 0 and bottom.height > 0 and bottom.y >= top.y + top.height - 1,
+          "details sit below the game title", row)
+    button_center = control.y + control.height / 2
+    title_center = top.y + top.height / 2
+    details_center = bottom.y + bottom.height / 2
+    # Font glyph extents/leading vary with GTK and fonts. The action must sit
+    # between the two text lines, not align with the top or bottom of the row.
+    check(title_center <= button_center <= details_center,
+          f"right-hand actions are centered between both text lines (button={button_center}, title={title_center}, details={details_center}, row={whole.y}/{whole.height})", row)
+    check(control.x >= top.x + top.width, "actions stay to the right of the text", row)
+    check(any(bounds(image).width >= 40 and bounds(image).height >= 40
+              for image in find_all(row, role="image")), "the game icon spans both text lines", row)
+
+
 def dump(root, why):
     print(f"\n--- accessibility tree ({why}) ---", file=sys.stderr)
     for node, depth in walk(root):
@@ -580,6 +624,8 @@ last-verified = 2026-10-10
             json.dump(
                 {
                     "schema": schema,
+                    "market": "US",
+                    "language": "en-us",
                     "product": {
                         "product_id": pid,
                         "name": name,
@@ -633,6 +679,8 @@ last-verified = 2026-10-10
             json.dump(
                 {
                     "schema": schema,
+                    "market": "US",
+                    "language": "en-us",
                     "product": {
                         "product_id": pid,
                         "name": name,
@@ -646,6 +694,37 @@ last-verified = 2026-10-10
                 },
                 f,
             )
+
+    # Local PNGs exercise actual Add to Steam downloads, cache reuse and grid
+    # installation without reaching an external artwork service.
+    art_png = open("crates/ferestre-core/tests/fixtures/steam-art.png", "rb").read()
+    class ArtworkServer(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(art_png)))
+            self.end_headers()
+            self.wfile.write(art_png)
+        def log_message(self, *args):
+            pass
+    art_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ArtworkServer)
+    threading.Thread(target=art_server.serve_forever, daemon=True).start()
+    art_url = f"http://127.0.0.1:{art_server.server_port}/art.png"
+    env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost"
+    for filename in glob.glob(os.path.join(recipes_dir, "*.toml")):
+        with open(filename, "rb") as f:
+            title = tomllib.load(f).get("title", {})
+        pid = title.get("product-id")
+        if not pid:
+            continue
+        path = os.path.join(catalog, f"{pid.upper()}.json")
+        entry = json.load(open(path)) if os.path.exists(path) else {
+            "schema": schema, "market": "US", "language": "en-us",
+            "product": {"product_id": pid, "name": title["name"]}}
+        entry["product"]["image"] = art_url
+        entry["product"]["artwork"] = {slot: art_url for slot in ("portrait", "landscape", "hero", "logo")}
+        with open(path, "w") as f:
+            json.dump(entry, f)
 
     # The window is run from a copy, with a stub `ferestre` beside it, because
     # that is how it picks its CLI -- a sibling first, the path second. Two
@@ -891,7 +970,9 @@ print(":: done", flush=True)
 
         labels = texts(frame)
         check(any("on disk" in t for t in labels), "installed rows show measured disk usage in Library", frame)
-        check("12.5 GB download" in labels, "catalog rows show a separate download size label", frame)
+        check(any("12.5 GB download" in t for t in labels), "catalog rows show download size in their details", frame)
+        check_game_row_layout(frame, "Smoke Test Racer", "12.5 GB", "Install")
+        check_game_row_layout(frame, "Minecraft for Windows", "on disk", "Play")
         print("installing asks before it downloads")
         install = row_button(frame, "Smoke Test Racer", "Install")
         check(install is not None, "an owned MSIXVC title offers an install", frame)
@@ -1051,7 +1132,8 @@ print(":: done", flush=True)
             frame,
         )
 
-        check("8.1 GB download" in labels, "Game Pass rows carry the same size label", frame)
+        check(any("8.1 GB download" in t for t in labels), "Game Pass rows use the same size details", frame)
+        check_game_row_layout(frame, "Subscription Racer", "8.1 GB", "Install")
         print("a download says how far, how fast and how long")
         select_in_list(frame, "Library")
         wait_for(
@@ -1157,6 +1239,35 @@ print(":: done", flush=True)
         check(shortcut_string("StartDir") == f'"{os.path.dirname(image)}"', "Steam start directory is persistent", frame)
         saved_options = shortcut_string("LaunchOptions")
         check(saved_options.startswith("run "), "Steam shortcut keeps the title launch options", frame)
+        stored_id = struct.unpack("<I", shortcut_bytes.split(b"\x02appid\0", 1)[1][:4])[0]
+        icon_path = shortcut_string("icon")
+        grid = os.path.join(os.path.dirname(shortcuts), "grid")
+        check(icon_path == os.path.join(grid, f"{stored_id}_icon.png") and os.path.isfile(icon_path),
+              "Steam gets a persistent game icon in its own directory", frame)
+        for suffix in ("p", "", "_hero", "_logo"):
+            check(open(os.path.join(grid, f"{stored_id}{suffix}.png"), "rb").read() == art_png,
+                  f"Steam artwork {suffix or 'landscape'} uses the stored app id", frame)
+        # Reproduce an older shortcut, including a renamed title and vanished
+        # AppImage mount, then re-add. Keep the id/controller configuration.
+        saved_name = shortcut_string("AppName")
+        legacy = shortcut_bytes.replace(b"\x01Exe\0" + shortcut_string("Exe").encode() + b"\0",
+                                        b'\x01Exe\0"/tmp/.mount_old/usr/bin/ferestre"\0')
+        legacy = legacy.replace(b"\x01AppName\0" + saved_name.encode() + b"\0", b"\x01AppName\0Old title name\0")
+        legacy = legacy.replace(b"\x01icon\0" + icon_path.encode() + b"\0", b"\x01icon\0\0")
+        with open(shortcuts, "wb") as f:
+            f.write(legacy)
+        os.unlink(icon_path)
+        previous_mtime = os.stat(shortcuts).st_mtime_ns
+        click(find_all(frame, role="button", name_contains="Add to Steam")[0])
+        wait_for(frame, lambda root: os.stat(shortcuts).st_mtime_ns != previous_mtime,
+                 "the existing Steam shortcut to update", time.monotonic() + TIMEOUT)
+        shortcut_bytes = open(shortcuts, "rb").read()
+        check(shortcut_bytes.count(b"\x01AppName\0") == 1, "re-adding updates instead of duplicating the shortcut", frame)
+        check(shortcut_string("AppName") == saved_name and shortcut_string("Exe") == f'"{image}"',
+              "re-adding repairs the old title and mount-local executable", frame)
+        check(struct.unpack("<I", shortcut_bytes.split(b"\x02appid\0", 1)[1][:4])[0] == stored_id,
+              "updating preserves the Steam app id and controller configuration identity", frame)
+        check(os.path.isfile(shortcut_string("icon")), "re-adding fills the missing game icon", frame)
         click(edit[0])
         labels = wait_for(
             frame,
@@ -1251,7 +1362,7 @@ print(":: done", flush=True)
         os.makedirs(installed_records, exist_ok=True)
         with open(os.path.join(installed_records, "9NBLGGH2JHXJ.json"), "w") as f:
             json.dump({"product_id": "9NBLGGH2JHXJ", "dir": unrecorded,
-                       "content_ids": [], "package_version": "9.9.9.9"}, f)
+                       "content_ids": ["fixture-content-id"], "package_version": "9.9.9.9"}, f)
         click_named(frame, "Refresh library, subscriptions and catalogue")
         select_in_list(frame, "Installed")
         time.sleep(0.5)
@@ -1390,12 +1501,37 @@ elif sys.argv[1] == 'library':
     (home / 'refresh-child-pid').write_text(str(os.getpid()))
     while (home / 'hold-refresh').exists():
         time.sleep(.05)
-    print(json.dumps({'items': [{'productId': '9ZZSMOKEGAME', 'productType': 'Game', 'status': 'Active'}]}))
+    print((home / 'client-library.json').read_text())
+elif sys.argv[1] == 'update':
+    print(json.dumps({'version': '9.9.9.9'}))
 """)
         os.chmod(client, 0o755)
+        # Six-hour-old lists and update checks must survive app restarts.
         for filename in ("library.json", "gamepass.json"):
-            os.utime(os.path.join(state, filename), None)
+            os.utime(os.path.join(state, filename), (time.time() - 21600, time.time() - 21600))
+        update_cache = os.path.join(state, "updates", "9NBLGGH2JHXJ.json")
+        os.makedirs(os.path.dirname(update_cache), exist_ok=True)
+        with open(update_cache, "w") as f:
+            json.dump({"schema": 1, "record": json.load(open(os.path.join(installed_records, "9NBLGGH2JHXJ.json"))),
+                       "available": "9.9.9.9"}, f)
+        os.utime(update_cache, (time.time() - 21600, time.time() - 21600))
+        # Fill recipe metadata too, so a fresh startup has no legitimate misses.
+        for filename in glob.glob(os.path.join(recipes_dir, "*.toml")):
+            with open(filename, "rb") as f:
+                title = tomllib.load(f).get("title", {})
+            pid = title.get("product-id")
+            if pid:
+                path = os.path.join(catalog, f"{pid.upper()}.json")
+                if not os.path.exists(path):
+                    with open(path, "w") as f:
+                        json.dump({"schema": schema, "market": "US", "language": "en-us",
+                                   "product": {"product_id": pid, "name": title["name"]}}, f)
+        usage_paths = glob.glob(os.path.join(home, "cache", "ferestre", "disk-usage", "*.json"))
+        check(bool(usage_paths), "disk usage measurements are persisted for future app loads")
+        usage_snapshots = {path: (os.stat(path).st_mtime_ns, open(path, "rb").read()) for path in usage_paths}
         cached_library = open(os.path.join(state, "library.json"), "rb").read()
+        with open(os.path.join(home, "client-library.json"), "wb") as f:
+            f.write(cached_library)
         gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         app = find_app(gui.pid, time.monotonic() + TIMEOUT)
         frame = wait_for(app, lambda root: next(iter(find_all(root, role="frame")), None),
@@ -1403,11 +1539,64 @@ elif sys.argv[1] == 'library':
         wait_for(frame, lambda root: "Fixture Player" in texts(root), "cached account identity", time.monotonic() + TIMEOUT)
         time.sleep(1)
         calls = open(os.path.join(home, "client-calls")).read().splitlines()
-        check("account" in calls and "library" not in calls, "fresh cached ownership is reused across app loads")
+        check("account" in calls and "library" not in calls, "six-hour-old ownership is reused across app loads")
+        check("update" not in calls, "six-hour-old game-update checks are reused at startup")
+        for section in ("Runtime", "Installed", "Library"):
+            select_in_list(frame, section)
+        time.sleep(.3)
+        check("update" not in open(os.path.join(home, "client-calls")).read().splitlines(),
+              "switching views does not repeat cached update checks")
         check(not any("catalog.gamepass.com" in request for request in CountingProxy.requests),
               "fresh Game Pass listing is not fetched again on startup")
         check(open(os.path.join(state, "library.json"), "rb").read() == cached_library,
               "unchanged startup preserves the cached game list")
+        check(not any("displaycatalog.mp.microsoft.com" in request for request in CountingProxy.requests),
+              "fresh product metadata is not fetched again on startup")
+        # A failed forced refresh still attempts the network and keeps rows.
+        cached_product = os.path.join(catalog, "9ZZSMOKEGDK1.json")
+        previous_product = open(cached_product, "rb").read()
+        click_named(frame, "Refresh library, subscriptions and catalogue")
+        wait_for(frame, lambda root: any("displaycatalog.mp.microsoft.com" in request for request in CountingProxy.requests),
+                 "explicit product metadata revalidation", time.monotonic() + TIMEOUT)
+        check(open(cached_product, "rb").read() == previous_product,
+              "failed metadata revalidation preserves the last good product")
+        check(any("Smoke Test Racer" in t for t in texts(frame)),
+              "cached rows remain visible during failed revalidation", frame)
+        click_named(frame, "Close")
+        check(gui.wait(timeout=5) == 0, "catalogue revalidation never blocks closing")
+        calls = open(os.path.join(home, "client-calls")).read().splitlines()
+        check("library" in calls and "update" in calls,
+              "top-right Refresh bypasses both daily library and game-update caches")
+        update_calls = calls.count("update")
+        os.utime(update_cache, (time.time() - 172800, time.time() - 172800))
+        # Expired metadata revalidates automatically while cached names draw.
+        for path in glob.glob(os.path.join(catalog, "*.json")):
+            os.utime(path, (time.time() - 172800, time.time() - 172800))
+        CountingProxy.requests.clear()
+        gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        app = find_app(gui.pid, time.monotonic() + TIMEOUT)
+        frame = wait_for(app, lambda root: next(iter(find_all(root, role="frame")), None),
+                         "stale catalogue window", time.monotonic() + TIMEOUT)
+        wait_for(frame, lambda root: any("displaycatalog.mp.microsoft.com" in request for request in CountingProxy.requests),
+                 "automatic stale metadata revalidation", time.monotonic() + TIMEOUT)
+        check(any("Smoke Test Racer" in t for t in texts(frame)),
+              "stale product names remain visible while revalidation fails", frame)
+        check(open(cached_product, "rb").read() == previous_product,
+              "automatic failed revalidation keeps the previous snapshot")
+        wait_for(frame, lambda root: open(os.path.join(home, "client-calls")).read().splitlines().count("update") > update_calls,
+                 "expired game-update checks to run", time.monotonic() + TIMEOUT)
+        wait_for(frame, lambda root: time.time() - os.stat(update_cache).st_mtime < 60,
+                 "the daily game-update result to persist", time.monotonic() + TIMEOUT)
+        check(True, "expired game updates refresh after 24 hours and persist for the next load")
+        # Restore ownership after the forced refresh's synthetic client answer.
+        with open(os.path.join(state, "library.json"), "wb") as f:
+            f.write(cached_library)
+        refresh_marker = os.path.join(home, "refresh-started")
+        if os.path.exists(refresh_marker):
+            os.unlink(refresh_marker)
+        check(all((os.stat(path).st_mtime_ns, open(path, "rb").read()) == snapshot
+                  for path, snapshot in usage_snapshots.items()),
+              "restarts and catalogue refreshes reuse fresh disk usage measurements")
         # Request an actual library refresh and hold its child, then close.
         open(os.path.join(home, "hold-refresh"), "w").close()
         click(find_all(frame, role="button", name_contains="Fixture Player")[0])
@@ -1425,6 +1614,8 @@ elif sys.argv[1] == 'library':
         # cache. Its public catalogue remains reusable across accounts.
         with open(os.path.join(home, "client-account.json"), "w") as f:
             json.dump({"gamertag": "Other Fixture Player", "xuid": "other-fixture-player"}, f)
+        with open(os.path.join(home, "client-library.json"), "w") as f:
+            json.dump({"items": [{"productId": "9ZZSMOKEGAME", "productType": "Game", "status": "Active"}]}, f)
         gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         app = find_app(gui.pid, time.monotonic() + TIMEOUT)
         frame = wait_for(app, lambda root: next(iter(find_all(root, role="frame")), None),
@@ -1445,6 +1636,7 @@ elif sys.argv[1] == 'library':
             dump(frame, str(e))
         failures.append(str(e))
     finally:
+        art_server.shutdown()
         # Release only this fixture's workers, even if an assertion failed.
         for gate in ("release-removal", "release-cleanup"):
             open(os.path.join(home, gate), "w").close()

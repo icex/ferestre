@@ -61,23 +61,75 @@ covered by the existing round-trip/upsert tests.
 
 ## Related requested GUI changes
 
-Rows in Library, Game Pass and Installed share a separate size label. Installed
+Library, Game Pass, Installed and Updates share a two-line layout: icon and
+name, details (version, one size phrase, compatibility/status), and centered
+right-hand actions. Size is no longer repeated in the catalog subtitle. Installed
 sizes are allocated bytes, measured off the GTK thread; sparse files and
 hardlinks are handled, symlinks are not traversed within a game tree, and a
-reload invalidates old measurements. Catalog rows identify download sizes.
+reload discards obsolete in-flight results. Disk usage persists in an atomic
+per-game cache for 24 hours, reused across app loads and list refreshes. Root
+identity/metadata, manifest metadata and install-record changes invalidate it;
+deep file changes are picked up at expiry. Stale totals remain visible while
+background remeasurement runs. Catalog rows identify download sizes.
 
 List/account/update refreshes may be closed immediately. Download cancellation
 and removal completion retain their existing close protocols. Cache snapshots
-publish by atomic rename; warm startup reuses ownership for five minutes and
-the public Game Pass list for 24 hours. Account changes and detected subscription
+publish by atomic rename; warm startup reuses ownership, game-update checks, the public Game Pass list
+and product details for 24 hours. Product metadata
+uses stale-while-revalidate: cached rows draw before network requests, stale
+entries refresh in the background, and explicit refresh includes named and
+off-page entries. Market/language changes also invalidate metadata freshness.
+Failed revalidation retains both the product and its original freshness time;
+a partial list/tier refresh never replaces a complete Game Pass snapshot. Account changes and detected subscription
 changes invalidate the corresponding data; explicit refresh bypasses freshness.
 No Microsoft change notification is available here: changes made elsewhere are
 detected by the periodic ownership check or an explicit refresh.
 
-Final local checks: 302 Rust tests, workspace formatting and Clippy with warnings
+Final local checks: 307 Rust tests, workspace formatting and Clippy with warnings
 as errors; complete isolated GTK smoke including all three size-label sections,
 cache reuse across restart, account-change invalidation, immediate close during
 a held list refresh, download cleanup and removal completion; CLI media and
 cancellation integration tests; all four patch series; GameInput compilation
 with `-Werror`; launch-helper/authentication probe tests and recipe validation.
 The Fedora/Bluetooth/Steam Input combination remains unverified.
+
+Catalogue revalidation follow-up: a local HTTP fixture checks cold load, a warm
+load with no request, changed stale metadata replacing the cached row, forced
+refresh of fresh data, locale changes and failure preserving data/freshness.
+The real GTK smoke also counts proxy requests across restarts and checks forced
+and automatic stale revalidation with cached names visible on failure.
+
+Disk usage follow-up: a filesystem test covers persistent reuse, expiry, deep
+content changes, changed manifests/install records, directory changes/moves and
+failure preserving the cache. The GTK restart/refresh checks assert the stored
+measurement contents and timestamps remain unchanged for fresh installs.
+
+Steam artwork/update follow-up: re-adding matches launch options even when the
+old display name or AppImage mount differs. Existing app IDs, play history,
+overlay settings and tags survive. Store icons/covers/heroes/title logos are
+downloaded concurrently, cached by source URL and copied into each account's
+grid directory; unavailable assets do not block the shortcut. Personal artwork
+is retained. Naming follows [SGDBoop's implementation](https://github.com/SteamGridDB/SGDBoop/blob/main/sgdboop.c),
+with asset roles described by [Steamworks](https://partner.steamgames.com/doc/store/assets/libraryassets).
+Steam's non-Steam shortcut format has no supported description field, so this
+adds the artwork rather than an ignored description key.
+
+Validation: local HTTP artwork downloads and offline cache reuse; all grid
+slots and preservation of personal art; metadata purpose selection; updating a
+renamed/moved shortcut while preserving its stored ID/history. The actual GTK
+test checks both text lines, a single size phrase, icon and vertically centered
+actions in Library/Installed/Game Pass, then downloads artwork, saves and
+repairs a deliberately stale shortcut without duplicating it.
+
+Live artwork qualification: the real mounted AppImage used old cached metadata
+for Minecraft Dungeons II, refreshed that one title, and downloaded Store PNGs:
+256x256 icon, 600x900 portrait, 920x518 header and 1920x1080 hero. All decoded
+with ImageMagick. The GUI closed, the mount disappeared, the copied icon stayed
+on disk and the saved persistent target still executed. Steam's own Play-button
+launch and visual rendering of its library artwork remain untested.
+
+Daily-check policy: game-update results persist per installed record for 24
+hours and are restored on startup. Navigation reuses them. Failed checks retain
+the last known version and are also throttled until tomorrow; the top-right
+Refresh button forces library/subscription, catalogue and game-update checks.
+Changed installs invalidate their own cached update result.
