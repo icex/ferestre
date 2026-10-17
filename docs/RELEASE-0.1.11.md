@@ -28,6 +28,9 @@ is downloaded separately. `SHA256SUMS` verifies both downloads.
   existing custom artwork is retained. Steam must be closed while editing.
 - Doctor and launch warnings diagnose missing FFmpeg 4 dependencies and explain
   the Fedora RPM Fusion `compat-ffmpeg4` workaround.
+- Automatic runtime selection compares numeric release versions across tool
+  names, so a newer Ferestre build takes precedence over an older Xodus build;
+  explicit per-title selections are retained.
 - Runtime GameInput v2 enumerates connected XInput gamepads and returns immutable
   button/stick/trigger readings, stable device identities, status and rumble.
 

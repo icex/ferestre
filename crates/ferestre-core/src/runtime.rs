@@ -197,8 +197,28 @@ pub fn installed(dir: &Path) -> Vec<InstalledRuntime> {
         .flatten()
         .filter_map(|entry| InstalledRuntime::at(&entry.path()).ok())
         .collect();
-    runtimes.sort_by(|a, b| b.version.cmp(&a.version).then_with(|| a.path.cmp(&b.path)));
+    runtimes.sort_by(runtime_order);
     runtimes
+}
+
+/// Compare the numeric release, independent of the tool's branding. A newer
+/// `ferestre-11.0.20261017.1` must precede `xodus-...20261013.3`, and build 10
+/// must precede build 9. Keep the full name/path as deterministic tie breakers.
+fn runtime_order(a: &InstalledRuntime, b: &InstalledRuntime) -> std::cmp::Ordering {
+    let numbers = |runtime: &InstalledRuntime| -> Vec<u64> {
+        runtime
+            .version
+            .as_deref()
+            .unwrap_or_default()
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|part| !part.is_empty())
+            .map(|part| part.parse().unwrap_or(u64::MAX))
+            .collect()
+    };
+    numbers(b)
+        .cmp(&numbers(a))
+        .then_with(|| b.version.cmp(&a.version))
+        .then_with(|| a.path.cmp(&b.path))
 }
 
 /// All usable runtimes known on this machine. A legacy configured runtime
@@ -213,7 +233,7 @@ pub fn all(paths: &Paths) -> Vec<InstalledRuntime> {
             }
         }
     }
-    runtimes.sort_by(|a, b| b.version.cmp(&a.version).then_with(|| a.path.cmp(&b.path)));
+    runtimes.sort_by(runtime_order);
     runtimes
 }
 
@@ -957,14 +977,24 @@ hangs"""
         std::fs::create_dir_all(&newer).unwrap();
         std::fs::write(older.join("proton"), "#!/bin/sh\nclose_fds=False\n").unwrap();
         std::fs::write(newer.join("proton"), "#!/bin/sh\nclose_fds=False\n").unwrap();
-        std::fs::write(older.join("version"), "11.0.1\n").unwrap();
-        std::fs::write(newer.join("version"), "11.0.2\n").unwrap();
+        std::fs::write(
+            older.join("version"),
+            "0 xodus-bleeding-edge-11.0.20261017.9\n",
+        )
+        .unwrap();
+        std::fs::write(newer.join("version"), "0 ferestre-11.0.20261017.10\n").unwrap();
         std::fs::create_dir_all(root.path().join("partial")).unwrap();
 
         let found = installed(root.path());
         assert_eq!(found.len(), 2);
-        assert_eq!(found[0].version.as_deref(), Some("11.0.2"));
-        assert_eq!(found[1].version.as_deref(), Some("11.0.1"));
+        assert_eq!(
+            found[0].version.as_deref(),
+            Some("ferestre-11.0.20261017.10")
+        );
+        assert_eq!(
+            found[1].version.as_deref(),
+            Some("xodus-bleeding-edge-11.0.20261017.9")
+        );
     }
 
     #[test]
