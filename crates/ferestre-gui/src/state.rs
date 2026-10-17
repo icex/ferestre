@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use ferestre_core::account::Account;
+use ferestre_core::accounts::{self, Profiles, Selection};
 use ferestre_core::catalog::{self, Cache, Product};
 use ferestre_core::gamepass;
 use ferestre_core::install::{self, Record};
@@ -70,6 +71,8 @@ impl Section {
 }
 
 pub struct Model {
+    pub roles: Option<Selection>,
+    pub profiles: Option<Profiles>,
     pub paths: Option<Paths>,
     pub recipes: Vec<Recipe>,
     /// The automatic default, used for compatibility rows.
@@ -139,6 +142,25 @@ impl Model {
             }
         };
 
+        let mut paths = paths;
+        let roles = match paths
+            .as_ref()
+            .map(|p| accounts::load(p.config_dir()))
+            .transpose()
+        {
+            Ok(roles) => roles.flatten(),
+            Err(error) => {
+                problem = Some(format!("Account roles: {error}"));
+                paths = None;
+                None
+            }
+        };
+        let private_state = paths
+            .as_ref()
+            .map(|p| accounts::private_state(p.state_dir(), roles.as_ref()));
+        let account_cache = paths
+            .as_ref()
+            .map(|p| accounts::private_state(p.cache_dir(), roles.as_ref()));
         let recipes = paths
             .as_ref()
             .map(|p| Recipe::load_layered(&p.title_dirs()).unwrap_or_default())
@@ -173,7 +195,7 @@ impl Model {
         // again" rather than "start".
         let ownership = paths
             .as_ref()
-            .and_then(|p| library::load_cache(p.state_dir()))
+            .and_then(|_| library::load_cache(private_state.as_deref()?))
             .map(Ownership::Known)
             .unwrap_or_default();
         let mut catalog: BTreeMap<String, Product> = match (&paths, &ownership) {
@@ -243,7 +265,9 @@ impl Model {
             .unwrap_or_default();
         let avatar = paths
             .as_ref()
-            .map(|p| ferestre_core::account::avatar_path(p.cache_dir(), AVATAR_PX))
+            .map(|_| {
+                ferestre_core::account::avatar_path(account_cache.as_deref().unwrap(), AVATAR_PX)
+            })
             .filter(|p| p.is_file());
 
         if problem.is_none() && recipes.is_empty() {
@@ -254,13 +278,20 @@ impl Model {
 
         let account = paths
             .as_ref()
-            .and_then(|p| ferestre_core::account::load_cache(p.state_dir()));
+            .and_then(|_| ferestre_core::account::load_cache(private_state.as_deref()?));
         let entitlements_checked = ownership.is_known();
         let available = paths
             .as_ref()
-            .map(|p| ferestre_core::updates::available(p.state_dir(), records.values()))
+            .map(|_| {
+                ferestre_core::updates::available(
+                    private_state.as_deref().unwrap(),
+                    records.values(),
+                )
+            })
             .unwrap_or_default();
         Model {
+            roles,
+            profiles: None,
             paths,
             recipes,
             runtime,
@@ -294,17 +325,22 @@ impl Model {
     /// Re-reading a recipe file is not a reason to make someone sign in again,
     /// or to re-download a hundred icons.
     pub fn reload(&mut self) {
-        let fresh = Model::load();
+        let mut fresh = Model::load();
+        let same_store =
+            self.roles.as_ref().map(|s| &s.store) == fresh.roles.as_ref().map(|s| &s.store);
+        if same_store {
+            fresh.ownership = std::mem::take(&mut self.ownership);
+            fresh.account = self.account.take();
+            fresh.avatar = self.avatar.take();
+            fresh.subscriptions = std::mem::take(&mut self.subscriptions);
+            fresh.entitlements_checked = self.entitlements_checked;
+        }
+        fresh.profiles = self.profiles.take();
         *self = Model {
             size_generation: self.size_generation.wrapping_add(1),
-            ownership: std::mem::take(&mut self.ownership),
             catalog: std::mem::take(&mut self.catalog),
             icons: std::mem::take(&mut self.icons),
-            account: self.account.take(),
-            avatar: self.avatar.take(),
             gamepass: std::mem::take(&mut self.gamepass),
-            subscriptions: std::mem::take(&mut self.subscriptions),
-            entitlements_checked: self.entitlements_checked,
             tiers: std::mem::take(&mut self.tiers),
             section: self.section,
             query: std::mem::take(&mut self.query),
@@ -338,12 +374,25 @@ impl Model {
     /// survives, and the row would say stopped while it kept running.
     pub fn wineserver(&self, recipe: &Recipe) -> Option<(PathBuf, PathBuf)> {
         let paths = self.paths.as_ref()?;
-        let server = paths.runtime_dir()?.join("files/bin/wineserver");
+        let inferred = ferestre_core::autofix::infer(recipe, self.game_dir(recipe).as_deref());
+        let selected = runtime::selected(paths.config_dir(), &recipe.title.product_id);
+        let runtime = runtime::select(
+            &inferred.recipe,
+            &self.runtimes,
+            selected.as_deref(),
+            self.registry.as_ref(),
+        )
+        .ok()?;
+        let server = runtime.path.join("files/bin/wineserver");
         if !server.is_file() {
             return None;
         }
-        // Proton puts the prefix one level inside STEAM_COMPAT_DATA_PATH.
-        Some((server, paths.prefix_dir(recipe).ok()?.join("pfx")))
+        let mut prefix = paths.prefix_dir(recipe).ok()?;
+        if let Some(roles) = &self.roles {
+            let (_, player) = roles.selected(self.profiles.as_ref()?).ok()?;
+            prefix = accounts::player_prefix(&prefix, player).ok()?;
+        }
+        Some((server, prefix.join("pfx")))
     }
 
     /// Where installing this product would put it: the recipe's directory when
@@ -397,6 +446,20 @@ impl Model {
 
     pub fn cache_dir(&self) -> Option<&Path> {
         self.paths.as_ref().map(Paths::cache_dir)
+    }
+
+    pub fn private_state_dir(&self) -> Option<PathBuf> {
+        Some(accounts::private_state(
+            self.paths.as_ref()?.state_dir(),
+            self.roles.as_ref(),
+        ))
+    }
+
+    pub fn account_cache_dir(&self) -> Option<PathBuf> {
+        Some(accounts::private_state(
+            self.paths.as_ref()?.cache_dir(),
+            self.roles.as_ref(),
+        ))
     }
 
     pub fn xodus_cli(&self) -> Option<PathBuf> {

@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use ferestre_core::accounts;
 use ferestre_core::autofix;
 use ferestre_core::capability;
 use ferestre_core::catalog;
@@ -385,6 +386,9 @@ fn cmd_library(cli: &Cli, all: bool, refresh: bool, offline: bool) -> Result<Exi
     // is the licence boundary (see NOTICE) and it is checked by the fact that
     // this crate has no Xodus dependency to link.
     let mut command = library::library_command(&xodus_cli, &library::Query::default());
+    if let Some(roles) = accounts::load(paths.config_dir())? {
+        roles.apply(&mut command);
+    }
     command.stdout(Stdio::piped()).stderr(Stdio::inherit());
     let output = command
         .output()
@@ -465,7 +469,11 @@ fn cmd_updates(cli: &Cli) -> Result<ExitCode> {
         let Some(content_id) = record.content_ids.first() else {
             continue;
         };
-        let output = update_command(&xodus_cli, content_id)
+        let mut command = update_command(&xodus_cli, content_id);
+        if let Some(roles) = accounts::load(paths.config_dir())? {
+            roles.apply(&mut command);
+        }
+        let output = command
             .output()
             .with_context(|| format!("running {} update", xodus_cli.display()))?;
         if !output.status.success() {
@@ -573,23 +581,62 @@ fn cmd_run(
         eprintln!("{line}");
     }
 
-    // Before anything is started: a runtime class the prefix has never been told
-    // about cannot be activated, however complete the implementation. Cheap when
-    // there is nothing to do -- reading one file -- and it is the difference
-    // between a patched runtime working and merely existing.
-    if let Some(registry) = &registry {
-        register_winrt_classes(&paths, recipe, registry, runtime);
-    }
-
     let dirs = launch_dirs_for_runtime(&paths, &runtime.path)?;
+    let roles = accounts::launch_selection(paths.config_dir())?;
+    let mut prefix = paths.prefix_dir(recipe)?;
+    if let Some(roles) = &roles {
+        let profiles = accounts::fetch(&dirs.xodus_cli())?;
+        let (store, player) = roles.selected(&profiles)?;
+        if roles.split() && !runtime.provides(accounts::CAPABILITY) {
+            bail!("This runtime cannot separate Store and Player identities. Select an account-sharing runtime, or clear the account role selections.");
+        }
+        if !runtime.provides(SERVICE_SOCKET_OVERRIDE) {
+            bail!("This runtime cannot isolate the selected account service. Update the runtime first.");
+        }
+        accounts::require_service(&dirs.xodus_service())?;
+        prefix = accounts::player_prefix(&prefix, player)?;
+        if cli.show_account {
+            eprintln!(":: Store: {}; Player: {}", store.label, player.label);
+        } else {
+            eprintln!(":: using the selected Store and Player accounts");
+        }
+    }
+    if let Some(registry) = &registry {
+        register_winrt_classes(&prefix, registry, runtime);
+    }
     let options = launch::Options {
         steam_integration: steam,
         xuid: paths.var("XGR_XUID").map(str::to_string),
         game_dir: Some(paths.install_dir(recipe)?),
-        prefix_dir: Some(paths.prefix_dir(recipe)?),
+        prefix_dir: Some(prefix),
     };
     let mut plan = launch::plan(recipe, &dirs, &options);
-    let service_socket = plan_service_socket(&mut plan, &dirs, runtime)?;
+    if let Some(roles) = &roles {
+        plan.env_set
+            .insert("XODUS_ACCOUNT_PROFILE".into(), roles.store.clone());
+        plan.env_set
+            .insert("XODUS_STORE_PROFILE".into(), roles.store.clone());
+        plan.env_set
+            .insert("XODUS_PLAYER_PROFILE".into(), roles.player.clone());
+        if runtime.provides(accounts::CAPABILITY) {
+            plan.env_set
+                .insert("XGR_ACCOUNT_ROLES_V1".into(), "1".into());
+        }
+        let record = install::all(paths.state_dir()).into_iter()
+            .find(|r| r.product_id.eq_ignore_ascii_case(&recipe.title.product_id))
+            .context("Account sharing needs an install record with its authenticated content ID. Refresh or reinstall this title.")?;
+        let content = record
+            .content_ids
+            .first()
+            .context("The installed title has no Store content ID")?;
+        plan.env_set.insert(
+            "XODUS_STORE_PRODUCT".into(),
+            recipe.title.product_id.clone(),
+        );
+        plan.env_set
+            .insert("XODUS_STORE_CONTENT".into(), content.clone());
+    }
+    let service_socket = plan_service_socket(&mut plan, &dirs, runtime, roles.as_ref())?;
 
     if dry_run {
         if cli.json {
@@ -632,7 +679,7 @@ fn cmd_run(
             }
         }
     }
-    start_service(&dirs, service_socket.as_deref())?;
+    start_service(&dirs, service_socket.as_deref(), &plan)?;
 
     if let Ok(missing) = ferestre_core::media::missing_libav_dependencies(&dirs.proton_dir) {
         if !missing.is_empty() {
@@ -719,7 +766,10 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
         (None, None) => paths.games_dir().join(product_id.to_ascii_lowercase()),
     };
 
-    let command = streaming_command(&xodus_cli, &product_id, &dest);
+    let mut command = streaming_command(&xodus_cli, &product_id, &dest);
+    if let Some(roles) = accounts::load(paths.config_dir())? {
+        roles.apply(&mut command);
+    }
 
     if cli.json {
         print_json(&json!({
@@ -964,25 +1014,17 @@ fn cmd_uninstall(
 /// may still run, and failing a launch over it would trade a definite loss for
 /// a possible one. What it must not do is stay quiet -- if a title then dies in
 /// `RoGetActivationFactory`, the reason is on screen above it.
-fn register_winrt_classes(
-    paths: &Paths,
-    recipe: &Recipe,
-    registry: &Registry,
-    runtime: &InstalledRuntime,
-) {
+fn register_winrt_classes(prefix: &Path, registry: &Registry, runtime: &InstalledRuntime) {
     let classes = registry.winrt_classes();
     if classes.is_empty() {
         return;
     }
-    let Ok(prefix) = paths.prefix_dir(recipe) else {
-        return;
-    };
     // A prefix that does not exist yet is about to be created from the default
     // one, and that copy would overwrite anything written now.
-    if !winrt::registry_path(&prefix).is_file() {
+    if !winrt::registry_path(prefix).is_file() {
         return;
     }
-    let missing = winrt::missing_in_prefix(&prefix, &classes);
+    let missing = winrt::missing_in_prefix(prefix, &classes);
     if missing.is_empty() {
         return;
     }
@@ -1455,7 +1497,32 @@ fn plan_service_socket(
     plan: &mut launch::Plan,
     dirs: &launch::Dirs,
     runtime: &InstalledRuntime,
+    roles: Option<&accounts::Selection>,
 ) -> Result<Option<PathBuf>> {
+    if let Some(roles) = roles {
+        let id = match std::fs::read_to_string(dirs.cli_dir.join("SERVICE_ID")) {
+            Ok(id) => id,
+            Err(_) => accounts::service_fingerprint(&dirs.xodus_service())?,
+        };
+        let binding = format!(
+            "{}:{}:{}",
+            id.trim(),
+            plan.get("XODUS_STORE_PRODUCT").unwrap_or_default(),
+            plan.get("XODUS_STORE_CONTENT").unwrap_or_default()
+        );
+        let root = std::env::var_os("XODUS_RUNTIME_DIR")
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var_os("XDG_RUNTIME_DIR"))
+            .context("XDG_RUNTIME_DIR is required for account sharing")?;
+        let directory =
+            scoped_service_directory(true, &roles.service_key(&binding), Path::new(&root))?
+                .unwrap();
+        plan.env_set.insert(
+            "XODUS_RUNTIME_DIR".into(),
+            directory.to_string_lossy().into_owned(),
+        );
+        return Ok(Some(directory.join("xodus.sock")));
+    }
     if let Some(value) = plan.get("XODUS_RUNTIME_DIR").filter(|v| !v.is_empty()) {
         return Ok(Some(PathBuf::from(value).join("xodus.sock")));
     }
@@ -1485,7 +1552,7 @@ fn plan_service_socket(
 }
 
 /// Start the service for this socket, preserving other running versions.
-fn start_service(dirs: &launch::Dirs, socket: Option<&Path>) -> Result<()> {
+fn start_service(dirs: &launch::Dirs, socket: Option<&Path>, plan: &launch::Plan) -> Result<()> {
     let socket =
         socket.context("XDG_RUNTIME_DIR or XODUS_RUNTIME_DIR is required for Xbox services")?;
     if service_socket_live(socket) {
@@ -1524,7 +1591,20 @@ fn start_service(dirs: &launch::Dirs, socket: Option<&Path>) -> Result<()> {
     let errs = out
         .try_clone()
         .context("duplicating the service log handle")?;
-    let mut child = Command::new(&binary)
+    let mut service = Command::new(&binary);
+    for key in [
+        "XODUS_STORE_PROFILE",
+        "XODUS_PLAYER_PROFILE",
+        "XODUS_STORE_PRODUCT",
+        "XODUS_STORE_CONTENT",
+    ] {
+        if let Some(value) = plan.get(key) {
+            service.env(key, value);
+        } else {
+            service.env_remove(key);
+        }
+    }
+    let mut child = service
         .env("XODUS_RUNTIME_DIR", directory)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
@@ -1734,6 +1814,10 @@ fn joined(names: &BTreeSet<String>) -> String {
 /// underscore-separated name, so `XGR_XUID` is caught and `MAX_TOKENS` is not).
 /// Short on purpose: it is meant to be read, not to be a filter.
 const ACCOUNT_KEYS: &[&str] = &[
+    "account_profile",
+    "store_profile",
+    "player_profile",
+    "save_namespace",
     "xuid",
     "puid",
     "gamertag",

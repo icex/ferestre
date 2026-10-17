@@ -54,7 +54,7 @@ CHECKED=0
 SKIPPED=0
 cleanup() {
     [ -d "$WORK/wine" ] && git -C "$WINE_REPO" worktree remove --force "$WORK/wine" 2>/dev/null
-    [ -d "$WORK/xgr" ] && git -C "$WINE_REPO/dlls/xgameruntime" worktree remove --force "$WORK/xgr" 2>/dev/null
+    [ -d "$WORK/xgr" ] && git -C "$XGR_REPO" worktree remove --force "$WORK/xgr" 2>/dev/null
     [ -d "$WORK/client" ] && git -C "$CLIENT_REPO" worktree remove --force "$WORK/client" 2>/dev/null
     [ -d "$WORK/vkd3d" ] && git -C "$VKD3D_REPO" worktree remove --force "$WORK/vkd3d" 2>/dev/null
     rm -rf "$WORK" 2>/dev/null
@@ -121,7 +121,7 @@ fi
 # at that repository's root rather than wine's. Applying them from the wine
 # root fails with "No such file or directory", which reads like a broken patch
 # and is not one.
-XGR_REPO=$WINE_REPO/dlls/xgameruntime
+XGR_REPO=${XGR_REPO:-$WINE_REPO/dlls/xgameruntime}
 if [ -e "$XGR_REPO/.git" ]; then
     if ! git -C "$XGR_REPO" cat-file -e "$XGR_BASE^{commit}" 2>/dev/null; then
         bad "the pinned base $XGR_BASE is not in $XGR_REPO (fetch it first)"

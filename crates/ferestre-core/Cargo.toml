@@ -12,6 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 anyhow.workspace = true
+sha2 = "0.10"
 ureq.workspace = true
 zip = { version = "2", default-features = false, features = ["deflate"] }
 

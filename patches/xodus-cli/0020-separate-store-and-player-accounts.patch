@@ -1,0 +1,1789 @@
+From: Ferestre contributors
+Subject: Isolate Store and Player credentials, services and authenticated licensing
+
+diff --git a/crates/xodus-cli/src/commands.rs b/crates/xodus-cli/src/commands.rs
+index 1892012..2f3559e 100644
+--- a/crates/xodus-cli/src/commands.rs
++++ b/crates/xodus-cli/src/commands.rs
+@@ -7,6 +7,7 @@ pub mod extract_eappx;
+ pub mod license;
+ pub mod login;
+ pub mod logout;
++pub mod profiles;
+ #[cfg(unix)]
+ pub mod run;
+ pub mod splicense;
+diff --git a/crates/xodus-cli/src/commands/account.rs b/crates/xodus-cli/src/commands/account.rs
+index be4e171..ae73ba9 100644
+--- a/crates/xodus-cli/src/commands/account.rs
++++ b/crates/xodus-cli/src/commands/account.rs
+@@ -33,12 +33,14 @@ fn setting(profile: &serde_json::Value, id: &str) -> Option<String> {
+         .map(str::to_string)
+ }
+ 
+-pub async fn run(client: &reqwest::Client, tokens: &xodus::tokens::TokenManager, json: bool) -> ExitCode {
++pub async fn describe(
++    client: &reqwest::Client,
++    tokens: &xodus::tokens::TokenManager,
++) -> Result<serde_json::Value, String> {
+     let xsts = match xsts_for(client, tokens, XBOXLIVE_RELYING_PARTY).await {
+         Ok(xsts) => xsts,
+         Err(message) => {
+-            eprintln!("{message}");
+-            return ExitCode::FAILURE;
++            return Err(message);
+         }
+     };
+     // From the token itself, so these survive a profile service that is down.
+@@ -72,8 +74,36 @@ pub async fn run(client: &reqwest::Client, tokens: &xodus::tokens::TokenManager,
+         Err(message) => eprintln!("profile settings: {message}"),
+     }
+ 
++    if let Some(id) = tokens.profile_id() {
++        if let Ok(root) = xodus::profiles::root() {
++            if let Ok(mut profile) = xodus::profiles::load(&root, id) {
++                if let Some(label) = account["gamertag"].as_str().filter(|s| !s.is_empty()) {
++                    profile.label = label.into();
++                    let _ = xodus::profiles::save(&root, &profile);
++                }
++            }
++        }
++    }
++    Ok(account)
++}
++
++pub async fn run(
++    client: &reqwest::Client,
++    tokens: &xodus::tokens::TokenManager,
++    json: bool,
++) -> ExitCode {
++    let account = match describe(client, tokens).await {
++        Ok(account) => account,
++        Err(error) => {
++            eprintln!("{error}");
++            return ExitCode::FAILURE;
++        }
++    };
+     if json {
+-        println!("{}", serde_json::to_string_pretty(&account).unwrap_or_default());
++        println!(
++            "{}",
++            serde_json::to_string_pretty(&account).unwrap_or_default()
++        );
+     } else {
+         let gamertag = account["gamertag"].as_str().unwrap_or("");
+         if gamertag.is_empty() {
+diff --git a/crates/xodus-cli/src/commands/login.rs b/crates/xodus-cli/src/commands/login.rs
+index 281ef9c..ce6440d 100644
+--- a/crates/xodus-cli/src/commands/login.rs
++++ b/crates/xodus-cli/src/commands/login.rs
+@@ -11,15 +11,18 @@ const LOGIN_MARKET: &str = "en-US";
+ const USER_AUTH_SCOPE: &str = "scope=service::user.auth.xboxlive.com::MBI_SSL&api-version=2.0";
+ 
+ pub async fn run(client: &reqwest::Client, tokens: &TokenManager) -> ExitCode {
+-    let token = tokens.get_device_sts_token().unwrap();
+-    let secrets::Token::Legacy(token) = token else {
++    let Ok(secrets::Token::Legacy(token)) = tokens.get_device_sts_token() else {
+         eprintln!("Invalid STS token");
+         return ExitCode::FAILURE;
+     };
+     let handler = LoginHandler::new(client.clone(), token, tokens.clone());
+-    let output = webview::run_sessions(handler)
+-        .expect("failed to login")
+-        .flatten();
++    let output = match webview::run_sessions(handler) {
++        Ok(output) => output.flatten(),
++        Err(_) => {
++            eprintln!("Sign-in did not complete. Check the account window, network and keychain.");
++            return ExitCode::FAILURE;
++        }
++    };
+     let issued_tokens = match output {
+         Some(soap::BodyContent::RequestSecurityTokenResponseCollection(collection)) => {
+             collection.security_tokens
+@@ -32,6 +35,9 @@ pub async fn run(client: &reqwest::Client, tokens: &TokenManager) -> ExitCode {
+         _ => unreachable!(),
+     };
+ 
++    if issued_tokens.is_empty() {
++        return ExitCode::FAILURE;
++    }
+     for token in issued_tokens {
+         let address = token.applies_to.endpoint_reference.address.clone();
+         let token = token.into();
+@@ -40,7 +46,10 @@ pub async fn run(client: &reqwest::Client, tokens: &TokenManager) -> ExitCode {
+         } else {
+             address
+         };
+-        tokens.save_user_token(address, token).unwrap();
++        if tokens.save_user_token(address, token).is_err() {
++            eprintln!("Could not save the new sign-in to your keychain");
++            return ExitCode::FAILURE;
++        }
+     }
+ 
+     ExitCode::SUCCESS
+@@ -162,7 +171,7 @@ impl webview::SessionHandler for LoginHandler {
+                         puid: data.puid,
+                         username: data.username,
+                     })
+-                    .unwrap();
++                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                 Ok(webview::HandlerControl::Complete(Some(da)))
+             }
+         }
+diff --git a/crates/xodus-cli/src/commands/profiles.rs b/crates/xodus-cli/src/commands/profiles.rs
+new file mode 100644
+index 0000000..d5b14d0
+--- /dev/null
++++ b/crates/xodus-cli/src/commands/profiles.rs
+@@ -0,0 +1,148 @@
++use std::path::Path;
++use std::process::ExitCode;
++use xodus::profiles::{self, Profile};
++use xodus::tokens::{TokenManager, store::TokenStoreError};
++
++pub fn manager(root: &Path, id: Option<&str>) -> Result<TokenManager, TokenStoreError> {
++    let id = match id {
++        Some(id) => Some(id.to_owned()),
++        None => profiles::default_id(root)?,
++    };
++    match id {
++        Some(id) => {
++            profiles::load(root, &id)?;
++            TokenManager::for_profile(&id)
++        }
++        None => Ok(TokenManager::with_keychain_and_memory()),
++    }
++}
++
++pub fn list(root: &Path, json: bool) -> ExitCode {
++    let result = (|| -> Result<serde_json::Value, TokenStoreError> {
++        let mut result = Vec::new();
++        for profile in profiles::list(root)? {
++            let tokens = TokenManager::for_profile(&profile.id)?;
++            let signed_in = match (tokens.get_user(), tokens.get_user_sts_token()) {
++                (Ok(_), Ok(_)) => true,
++                (Err(TokenStoreError::NotFound), _) | (_, Err(TokenStoreError::NotFound)) => false,
++                (Err(e), _) | (_, Err(e)) => return Err(e),
++            };
++            let mut value = serde_json::to_value(profile)?;
++            value["signed_in"] = signed_in.into();
++            result.push(value);
++        }
++        Ok(
++            serde_json::json!({"schema":1,"capabilities":["store-player-accounts"],
++            "default_profile":profiles::default_id(root)?,"profiles":result}),
++        )
++    })();
++    match result {
++        Ok(value) => {
++            if json {
++                println!("{value}");
++            } else {
++                for profile in value["profiles"].as_array().unwrap() {
++                    println!(
++                        "{}  {}{}",
++                        profile["id"].as_str().unwrap_or_default(),
++                        profile["label"].as_str().unwrap_or_default(),
++                        if profile["signed_in"] == true {
++                            ""
++                        } else {
++                            " (signed out)"
++                        }
++                    );
++                }
++            }
++            ExitCode::SUCCESS
++        }
++        Err(e) => {
++            eprintln!("Account profiles: {e}");
++            ExitCode::FAILURE
++        }
++    }
++}
++
++pub fn migrate(root: &Path) -> ExitCode {
++    match profiles::migrate(root, &TokenManager::with_keychain_and_memory()) {
++        Ok(profile) => {
++            println!("{}", serde_json::json!({"profile":profile}));
++            ExitCode::SUCCESS
++        }
++        Err(e) => {
++            eprintln!("Account migration: {e}");
++            ExitCode::FAILURE
++        }
++    }
++}
++
++pub async fn add(client: &reqwest::Client, root: &Path) -> ExitCode {
++    let id = uuid::Uuid::new_v4().simple().to_string();
++    let tokens = match TokenManager::for_profile(&id) {
++        Ok(tokens) => tokens,
++        Err(e) => {
++            eprintln!("New account: {e}");
++            return ExitCode::FAILURE;
++        }
++    };
++    xodus::tokens::device::ensure_device_credentials(client, &tokens).await;
++    if super::login::run(client, &tokens).await != ExitCode::SUCCESS {
++        let _ = tokens.remove_user();
++        return ExitCode::FAILURE;
++    }
++    // Publish the profile only after both sign-in and Xbox identity succeeded.
++    // A cancelled/failed login never replaces either selected account.
++    let account = match super::account::describe(client, &tokens).await {
++        Ok(value) if value["gamertag"].as_str().is_some_and(|s| !s.is_empty()) => value,
++        _ => {
++            let _ = tokens.remove_user();
++            eprintln!("New account did not supply an Xbox identity");
++            return ExitCode::FAILURE;
++        }
++    };
++    let user = match tokens.get_user() {
++        Ok(user) => user,
++        Err(e) => {
++            let _ = tokens.remove_user();
++            eprintln!("New account identity: {e}");
++            return ExitCode::FAILURE;
++        }
++    };
++    let save_namespace = profiles::save_namespace(&user.puid);
++    if let Some(mut existing) = profiles::list(root)
++        .unwrap_or_default()
++        .into_iter()
++        .find(|p| p.save_namespace == save_namespace)
++    {
++        if let Err(e) = tokens.migrate_user_to(&existing.id) {
++            let _ = tokens.remove_user();
++            eprintln!("Cannot refresh account profile: {e}");
++            return ExitCode::FAILURE;
++        }
++        let _ = tokens.remove_user();
++        existing.label = account["gamertag"].as_str().unwrap().into();
++        if let Err(e) = profiles::save(root, &existing) {
++            eprintln!("Cannot save account profile: {e}");
++            return ExitCode::FAILURE;
++        }
++        println!("{}", serde_json::json!({"profile":existing}));
++        return ExitCode::SUCCESS;
++    }
++    let profile = Profile {
++        id,
++        label: account["gamertag"].as_str().unwrap().into(),
++        legacy_saves: false,
++        save_namespace,
++    };
++    match profiles::save(root, &profile) {
++        Ok(()) => {
++            println!("{}", serde_json::json!({"profile":profile}));
++            ExitCode::SUCCESS
++        }
++        Err(e) => {
++            let _ = tokens.remove_user();
++            eprintln!("Cannot save account profile: {e}");
++            ExitCode::FAILURE
++        }
++    }
++}
+diff --git a/crates/xodus-cli/src/license.rs b/crates/xodus-cli/src/license.rs
+index b90fa61..70c3518 100644
+--- a/crates/xodus-cli/src/license.rs
++++ b/crates/xodus-cli/src/license.rs
+@@ -1,95 +1,2 @@
+-use xodus::licensing::splicense::{DeviceKey, SPLicense};
+-use xodus::models::live::ExchangeUserTokenOutcome;
+-use xodus::models::secrets::Token;
+-use xodus::models::soap;
+-use xodus::tokens::TokenManager;
+-
+-pub async fn get_license(
+-    client: &reqwest::Client,
+-    tokens: &TokenManager,
+-    content_id: String,
+-    market: String,
+-) -> std::result::Result<(DeviceKey, SPLicense), String> {
+-    let dev_token = tokens.get_device_sts_token().unwrap();
+-    let Token::Legacy(dev_token) = dev_token else {
+-        return Err("Invalid STS token".to_string());
+-    };
+-    let user = tokens.get_user().unwrap();
+-    let user_token = tokens.get_user_sts_token().unwrap();
+-    let Token::Legacy(legacy) = user_token else {
+-        return Err("Unspported user token".to_string());
+-    };
+-
+-    let ms_device_token = xodus::api::live::exchange_device_token(
+-        client,
+-        dev_token.clone(),
+-        "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".to_string(),
+-        "www.microsoft.com".to_owned(),
+-        Some(soap::PolicyReference::mbi_ssl()),
+-    )
+-    .await
+-    .unwrap();
+-
+-    let user_token = xodus::api::live::exchange_user_token(
+-        client,
+-        legacy,
+-        user.username,
+-        dev_token,
+-        None,
+-        Some("Silent".to_string()),
+-        "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".to_string(),
+-        &[(
+-            "www.microsoft.com".to_owned(),
+-            Some(soap::PolicyReference::mbi_ssl()),
+-        )],
+-    )
+-    .await
+-    .expect("Failed to get ms user token");
+-
+-    let ms_device_token: Token = ms_device_token.into();
+-    let Token::Compact(ms_device_token) = ms_device_token else {
+-        return Err("Unsupported token".to_string());
+-    };
+-
+-    let user_token: Token = match user_token {
+-        ExchangeUserTokenOutcome::Fault(_) => {
+-            return Err("Failed to get exchange MS token".to_string());
+-        }
+-        ExchangeUserTokenOutcome::Issued(
+-            soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
+-        ) => {
+-            let token = collection.security_tokens.remove(0);
+-            token.into()
+-        }
+-        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(
+-            token,
+-        )) => (*token).into(),
+-        _ => unreachable!("Only responses are handled"),
+-    };
+-    let Token::Compact(user_token) = user_token else {
+-        return Err("Unsupported token".to_string());
+-    };
+-
+-    let (_content, game_license) = xodus::licensing::content::get_license_content(
+-        client,
+-        ms_device_token,
+-        user_token,
+-        user.puid,
+-        content_id,
+-        market,
+-    )
+-    .await
+-    .map_err(|err| err.to_string())?;
+-
+-    let game_splicense = SPLicense::parse_base64(&game_license.splicense_block)
+-        .expect("could not parse base64 game SPLicense");
+-
+-    let dev_license = tokens.get_device_license().unwrap();
+-    let device_license = SPLicense::parse_base64(&dev_license.splicense)
+-        .expect("could not parse base64 device SPLicense");
+-    let key = device_license
+-        .encrypted_device_key
+-        .unwrap()
+-        .derive_device_key();
+-    Ok((key, game_splicense))
+-}
++// Shared credential-owning implementation used by the CLI and Store service.
++pub use xodus::licensing::acquire::get_license;
+diff --git a/crates/xodus-cli/src/main.rs b/crates/xodus-cli/src/main.rs
+index c5f2674..a6ade67 100644
+--- a/crates/xodus-cli/src/main.rs
++++ b/crates/xodus-cli/src/main.rs
+@@ -4,7 +4,6 @@ use clap::{Parser, Subcommand};
+ use tracing_subscriber::Layer;
+ use tracing_subscriber::layer::SubscriberExt;
+ use tracing_subscriber::util::SubscriberInitExt;
+-use xodus::tokens::TokenManager;
+ 
+ mod commands;
+ mod license;
+@@ -13,11 +12,24 @@ mod webview;
+ 
+ #[derive(Subcommand)]
+ enum SubCommand {
++    /// List local account profiles; credentials never leave the keychain.
++    AccountProfiles {
++        #[arg(long)]
++        json: bool,
++    },
++    /// Import the existing sign-in without removing legacy credentials.
++    MigrateAccounts,
++    /// Sign in to a new, separate account profile.
++    AddAccount,
+     #[command(
+         about = "Probe an authenticated Microsoft endpoint (research: owned-title enumeration)"
+     )]
+     Library {
+-        #[arg(long, default_value_t = 100, help = "Page size for the collections query")]
++        #[arg(
++            long,
++            default_value_t = 100,
++            help = "Page size for the collections query"
++        )]
+         page_size: u32,
+         #[arg(
+             long,
+@@ -25,7 +37,11 @@ enum SubCommand {
+             help = "MSA ticket target; the licensing path uses www.microsoft.com"
+         )]
+         msa_target: String,
+-        #[arg(long, default_value_t = false, help = "Keep add-ons, passes and inactive entitlements")]
++        #[arg(
++            long,
++            default_value_t = false,
++            help = "Keep add-ons, passes and inactive entitlements"
++        )]
+         all: bool,
+         #[arg(long, default_value_t = false, help = "Emit JSON")]
+         json: bool,
+@@ -75,7 +91,10 @@ enum SubCommand {
+         game_dir: Option<std::path::PathBuf>,
+         #[arg(long, help = "Decimal TitleId, instead of reading the game directory")]
+         title_id: Option<i64>,
+-        #[arg(long, help = "The title's MSAAppId, instead of reading the game directory")]
++        #[arg(
++            long,
++            help = "The title's MSAAppId, instead of reading the game directory"
++        )]
+         title_client_id: Option<String>,
+     },
+     #[command(about = "Report the available version for an installed MSIXVC package")]
+@@ -190,6 +209,9 @@ enum ClepAction {
+ #[derive(Parser)]
+ #[command(version, about, long_about = None)]
+ struct CliArgs {
++    /// Select an account profile for this command (defaults to the imported account).
++    #[arg(long, global = true)]
++    profile: Option<String>,
+     #[command(subcommand)]
+     command: SubCommand,
+ }
+@@ -223,7 +245,37 @@ async fn main() -> ExitCode {
+     let args = CliArgs::parse();
+ 
+     xodus::secrets::init_secrets().expect("Unable to initialize credentials");
+-    let tokens = TokenManager::with_keychain_and_memory();
++    let profile_root = match xodus::profiles::root() {
++        Ok(root) => root,
++        Err(e) => {
++            eprintln!("Account profiles: {e}");
++            return ExitCode::FAILURE;
++        }
++    };
++    match &args.command {
++        SubCommand::AccountProfiles { json } => {
++            return commands::profiles::list(&profile_root, *json);
++        }
++        SubCommand::MigrateAccounts => return commands::profiles::migrate(&profile_root),
++        SubCommand::AddAccount => return commands::profiles::add(&client, &profile_root).await,
++        _ => {}
++    }
++    let profile = args
++        .profile
++        .or_else(|| std::env::var("XODUS_ACCOUNT_PROFILE").ok());
++    let tokens = match commands::profiles::manager(&profile_root, profile.as_deref()) {
++        Ok(tokens) => tokens,
++        Err(e) => {
++            eprintln!("Account profile: {e}");
++            return ExitCode::FAILURE;
++        }
++    };
++    if tokens.profile_id().is_some() && matches!(args.command, SubCommand::Login) {
++        eprintln!(
++            "Use add-account for a separate sign-in; an existing profile cannot change identity"
++        );
++        return ExitCode::FAILURE;
++    }
+ 
+     // Clep/SpLicense are pure local data transforms and Logout only removes
+     // stored credentials - none of them need a device identity, so don't
+@@ -260,6 +312,9 @@ async fn main() -> ExitCode {
+             .await
+         }
+         SubCommand::Login => commands::login::run(&client, &tokens).await,
++        SubCommand::AccountProfiles { .. }
++        | SubCommand::MigrateAccounts
++        | SubCommand::AddAccount => unreachable!(),
+         SubCommand::Logout { device } => commands::logout::run(&tokens, device).await,
+         SubCommand::Extract {
+             path,
+@@ -342,10 +397,13 @@ async fn main() -> ExitCode {
+                 Ok(package) => match package::available_version(&package) {
+                     Some(version) => {
+                         if json {
+-                            println!("{}", serde_json::json!({
+-                                "content_id": content_id,
+-                                "version": version,
+-                            }));
++                            println!(
++                                "{}",
++                                serde_json::json!({
++                                    "content_id": content_id,
++                                    "version": version,
++                                })
++                            );
+                         } else {
+                             println!("{version}");
+                         }
+diff --git a/crates/xodus-cli/src/webview.rs b/crates/xodus-cli/src/webview.rs
+index f761a90..e581d24 100644
+--- a/crates/xodus-cli/src/webview.rs
++++ b/crates/xodus-cli/src/webview.rs
+@@ -4,7 +4,7 @@ use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopWindowT
+ use tao::platform::run_return::EventLoopExtRunReturn;
+ use tao::window::{Window, WindowBuilder};
+ use wry::http::{HeaderMap, HeaderValue};
+-use wry::{PageLoadEvent, WebView, WebViewBuilder};
++use wry::{PageLoadEvent, WebContext, WebView, WebViewBuilder};
+ use xodus::models::live::{DAProperty, HostBridgeMessage};
+ 
+ type HandlerResult<T> = Result<T, Box<dyn std::error::Error>>;
+@@ -75,6 +75,10 @@ struct RuntimeState<T: SessionHandler> {
+     active_webview: Option<WebView>,
+     result: Option<T::Output>,
+     error: Option<String>,
++    web_context: WebContext,
++    // One isolated browser store per login process, shared across MFA pages.
++    // Drop views/context before removing their temporary cookies.
++    _browser_data: tempfile::TempDir,
+ }
+ 
+ impl RuntimeCommands {
+@@ -157,6 +161,8 @@ where
+ {
+     let mut event_loop: EventLoop<CustomEvent> = EventLoopBuilder::with_user_event().build();
+     let proxy = event_loop.create_proxy();
++    let browser_data = tempfile::Builder::new().prefix("xodus-signin-").tempdir()?;
++    let web_context = WebContext::new(Some(browser_data.path().to_path_buf()));
+     let mut state = RuntimeState {
+         handler,
+         next_session_id: 1,
+@@ -165,6 +171,8 @@ where
+         active_webview: None,
+         result: None,
+         error: None,
++        web_context,
++        _browser_data: browser_data,
+     };
+ 
+     let mut commands = RuntimeCommands::new(state.next_session_id);
+@@ -332,7 +340,7 @@ fn create_session<T: SessionHandler>(
+     window.set_title(&request.title);
+ 
+     let proxy_ipc = proxy.clone();
+-    let builder = WebViewBuilder::new()
++    let builder = WebViewBuilder::new_with_web_context(&mut state.web_context)
+             .with_url(&request.url)
+             .with_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64; MSAppHost/3.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36 Edge/18.26100")
+             .with_headers(request.headers)
+diff --git a/crates/xodus-service/src/connection/license.rs b/crates/xodus-service/src/connection/license.rs
+index 47fa480..1fcb988 100644
+--- a/crates/xodus-service/src/connection/license.rs
++++ b/crates/xodus-service/src/connection/license.rs
+@@ -143,8 +143,9 @@ where
+ }
+ 
+ pub(super) async fn fetch(context: &mut SimpleContext, xml: &[u8]) -> Result<String, Error> {
++    let mut store = context.store_context();
+     fetch_with(xml, URL, &client(HTTP_TIMEOUT)?, |req| async move {
+-        super::xml::xsts_token(context, req)
++        super::xml::xsts_token(&mut store, req)
+             .await
+             .map_err(|_| "licensing authorization failed")
+     })
+diff --git a/crates/xodus-service/src/connection/router.rs b/crates/xodus-service/src/connection/router.rs
+index dfea07e..a584a8b 100644
+--- a/crates/xodus-service/src/connection/router.rs
++++ b/crates/xodus-service/src/connection/router.rs
+@@ -1,6 +1,6 @@
+ use std::sync::Arc;
+ 
+-use tokio::io::AsyncReadExt;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ use tokio_util::sync::CancellationToken;
+ use xodus::models::secrets::LegacyToken;
+ use xodus::tokens::TokenManager;
+@@ -8,15 +8,26 @@ use xodus::tokens::TokenManager;
+ use crate::simple_context::SimpleContext;
+ 
+ pub async fn route(
+-    mut socket: tokio::net::UnixStream,
++    socket: tokio::net::UnixStream,
+     token: CancellationToken,
+     device_token: LegacyToken,
+     tokens: Arc<TokenManager>,
++    store_tokens: Arc<TokenManager>,
++    entitlement: Option<Arc<crate::entitlement::Entitlement>>,
+ ) {
+     let cred = socket.peer_cred().ok().and_then(|cred| cred.pid());
+     tracing::debug!("Connection from pid {cred:?}");
+ 
+-    let mut context = SimpleContext::new(device_token, tokens);
++    let mut context = SimpleContext::with_roles(device_token, store_tokens, tokens);
++    context.entitlement = entitlement;
++    route_context(socket, token, context).await;
++}
++
++async fn route_context(
++    mut socket: tokio::net::UnixStream,
++    token: CancellationToken,
++    mut context: SimpleContext,
++) {
+     loop {
+         let mut read_magic = [0; 4];
+         if token.is_cancelled() {
+@@ -31,6 +42,63 @@ pub async fn route(
+         let magic = u32::from_le_bytes(read_magic);
+         let res = match magic {
+             crate::XML_MAGIC => super::xml::handle(&mut socket, &mut context).await,
++            0x58445345 => {
++                let mut header = [0; 8];
++                match tokio::time::timeout(
++                    std::time::Duration::from_secs(5),
++                    socket.read_exact(&mut header),
++                )
++                .await
++                {
++                    Ok(Ok(_))
++                        if u32::from_le_bytes(header[..4].try_into().unwrap()) == 1
++                            && u32::from_le_bytes(header[4..].try_into().unwrap()) == 12 => {}
++                    _ => return,
++                }
++                let mut product = [0; 12];
++                if !matches!(
++                    tokio::time::timeout(
++                        std::time::Duration::from_secs(5),
++                        socket.read_exact(&mut product)
++                    )
++                    .await,
++                    Ok(Ok(_))
++                ) {
++                    return;
++                }
++                let valid = match (std::str::from_utf8(&product), &context.entitlement) {
++                    (Ok(product), Some(binding)) => {
++                        binding
++                            .valid(product, &context.client, context.store_context().tokens())
++                            .await
++                    }
++                    _ => false,
++                };
++                let bytes: Vec<u8> = [1u32, valid as u32]
++                    .into_iter()
++                    .flat_map(u32::to_le_bytes)
++                    .collect();
++                socket.write_all(&bytes).await.map_err(|e| e.into())
++            }
++            0x58445341 => {
++                let mut version = [0; 4];
++                match tokio::time::timeout(
++                    std::time::Duration::from_secs(5),
++                    socket.read_exact(&mut version),
++                )
++                .await
++                {
++                    Ok(Ok(_)) if u32::from_le_bytes(version) == 1 => {
++                        let bytes: Vec<u8> = context
++                            .account_roles()
++                            .into_iter()
++                            .flat_map(u32::to_le_bytes)
++                            .collect();
++                        socket.write_all(&bytes).await.map_err(|e| e.into())
++                    }
++                    _ => return,
++                }
++            }
+             0x58445343 => super::catalog::handle(&mut socket).await,
+             crate::PROTO_MAGIC => super::proto::handle(&mut socket, &mut context).await,
+             _ => {
+@@ -44,3 +112,81 @@ pub async fn route(
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn wire_reports_roles_and_refuses_unbound_or_wrong_version_grants() {
++        let context = crate::simple_context::tests::context("owner-wire", "player-wire");
++        let owner = context.store_context().tokens().clone();
++        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
++        let task = tokio::spawn(route_context(server, CancellationToken::new(), context));
++        client
++            .write_all(
++                &[0x58445341u32, 1]
++                    .into_iter()
++                    .flat_map(u32::to_le_bytes)
++                    .collect::<Vec<_>>(),
++            )
++            .await
++            .unwrap();
++        let mut response = [0; 16];
++        client.read_exact(&mut response).await.unwrap();
++        assert_eq!(
++            response,
++            [1u32, 1, 1, 0]
++                .into_iter()
++                .flat_map(u32::to_le_bytes)
++                .collect::<Vec<_>>()
++                .as_slice()
++        );
++        owner.remove_user().unwrap();
++        client
++            .write_all(
++                &[0x58445341u32, 1]
++                    .into_iter()
++                    .flat_map(u32::to_le_bytes)
++                    .collect::<Vec<_>>(),
++            )
++            .await
++            .unwrap();
++        client.read_exact(&mut response).await.unwrap();
++        assert_eq!(
++            response,
++            [1u32, 0, 1, 0]
++                .into_iter()
++                .flat_map(u32::to_le_bytes)
++                .collect::<Vec<_>>()
++                .as_slice()
++        );
++        let mut request = [0x58445345u32, 1, 12]
++            .into_iter()
++            .flat_map(u32::to_le_bytes)
++            .collect::<Vec<_>>();
++        request.extend(b"9TESTROLE0ID");
++        client.write_all(&request).await.unwrap();
++        let mut grant = [0; 8];
++        client.read_exact(&mut grant).await.unwrap();
++        assert_eq!(
++            grant,
++            [1u32, 0]
++                .into_iter()
++                .flat_map(u32::to_le_bytes)
++                .collect::<Vec<_>>()
++                .as_slice()
++        );
++        client
++            .write_all(
++                &[0x58445341u32, 2]
++                    .into_iter()
++                    .flat_map(u32::to_le_bytes)
++                    .collect::<Vec<_>>(),
++            )
++            .await
++            .unwrap();
++        assert_eq!(client.read(&mut grant).await.unwrap(), 0);
++        task.await.unwrap();
++    }
++}
+diff --git a/crates/xodus-service/src/entitlement.rs b/crates/xodus-service/src/entitlement.rs
+new file mode 100644
+index 0000000..3d2a04c
+--- /dev/null
++++ b/crates/xodus-service/src/entitlement.rs
+@@ -0,0 +1,104 @@
++//! A title-bound Store licence. No running-title or player ownership inference.
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++use xodus::tokens::TokenManager;
++
++pub struct Entitlement {
++    product: String,
++    content: String,
++    cached: tokio::sync::Mutex<Option<(Instant, bool)>>,
++}
++
++impl Entitlement {
++    pub fn from_env() -> Result<Option<Arc<Self>>, String> {
++        match (
++            std::env::var("XODUS_STORE_PRODUCT"),
++            std::env::var("XODUS_STORE_CONTENT"),
++        ) {
++            (Err(_), Err(_)) => Ok(None),
++            (Ok(product), Ok(content))
++                if product.len() == 12
++                    && product.bytes().all(|c| c.is_ascii_alphanumeric())
++                    && uuid_valid(&content) =>
++            {
++                Ok(Some(Arc::new(Self {
++                    product,
++                    content,
++                    cached: Default::default(),
++                })))
++            }
++            _ => Err("invalid Store title binding".into()),
++        }
++    }
++
++    pub async fn valid(
++        &self,
++        product: &str,
++        client: &reqwest::Client,
++        tokens: &TokenManager,
++    ) -> bool {
++        if product != self.product
++            || tokens.get_user().is_err()
++            || tokens.get_user_sts_token().is_err()
++        {
++            return false;
++        }
++        let mut cached = self.cached.lock().await;
++        if let Some((checked, valid)) = *cached {
++            if checked.elapsed() < Duration::from_secs(if valid { 60 } else { 10 }) {
++                return valid;
++            }
++        }
++        let valid = matches!(
++            tokio::time::timeout(
++                Duration::from_secs(25),
++                xodus::licensing::acquire::get_license(
++                    client,
++                    tokens,
++                    self.content.clone(),
++                    "neutral".into()
++                )
++            )
++            .await,
++            Ok(Ok(_))
++        );
++        let valid = valid && tokens.get_user().is_ok() && tokens.get_user_sts_token().is_ok();
++        *cached = Some((Instant::now(), valid));
++        if !valid {
++            tracing::warn!("Store account content licence check failed");
++        }
++        valid
++    }
++}
++
++fn uuid_valid(s: &str) -> bool {
++    s.len() == 36
++        && s.bytes().enumerate().all(|(i, c)| {
++            if matches!(i, 8 | 13 | 18 | 23) {
++                c == b'-'
++            } else {
++                c.is_ascii_hexdigit()
++            }
++        })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[tokio::test]
++    async fn cached_grant_stays_bound_to_title_and_current_store_credentials() {
++        let context = crate::simple_context::tests::context("owner-cache", "player-cache");
++        let owner = context.store_context().tokens().clone();
++        let binding = Entitlement {
++            product: "9TESTROLE0ID".into(),
++            content: "00000000-0000-0000-0000-000000000001".into(),
++            cached: tokio::sync::Mutex::new(Some((Instant::now(), true))),
++        };
++        assert!(binding.valid("9TESTROLE0ID", &context.client, &owner).await);
++        assert!(!binding.valid("9OTHERROLE00", &context.client, &owner).await);
++        context.tokens().remove_user().unwrap();
++        assert!(binding.valid("9TESTROLE0ID", &context.client, &owner).await);
++        owner.remove_user().unwrap();
++        assert!(!binding.valid("9TESTROLE0ID", &context.client, &owner).await);
++    }
++}
+diff --git a/crates/xodus-service/src/main.rs b/crates/xodus-service/src/main.rs
+index 313c401..312bf54 100644
+--- a/crates/xodus-service/src/main.rs
++++ b/crates/xodus-service/src/main.rs
+@@ -10,6 +10,7 @@ use tracing_subscriber::util::SubscriberInitExt;
+ use xodus::tokens::TokenManager;
+ 
+ mod connection;
++mod entitlement;
+ mod simple_context;
+ mod utils;
+ 
+@@ -18,6 +19,12 @@ const PROTO_MAGIC: u32 = 0x58445350;
+ 
+ #[tokio::main]
+ async fn main() {
++    if std::env::args().any(|arg| arg == "--capabilities") {
++        println!(
++            "{{\"schema\":1,\"protocol\":\"FERESTRE_ACCOUNT_ROLES_SERVICE_V1\",\"capabilities\":[\"store-player-accounts\"]}}"
++        );
++        return;
++    }
+     // Default to info rather than to the EnvFilter's own error-only default.
+     // The service's log is the only place the reason a title's Xbox call was
+     // refused ever appears -- the title itself just sees the 403 -- and a log
+@@ -47,7 +54,23 @@ async fn main() {
+     }
+ 
+     xodus::secrets::init_secrets().expect("Failed to init keychain");
+-    let tokens = Arc::new(TokenManager::with_keychain_and_memory());
++    let root = xodus::profiles::root().expect("Account profile directory unavailable");
++    let default = xodus::profiles::default_id(&root).expect("Invalid default account profile");
++    let select = |role: &str| {
++        let id = std::env::var(role).ok().or_else(|| default.clone());
++        match id {
++            Some(id) => {
++                xodus::profiles::load(&root, &id).expect("Selected account profile is unavailable");
++                TokenManager::for_profile(&id).expect("Invalid account profile")
++            }
++            None => TokenManager::with_keychain_and_memory(),
++        }
++        .pin_user()
++        .expect("Selected account is signed out or invalid")
++    };
++    let tokens = Arc::new(select("XODUS_PLAYER_PROFILE"));
++    let store_tokens = Arc::new(select("XODUS_STORE_PROFILE"));
++    let entitlement = entitlement::Entitlement::from_env().expect("Invalid Store title binding");
+     xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await;
+     let xodus::models::secrets::Token::Legacy(device_token) =
+         tokens.get_device_sts_token().unwrap()
+@@ -80,8 +103,18 @@ async fn main() {
+             let token = cancellation.clone();
+             let device_token = device_token.clone();
+             let tokens = tokens.clone();
++            let store_tokens = store_tokens.clone();
++            let entitlement = entitlement.clone();
+             tokio::spawn(async move {
+-                connection::router::route(accept.0, token, device_token, tokens).await
++                connection::router::route(
++                    accept.0,
++                    token,
++                    device_token,
++                    tokens,
++                    store_tokens,
++                    entitlement,
++                )
++                .await
+             });
+         }
+     }
+diff --git a/crates/xodus-service/src/simple_context.rs b/crates/xodus-service/src/simple_context.rs
+index 2900465..5948cfc 100644
+--- a/crates/xodus-service/src/simple_context.rs
++++ b/crates/xodus-service/src/simple_context.rs
+@@ -6,13 +6,91 @@ use xodus::models::secrets::LegacyToken;
+ use xodus::tokens::TokenManager;
+ 
+ pub struct SimpleContext {
++    pub entitlement: Option<Arc<crate::entitlement::Entitlement>>,
+     pub client: reqwest::Client,
+     pub device_token: Option<LegacyToken>,
+     tokens: Arc<TokenManager>,
++    store_tokens: Arc<TokenManager>,
++}
++
++#[cfg(test)]
++pub(crate) mod tests {
++    use super::*;
++    use xodus::models::secrets::User;
++
++    pub(crate) fn context(store: &str, player: &str) -> SimpleContext {
++        let backend = TokenManager::with_memory();
++        let owner = backend.scoped("11111111111111111111111111111111").unwrap();
++        let gamer = backend.scoped("22222222222222222222222222222222").unwrap();
++        owner
++            .save_user(&User {
++                puid: store.into(),
++                username: "owner fixture".into(),
++            })
++            .unwrap();
++        gamer
++            .save_user(&User {
++                puid: player.into(),
++                username: "player fixture".into(),
++            })
++            .unwrap();
++        owner
++            .save_user_token(
++                xodus::tokens::PASSPORT_STS.into(),
++                xodus::models::secrets::Token::Compact("owner fixture".into()),
++            )
++            .unwrap();
++        gamer
++            .save_user_token(
++                xodus::tokens::PASSPORT_STS.into(),
++                xodus::models::secrets::Token::Compact("player fixture".into()),
++            )
++            .unwrap();
++        SimpleContext {
++            entitlement: None,
++            client: reqwest::Client::new(),
++            device_token: None,
++            tokens: Arc::new(gamer.pin_user().unwrap()),
++            store_tokens: Arc::new(owner.pin_user().unwrap()),
++        }
++    }
++
++    #[test]
++    fn role_routing_and_msa_comparison_use_the_selected_accounts() {
++        let split = context("owner-fixture", "player-fixture");
++        assert_eq!(split.account_roles(), [1, 1, 1, 0]);
++        assert_eq!(split.tokens().get_user().unwrap().puid, "player-fixture");
++        assert_eq!(
++            split.store_context().tokens().get_user().unwrap().puid,
++            "owner-fixture"
++        );
++        assert_eq!(
++            context("same-fixture", "same-fixture").account_roles(),
++            [1, 1, 1, 1]
++        );
++        split.store_tokens.remove_user().unwrap();
++        assert_eq!(split.account_roles(), [1, 0, 1, 0]);
++        assert_eq!(split.tokens().get_user().unwrap().puid, "player-fixture");
++        let split = context("owner-fixture", "player-fixture");
++        split.tokens.remove_user().unwrap();
++        assert_eq!(split.account_roles(), [1, 1, 0, 0]);
++        assert_eq!(
++            split.store_context().tokens().get_user().unwrap().puid,
++            "owner-fixture"
++        );
++    }
+ }
+ 
+ impl SimpleContext {
+     pub fn new(device_token: LegacyToken, tokens: Arc<TokenManager>) -> Self {
++        Self::with_roles(device_token, tokens.clone(), tokens)
++    }
++
++    pub fn with_roles(
++        device_token: LegacyToken,
++        store_tokens: Arc<TokenManager>,
++        tokens: Arc<TokenManager>,
++    ) -> Self {
+         let client = reqwest::ClientBuilder::new()
+             .user_agent(format!("xodus-service/{}", env!("CARGO_PKG_VERSION")))
+             .connection_verbose(true)
+@@ -21,12 +99,43 @@ impl SimpleContext {
+ 
+         Self {
+             client,
++            entitlement: None,
+             device_token: Some(device_token),
+             tokens,
++            store_tokens,
+         }
+     }
+ 
+     pub fn tokens(&self) -> &Arc<TokenManager> {
+         &self.tokens
+     }
++
++    pub fn store_context(&self) -> Self {
++        Self {
++            entitlement: self.entitlement.clone(),
++            client: self.client.clone(),
++            device_token: self.device_token.clone(),
++            tokens: self.store_tokens.clone(),
++            store_tokens: self.store_tokens.clone(),
++        }
++    }
++
++    pub fn account_roles(&self) -> [u32; 4] {
++        let store = self
++            .store_tokens
++            .get_user()
++            .ok()
++            .filter(|u| !u.puid.is_empty() && self.store_tokens.get_user_sts_token().is_ok());
++        let player = self
++            .tokens
++            .get_user()
++            .ok()
++            .filter(|u| !u.puid.is_empty() && self.tokens.get_user_sts_token().is_ok());
++        [
++            1,
++            store.is_some() as u32,
++            player.is_some() as u32,
++            matches!((&store,&player),(Some(a),Some(b)) if a.puid==b.puid) as u32,
++        ]
++    }
+ }
+diff --git a/crates/xodus/src/lib.rs b/crates/xodus/src/lib.rs
+index 133a2ed..87dfd38 100644
+--- a/crates/xodus/src/lib.rs
++++ b/crates/xodus/src/lib.rs
+@@ -4,6 +4,7 @@ pub mod clep;
+ pub mod hardware;
+ pub mod licensing;
+ pub mod models;
++pub mod profiles;
+ pub mod secrets;
+ pub mod tokens;
+ 
+diff --git a/crates/xodus/src/licensing.rs b/crates/xodus/src/licensing.rs
+index c0e11f5..e8a12ea 100644
+--- a/crates/xodus/src/licensing.rs
++++ b/crates/xodus/src/licensing.rs
+@@ -1,3 +1,4 @@
++pub mod acquire;
+ pub mod content;
+ pub mod splicense;
+ pub mod utils;
+diff --git a/crates/xodus/src/licensing/acquire.rs b/crates/xodus/src/licensing/acquire.rs
+new file mode 100644
+index 0000000..4e48b18
+--- /dev/null
++++ b/crates/xodus/src/licensing/acquire.rs
+@@ -0,0 +1,107 @@
++use crate::licensing::splicense::{DeviceKey, SPLicense};
++use crate::models::live::ExchangeUserTokenOutcome;
++use crate::models::secrets::Token;
++use crate::models::soap;
++use crate::tokens::TokenManager;
++
++pub async fn get_license(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++    content_id: String,
++    market: String,
++) -> std::result::Result<(DeviceKey, SPLicense), String> {
++    let dev_token = tokens
++        .get_device_sts_token()
++        .map_err(|_| "Store account device credentials are unavailable")?;
++    let Token::Legacy(dev_token) = dev_token else {
++        return Err("Invalid STS token".to_string());
++    };
++    let user = tokens
++        .get_user()
++        .map_err(|_| "Store account is signed out or changed")?;
++    let user_token = tokens
++        .get_user_sts_token()
++        .map_err(|_| "Store account credentials are unavailable")?;
++    let Token::Legacy(legacy) = user_token else {
++        return Err("Unspported user token".to_string());
++    };
++
++    let ms_device_token = crate::api::live::exchange_device_token(
++        client,
++        dev_token.clone(),
++        "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".to_string(),
++        "www.microsoft.com".to_owned(),
++        Some(soap::PolicyReference::mbi_ssl()),
++    )
++    .await
++    .map_err(|_| "Store device authentication failed")?;
++
++    let user_token = crate::api::live::exchange_user_token(
++        client,
++        legacy,
++        user.username,
++        dev_token,
++        None,
++        Some("Silent".to_string()),
++        "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".to_string(),
++        &[(
++            "www.microsoft.com".to_owned(),
++            Some(soap::PolicyReference::mbi_ssl()),
++        )],
++    )
++    .await
++    .map_err(|_| "Store account authentication failed")?;
++
++    let ms_device_token: Token = ms_device_token.into();
++    let Token::Compact(ms_device_token) = ms_device_token else {
++        return Err("Unsupported token".to_string());
++    };
++
++    let user_token: Token = match user_token {
++        ExchangeUserTokenOutcome::Fault(_) => {
++            return Err("Failed to get exchange MS token".to_string());
++        }
++        ExchangeUserTokenOutcome::Issued(
++            soap::BodyContent::RequestSecurityTokenResponseCollection(collection),
++        ) => {
++            let token = collection
++                .security_tokens
++                .into_iter()
++                .next()
++                .ok_or("Store account supplied no token")?;
++            token.into()
++        }
++        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(
++            token,
++        )) => (*token).into(),
++        _ => return Err("Store account supplied an unsupported response".into()),
++    };
++    let Token::Compact(user_token) = user_token else {
++        return Err("Unsupported token".to_string());
++    };
++
++    let (_content, game_license) = crate::licensing::content::get_license_content(
++        client,
++        ms_device_token,
++        user_token,
++        user.puid,
++        content_id,
++        market,
++    )
++    .await
++    .map_err(|err| err.to_string())?;
++
++    let game_splicense = SPLicense::parse_base64(&game_license.splicense_block)
++        .map_err(|_| "Invalid content licence")?;
++
++    let dev_license = tokens
++        .get_device_license()
++        .map_err(|_| "Device licence is unavailable")?;
++    let device_license =
++        SPLicense::parse_base64(&dev_license.splicense).map_err(|_| "Invalid device licence")?;
++    let key = device_license
++        .encrypted_device_key
++        .ok_or("Device licence has no key")?
++        .derive_device_key();
++    Ok((key, game_splicense))
++}
+diff --git a/crates/xodus/src/licensing/content.rs b/crates/xodus/src/licensing/content.rs
+index 2755f1b..ef7cbc9 100644
+--- a/crates/xodus/src/licensing/content.rs
++++ b/crates/xodus/src/licensing/content.rs
+@@ -13,6 +13,8 @@ use crate::models::licensing::{
+ 
+ #[derive(Debug, thiserror::Error)]
+ pub enum LicenseContentError {
++    #[error("invalid licensing response")]
++    InvalidResponse,
+     #[error("request error: {0}")]
+     Request(#[from] reqwest::Error),
+ 
+@@ -71,9 +73,18 @@ pub async fn get_license_content(
+             });
+         }
+     };
+-    let license = &content.keys[0].value;
+-    let license = BASE64_STANDARD.decode(license).unwrap();
+-    let license = quick_xml::de::from_str::<License>(&String::from_utf8(license).unwrap()).unwrap();
++    let license = &content
++        .keys
++        .first()
++        .ok_or(LicenseContentError::InvalidResponse)?
++        .value;
++    let license = BASE64_STANDARD
++        .decode(license)
++        .map_err(|_| LicenseContentError::InvalidResponse)?;
++    let license = quick_xml::de::from_str::<License>(
++        std::str::from_utf8(&license).map_err(|_| LicenseContentError::InvalidResponse)?,
++    )
++    .map_err(|_| LicenseContentError::InvalidResponse)?;
+     Ok((content, license))
+ }
+ 
+diff --git a/crates/xodus/src/profiles.rs b/crates/xodus/src/profiles.rs
+new file mode 100644
+index 0000000..8f57c6b
+--- /dev/null
++++ b/crates/xodus/src/profiles.rs
+@@ -0,0 +1,207 @@
++//! Local account identifiers and metadata. Credentials stay in the keychain.
++use crate::tokens::{TokenManager, store::TokenStoreError};
++use serde::{Deserialize, Serialize};
++use std::path::{Path, PathBuf};
++
++pub const MIGRATED_PROFILE: &str = "00000000000000000000000000000001";
++
++#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
++pub struct Profile {
++    pub id: String,
++    pub label: String,
++    /// Only this imported player may reuse the pre-profile Wine prefix.
++    #[serde(default)]
++    pub legacy_saves: bool,
++    /// Stable across repeat sign-ins to the same verified MSA; never a raw ID.
++    pub save_namespace: String,
++}
++
++pub fn save_namespace(puid: &str) -> String {
++    use sha2::{Digest, Sha256};
++    Sha256::digest(format!("ferestre-player-saves-v1:{puid}"))
++        .iter()
++        .map(|b| format!("{b:02x}"))
++        .collect()
++}
++
++pub fn valid_id(id: &str) -> bool {
++    id.len() == 32
++        && id
++            .bytes()
++            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
++}
++
++pub fn root() -> Result<PathBuf, TokenStoreError> {
++    if let Some(path) = std::env::var_os("XODUS_PROFILE_DIR").filter(|p| !p.is_empty()) {
++        return Ok(PathBuf::from(path));
++    }
++    let state = std::env::var_os("XDG_STATE_HOME")
++        .filter(|p| !p.is_empty())
++        .map(PathBuf::from)
++        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/state")))
++        .ok_or_else(|| std::io::Error::other("HOME or XDG_STATE_HOME is required"))?;
++    Ok(state.join("xodus/accounts"))
++}
++
++fn path(root: &Path, id: &str) -> Result<PathBuf, TokenStoreError> {
++    if !valid_id(id) {
++        return Err(std::io::Error::other("invalid account profile ID").into());
++    }
++    Ok(root.join(format!("{id}.json")))
++}
++
++pub fn load(root: &Path, id: &str) -> Result<Profile, TokenStoreError> {
++    let profile: Profile = serde_json::from_slice(&std::fs::read(path(root, id)?)?)?;
++    if profile.id != id {
++        return Err(std::io::Error::other("account profile identity mismatch").into());
++    }
++    Ok(profile)
++}
++
++pub fn list(root: &Path) -> Result<Vec<Profile>, TokenStoreError> {
++    let entries = match std::fs::read_dir(root) {
++        Ok(entries) => entries,
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
++        Err(e) => return Err(e.into()),
++    };
++    let mut profiles = Vec::new();
++    for entry in entries {
++        let entry = entry?;
++        if let Some(id) = entry
++            .path()
++            .file_stem()
++            .and_then(|s| s.to_str())
++            .filter(|s| valid_id(s))
++        {
++            profiles.push(load(root, id)?);
++        }
++    }
++    profiles.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.id.cmp(&b.id)));
++    Ok(profiles)
++}
++
++pub fn default_id(root: &Path) -> Result<Option<String>, TokenStoreError> {
++    let id = match std::fs::read_to_string(root.join("default")) {
++        Ok(id) => id.trim().to_owned(),
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
++        Err(e) => return Err(e.into()),
++    };
++    load(root, &id)?;
++    Ok(Some(id))
++}
++
++pub fn save(root: &Path, profile: &Profile) -> Result<(), TokenStoreError> {
++    atomic(
++        root,
++        &path(root, &profile.id)?,
++        &serde_json::to_vec(profile)?,
++    )
++}
++
++fn atomic(root: &Path, dest: &Path, bytes: &[u8]) -> Result<(), TokenStoreError> {
++    use std::io::Write;
++    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
++    std::fs::DirBuilder::new()
++        .recursive(true)
++        .mode(0o700)
++        .create(root)?;
++    let temporary = root.join(format!(".write-{}", uuid::Uuid::new_v4().simple()));
++    let result = (|| -> Result<(), TokenStoreError> {
++        let mut file = std::fs::OpenOptions::new()
++            .write(true)
++            .create_new(true)
++            .mode(0o600)
++            .open(&temporary)?;
++        file.write_all(bytes)?;
++        file.sync_all()?;
++        std::fs::rename(&temporary, dest)?;
++        Ok(())
++    })();
++    let _ = std::fs::remove_file(temporary);
++    result
++}
++
++/// Copy both legacy entries before publishing the default. An interrupted copy
++/// is retryable, and the original entries remain available to older launchers.
++pub fn migrate(root: &Path, legacy: &TokenManager) -> Result<Option<Profile>, TokenStoreError> {
++    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
++    std::fs::DirBuilder::new()
++        .recursive(true)
++        .mode(0o700)
++        .create(root)?;
++    let lock = std::fs::OpenOptions::new()
++        .create(true)
++        .truncate(false)
++        .read(true)
++        .write(true)
++        .mode(0o600)
++        .open(root.join(".migration-lock"))?;
++    lock.lock()?;
++    if let Some(id) = default_id(root)? {
++        return Ok(Some(load(root, &id)?));
++    }
++    let user = match legacy.get_user() {
++        Ok(user) => user,
++        Err(TokenStoreError::NotFound) => return Ok(None),
++        Err(error) => return Err(error),
++    };
++    match legacy.get_user_sts_token() {
++        Ok(_) => {}
++        Err(TokenStoreError::NotFound) => return Ok(None),
++        Err(error) => return Err(error),
++    }
++    // If the credentials/profile were already copied before a crash, commit
++    // that original binding rather than overwrite it from a changed legacy login.
++    if let Ok(existing) = load(root, MIGRATED_PROFILE) {
++        let migrated = legacy.scoped(MIGRATED_PROFILE)?;
++        if let Ok(original) = migrated.get_user() {
++            if existing.save_namespace == save_namespace(&original.puid)
++                && migrated.get_user_sts_token().is_ok()
++            {
++                atomic(root, &root.join("default"), existing.id.as_bytes())?;
++                return Ok(Some(existing));
++            }
++        }
++        if existing.save_namespace != save_namespace(&user.puid) {
++            return Err(std::io::Error::other(
++                "legacy sign-in changed during migration; existing profile kept",
++            )
++            .into());
++        }
++    }
++    legacy.migrate_user_to(MIGRATED_PROFILE)?;
++    let profile = Profile {
++        id: MIGRATED_PROFILE.into(),
++        label: "Existing account".into(),
++        legacy_saves: true,
++        save_namespace: save_namespace(&legacy.get_user()?.puid),
++    };
++    save(root, &profile)?;
++    atomic(root, &root.join("default"), profile.id.as_bytes())?;
++    Ok(Some(profile))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn registry_rejects_paths_and_retains_the_default_binding() {
++        let root = std::env::temp_dir().join(format!("xodus-profiles-{}", uuid::Uuid::new_v4()));
++        let profile = Profile {
++            id: MIGRATED_PROFILE.into(),
++            label: "Fixture player".into(),
++            legacy_saves: true,
++            save_namespace: save_namespace("registry-fixture"),
++        };
++        assert!(load(&root, "../elsewhere").is_err());
++        assert_eq!(list(&root).unwrap(), Vec::new());
++        save(&root, &profile).unwrap();
++        atomic(&root, &root.join("default"), profile.id.as_bytes()).unwrap();
++        assert_eq!(list(&root).unwrap(), vec![profile]);
++        assert_eq!(
++            default_id(&root).unwrap().as_deref(),
++            Some(MIGRATED_PROFILE)
++        );
++        std::fs::remove_dir_all(root).unwrap();
++    }
++}
+diff --git a/crates/xodus/src/tokens/manager.rs b/crates/xodus/src/tokens/manager.rs
+index aeb9897..98502ac 100644
+--- a/crates/xodus/src/tokens/manager.rs
++++ b/crates/xodus/src/tokens/manager.rs
+@@ -14,6 +14,132 @@ mod keys {
+     pub const USER_INFO: &str = "user-DA";
+ }
+ 
++#[cfg(test)]
++mod profile_tests {
++    use super::*;
++    use crate::tokens::store::TokenBackend;
++    const OWNER: &str = "11111111111111111111111111111111";
++    const PLAYER: &str = "22222222222222222222222222222222";
++
++    fn user(puid: &str) -> User {
++        User {
++            puid: puid.into(),
++            username: "offline fixture".into(),
++        }
++    }
++
++    #[test]
++    fn profiles_isolate_user_tokens_and_logout_without_replacing_the_device() {
++        let legacy = TokenManager::with_memory();
++        let owner = legacy.scoped(OWNER).unwrap();
++        let player = legacy.scoped(PLAYER).unwrap();
++        legacy.save_user(&user("legacy-fixture")).unwrap();
++        owner.save_user(&user("owner-fixture")).unwrap();
++        player.save_user(&user("player-fixture")).unwrap();
++        owner
++            .save_user_token(PASSPORT_STS.into(), Token::Compact("owner-fixture".into()))
++            .unwrap();
++        player
++            .save_user_token(PASSPORT_STS.into(), Token::Compact("player-fixture".into()))
++            .unwrap();
++        owner
++            .save_device_token(
++                PASSPORT_STS.into(),
++                Token::Compact("shared-device-fixture".into()),
++            )
++            .unwrap();
++        assert_eq!(legacy.get_user().unwrap().puid, "legacy-fixture");
++        assert_eq!(owner.get_user().unwrap().puid, "owner-fixture");
++        assert_eq!(player.get_user().unwrap().puid, "player-fixture");
++        assert!(
++            matches!(owner.get_user_sts_token().unwrap(),Token::Compact(s) if s=="owner-fixture")
++        );
++        assert!(
++            matches!(player.get_user_sts_token().unwrap(),Token::Compact(s) if s=="player-fixture")
++        );
++        assert!(
++            matches!(player.get_device_sts_token().unwrap(),Token::Compact(s) if s=="shared-device-fixture")
++        );
++        owner.remove_persistent().unwrap();
++        assert!(owner.get_user().is_err());
++        assert_eq!(player.get_user().unwrap().puid, "player-fixture");
++        assert!(legacy.get_device_sts_token().is_ok());
++        assert!(player.scoped("../owner").is_err());
++    }
++
++    #[test]
++    fn a_live_service_cannot_follow_replacement_credentials_in_its_profile() {
++        let backend = TokenManager::with_memory();
++        let profile = backend.scoped(OWNER).unwrap();
++        profile.save_user(&user("original-fixture")).unwrap();
++        profile
++            .save_user_token(
++                PASSPORT_STS.into(),
++                Token::Compact("original-fixture".into()),
++            )
++            .unwrap();
++        let pinned = profile.clone().pin_user().unwrap();
++        profile.save_user(&user("replacement-fixture")).unwrap();
++        profile
++            .save_user_token(
++                PASSPORT_STS.into(),
++                Token::Compact("replacement-fixture".into()),
++            )
++            .unwrap();
++        assert!(pinned.get_user().is_err());
++        assert!(pinned.get_user_sts_token().is_err());
++    }
++
++    struct InterruptCopy {
++        inner: MemoryBackend,
++        interrupt: std::sync::atomic::AtomicBool,
++    }
++    impl TokenBackend for InterruptCopy {
++        fn get(&self, k: &str) -> Result<Option<Vec<u8>>, TokenStoreError> {
++            self.inner.get(k)
++        }
++        fn set(&self, k: &str, v: &[u8]) -> Result<(), TokenStoreError> {
++            if k.ends_with("/user-DA")
++                && self
++                    .interrupt
++                    .swap(false, std::sync::atomic::Ordering::SeqCst)
++            {
++                return Err(std::io::Error::other("simulated interrupted migration").into());
++            }
++            self.inner.set(k, v)
++        }
++        fn remove(&self, k: &str) -> Result<(), TokenStoreError> {
++            self.inner.remove(k)
++        }
++    }
++
++    #[test]
++    fn interrupted_migration_keeps_legacy_credentials_and_retries_without_crossing_profiles() {
++        let backend = Arc::new(InterruptCopy {
++            inner: MemoryBackend::default(),
++            interrupt: std::sync::atomic::AtomicBool::new(true),
++        });
++        let legacy = TokenManager::new(backend, Arc::new(MemoryBackend::default()));
++        legacy.save_user(&user("original-fixture")).unwrap();
++        legacy
++            .save_user_token(
++                PASSPORT_STS.into(),
++                Token::Compact("original-fixture".into()),
++            )
++            .unwrap();
++        assert!(legacy.migrate_user_to(OWNER).is_err());
++        assert_eq!(legacy.get_user().unwrap().puid, "original-fixture");
++        assert!(legacy.scoped(OWNER).unwrap().get_user().is_err());
++        legacy.migrate_user_to(OWNER).unwrap();
++        assert_eq!(
++            legacy.scoped(OWNER).unwrap().get_user().unwrap().puid,
++            "original-fixture"
++        );
++        assert!(legacy.scoped(PLAYER).unwrap().get_user().is_err());
++        assert!(legacy.get_user_sts_token().is_ok());
++    }
++}
++
+ pub const PASSPORT_STS: &str = "http://Passport.NET/STS";
+ 
+ /// Semantic facade over the two storage tiers: a persistent, keychain-backed tier
+@@ -24,6 +150,8 @@ pub const PASSPORT_STS: &str = "http://Passport.NET/STS";
+ pub struct TokenManager {
+     persistent: Arc<dyn TokenBackend>,
+     ephemeral: Arc<dyn ExpiringTokenBackend>,
++    profile: Option<String>,
++    expected_user: Option<String>,
+ }
+ 
+ impl TokenManager {
+@@ -34,6 +162,8 @@ impl TokenManager {
+         Self {
+             persistent,
+             ephemeral,
++            profile: None,
++            expected_user: None,
+         }
+     }
+ 
+@@ -46,6 +176,72 @@ impl TokenManager {
+         )
+     }
+ 
++    /// Device registration is shared; only user credentials are namespaced.
++    /// Every manager has its own ephemeral token cache, even for the same RP.
++    pub fn for_profile(profile: &str) -> Result<Self, TokenStoreError> {
++        Self::with_keychain_and_memory().scoped(profile)
++    }
++
++    pub fn profile_id(&self) -> Option<&str> {
++        self.profile.as_deref()
++    }
++
++    pub fn scoped(&self, profile: &str) -> Result<Self, TokenStoreError> {
++        if !crate::profiles::valid_id(profile) {
++            return Err(std::io::Error::other("invalid account profile ID").into());
++        }
++        Ok(Self {
++            persistent: self.persistent.clone(),
++            ephemeral: Arc::new(MemoryBackend::default()),
++            profile: Some(profile.into()),
++            expected_user: None,
++        })
++    }
++
++    fn user_key(&self, key: &str) -> String {
++        match &self.profile {
++            Some(id) => format!("profile/{id}/{key}"),
++            None => key.into(),
++        }
++    }
++
++    /// A running service may refresh credentials, but never change identity.
++    pub fn pin_user(mut self) -> Result<Self, TokenStoreError> {
++        let user = self.get_user()?;
++        self.get_user_sts_token()?;
++        if user.puid.is_empty() {
++            return Err(std::io::Error::other("account has no verified MSA identity").into());
++        }
++        self.expected_user = Some(user.puid);
++        Ok(self)
++    }
++
++    pub fn migrate_user_to(&self, profile: &str) -> Result<(), TokenStoreError> {
++        let target = self.scoped(profile)?;
++        for key in [keys::USER_TOKENS, keys::USER_INFO] {
++            let value = self
++                .persistent
++                .get(&self.user_key(key))?
++                .ok_or(TokenStoreError::NotFound)?;
++            let dest = target.user_key(key);
++            self.persistent.set(&dest, &value)?;
++            if self.persistent.get(&dest)?.as_deref() != Some(value.as_slice()) {
++                return Err(std::io::Error::other("account migration verification failed").into());
++            }
++        }
++        Ok(())
++    }
++
++    pub fn remove_user(&self) -> Result<(), TokenStoreError> {
++        for key in [keys::USER_TOKENS, keys::USER_INFO] {
++            let key = self.user_key(key);
++            if self.persistent.get(&key)?.is_some() {
++                self.persistent.remove(&key)?;
++            }
++        }
++        Ok(())
++    }
++
+     /// Keychain for persistent storage, in-memory for ephemeral - the default
+     /// wiring for both `xodus-cli` and `xodus-service` today.
+     pub fn with_memory() -> Self {
+@@ -56,6 +252,9 @@ impl TokenManager {
+     }
+ 
+     pub fn remove_persistent(&self) -> Result<(), TokenStoreError> {
++        if self.profile.is_some() {
++            return self.remove_user();
++        }
+         self.persistent.remove(keys::DEVICE_TOKENS)?;
+         self.persistent.remove(keys::USER_TOKENS)?;
+         self.persistent.remove(keys::USER_INFO)
+@@ -98,11 +297,26 @@ impl TokenManager {
+     // ---- User STS tokens (keyed by SOAP "applies_to" address) --------------
+ 
+     pub fn get_user_token_for(&self, address: &str) -> Result<Option<Token>, TokenStoreError> {
+-        Self::read_token_store(&*self.persistent, keys::USER_TOKENS, address)
++        if self.expected_user.is_some() {
++            self.get_user()?;
++        }
++        Self::read_token_store(
++            &*self.persistent,
++            &self.user_key(keys::USER_TOKENS),
++            address,
++        )
+     }
+ 
+     pub fn save_user_token(&self, address: String, token: Token) -> Result<(), TokenStoreError> {
+-        Self::write_token_store(&*self.persistent, keys::USER_TOKENS, address, token)
++        if self.expected_user.is_some() {
++            self.get_user()?;
++        }
++        Self::write_token_store(
++            &*self.persistent,
++            &self.user_key(keys::USER_TOKENS),
++            address,
++            token,
++        )
+     }
+ 
+     pub fn get_user_sts_token(&self) -> Result<Token, TokenStoreError> {
+@@ -115,19 +329,33 @@ impl TokenManager {
+     pub fn get_user(&self) -> Result<User, TokenStoreError> {
+         let bytes = self
+             .persistent
+-            .get(keys::USER_INFO)?
++            .get(&self.user_key(keys::USER_INFO))?
+             .ok_or(TokenStoreError::NotFound)?;
+-        Ok(serde_json::from_slice(&bytes)?)
++        let user: User = serde_json::from_slice(&bytes)?;
++        if self
++            .expected_user
++            .as_ref()
++            .is_some_and(|expected| *expected != user.puid)
++        {
++            return Err(std::io::Error::other(
++                "account changed while a game was running; launch again",
++            )
++            .into());
++        }
++        Ok(user)
+     }
+ 
+     pub fn save_user(&self, user: &User) -> Result<(), TokenStoreError> {
+         self.persistent
+-            .set(keys::USER_INFO, &serde_json::to_vec(user)?)
++            .set(&self.user_key(keys::USER_INFO), &serde_json::to_vec(user)?)
+     }
+ 
+     // ---- Ephemeral XSTS-by-relying-party cache --------------------------------
+ 
+     pub fn get_cached_xsts(&self, relying_party: &str) -> Option<XstsResponse> {
++        if self.expected_user.is_some() && self.get_user().is_err() {
++            return None;
++        }
+         let bytes = self.ephemeral.get(relying_party).ok()??;
+         serde_json::from_slice(&bytes).ok()
+     }

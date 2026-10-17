@@ -9,6 +9,7 @@
 //!
 //! The client is never linked: Xodus is GPL-3.0-only, and the decrypted
 //! executable has to stay a child of the process that opened it.
+mod accounts_ui;
 mod cancel;
 mod editor;
 mod model;
@@ -24,7 +25,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use ferestre_core::recipe::Recipe;
-use ferestre_core::{account, catalog, gamepass, library, steam};
+use ferestre_core::{account, accounts, catalog, gamepass, library, steam};
 use model::{Action, Inputs, LibraryRow, Ownership};
 use state::{Model, Section, AVATAR_PX, ICON_PX, PER_PAGE};
 
@@ -69,10 +70,17 @@ struct Ui {
     /// mapped to the process group to signal. Deliberately not the `busy` flag:
     /// a game runs for hours and must not hold the window's other work.
     running: Rc<RefCell<BTreeMap<String, u32>>>,
+    running_servers: Rc<RefCell<BTreeMap<String, (PathBuf, PathBuf)>>>,
 }
 
 fn main() -> glib::ExitCode {
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    let application_id = std::env::var("FERESTRE_APPLICATION_ID")
+        .ok()
+        .filter(|id| gio::Application::id_is_valid(id))
+        .unwrap_or_else(|| APP_ID.into());
+    let app = adw::Application::builder()
+        .application_id(&application_id)
+        .build();
     app.connect_activate(build_ui);
     app.run()
 }
@@ -262,6 +270,7 @@ fn build_ui(app: &adw::Application) {
         close_dialog_open: Rc::new(RefCell::new(false)),
         download_control: Rc::new(RefCell::new(None)),
         running: Rc::new(RefCell::new(BTreeMap::new())),
+        running_servers: Rc::new(RefCell::new(BTreeMap::new())),
         asked_names: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
         fetching_gamepass: Rc::new(RefCell::new(false)),
         fetching_names: Rc::new(Cell::new(false)),
@@ -1384,27 +1393,61 @@ fn render_account_button(ui: &Ui) {
     }
     content.append(&avatar);
 
+    let (primary, secondary) = if let Some(roles) = &model.roles {
+        let player = model
+            .profiles
+            .as_ref()
+            .and_then(|p| p.profiles.iter().find(|p| p.id == roles.player))
+            .map(|p| {
+                format!(
+                    "{}{}",
+                    p.label,
+                    if p.signed_in { "" } else { " (signed out)" }
+                )
+            })
+            .unwrap_or_else(|| "not checked".into());
+        (
+            format!(
+                "Store: {}",
+                model
+                    .account
+                    .as_ref()
+                    .map(|a| a.label())
+                    .unwrap_or("signed out")
+            ),
+            format!("Player: {player}"),
+        )
+    } else {
+        (
+            model
+                .account
+                .as_ref()
+                .map(|a| a.label())
+                .unwrap_or("Not signed in")
+                .to_string(),
+            if model.ownership.is_known() {
+                "Library loaded"
+            } else if model.account.is_some() {
+                "Load library"
+            } else {
+                "Sign in"
+            }
+            .into(),
+        )
+    };
     let labels = gtk::Box::new(gtk::Orientation::Vertical, 0);
     labels.append(
         &gtk::Label::builder()
-            .label(match &model.account {
-                Some(account) => account.label(),
-                None => "Not signed in",
-            })
+            .label(&primary)
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build(),
     );
     labels.append(
         &gtk::Label::builder()
-            .label(if model.ownership.is_known() {
-                "Library loaded"
-            } else if model.account.is_some() {
-                "Load library"
-            } else {
-                "Sign in"
-            })
+            .label(&secondary)
             .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["caption", "dim-label"])
             .build(),
     );
@@ -1457,6 +1500,22 @@ fn account_menu(ui: &Ui) {
         }
         button
     };
+
+    let accounts = entry(
+        "Accounts",
+        "Choose the Store owner and Xbox player separately",
+    );
+    accounts.connect_clicked(glib::clone!(
+        #[strong]
+        ui,
+        #[strong]
+        popover,
+        move |_| {
+            popover.popdown();
+            accounts_ui::open(&ui);
+        }
+    ));
+    items.append(&accounts);
 
     let reload = entry(
         "Reload library",
@@ -1571,11 +1630,11 @@ fn sign_out(ui: &Ui) {
         report_busy(ui);
         return;
     }
+    let roles = ui.model.borrow().roles.clone();
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = gio::spawn_blocking(move || {
-            std::process::Command::new(&client)
-                .arg("logout")
+            scope_store(account::logout_command(&client), roles.as_ref())
                 .stdin(std::process::Stdio::null())
                 .status()
                 .map_err(|e| format!("{}: {e}", client.display()))
@@ -1594,9 +1653,9 @@ fn sign_out(ui: &Ui) {
                     model.ownership = Ownership::Unknown;
                     model.subscriptions.clear();
                     model.entitlements_checked = false;
-                    if let Some(paths) = model.paths.as_ref() {
-                        let _ = std::fs::remove_file(library::cache_path(paths.state_dir()));
-                        let _ = std::fs::remove_file(account::cache_path(paths.state_dir()));
+                    if let Some(state) = model.private_state_dir() {
+                        let _ = std::fs::remove_file(library::cache_path(&state));
+                        let _ = std::fs::remove_file(account::cache_path(&state));
                     }
                 }
                 render(&ui);
@@ -1666,12 +1725,72 @@ fn warn_about_media(ui: &Ui, product_id: &str) {
 }
 
 fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
+    let (roles, server) = {
+        let model = ui.model.borrow();
+        if let Some(roles) = &model.roles {
+            let result = model
+                .profiles
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Account identities are still loading. Open Accounts to check them."
+                    )
+                })
+                .and_then(|profiles| roles.selected(profiles));
+            if let Err(error) = result {
+                ui.toasts.add_toast(adw::Toast::new(&error.to_string()));
+                return;
+            }
+            if roles.split() {
+                let supported = model
+                    .paths
+                    .as_ref()
+                    .zip(model.recipe_for(product_id))
+                    .and_then(|(paths, recipe)| {
+                        let inferred = ferestre_core::autofix::infer(
+                            recipe,
+                            model.game_dir(recipe).as_deref(),
+                        );
+                        let selected =
+                            ferestre_core::runtime::selected(paths.config_dir(), product_id);
+                        ferestre_core::runtime::select(
+                            &inferred.recipe,
+                            &model.runtimes,
+                            selected.as_deref(),
+                            model.registry.as_ref(),
+                        )
+                        .ok()
+                    })
+                    .is_some_and(|runtime| runtime.provides(accounts::CAPABILITY));
+                if !supported {
+                    ui.toasts.add_toast(adw::Toast::builder()
+                        .title("Select an account-sharing runtime for this game using its runtime button, then try again.")
+                        .timeout(15).build());
+                    return;
+                }
+            }
+        }
+        (
+            model.roles.clone(),
+            model
+                .recipe_for(product_id)
+                .and_then(|r| model.wineserver(r)),
+        )
+    };
     warn_about_media(ui, product_id);
     use std::os::unix::process::CommandExt;
 
     let program = cli_binary();
     let mut command = std::process::Command::new(&program);
     command.arg("run").arg(product_id);
+    if let Some(roles) = &roles {
+        command.env(
+            "FERESTRE_ACCOUNT_ROLES",
+            serde_json::to_string(roles).unwrap(),
+        );
+    } else {
+        command.env_remove("FERESTRE_ACCOUNT_ROLES");
+    }
     // Safety: setsid in the child between fork and exec. Async-signal-safe, and
     // the only thing this closure does.
     unsafe {
@@ -1695,6 +1814,9 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
     let key = product_id.to_ascii_uppercase();
     // setsid makes the child its own group leader, so the group id is its pid.
     ui.running.borrow_mut().insert(key.clone(), child.id());
+    if let Some(server) = server {
+        ui.running_servers.borrow_mut().insert(key.clone(), server);
+    }
     render(ui);
     ui.toasts
         .add_toast(adw::Toast::new(&format!("Starting {name}")));
@@ -1707,6 +1829,7 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
         let mut child = child;
         let status = gio::spawn_blocking(move || child.wait()).await;
         ui.running.borrow_mut().remove(&key);
+        ui.running_servers.borrow_mut().remove(&key);
         render(&ui);
         match status {
             Ok(Ok(status)) if status.success() => {}
@@ -1744,12 +1867,7 @@ fn stop_title(ui: &Ui, product_id: &str, name: &str) {
     // wineserver detaches, so the title is reparented out of the group this
     // window created and survives it -- measured, with the row saying stopped
     // while Minecraft was still running. `wineserver -k` ends the prefix.
-    let server = {
-        let model = ui.model.borrow();
-        model
-            .recipe_for(product_id)
-            .and_then(|recipe| model.wineserver(recipe))
-    };
+    let server = ui.running_servers.borrow().get(&key).cloned();
     if let Some((server, prefix)) = server {
         if let Ok(child) = std::process::Command::new(server)
             .env("WINEPREFIX", prefix)
@@ -2433,6 +2551,8 @@ fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {
 fn account_pressed(ui: &Ui) {
     if ui.model.borrow().account.is_some() {
         account_menu(ui);
+    } else if ui.model.borrow().roles.is_some() {
+        accounts_ui::open(ui);
     } else {
         sign_in(ui);
     }
@@ -2597,9 +2717,13 @@ fn sign_in(ui: &Ui) {
 }
 
 fn refresh_account(ui: &Ui) {
-    let (client, cache_dir) = {
+    let (client, cache_dir, roles) = {
         let model = ui.model.borrow();
-        (model.xodus_cli(), model.cache_dir().map(Path::to_owned))
+        (
+            model.xodus_cli(),
+            model.account_cache_dir(),
+            model.roles.clone(),
+        )
     };
     let (Some(client), Some(cache_dir)) = (client, cache_dir) else {
         return;
@@ -2607,53 +2731,97 @@ fn refresh_account(ui: &Ui) {
     if !begin(ui, "Refreshing account") {
         return;
     }
-
     let ui = ui.clone();
     glib::spawn_future_local(async move {
+        let expected = roles.clone();
         let result = gio::spawn_blocking(move || {
-            let output = account::command(&client).output().ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            let account = account::parse(&String::from_utf8_lossy(&output.stdout)).ok()?;
-            // Best effort: an account with no picture is still an account.
-            let avatar = account::avatar(&cache_dir, &account, AVATAR_PX).ok();
-            Some((account, avatar))
+            let profiles = if roles.is_some() {
+                accounts::fetch(&client).ok()
+            } else {
+                None
+            };
+            let mut command = scope_store(account::command(&client), roles.as_ref());
+            let found = command
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| account::parse(&String::from_utf8_lossy(&o.stdout)).ok())
+                .map(|account| {
+                    let avatar = account::avatar(&cache_dir, &account, AVATAR_PX).ok();
+                    (account, avatar)
+                });
+            (found, profiles)
         })
         .await;
         finish(&ui);
-        if let Ok(Some((account, avatar))) = result {
-            {
-                let mut model = ui.model.borrow_mut();
+        if ui.model.borrow().roles != expected {
+            return;
+        }
+        if let Ok((found, profiles)) = result {
+            let mut model = ui.model.borrow_mut();
+            if let Some(profiles) = profiles {
+                model.profiles = Some(profiles);
+            }
+            if let Some((account, avatar)) = found {
                 let changed = model
                     .account
                     .as_ref()
-                    .map_or(true, |previous| !account::same_identity(previous, &account));
+                    .map_or(true, |old| !account::same_identity(old, &account));
                 if changed {
                     model.ownership = Ownership::Unknown;
                     model.subscriptions.clear();
                     model.entitlements_checked = false;
-                    if let Some(paths) = model.paths.as_ref() {
-                        let _ = std::fs::remove_file(library::cache_path(paths.state_dir()));
+                    if let Some(state) = model.private_state_dir() {
+                        let _ = std::fs::remove_file(library::cache_path(&state));
                     }
                 }
-                if let Some(paths) = model.paths.as_ref() {
-                    let _ = account::save_cache(paths.state_dir(), &account);
+                if let Some(state) = model.private_state_dir() {
+                    let _ = account::save_cache(&state, &account);
                 }
                 model.account = Some(account);
                 model.avatar = avatar;
+            } else if model
+                .roles
+                .as_ref()
+                .zip(model.profiles.as_ref())
+                .is_some_and(|(roles, profiles)| {
+                    !profiles
+                        .profiles
+                        .iter()
+                        .any(|p| p.id == roles.store && p.signed_in)
+                })
+            {
+                model.account = None;
+                model.avatar = None;
+                model.ownership = Ownership::Unknown;
+                model.subscriptions.clear();
+                model.entitlements_checked = false;
+                if let Some(state) = model.private_state_dir() {
+                    let _ = std::fs::remove_file(library::cache_path(&state));
+                    let _ = std::fs::remove_file(account::cache_path(&state));
+                }
             }
-            render(&ui);
-            refresh_entitlements(&ui, false);
         }
+        render(&ui);
+        refresh_entitlements(&ui, false);
         refresh_updates(&ui, false);
     });
+}
+
+fn scope_store(
+    mut command: std::process::Command,
+    roles: Option<&accounts::Selection>,
+) -> std::process::Command {
+    if let Some(roles) = roles {
+        roles.apply(&mut command);
+    }
+    command
 }
 
 fn refresh_updates(ui: &Ui, force: bool) {
     let (client, state_dir, records) = {
         let model = ui.model.borrow();
-        let state_dir = model.paths.as_ref().map(|p| p.state_dir().to_path_buf());
+        let state_dir = model.private_state_dir();
         let records = model
             .records
             .values()
@@ -2680,14 +2848,17 @@ fn refresh_updates(ui: &Ui, force: bool) {
         }
         return;
     }
+    let roles = ui.model.borrow().roles.clone();
     let ui = ui.clone();
     glib::spawn_future_local(async move {
+        let expected = roles.clone();
         let checked = gio::spawn_blocking(move || {
             let mut available = Vec::new();
             for record in records {
                 let content_id = &record.content_ids[0];
-                let version = std::process::Command::new(&client)
-                    .args(["update", content_id, "--json"])
+                let mut command = std::process::Command::new(&client);
+                command.args(["update", content_id, "--json"]);
+                let version = scope_store(command, roles.as_ref())
                     .stderr(std::process::Stdio::null())
                     .output()
                     .ok()
@@ -2711,6 +2882,9 @@ fn refresh_updates(ui: &Ui, force: bool) {
         })
         .await;
         finish(&ui);
+        if ui.model.borrow().roles != expected {
+            return;
+        }
         if let Ok(available) = checked {
             let mut model = ui.model.borrow_mut();
             for (record, version) in available {
@@ -2734,9 +2908,9 @@ fn refresh_entitlements(ui: &Ui, force: bool) {
     if !force {
         let model = ui.model.borrow();
         if model.entitlements_checked
-            && model.paths.as_ref().is_some_and(|p| {
+            && model.private_state_dir().is_some_and(|p| {
                 ferestre_core::cache::is_fresh(
-                    &library::cache_path(p.state_dir()),
+                    &library::cache_path(&p),
                     ferestre_core::cache::LIBRARY_MAX_AGE,
                 )
             })
@@ -2753,7 +2927,7 @@ fn refresh_entitlements(ui: &Ui, force: bool) {
         let model = ui.model.borrow();
         (
             model.xodus_cli(),
-            model.paths.as_ref().map(|p| p.state_dir().to_path_buf()),
+            model.private_state_dir(),
             model.account.clone(),
         )
     };
@@ -2761,13 +2935,18 @@ fn refresh_entitlements(ui: &Ui, force: bool) {
         return;
     };
     ui.fetching_entitlements.replace(true);
+    let roles = ui.model.borrow().roles.clone();
     let ui = ui.clone();
     glib::spawn_future_local(async move {
+        let expected = roles.clone();
         let result = gio::spawn_blocking(move || {
-            let output = ferestre_core::library::library_command(&client, &Default::default())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .ok()?;
+            let output = scope_store(
+                ferestre_core::library::library_command(&client, &Default::default()),
+                roles.as_ref(),
+            )
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
             if !output.status.success() {
                 return None;
             }
@@ -2778,6 +2957,10 @@ fn refresh_entitlements(ui: &Ui, force: bool) {
         if let Ok(Some(entries)) = result {
             // Ignore a response for an account that signed out or changed
             // while the query was in flight.
+            if ui.model.borrow().roles != expected {
+                refresh_entitlements(&ui, false);
+                return;
+            }
             if ui.model.borrow().account != account {
                 return;
             }
@@ -2823,13 +3006,18 @@ fn refresh_library(ui: &Ui) {
     ui.toasts
         .add_toast(adw::Toast::new("Asking what this account owns"));
 
+    let roles = ui.model.borrow().roles.clone();
     let ui = ui.clone();
     glib::spawn_future_local(async move {
+        let expected = roles.clone();
         let result = gio::spawn_blocking(move || {
-            let output = ferestre_core::library::library_command(&client, &Default::default())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .map_err(|e| format!("{}: {e}", client.display()))?;
+            let output = scope_store(
+                ferestre_core::library::library_command(&client, &Default::default()),
+                roles.as_ref(),
+            )
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("{}: {e}", client.display()))?;
             if !output.status.success() {
                 return Err(format!("{} exited {}", client.display(), output.status));
             }
@@ -2854,19 +3042,16 @@ fn refresh_library(ui: &Ui) {
         .await;
         finish(&ui);
 
+        if ui.model.borrow().roles != expected {
+            return;
+        }
         match result {
             Ok(Ok((entries, products, failures))) => {
                 let owned = entries.iter().filter(|e| e.is_title()).count();
                 {
                     // Written before it is drawn, so the next launch opens on a
                     // library rather than on a button.
-                    if let Some(state_dir) = ui
-                        .model
-                        .borrow()
-                        .paths
-                        .as_ref()
-                        .map(|p| p.state_dir().to_owned())
-                    {
+                    if let Some(state_dir) = ui.model.borrow().private_state_dir() {
                         let _ = ferestre_core::library::save_cache(&state_dir, &entries);
                     }
                     let mut model = ui.model.borrow_mut();
@@ -3085,6 +3270,8 @@ mod catalog_regressions {
 
     fn fixture() -> Model {
         Model {
+            roles: None,
+            profiles: None,
             paths: None,
             recipes: Vec::new(),
             runtime: None,
