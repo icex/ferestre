@@ -38,25 +38,28 @@ pub(super) fn open(ui: &Ui) {
 
 fn show(ui: &Ui, profiles: accounts::Profiles) {
     ui.model.borrow_mut().profiles = Some(profiles.clone());
-    let window = gtk::Window::builder()
+    let window = adw::Window::builder()
         .title("Accounts")
         .transient_for(&ui.window)
         .modal(true)
-        .default_width(540)
+        .default_width(600)
+        .default_height(680)
         .build();
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(18)
-        .margin_bottom(18)
-        .margin_start(18)
-        .margin_end(18)
+    let header = adw::HeaderBar::new();
+    let add = gtk::Button::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("Sign in another Microsoft account")
         .build();
-    let help=gtk::Label::builder().label("The Store account supplies purchases and subscriptions. The Player account supplies Xbox identity, achievements and saves.")
-        .wrap(true).xalign(0.0).build();
-    content.append(&help);
-    let labels: Vec<String> = profiles
-        .profiles
+    add.update_property(&[gtk::accessible::Property::Label("Add account")]);
+    header.pack_start(&add);
+    let page = adw::PreferencesPage::new();
+    let content = adw::ToolbarView::new();
+    content.add_top_bar(&header);
+    content.set_content(Some(&page));
+    window.set_content(Some(&content));
+
+    let choices = Rc::new(profiles.profiles.clone());
+    let labels: Vec<String> = choices
         .iter()
         .map(|p| {
             format!(
@@ -67,62 +70,195 @@ fn show(ui: &Ui, profiles: accounts::Profiles) {
         })
         .collect();
     let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-    let store = gtk::DropDown::from_strings(&refs);
-    store.update_property(&[gtk::accessible::Property::Label("Store account")]);
-    let player = gtk::DropDown::from_strings(&refs);
-    player.update_property(&[gtk::accessible::Property::Label("Player account")]);
     let selection = ui.model.borrow().roles.clone();
     let default = profiles
         .default_profile
         .as_deref()
-        .or_else(|| profiles.profiles.first().map(|p| p.id.as_str()));
+        .or_else(|| choices.first().map(|p| p.id.as_str()));
     let index = |id: Option<&str>| -> u32 {
-        id.and_then(|id| profiles.profiles.iter().position(|p| p.id == id))
+        id.and_then(|id| choices.iter().position(|p| p.id == id))
             .map(|i| i as u32)
             .unwrap_or(gtk::INVALID_LIST_POSITION)
     };
-    store.set_selected(index(
-        selection.as_ref().map(|s| s.store.as_str()).or(default),
-    ));
-    player.set_selected(index(
-        selection.as_ref().map(|s| s.player.as_str()).or(default),
-    ));
-    for (label, dropdown) in [("Store account", &store), ("Player account", &player)] {
-        content.append(&gtk::Label::builder().label(label).xalign(0.0).build());
-        content.append(dropdown);
-    }
-    let note=gtk::Label::builder().label("Changes apply to the next launch. Running games keep their accounts. A different player gets separate local saves; existing saves are kept.")
-        .wrap(true).xalign(0.0).css_classes(["dim-label"]).build();
-    content.append(&note);
-    let apply = gtk::Button::with_label("Apply accounts");
-    apply.add_css_class("suggested-action");
-    let choices = Rc::new(profiles.profiles.clone());
+
+    // Who owns and who plays. Dropdowns rather than combo rows so each keeps a
+    // plain accessible combo box the GUI test can drive.
+    let roles = adw::PreferencesGroup::builder()
+        .title("Who plays")
+        .description(
+            "The Store account supplies purchases and Game Pass. The Player account is \
+             the gamertag the game signs in with, and gets its own saves.",
+        )
+        .build();
+    let picker = |title: &str, subtitle: &str, icon: &str, selected: u32| {
+        let dropdown = gtk::DropDown::from_strings(&refs);
+        dropdown.set_valign(gtk::Align::Center);
+        dropdown.set_selected(selected);
+        dropdown.update_property(&[gtk::accessible::Property::Label(title)]);
+        let row = adw::ActionRow::builder()
+            .title(title)
+            .subtitle(subtitle)
+            .activatable_widget(&dropdown)
+            .build();
+        row.add_prefix(&gtk::Image::from_icon_name(icon));
+        row.add_suffix(&dropdown);
+        roles.add(&row);
+        dropdown
+    };
+    let store = picker(
+        "Store account",
+        "Owns the games, or has Game Pass",
+        "emblem-shared-symbolic",
+        index(selection.as_ref().map(|s| s.store.as_str()).or(default)),
+    );
+    let player = picker(
+        "Player account",
+        "Gamertag, achievements and saves",
+        "avatar-default-symbolic",
+        index(selection.as_ref().map(|s| s.player.as_str()).or(default)),
+    );
+    page.add(&roles);
+
+    let summary = gtk::Label::builder()
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(["dim-label"])
+        .margin_top(12)
+        .build();
+    let apply = gtk::Button::builder()
+        .label("Apply accounts")
+        .halign(gtk::Align::Center)
+        .margin_top(12)
+        .css_classes(["pill", "suggested-action"])
+        .build();
+    let footer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    footer.append(&summary);
+    footer.append(&apply);
+    let footer_group = adw::PreferencesGroup::new();
+    footer_group.add(&footer);
+    page.add(&footer_group);
+
     let update = {
-        let store = store.clone();
-        let player = player.clone();
-        let apply = apply.clone();
-        let choices = choices.clone();
+        let (store, player, apply, summary, choices) = (
+            store.clone(),
+            player.clone(),
+            apply.clone(),
+            summary.clone(),
+            choices.clone(),
+        );
         move || {
-            apply.set_sensitive(
-                choices
-                    .get(store.selected() as usize)
-                    .is_some_and(|p| p.signed_in)
-                    && choices
-                        .get(player.selected() as usize)
-                        .is_some_and(|p| p.signed_in),
-            );
+            let owner = choices.get(store.selected() as usize);
+            let gamer = choices.get(player.selected() as usize);
+            let ready = owner.zip(gamer).filter(|(o, g)| o.signed_in && g.signed_in);
+            apply.set_sensitive(ready.is_some());
+            summary.set_label(&match (owner, gamer) {
+                (Some(o), Some(g)) if !o.signed_in || !g.signed_in => {
+                    "Sign the selected accounts in again before applying.".to_string()
+                }
+                (Some(o), Some(g)) if o.id == g.id => format!(
+                    "{} plays with its own purchases and Game Pass. Changes apply to the next \
+                     launch; running games keep their accounts.",
+                    o.label
+                ),
+                (Some(o), Some(g)) => format!(
+                    "{} plays with {}'s purchases and Game Pass, with separate saves. Changes \
+                     apply to the next launch; running games keep their accounts.",
+                    g.label, o.label
+                ),
+                _ => "Choose a Store account and a Player account.".to_string(),
+            });
         }
     };
     update();
     let update = Rc::new(update);
-    store.connect_selected_notify({
+    for dropdown in [&store, &player] {
         let update = update.clone();
-        move |_| update()
-    });
-    player.connect_selected_notify({
-        let update = update.clone();
-        move |_| update()
-    });
+        dropdown.connect_selected_notify(move |_| update());
+    }
+
+    // Every account this computer knows, with what it is used for now.
+    let known = adw::PreferencesGroup::builder()
+        .title("Accounts on this computer")
+        .description("Games still enforce Microsoft and publisher account-sharing rules.")
+        .build();
+    for profile in choices.iter() {
+        let row = adw::ActionRow::builder()
+            .title(&profile.label)
+            .subtitle(if profile.signed_in {
+                "Signed in"
+            } else {
+                "Signed out"
+            })
+            .build();
+        row.set_use_markup(false);
+        row.add_prefix(
+            &adw::Avatar::builder()
+                .size(36)
+                .text(&profile.label)
+                .show_initials(true)
+                .build(),
+        );
+        if let Some(selected) = &selection {
+            for (role, id, class) in [
+                ("Store", &selected.store, "store"),
+                ("Player", &selected.player, "player"),
+            ] {
+                if *id == profile.id {
+                    row.add_suffix(
+                        &gtk::Label::builder()
+                            .label(role)
+                            .valign(gtk::Align::Center)
+                            .css_classes(["role-badge", class])
+                            .build(),
+                    );
+                }
+            }
+        }
+        let action = gtk::Button::builder()
+            .label(if profile.signed_in {
+                "Sign out"
+            } else {
+                "Sign in again"
+            })
+            .valign(gtk::Align::Center)
+            .css_classes(if profile.signed_in {
+                ["flat", "destructive-action"]
+            } else {
+                ["flat", "suggested-action"]
+            })
+            .build();
+        let name = format!(
+            "{} {}",
+            if profile.signed_in {
+                "Sign out"
+            } else {
+                "Sign in again as"
+            },
+            profile.label
+        );
+        action.update_property(&[gtk::accessible::Property::Label(&name)]);
+        let (id, signed_in) = (profile.id.clone(), profile.signed_in);
+        action.connect_clicked(glib::clone!(
+            #[strong]
+            ui,
+            #[strong]
+            window,
+            move |_| {
+                window.close();
+                if signed_in {
+                    logout(&ui, id.clone());
+                } else {
+                    // The client recognises a known account and reuses its
+                    // profile and save namespace.
+                    add_account(&ui);
+                }
+            }
+        ));
+        row.add_suffix(&action);
+        known.add(&row);
+    }
+    page.add(&known);
+
     apply.connect_clicked(glib::clone!(
         #[strong]
         ui,
@@ -165,14 +301,15 @@ fn show(ui: &Ui, profiles: accounts::Profiles) {
                     ui.toasts
                         .add_toast(adw::Toast::new("Accounts saved for future launches"));
                 }
-                Err(error) => ui
-                    .toasts
-                    .add_toast(adw::Toast::new(&format!("Accounts: {error}"))),
+                Err(error) => ui.toasts.add_toast(
+                    adw::Toast::builder()
+                        .title(format!("Accounts: {error}"))
+                        .use_markup(false)
+                        .build(),
+                ),
             }
         }
     ));
-    content.append(&apply);
-    let add = gtk::Button::with_label("Add account");
     add.connect_clicked(glib::clone!(
         #[strong]
         ui,
@@ -183,43 +320,6 @@ fn show(ui: &Ui, profiles: accounts::Profiles) {
             add_account(&ui);
         }
     ));
-    content.append(&add);
-    let signouts = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    for (label, selector) in [
-        ("Sign out Store account", store.clone()),
-        ("Sign out Player account", player.clone()),
-    ] {
-        let button = gtk::Button::with_label(label);
-        button.add_css_class("destructive-action");
-        button.connect_clicked(glib::clone!(
-            #[strong]
-            ui,
-            #[strong]
-            window,
-            #[strong]
-            choices,
-            move |_| {
-                let Some(profile) = choices.get(selector.selected() as usize) else {
-                    return;
-                };
-                window.close();
-                logout(&ui, profile.id.clone());
-            }
-        ));
-        signouts.append(&button);
-    }
-    content.append(&signouts);
-    let warning=gtk::Label::builder().label("Signing out a profile used by both roles signs out both. Games still enforce Microsoft and publisher account-sharing rules.")
-        .wrap(true).xalign(0.0).css_classes(["dim-label"]).build();
-    content.append(&warning);
-    let close = gtk::Button::with_label("Close");
-    close.connect_clicked(glib::clone!(
-        #[strong]
-        window,
-        move |_| window.close()
-    ));
-    content.append(&close);
-    window.set_child(Some(&content));
     window.present();
 }
 
@@ -278,12 +378,8 @@ fn logout(ui: &Ui, id: String) {
         .await;
         finish(&ui);
         if matches!(result,Ok(Ok(status)) if status.success()) {
-            if let Some(paths) = ui.model.borrow().paths.as_ref() {
-                let private = paths.state_dir().join("accounts").join(&id);
-                let _ = std::fs::remove_file(library::cache_path(&private));
-                let _ = std::fs::remove_file(account::cache_path(&private));
-            }
-            // Read the scoped caches again; reload normally preserves a live account.
+            // Clear the in-memory Store account explicitly: `Model::reload`
+            // keeps it while the Store selection is unchanged.
             let mut model = ui.model.borrow_mut();
             let store = model.roles.as_ref().map(|r| r.store.as_str()).or_else(|| {
                 model
@@ -292,11 +388,30 @@ fn logout(ui: &Ui, id: String) {
                     .and_then(|p| p.default_profile.as_deref())
             });
             let signs_out_store = store.is_some_and(|store| store == id);
+            // With no role selection the default profile's caches are the
+            // unscoped ones, which a restart would otherwise show again.
+            let mut stale = Vec::new();
+            if let Some(paths) = model.paths.as_ref() {
+                stale.push(paths.state_dir().join("accounts").join(&id));
+                if signs_out_store && model.roles.is_none() {
+                    stale.push(paths.state_dir().to_path_buf());
+                }
+            }
+            for dir in stale {
+                for cache in [library::cache_path(&dir), account::cache_path(&dir)] {
+                    if let Err(e) = std::fs::remove_file(&cache) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            eprintln!("!! {}: {e}", cache.display());
+                        }
+                    }
+                }
+            }
             if signs_out_store {
                 model.account = None;
                 model.avatar = None;
                 model.ownership = Ownership::Unknown;
                 model.subscriptions.clear();
+                model.refused.clear();
                 model.entitlements_checked = false;
             }
             drop(model);

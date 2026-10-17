@@ -280,8 +280,10 @@ pub struct Listing {
 
 /// Version 2 is where the tier map joined the listing. A version-1 file parses
 /// and is not wrong, it just has nothing to say about tiers -- but treating it
-/// as complete would mean never fetching them.
-const LISTING_SCHEMA: u32 = 2;
+/// as complete would mean never fetching them. Version 3 keeps the merchandised
+/// list alone, without the tier feed's additions merged in, so which ids were
+/// added is still known after a restart.
+const LISTING_SCHEMA: u32 = 3;
 
 pub fn cache_path(state_dir: &Path) -> PathBuf {
     state_dir.join("gamepass.json")

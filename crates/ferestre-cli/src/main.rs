@@ -584,6 +584,11 @@ fn cmd_run(
     let dirs = launch_dirs_for_runtime(&paths, &runtime.path)?;
     let roles = accounts::launch_selection(paths.config_dir())?;
     let mut prefix = paths.prefix_dir(recipe)?;
+    // `XGR_XUID` is the Windows install's XUID, so it names the imported
+    // player's save folders. Another player has their own prefix and their own
+    // XUID: inheriting it would name their saves after somebody else, and
+    // report that XUID whenever the live lookup has not answered yet.
+    let mut own_xuid = true;
     if let Some(roles) = &roles {
         let profiles = accounts::fetch(&dirs.xodus_cli())?;
         let (store, player) = roles.selected(&profiles)?;
@@ -595,6 +600,7 @@ fn cmd_run(
         }
         accounts::require_service(&dirs.xodus_service())?;
         prefix = accounts::player_prefix(&prefix, player)?;
+        own_xuid = player.legacy_saves;
         if cli.show_account {
             eprintln!(":: Store: {}; Player: {}", store.label, player.label);
         } else {
@@ -606,11 +612,18 @@ fn cmd_run(
     }
     let options = launch::Options {
         steam_integration: steam,
-        xuid: paths.var("XGR_XUID").map(str::to_string),
+        xuid: paths
+            .var("XGR_XUID")
+            .filter(|_| own_xuid)
+            .map(str::to_string),
         game_dir: Some(paths.install_dir(recipe)?),
         prefix_dir: Some(prefix),
     };
     let mut plan = launch::plan(recipe, &dirs, &options);
+    if !own_xuid {
+        plan.env_set.remove("XGR_XUID");
+        plan.env_unset.push("XGR_XUID".into());
+    }
     if let Some(roles) = &roles {
         plan.env_set
             .insert("XODUS_ACCOUNT_PROFILE".into(), roles.store.clone());
@@ -629,9 +642,11 @@ fn cmd_run(
             .content_ids
             .first()
             .context("The installed title has no Store content ID")?;
+        // Upper case like every Store id the runtime sends; the service
+        // compares the bound product exactly.
         plan.env_set.insert(
             "XODUS_STORE_PRODUCT".into(),
-            recipe.title.product_id.clone(),
+            recipe.title.product_id.to_ascii_uppercase(),
         );
         plan.env_set
             .insert("XODUS_STORE_CONTENT".into(), content.clone());

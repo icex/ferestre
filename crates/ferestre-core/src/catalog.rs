@@ -127,6 +127,12 @@ pub struct Product {
     /// reader could see.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bundled_ids: Vec<String>,
+    /// What the catalog says this product is: `Game` for a title, `Durable`
+    /// for an add-on. The Game Pass tier feed marks add-ons as included too, so
+    /// without it an expansion counts and lists as a Game Pass game. `None` in
+    /// entries cached before it was recorded, which is "not known", not "game".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_kind: Option<String>,
 }
 
 impl Product {
@@ -193,6 +199,8 @@ struct RawProduct {
     localized: Vec<Localized>,
     #[serde(rename = "DisplaySkuAvailabilities", default)]
     skus: Vec<SkuAvailability>,
+    #[serde(rename = "ProductKind", default)]
+    kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -460,6 +468,7 @@ pub fn parse(json: &str) -> Result<Vec<Product>> {
         .into_iter()
         .filter_map(|raw| {
             let product_id = raw.product_id.filter(|s| !s.is_empty())?;
+            let product_kind = raw.kind.filter(|s| !s.is_empty());
             let localized = raw.localized.first();
             let name = localized
                 .and_then(|l| l.title.clone())
@@ -556,6 +565,7 @@ pub fn parse(json: &str) -> Result<Vec<Product>> {
                 wu_category_id,
                 has_pc_package: tier.is_some(),
                 bundled_ids,
+                product_kind,
             })
         })
         .collect())
@@ -647,6 +657,9 @@ impl Cache {
                 entry.schema == CACHE_SCHEMA
                     && entry.market.eq_ignore_ascii_case(market)
                     && entry.language.eq_ignore_ascii_case(language)
+                    // Written before the product kind was recorded: fetched
+                    // again so an add-on is not taken for a game.
+                    && entry.product.product_kind.is_some()
             })
     }
 
@@ -702,6 +715,7 @@ mod tests {
       "Products": [
         {
           "ProductId": "9ZZTESTGAME1",
+          "ProductKind": "Game",
           "LastModifiedDate": "2026-08-28T18:26:01.6677099Z",
           "LocalizedProperties": [{
             "ProductTitle": "Test Game One",
@@ -728,6 +742,7 @@ mod tests {
         },
         {
           "ProductId": "9ZZTESTGAME2",
+          "ProductKind": "Game",
           "LocalizedProperties": [{
             "ProductTitle": "Test Game Two",
             "Images": [
@@ -771,6 +786,7 @@ mod tests {
             one.last_update.as_deref(),
             Some("2026-08-28T18:26:01.0000000Z")
         );
+        assert_eq!(one.product_kind.as_deref(), Some("Game"));
     }
 
     /// Every sku of a title lists the same package. Counting it once per sku

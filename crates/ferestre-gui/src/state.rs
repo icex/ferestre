@@ -73,6 +73,10 @@ impl Section {
 pub struct Model {
     pub roles: Option<Selection>,
     pub profiles: Option<Profiles>,
+    /// Titles whose licence the selected Store account was refused at launch
+    /// this session, as uppercase product ids. Stronger than anything the
+    /// collections listing implies, and cleared when the Store account changes.
+    pub refused: BTreeSet<String>,
     pub paths: Option<Paths>,
     pub recipes: Vec<Recipe>,
     /// The automatic default, used for compatibility rows.
@@ -104,6 +108,9 @@ pub struct Model {
     /// the entitlement is not, and a launcher that guesses the second from the
     /// first tells people they cannot install titles they can.
     pub gamepass: Vec<String>,
+    /// The merchandised "All PC Games" ids within `gamepass`; the rest came
+    /// from the tier feed and must be confirmed by the catalog to be listed.
+    pub gamepass_merchandised: BTreeSet<String>,
     pub subscriptions: Vec<&'static str>,
     pub entitlements_checked: bool,
     /// Which subscription tiers include which products. Joined against
@@ -231,12 +238,17 @@ impl Model {
         let cached = paths
             .as_ref()
             .and_then(|p| gamepass::load_cache(p.state_dir(), &market));
-        let (gamepass, tiers) = match cached {
+        let (gamepass, gamepass_merchandised, tiers) = match cached {
             Some(listing) => (
                 gamepass::complete_listing(&listing.product_ids, &listing.tiers),
+                listing
+                    .product_ids
+                    .iter()
+                    .map(|id| id.to_ascii_uppercase())
+                    .collect(),
                 listing.tiers,
             ),
-            None => (Vec::new(), gamepass::Tiers::default()),
+            None => (Vec::new(), BTreeSet::new(), gamepass::Tiers::default()),
         };
         // Cached Game Pass rows must draw before background revalidation too.
         if let Some(paths) = &paths {
@@ -292,6 +304,7 @@ impl Model {
         Model {
             roles,
             profiles: None,
+            refused: BTreeSet::new(),
             paths,
             recipes,
             runtime,
@@ -309,6 +322,7 @@ impl Model {
             account,
             avatar,
             gamepass,
+            gamepass_merchandised,
             subscriptions,
             entitlements_checked,
             tiers,
@@ -320,7 +334,9 @@ impl Model {
         }
     }
 
-    /// Reload from disk, keeping everything that was fetched.
+    /// Reload from disk, keeping what was fetched. Account-private state
+    /// (account, avatar, ownership, subscriptions, refused launches) is kept
+    /// only while the selected Store profile is unchanged.
     ///
     /// Re-reading a recipe file is not a reason to make someone sign in again,
     /// or to re-download a hundred icons.
@@ -334,6 +350,7 @@ impl Model {
             fresh.avatar = self.avatar.take();
             fresh.subscriptions = std::mem::take(&mut self.subscriptions);
             fresh.entitlements_checked = self.entitlements_checked;
+            fresh.refused = std::mem::take(&mut self.refused);
         }
         fresh.profiles = self.profiles.take();
         *self = Model {
@@ -341,6 +358,7 @@ impl Model {
             catalog: std::mem::take(&mut self.catalog),
             icons: std::mem::take(&mut self.icons),
             gamepass: std::mem::take(&mut self.gamepass),
+            gamepass_merchandised: std::mem::take(&mut self.gamepass_merchandised),
             tiers: std::mem::take(&mut self.tiers),
             section: self.section,
             query: std::mem::take(&mut self.query),

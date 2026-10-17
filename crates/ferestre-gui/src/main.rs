@@ -31,6 +31,36 @@ use state::{Model, Section, AVATAR_PX, ICON_PX, PER_PAGE};
 
 const APP_ID: &str = "io.github.icex.ferestre";
 
+/// Only what Adwaita's own classes do not cover. Colours are Adwaita's named
+/// ones, so dark mode and accent changes follow without a second stylesheet.
+const STYLE: &str = "
+.access-chip {
+  padding: 4px 10px;
+  border-radius: 999px;
+  color: @warning_color;
+  background-color: alpha(@warning_color, 0.12);
+}
+row.library-row {
+  padding-top: 8px;
+  padding-bottom: 8px;
+}
+row.library-row label.title {
+  font-weight: bold;
+}
+.role-badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: smaller;
+  font-weight: bold;
+  color: @accent_color;
+  background-color: alpha(@accent_color, 0.12);
+}
+.role-badge.player {
+  color: @success_color;
+  background-color: alpha(@success_color, 0.12);
+}
+";
+
 /// Everything a callback needs to redraw the window, in one place so it can
 /// hold one clone instead of nine.
 #[derive(Clone)]
@@ -118,6 +148,13 @@ fn build_ui(app: &adw::Application) {
 
     if let Some(display) = gdk::Display::default() {
         add_source_icon_path(&display);
+        let css = gtk::CssProvider::new();
+        css.load_from_data(STYLE);
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
     }
     // Without this the shell has no icon to draw and falls back to a generated
     // letter tile. The name is the application id, which is what the packaging
@@ -466,25 +503,29 @@ fn render(ui: &Ui) {
                 &page,
                 move |row| show_all || !row.known_uninstallable(),
                 "Nothing here yet.",
-            )
+            );
         }
         Section::GamePass => {
             // A missing catalogue is fetched when this section opens too.
             fetch_gamepass(ui, false);
             render_gamepass(ui, &page)
         }
-        Section::Installed => render_rows(
-            ui,
-            &page,
-            |row| row.installed,
-            "Nothing is installed yet. Find a title in the library and install it.",
-        ),
-        Section::Updates => render_rows(
-            ui,
-            &page,
-            |row| row.update == Some(true),
-            "Everything installed is up to date.",
-        ),
+        Section::Installed => {
+            render_rows(
+                ui,
+                &page,
+                |row| row.installed,
+                "Nothing is installed yet. Find a title in the library and install it.",
+            );
+        }
+        Section::Updates => {
+            render_rows(
+                ui,
+                &page,
+                |row| row.update == Some(true),
+                "Everything installed is up to date.",
+            );
+        }
     }
 }
 
@@ -586,6 +627,9 @@ struct Drawn {
     /// currently being shown.
     unsupported: usize,
     outside_tier: usize,
+    /// Rows the list holds after the filter and before a search narrows it:
+    /// what a heading counting this list should say.
+    listed: usize,
     /// Rows in the whole list still waiting for a name while a search is
     /// running. A search cannot match what has not been fetched, and saying
     /// "nothing matches" during that is telling somebody something untrue.
@@ -647,14 +691,27 @@ fn draw_list(
             } else {
                 Vec::new()
             };
-            model::gamepass(&inputs, &model.gamepass, &model.tiers, &held)
+            model::gamepass(
+                &inputs,
+                &model.gamepass,
+                // Empty is "not known", not "nothing is merchandised".
+                Some(&model.gamepass_merchandised).filter(|m| !m.is_empty()),
+                &model.tiers,
+                &held,
+            )
         }
         _ => model::library(&inputs),
     };
     // Bundle rows install a child product. They still need to show the active
     // download on their own row, regardless of which model branch built it.
     for row in &mut rows {
-        let source = model::access_source(
+        // An installed title says when the selected Store account cannot play
+        // it, before Play fails at the licence step.
+        let store = model
+            .account
+            .as_ref()
+            .map_or("this Store account", |a| a.label());
+        let gap = model::subscription_gap(
             &row.product_id,
             &model.ownership,
             &model.catalog,
@@ -662,19 +719,47 @@ fn draw_list(
             &model.tiers,
             &model.subscriptions,
         );
+        let installed_here = installed_product(&row.product_id);
+        let source =
+            if installed_here && model.refused.contains(&row.product_id.to_ascii_uppercase()) {
+                format!("Not available to {store}: licence refused")
+            } else if installed_here && gap == Some(model::SubscriptionGap::NoSubscription) {
+                format!("Not available to {store}: needs Game Pass")
+            } else if installed_here && gap == Some(model::SubscriptionGap::OutsideTier) {
+                format!("Not available to {store}: outside its Game Pass tier")
+            } else {
+                model::access_source(
+                    &row.product_id,
+                    &model.ownership,
+                    &model.catalog,
+                    &model.gamepass,
+                    &model.tiers,
+                    &model.subscriptions,
+                )
+                .to_string()
+            };
+        // The chip beside Play says this; the subtitle need not say it twice.
+        let (source, unavailable) = if source.starts_with("Not available to ") {
+            (String::new(), Some(source))
+        } else {
+            (source, None)
+        };
+        row.unavailable = unavailable;
         let details = row
             .subtitle
             .split("  ·  ")
             .filter(|part| *part != "Included with PC Game Pass")
             .collect::<Vec<_>>()
             .join("  ·  ");
-        row.subtitle = if details.starts_with("Version ") {
+        row.subtitle = if source.is_empty() {
+            details
+        } else if details.starts_with("Version ") {
             match details.split_once("  ·  ") {
                 Some((version, rest)) => format!("{version}  ·  {source}  ·  {rest}"),
                 None => format!("{details}  ·  {source}"),
             }
         } else if details.is_empty() {
-            source.into()
+            source
         } else {
             format!("{source}  ·  {details}")
         };
@@ -701,6 +786,7 @@ fn draw_list(
     // Revalidation must include named, cached rows, including off-page ones.
     let metadata_ids: Vec<String> = rows.iter().map(|row| row.product_id.clone()).collect();
     let rows: Vec<LibraryRow> = rows.into_iter().filter(|row| keep(row)).collect();
+    let listed = rows.len();
 
     let matching = model::search(&rows, &model.query);
     let view = model::paginate(&matching, model.page, PER_PAGE);
@@ -710,6 +796,7 @@ fn draw_list(
     // until you happened to page past the row, and then worked ever after.
     Drawn {
         page: view.page,
+        listed,
         pending_names: unnamed_off_page.len(),
         want_names: metadata_ids
             .into_iter()
@@ -756,52 +843,74 @@ fn draw_list(
 /// leaving that unsaid would make every licence refusal look like a bug in the
 /// launcher.
 fn render_gamepass(ui: &Ui, page: &gtk::Box) {
-    let (held, listing, market) = {
+    let (held, fetched, market, store) = {
         let model = ui.model.borrow();
         (
             model.subscriptions.clone(),
-            model.gamepass.len(),
+            !model.gamepass.is_empty(),
             model.market().0,
+            model
+                .account
+                .as_ref()
+                .map(|a| a.label().to_string())
+                .filter(|_| model.entitlements_checked),
         )
     };
 
+    // Drawn first, filled in after the list: the count is what the list below
+    // actually holds -- games only, in this market, that this account's tier
+    // and this runtime can install -- not the size of the feed it came from.
     let group = adw::PreferencesGroup::builder().build();
-    let (title, subtitle) = match (listing, held.as_slice()) {
-        (0, _) => (
-            "The Game Pass catalogue has not been fetched yet".to_string(),
-            "Reload to fetch it. It is a public listing -- no account needed.".to_string(),
-        ),
-        (n, []) => (
-            format!("{n} titles are included with PC Game Pass in {market}"),
-            "No active subscription was found on this account, so installing one \
-             will be refused at the licence step."
-                .to_string(),
-        ),
-        (n, subs) => (
-            format!("{n} titles are included with PC Game Pass in {market}"),
-            format!(
-                "This account holds {}. Whether a tier covers a given title is decided \
-                 when it is installed, not here.",
-                subs.join(" and ")
-            ),
-        ),
-    };
-    let row = adw::ActionRow::builder()
-        .title(&title)
-        .subtitle(&subtitle)
-        .subtitle_lines(3)
-        .build();
-    row.add_css_class("dim-label");
-    group.add(&row);
+    let banner = adw::ActionRow::builder().subtitle_lines(3).build();
+    banner.set_use_markup(false);
+    banner.add_prefix(&gtk::Image::from_icon_name("starred-symbolic"));
+    group.add(&banner);
     page.append(&group);
 
     let show_all = ui.model.borrow().show_unsupported;
-    render_rows(
+    let listed = render_rows(
         ui,
         page,
         move |row| show_all || !row.known_uninstallable(),
         "Nothing here yet.",
     );
+
+    let games = |n: usize| format!("{n} {}", if n == 1 { "game" } else { "games" });
+    let (title, subtitle) = match (fetched, store, held.as_slice()) {
+        (false, _, _) => (
+            "The Game Pass catalogue has not been fetched yet".to_string(),
+            "Reload to fetch it. It is a public listing -- no account needed.".to_string(),
+        ),
+        (true, None, _) => (
+            format!("{} in PC Game Pass for the {market} Store", games(listed)),
+            "Load the library to see which of them the Store account can play.".to_string(),
+        ),
+        (true, Some(store), []) => (
+            format!("{} in PC Game Pass for the {market} Store", games(listed)),
+            format!(
+                "{store} has no Game Pass subscription, so it cannot play these. Choose an \
+                 account with Game Pass as the Store account in Accounts."
+            ),
+        ),
+        (true, Some(store), subs) => (
+            if show_all {
+                format!("{} in PC Game Pass for the {market} Store", games(listed))
+            } else {
+                format!(
+                    "{} {store} can install with {}",
+                    games(listed),
+                    subs.join(" and ")
+                )
+            },
+            format!(
+                "From the PC Game Pass catalogue for the {market} Store. Add-ons are not \
+                 counted, and titles outside the tier or in packages this runtime cannot \
+                 open are left out unless you choose to show them."
+            ),
+        ),
+    };
+    banner.set_title(&title);
+    banner.set_subtitle(&subtitle);
 }
 
 /// Reuse persistent disk measurements before drawing. Only missing/stale or
@@ -885,7 +994,13 @@ fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
     });
 }
 
-fn render_rows(ui: &Ui, page: &gtk::Box, keep: impl Fn(&LibraryRow) -> bool, empty_message: &str) {
+/// Draws the list and returns how many rows it holds before a search.
+fn render_rows(
+    ui: &Ui,
+    page: &gtk::Box,
+    keep: impl Fn(&LibraryRow) -> bool,
+    empty_message: &str,
+) -> usize {
     let section = ui.model.borrow().section;
     let downloading = ui
         .download
@@ -900,6 +1015,7 @@ fn render_rows(ui: &Ui, page: &gtk::Box, keep: impl Fn(&LibraryRow) -> bool, emp
         section,
         keep,
     );
+    let listed = drawn.listed;
     // Persist the clamped page. Otherwise Previous decrements a stale page
     // number and keeps showing the last page after the list shrinks.
     ui.model.borrow_mut().page = drawn.page;
@@ -1041,6 +1157,7 @@ fn render_rows(ui: &Ui, page: &gtk::Box, keep: impl Fn(&LibraryRow) -> bool, emp
     if !drawn.want_icons.is_empty() {
         fetch_icons(ui, drawn.want_icons);
     }
+    listed
 }
 
 fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
@@ -1137,7 +1254,8 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
     // subtitle that names a title, which the bundle rows do.
     let action_row = adw::ActionRow::builder()
         .title_lines(1)
-        .subtitle_lines(1)
+        .subtitle_lines(2)
+        .css_classes(["library-row"])
         .tooltip_text(&row.product_id)
         .build();
     action_row.set_use_markup(false);
@@ -1206,6 +1324,36 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
         row.name, details, row.product_id
     )));
 
+    // Said where the Play button is, not only in a dimmed subtitle the eye
+    // skips: pressing Play would end at the licence step.
+    if let Some(reason) = &row.unavailable {
+        let why = reason
+            .split_once(": ")
+            .map_or("Not available", |(_, why)| why);
+        let mut why = why.chars();
+        let why: String = why
+            .next()
+            .map(|c| c.to_uppercase().chain(why).collect())
+            .unwrap_or_default();
+        let chip = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(6)
+                .valign(gtk::Align::Center)
+                .css_classes(["access-chip"])
+                .tooltip_text(format!(
+                    "{reason}. Choose an account that owns it or has Game Pass as the Store account in Accounts."
+                ))
+                .build();
+        chip.append(&gtk::Image::from_icon_name("dialog-warning-symbolic"));
+        chip.append(
+            &gtk::Label::builder()
+                .label(&why)
+                .css_classes(["caption-heading"])
+                .build(),
+        );
+        action_row.add_suffix(&chip);
+    }
+
     let actions = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(4)
@@ -1214,85 +1362,79 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
         .build();
     action_row.add_suffix(&actions);
 
-    let store = gtk::Button::builder()
-        .icon_name("web-browser-symbolic")
+    // Secondary actions live behind one menu button: five icon buttons on
+    // every row left the title three characters wide.
+    let menu = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    let popover = gtk::Popover::builder().child(&menu).build();
+    let more = gtk::MenuButton::builder()
+        .icon_name("view-more-symbolic")
         .valign(gtk::Align::Center)
         .css_classes(["flat"])
-        .tooltip_text("Open this title's Microsoft Store page")
+        .tooltip_text("More actions")
+        .popover(&popover)
         .build();
-    let store_url = format!("{STORE_PAGE}{}", row.product_id);
-    store.connect_clicked(move |button| open_link(button, &store_url));
-    actions.append(&store);
-
-    // Anything on disk can be removed, recipe or not -- and the rows that most
-    // need it are the ones with no recipe, because a failed install leaves
-    // exactly that and there was previously no way to say so.
-    if row.installed {
-        let remove = gtk::Button::builder()
-            .icon_name("user-trash-symbolic")
-            .valign(gtk::Align::Center)
+    let item = |icon: &str, label: &str, run: Box<dyn Fn()>| {
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        content.append(&gtk::Image::from_icon_name(icon));
+        content.append(&gtk::Label::builder().label(label).xalign(0.0).build());
+        let button = gtk::Button::builder()
+            .child(&content)
             .css_classes(["flat"])
-            .tooltip_text("Remove this title from disk")
             .build();
-        let product_id = row.product_id.clone();
-        let name = row.name.clone();
-        remove.connect_clicked(glib::clone!(
-            #[strong]
-            ui,
-            move |_| confirm_remove(&ui, &product_id, &name)
-        ));
-        actions.append(&remove);
-    }
-
+        let popover = popover.clone();
+        button.connect_clicked(move |_| {
+            popover.popdown();
+            run();
+        });
+        menu.append(&button);
+    };
+    let store_url = format!("{STORE_PAGE}{}", row.product_id);
+    let anchor = action_row.clone();
+    item(
+        "web-browser-symbolic",
+        "Open Store page",
+        Box::new(move || open_link(&anchor, &store_url)),
+    );
     // A shortcut needs something that will launch. A recipe is one; a title on
     // disk is another, because `run` writes a recipe from the package manifest
     // on its way past.
     if row.has_recipe || row.installed {
-        let runtime = gtk::Button::builder()
-            .icon_name("applications-engineering-symbolic")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat"])
-            .tooltip_text("Choose the Proton runtime for this title")
-            .build();
-        let product_id = row.product_id.clone();
-        let name = row.name.clone();
-        runtime.connect_clicked(glib::clone!(
-            #[strong]
-            ui,
-            move |_| choose_runtime(&ui, &product_id, &name)
-        ));
-        actions.append(&runtime);
-
-        let to_steam = gtk::Button::builder()
-            .icon_name("list-add-symbolic")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat"])
-            .tooltip_text("Add to Steam as a non-Steam shortcut")
-            .build();
-        let product_id = row.product_id.clone();
-        let name = row.name.clone();
-        to_steam.connect_clicked(glib::clone!(
-            #[strong]
-            ui,
-            move |_| add_to_steam(&ui, &product_id, &name)
-        ));
-        actions.append(&to_steam);
-
-        let edit = gtk::Button::builder()
-            .icon_name("document-edit-symbolic")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat"])
-            .tooltip_text("Edit how this title launches")
-            .build();
-        let product_id = row.product_id.clone();
-        let name = row.name.clone();
-        edit.connect_clicked(glib::clone!(
-            #[strong]
-            ui,
-            move |_| open_editor(&ui, &product_id, &name)
-        ));
-        actions.append(&edit);
+        for (icon, label, run) in [
+            (
+                "applications-engineering-symbolic",
+                "Choose runtime",
+                choose_runtime as fn(&Ui, &str, &str),
+            ),
+            ("list-add-symbolic", "Add to Steam", add_to_steam),
+            (
+                "document-edit-symbolic",
+                "Edit launch settings",
+                open_editor,
+            ),
+        ] {
+            let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
+            item(icon, label, Box::new(move || run(&ui, &product_id, &name)));
+        }
     }
+    // Anything on disk can be removed, recipe or not -- and the rows that most
+    // need it are the ones with no recipe, because a failed install leaves
+    // exactly that and there was previously no way to say so.
+    if row.installed {
+        let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
+        item(
+            "user-trash-symbolic",
+            "Remove from disk",
+            Box::new(move || confirm_remove(&ui, &product_id, &name)),
+        );
+    }
+    actions.append(&more);
 
     // A greyed-out "Play" is a button that says a title might work if you found
     // the right thing to click. It never will: the reason is in the subtitle
@@ -1310,6 +1452,9 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
         .build();
     let downloading = ui.download.current.borrow().is_some();
     button.set_sensitive(row.action.is_enabled_during_download(downloading));
+    if row.unavailable.is_some() {
+        button.remove_css_class("suggested-action");
+    }
 
     match &row.action {
         Action::Blocked(reason) => button.set_tooltip_text(Some(reason)),
@@ -1557,7 +1702,10 @@ fn account_menu(ui: &Ui) {
 
     items.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
-    let out = entry("Sign out", "Forget this machine's tokens");
+    let out = entry(
+        "Sign out",
+        "Remove the Store account's sign-in from this computer",
+    );
     out.add_css_class("destructive-action");
     out.connect_clicked(glib::clone!(
         #[strong]
@@ -1652,6 +1800,7 @@ fn sign_out(ui: &Ui) {
                     model.avatar = None;
                     model.ownership = Ownership::Unknown;
                     model.subscriptions.clear();
+                    model.refused.clear();
                     model.entitlements_checked = false;
                     if let Some(state) = model.private_state_dir() {
                         let _ = std::fs::remove_file(library::cache_path(&state));
@@ -1808,7 +1957,11 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
         });
     }
 
-    let child = match command.spawn() {
+    // The reason a launch failed is on the launcher's stderr ("not entitled to
+    // this content", "Player account is signed out"), not in its exit status.
+    // Keep a short tail for the toast and pass every line on as before.
+    command.stderr(std::process::Stdio::piped());
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
             ui.toasts
@@ -1816,6 +1969,28 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
             return;
         }
     };
+    let (tail_sender, tail) = std::sync::mpsc::channel();
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let mut kept = std::collections::VecDeque::with_capacity(64);
+            let mut reader = std::io::BufReader::new(stderr);
+            let mut line = Vec::new();
+            while matches!(reader.read_until(b'\n', &mut line), Ok(n) if n > 0) {
+                let _ = std::io::stderr().write_all(&line);
+                if kept.len() == 64 {
+                    kept.pop_front();
+                }
+                kept.push_back(
+                    String::from_utf8_lossy(&line[..line.len().min(512)])
+                        .trim_end()
+                        .to_string(),
+                );
+                line.clear();
+            }
+            let _ = tail_sender.send(Vec::from(kept));
+        });
+    }
 
     let key = product_id.to_ascii_uppercase();
     // setsid makes the child its own group leader, so the group id is its pid.
@@ -1833,15 +2008,44 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
     let name = name.to_string();
     glib::spawn_future_local(async move {
         let mut child = child;
-        let status = gio::spawn_blocking(move || child.wait()).await;
+        let status = gio::spawn_blocking(move || {
+            let status = child.wait();
+            // The launcher has exited, so its stderr is at EOF unless something
+            // it started kept the pipe. Do not wait on that for long.
+            let reason = tail
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .ok()
+                .and_then(|lines| model::launch_failure(&lines));
+            (status, reason)
+        })
+        .await;
         ui.running.borrow_mut().remove(&key);
         ui.running_servers.borrow_mut().remove(&key);
         render(&ui);
         match status {
-            Ok(Ok(status)) if status.success() => {}
-            Ok(Ok(status)) => ui
-                .toasts
-                .add_toast(adw::Toast::new(&format!("{name} exited {status}"))),
+            Ok((Ok(status), _)) if status.success() => {}
+            Ok((Ok(status), reason)) => {
+                if reason.as_deref().is_some_and(model::is_licence_refusal) {
+                    ui.model.borrow_mut().refused.insert(key.clone());
+                    render(&ui);
+                }
+                let code = status
+                    .code()
+                    .map_or_else(|| status.to_string(), |c| format!("with code {c}"));
+                ui.toasts.add_toast(
+                    adw::Toast::builder()
+                        .title(match reason {
+                            Some(reason) => format!("{name} stopped: {reason}"),
+                            None => format!("{name} exited {code}"),
+                        })
+                        // The reason is a program's text, not markup: "<DIR>"
+                        // in it made the toast fail to draw at all.
+                        .use_markup(false)
+                        .priority(adw::ToastPriority::High)
+                        .timeout(20)
+                        .build(),
+                )
+            }
             _ => ui
                 .toasts
                 .add_toast(adw::Toast::new(&format!("{name}: could not be waited on"))),
@@ -2783,6 +2987,7 @@ fn refresh_account(ui: &Ui) {
                 if changed {
                     model.ownership = Ownership::Unknown;
                     model.subscriptions.clear();
+                    model.refused.clear();
                     model.entitlements_checked = false;
                     if let Some(state) = model.private_state_dir() {
                         let _ = std::fs::remove_file(library::cache_path(&state));
@@ -2808,6 +3013,7 @@ fn refresh_account(ui: &Ui) {
                 model.avatar = None;
                 model.ownership = Ownership::Unknown;
                 model.subscriptions.clear();
+                model.refused.clear();
                 model.entitlements_checked = false;
                 if let Some(state) = model.private_state_dir() {
                     let _ = std::fs::remove_file(library::cache_path(&state));
@@ -3139,13 +3345,12 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
                 move || {
                     let listing = gamepass::fetch(&market, &language)?;
                     let tiers = gamepass::fetch_tiers(&market, &language)?;
-                    let ids = gamepass::complete_listing(&listing, &tiers);
-                    Ok::<_, anyhow::Error>((ids, tiers))
+                    Ok::<_, anyhow::Error>((listing, tiers))
                 }
             })
             .await;
             ui.fetching_gamepass.replace(false);
-            let Ok(Ok((ids, tiers))) = fetched else {
+            let Ok(Ok((listing, tiers))) = fetched else {
                 // Silent on purpose when there is already a listing: a failed
                 // refresh of a public list is not worth a toast over the top of
                 // whatever someone is doing.
@@ -3155,12 +3360,16 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
                 }
                 return;
             };
+            // The merchandised list is what is kept: which ids the tier feed
+            // added is worth knowing again on the next start.
             if let Some(dir) = paths {
-                let _ = gamepass::save_cache(&dir, &market, &ids, &tiers);
+                let _ = gamepass::save_cache(&dir, &market, &listing, &tiers);
             }
             {
                 let mut model = ui.model.borrow_mut();
-                model.gamepass = ids;
+                model.gamepass = gamepass::complete_listing(&listing, &tiers);
+                model.gamepass_merchandised =
+                    listing.iter().map(|id| id.to_ascii_uppercase()).collect();
                 model.tiers = tiers;
             }
             if ui.model.borrow().section == Section::GamePass {
@@ -3285,6 +3494,7 @@ mod catalog_regressions {
         Model {
             roles: None,
             profiles: None,
+            refused: Default::default(),
             paths: None,
             recipes: Vec::new(),
             runtime: None,
@@ -3302,6 +3512,7 @@ mod catalog_regressions {
             account: None,
             avatar: None,
             gamepass: vec!["9NR1R1XWLCNB".into()],
+            gamepass_merchandised: Default::default(),
             subscriptions: Vec::new(),
             entitlements_checked: false,
             tiers: gamepass::parse_tiers(r#"{"9NR1R1XWLCNB":{"PCSubMetadata":{"Included":true}}}"#)

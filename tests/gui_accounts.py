@@ -117,8 +117,11 @@ summary="Synthetic account fixture"
         env=dict(os.environ,HOME=str(home),XDG_CONFIG_HOME=str(home/"config"),XDG_STATE_HOME=str(home/"state"),XDG_CACHE_HOME=str(home/"cache"),
             XODUS_CLI_DIR=str(home/"client"),XODUS_GAMES_DIR=str(home/"games"),XODUS_PROTON_DIR=str(home/"runtime"),XODUS_RUNTIME_DIR=str(home/"s"),
             FERESTRE_TITLES=str(home/"titles"),GTK_A11Y="atspi",HTTPS_PROXY="http://127.0.0.1:9",HTTP_PROXY="http://127.0.0.1:9",ALL_PROXY="http://127.0.0.1:9")
-        for key in ("APPIMAGE","FERESTRE_ACCOUNT_ROLES","FERESTRE_APPLICATION_ID"):
+        for key in ("APPIMAGE","FERESTRE_ACCOUNT_ROLES"):
             env.pop(key,None)
+        # Its own application id, so a Ferestre already open on this desktop
+        # is not the instance that receives the activation.
+        env["FERESTRE_APPLICATION_ID"]="io.github.icex.ferestre.AccountTest"
         gui=subprocess.Popen([home/"bin/ferestre-gui"],env=env,stderr=subprocess.PIPE)
         s.Atspi.init()
         app=s.find_app(gui.pid,time.monotonic()+20)
@@ -195,7 +198,7 @@ summary="Synthetic account fixture"
         s.click_named(dialog,"Apply accounts")
         s.wait_for(frame,lambda root:json.loads(settings.read_text())["player"]==PLAYER,"restore split selection",time.monotonic()+20)
         dialog=open_accounts()
-        s.click_named(dialog,"Sign out Player account")
+        s.click_named(dialog,"Sign out Player Fixture")
         s.wait_for(frame,lambda root:not json.loads((home/"profiles.json").read_text())["profiles"][1]["signed_in"],"Player-only logout",time.monotonic()+20)
         s.check(json.loads((home/"profiles.json").read_text())["profiles"][0]["signed_in"],"Player sign-out preserves Store credentials")
         s.wait_for(frame,lambda root:any("Store: Owner Fixture" in t for t in s.texts(root)),"Store identity after Player sign-out",time.monotonic()+20)
@@ -212,7 +215,7 @@ summary="Synthetic account fixture"
         profiles["profiles"][0]["signed_in"]=False
         write(home/"profiles.json",json.dumps(profiles))
         settings.unlink()
-        # Explicit sign-out clears the legacy account cache as well as keys.
+        # Stand in for an account-menu sign-out, which also deletes the unscoped account cache.
         (state/"account.json").unlink(missing_ok=True)
         gui=subprocess.Popen([home/"bin/ferestre-gui"],env=env,stderr=subprocess.PIPE)
         app=s.find_app(gui.pid,time.monotonic()+20)
