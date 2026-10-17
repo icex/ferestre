@@ -411,6 +411,23 @@ def row_button(root, title, label):
 def check_game_row_layout(root, title, size, action):
     button = row_button(root, title, action)
     check(button is not None, f"{title} keeps its {action} action", root)
+    bounds = lambda node: node.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+    viewport = button.get_parent()
+    while viewport and viewport.get_role_name() != "scroll pane":
+        viewport = viewport.get_parent()
+    # Offscreen label coordinates differ between GTK versions. Measure an
+    # actually visible row, using the same scrollbar path as pointer tests.
+    for _ in range(3):
+        control, view = bounds(button), bounds(viewport)
+        center = control.y + control.height / 2
+        if view.y <= center < view.y + view.height:
+            break
+        values = [node.get_value_iface() for node in find_all(root, role="scroll bar")]
+        value = next(v for v in values if v and v.get_maximum_value() > 200)
+        target = value.get_current_value() + center - (view.y + view.height / 2)
+        value.set_current_value(max(0, min(target, value.get_maximum_value())))
+        time.sleep(0.25)
+        button = row_button(root, title, action)
     row = button.get_parent()
     while row and row.get_role_name() != "list item":
         row = row.get_parent()
@@ -419,12 +436,16 @@ def check_game_row_layout(root, title, size, action):
     details = find_all(row, role="label", name_contains=size)
     check(len(details) == 1 and details[0].get_name().count(size) == 1,
           "size appears once, in the details line", row)
-    bounds = lambda node: node.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
-    top, bottom, control = bounds(title_label), bounds(details[0]), bounds(button)
-    check(bottom.y >= top.y + top.height - 1, "details sit below the game title", row)
-    text_center = (top.y + bottom.y + bottom.height) / 2
-    check(abs(control.y + control.height / 2 - text_center) <= 4,
-          "right-hand actions are centered across both text lines", row)
+    top, bottom, control, whole = bounds(title_label), bounds(details[0]), bounds(button), bounds(row)
+    check(top.height > 0 and bottom.height > 0 and bottom.y >= top.y + top.height - 1,
+          "details sit below the game title", row)
+    button_center = control.y + control.height / 2
+    title_center = top.y + top.height / 2
+    details_center = bottom.y + bottom.height / 2
+    # Font glyph extents/leading vary with GTK and fonts. The action must sit
+    # between the two text lines, not align with the top or bottom of the row.
+    check(title_center <= button_center <= details_center,
+          f"right-hand actions are centered between both text lines (button={button_center}, title={title_center}, details={details_center}, row={whole.y}/{whole.height})", row)
     check(control.x >= top.x + top.width, "actions stay to the right of the text", row)
     check(any(bounds(image).width >= 40 and bounds(image).height >= 40
               for image in find_all(row, role="image")), "the game icon spans both text lines", row)
