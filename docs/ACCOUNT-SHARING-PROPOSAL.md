@@ -16,8 +16,16 @@ the current selection.
 
 Changes apply to future launches. Existing games retain their captured pair,
 service socket and save prefix, including when Stop is pressed. Explicit sign-out
-removes only the selected profile's user credentials; if both roles use that
-profile, both are signed out. Device credentials remain separate.
+removes that profile's user credentials; if both roles use that profile, both are
+signed out. The device registration is shared by every profile and is kept.
+Signing out the imported account does not remove the pre-profile keychain entries
+it was copied from, which older launchers can still use.
+
+An installed game the Store account cannot license says so beside its Play button:
+"Needs Game Pass" for a Game Pass title on an account without a subscription,
+"Outside its Game Pass tier", or "Licence refused" once a launch was refused. A
+launch that fails shows the client's own reason (for example "not entitled to this
+content") instead of an exit code.
 
 A split pair requires the matching profile-aware client/service and a runtime
 with `xgameruntime.store-player-accounts`. Choose the local accounts runtime using
@@ -35,8 +43,10 @@ with the selected player; Ferestre does not create an entitlement for the player
   pages, without carrying cookies into another account's login.
 - Each launch captures Store/Player IDs and a selection generation. The service
   pins verified MSA bindings and cannot follow replacement credentials under a
-  running title. Socket names hash the pair, generation, service binary and bound
-  title/content. IPC does not accept a title-selected profile or credentials.
+  running title. Service socket directories are keyed by a hash of the pair, the
+  generation, the packaged service fingerprint and the bound product/content ID.
+  IPC does not accept a title-selected profile or credentials, and licence-token
+  requests are signed only for the bound title.
 - Store library, subscription, download, content licence and XStore licence-token
   calls use Store credentials. XUser/MSA/Xbox/PlayFab calls use Player credentials.
   Public catalog/tier data stays shared; private library, account and update
@@ -46,9 +56,12 @@ with the selected player; Ferestre does not create an entitlement for the player
   game licences and package licences come from an authenticated, title-bound
   Store content-licence check. Installed files do not imply ownership. Unrelated
   package licensing and unsupported purchase APIs stay unsupported.
-- Store checks run on the async work queue and cache successful checks for up to
-  60 seconds (denials for 10 seconds); local sign-out is checked before cached
-  grants. Player and licence state is polled on the Work port once per second,
+- Store queries (product, game licence, acquire / can-acquire) run on the async
+  work queue. `XStoreIsLicenseValid` and game-licence registration revalidate
+  synchronously and are served from the service cache when it is fresh: successful
+  checks for up to 60 seconds, denials for 10. A verified grant survives failed
+  refreshes (network errors look the same as denials) for 30 minutes; local
+  sign-out is checked before any cached grant. Player and licence state is polled on the Work port once per second,
   then change/lost callbacks are delivered on the caller's Completion port.
   Unregister suppresses queued callbacks and can wait for active delivery.
 - Local saves use a stable hash of the verified Player MSA for an independent

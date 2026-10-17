@@ -134,10 +134,10 @@ index 281ef9c..ce6440d 100644
          }
 diff --git a/crates/xodus-cli/src/commands/profiles.rs b/crates/xodus-cli/src/commands/profiles.rs
 new file mode 100644
-index 0000000..d5b14d0
+index 0000000..c74daad
 --- /dev/null
 +++ b/crates/xodus-cli/src/commands/profiles.rs
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,157 @@
 +use std::path::Path;
 +use std::process::ExitCode;
 +use xodus::profiles::{self, Profile};
@@ -249,8 +249,17 @@ index 0000000..d5b14d0
 +        }
 +    };
 +    let save_namespace = profiles::save_namespace(&user.puid);
-+    if let Some(mut existing) = profiles::list(root)
-+        .unwrap_or_default()
++    // Unreadable is not empty: treating it as empty would give an account
++    // that already has a profile a second one, with saves split between them.
++    let known = match profiles::list(root) {
++        Ok(known) => known,
++        Err(e) => {
++            let _ = tokens.remove_user();
++            eprintln!("Cannot read account profiles: {e}");
++            return ExitCode::FAILURE;
++        }
++    };
++    if let Some(mut existing) = known
 +        .into_iter()
 +        .find(|p| p.save_namespace == save_namespace)
 +    {
@@ -580,13 +589,24 @@ index f761a90..e581d24 100644
              .with_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64; MSAppHost/3.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36 Edge/18.26100")
              .with_headers(request.headers)
 diff --git a/crates/xodus-service/src/connection/license.rs b/crates/xodus-service/src/connection/license.rs
-index 47fa480..1fcb988 100644
+index 47fa480..cfbacf0 100644
 --- a/crates/xodus-service/src/connection/license.rs
 +++ b/crates/xodus-service/src/connection/license.rs
-@@ -143,8 +143,9 @@ where
+@@ -143,8 +143,20 @@ where
  }
  
  pub(super) async fn fetch(context: &mut SimpleContext, xml: &[u8]) -> Result<String, Error> {
++    // A service bound to one title signs licence requests for that title
++    // only: the Store account's token is not the running game's to spend on
++    // another product it happens to own.
++    if let Some(bound) = &context.entitlement {
++        let req: LicenseTokenIpcRequest =
++            quick_xml::de::from_str(std::str::from_utf8(xml).map_err(|_| "invalid IPC request")?)
++                .map_err(|_| "invalid IPC request")?;
++        if !req.parent_product_id.eq_ignore_ascii_case(bound.product()) {
++            return Err("licence token request is for another title");
++        }
++    }
 +    let mut store = context.store_context();
      fetch_with(xml, URL, &client(HTTP_TIMEOUT)?, |req| async move {
 -        super::xml::xsts_token(context, req)
@@ -594,6 +614,28 @@ index 47fa480..1fcb988 100644
              .await
              .map_err(|_| "licensing authorization failed")
      })
+diff --git a/crates/xodus-service/src/connection/license/tests.rs b/crates/xodus-service/src/connection/license/tests.rs
+index e6dbc9d..3f1d0be 100644
+--- a/crates/xodus-service/src/connection/license/tests.rs
++++ b/crates/xodus-service/src/connection/license/tests.rs
+@@ -316,3 +316,17 @@ async fn chunked_bodies_are_parsed_and_bounded_without_content_length() {
+         server.await.unwrap();
+     }
+ }
++
++#[tokio::test]
++async fn a_title_bound_service_signs_licence_requests_for_that_title_only() {
++    let mut context = crate::simple_context::tests::context("owner-bound", "player-bound");
++    context.entitlement = Some(crate::entitlement::Entitlement::fixture("9OTHERSTORE0"));
++    let xml = format!(
++        "<LicenseTokenRequest><ParentProductId>9TESTSTORE0ID</ParentProductId><ProductIds><ProductId>9TESTADDON00</ProductId></ProductIds><CustomBase64>{}</CustomBase64><TitleId>123</TitleId></LicenseTokenRequest>",
++        STANDARD.encode("fixture")
++    );
++    assert_eq!(
++        super::fetch(&mut context, xml.as_bytes()).await,
++        Err("licence token request is for another title")
++    );
++}
 diff --git a/crates/xodus-service/src/connection/router.rs b/crates/xodus-service/src/connection/router.rs
 index dfea07e..a584a8b 100644
 --- a/crates/xodus-service/src/connection/router.rs
@@ -783,10 +825,10 @@ index dfea07e..a584a8b 100644
 +}
 diff --git a/crates/xodus-service/src/entitlement.rs b/crates/xodus-service/src/entitlement.rs
 new file mode 100644
-index 0000000..3d2a04c
+index 0000000..9487753
 --- /dev/null
 +++ b/crates/xodus-service/src/entitlement.rs
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,184 @@
 +//! A title-bound Store licence. No running-title or player ownership inference.
 +use std::sync::Arc;
 +use std::time::{Duration, Instant};
@@ -795,8 +837,23 @@ index 0000000..3d2a04c
 +pub struct Entitlement {
 +    product: String,
 +    content: String,
-+    cached: tokio::sync::Mutex<Option<(Instant, bool)>>,
++    cached: tokio::sync::Mutex<Option<Check>>,
 +}
++
++/// The last answer, and when the licence was last actually granted.
++#[derive(Clone, Copy)]
++struct Check {
++    at: Instant,
++    valid: bool,
++    granted: Option<Instant>,
++}
++
++/// How long a verified grant outlives failed checks. The licensing endpoint
++/// cannot tell this service "denied" from "unreachable", and the runtime
++/// treats a false answer as a lost licence -- so without this, a network blip
++/// or going offline ends a game that was licensed a minute earlier. A real
++/// revocation is honoured once the grace has run out.
++const GRACE: Duration = Duration::from_secs(30 * 60);
 +
 +impl Entitlement {
 +    pub fn from_env() -> Result<Option<Arc<Self>>, String> {
@@ -820,42 +877,72 @@ index 0000000..3d2a04c
 +        }
 +    }
 +
++    #[cfg(test)]
++    pub(crate) fn fixture(product: &str) -> Arc<Self> {
++        Arc::new(Self {
++            product: product.into(),
++            content: "00000000-0000-0000-0000-000000000001".into(),
++            cached: Default::default(),
++        })
++    }
++
++    /// The Store product this service is bound to.
++    pub fn product(&self) -> &str {
++        &self.product
++    }
++
 +    pub async fn valid(
 +        &self,
 +        product: &str,
 +        client: &reqwest::Client,
 +        tokens: &TokenManager,
 +    ) -> bool {
-+        if product != self.product
++        if !product.eq_ignore_ascii_case(&self.product)
 +            || tokens.get_user().is_err()
 +            || tokens.get_user_sts_token().is_err()
 +        {
 +            return false;
 +        }
 +        let mut cached = self.cached.lock().await;
-+        if let Some((checked, valid)) = *cached {
-+            if checked.elapsed() < Duration::from_secs(if valid { 60 } else { 10 }) {
-+                return valid;
++        let previous = *cached;
++        if let Some(check) = previous {
++            if check.at.elapsed() < Duration::from_secs(if check.valid { 60 } else { 10 }) {
++                return check.valid;
 +            }
 +        }
-+        let valid = matches!(
-+            tokio::time::timeout(
-+                Duration::from_secs(25),
-+                xodus::licensing::acquire::get_license(
-+                    client,
-+                    tokens,
-+                    self.content.clone(),
-+                    "neutral".into()
-+                )
-+            )
-+            .await,
-+            Ok(Ok(_))
-+        );
-+        let valid = valid && tokens.get_user().is_ok() && tokens.get_user_sts_token().is_ok();
-+        *cached = Some((Instant::now(), valid));
-+        if !valid {
-+            tracing::warn!("Store account content licence check failed");
++        let checked = tokio::time::timeout(
++            Duration::from_secs(25),
++            xodus::licensing::acquire::get_license(
++                client,
++                tokens,
++                self.content.clone(),
++                "neutral".into(),
++            ),
++        )
++        .await;
++        let signed_in = tokens.get_user().is_ok() && tokens.get_user_sts_token().is_ok();
++        let now = Instant::now();
++        let granted = match &checked {
++            Ok(Ok(_)) => Some(now),
++            _ => previous.and_then(|check| check.granted),
++        };
++        let valid = signed_in && granted.is_some_and(|at| now.duration_since(at) < GRACE);
++        if !matches!(checked, Ok(Ok(_))) {
++            let cause = match &checked {
++                Ok(Err(e)) => e.clone(),
++                _ => "timed out".to_string(),
++            };
++            tracing::warn!(
++                product = %self.product,
++                within_grace = valid,
++                "Store account content licence check failed: {cause}"
++            );
 +        }
++        *cached = Some(Check {
++            at: now,
++            valid,
++            granted,
++        });
 +        valid
 +    }
 +}
@@ -881,7 +968,11 @@ index 0000000..3d2a04c
 +        let binding = Entitlement {
 +            product: "9TESTROLE0ID".into(),
 +            content: "00000000-0000-0000-0000-000000000001".into(),
-+            cached: tokio::sync::Mutex::new(Some((Instant::now(), true))),
++            cached: tokio::sync::Mutex::new(Some(Check {
++                at: Instant::now(),
++                valid: true,
++                granted: Some(Instant::now()),
++            })),
 +        };
 +        assert!(binding.valid("9TESTROLE0ID", &context.client, &owner).await);
 +        assert!(!binding.valid("9OTHERROLE00", &context.client, &owner).await);
@@ -889,6 +980,37 @@ index 0000000..3d2a04c
 +        assert!(binding.valid("9TESTROLE0ID", &context.client, &owner).await);
 +        owner.remove_user().unwrap();
 +        assert!(!binding.valid("9TESTROLE0ID", &context.client, &owner).await);
++    }
++
++    /// A refresh that fails -- here because the fixture has no device
++    /// credentials, as a network failure would -- keeps a recent grant, and
++    /// lets one older than the grace period go.
++    #[tokio::test]
++    async fn a_verified_grant_survives_failed_checks_only_for_the_grace_period() {
++        let context = crate::simple_context::tests::context("owner-grace", "player-grace");
++        let owner = context.store_context().tokens().clone();
++        let binding = |granted_ago: Duration| {
++            let now = Instant::now();
++            Some(Entitlement {
++                product: "9TESTROLE0ID".into(),
++                content: "00000000-0000-0000-0000-000000000001".into(),
++                cached: tokio::sync::Mutex::new(Some(Check {
++                    at: now.checked_sub(Duration::from_secs(61))?,
++                    valid: true,
++                    granted: Some(now.checked_sub(granted_ago)?),
++                })),
++            })
++        };
++        if let Some(recent) = binding(Duration::from_secs(120)) {
++            assert!(recent.valid("9testrole0id", &context.client, &owner).await);
++        }
++        // A machine up for less than the grace period cannot hold an older
++        // instant; the check is skipped there rather than faked.
++        if let Some(expired) = binding(GRACE + Duration::from_secs(1)) {
++            assert!(!expired.valid("9TESTROLE0ID", &context.client, &owner).await);
++        }
++        let never = Entitlement::fixture("9TESTROLE0ID");
++        assert!(!never.valid("9TESTROLE0ID", &context.client, &owner).await);
 +    }
 +}
 diff --git a/crates/xodus-service/src/main.rs b/crates/xodus-service/src/main.rs
@@ -1272,10 +1394,10 @@ index 2755f1b..ef7cbc9 100644
  
 diff --git a/crates/xodus/src/profiles.rs b/crates/xodus/src/profiles.rs
 new file mode 100644
-index 0000000..8f57c6b
+index 0000000..d507937
 --- /dev/null
 +++ b/crates/xodus/src/profiles.rs
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,218 @@
 +//! Local account identifiers and metadata. Credentials stay in the keychain.
 +use crate::tokens::{TokenManager, store::TokenStoreError};
 +use serde::{Deserialize, Serialize};
@@ -1345,8 +1467,13 @@ index 0000000..8f57c6b
 +    let mut profiles = Vec::new();
 +    for entry in entries {
 +        let entry = entry?;
-+        if let Some(id) = entry
-+            .path()
++        let path = entry.path();
++        // `<id>.json~` or `<id>.bak` has the same stem: listed, it would be
++        // the same profile twice.
++        if path.extension().and_then(|e| e.to_str()) != Some("json") {
++            continue;
++        }
++        if let Some(id) = path
 +            .file_stem()
 +            .and_then(|s| s.to_str())
 +            .filter(|s| valid_id(s))
@@ -1475,6 +1602,12 @@ index 0000000..8f57c6b
 +        assert_eq!(list(&root).unwrap(), Vec::new());
 +        save(&root, &profile).unwrap();
 +        atomic(&root, &root.join("default"), profile.id.as_bytes()).unwrap();
++        // An editor backup of a profile is not a second profile.
++        std::fs::copy(
++            root.join(format!("{MIGRATED_PROFILE}.json")),
++            root.join(format!("{MIGRATED_PROFILE}.json~")),
++        )
++        .unwrap();
 +        assert_eq!(list(&root).unwrap(), vec![profile]);
 +        assert_eq!(
 +            default_id(&root).unwrap().as_deref(),
