@@ -158,7 +158,11 @@ directly. Everything has to go through the client's `run` path.
 
 Every game row shows either measured disk usage for its game directory or the
 Store's PC download size. Wine prefixes and cached downloads are separate from
-the installed game total; unavailable sizes are labelled explicitly.
+the installed game total; unavailable sizes are labelled explicitly. Disk usage
+measurements persist across restarts and list refreshes for 24 hours. Install
+record, directory identity or manifest changes invalidate them; expired totals
+remain visible while a background scan updates them. Changes to existing files
+deep inside a game are picked up by that daily scan.
 
 Owned games, subscription access and the public Game Pass catalogue open from
 disk cache. Ownership checks are reused for five minutes and public Game Pass

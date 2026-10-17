@@ -234,6 +234,111 @@ pub fn disk_usage(dir: &Path) -> Option<u64> {
     walk(&dir.canonicalize().ok()?, &mut BTreeSet::new())
 }
 
+/// A cheap identity check, not a recursive walk. The daily expiry catches
+/// changes to files deep inside a game that do not alter its root directory.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct UsageFingerprint {
+    dir: PathBuf,
+    root: UsageStamp,
+    manifest: Option<UsageStamp>,
+    record: Option<Record>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct UsageStamp {
+    device: u64,
+    inode: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+    len: u64,
+}
+
+impl UsageStamp {
+    fn read(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+            len: metadata.len(),
+        })
+    }
+}
+
+impl UsageFingerprint {
+    fn read(dir: &Path, record: Option<&Record>) -> Option<Self> {
+        let dir = dir.canonicalize().ok()?;
+        let root = UsageStamp::read(&dir)?;
+        let manifest = ["appxmanifest.xml", "AppxManifest.xml"]
+            .iter()
+            .find_map(|name| UsageStamp::read(&dir.join(name)));
+        Some(Self {
+            dir,
+            root,
+            manifest,
+            record: record.cloned(),
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct UsageEntry {
+    schema: u32,
+    fingerprint: UsageFingerprint,
+    bytes: u64,
+}
+
+pub fn disk_usage_cache_path(cache_dir: &Path, product_id: &str) -> Option<PathBuf> {
+    let name = record_path(cache_dir, product_id)?.file_name()?.to_owned();
+    Some(cache_dir.join("disk-usage").join(name))
+}
+
+/// Last good allocated-byte measurement and whether it is still fresh.
+/// Reading this only stats the root/manifest and reads one small cache file.
+pub fn cached_disk_usage(
+    cache_dir: &Path,
+    product_id: &str,
+    dir: &Path,
+    record: Option<&Record>,
+) -> Option<(u64, bool)> {
+    let path = disk_usage_cache_path(cache_dir, product_id)?;
+    let entry: UsageEntry = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+    if entry.schema != 1 || entry.fingerprint != UsageFingerprint::read(dir, record)? {
+        return None;
+    }
+    Some((
+        entry.bytes,
+        crate::cache::is_fresh(&path, crate::cache::DISK_USAGE_MAX_AGE),
+    ))
+}
+
+/// Measure off the UI thread and atomically keep the result for future loads.
+/// Do not cache an unreadable or detectably changing install.
+pub fn measure_disk_usage(
+    cache_dir: &Path,
+    product_id: &str,
+    dir: &Path,
+    record: Option<&Record>,
+) -> Option<u64> {
+    let fingerprint = UsageFingerprint::read(dir, record)?;
+    let bytes = disk_usage(dir)?;
+    if UsageFingerprint::read(dir, record).as_ref() == Some(&fingerprint) {
+        if let Some(path) = disk_usage_cache_path(cache_dir, product_id) {
+            let entry = UsageEntry {
+                schema: 1,
+                fingerprint,
+                bytes,
+            };
+            if let Ok(json) = serde_json::to_vec(&entry) {
+                let _ = crate::cache::write(&path, &json);
+            }
+        }
+    }
+    Some(bytes)
+}
+
 /// An RFC 3339 timestamp for now, in UTC.
 ///
 /// Written by hand rather than by pulling in a date crate, because the only
@@ -534,6 +639,75 @@ mod tests {
 
     /// The guard on the one irreversible thing here. A record is a JSON file
     /// anybody can edit, so the path in it is checked rather than trusted.
+    #[test]
+    fn disk_usage_cache_survives_loads_and_invalidates_changed_installs() {
+        use std::time::{Duration, SystemTime};
+        let base =
+            std::env::temp_dir().join(format!("ferestre-usage-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let game = base.join("game");
+        let cache = base.join("cache");
+        std::fs::create_dir_all(game.join("data")).unwrap();
+        std::fs::write(game.join("data/content"), b"old").unwrap();
+        std::fs::write(game.join("appxmanifest.xml"), b"version one").unwrap();
+        let record = Record {
+            product_id: "9ZZTESTGAME1".into(),
+            dir: game.clone(),
+            content_ids: vec![],
+            installed_at: Some("2026-10-17T00:00:00Z".into()),
+            package_version: Some("1".into()),
+        };
+        assert!(cached_disk_usage(&cache, &record.product_id, &game, Some(&record)).is_none());
+        let measured =
+            measure_disk_usage(&cache, &record.product_id, &game, Some(&record)).unwrap();
+        assert_eq!(measured, disk_usage(&game).unwrap());
+        let path = disk_usage_cache_path(&cache, &record.product_id).unwrap();
+        let snapshot = std::fs::read(&path).unwrap();
+        // Existing deep content changes do not require an expensive recursive
+        // fingerprint. A fresh cache reuses its measurement; expiry updates it.
+        std::fs::write(game.join("data/content"), [7; 128 * 1024]).unwrap();
+        assert_eq!(
+            cached_disk_usage(&cache, &record.product_id, &game, Some(&record)),
+            Some((measured, true))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), snapshot);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::now() - Duration::from_secs(48 * 3600)),
+            )
+            .unwrap();
+        assert_eq!(
+            cached_disk_usage(&cache, &record.product_id, &game, Some(&record)),
+            Some((measured, false))
+        );
+        let updated = measure_disk_usage(&cache, &record.product_id, &game, Some(&record)).unwrap();
+        assert!(updated > measured);
+        assert_eq!(
+            cached_disk_usage(&cache, &record.product_id, &game, Some(&record)),
+            Some((updated, true))
+        );
+        let mut new_record = record.clone();
+        new_record.package_version = Some("2".into());
+        assert!(cached_disk_usage(&cache, &record.product_id, &game, Some(&new_record)).is_none());
+        std::fs::write(game.join("appxmanifest.xml"), b"version two changed").unwrap();
+        assert!(cached_disk_usage(&cache, &record.product_id, &game, Some(&record)).is_none());
+        measure_disk_usage(&cache, &record.product_id, &game, Some(&record)).unwrap();
+        std::fs::write(game.join("new-package"), b"more content").unwrap();
+        assert!(cached_disk_usage(&cache, &record.product_id, &game, Some(&record)).is_none());
+        let moved = base.join("moved");
+        std::fs::rename(&game, &moved).unwrap();
+        assert!(cached_disk_usage(&cache, &record.product_id, &moved, Some(&record)).is_none());
+        let before_failure = std::fs::read(&path).unwrap();
+        assert!(measure_disk_usage(&cache, &record.product_id, &game, Some(&record)).is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), before_failure);
+        assert!(disk_usage_cache_path(&cache, "../../escape").is_none());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn disk_usage_counts_allocations_once_and_does_not_follow_links() {
         use std::os::unix::fs::{symlink, MetadataExt};

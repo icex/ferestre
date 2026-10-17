@@ -64,7 +64,11 @@ covered by the existing round-trip/upsert tests.
 Rows in Library, Game Pass and Installed share a separate size label. Installed
 sizes are allocated bytes, measured off the GTK thread; sparse files and
 hardlinks are handled, symlinks are not traversed within a game tree, and a
-reload invalidates old measurements. Catalog rows identify download sizes.
+reload discards obsolete in-flight results. Disk usage persists in an atomic
+per-game cache for 24 hours, reused across app loads and list refreshes. Root
+identity/metadata, manifest metadata and install-record changes invalidate it;
+deep file changes are picked up at expiry. Stale totals remain visible while
+background remeasurement runs. Catalog rows identify download sizes.
 
 List/account/update refreshes may be closed immediately. Download cancellation
 and removal completion retain their existing close protocols. Cache snapshots
@@ -79,7 +83,7 @@ changes invalidate the corresponding data; explicit refresh bypasses freshness.
 No Microsoft change notification is available here: changes made elsewhere are
 detected by the periodic ownership check or an explicit refresh.
 
-Final local checks: 303 Rust tests, workspace formatting and Clippy with warnings
+Final local checks: 304 Rust tests, workspace formatting and Clippy with warnings
 as errors; complete isolated GTK smoke including all three size-label sections,
 cache reuse across restart, account-change invalidation, immediate close during
 a held list refresh, download cleanup and removal completion; CLI media and
@@ -92,3 +96,8 @@ load with no request, changed stale metadata replacing the cached row, forced
 refresh of fresh data, locale changes and failure preserving data/freshness.
 The real GTK smoke also counts proxy requests across restarts and checks forced
 and automatic stale revalidation with cached names visible on failure.
+
+Disk usage follow-up: a filesystem test covers persistent reuse, expiry, deep
+content changes, changed manifests/install records, directory changes/moves and
+failure preserving the cache. The GTK restart/refresh checks assert the stored
+measurement contents and timestamps remain unchanged for fresh installs.

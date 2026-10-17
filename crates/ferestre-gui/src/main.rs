@@ -765,11 +765,13 @@ fn render_gamepass(ui: &Ui, page: &gtk::Box) {
     );
 }
 
-/// Scan visible installed games off the GTK thread. Reload invalidates the
-/// totals, and a result from the previous generation cannot repopulate them.
+/// Reuse persistent disk measurements before drawing. Only missing/stale or
+/// changed installs need a walk, and that runs off the GTK thread. Results
+/// from a previous install generation cannot repopulate the model.
 fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
-    let (generation, wanted) = {
+    let (generation, cache_dir, wanted) = {
         let mut model = ui.model.borrow_mut();
+        let cache_dir = model.cache_dir().map(Path::to_path_buf);
         let wanted: Vec<_> = rows
             .iter()
             .filter(|row| row.installed)
@@ -783,11 +785,25 @@ fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
                         .recipe_for(&row.product_id)
                         .and_then(|recipe| model.game_dir(recipe))
                 });
+                let record = model.records.get(&key).cloned();
+                if let (Some(cache_dir), Some(dir)) = (&cache_dir, &dir) {
+                    if let Some((bytes, fresh)) = ferestre_core::install::cached_disk_usage(
+                        cache_dir,
+                        &key,
+                        dir,
+                        record.as_ref(),
+                    ) {
+                        model.disk_usage.insert(key.clone(), Some(bytes));
+                        if fresh {
+                            return None;
+                        }
+                    }
+                }
                 model.sizes_pending.insert(key.clone());
-                Some((key, dir))
+                Some((key, dir, record))
             })
             .collect();
-        (model.size_generation, wanted)
+        (model.size_generation, cache_dir, wanted)
     };
     if wanted.is_empty() {
         return;
@@ -797,8 +813,16 @@ fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
         let scanned = gio::spawn_blocking(move || {
             wanted
                 .into_iter()
-                .map(|(key, dir)| {
-                    let bytes = dir.and_then(|dir| ferestre_core::install::disk_usage(&dir));
+                .map(|(key, dir, record)| {
+                    let bytes = dir.and_then(|dir| match &cache_dir {
+                        Some(cache_dir) => ferestre_core::install::measure_disk_usage(
+                            cache_dir,
+                            &key,
+                            &dir,
+                            record.as_ref(),
+                        ),
+                        None => ferestre_core::install::disk_usage(&dir),
+                    });
                     (key, bytes)
                 })
                 .collect::<Vec<_>>()
@@ -811,7 +835,10 @@ fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
             }
             for (key, bytes) in scanned {
                 model.sizes_pending.remove(&key);
-                model.disk_usage.insert(key, bytes);
+                // Keep an expired measurement if the new walk failed.
+                if bytes.is_some() || !model.disk_usage.contains_key(&key) {
+                    model.disk_usage.insert(key, bytes);
+                }
             }
             drop(model);
             render(&ui);
@@ -1115,7 +1142,7 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
         .valign(gtk::Align::Center)
         .build();
     size.set_tooltip_text(Some(if row.installed {
-        "Allocated space used by the game directory; Wine prefix and download cache are separate"
+        "Allocated space used by the game directory; cached for up to 24 hours and refreshed after install changes. Wine prefix and download cache are separate"
     } else {
         "PC download size from the Microsoft Store; installed disk usage may differ"
     }));

@@ -1410,6 +1410,9 @@ elif sys.argv[1] == 'library':
                     with open(path, "w") as f:
                         json.dump({"schema": schema, "market": "US", "language": "en-us",
                                    "product": {"product_id": pid, "name": title["name"]}}, f)
+        usage_paths = glob.glob(os.path.join(home, "cache", "ferestre", "disk-usage", "*.json"))
+        check(bool(usage_paths), "disk usage measurements are persisted for future app loads")
+        usage_snapshots = {path: (os.stat(path).st_mtime_ns, open(path, "rb").read()) for path in usage_paths}
         cached_library = open(os.path.join(state, "library.json"), "rb").read()
         with open(os.path.join(home, "client-library.json"), "wb") as f:
             f.write(cached_library)
@@ -1459,6 +1462,9 @@ elif sys.argv[1] == 'library':
         refresh_marker = os.path.join(home, "refresh-started")
         if os.path.exists(refresh_marker):
             os.unlink(refresh_marker)
+        check(all((os.stat(path).st_mtime_ns, open(path, "rb").read()) == snapshot
+                  for path, snapshot in usage_snapshots.items()),
+              "restarts and catalogue refreshes reuse fresh disk usage measurements")
         # Request an actual library refresh and hold its child, then close.
         open(os.path.join(home, "hold-refresh"), "w").close()
         click(find_all(frame, role="button", name_contains="Fixture Player")[0])
