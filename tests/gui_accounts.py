@@ -208,6 +208,24 @@ summary="Synthetic account fixture"
         s.check(not (home/"launched.json").exists(),"signed-out Player cannot launch using Store identity")
         s.click_named(frame,"Close")
         s.check(gui.wait(timeout=10)==0,"account test window closes")
+        profiles=json.loads((home/"profiles.json").read_text())
+        profiles["profiles"][0]["signed_in"]=False
+        write(home/"profiles.json",json.dumps(profiles))
+        settings.unlink()
+        gui=subprocess.Popen([home/"bin/ferestre-gui"],env=env,stderr=subprocess.PIPE)
+        app=s.find_app(gui.pid,time.monotonic()+20)
+        frame=s.wait_for(app,lambda root:next(iter(s.find_all(root,role="frame",name="Ferestre")),None),"signed-out restart",time.monotonic()+20)
+        button=s.wait_for(frame,lambda root:next(iter(s.find_all(root,role="button",name_contains="Not signed in")),None),"signed-out account button",time.monotonic()+20)
+        s.wait_for(frame,lambda root:any(n.get_name()=="No activity" for n in s.find_all(root,role="progress bar")),"signed-out refresh completes",time.monotonic()+20)
+        s.click(button)
+        dialog=s.wait_for(app,lambda root:next(iter(s.find_all(root,role="frame",name="Accounts")),None),"reauthentication accounts dialog",time.monotonic()+20)
+        s.check(bool(s.find_all(dialog,role="button",name="Add account")),"signed-out default profile can reopen Accounts without saved role settings")
+        commands=[json.loads(line)["args"][0] for line in (home/"client.log").read_text().splitlines()]
+        s.check("login" not in commands,"profile-aware reauthentication does not attempt the legacy identity-replacing login")
+        s.click_named(dialog,"Close")
+        s.wait_for(app,lambda root:not s.find_all(root,role="frame",name="Accounts"),"Accounts dialog closes",time.monotonic()+10)
+        s.click_named(frame,"Close")
+        s.check(gui.wait(timeout=10)==0,"signed-out restart closes")
         print("all account GUI checks passed")
     finally:
         if gui is not None and gui.poll() is None:

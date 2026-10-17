@@ -2699,21 +2699,28 @@ fn sign_in(ui: &Ui) {
         return;
     }
     ui.toasts
-        .add_toast(adw::Toast::new("Signing in — the client opens a browser"));
+        .add_toast(adw::Toast::new("Loading sign-in options"));
 
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = gio::spawn_blocking(move || {
+            // A signed-out default profile must be reauthenticated through Add
+            // account, which verifies and reuses its existing save namespace.
+            if accounts::fetch(&client).is_ok() {
+                return Ok(None);
+            }
             account::login_command(&client)
                 .stdin(std::process::Stdio::null())
                 .status()
+                .map(Some)
                 .map_err(|e| format!("{}: {e}", client.display()))
         })
         .await;
         finish(&ui);
         match result {
-            Ok(Ok(status)) if status.success() => refresh_account(&ui),
-            Ok(Ok(status)) => ui
+            Ok(Ok(None)) => accounts_ui::open(&ui),
+            Ok(Ok(Some(status))) if status.success() => refresh_account(&ui),
+            Ok(Ok(Some(status))) => ui
                 .toasts
                 .add_toast(adw::Toast::new(&format!("Sign-in exited {status}"))),
             Ok(Err(e)) => ui.toasts.add_toast(adw::Toast::new(&e)),

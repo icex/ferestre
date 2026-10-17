@@ -74,6 +74,8 @@ platform contract, not proof that Dungeons II accepts a particular account pair.
   prefix, changing selection while a game runs, Stop targeting the original
   prefix, Player-only sign-out retaining the Store library, old-runtime refusal
   and refusing a signed-out Player without falling back to the Store identity.
+  A signed-out default profile can also reopen Accounts after a cold restart
+  with no saved role selection, instead of attempting legacy login.
 - Both 64-bit and 32-bit native probes: 47 checks each, including delayed async
   licensing, no fabricated grants, Store sign-out notifications, Player state
   changes and no callbacks after unregister. A previous production runtime fails
