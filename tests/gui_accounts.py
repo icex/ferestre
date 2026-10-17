@@ -92,7 +92,7 @@ def main():
         write(home/"runtime/proton","#!/bin/sh\n# close_fds=False\nexit 0\n",True)
         write(home/"runtime/version","0 ferestre-account-fixture\n")
         write(home/"runtime/files/share/ferestre/capabilities.json",json.dumps({"schema":1,"capabilities":[
-            "xgameruntime.store-player-accounts","xgameruntime.service-socket-override"]}))
+            "xgameruntime.service-socket-override"]}))
         write(home/"runtime/files/bin/wineserver", "#!/bin/sh\nprintf '%s\\n' \"$WINEPREFIX\" > \"$HOME/stopped-prefix\"\n", True)
         write(home/"titles/role-test.toml",f'''schema=1
 [title]
@@ -159,6 +159,14 @@ summary="Synthetic account fixture"
         s.select_in_list(frame,"Installed")
         play=s.wait_for(frame,lambda root:s.row_button(root,"Account Test Game","Play"),"Play",time.monotonic()+20)
         s.click(play)
+        s.wait_for(frame,lambda root:any("Select an account-sharing runtime" in t for t in s.texts(root)),"old-runtime refusal",time.monotonic()+20)
+        s.check(not (home/"launched.json").exists(),"old runtime cannot silently launch a split pair")
+        write(home/"runtime/files/share/ferestre/capabilities.json",json.dumps({"schema":1,"capabilities":["xgameruntime.store-player-accounts","xgameruntime.service-socket-override"]}))
+        generation=json.loads(settings.read_text())["generation"]
+        dialog=open_accounts();s.click_named(dialog,"Apply accounts")
+        s.wait_for(frame,lambda root:json.loads(settings.read_text())["generation"]>generation,"runtime reload after applying accounts",time.monotonic()+20)
+        play=s.wait_for(frame,lambda root:s.row_button(root,"Account Test Game","Play"),"Play with upgraded runtime",time.monotonic()+20)
+        s.click(play)
         s.wait_for(frame,lambda root:(home/"launched.json").exists(),"core launch record",time.monotonic()+20)
         launched=json.loads((home/"launched.json").read_text())
         s.check(launched['XODUS_STORE_PROFILE']==OWNER and launched['XODUS_PLAYER_PROFILE']==PLAYER,"actual launch keeps Store and Player contexts")
@@ -184,6 +192,12 @@ summary="Synthetic account fixture"
         s.check(json.loads((home/"profiles.json").read_text())["profiles"][0]["signed_in"],"Player sign-out preserves Store credentials")
         s.wait_for(frame,lambda root:any("Store: Owner Fixture" in t for t in s.texts(root)),"Store identity after Player sign-out",time.monotonic()+20)
         s.check(any("Purchased" in t for t in s.texts(frame)),"Player sign-out preserves Store library access labels",frame)
+        s.wait_for(frame,lambda root:any("Player Fixture (signed out)" in t for t in s.texts(root)),"signed-out Player label",time.monotonic()+20)
+        (home/"launched.json").unlink()
+        play=s.wait_for(frame,lambda root:s.row_button(root,"Account Test Game","Play"),"Play after Player sign-out",time.monotonic()+20)
+        s.click(play)
+        s.wait_for(frame,lambda root:any("Player account is signed out" in t for t in s.texts(root)),"signed-out Player refusal",time.monotonic()+20)
+        s.check(not (home/"launched.json").exists(),"signed-out Player cannot launch using Store identity")
         s.click_named(frame,"Close")
         s.check(gui.wait(timeout=10)==0,"account test window closes")
         print("all account GUI checks passed")
