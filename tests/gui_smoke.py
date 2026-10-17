@@ -711,6 +711,9 @@ last-verified = 2026-10-10
     threading.Thread(target=art_server.serve_forever, daemon=True).start()
     art_url = f"http://127.0.0.1:{art_server.server_port}/art.png"
     env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost"
+    # The seeded Game Pass listing is the US one; the market otherwise follows
+    # the locale, which is not this test's to choose.
+    env["FERESTRE_MARKET"] = "US"
     for filename in glob.glob(os.path.join(recipes_dir, "*.toml")):
         with open(filename, "rb") as f:
             title = tomllib.load(f).get("title", {})
@@ -1097,17 +1100,18 @@ print(":: done", flush=True)
             "the Game Pass section",
             time.monotonic() + TIMEOUT,
         )
+        # Counted from the rows below it: the AppxBundle is held back, so two.
         check(
-            any("3 titles are included with PC Game Pass" in t for t in labels),
-            "the section says what the list is and how long it is",
+            any("2 games in PC Game Pass for the US Store" in t for t in labels),
+            "the section says what the list is, where, and how long it is",
             frame,
         )
         # The distinction the whole section rests on: what the catalogue
         # includes is not the same as what this account may install, and saying
         # so is what stops a licence refusal from reading as a bug.
         check(
-            any("No active subscription was found" in t for t in labels),
-            "and says plainly that no subscription was found on this account",
+            any("Sign in to see which of these your Store account can play" in t for t in labels),
+            "and says that nobody signed in means nothing is known about access",
             frame,
         )
         check(

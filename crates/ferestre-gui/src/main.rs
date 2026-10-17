@@ -843,17 +843,14 @@ fn draw_list(
 /// leaving that unsaid would make every licence refusal look like a bug in the
 /// launcher.
 fn render_gamepass(ui: &Ui, page: &gtk::Box) {
-    let (held, fetched, market, store) = {
+    let (held, fetched, market, store, checked) = {
         let model = ui.model.borrow();
         (
             model.subscriptions.clone(),
             !model.gamepass.is_empty(),
             model.market().0,
-            model
-                .account
-                .as_ref()
-                .map(|a| a.label().to_string())
-                .filter(|_| model.entitlements_checked),
+            model.account.as_ref().map(|a| a.label().to_string()),
+            model.entitlements_checked,
         )
     };
 
@@ -876,25 +873,30 @@ fn render_gamepass(ui: &Ui, page: &gtk::Box) {
     );
 
     let games = |n: usize| format!("{n} {}", if n == 1 { "game" } else { "games" });
-    let (title, subtitle) = match (fetched, store, held.as_slice()) {
-        (false, _, _) => (
+    let in_market = format!("{} in PC Game Pass for the {market} Store", games(listed));
+    let (title, subtitle) = match (fetched, store, checked, held.as_slice()) {
+        (false, ..) => (
             "The Game Pass catalogue has not been fetched yet".to_string(),
             "Reload to fetch it. It is a public listing -- no account needed.".to_string(),
         ),
-        (true, None, _) => (
-            format!("{} in PC Game Pass for the {market} Store", games(listed)),
-            "Load the library to see which of them the Store account can play.".to_string(),
+        (true, None, ..) => (
+            in_market,
+            "Sign in to see which of these your Store account can play.".to_string(),
         ),
-        (true, Some(store), []) => (
-            format!("{} in PC Game Pass for the {market} Store", games(listed)),
+        (true, Some(store), false, _) => (
+            in_market,
+            format!("Load the library to see which of these {store} can play."),
+        ),
+        (true, Some(store), true, []) => (
+            in_market,
             format!(
                 "{store} has no Game Pass subscription, so it cannot play these. Choose an \
                  account with Game Pass as the Store account in Accounts."
             ),
         ),
-        (true, Some(store), subs) => (
+        (true, Some(store), true, subs) => (
             if show_all {
-                format!("{} in PC Game Pass for the {market} Store", games(listed))
+                in_market
             } else {
                 format!(
                     "{} {store} can install with {}",
