@@ -267,19 +267,9 @@ fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
         _ => None,
     };
 
-    // Absence from the library listing is a caution, not a refusal.
-    //
-    // The listing is not exhaustive, and that is not a guess: Clair Obscur:
-    // Expedition 33 is installed, licensed and launches on this machine, and
-    // does not appear in the 124 entitlements collections returns for the
-    // account that owns it. Refusing to launch an installed title on that
-    // evidence would be the launcher calling its owner a liar and being wrong.
-    // A download for something genuinely unowned fails at the licence step
-    // anyway, which teaches the same lesson at the right moment.
+    // Collections omit subscription grants and some licensed purchases.
+    // Access source is labelled separately from runtime compatibility.
     let mut caution = broken;
-    if inputs.ownership.owns(&recipe.title.product_id) == Some(false) {
-        caution = Some(join(caution, "not in this account's library listing"));
-    }
 
     let Some(runtime) = inputs.runtime else {
         return blocked("install the patched runtime first".into());
@@ -519,6 +509,66 @@ pub fn game_size_label(
             None => "Size unavailable".to_string(),
         }
     }
+}
+
+/// Identify how the account can access a title. A public catalog entry alone
+/// is not a subscription grant. Purchases take precedence over subscriptions;
+/// a full subscription takes precedence over an old trial entry.
+pub fn access_source(
+    product_id: &str,
+    ownership: &Ownership,
+    catalog: &BTreeMap<String, Product>,
+    gamepass_ids: &[String],
+    tiers: &gamepass::Tiers,
+    held: &[&str],
+) -> &'static str {
+    let related = |id: &str| {
+        id.eq_ignore_ascii_case(product_id)
+            || catalog.get(&id.to_ascii_uppercase()).is_some_and(|p| {
+                p.bundled_ids
+                    .iter()
+                    .any(|child| child.eq_ignore_ascii_case(product_id))
+            })
+    };
+    if let Ownership::Known(entries) = ownership {
+        if let Some(entry) = entries.iter().find(|entry| {
+            entry.is_title()
+                && related(&entry.product_id)
+                && !entry
+                    .sku_type
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("Trial"))
+        }) {
+            return match entry.ownership_type.as_deref() {
+                Some("OwnedByBeneficiary") | None => "Purchased",
+                Some("Shared") | Some("SharedWithBeneficiary") => "Shared licence",
+                _ => "Owned",
+            };
+        }
+    }
+    if tiers.covered(product_id, held) == Some(true)
+        || gamepass_ids
+            .iter()
+            .filter(|id| related(id))
+            .any(|id| tiers.covered(id, held) == Some(true))
+    {
+        return "Game Pass";
+    }
+    if let Ownership::Known(entries) = ownership {
+        if entries.iter().any(|e| {
+            e.is_title()
+                && related(&e.product_id)
+                && e.sku_type
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("Trial"))
+        }) {
+            return "Trial";
+        }
+    }
+    if gamepass_ids.iter().any(|id| related(id)) {
+        return "Game Pass catalogue";
+    }
+    "Access not checked"
 }
 
 /// One row of the library: something owned, something described, or both.
@@ -1403,7 +1453,7 @@ mod tests {
     /// An unasked library must not read as "you do not own this", and a library
     /// that was asked and came back without the title must not either.
     #[test]
-    fn absence_from_the_library_cautions_rather_than_refuses() {
+    fn missing_purchase_entries_do_not_claim_that_access_is_missing() {
         let recipes = vec![recipe("9ZZTESTGAME1", "playable", &[])];
         let rt = runtime_with(&[], CapabilitySource::Manifest);
 
@@ -1421,9 +1471,8 @@ mod tests {
         let row = &library(&inputs(&recipes, Some(&rt), &elsewhere, NOTHING_INSTALLED))[0];
         assert_eq!(row.action, Action::Install, "still offered, not refused");
         assert!(
-            row.subtitle
-                .contains("not in this account's library listing"),
-            "but it says so: {}",
+            !row.subtitle.contains("library listing"),
+            "absence is not a negative entitlement verdict: {}",
             row.subtitle
         );
 
@@ -1438,6 +1487,50 @@ mod tests {
             !row.subtitle.contains("library listing"),
             "{}",
             row.subtitle
+        );
+    }
+
+    #[test]
+    fn access_sources_distinguish_purchases_game_pass_trials_and_unknown_access() {
+        let id = "9ZZTESTGAME1";
+        let ids = vec![id.to_string()];
+        let tiers =
+            gamepass::parse_tiers(r#"{"9ZZTESTGAME1":{"PCSubMetadata":{"Included":true}}}"#)
+                .unwrap();
+        let empty = Ownership::Known(Vec::new());
+        let cat = BTreeMap::new();
+        assert_eq!(
+            access_source(id, &empty, &cat, &ids, &tiers, &["PC Game Pass"]),
+            "Game Pass"
+        );
+        assert_eq!(
+            access_source(id, &empty, &cat, &ids, &tiers, &[]),
+            "Game Pass catalogue"
+        );
+        assert_eq!(
+            access_source(id, &empty, &cat, &[], &tiers, &[]),
+            "Access not checked"
+        );
+        let owned = Ownership::Known(entries(&[id]));
+        assert_eq!(
+            access_source(id, &owned, &cat, &ids, &tiers, &["PC Game Pass"]),
+            "Purchased"
+        );
+        let mut trial = entries(&[id]);
+        trial[0].sku_type = Some("Trial".into());
+        let trial = Ownership::Known(trial);
+        assert_eq!(access_source(id, &trial, &cat, &ids, &tiers, &[]), "Trial");
+        assert_eq!(
+            access_source(id, &trial, &cat, &ids, &tiers, &["PC Game Pass"]),
+            "Game Pass"
+        );
+        let mut parent = product("9ZZTESTBUNDL", "Fixture bundle", &[]);
+        parent.bundled_ids = vec![id.into()];
+        let cat = catalog(vec![parent]);
+        let owned = Ownership::Known(entries(&["9ZZTESTBUNDL"]));
+        assert_eq!(
+            access_source(id, &owned, &cat, &[], &tiers, &[]),
+            "Purchased"
         );
     }
 

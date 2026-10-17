@@ -645,6 +645,25 @@ fn draw_list(
     // Bundle rows install a child product. They still need to show the active
     // download on their own row, regardless of which model branch built it.
     for row in &mut rows {
+        let source = model::access_source(
+            &row.product_id,
+            &model.ownership,
+            &model.catalog,
+            &model.gamepass,
+            &model.tiers,
+            &model.subscriptions,
+        );
+        let details = row
+            .subtitle
+            .split("  ·  ")
+            .filter(|part| *part != "Included with PC Game Pass")
+            .collect::<Vec<_>>()
+            .join("  ·  ");
+        row.subtitle = if details.is_empty() {
+            source.into()
+        } else {
+            format!("{source}  ·  {details}")
+        };
         if installing(&row.product_id) {
             row.action = Action::Installing;
             row.outside_tier = false;

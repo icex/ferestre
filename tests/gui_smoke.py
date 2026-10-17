@@ -970,6 +970,8 @@ print(":: done", flush=True)
 
         labels = texts(frame)
         check(any("on disk" in t for t in labels), "installed rows show measured disk usage in Library", frame)
+        check(any("Purchased" in t and "12.5 GB" in t for t in labels), "purchased games show their access source", frame)
+        check(not any("not in this account's library listing" in t.lower() for t in labels), "missing direct purchase entries never claim missing access", frame)
         check(any("12.5 GB download" in t for t in labels), "catalog rows show download size in their details", frame)
         check_game_row_layout(frame, "Smoke Test Racer", "12.5 GB", "Install")
         check_game_row_layout(frame, "Minecraft for Windows", "on disk", "Play")
@@ -1109,7 +1111,7 @@ print(":: done", flush=True)
             frame,
         )
         check(
-            any("Included with PC Game Pass" in t and "8.1 GB" in t for t in labels),
+            any("Game Pass catalogue" in t and "8.1 GB" in t for t in labels),
             f"a row carries the size before the download: {[t for t in labels if 'GB' in t]}",
             frame,
         )
@@ -1369,6 +1371,10 @@ print(":: done", flush=True)
         wait_for(frame, lambda root: any("on disk" in t for t in texts(root)),
                  "measured disk usage in Installed", time.monotonic() + TIMEOUT)
         check(True, "Installed rows show disk usage too")
+        check(any(any(source in t for source in ("Purchased", "Game Pass", "Access not checked")) and "on disk" in t for t in texts(frame)),
+              "Installed rows show the access source beside their details", frame)
+        check(not any("not in this account's library listing" in t.lower() for t in texts(frame)),
+              "Installed never confuses purchase-list absence with missing access", frame)
         wait_for(frame, lambda root: not any("Checking for game updates" in t for t in texts(root)),
                  "the automatic update check to finish", time.monotonic() + TIMEOUT)
         remove = wait_for(
