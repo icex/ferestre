@@ -61,12 +61,12 @@ Pronounced roughly *feh-RESS-treh*.
 
 ## Status
 
-Release **0.1.11** pairs with runtime **11.0.20261017.1**. Forza Horizon 6
+Release **0.1.12** pairs with runtime **11.0.20261017.1**. Forza Horizon 6
 is playable, with shader startup, native PlayFab saves and Continue confirmed.
 Its marketplace is still under qualification. Dune: Awakening is marked
 playable from player confirmation. Game Pass tiers refresh independently of
 the catalog, and searches and paging include the full PC catalog.
-See [the release qualification](docs/RELEASE-0.1.11.md) for tested scope.
+See [the release qualification](docs/RELEASE-0.1.12.md) for tested scope.
 
 Honest version, because this is early. Every row here was run on a real machine,
 not inferred from the fact that it downloaded:
