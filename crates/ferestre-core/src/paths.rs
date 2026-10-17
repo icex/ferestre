@@ -398,11 +398,26 @@ impl Paths {
     /// Only decides which name and art come back; every market has the same
     /// product ids. Lives here rather than in each caller so the CLI and the
     /// window cannot ask for different ones and cache over each other.
+    /// The market is the person's country, which a locale says in its region:
+    /// `ro_RO.UTF-8` is Romania. Game Pass differs by market -- the RO and US
+    /// catalogues are different lists -- so a fixed `US` showed somebody in
+    /// Romania another country's titles and count. Formats and money are the
+    /// categories that follow where someone lives; `LANG` may be English
+    /// everywhere and is consulted last.
     pub fn market(&self) -> (String, String) {
+        let region = ["LC_ALL", "LC_MONETARY", "LC_ADDRESS", "LANG"]
+            .iter()
+            .filter_map(|name| self.var(name))
+            .find_map(|locale| {
+                let region = locale.split(['.', '@']).next()?.split_once('_')?.1;
+                (region.len() == 2 && region.bytes().all(|c| c.is_ascii_alphabetic()))
+                    .then(|| region.to_ascii_uppercase())
+            });
         (
             self.var("FERESTRE_MARKET")
-                .unwrap_or(crate::catalog::DEFAULT_MARKET)
-                .to_string(),
+                .map(str::to_string)
+                .or(region)
+                .unwrap_or_else(|| crate::catalog::DEFAULT_MARKET.to_string()),
             self.var("FERESTRE_LANGUAGE")
                 .unwrap_or(crate::catalog::DEFAULT_LANGUAGE)
                 .to_string(),
@@ -556,6 +571,30 @@ mod tests {
 
     fn paths(pairs: &[(&str, &str)]) -> Paths {
         Paths::resolve(&env(pairs)).expect("should resolve")
+    }
+
+    #[test]
+    fn the_market_follows_where_the_locale_says_someone_lives() {
+        let market = |pairs: &[(&str, &str)]| paths(pairs).market().0;
+        // English text with Romanian formats is someone in Romania.
+        assert_eq!(
+            market(&[("LANG", "en_US.UTF-8"), ("LC_MONETARY", "ro_RO.UTF-8")]),
+            "RO"
+        );
+        assert_eq!(market(&[("LANG", "en_GB.UTF-8")]), "GB");
+        assert_eq!(
+            market(&[("LC_ALL", "de_DE@euro"), ("LC_MONETARY", "ro_RO.UTF-8")]),
+            "DE"
+        );
+        assert_eq!(
+            market(&[("FERESTRE_MARKET", "US"), ("LC_MONETARY", "ro_RO.UTF-8")]),
+            "US"
+        );
+        assert_eq!(
+            market(&[("LANG", "C.UTF-8")]),
+            crate::catalog::DEFAULT_MARKET
+        );
+        assert_eq!(market(&[]), crate::catalog::DEFAULT_MARKET);
     }
 
     fn recipe(extra: &str) -> Recipe {

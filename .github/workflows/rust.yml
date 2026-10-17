@@ -22,6 +22,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'tests/gui_smoke.py'
+      - 'tests/gui_accounts.py'
       - 'tests/test_download_cancel.py'
       - 'tests/test_media_dependencies.py'
       - 'tools/xsts_probe.py'
@@ -42,6 +43,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'tests/gui_smoke.py'
+      - 'tests/gui_accounts.py'
       - 'tests/test_download_cancel.py'
       - 'tests/test_media_dependencies.py'
       - 'tools/xsts_probe.py'
@@ -151,6 +153,7 @@ jobs:
           done
           cd third_party/xodus-cli
           cargo test --locked -p xodus-service
+          cargo test --locked -p xodus profile
 
   gui:
     runs-on: ubuntu-latest
@@ -169,7 +172,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build the window
-        run: cargo build -p ferestre-gui
+        run: cargo build -p ferestre-gui -p ferestre-cli
 
       # A session bus for the accessibility bus to live on, a display for the
       # window to map into, and then the test drives it by pressing things.
@@ -177,3 +180,8 @@ jobs:
         run: |
           xvfb-run -a --server-args='-screen 0 1280x900x24' \
             dbus-run-session -- python3 tests/gui_smoke.py
+
+      - name: Separate Store and Player accounts (offline)
+        run: |
+          xvfb-run -a --server-args='-screen 0 1280x900x24' \
+            dbus-run-session -- python3 tests/gui_accounts.py
