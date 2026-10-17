@@ -74,8 +74,8 @@ background remeasurement runs. Catalog rows identify download sizes.
 
 List/account/update refreshes may be closed immediately. Download cancellation
 and removal completion retain their existing close protocols. Cache snapshots
-publish by atomic rename; warm startup reuses ownership for five minutes and
-the public Game Pass list and product details for 24 hours. Product metadata
+publish by atomic rename; warm startup reuses ownership, game-update checks, the public Game Pass list
+and product details for 24 hours. Product metadata
 uses stale-while-revalidate: cached rows draw before network requests, stale
 entries refresh in the background, and explicit refresh includes named and
 off-page entries. Market/language changes also invalidate metadata freshness.
@@ -85,7 +85,7 @@ changes invalidate the corresponding data; explicit refresh bypasses freshness.
 No Microsoft change notification is available here: changes made elsewhere are
 detected by the periodic ownership check or an explicit refresh.
 
-Final local checks: 306 Rust tests, workspace formatting and Clippy with warnings
+Final local checks: 307 Rust tests, workspace formatting and Clippy with warnings
 as errors; complete isolated GTK smoke including all three size-label sections,
 cache reuse across restart, account-change invalidation, immediate close during
 a held list refresh, download cleanup and removal completion; CLI media and
@@ -127,3 +127,9 @@ for Minecraft Dungeons II, refreshed that one title, and downloaded Store PNGs:
 with ImageMagick. The GUI closed, the mount disappeared, the copied icon stayed
 on disk and the saved persistent target still executed. Steam's own Play-button
 launch and visual rendering of its library artwork remain untested.
+
+Daily-check policy: game-update results persist per installed record for 24
+hours and are restored on startup. Navigation reuses them. Failed checks retain
+the last known version and are also throttled until tomorrow; the top-right
+Refresh button forces library/subscription, catalogue and game-update checks.
+Changed installs invalidate their own cached update result.

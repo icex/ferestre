@@ -1362,7 +1362,7 @@ print(":: done", flush=True)
         os.makedirs(installed_records, exist_ok=True)
         with open(os.path.join(installed_records, "9NBLGGH2JHXJ.json"), "w") as f:
             json.dump({"product_id": "9NBLGGH2JHXJ", "dir": unrecorded,
-                       "content_ids": [], "package_version": "9.9.9.9"}, f)
+                       "content_ids": ["fixture-content-id"], "package_version": "9.9.9.9"}, f)
         click_named(frame, "Refresh library, subscriptions and catalogue")
         select_in_list(frame, "Installed")
         time.sleep(0.5)
@@ -1502,10 +1502,19 @@ elif sys.argv[1] == 'library':
     while (home / 'hold-refresh').exists():
         time.sleep(.05)
     print((home / 'client-library.json').read_text())
+elif sys.argv[1] == 'update':
+    print(json.dumps({'version': '9.9.9.9'}))
 """)
         os.chmod(client, 0o755)
+        # Six-hour-old lists and update checks must survive app restarts.
         for filename in ("library.json", "gamepass.json"):
-            os.utime(os.path.join(state, filename), None)
+            os.utime(os.path.join(state, filename), (time.time() - 21600, time.time() - 21600))
+        update_cache = os.path.join(state, "updates", "9NBLGGH2JHXJ.json")
+        os.makedirs(os.path.dirname(update_cache), exist_ok=True)
+        with open(update_cache, "w") as f:
+            json.dump({"schema": 1, "record": json.load(open(os.path.join(installed_records, "9NBLGGH2JHXJ.json"))),
+                       "available": "9.9.9.9"}, f)
+        os.utime(update_cache, (time.time() - 21600, time.time() - 21600))
         # Fill recipe metadata too, so a fresh startup has no legitimate misses.
         for filename in glob.glob(os.path.join(recipes_dir, "*.toml")):
             with open(filename, "rb") as f:
@@ -1530,7 +1539,13 @@ elif sys.argv[1] == 'library':
         wait_for(frame, lambda root: "Fixture Player" in texts(root), "cached account identity", time.monotonic() + TIMEOUT)
         time.sleep(1)
         calls = open(os.path.join(home, "client-calls")).read().splitlines()
-        check("account" in calls and "library" not in calls, "fresh cached ownership is reused across app loads")
+        check("account" in calls and "library" not in calls, "six-hour-old ownership is reused across app loads")
+        check("update" not in calls, "six-hour-old game-update checks are reused at startup")
+        for section in ("Runtime", "Installed", "Library"):
+            select_in_list(frame, section)
+        time.sleep(.3)
+        check("update" not in open(os.path.join(home, "client-calls")).read().splitlines(),
+              "switching views does not repeat cached update checks")
         check(not any("catalog.gamepass.com" in request for request in CountingProxy.requests),
               "fresh Game Pass listing is not fetched again on startup")
         check(open(os.path.join(state, "library.json"), "rb").read() == cached_library,
@@ -1549,6 +1564,11 @@ elif sys.argv[1] == 'library':
               "cached rows remain visible during failed revalidation", frame)
         click_named(frame, "Close")
         check(gui.wait(timeout=5) == 0, "catalogue revalidation never blocks closing")
+        calls = open(os.path.join(home, "client-calls")).read().splitlines()
+        check("library" in calls and "update" in calls,
+              "top-right Refresh bypasses both daily library and game-update caches")
+        update_calls = calls.count("update")
+        os.utime(update_cache, (time.time() - 172800, time.time() - 172800))
         # Expired metadata revalidates automatically while cached names draw.
         for path in glob.glob(os.path.join(catalog, "*.json")):
             os.utime(path, (time.time() - 172800, time.time() - 172800))
@@ -1563,6 +1583,11 @@ elif sys.argv[1] == 'library':
               "stale product names remain visible while revalidation fails", frame)
         check(open(cached_product, "rb").read() == previous_product,
               "automatic failed revalidation keeps the previous snapshot")
+        wait_for(frame, lambda root: open(os.path.join(home, "client-calls")).read().splitlines().count("update") > update_calls,
+                 "expired game-update checks to run", time.monotonic() + TIMEOUT)
+        wait_for(frame, lambda root: time.time() - os.stat(update_cache).st_mtime < 60,
+                 "the daily game-update result to persist", time.monotonic() + TIMEOUT)
+        check(True, "expired game updates refresh after 24 hours and persist for the next load")
         # Restore ownership after the forced refresh's synthetic client answer.
         with open(os.path.join(state, "library.json"), "wb") as f:
             f.write(cached_library)

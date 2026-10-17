@@ -311,7 +311,7 @@ fn build_ui(app: &adw::Application) {
             if section == Section::GamePass {
                 refresh_entitlements(&ui, false);
             }
-            refresh_updates(&ui);
+            refresh_updates(&ui, false);
         }
     ));
 
@@ -346,6 +346,7 @@ fn build_ui(app: &adw::Application) {
             // thing that changes without anything here doing so.
             fetch_gamepass(&ui, true);
             refresh_entitlements(&ui, true);
+            refresh_updates(&ui, true);
         }
     ));
 
@@ -389,6 +390,7 @@ fn build_ui(app: &adw::Application) {
                     return glib::ControlFlow::Break;
                 }
                 refresh_entitlements(&ui, false);
+                refresh_updates(&ui, false);
                 glib::ControlFlow::Continue
             }
         ),
@@ -2620,51 +2622,83 @@ fn refresh_account(ui: &Ui) {
             render(&ui);
             refresh_entitlements(&ui, false);
         }
+        refresh_updates(&ui, false);
     });
 }
 
-fn refresh_updates(ui: &Ui) {
-    let (client, records) = {
+fn refresh_updates(ui: &Ui, force: bool) {
+    let (client, state_dir, records) = {
         let model = ui.model.borrow();
-        (
-            model.xodus_cli(),
-            model.records.values().cloned().collect::<Vec<_>>(),
-        )
+        let state_dir = model.paths.as_ref().map(|p| p.state_dir().to_path_buf());
+        let records = model
+            .records
+            .values()
+            .filter(|record| !record.content_ids.is_empty())
+            .filter(|record| {
+                force
+                    || state_dir
+                        .as_ref()
+                        .map_or(true, |dir| !ferestre_core::updates::is_fresh(dir, record))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        (model.xodus_cli(), state_dir, records)
     };
-    let Some(client) = client else { return };
-    if records.is_empty() || !begin(ui, "Checking for game updates") {
+    let (Some(client), Some(state_dir)) = (client, state_dir) else {
+        return;
+    };
+    if records.is_empty() {
+        return;
+    }
+    if !begin(ui, "Checking for game updates") {
+        if force {
+            report_busy(ui);
+        }
         return;
     }
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let checked = gio::spawn_blocking(move || {
-            let mut available = BTreeMap::new();
+            let mut available = Vec::new();
             for record in records {
-                let Some(content_id) = record.content_ids.first() else {
-                    continue;
-                };
-                let output = std::process::Command::new(&client)
+                let content_id = &record.content_ids[0];
+                let version = std::process::Command::new(&client)
                     .args(["update", content_id, "--json"])
                     .stderr(std::process::Stdio::null())
                     .output()
-                    .ok()?;
-                if !output.status.success() {
-                    continue;
-                }
-                let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-                if let Some(version) = value["version"]
-                    .as_str()
-                    .filter(|version| !version.is_empty())
-                {
-                    available.insert(record.product_id.to_ascii_uppercase(), version.to_string());
-                }
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .and_then(|output| {
+                        serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()
+                    })
+                    .and_then(|value| {
+                        value["version"]
+                            .as_str()
+                            .filter(|v| !v.is_empty())
+                            .map(str::to_string)
+                    });
+                // Preserve last-known results on failure, but also throttle
+                // retries across restarts until tomorrow or manual Refresh.
+                let version = ferestre_core::updates::save(&state_dir, &record, version.clone())
+                    .unwrap_or(version);
+                available.push((record, version));
             }
-            Some(available)
+            available
         })
         .await;
         finish(&ui);
-        if let Ok(Some(available)) = checked {
-            ui.model.borrow_mut().available = available;
+        if let Ok(available) = checked {
+            let mut model = ui.model.borrow_mut();
+            for (record, version) in available {
+                let key = record.product_id.to_ascii_uppercase();
+                if model.records.get(&key) != Some(&record) {
+                    continue;
+                }
+                if let Some(version) = version {
+                    model.available.insert(key, version);
+                }
+            }
+            drop(model);
             render(&ui);
         }
     });

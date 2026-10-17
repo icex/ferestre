@@ -61,12 +61,12 @@ Pronounced roughly *feh-RESS-treh*.
 
 ## Status
 
-Release **0.1.10** pairs with runtime **11.0.20261013.3**. Forza Horizon 6
+Release **0.1.11** pairs with runtime **11.0.20261017.1**. Forza Horizon 6
 is playable, with shader startup, native PlayFab saves and Continue confirmed.
 Its marketplace is still under qualification. Dune: Awakening is marked
 playable from player confirmation. Game Pass tiers refresh independently of
 the catalog, and searches and paging include the full PC catalog.
-See [the release qualification](docs/RELEASE-0.1.10.md) for tested scope.
+See [the release qualification](docs/RELEASE-0.1.11.md) for tested scope.
 
 Honest version, because this is early. Every row here was run on a real machine,
 not inferred from the fact that it downloaded:
@@ -167,8 +167,9 @@ remain visible while a background scan updates them. Changes to existing files
 deep inside a game are picked up by that daily scan.
 
 Owned games, subscription access and the public Game Pass catalogue open from
-disk cache. Ownership checks are reused for five minutes and public Game Pass
-listings and product details for 24 hours. Cached names and sizes appear
+disk cache. Library/subscription lists, game-update checks, public Game Pass listings
+and product details are reused for 24 hours. Switching views does not repeat
+game-update queries. The top-right Refresh button forces an immediate check. Cached names and sizes appear
 immediately while stale details revalidate in the background. Changing market
 or language revalidates product details too. The refresh button bypasses cache
 freshness, including for already named games. Account changes

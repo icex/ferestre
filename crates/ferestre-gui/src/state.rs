@@ -256,6 +256,10 @@ impl Model {
             .as_ref()
             .and_then(|p| ferestre_core::account::load_cache(p.state_dir()));
         let entitlements_checked = ownership.is_known();
+        let available = paths
+            .as_ref()
+            .map(|p| ferestre_core::updates::available(p.state_dir(), records.values()))
+            .unwrap_or_default();
         Model {
             paths,
             recipes,
@@ -270,7 +274,7 @@ impl Model {
             ownership,
             catalog,
             icons,
-            available: BTreeMap::new(),
+            available,
             account,
             avatar,
             gamepass,
@@ -296,7 +300,6 @@ impl Model {
             ownership: std::mem::take(&mut self.ownership),
             catalog: std::mem::take(&mut self.catalog),
             icons: std::mem::take(&mut self.icons),
-            available: std::mem::take(&mut self.available),
             account: self.account.take(),
             avatar: self.avatar.take(),
             gamepass: std::mem::take(&mut self.gamepass),
