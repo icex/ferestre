@@ -522,14 +522,17 @@ const CACHE_SCHEMA: u32 = 4;
 struct CacheEntry {
     schema: u32,
     product: Product,
+    #[serde(default)]
+    market: String,
+    #[serde(default)]
+    language: String,
 }
 
 /// A catalog answer kept on disk.
 ///
-/// Names and art change about as often as a game is re-released, so this is a
-/// cache with no expiry and an explicit refresh rather than a TTL that makes
-/// someone wait for the network on a cold morning. A miss is not an error: the
-/// window shows the product id until the fetch lands.
+/// Readers can display the last good answer immediately, even when stale.
+/// Resolution revalidates after a day, on market/language changes, or when
+/// explicitly requested. A failed refresh leaves that answer intact.
 #[derive(Debug, Clone)]
 pub struct Cache {
     dir: PathBuf,
@@ -572,7 +575,28 @@ impl Cache {
         (entry.schema == CACHE_SCHEMA).then_some(entry.product)
     }
 
+    pub fn is_fresh(&self, product_id: &str, market: &str, language: &str) -> bool {
+        let Some(path) = self.entry_path(product_id) else {
+            return false;
+        };
+        if !crate::cache::is_fresh(&path, crate::cache::CATALOG_MAX_AGE) {
+            return false;
+        }
+        std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<CacheEntry>(&bytes).ok())
+            .is_some_and(|entry| {
+                entry.schema == CACHE_SCHEMA
+                    && entry.market.eq_ignore_ascii_case(market)
+                    && entry.language.eq_ignore_ascii_case(language)
+            })
+    }
+
     pub fn put(&self, product: &Product) -> Result<()> {
+        self.put_for(product, DEFAULT_MARKET, DEFAULT_LANGUAGE)
+    }
+
+    pub fn put_for(&self, product: &Product, market: &str, language: &str) -> Result<()> {
         let path = self
             .entry_path(&product.product_id)
             .ok_or_else(|| anyhow!("not a usable product id: {:?}", product.product_id))?;
@@ -580,6 +604,8 @@ impl Cache {
         let entry = CacheEntry {
             schema: CACHE_SCHEMA,
             product: product.clone(),
+            market: market.into(),
+            language: language.into(),
         };
         crate::cache::write(&path, &serde_json::to_vec_pretty(&entry)?)?;
         Ok(())
@@ -1072,6 +1098,105 @@ mod tests {
     }
 
     #[test]
+    fn revalidation_reuses_fresh_data_and_preserves_stale_data_on_failure() {
+        use std::io::{Read, Write};
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join(format!("ferestre-revalidate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Cache::new(&dir);
+        let ids = vec!["9ZZTESTGAME1".to_string()];
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/catalog", server.local_addr().unwrap());
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = requests.clone();
+        let worker = std::thread::spawn(move || {
+            // Cold load, stale refresh, explicit refresh failure, then locale change.
+            for body in [
+                PAYLOAD,
+                &PAYLOAD.replace("Test Game One", "Updated Game"),
+                "unavailable",
+                PAYLOAD,
+            ] {
+                let (mut stream, _) = server.accept().unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).unwrap() > 0);
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let lookup = |force, market, language| {
+            resolve_using(&cache, &ids, market, language, force, |wanted| {
+                assert_eq!(wanted, &ids);
+                match crate::http::get_text(&url).and_then(|body| parse(&body)) {
+                    Ok(products) => (
+                        products
+                            .into_iter()
+                            .filter(|p| wanted.contains(&p.product_id))
+                            .collect(),
+                        vec![],
+                    ),
+                    Err(error) => (vec![], vec![error.to_string()]),
+                }
+            })
+        };
+        let (cold, failures) = lookup(false, "US", "en-us");
+        assert!(failures.is_empty());
+        assert_eq!(cold[0].name, "Test Game One");
+        assert_eq!(lookup(false, "US", "en-us").0, cold);
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "warm startup must not request again"
+        );
+        let path = cache.entry_path(&ids[0]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60)),
+            )
+            .unwrap();
+        assert_eq!(
+            cache.get(&ids[0]).unwrap().name,
+            "Test Game One",
+            "stale data stays drawable"
+        );
+        let updated = lookup(false, "US", "en-us").0;
+        assert_eq!(
+            updated.len(),
+            1,
+            "replace the stale row, do not duplicate it"
+        );
+        assert_eq!(updated[0].name, "Updated Game");
+        assert_eq!(cache.get(&ids[0]), Some(updated[0].clone()));
+        let snapshot = std::fs::read(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let (fallback, failures) = lookup(true, "US", "en-us");
+        assert_eq!(fallback, updated);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), snapshot);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified,
+            "failure must not extend freshness"
+        );
+        assert_eq!(lookup(false, "GB", "en-gb").0[0].name, "Test Game One");
+        assert!(cache.is_fresh(&ids[0], "GB", "en-gb"));
+        assert!(!cache.is_fresh(&ids[0], "GB", "fr-fr"));
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 4);
+        worker.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_cache_round_trip_keeps_what_the_window_draws() {
         let dir =
             std::env::temp_dir().join(format!("ferestre-catalog-test-{}", std::process::id()));
@@ -1125,16 +1250,53 @@ pub fn resolve(
     market: &str,
     language: &str,
 ) -> (Vec<Product>, Vec<String>) {
-    let (mut products, misses) = cache.split(ids);
-    if misses.is_empty() {
+    revalidate(cache, ids, market, language, false)
+}
+
+/// Revalidate stale/missing entries, or every requested entry when forced.
+/// Callers display `Cache::get` answers while this runs off their UI thread.
+pub fn revalidate(
+    cache: &Cache,
+    ids: &[String],
+    market: &str,
+    language: &str,
+    force: bool,
+) -> (Vec<Product>, Vec<String>) {
+    resolve_using(cache, ids, market, language, force, |wanted| {
+        net::fetch(wanted, market, language)
+    })
+}
+
+fn resolve_using(
+    cache: &Cache,
+    ids: &[String],
+    market: &str,
+    language: &str,
+    force: bool,
+    fetch: impl FnOnce(&[String]) -> (Vec<Product>, Vec<String>),
+) -> (Vec<Product>, Vec<String>) {
+    let (mut products, _) = cache.split(ids);
+    let wanted: Vec<String> = ids
+        .iter()
+        .filter(|id| force || !cache.is_fresh(id, market, language))
+        .cloned()
+        .collect();
+    if wanted.is_empty() {
         return (products, Vec::new());
     }
-    let (fetched, failures) = net::fetch(&misses, market, language);
-    for product in &fetched {
-        // A cache that cannot be written is not worth failing a lookup over.
-        let _ = cache.put(product);
+    let (fetched, failures) = fetch(&wanted);
+    for product in fetched {
+        let _ = cache.put_for(&product, market, language);
+        // Replace stale entries rather than returning two versions of a row.
+        if let Some(old) = products
+            .iter_mut()
+            .find(|p| p.product_id.eq_ignore_ascii_case(&product.product_id))
+        {
+            *old = product;
+        } else {
+            products.push(product);
+        }
     }
-    products.extend(fetched);
     (products, failures)
 }
 

@@ -176,7 +176,7 @@ impl Model {
             .and_then(|p| library::load_cache(p.state_dir()))
             .map(Ownership::Known)
             .unwrap_or_default();
-        let catalog = match (&paths, &ownership) {
+        let mut catalog: BTreeMap<String, Product> = match (&paths, &ownership) {
             (Some(paths), _) => {
                 let cache = paths.catalog_cache();
                 let mut ids: Vec<String> = match &ownership {
@@ -188,6 +188,7 @@ impl Model {
                     Ownership::Unknown => Vec::new(),
                 };
                 ids.extend(recipes.iter().map(|r| r.title.product_id.clone()));
+                ids.extend(records.keys().cloned());
                 // Cache only: opening a window must not wait on a network.
                 cache
                     .split(&ids)
@@ -215,6 +216,17 @@ impl Model {
             ),
             None => (Vec::new(), gamepass::Tiers::default()),
         };
+        // Cached Game Pass rows must draw before background revalidation too.
+        if let Some(paths) = &paths {
+            catalog.extend(
+                paths
+                    .catalog_cache()
+                    .split(&gamepass)
+                    .0
+                    .into_iter()
+                    .map(|p| (p.product_id.to_ascii_uppercase(), p)),
+            );
+        }
         let subscriptions = match &ownership {
             Ownership::Known(entries) => gamepass::active(entries),
             Ownership::Unknown => Vec::new(),

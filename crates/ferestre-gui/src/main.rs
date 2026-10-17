@@ -17,7 +17,7 @@ mod state;
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -60,6 +60,8 @@ struct Ui {
     /// Set while the Game Pass listing is being fetched, so opening the section
     /// twice does not ask twice.
     fetching_gamepass: Rc<RefCell<bool>>,
+    fetching_names: Rc<Cell<bool>>,
+    catalog_generation: Rc<Cell<u64>>,
     fetching_entitlements: Rc<RefCell<bool>>,
     /// The bar along the bottom, and the download it is describing.
     download: DownloadBar,
@@ -262,6 +264,8 @@ fn build_ui(app: &adw::Application) {
         running: Rc::new(RefCell::new(BTreeMap::new())),
         asked_names: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
         fetching_gamepass: Rc::new(RefCell::new(false)),
+        fetching_names: Rc::new(Cell::new(false)),
+        catalog_generation: Rc::new(Cell::new(0)),
         fetching_entitlements: Rc::new(RefCell::new(false)),
         download: download.clone(),
     };
@@ -334,6 +338,8 @@ fn build_ui(app: &adw::Application) {
         ui,
         move |_| {
             ui.model.borrow_mut().reload();
+            ui.catalog_generation
+                .set(ui.catalog_generation.get().wrapping_add(1));
             ui.asked_names.borrow_mut().clear();
             render(&ui);
             // Reload means "check again", and the Game Pass catalogue is a
@@ -653,6 +659,8 @@ fn draw_list(
         })
         .map(|row| row.product_id.clone())
         .collect();
+    // Revalidation must include named, cached rows, including off-page ones.
+    let metadata_ids: Vec<String> = rows.iter().map(|row| row.product_id.clone()).collect();
     let rows: Vec<LibraryRow> = rows.into_iter().filter(|row| keep(row)).collect();
 
     let matching = model::search(&rows, &model.query);
@@ -664,9 +672,8 @@ fn draw_list(
     Drawn {
         page: view.page,
         pending_names: unnamed_off_page.len(),
-        want_names: unnamed_off_page
-            .iter()
-            .cloned()
+        want_names: metadata_ids
+            .into_iter()
             .chain(view.rows.iter().flat_map(|row| {
                 let mut wanted = Vec::new();
                 if !row.is_named() {
@@ -677,13 +684,7 @@ fn draw_list(
                 // are asked for alongside the names on this page rather than
                 // waiting for someone to open something.
                 if let Some(product) = model.catalog.get(&row.product_id.to_ascii_uppercase()) {
-                    wanted.extend(
-                        product
-                            .bundled_ids
-                            .iter()
-                            .filter(|id| !model.catalog.contains_key(&id.to_ascii_uppercase()))
-                            .cloned(),
-                    );
+                    wanted.extend(product.bundled_ids.iter().cloned());
                 }
                 wanted
             }))
@@ -2704,11 +2705,6 @@ fn refresh_library(ui: &Ui) {
     });
 }
 
-/// Look up names for the rows currently on screen.
-///
-/// A page at a time, like the art, and each id is attempted once: a product the
-/// catalog does not answer for would otherwise be re-requested on every redraw,
-/// which is a request loop rather than a retry.
 /// Fetch the PC Game Pass listing, unless there is already one and `force` is
 /// not set.
 ///
@@ -2749,21 +2745,9 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
             let fetched = gio::spawn_blocking({
                 let market = market.clone();
                 move || {
-                    let listing = gamepass::fetch(&market, &language);
-                    // The tier map is a second request and a failure of it is
-                    // not a failure of the listing: without it the section
-                    // still works, it just cannot warn.
-                    let tiers = gamepass::fetch_tiers(&market, &language).unwrap_or_default();
-                    let ids = match listing {
-                        Ok(ids) => gamepass::complete_listing(&ids, &tiers),
-                        Err(error) => {
-                            let ids = gamepass::complete_listing(&[], &tiers);
-                            if ids.is_empty() {
-                                return Err(error);
-                            }
-                            ids
-                        }
-                    };
+                    let listing = gamepass::fetch(&market, &language)?;
+                    let tiers = gamepass::fetch_tiers(&market, &language)?;
+                    let ids = gamepass::complete_listing(&listing, &tiers);
                     Ok::<_, anyhow::Error>((ids, tiers))
                 }
             })
@@ -2794,7 +2778,13 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
     }
 }
 
+/// Display the cached metadata while one worker checks missing/stale entries.
+/// Each id is attempted once per window or explicit refresh, including names
+/// off-page, so failures cannot become a request loop on every redraw.
 fn fetch_names(ui: &Ui, product_ids: Vec<String>) {
+    if ui.fetching_names.get() {
+        return;
+    }
     let (cache, market, wanted) = {
         let model = ui.model.borrow();
         let mut asked = ui.asked_names.borrow_mut();
@@ -2809,6 +2799,8 @@ fn fetch_names(ui: &Ui, product_ids: Vec<String>) {
         return;
     }
 
+    ui.fetching_names.set(true);
+    let generation = ui.catalog_generation.get();
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let (market, language) = market;
@@ -2816,14 +2808,21 @@ fn fetch_names(ui: &Ui, product_ids: Vec<String>) {
         // rather than after every request has finished. Each chunk is several
         // batched lookups, so this is not a request per await.
         for chunk in wanted.chunks(catalog::BATCH * 5) {
+            if ui.catalog_generation.get() != generation {
+                break;
+            }
             let ids = chunk.to_vec();
             let (cache, market, language) = (cache.clone(), market.clone(), language.clone());
             let found = gio::spawn_blocking(move || {
-                let (products, _failures) = catalog::resolve(&cache, &ids, &market, &language);
+                let (products, _failures) =
+                    catalog::revalidate(&cache, &ids, &market, &language, generation != 0);
                 products
             })
             .await;
-            let Ok(found) = found else { return };
+            let Ok(found) = found else { break };
+            if ui.catalog_generation.get() != generation {
+                break;
+            }
             if found.is_empty() {
                 continue;
             }
@@ -2837,6 +2836,9 @@ fn fetch_names(ui: &Ui, product_ids: Vec<String>) {
             }
             render(&ui);
         }
+        ui.fetching_names.set(false);
+        // A section change or explicit refresh may have queued more ids.
+        render(&ui);
     });
 }
 

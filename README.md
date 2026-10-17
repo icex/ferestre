@@ -162,7 +162,10 @@ the installed game total; unavailable sizes are labelled explicitly.
 
 Owned games, subscription access and the public Game Pass catalogue open from
 disk cache. Ownership checks are reused for five minutes and public Game Pass
-listings for 24 hours. The refresh button checks immediately. Account changes
+listings and product details for 24 hours. Cached names and sizes appear
+immediately while stale details revalidate in the background. Changing market
+or language revalidates product details too. The refresh button bypasses cache
+freshness, including for already named games. Account changes
 invalidate cached ownership, and a detected subscription change refreshes the
 Game Pass listing. Failed or interrupted refreshes preserve the last complete
 snapshot. Closing during a list/account/update refresh exits immediately;

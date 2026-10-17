@@ -69,15 +69,26 @@ reload invalidates old measurements. Catalog rows identify download sizes.
 List/account/update refreshes may be closed immediately. Download cancellation
 and removal completion retain their existing close protocols. Cache snapshots
 publish by atomic rename; warm startup reuses ownership for five minutes and
-the public Game Pass list for 24 hours. Account changes and detected subscription
+the public Game Pass list and product details for 24 hours. Product metadata
+uses stale-while-revalidate: cached rows draw before network requests, stale
+entries refresh in the background, and explicit refresh includes named and
+off-page entries. Market/language changes also invalidate metadata freshness.
+Failed revalidation retains both the product and its original freshness time;
+a partial list/tier refresh never replaces a complete Game Pass snapshot. Account changes and detected subscription
 changes invalidate the corresponding data; explicit refresh bypasses freshness.
 No Microsoft change notification is available here: changes made elsewhere are
 detected by the periodic ownership check or an explicit refresh.
 
-Final local checks: 302 Rust tests, workspace formatting and Clippy with warnings
+Final local checks: 303 Rust tests, workspace formatting and Clippy with warnings
 as errors; complete isolated GTK smoke including all three size-label sections,
 cache reuse across restart, account-change invalidation, immediate close during
 a held list refresh, download cleanup and removal completion; CLI media and
 cancellation integration tests; all four patch series; GameInput compilation
 with `-Werror`; launch-helper/authentication probe tests and recipe validation.
 The Fedora/Bluetooth/Steam Input combination remains unverified.
+
+Catalogue revalidation follow-up: a local HTTP fixture checks cold load, a warm
+load with no request, changed stale metadata replacing the cached row, forced
+refresh of fresh data, locale changes and failure preserving data/freshness.
+The real GTK smoke also counts proxy requests across restarts and checks forced
+and automatic stale revalidation with cached names visible on failure.

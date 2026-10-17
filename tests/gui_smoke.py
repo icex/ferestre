@@ -580,6 +580,8 @@ last-verified = 2026-10-10
             json.dump(
                 {
                     "schema": schema,
+                    "market": "US",
+                    "language": "en-us",
                     "product": {
                         "product_id": pid,
                         "name": name,
@@ -633,6 +635,8 @@ last-verified = 2026-10-10
             json.dump(
                 {
                     "schema": schema,
+                    "market": "US",
+                    "language": "en-us",
                     "product": {
                         "product_id": pid,
                         "name": name,
@@ -1390,12 +1394,25 @@ elif sys.argv[1] == 'library':
     (home / 'refresh-child-pid').write_text(str(os.getpid()))
     while (home / 'hold-refresh').exists():
         time.sleep(.05)
-    print(json.dumps({'items': [{'productId': '9ZZSMOKEGAME', 'productType': 'Game', 'status': 'Active'}]}))
+    print((home / 'client-library.json').read_text())
 """)
         os.chmod(client, 0o755)
         for filename in ("library.json", "gamepass.json"):
             os.utime(os.path.join(state, filename), None)
+        # Fill recipe metadata too, so a fresh startup has no legitimate misses.
+        for filename in glob.glob(os.path.join(recipes_dir, "*.toml")):
+            with open(filename, "rb") as f:
+                title = tomllib.load(f).get("title", {})
+            pid = title.get("product-id")
+            if pid:
+                path = os.path.join(catalog, f"{pid.upper()}.json")
+                if not os.path.exists(path):
+                    with open(path, "w") as f:
+                        json.dump({"schema": schema, "market": "US", "language": "en-us",
+                                   "product": {"product_id": pid, "name": title["name"]}}, f)
         cached_library = open(os.path.join(state, "library.json"), "rb").read()
+        with open(os.path.join(home, "client-library.json"), "wb") as f:
+            f.write(cached_library)
         gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         app = find_app(gui.pid, time.monotonic() + TIMEOUT)
         frame = wait_for(app, lambda root: next(iter(find_all(root, role="frame")), None),
@@ -1408,6 +1425,40 @@ elif sys.argv[1] == 'library':
               "fresh Game Pass listing is not fetched again on startup")
         check(open(os.path.join(state, "library.json"), "rb").read() == cached_library,
               "unchanged startup preserves the cached game list")
+        check(not any("displaycatalog.mp.microsoft.com" in request for request in CountingProxy.requests),
+              "fresh product metadata is not fetched again on startup")
+        # A failed forced refresh still attempts the network and keeps rows.
+        cached_product = os.path.join(catalog, "9ZZSMOKEGDK1.json")
+        previous_product = open(cached_product, "rb").read()
+        click_named(frame, "Refresh library, subscriptions and catalogue")
+        wait_for(frame, lambda root: any("displaycatalog.mp.microsoft.com" in request for request in CountingProxy.requests),
+                 "explicit product metadata revalidation", time.monotonic() + TIMEOUT)
+        check(open(cached_product, "rb").read() == previous_product,
+              "failed metadata revalidation preserves the last good product")
+        check(any("Smoke Test Racer" in t for t in texts(frame)),
+              "cached rows remain visible during failed revalidation", frame)
+        click_named(frame, "Close")
+        check(gui.wait(timeout=5) == 0, "catalogue revalidation never blocks closing")
+        # Expired metadata revalidates automatically while cached names draw.
+        for path in glob.glob(os.path.join(catalog, "*.json")):
+            os.utime(path, (time.time() - 172800, time.time() - 172800))
+        CountingProxy.requests.clear()
+        gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        app = find_app(gui.pid, time.monotonic() + TIMEOUT)
+        frame = wait_for(app, lambda root: next(iter(find_all(root, role="frame")), None),
+                         "stale catalogue window", time.monotonic() + TIMEOUT)
+        wait_for(frame, lambda root: any("displaycatalog.mp.microsoft.com" in request for request in CountingProxy.requests),
+                 "automatic stale metadata revalidation", time.monotonic() + TIMEOUT)
+        check(any("Smoke Test Racer" in t for t in texts(frame)),
+              "stale product names remain visible while revalidation fails", frame)
+        check(open(cached_product, "rb").read() == previous_product,
+              "automatic failed revalidation keeps the previous snapshot")
+        # Restore ownership after the forced refresh's synthetic client answer.
+        with open(os.path.join(state, "library.json"), "wb") as f:
+            f.write(cached_library)
+        refresh_marker = os.path.join(home, "refresh-started")
+        if os.path.exists(refresh_marker):
+            os.unlink(refresh_marker)
         # Request an actual library refresh and hold its child, then close.
         open(os.path.join(home, "hold-refresh"), "w").close()
         click(find_all(frame, role="button", name_contains="Fixture Player")[0])
@@ -1425,6 +1476,8 @@ elif sys.argv[1] == 'library':
         # cache. Its public catalogue remains reusable across accounts.
         with open(os.path.join(home, "client-account.json"), "w") as f:
             json.dump({"gamertag": "Other Fixture Player", "xuid": "other-fixture-player"}, f)
+        with open(os.path.join(home, "client-library.json"), "w") as f:
+            json.dump({"items": [{"productId": "9ZZSMOKEGAME", "productType": "Game", "status": "Active"}]}, f)
         gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         app = find_app(gui.pid, time.monotonic() + TIMEOUT)
         frame = wait_for(app, lambda root: next(iter(find_all(root, role="frame")), None),

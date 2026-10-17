@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 pub const LIBRARY_MAX_AGE: Duration = Duration::from_secs(5 * 60);
+pub const CATALOG_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 pub const GAMEPASS_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Missing, unreadable and future-dated entries need a check. Existing data
