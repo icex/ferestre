@@ -659,7 +659,12 @@ fn draw_list(
             .filter(|part| *part != "Included with PC Game Pass")
             .collect::<Vec<_>>()
             .join("  ·  ");
-        row.subtitle = if details.is_empty() {
+        row.subtitle = if details.starts_with("Version ") {
+            match details.split_once("  ·  ") {
+                Some((version, rest)) => format!("{version}  ·  {source}  ·  {rest}"),
+                None => format!("{details}  ·  {source}"),
+            }
+        } else if details.is_empty() {
             source.into()
         } else {
             format!("{source}  ·  {details}")
@@ -1176,7 +1181,7 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
     };
     let mut details = Vec::new();
     if let Some(version) = version {
-        details.push(version.to_string());
+        details.push(format!("v{}", version.trim_start_matches("Version ")));
     }
     details.push(size_text);
     if let Some((badge, _)) = row.badge {
