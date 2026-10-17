@@ -435,7 +435,7 @@ Failed-Begin cleanup waits for the provider and completion callback, using an \
 owned block snapshot because the callback may free the caller's block. A \
 reused block still reports its newest failure rather than an older result."""
 verify = [
-    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "failed Begin for block %p completes asynchronously; cleanup follows delivery" },
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "for block %p completes asynchronously; cleanup follows delivery" },
 ]
 
 [[capability]]
@@ -525,3 +525,129 @@ because a mask of zero is wrong on its own terms."""
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "XNetworkingQuerySecurityInformationForUrlUtf16Async" },
 ]
+
+[[capability]]
+name = "winhttp.ipv6-fast-fallback-option"
+summary = "WinHTTP accepts XCurl's IPv6 fast fallback session option, matching upstream Wine."
+provided-by = ["patches/wine/0014-winhttp-ipv6-fast-fallback.patch"]
+symptom-if-missing = "XCurl abandons initialization before connecting; Minecraft Dungeons II reports login error 0063"
+note = "The upstream backport accepts the option; it does not implement a new connection-racing algorithm."
+verify = [
+    { file = "files/lib/wine/x86_64-windows/winhttp.dll", contains = "WINHTTP_OPTION_IPV6_FAST_FALLBACK:" },
+]
+
+[[capability]]
+name = "xgameruntime.store-license-token"
+summary = "XStoreQueryLicenseTokenAsync fetches a nonempty licence token asynchronously through the service."
+provided-by = [
+    "patches/xgameruntime/0018-clean-up-background-provider-failures.patch",
+    "patches/xgameruntime/0019-fetch-license-tokens-through-the-service.patch",
+    "patches/xodus-cli/0017-fetch-license-tokens-in-the-service.patch",
+]
+symptom-if-missing = "a title requiring a Store licence token receives an empty result or cannot verify ownership"
+note = "The runtime probe checks IPC support only. The matching xodus-service must also be installed and restarted; old services fail closed."
+verify = [
+    { file = "files/lib/wine/x86_64-unix/xgameruntime.so", contains = "<LicenseTokenRequest><ParentProductId>" },
+]
+
+[[capability]]
+name = "xgameruntime.user-handle-result-size"
+summary = "XUserAddAsync exposes the user handle through the generic async size and result APIs."
+provided-by = ["patches/xgameruntime/0022-report-the-user-handle-async-result-size.patch"]
+symptom-if-missing = "Halo's native sign-in wrapper sees a zero-byte result and dereferences a missing user handle"
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "user handle async result:" },
+]
+
+[[capability]]
+name = "xgameruntime.save-result-sizes"
+summary = "Save provider and remaining quota operations expose correctly sized generic async results."
+provided-by = ["patches/xgameruntime/0023-report-save-provider-and-quota-result-sizes.patch"]
+symptom-if-missing = "Halo sees a successful but empty save-provider result and crashes before loading gameplay"
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "save provider async result:" },
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "save quota async result:" },
+]
+
+[[capability]]
+name = "xgameruntime.manual-queue-thread-affinity"
+summary = "With XGR_STRICT_MANUAL_QUEUES=1, Manual work and completion ports run only when their owning endpoint is dispatched."
+provided-by = ["patches/xgameruntime/0024-dispatch-async-work-on-the-requested-manual-port.patch"]
+symptom-if-missing = "Halo campaign aborts with Thread not registered when its async work runs on an unrelated thread-pool thread"
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "XGR_STRICT_MANUAL_QUEUES" },
+]
+
+[[capability]]
+name = "xgameruntime.analytics-device-family"
+summary = "System analytics preserves the full Windows.Desktop device family used by native PlayFab Party to identify its platform."
+provided-by = ["patches/xgameruntime/0025-preserve-the-complete-analytics-device-family.patch"]
+symptom-if-missing = "Party initialization fails with unmapped platform error and Goat Simulator 3 reports GS3-NF-2"
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "returning complete analytics device family" },
+]
+
+[[capability]]
+name = "xgameruntime.store-product-lifetime"
+summary = "Enumerated Store products and their metadata remain valid until the query handle closes."
+provided-by = ["patches/xgameruntime/0026-keep-store-products-alive-for-the-query-lifetime.patch"]
+symptom-if-missing = "Goat Simulator 3 retains a pointer to expired stack data and crashes while processing owned products"
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "query-owned product" },
+]
+
+[[capability]]
+name = "xgameruntime.gamesave-interface4-legacy"
+summary = "IXGameSaveImpl4 is exposed with its complete GDK 2510 layout, so legacy local save calls made through it keep their slots; PlayFab file saves are a separate capability."
+provided-by = ["patches/xgameruntime/0027-expose-legacy-save-apis-through-the-complete-interface4.patch"]
+symptom-if-missing = "A title that asks for IXGameSaveImpl4 gets E_NOINTERFACE, and every save call after it fails; Retro Classics logs XGameSaveFilesGetFolderWithUiAsync failed with 0x80004002"
+# A string compiled into the DLL for this check, not a diagnostic's wording.
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "xgameruntime.gamesave-interface4-legacy" },
+]
+
+[[capability]]
+name = "d3d12.recording-allocator-lifetime"
+summary = "VKD3D_CONFIG=retain_recording_allocators keeps an allocator released while a command list records from it alive until the list's next Reset or destruction; without it the list is invalidated and Close fails."
+provided-by = ["patches/vkd3d-proton/0001-retain-retired-recording-allocators-for-engine-compatibility.patch"]
+symptom-if-missing = "An engine that releases an allocator mid-recording faults in vkEndCommandBuffer on a null command buffer when it closes the list"
+verify = [
+    { file = "files/lib/wine/vkd3d-proton/x86_64-windows/d3d12core.dll", contains = "retain_recording_allocators" },
+]
+
+[[capability]]
+name = "concrt140.concurrent-queue-iterator"
+summary = "Concurrent queue iterators preserve FIFO traversal, copying, assignment and page boundaries."
+provided-by = ["patches/wine/0015-implement-concurrent-queue-iterators.patch"]
+symptom-if-missing = "Forza Horizon 6 aborts on an unimplemented concurrent queue iterator constructor after compiling shaders"
+verify = [{ file = "files/lib/wine/x86_64-windows/concrt140.dll", contains = "_Concurrent_queue_iterator_base_v4__Advance" }]
+
+[[capability]]
+name = "xgameruntime.playfab-file-saves"
+summary = "PFX file-save calls use the title-matched native SDK for authentication, manifests, folders, quota and uploads."
+provided-by = ["patches/xgameruntime/0028-register-runtime-and-bridge-playfab-file-saves.patch"]
+symptom-if-missing = "New PlayFab save clients fail PFXGameSaveInitializeConfig before loading gameplay"
+note = "Runs in-process. Entity-only and custom-root configurations, and final upload after process exit are not implemented."
+verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "authenticated native PlayFab save backend initialized" }]
+
+[[capability]]
+name = "xgameruntime.service-socket-override"
+summary = "The runtime can connect to a separately versioned service without changing desktop or audio discovery."
+provided-by = ["patches/xgameruntime/0028-register-runtime-and-bridge-playfab-file-saves.patch"]
+symptom-if-missing = "An updated launcher cannot isolate its matching service from a still-running older session"
+verify = [{ file = "files/lib/wine/x86_64-unix/xgameruntime.so", contains = "XODUS_RUNTIME_DIR" }]
+
+[[capability]]
+name = "xgameruntime.playfab-shutdown-upload"
+summary = "Online PFX save configurations complete a final upload and release the active device before their native handles close."
+provided-by = ["patches/xgameruntime/0028-register-runtime-and-bridge-playfab-file-saves.patch"]
+symptom-if-missing = "Progress stays unsynced when a GRTS client releases its save configuration at exit"
+note = "Normal shutdown waits up to 30 seconds; failures retain local game files and do not claim successful cloud synchronization. Crash-time background upload remains unavailable."
+verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "final save upload completed before config close" }]
+[[capability]]
+name = "xgameruntime.store-catalog"
+summary = "Opt-in XStore product and associated-product queries return live Microsoft catalog data with retained SKU/image data and independent page handles."
+provided-by = ["patches/xgameruntime/0029-bridge-live-store-catalog.patch", "patches/xodus-cli/0019-serve-read-only-store-catalog.patch"]
+symptom-if-missing = "Forza Horizon 6 receives empty marketplace product listings"
+note = "Enable XGR_STORE_CATALOG=1 per title. Catalog data does not grant DLC ownership; purchasing remains unsupported."
+verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "catalog snapshot:" }, { file = "files/lib/wine/x86_64-unix/xgameruntime.so", contains = "CSDX" }]

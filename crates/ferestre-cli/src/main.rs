@@ -21,6 +21,8 @@
 //!     output here must be safe to paste into a bug report unedited, which is
 //!     the rule `tools/xsts_probe.py` already follows.
 
+mod cancel;
+
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -29,6 +31,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use ferestre_core::autofix;
+use ferestre_core::capability;
 use ferestre_core::catalog;
 use ferestre_core::http;
 use ferestre_core::install;
@@ -279,7 +283,7 @@ fn cmd_inspect_package(cli: &Cli, path: &Path) -> Result<ExitCode> {
 
 fn cmd_version(cli: &Cli) -> Result<ExitCode> {
     let packaged = std::env::var("FERESTRE_PACKAGE_VERSION").ok();
-    let version = package_version(packaged.as_deref());
+    let version = ferestre_core::package_version(packaged.as_deref());
     if cli.json {
         print_json(&json!({
             "schema": JSON_SCHEMA,
@@ -290,14 +294,6 @@ fn cmd_version(cli: &Cli) -> Result<ExitCode> {
         println!("{version}");
     }
     Ok(ExitCode::SUCCESS)
-}
-
-/// AppRun supplies the release tag from the staged `VERSION` file. A normal
-/// checkout has no such wrapper, so its compiled Cargo version remains useful.
-fn package_version(packaged: Option<&str>) -> &str {
-    packaged
-        .filter(|version| !version.is_empty())
-        .unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
 fn cmd_doctor(cli: &Cli) -> Result<ExitCode> {
@@ -551,17 +547,22 @@ fn cmd_run(
         )
     })?;
 
+    // A title without a tested recipe can still share an engine with one that
+    // has been debugged. The same inference feeds the window's verdict.
+    let inferred = autofix::infer(recipe, Some(&paths.install_dir(recipe)?));
+
     // Checked before anything is started, because the alternative is a title
     // that exits 1 with an empty log and someone guessing which of eleven
     // patches is missing.
     let runtimes = runtime::all(&paths);
     let requested_runtime = runtime::selected(paths.config_dir(), &recipe.title.product_id);
     let runtime = runtime::select(
-        recipe,
+        &inferred.recipe,
         &runtimes,
         requested_runtime.as_deref(),
         registry_for(&paths).as_ref(),
     )?;
+    let recipe = &engine_defaults(inferred, runtime, &paths);
     let registry = registry_for(&paths);
     let assessment = runtime::assess(recipe, runtime, registry.as_ref());
     let verdict = gate(&assessment);
@@ -587,7 +588,8 @@ fn cmd_run(
         game_dir: Some(paths.install_dir(recipe)?),
         prefix_dir: Some(paths.prefix_dir(recipe)?),
     };
-    let plan = launch::plan(recipe, &dirs, &options);
+    let mut plan = launch::plan(recipe, &dirs, &options);
+    let service_socket = plan_service_socket(&mut plan, &dirs, runtime)?;
 
     if dry_run {
         if cli.json {
@@ -612,12 +614,79 @@ fn cmd_run(
     run_setup(recipe, "every-launch", &dirs, &game_dir)?;
     std::fs::create_dir_all(launch::prefix_dir(recipe, &dirs, &options))
         .context("creating the Wine prefix directory")?;
-    start_service(&dirs)?;
+    if runtime.provides("xgameruntime.playfab-file-saves") {
+        if let Some(identity) = install::package_identity(&game_dir) {
+            let backups = paths
+                .state_dir()
+                .join("save-backups")
+                .join(&recipe.title.product_id);
+            for backup in ferestre_core::playfab::repair_package(
+                &launch::prefix_dir(recipe, &dirs, &options),
+                &identity,
+                &backups,
+            )? {
+                eprintln!(
+                    ":: preserved unsynced save cache at {}; saved progress will be rescanned",
+                    backup.display()
+                );
+            }
+        }
+    }
+    start_service(&dirs, service_socket.as_deref())?;
 
     run_teed(plan.to_command(), &launch::log_path(recipe, &dirs))
 }
 
+/// The recipe a launch uses once a detected engine's defaults are settled,
+/// with one line saying what happened to them.
+///
+/// Said whatever the outcome, short of no engine at all: someone comparing a
+/// run with and without a flag needs to know whether the launcher added it, and
+/// someone who opted out needs to see that the opt-out was honoured.
+fn engine_defaults(
+    inferred: autofix::Inferred,
+    runtime: &InstalledRuntime,
+    paths: &Paths,
+) -> Recipe {
+    let mut recipe = inferred.recipe.into_owned();
+    let Some(profile) = inferred.profile else {
+        return recipe;
+    };
+    let (key, token) = profile.setting();
+    // Raw, not `var`: an empty value is the opt-out, not an absence.
+    let outcome = autofix::apply(
+        &mut recipe,
+        Some(profile),
+        &runtime.provides,
+        paths.var_raw(key),
+    );
+    let (engine, effect) = (profile.engine(), profile.effect());
+    match outcome {
+        autofix::Outcome::NotDetected => {}
+        autofix::Outcome::Applied => {
+            eprintln!("-- detected {engine}: enabled {effect} ({key}={token})")
+        }
+        autofix::Outcome::Merged { previous } => {
+            eprintln!(
+                "-- detected {engine}: enabled {effect} by adding {token} to {key}={previous}"
+            )
+        }
+        autofix::Outcome::AlreadyPresent => {
+            eprintln!("-- detected {engine}: {key} already enables {effect}")
+        }
+        autofix::Outcome::SkippedExplicitEmpty => {
+            eprintln!("-- detected {engine}: {key} is set and empty, so {effect} stays off")
+        }
+        autofix::Outcome::RuntimeLacks => eprintln!(
+            "-- detected {engine}: this runtime does not provide {}, so {effect} is unavailable",
+            profile.capability()
+        ),
+    }
+    recipe
+}
+
 fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCode> {
+    let cancellation = cancel::Cancellation::from_gui();
     if !is_product_id(product_id) {
         return Err(usage(&format!(
             "'{product_id}' is not a Store product id (12 characters, letters and digits, \
@@ -658,7 +727,16 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
     let dest_existed = dest.is_dir();
     std::fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
     eprintln!(":: {product_id} -> {}", dest.display());
-    let code = run_inherited(command)?;
+    let code = cancellation.run(command)?;
+    // Keep partial files for the streaming client's resume path. In particular,
+    // never remove an existing installation when an update is stopped.
+    if cancellation.requested() {
+        eprintln!(
+            "-- download stopped; files kept at {} for resuming",
+            dest.display()
+        );
+        return Ok(ExitCode::from(130));
+    }
 
     // Checked whatever the exit code was, because both halves have been wrong.
     //
@@ -722,6 +800,7 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
 
     // Written last, and only on success, because a record for a download that
     // failed halfway would claim a build is installed that is not.
+    cancellation.check()?;
     match record_install(&paths, &product_id, &dest) {
         Ok(record) => eprintln!("{}", installed_summary(&record)),
         // The title is installed either way. Failing the command over the
@@ -975,8 +1054,45 @@ fn write_detected_recipe(paths: &Paths, product_id: &str, dest: &Path) -> Result
     if let Ok(relative) = dest.strip_prefix(paths.games_dir()) {
         recipe.install.dir = Some(relative.to_string_lossy().into_owned());
     }
+    detected_requirements(&mut recipe, dest);
     let path = recipe.save_to(&paths.user_titles_dir())?;
     Ok(Some(path))
+}
+
+/// What a recipe written from a package can honestly ask of the runtime.
+///
+/// `requires` only names what every runtime this launcher would pick can be
+/// seen to provide, because `runtime::select` refuses a runtime that misses a
+/// requirement before the gate ever gets to say "could not be verified". A
+/// runtime that publishes nothing is probed, and the probe can see the
+/// inherited-fd change and our `xgameruntime.dll` but never package identity.
+/// So:
+///
+/// - every package is an encrypted MSIXVC image, which cannot start without
+///   the memfd main image: required, and the probe can confirm it;
+/// - a GDK package (it has `MicrosoftGame.config`) signs a user in through
+///   our `xgameruntime.dll`: required, and the probe can confirm that too;
+/// - the same package asks Wine who it is, which a probe cannot see: wanted,
+///   so a published list that lacks it still warns, and a probed runtime is
+///   not refused for something nobody could check.
+///
+/// The engine's own wants go in as well, so the file shows what the launcher
+/// will ask for.
+fn detected_requirements(recipe: &mut Recipe, dest: &Path) {
+    recipe.runtime.requires = vec![capability::MEMFD_MAIN_IMAGE.into()];
+    if install::game_config(dest).is_some() {
+        recipe
+            .runtime
+            .requires
+            .push(capability::XGAMERUNTIME_USER.into());
+        recipe
+            .runtime
+            .wants
+            .push(capability::PACKAGE_IDENTITY.into());
+    }
+    if let Some(profile) = autofix::detect(dest, &recipe.launch.executable) {
+        autofix::add_wants(recipe, profile);
+    }
 }
 
 /// Write down what was just installed, so an update can be detected later.
@@ -1022,9 +1138,11 @@ fn installed_summary(record: &install::Record) -> String {
 const RELEASES_API: &str = "https://api.github.com/repos/icex/ferestre/releases?per_page=30";
 
 fn cmd_install_runtime(cli: &Cli) -> Result<ExitCode> {
+    let cancellation = cancel::Cancellation::from_gui();
     let paths = Paths::from_env()?;
     eprintln!("-- checking for the latest Ferestre runtime");
     let release = runtime::latest_release(&http::get_text(RELEASES_API)?)?;
+    cancellation.check()?;
     let version = release
         .tag
         .strip_prefix("runtime-")
@@ -1055,7 +1173,8 @@ fn cmd_install_runtime(cli: &Cli) -> Result<ExitCode> {
 
     let archive = paths.cache_dir().join("runtime").join(&release.asset_name);
     eprintln!("-- downloading runtime {version} (this is a one-time download)");
-    http::download_large(&release.url, &archive)?;
+    http::download_large_cancellable(&release.url, &archive, || cancellation.requested())?;
+    cancellation.check()?;
     eprintln!("-- unpacking runtime {version}");
     std::fs::create_dir_all(paths.runtimes_dir())?;
     let temporary = paths
@@ -1069,10 +1188,15 @@ fn cmd_install_runtime(cli: &Cli) -> Result<ExitCode> {
         .arg(&archive)
         .arg("-C")
         .arg(&temporary);
-    let code = run_inherited(unpack)?;
-    if code != 0 {
+    let code = cancellation.run(unpack);
+    if cancellation.requested() || !matches!(code, Ok(0)) {
         let _ = std::fs::remove_dir_all(&temporary);
-        bail!("could not unpack {}; tar exited {code}", archive.display());
+        cancellation.check()?;
+        bail!(
+            "could not unpack {}; tar exited {}",
+            archive.display(),
+            code?
+        );
     }
     let unpacked = temporary.join(format!("ferestre-runtime-{version}"));
     InstalledRuntime::at(&unpacked)?;
@@ -1299,14 +1423,63 @@ fn tee<R: std::io::Read + Send + 'static>(
     })
 }
 
-/// Start `xodus-service` if it is not already up.
-///
-/// The GDK runtime's Xbox-side calls (sign-in, tokens) go through it, and a
-/// title sits on its sign-in screen without one. A stale socket is removed
-/// first: the service does not clean up after a crash, and a leftover socket
-/// makes the runtime think there is a service to talk to.
-fn start_service(dirs: &launch::Dirs) -> Result<()> {
-    if process_running("xodus-service") {
+const SERVICE_SOCKET_OVERRIDE: &str = "xgameruntime.service-socket-override";
+
+fn scoped_service_directory(supported: bool, id: &str, root: &Path) -> Result<Option<PathBuf>> {
+    if !supported {
+        return Ok(None);
+    }
+    let id = id.trim();
+    if id.len() != 64 || !id.bytes().all(|c| c.is_ascii_hexdigit()) {
+        bail!("invalid packaged Xbox service fingerprint");
+    }
+    // Keep the Unix socket path below sun_path limits (the full SHA remains
+    // in SERVICE_ID; 128 bits identify the namespace).
+    Ok(Some(root.join("ferestre-services").join(&id[..32])))
+}
+
+/// A capable runtime and its packaged service share a content-addressed socket
+/// directory. Replacing the AppImage can start the updated service without
+/// interrupting a game connected to the previous one. Older runtimes retain
+/// their existing socket because they do not understand the directory override.
+fn plan_service_socket(
+    plan: &mut launch::Plan,
+    dirs: &launch::Dirs,
+    runtime: &InstalledRuntime,
+) -> Result<Option<PathBuf>> {
+    if let Some(value) = plan.get("XODUS_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        return Ok(Some(PathBuf::from(value).join("xodus.sock")));
+    }
+    if let Some(value) = std::env::var_os("XODUS_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        return Ok(Some(PathBuf::from(value).join("xodus.sock")));
+    }
+    if runtime.provides(SERVICE_SOCKET_OVERRIDE) {
+        let metadata = dirs.cli_dir.join("SERVICE_ID");
+        match std::fs::read_to_string(&metadata) {
+            Ok(id) => {
+                if let Some(root) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+                    let directory = scoped_service_directory(true, &id, Path::new(&root))?.unwrap();
+                    plan.env_set.insert(
+                        "XODUS_RUNTIME_DIR".into(),
+                        directory.to_string_lossy().into_owned(),
+                    );
+                    return Ok(Some(directory.join("xodus.sock")));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", metadata.display()))
+            }
+        }
+    }
+    Ok(runtime_socket())
+}
+
+/// Start the service for this socket, preserving other running versions.
+fn start_service(dirs: &launch::Dirs, socket: Option<&Path>) -> Result<()> {
+    let socket =
+        socket.context("XDG_RUNTIME_DIR or XODUS_RUNTIME_DIR is required for Xbox services")?;
+    if service_socket_live(socket) {
         return Ok(());
     }
     let binary = dirs.xodus_service();
@@ -1316,60 +1489,77 @@ fn start_service(dirs: &launch::Dirs) -> Result<()> {
             binary.display()
         );
     }
-    if let Some(socket) = runtime_socket() {
-        let _ = std::fs::remove_file(socket);
+    let directory = socket
+        .parent()
+        .context("invalid service socket directory")?;
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("creating {}", directory.display()))?;
+    // Only remove an unreachable socket. An unrelated regular file is an error.
+    if let Ok(metadata) = std::fs::symlink_metadata(socket) {
+        use std::os::unix::fs::FileTypeExt;
+        if !metadata.file_type().is_socket() {
+            bail!("{} exists and is not a service socket", socket.display());
+        }
+        std::fs::remove_file(socket)
+            .with_context(|| format!("removing stale {}", socket.display()))?;
     }
-    let log = std::env::temp_dir().join("xodus-service.log");
-    let out = std::fs::File::create(&log).with_context(|| format!("creating {}", log.display()))?;
+    let log = directory.join("xodus-service.log");
+    use std::os::unix::fs::OpenOptionsExt;
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&log)
+        .with_context(|| format!("creating {}", log.display()))?;
     let errs = out
         .try_clone()
         .context("duplicating the service log handle")?;
-    Command::new(&binary)
+    let mut child = Command::new(&binary)
+        .env("XODUS_RUNTIME_DIR", directory)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(errs))
         .spawn()
         .with_context(|| format!("starting {}", binary.display()))?;
-    eprintln!(":: started xodus-service (log: {})", log.display());
-    // It has to be listening before the title asks it anything, and it offers
-    // nothing to wait on. Same two seconds launch-gdk.sh sleeps.
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    Ok(())
+    for _ in 0..100 {
+        if service_socket_live(socket) {
+            eprintln!(":: started xodus-service (log: {})", log.display());
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait().context("checking service startup")? {
+            bail!(
+                "Xbox service exited {status} before listening; log: {}",
+                log.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    bail!(
+        "Xbox service did not start listening; log: {}",
+        log.display()
+    )
+}
+
+fn runtime_socket_from(
+    override_dir: Option<std::ffi::OsString>,
+    runtime_dir: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    override_dir
+        .filter(|d| !d.is_empty())
+        .or_else(|| runtime_dir.filter(|d| !d.is_empty()))
+        .map(|d| PathBuf::from(d).join("xodus.sock"))
 }
 
 fn runtime_socket() -> Option<PathBuf> {
-    std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("xodus.sock"))
+    runtime_socket_from(
+        std::env::var_os("XODUS_RUNTIME_DIR"),
+        std::env::var_os("XDG_RUNTIME_DIR"),
+    )
 }
 
-/// Whether a process with this name is running, read from `/proc`.
-///
-/// `pgrep -x` is what the shell script uses; reading `/proc` avoids depending
-/// on procps being installed, which it is not in every container.
-fn process_running(name: &str) -> bool {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            // `Option::is_none_or` would say this better and is newer than the
-            // MSRV this workspace promises.
-            .map_or(true, |n| !n.bytes().all(|b| b.is_ascii_digit()))
-        {
-            continue;
-        }
-        if let Ok(comm) = std::fs::read_to_string(path.join("comm")) {
-            // /proc/PID/comm is truncated to 15 characters, so a long name is
-            // compared on the prefix the kernel kept.
-            let comm = comm.trim_end();
-            if comm == name || (comm.len() == 15 && name.starts_with(comm)) {
-                return true;
-            }
-        }
-    }
-    false
+fn service_socket_live(socket: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket).is_ok()
 }
 
 /// A recipe's `[[setup]]` steps for one moment in the title's life.
@@ -2190,6 +2380,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn packaged_service_versions_are_isolated_only_for_capable_runtimes() {
+        let root = Path::new("/desktop");
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        assert_ne!(
+            scoped_service_directory(true, &first, root).unwrap(),
+            scoped_service_directory(true, &second, root).unwrap()
+        );
+        assert_eq!(scoped_service_directory(false, &first, root).unwrap(), None);
+        assert_eq!(
+            scoped_service_directory(false, "legacy metadata", root).unwrap(),
+            None
+        );
+        assert!(scoped_service_directory(true, "../other", root).is_err());
+        let socket = scoped_service_directory(true, &first, Path::new("/run/user/1000"))
+            .unwrap()
+            .unwrap()
+            .join("xodus.sock");
+        assert!(
+            socket.as_os_str().len() < 108,
+            "service namespace must fit a Linux Unix socket path"
+        );
+    }
+
+    #[test]
+    fn service_directory_override_preserves_legacy_default() {
+        assert_eq!(
+            runtime_socket_from(Some("/candidate".into()), Some("/desktop".into())),
+            Some(PathBuf::from("/candidate/xodus.sock"))
+        );
+        assert_eq!(
+            runtime_socket_from(Some("".into()), Some("/desktop".into())),
+            Some(PathBuf::from("/desktop/xodus.sock"))
+        );
+        assert_eq!(
+            runtime_socket_from(None, Some("/desktop".into())),
+            Some(PathBuf::from("/desktop/xodus.sock"))
+        );
+        assert_eq!(runtime_socket_from(None, None), None);
+    }
+
+    #[test]
+    fn service_readiness_is_scoped_to_the_requested_socket() {
+        let directory =
+            std::env::temp_dir().join(format!("ferestre-service-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let first = directory.join("first.sock");
+        let other = directory.join("other.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&first).unwrap();
+        assert!(service_socket_live(&first));
+        assert!(!service_socket_live(&other));
+        drop(listener);
+        assert!(!service_socket_live(&first)); // A stale path is not a running service.
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn update_command_asks_the_client_for_json() {
         let command = update_command(Path::new("/opt/xodus/xodus-cli"), "content-id");
         assert_eq!(command.get_program(), Path::new("/opt/xodus/xodus-cli"));
@@ -2249,13 +2496,6 @@ summary = "Runs."
         // as a panic on someone else's machine: a duplicate short flag, a
         // positional after a variadic, an alias shadowing a command.
         Cli::command().debug_assert();
-    }
-
-    #[test]
-    fn a_packaged_release_reports_its_staged_version() {
-        assert_eq!(package_version(Some("0.1.2")), "0.1.2");
-        assert_eq!(package_version(Some("")), env!("CARGO_PKG_VERSION"));
-        assert_eq!(package_version(None), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
@@ -2705,6 +2945,97 @@ summary = "Runs."
         assert_eq!(exit_code_from(None, None), EXIT_FAILURE);
         assert_eq!(exit_code_from(Some(-1), None), EXIT_FAILURE);
         assert_eq!(exit_code_from(None, Some(200)), EXIT_FAILURE);
+    }
+
+    // -- recipes written from a package ------------------------------------
+
+    fn package(name: &str, files: &[&str]) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ferestre-detected-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for file in files {
+            std::fs::write(dir.join(file), b"").expect("write");
+        }
+        dir
+    }
+
+    fn detected(dir: &Path, executable: &str) -> Recipe {
+        let mut recipe = Recipe::blank("9ZZDETECTED1", "Detected");
+        recipe.launch.executable = executable.into();
+        detected_requirements(&mut recipe, dir);
+        recipe
+    }
+
+    #[test]
+    fn a_package_without_a_game_config_only_requires_the_main_image() {
+        let dir = package("plain", &["Game.exe"]);
+        let recipe = detected(&dir, "Game.exe");
+        assert_eq!(recipe.runtime.requires, [capability::MEMFD_MAIN_IMAGE]);
+        assert!(recipe.runtime.wants.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_gdk_package_requires_what_a_probe_can_see_and_wants_the_rest() {
+        // Any case of the config name is the same file to the package.
+        let dir = package("gdk", &["Game.exe", "microsoftgame.CONFIG"]);
+        let recipe = detected(&dir, "Game.exe");
+        assert_eq!(
+            recipe.runtime.requires,
+            [capability::MEMFD_MAIN_IMAGE, capability::XGAMERUNTIME_USER]
+        );
+        assert_eq!(recipe.runtime.wants, [capability::PACKAGE_IDENTITY]);
+
+        // The point of the split: a runtime that publishes nothing is still
+        // selected, and the name the probe cannot see becomes a warning.
+        let probed = InstalledRuntime {
+            path: PathBuf::from("/opt/probed"),
+            version: None,
+            provides: names(&[
+                capability::MEMFD_MAIN_IMAGE,
+                capability::XGAMERUNTIME_GAMESAVE,
+                capability::XGAMERUNTIME_NETWORKING,
+                capability::XGAMERUNTIME_PACKAGE,
+                capability::XGAMERUNTIME_TASKQUEUE,
+                capability::XGAMERUNTIME_USER,
+            ]),
+            source: CapabilitySource::Probed,
+        };
+        let runtimes = [probed];
+        let selected = runtime::select(&recipe, &runtimes, None, None).expect("selected");
+        assert_eq!(
+            gate(&runtime::assess(&recipe, selected, None)),
+            Gate::Degraded
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_package_with_a_known_engine_records_its_want() {
+        let dir = package(
+            "engine",
+            &[
+                "RetroClassics.exe",
+                "MicrosoftGame.Config",
+                "Ultralight.dll",
+                "UltralightCore.dll",
+                "WebCore.dll",
+            ],
+        );
+        let recipe = detected(&dir, "RetroClassics.exe");
+        assert_eq!(
+            recipe.runtime.wants,
+            [
+                capability::PACKAGE_IDENTITY,
+                capability::RECORDING_ALLOCATOR_LIFETIME
+            ]
+        );
+        // A default inferred at launch is not written down as configuration.
+        assert!(recipe.launch.env.is_empty());
+        let text = recipe.to_toml().expect("serialises");
+        Recipe::parse(&text).expect("and reads back");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // -- the repository's own data -----------------------------------------

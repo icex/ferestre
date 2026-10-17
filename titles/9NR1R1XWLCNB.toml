@@ -1,0 +1,46 @@
+# Written by the ferestre launcher. Edits here win over the packaged
+# recipe of the same product id, and survive an upgrade.
+#
+# If this makes a title work, the most useful thing you can do with
+# it is open an issue with this file attached.
+schema = 1
+
+[title]
+product-id = "9NR1R1XWLCNB"
+name = "Forza Horizon 6"
+slug = "forza-horizon-6"
+
+[install]
+dir = "forza-horizon-6"
+
+[launch]
+executable = "forzahorizon6.exe"
+
+[launch.env]
+XGR_STORE_CATALOG = "1"
+
+[runtime]
+requires = [
+    "loader.memfd-main-image",
+    "xgameruntime.user",
+    "xgameruntime.playfab-file-saves",
+    "xgameruntime.playfab-shutdown-upload",
+    "concrt140.concurrent-queue-iterator",
+]
+wants = ["appmodel.package-identity", "xgameruntime.store-catalog"]
+
+[status]
+state = "playable"
+summary = "Gameplay and Continue with saved progress confirmed by the player. The in-game marketplace is currently unavailable."
+last-verified = 2026-10-13
+verified-with = "Ferestre 0.1.8, package 3.461.691.0, runtime 11.0.20261013.2-local; player-confirmed gameplay and Continue after normal exit. Native PlayFab cloud synchronization and byte-identical save reopen also passed."
+
+[[issues]]
+symptom = "The in-game store reports failed to download marketplace data."
+cause = "The original catalog calls returned empty results. A later trace showed an older background service rejecting the new catalog protocol; the matching runtime and service pass live product and paging probes. In-game recovery remains unconfirmed."
+fix = "Use the matching launcher and runtime; a real catalog probe passes, but marketplace UI recovery is unconfirmed and purchases remain unsupported."
+
+[[issues]]
+symptom = "Crash-time cloud synchronization and full online-mode coverage remain unverified."
+cause = "Normal shutdown uploads and Continue passed; the compatibility layer does not yet provide an out-of-process save uploader after a crash."
+fix = "Keep save backups while qualifying these paths."

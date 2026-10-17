@@ -241,9 +241,14 @@ impl Paths {
             })
             .or_else(|| env.on_path("xodus-cli"))
             .or_else(|| {
-                let mut candidates = vec![home.join("src/xodus-cli/target/release")];
-                // A checkout beside this one, which is where it is when both
-                // are being worked on at once.
+                let mut candidates = Vec::new();
+                // The client is a submodule of this repository, built in
+                // place; a checkout from before that layout had it beside
+                // this one in ~/src instead.
+                if let Some(r) = repo.as_ref() {
+                    candidates.push(r.join("third_party/xodus-cli/target/release"));
+                }
+                candidates.push(home.join("src/xodus-cli/target/release"));
                 if let Some(beside) = repo.as_ref().and_then(|r| r.parent()) {
                     candidates.push(beside.join("xodus-cli/target/release"));
                 }
@@ -275,6 +280,15 @@ impl Paths {
             .get(name)
             .map(String::as_str)
             .filter(|v| !v.is_empty())
+    }
+
+    /// A variable exactly as the process had it, an empty value included.
+    ///
+    /// For the few settings where empty is an answer rather than an absence.
+    /// `VKD3D_CONFIG=` is how somebody says "no backend flags, not even the
+    /// ones you would infer", and [`Paths::var`] would read that as unset.
+    pub fn var_raw(&self, name: &str) -> Option<&str> {
+        self.vars.get(name).map(String::as_str)
     }
 
     pub fn home(&self) -> &Path {
@@ -411,9 +425,23 @@ impl Paths {
     /// drive", so it is deliberately not confined to the games directory. The
     /// path from the recipe is, because a recipe is data from a file that may
     /// not be ours.
+    ///
+    /// A recipe that names no directory falls back to where the launcher
+    /// recorded installing the title, while that directory is still there. A
+    /// title downloaded before it had a recipe went to `<product id>`, not to
+    /// the slug a recipe shipped later defaults to; without this, the only way
+    /// to find it was a copy of the recipe in the user's titles directory, and
+    /// that copy then hid every later change to the shipped one.
     pub fn install_dir(&self, recipe: &Recipe) -> Result<PathBuf> {
         if let Some(dir) = self.recipe_env(recipe.install.dir_env.as_deref()) {
             return Ok(dir);
+        }
+        if recipe.install.dir.is_none() {
+            if let Some(record) = crate::install::load(&self.state, &recipe.title.product_id) {
+                if record.dir.is_dir() {
+                    return Ok(record.dir);
+                }
+            }
         }
         self.under_games(recipe.install_dir(), "install dir", recipe)
     }
@@ -617,6 +645,16 @@ summary = "Runs."
     }
 
     #[test]
+    fn an_empty_variable_is_still_present_when_presence_is_the_question() {
+        // A path variable set to "" means unset; a backend flag list set to ""
+        // means "none". The launcher has to be able to tell that from absent.
+        let p = paths(&[("VKD3D_CONFIG", "")]);
+        assert_eq!(p.var("VKD3D_CONFIG"), None);
+        assert_eq!(p.var_raw("VKD3D_CONFIG"), Some(""));
+        assert_eq!(p.var_raw("DXVK_CONFIG"), None);
+    }
+
+    #[test]
     fn a_relative_xdg_home_is_ignored_as_the_spec_requires() {
         let p = paths(&[("XDG_STATE_HOME", "state")]);
         assert_eq!(
@@ -678,6 +716,22 @@ summary = "Runs."
         assert_eq!(
             p.cli_dir(),
             Some(Path::new("/home/tester/src/xodus-cli/target/release"))
+        );
+
+        // The submodule built in place wins over a checkout beside the tree.
+        let e = env(&[])
+            .with_exe("/home/tester/src/ferestre/target/debug/ferestre")
+            .with_existing([
+                "/home/tester/src/ferestre/scripts",
+                "/home/tester/src/ferestre/third_party/xodus-cli/target/release",
+                "/home/tester/src/xodus-cli/target/release",
+            ]);
+        let p = Paths::resolve(&e).unwrap();
+        assert_eq!(
+            p.cli_dir(),
+            Some(Path::new(
+                "/home/tester/src/ferestre/third_party/xodus-cli/target/release"
+            ))
         );
     }
 
@@ -769,6 +823,41 @@ summary = "Runs."
             p.log_file(&r).unwrap(),
             Path::new("/home/tester/xbox-games/example-launch.log")
         );
+    }
+
+    #[test]
+    fn a_recorded_install_is_found_without_a_recipe_naming_its_directory() {
+        let root = std::env::temp_dir().join(format!("ferestre-recorded-{}", std::process::id()));
+        let downloaded = root.join("games/9nblggh2jhxj");
+        std::fs::create_dir_all(&downloaded).unwrap();
+        let state = root.join("state");
+        let p = paths(&[
+            ("XDG_STATE_HOME", state.to_str().unwrap()),
+            ("XODUS_GAMES_DIR", root.join("games").to_str().unwrap()),
+        ]);
+        let record = crate::install::Record {
+            product_id: "9NBLGGH2JHXJ".into(),
+            dir: downloaded.clone(),
+            content_ids: Vec::new(),
+            installed_at: None,
+            package_version: None,
+        };
+        crate::install::save(p.state_dir(), &record).unwrap();
+
+        assert_eq!(p.install_dir(&recipe("")).unwrap(), downloaded);
+        // A directory the recipe names is still where the recipe says.
+        assert_eq!(
+            p.install_dir(&recipe("[install]\ndir = \"elsewhere\""))
+                .unwrap(),
+            root.join("games/elsewhere")
+        );
+        // A record whose directory has gone is not followed.
+        std::fs::remove_dir_all(&downloaded).unwrap();
+        assert_eq!(
+            p.install_dir(&recipe("")).unwrap(),
+            root.join("games/example")
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

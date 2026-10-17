@@ -1,0 +1,479 @@
+diff --git a/xthreading.c b/xthreading.c
+index bb4bbcf..ef7abf2 100644
+--- a/xthreading.c
++++ b/xthreading.c
+@@ -70,7 +70,30 @@ static ULONG WINAPI x_threading_Release( IXThreadingImpl *iface )
+     return ref;
+ }
+ 
+-static BOOL deliver_one_completion( void );
++struct x_task_queue;
++struct x_queue_port;
++static BOOL deliver_one_completion( XTaskQueueHandle queue, XTaskQueuePort port, BOOL own_only );
++static BOOL dispatch_manual_work( XTaskQueueHandle queue, XTaskQueuePort port );
++static XTaskQueueDispatchMode work_mode_for( XTaskQueueHandle queue );
++static struct x_queue_port *queue_port( XTaskQueueHandle queue, XTaskQueuePort port );
++static HRESULT WINAPI x_threading_XTaskQueueSubmitDelayedCallback( IXThreadingImpl *iface,
++    XTaskQueueHandle queue, XTaskQueuePort port, UINT32 delayMs, void *context, XTaskQueueCallback *callback );
++
++static BOOL WINAPI init_manual_dispatch( INIT_ONCE *once, void *param, void **context )
++{
++    char value[2];
++    *context = (void *)(ULONG_PTR)(GetEnvironmentVariableA( "XGR_STRICT_MANUAL_QUEUES", value, sizeof(value) ) == 1 &&
++                                 value[0] == '1' ? 4 : 0);
++    return TRUE;
++}
++
++static BOOL strict_manual_dispatch( void )
++{
++    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
++    void *context;
++    InitOnceExecuteOnce( &once, init_manual_dispatch, NULL, &context );
++    return context != NULL;
++}
+ 
+ static HRESULT WINAPI x_threading_XAsyncGetStatus( IXThreadingImpl *iface, XAsyncBlock *asyncBlock, BOOLEAN wait )
+ {
+@@ -91,7 +114,7 @@ static HRESULT WINAPI x_threading_XAsyncGetStatus( IXThreadingImpl *iface, XAsyn
+     for (i = 0; i < 30000; i++)
+     {
+         if (xgr_async_completed( asyncBlock, &hr, NULL )) return hr;
+-        if (!deliver_one_completion()) Sleep( 1 );
++        if (!deliver_one_completion(asyncBlock->queue, XTaskQueuePort_Completion, FALSE)) Sleep( 1 );
+     }
+ 
+     WARN( "asyncBlock %p did not complete.\n", asyncBlock );
+@@ -496,8 +519,35 @@ static void CALLBACK async_work_thunk( TP_CALLBACK_INSTANCE *instance, void *con
+     release_async_op( op );
+ }
+ 
++static void CALLBACK manual_async_work( void *context, BOOLEAN canceled )
++{
++    struct x_async_op *op = context;
++    BOOL active;
++
++    EnterCriticalSection( &async_ops_cs );
++    active = find_async_op( op->async ) == op && !op->completed;
++    LeaveCriticalSection( &async_ops_cs );
++    if (active)
++    {
++        if (canceled) x_threading_XAsyncComplete_helper( op->async, E_ABORT, 0 );
++        else async_op_do_work( op );
++    }
++    release_async_op( op );
++}
++
+ static HRESULT schedule_async_work( XAsyncBlock *async, UINT32 delay_ms )
+ {
++    struct x_async_op *op;
++    HRESULT hr;
++
++    if (strict_manual_dispatch() && work_mode_for( async->queue ) == XTaskQueueDispatchMode_Manual)
++    {
++        if (!(op = acquire_async_op( async ))) return E_INVALIDARG;
++        hr = x_threading_XTaskQueueSubmitDelayedCallback( NULL, async->queue, XTaskQueuePort_Work,
++                                                         delay_ms, op, manual_async_work );
++        if (FAILED(hr)) release_async_op( op );
++        return hr;
++    }
+     return submit_delayed( delay_ms, async_work_thunk, async );
+ }
+ 
+@@ -712,12 +762,18 @@ static HRESULT WINAPI x_threading_XAsyncGetResult( IXThreadingImpl *iface, XAsyn
+     return hr;
+ }
+ 
+-/* A queue is only ever handed back to the caller and later closed; work items
+- * for locally-satisfied operations are run inline rather than dispatched, so
+- * the object just needs to be a distinct, refcounted allocation. */
++/* Composite queues share endpoint identities with their parent queues. */
++struct x_queue_port
++{
++    struct x_task_queue *owner;
++    XTaskQueuePort kind;
++};
++
+ struct x_task_queue
+ {
+     LONG ref;
++    struct x_queue_port owned_ports[2];
++    struct x_queue_port *ports[2];
+     XTaskQueueDispatchMode work_mode;
+     XTaskQueueDispatchMode completion_mode;
+     struct list pending;        /* callbacks submitted but not run yet */
+@@ -734,6 +790,18 @@ struct x_task_queue
+  * load followed by an orderly shutdown. */
+ static struct x_task_queue *process_queue;
+ 
++static void init_queue_ports( struct x_task_queue *queue )
++{
++    unsigned int i;
++    for (i = 0; i < 2; ++i)
++    {
++        queue->owned_ports[i].owner = queue;
++        queue->owned_ports[i].kind = i;
++        queue->ports[i] = &queue->owned_ports[i];
++    }
++}
++
++
+ static BOOL WINAPI create_process_queue( INIT_ONCE *once, void *param, void **ctx )
+ {
+     struct x_task_queue *obj;
+@@ -741,6 +809,7 @@ static BOOL WINAPI create_process_queue( INIT_ONCE *once, void *param, void **ct
+     if (process_queue) return TRUE;    /* the title installed one first */
+     if (!(obj = calloc( 1, sizeof(*obj) ))) return FALSE;
+     obj->ref = 1;
++    init_queue_ports( obj );
+     obj->work_mode = XTaskQueueDispatchMode_ThreadPool;
+     obj->completion_mode = XTaskQueueDispatchMode_ThreadPool;
+     process_queue = obj;
+@@ -755,6 +824,20 @@ static struct x_task_queue *default_task_queue( void )
+     return process_queue;
+ }
+ 
++static struct x_queue_port *queue_port( XTaskQueueHandle queue, XTaskQueuePort port )
++{
++    struct x_task_queue *obj = (struct x_task_queue *)queue;
++    if (!obj) obj = default_task_queue();
++    return obj && (port == XTaskQueuePort_Work || port == XTaskQueuePort_Completion) ? obj->ports[port] : NULL;
++}
++
++static XTaskQueueDispatchMode work_mode_for( XTaskQueueHandle queue )
++{
++    struct x_queue_port *port = queue_port( queue, XTaskQueuePort_Work );
++    if (!port) return XTaskQueueDispatchMode_ThreadPool;
++    return port->kind == XTaskQueuePort_Work ? port->owner->work_mode : port->owner->completion_mode;
++}
++
+ /* Completions waiting to be handed to whoever pumps the queue. */
+ struct x_pending_completion
+ {
+@@ -762,6 +845,8 @@ struct x_pending_completion
+     XAsyncBlock *async;
+     XAsyncCompletionRoutine *callback;
+     struct x_async_op *keep_alive;
++    struct x_queue_port *port;
++    XTaskQueueHandle origin;
+ };
+ 
+ /* Set once a title actually pumps a queue. Until then a Manual completion has
+@@ -785,7 +870,7 @@ static CRITICAL_SECTION pending_cs = { &pending_cs_debug, -1, 0, 0, 0, 0 };
+  * A queue handle is the queue object itself. A Manual queue is pumped by the
+  * title, so its completions wait for XTaskQueueDispatch; for every other mode
+  * the runtime has to deliver them itself. A block with no queue is treated as
+- * runtime-driven, since nothing would ever dispatch it. */
++ * runtime-driven in compatibility mode; strict mode uses the process default. */
+ static XTaskQueueDispatchMode completion_mode_for( const XAsyncBlock *async )
+ {
+     const struct x_task_queue *obj = (const struct x_task_queue *)async->queue;
+@@ -797,6 +882,7 @@ static XTaskQueueDispatchMode completion_mode_for( const XAsyncBlock *async )
+      * here parks the completion for ever. That stranded half of its
+      * XUserAddAsync calls, sign-in never finished, and everything needing a
+      * token -- profile, presence, loading a saved world -- stopped working. */
++    if (!obj && strict_manual_dispatch()) obj = default_task_queue();
+     if (!obj) return XTaskQueueDispatchMode_ThreadPool;
+     return obj->completion_mode;
+ }
+@@ -843,6 +929,8 @@ static void deliver_async_completion( XAsyncBlock *async, struct x_async_op *kee
+     item->async = async;
+     item->callback = async->callback;
+     item->keep_alive = keep_alive;
++    item->port = queue_port( async->queue, XTaskQueuePort_Completion );
++    item->origin = async->queue ? async->queue : (XTaskQueueHandle)default_task_queue();
+     if (keep_alive) InterlockedIncrement( &keep_alive->ref );
+ 
+     /* A Manual queue is the title's to pump. Bedrock, though, creates Manual
+@@ -859,7 +947,7 @@ static void deliver_async_completion( XAsyncBlock *async, struct x_async_op *kee
+      * Hand those to the thread pool rather than running them inline, which
+      * would re-enter the caller's own *Async() frame. */
+     if (completion_mode_for( async ) != XTaskQueueDispatchMode_Manual ||
+-        !InterlockedCompareExchange( &queue_ever_dispatched, 0, 0 ))
++        (!strict_manual_dispatch() && !InterlockedCompareExchange( &queue_ever_dispatched, 0, 0 )))
+     {
+         HANDLE thread;
+ 
+@@ -898,10 +986,11 @@ void xgr_async_complete( XAsyncBlock *async, HRESULT hr, void *payload )
+ }
+ 
+ /* Hand one queued completion to its callback. Returns TRUE if work was done. */
+-static BOOL deliver_one_completion( void )
++static BOOL deliver_one_completion( XTaskQueueHandle queue, XTaskQueuePort port, BOOL own_only )
+ {
+     struct x_pending_completion *item = NULL;
+-    struct list *head;
++    struct x_pending_completion *candidate;
++    struct x_queue_port *target = strict_manual_dispatch() ? queue_port( queue, port ) : NULL;
+ 
+     /* Titles poll this extremely hard -- millions of calls per session, from
+      * several threads at once. Taking the lock every time makes the queue a
+@@ -911,11 +1000,14 @@ static BOOL deliver_one_completion( void )
+     if (!InterlockedCompareExchange( &pending_count, 0, 0 )) return FALSE;
+ 
+     EnterCriticalSection( &pending_cs );
+-    if ((head = list_head( &pending_completions )))
++    LIST_FOR_EACH_ENTRY( candidate, &pending_completions, struct x_pending_completion, entry )
+     {
+-        item = LIST_ENTRY( head, struct x_pending_completion, entry );
++        if (target && candidate->port != target) continue;
++        if (own_only && candidate->origin != queue) continue;
++        item = candidate;
+         list_remove( &item->entry );
+         InterlockedDecrement( &pending_count );
++        break;
+     }
+     LeaveCriticalSection( &pending_cs );
+ 
+@@ -940,6 +1032,7 @@ static HRESULT WINAPI x_threading_XTaskQueueCreate( IXThreadingImpl *iface, XTas
+     if (!(obj = calloc( 1, sizeof(*obj) ))) return E_OUTOFMEMORY;
+ 
+     obj->ref = 1;
++    init_queue_ports( obj );
+     obj->work_mode = workDispatchMode;
+     obj->completion_mode = completionDispatchMode;
+ 
+@@ -960,8 +1053,19 @@ static HRESULT WINAPI x_threading_XTaskQueueCreateComposite( IXThreadingImpl *if
+     if (!queue) return E_INVALIDARG;
+     if (!(obj = calloc( 1, sizeof(*obj) ))) return E_OUTOFMEMORY;
+     obj->ref = 1;
+-    if (workPort) obj->work_mode = ((struct x_task_queue *)workPort)->work_mode;
+-    if (completionPort) obj->completion_mode = ((struct x_task_queue *)completionPort)->completion_mode;
++    init_queue_ports( obj );
++    if (workPort)
++    {
++        struct x_queue_port *port = (struct x_queue_port *)workPort;
++        obj->ports[XTaskQueuePort_Work] = port;
++        obj->work_mode = port->kind == XTaskQueuePort_Work ? port->owner->work_mode : port->owner->completion_mode;
++    }
++    if (completionPort)
++    {
++        struct x_queue_port *port = (struct x_queue_port *)completionPort;
++        obj->ports[XTaskQueuePort_Completion] = port;
++        obj->completion_mode = port->kind == XTaskQueuePort_Work ? port->owner->work_mode : port->owner->completion_mode;
++    }
+     *queue = (XTaskQueueHandle)obj;
+     return S_OK;
+ }
+@@ -970,10 +1074,10 @@ static HRESULT WINAPI x_threading_XTaskQueueGetPort( IXThreadingImpl *iface, XTa
+ {
+     TRACE( "iface %p, queue %p, port %d, portHandle %p.\n", iface, queue, port, portHandle );
+ 
+-    /* Work and completion share one implicit port: the queue itself. */
+-    if (!portHandle) return E_INVALIDARG;
++    /* Each endpoint retains its owning queue and dispatch mode. */
++    if (!portHandle || (port != XTaskQueuePort_Work && port != XTaskQueuePort_Completion)) return E_INVALIDARG;
+     if (!queue && !(queue = (XTaskQueueHandle)default_task_queue())) return E_OUTOFMEMORY;
+-    *portHandle = (XTaskQueuePortHandle)queue;
++    *portHandle = (XTaskQueuePortHandle)queue_port( queue, port );
+     return S_OK;
+ }
+ 
+@@ -995,7 +1099,8 @@ static BOOLEAN WINAPI x_threading_XTaskQueueDispatch( IXThreadingImpl *iface, XT
+ 
+     InterlockedExchange( &queue_ever_dispatched, 1 );
+ 
+-    if (deliver_one_completion()) return TRUE;
++    if (strict_manual_dispatch() && dispatch_manual_work( queue, port )) return TRUE;
++    if (deliver_one_completion(queue, port, FALSE)) return TRUE;
+ 
+     /* Callers pump this in a loop. Returning immediately turns that into a
+      * busy-wait that saturates a core and starves the rest of the title, so
+@@ -1011,7 +1116,7 @@ static BOOLEAN WINAPI x_threading_XTaskQueueDispatch( IXThreadingImpl *iface, XT
+         if (pending_event)
+         {
+             if (WaitForSingleObject( pending_event, wait ) == WAIT_OBJECT_0)
+-                return deliver_one_completion();
++                return deliver_one_completion(queue, port, FALSE);
+         }
+         else Sleep( wait );
+     }
+@@ -1024,16 +1129,99 @@ static void WINAPI x_threading_XTaskQueueCloseHandle( IXThreadingImpl *iface, XT
+ 
+     TRACE( "iface %p, queue %p.\n", iface, queue );
+ 
+-    /* Dropped to zero, but deliberately not freed. A port handle is just the
+-     * queue pointer (XTaskQueueGetPort hands it out with no reference), and a
+-     * composite queue reads its ports' dispatch modes later, so freeing here
+-     * leaves those raw pointers dangling -- the crashes seen in both this
+-     * module and libHttpClient were a read of a field at offset 8 of a freed
+-     * queue. The object is 24 bytes and a session creates a few hundred, so
+-     * keeping them costs a few kilobytes and removes the whole class of bug. */
++    /* Retain queue objects and their embedded endpoints after the last close.
++     * Port handles carry no reference, and composite queues share endpoints;
++     * freeing the owner here would leave those handles dangling. */
+     if (obj) InterlockedDecrement( &obj->ref );
+ }
+ 
++struct x_manual_callback
++{
++    struct list entry;
++    struct x_queue_port *port;
++    struct x_task_queue *origin;
++    ULONGLONG ready_at;
++    void *context;
++    XTaskQueueCallback *callback;
++};
++
++static struct list manual_callbacks = LIST_INIT( manual_callbacks );
++static CRITICAL_SECTION manual_cs;
++static CRITICAL_SECTION_DEBUG manual_cs_debug =
++{
++    0, 0, &manual_cs,
++    { &manual_cs_debug.ProcessLocksList, &manual_cs_debug.ProcessLocksList },
++    0, 0, { (DWORD_PTR)(__FILE__ ": manual_cs") }
++};
++static CRITICAL_SECTION manual_cs = { &manual_cs_debug, -1, 0, 0, 0, 0 };
++
++static BOOL dispatch_manual_work( XTaskQueueHandle queue, XTaskQueuePort port )
++{
++    struct x_queue_port *target = queue_port( queue, port );
++    struct x_manual_callback *item, *found = NULL;
++    EnterCriticalSection( &manual_cs );
++    LIST_FOR_EACH_ENTRY( item, &manual_callbacks, struct x_manual_callback, entry )
++    {
++        if (item->port != target) continue;
++        if (!item->origin->terminated && !item->port->owner->terminated &&
++            GetTickCount64() < item->ready_at) continue;
++        found = item;
++        list_remove( &item->entry );
++        break;
++    }
++    LeaveCriticalSection( &manual_cs );
++    if (!found) return FALSE;
++    found->callback( found->context, found->origin->terminated || found->port->owner->terminated );
++    free( found );
++    return TRUE;
++}
++
++static HRESULT enqueue_manual_callback( struct x_task_queue *queue, XTaskQueuePort port,
++                                        void *context, XTaskQueueCallback *callback, UINT32 delay_ms )
++{
++    struct x_manual_callback *item;
++    if (!(item = calloc( 1, sizeof(*item) ))) return E_OUTOFMEMORY;
++    item->port = queue_port( (XTaskQueueHandle)queue, port );
++    item->origin = queue;
++    item->ready_at = GetTickCount64() + delay_ms;
++    item->context = context;
++    item->callback = callback;
++    EnterCriticalSection( &manual_cs );
++    if (queue->terminated || item->port->owner->terminated)
++    {
++        LeaveCriticalSection( &manual_cs );
++        free( item );
++        return E_ABORT;
++    }
++    list_add_tail( &manual_callbacks, &item->entry );
++    LeaveCriticalSection( &manual_cs );
++    return S_OK;
++}
++
++/* Termination owns callbacks submitted through this queue, even when its
++ * endpoints are shared with a parent or another composite. */
++static void cancel_manual_callbacks( struct x_task_queue *queue )
++{
++    struct x_manual_callback *item, *next;
++    struct list drained;
++    list_init( &drained );
++    EnterCriticalSection( &manual_cs );
++    LIST_FOR_EACH_ENTRY_SAFE( item, next, &manual_callbacks, struct x_manual_callback, entry )
++    {
++        if (item->origin != queue) continue;
++        list_remove( &item->entry );
++        list_add_tail( &drained, &item->entry );
++    }
++    LeaveCriticalSection( &manual_cs );
++    while (!list_empty( &drained ))
++    {
++        item = LIST_ENTRY( list_head( &drained ), struct x_manual_callback, entry );
++        list_remove( &item->entry );
++        item->callback( item->context, TRUE );
++        free( item );
++    }
++}
++
+ /* A task queue port is a serial execution context: the GDK runs one callback
+  * at a time on it, and a title dispatching a Manual queue itself necessarily
+  * runs them one after another. We used to hand every callback straight to the
+@@ -1053,6 +1241,7 @@ struct x_queue_work
+ {
+     struct list entry;
+     struct x_task_queue *queue;
++    XTaskQueuePort port;
+     void *context;
+     XTaskQueueCallback *callback;
+ };
+@@ -1142,10 +1331,13 @@ static void kick_queue_runner( struct x_task_queue *queue )
+     }
+ }
+ 
+-static HRESULT enqueue_queue_work( struct x_task_queue *queue, void *context, XTaskQueueCallback *callback )
++static HRESULT enqueue_queue_work( struct x_task_queue *queue, XTaskQueuePort port, void *context, XTaskQueueCallback *callback )
+ {
+     struct x_queue_work *item;
++    XTaskQueueDispatchMode mode = port == XTaskQueuePort_Work ? queue->work_mode : queue->completion_mode;
+ 
++    if (strict_manual_dispatch() && mode == XTaskQueueDispatchMode_Manual)
++        return enqueue_manual_callback( queue, port, context, callback, 0 );
+     if (!(item = calloc( 1, sizeof(*item) ))) return E_OUTOFMEMORY;
+     item->queue = queue;
+     item->context = context;
+@@ -1169,7 +1361,6 @@ static void CALLBACK delayed_enqueue_thunk( TP_CALLBACK_INSTANCE *instance, void
+ {
+     struct x_queue_work *item = context;
+     struct x_task_queue *queue = item->queue;
+-
+     EnterCriticalSection( &queue_work_cs );
+     if (!queue->initialised)
+     {
+@@ -1188,7 +1379,7 @@ static HRESULT WINAPI x_threading_XTaskQueueSubmitCallback( IXThreadingImpl *ifa
+ 
+     TRACE( "iface %p, queue %p, port %d, callbackContext %p, callback %p.\n", iface, queue, port, callbackContext, callback );
+ 
+-    if (!callback) return E_INVALIDARG;
++    if (!callback || (port != XTaskQueuePort_Work && port != XTaskQueuePort_Completion)) return E_INVALIDARG;
+     if (!obj) obj = default_task_queue();
+     if (!obj) return E_OUTOFMEMORY;
+     /* A terminated queue takes no more work. Accepting it is how a callback
+@@ -1201,7 +1392,7 @@ static HRESULT WINAPI x_threading_XTaskQueueSubmitCallback( IXThreadingImpl *ifa
+         callback( callbackContext, FALSE );
+         return S_OK;
+     }
+-    return enqueue_queue_work( obj, callbackContext, callback );
++    return enqueue_queue_work( obj, port, callbackContext, callback );
+ }
+ 
+ /* A delayed callback is how callers implement retry backoff (libHttpClient
+@@ -1215,14 +1406,20 @@ static HRESULT WINAPI x_threading_XTaskQueueSubmitDelayedCallback( IXThreadingIm
+ 
+     TRACE( "iface %p, queue %p, port %d, delayMs %d, callbackContext %p, callback %p.\n", iface, queue, port, delayMs, callbackContext, callback );
+ 
+-    if (!callback) return E_INVALIDARG;
++    if (!callback || (port != XTaskQueuePort_Work && port != XTaskQueuePort_Completion)) return E_INVALIDARG;
+     if (!obj) obj = default_task_queue();
+     if (!obj) return E_OUTOFMEMORY;
+ 
+-    if (!delayMs) return enqueue_queue_work( obj, callbackContext, callback );
++    if (obj->terminated) return E_ABORT;
++    if (strict_manual_dispatch() &&
++        (port == XTaskQueuePort_Work ? obj->work_mode : obj->completion_mode) == XTaskQueueDispatchMode_Manual)
++        return enqueue_manual_callback( obj, port, callbackContext, callback, delayMs );
++
++    if (!delayMs) return enqueue_queue_work( obj, port, callbackContext, callback );
+ 
+     if (!(item = calloc( 1, sizeof(*item) ))) return E_OUTOFMEMORY;
+     item->queue = obj;
++    item->port = port;
+     item->context = callbackContext;
+     item->callback = callback;
+ 
+@@ -1326,7 +1523,9 @@ static HRESULT WINAPI x_threading_XTaskQueueTerminate( IXThreadingImpl *iface, X
+         }
+     }
+ 
+-    while (deliver_one_completion());
++    if (strict_manual_dispatch()) cancel_manual_callbacks( obj );
++    while (deliver_one_completion((XTaskQueueHandle)obj, XTaskQueuePort_Work, strict_manual_dispatch()) ||
++           deliver_one_completion((XTaskQueueHandle)obj, XTaskQueuePort_Completion, strict_manual_dispatch()));
+     if (callback) callback( callbackContext );
+     return S_OK;
+ }

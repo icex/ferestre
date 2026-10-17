@@ -120,13 +120,14 @@ jobs:
       - name: Build bundled Xodus client
         run: |
           set -euo pipefail
-          git clone --quiet https://github.com/xodus-gaming/xodus.git xodus
-          git -C xodus checkout --quiet 3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
+          # The submodule pin is the upstream commit the series is written
+          # against; scripts/check-patches.sh and the AUR package name the same one.
+          git submodule update --init --quiet third_party/xodus-cli
           for patch in patches/xodus-cli/*.patch; do
               case "$(basename "$patch")" in 0001-*) continue ;; esac
-              git -C xodus apply "$GITHUB_WORKSPACE/$patch"
+              git -C third_party/xodus-cli apply "$GITHUB_WORKSPACE/$patch"
           done
-          cargo build --release --manifest-path xodus/Cargo.toml \
+          cargo build --release --manifest-path third_party/xodus-cli/Cargo.toml \
               -p xodus-cli -p xodus-service
 
       # The layout an installed copy has: usr/bin/ferestre with
@@ -145,10 +146,11 @@ jobs:
           install -d "$root/usr/bin" "$root/usr/lib/ferestre"
           install -Dm755 target/release/ferestre     "$root/usr/bin/ferestre"
           install -Dm755 target/release/ferestre-gui "$root/usr/bin/ferestre-gui"
-          install -Dm755 xodus/target/release/xodus-cli \
+          install -Dm755 third_party/xodus-cli/target/release/xodus-cli \
               "$root/usr/lib/ferestre/client/xodus-cli"
-          install -Dm755 xodus/target/release/xodus-service \
+          install -Dm755 third_party/xodus-cli/target/release/xodus-service \
               "$root/usr/lib/ferestre/client/xodus-service"
+          sha256sum "$root/usr/lib/ferestre/client/xodus-service" | cut -d' ' -f1 > "$root/usr/lib/ferestre/client/SERVICE_ID"
           # Not documentation: launch-gdk.sh is the launch path and
           # proton-wine-shim.sh is what the client execs as its "wine".
           # patches/ travels with them because install-xodus-proton.sh reads
@@ -169,7 +171,7 @@ jobs:
                   "$root/usr/share/icons/hicolor/scalable/apps/$id.svg"
           fi
 
-          for doc in README.md NOTICE docs/RECIPES.md docs/ROADMAP.md docs/COMPATIBILITY.md; do
+          for doc in README.md NOTICE docs/RELEASE-0.1.10.md docs/RELEASE-0.1.9.md docs/RECIPES.md docs/ROADMAP.md docs/COMPATIBILITY.md docs/AUTODETECTION.md; do
               install -Dm644 "$doc" "$root/usr/share/doc/ferestre/$(basename "$doc")"
           done
           for lic in LICENSE LICENSE.LGPL-2.1; do
@@ -197,7 +199,7 @@ jobs:
         run: |
           packaging/appimage/build-appimage.sh \
             --bin target/release/ferestre \
-            --client xodus/target/release/xodus-cli \
+            --client third_party/xodus-cli/target/release/xodus-cli \
             --version "$VERSION" \
             --out out
 
@@ -229,14 +231,20 @@ jobs:
 
           | File | What it is |
           |---|---|
-          | \`Ferestre-$VERSION-x86_64.AppImage\` | One file. Make it executable and run it. |
+          | \`ferestre-$VERSION-x86_64.AppImage\` | One file. Make it executable and run it. |
           | \`ferestre-$VERSION-x86_64.tar.zst\` | The same tree an installed copy has. Extract anywhere and run \`usr/bin/ferestre\`. |
           | \`SHA256SUMS\` | Checksums for both. |
 
-          The AppImage and tarball include the Xodus client and a patched Proton
-          runtime, so a fresh installation can sign in and launch titles at
-          first start. The runtime is still released independently under
-          \`runtime-*\` tags for maintainers and AUR users.
+          The AppImage and tarball include the Xodus client. The patched Proton
+          runtime is downloaded separately on first start and is released
+          under \`runtime-*\` tags. Use runtime 11.0.20261013.3. Ferestre
+          now has clearer activity messages and a spinner tooltip naming the
+          current task. Closing during work asks first, stops downloads while
+          keeping game files for resuming, lets removals finish, and waits for
+          cleanup before exiting. This launcher update uses the existing
+          runtime and makes no new gameplay compatibility claims.
+          See docs/RELEASE-0.1.10.md for tested scope and docs/RELEASE-0.1.9.md
+          for the existing runtime and gameplay qualification.
 
           You need to own the games. This downloads and runs what your own
           Microsoft account is licensed for, and nothing else.

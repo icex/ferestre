@@ -11,3 +11,7 @@ compatibility libraries before starting a title.
 
 Run `ferestre doctor` afterwards. It reports **32-bit Linux loader available**
 when Wine can start 32-bit helpers.
+
+Halo Infinite also needs Python 3 and util-linux (`unshare`, `mount`, `umount`),
+with unprivileged user and mount namespaces enabled. Its licensed executable
+view exists only in private tmpfs mounts for the lifetime of the launch.

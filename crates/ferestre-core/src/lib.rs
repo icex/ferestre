@@ -15,6 +15,7 @@
 
 pub mod account;
 pub mod appx;
+pub mod autofix;
 pub mod capability;
 pub mod catalog;
 pub mod gamepass;
@@ -23,6 +24,7 @@ pub mod install;
 pub mod launch;
 pub mod library;
 pub mod paths;
+pub mod playfab;
 pub mod recipe;
 pub mod runtime;
 pub mod steam;
@@ -43,5 +45,25 @@ pub fn human_bytes(n: u64) -> String {
         n if n >= 1_000_000 => format!("{} MB", n / 1_000_000),
         n if n >= 1_000 => format!("{} kB", n / 1_000),
         n => format!("{n} B"),
+    }
+}
+
+/// AppRun supplies the release tag from the staged `VERSION` file. A normal
+/// checkout has no such wrapper, so its compiled Cargo version remains useful.
+pub fn package_version(packaged: Option<&str>) -> &str {
+    packaged
+        .filter(|version| !version.is_empty())
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::package_version;
+
+    #[test]
+    fn a_packaged_release_reports_its_staged_version() {
+        assert_eq!(package_version(Some("0.1.2")), "0.1.2");
+        assert_eq!(package_version(Some("")), env!("CARGO_PKG_VERSION"));
+        assert_eq!(package_version(None), env!("CARGO_PKG_VERSION"));
     }
 }

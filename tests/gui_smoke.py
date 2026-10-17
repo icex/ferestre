@@ -20,6 +20,8 @@ without a rerun.
 """
 
 import argparse
+import ctypes
+import ctypes.util
 import glob
 import json
 import os
@@ -129,7 +131,12 @@ def texts(root):
 def wait_for(root, predicate, what, deadline):
     last = None
     while time.monotonic() < deadline:
-        last = predicate(root)
+        # A node can vanish between being listed and being asked about while
+        # the list it sits in is rebuilt; that is "not yet", not a failure.
+        try:
+            last = predicate(root)
+        except GLib.GError:
+            last = None
         if last:
             return last
         time.sleep(POLL)
@@ -211,6 +218,104 @@ def click(node):
             return target
     action.do_action(0)
     return target
+
+
+def window_origin(pid):
+    """Where on the X screen the window this process mapped begins.
+
+    GTK 4 reports every extent relative to its own window and answers zero for
+    screen coordinates, so a pointer event cannot be aimed from AT-SPI alone.
+    The X server knows where the window went; ask it, by the same process id
+    the application was found by.
+    """
+    x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XDefaultRootWindow.restype = ctypes.c_ulong
+    x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    x11.XInternAtom.restype = ctypes.c_ulong
+    x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    x11.XQueryTree.argtypes = [ctypes.c_void_p, ctypes.c_ulong] + [ctypes.c_void_p] * 4
+    x11.XGetWindowProperty.argtypes = (
+        [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long, ctypes.c_long]
+        + [ctypes.c_int, ctypes.c_ulong]
+        + [ctypes.c_void_p] * 5
+    )
+    x11.XTranslateCoordinates.argtypes = (
+        [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_int]
+        + [ctypes.c_void_p] * 3
+    )
+    x11.XFree.argtypes = [ctypes.c_void_p]
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+
+    display = x11.XOpenDisplay(None)
+    if not display:
+        raise Failure("cannot open the X display to aim the pointer; is DISPLAY set?")
+    try:
+        root = x11.XDefaultRootWindow(display)
+        wm_pid = x11.XInternAtom(display, b"_NET_WM_PID", 1)
+
+        def owner(window):
+            kind, fmt = ctypes.c_ulong(), ctypes.c_int()
+            count, left = ctypes.c_ulong(), ctypes.c_ulong()
+            data = ctypes.POINTER(ctypes.c_ulong)()
+            if x11.XGetWindowProperty(
+                display, window, wm_pid, 0, 1, 0, 0,
+                ctypes.byref(kind), ctypes.byref(fmt), ctypes.byref(count),
+                ctypes.byref(left), ctypes.byref(data),
+            ) != 0 or not data:
+                return None
+            try:
+                return data[0] if count.value else None
+            finally:
+                x11.XFree(data)
+
+        def search(window):
+            if owner(window) == pid:
+                return window
+            root_out, parent = ctypes.c_ulong(), ctypes.c_ulong()
+            children = ctypes.POINTER(ctypes.c_ulong)()
+            count = ctypes.c_uint()
+            if not x11.XQueryTree(
+                display, window, ctypes.byref(root_out), ctypes.byref(parent),
+                ctypes.byref(children), ctypes.byref(count),
+            ):
+                return None
+            try:
+                for i in range(count.value):
+                    found = search(children[i])
+                    if found:
+                        return found
+            finally:
+                if children:
+                    x11.XFree(children)
+            return None
+
+        window = search(root) if wm_pid else None
+        if window is None:
+            raise Failure(f"no X window belongs to pid {pid}")
+        x, y, child = ctypes.c_int(), ctypes.c_int(), ctypes.c_ulong()
+        x11.XTranslateCoordinates(
+            display, window, root, 0, 0, ctypes.byref(x), ctypes.byref(y), ctypes.byref(child)
+        )
+        return x.value, y.value
+    finally:
+        x11.XCloseDisplay(display)
+
+
+def press(node, pid):
+    """Click a widget with the pointer, the way a person does.
+
+    Not the same as `click`. An accessibility action activates a button and
+    leaves the keyboard focus where it was; a real click gives the button the
+    focus first. The window has to survive that button being destroyed under
+    its own focus, and only a pointer click puts it in that position.
+    """
+    origin_x, origin_y = window_origin(pid)
+    box = node.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+    x = origin_x + box.x + box.width // 2
+    y = origin_y + box.y + box.height // 2
+    Atspi.generate_mouse_event(x, y, "b1c")
 
 
 # A GtkLabel advertises clipboard and selection actions. They are real, and
@@ -347,6 +452,24 @@ def main():
     # or write into one. It also means the run starts from the state a new user
     # has, which is the state most worth testing.
     home = tempfile.mkdtemp(prefix="ferestre-gui-smoke-")
+    recipes_dir = os.path.join(home, "titles")
+    shutil.copytree(os.path.join(os.getcwd(), "titles"), recipes_dir)
+    # A fixed fixture keeps this warning check independent of live compatibility.
+    with open(os.path.join(recipes_dir, "9ZZBROKEN001.toml"), "w") as f:
+        f.write('''schema = 1
+[title]
+product-id = "9ZZBROKEN001"
+name = "Smoke Test Broken Game"
+slug = "smoke-broken-game"
+[launch]
+executable = "Game.exe"
+[status]
+state = "broken"
+summary = "Synthetic failure fixture"
+stops-at = "Synthetic startup failure"
+blocked-by = "unknown"
+last-verified = 2026-10-10
+''')
     env = dict(os.environ)
     env.update(
         {
@@ -355,12 +478,24 @@ def main():
             "XDG_STATE_HOME": os.path.join(home, "state"),
             "XDG_CONFIG_HOME": os.path.join(home, "config"),
             "GTK_A11Y": "atspi",
-            "FERESTRE_TITLES": os.path.join(os.getcwd(), "titles"),
+            # Startup now refreshes the public catalog. Keep this fixture
+            # offline: a refused local proxy exercises cached fallback and
+            # prevents real Microsoft data from replacing its seeded rows.
+            "HTTPS_PROXY": "http://127.0.0.1:9",
+            "https_proxy": "http://127.0.0.1:9",
+            "HTTP_PROXY": "http://127.0.0.1:9",
+            "http_proxy": "http://127.0.0.1:9",
+            "ALL_PROXY": "http://127.0.0.1:9",
+            "all_proxy": "http://127.0.0.1:9",
+            "NO_PROXY": "",
+            "no_proxy": "",
+            "FERESTRE_TITLES": recipes_dir,
             # Recipes come from the checkout, but nothing else should: no Steam,
             # no runtime, no client.
             "XODUS_GAMES_DIR": os.path.join(home, "games"),
             "XODUS_STEAM_DIR": os.path.join(home, "steam"),
             "XODUS_PROTON_DIR": os.path.join(home, "runtime"),
+            "FERESTRE_PACKAGE_VERSION": "0.1.3-smoke",
             "XODUS_CLI_DIR": os.path.join(home, "client"),
         }
     )
@@ -377,10 +512,10 @@ def main():
         f.write("0 smoke-test-runtime\n")
     wanted = set()
     recipe_count = 0
-    for name in os.listdir(os.path.join(os.getcwd(), "titles")):
+    for name in os.listdir(recipes_dir):
         if not name.endswith(".toml") or name == "capabilities.toml":
             continue
-        with open(os.path.join(os.getcwd(), "titles", name), "rb") as f:
+        with open(os.path.join(recipes_dir, name), "rb") as f:
             recipe = tomllib.load(f)
         recipe_count += 1
         wanted |= set(recipe.get("runtime", {}).get("requires", []))
@@ -522,18 +657,43 @@ def main():
     with open(stub, "w") as f:
         f.write(
             """#!/usr/bin/env python3
-import json, os, sys, time
+import json, os, select, sys, time
+from pathlib import Path
+home = Path(os.environ["HOME"])
+if sys.argv[1:2] == ["uninstall"]:
+    (home / "removal-started").touch()
+    while not (home / "release-removal").exists():
+        time.sleep(0.05)
+    (home / "removal-finished").touch()
+    sys.exit(0)
+if sys.argv[1:2] == ["run"]:
+    # Long enough that starting and exiting are separate redraws, as they are
+    # for a real title: each one rebuilds the row the person just clicked.
+    time.sleep(2)
+    sys.exit(0)
 if sys.argv[1:2] != ["install"]:
     sys.exit(0)
 if os.environ.get("XODUS_PROGRESS") != "json":
     # The real client only emits these when asked. A window that forgets to ask
     # would then sit on an empty bar, and this is where that gets noticed.
     sys.exit("progress was not requested")
+if (home / "hold-download").exists():
+    (home / "download-started").touch()
+    while not select.select([sys.stdin], [], [], 0.05)[0]:
+        pass
+    sys.stdin.buffer.read(1)
+    (home / "download-stopping").touch()
+    while not (home / "release-cleanup").exists():
+        time.sleep(0.05)
+    (home / "download-stopped").touch()
+    sys.exit(130)
 total = 800_000_000
-# Four seconds of it: the estimate deliberately says nothing until it has a
-# couple of seconds to average over, so a shorter run would prove less.
-for step in range(1, 41):
-    print(json.dumps({"progress": {"done": total * step // 40, "total": total}}), flush=True)
+# Ten seconds of it: the estimate deliberately says nothing until it has a
+# couple of seconds to average over, and on a loaded machine one walk of the
+# accessibility tree can take most of a second, so a four-second run left the
+# check only a moment to see the rate before the download ended.
+for step in range(1, 101):
+    print(json.dumps({"progress": {"done": total * step // 100, "total": total}}), flush=True)
     time.sleep(0.1)
 print(":: done", flush=True)
 """
@@ -574,7 +734,7 @@ print(":: done", flush=True)
             frame,
         )
         check(
-            any("Forza Horizon 5" in label for label in labels),
+            any("Smoke Test Broken Game" in label for label in labels),
             "a broken title is listed rather than hidden",
             frame,
         )
@@ -636,6 +796,81 @@ print(":: done", flush=True)
             time.monotonic() + TIMEOUT,
         )
         check(True, "and the switch turns them back off")
+
+        print("scroll position on title actions")
+        def scroll_value():
+            for node in find_all(frame, role="scroll bar"):
+                value = node.get_value_iface()
+                if value is not None and value.get_maximum_value() > 200:
+                    return value
+            return None
+        value = scroll_value()
+        check(value is not None, "the library has a scrollable title list", frame)
+        value.set_current_value(200)
+        time.sleep(0.25)
+        play = row_button(frame, "Minecraft for Windows", "Play")
+        check(play is not None, "the installed fixture can be selected to play", frame)
+        # The title list grows with the recipe set. A fixed offset does not
+        # guarantee this button is in the viewport; pointer events aimed at an
+        # offscreen accessible hit another widget or empty space.
+        # Check the target against its viewport before generating the pointer
+        # event. This still tests a real focus-changing click, not activation.
+        viewport = play.get_parent()
+        while viewport is not None and viewport.get_role_name() != "scroll pane":
+            viewport = viewport.get_parent()
+        check(viewport is not None, "the Play button belongs to the title viewport", frame)
+        # GTK4's AT-SPI ScrollTo method is unsupported. Use the same exposed
+        # scrollbar Value interface as the rest of this check, aiming from the
+        # target's current geometry instead of guessing a catalog-size offset.
+        for _ in range(3):
+            play = row_button(frame, "Minecraft for Windows", "Play")
+            button_box = play.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+            view_box = viewport.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+            center = button_box.y + button_box.height // 2
+            if view_box.y <= center < view_box.y + view_box.height:
+                break
+            value = scroll_value()
+            target = value.get_current_value() + center - (view_box.y + view_box.height // 2)
+            value.set_current_value(max(0, min(target, value.get_maximum_value())))
+            time.sleep(0.25)
+        position = scroll_value().get_current_value()
+        check(position > 50, f"the library is scrolled before the click ({position})", frame)
+        button_box = play.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+        view_box = viewport.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+        check(
+            view_box.y <= button_box.y + button_box.height // 2 < view_box.y + view_box.height,
+            f"the pointer target is visible (button y={button_box.y}, viewport y={view_box.y}, height={view_box.height})",
+            frame,
+        )
+        # With the pointer, not an action: the click focuses the button, the
+        # redraw destroys it, and GTK hands the focus to the first widget left
+        # in the list -- scrolling the library to the top to show it.
+        press(play, gui.pid)
+        wait_for(
+            frame,
+            lambda root: row_button(root, "Minecraft for Windows", "Stop"),
+            "the row to say the title is running",
+            time.monotonic() + TIMEOUT,
+        )
+        time.sleep(0.5)
+        after = scroll_value().get_current_value()
+        check(abs(after - position) < 2, f"starting a title keeps the scroll position ({position} -> {after})", frame)
+        wait_for(
+            frame,
+            lambda root: row_button(root, "Minecraft for Windows", "Play"),
+            "the title to exit",
+            time.monotonic() + TIMEOUT,
+        )
+        time.sleep(0.5)
+        after = scroll_value().get_current_value()
+        check(abs(after - position) < 2, f"and so does its exit ({position} -> {after})", frame)
+
+        select_in_list(frame, "Runtime")
+        wait_for(frame, lambda root: "Ferestre release" in texts(root), "section navigation", time.monotonic() + TIMEOUT)
+        time.sleep(0.2)
+        check(scroll_value().get_current_value() == 0, "a different section starts at the top", frame)
+        select_in_list(frame, "Library")
+        wait_for(frame, lambda root: "Minecraft for Windows" in texts(root), "return to library", time.monotonic() + TIMEOUT)
 
         print("installing asks before it downloads")
         install = row_button(frame, "Smoke Test Racer", "Install")
@@ -705,6 +940,17 @@ print(":: done", flush=True)
         check(
             any("smoke-test-runtime" in t for t in labels),
             "the runtime it found is named",
+            frame,
+        )
+
+        check(
+            "Ferestre release" in labels and "0.1.3-smoke" in labels,
+            "the launcher release uses the packaged version",
+            frame,
+        )
+        check(
+            labels.index("Ferestre release") < labels.index("Patched Proton"),
+            "the launcher release appears before the Proton runtime",
             frame,
         )
 
@@ -810,6 +1056,21 @@ print(":: done", flush=True)
             time.monotonic() + TIMEOUT,
         )
         check(True, "the bar says what is being installed")
+        installing = row_button(frame, "Smoke Test Racer", "Installing..")
+        check(
+            installing is not None
+            and not installing.get_state_set().contains(Atspi.StateType.SENSITIVE),
+            "the active install immediately shows a disabled Installing.. button",
+            frame,
+        )
+        for button in find_all(frame, role="button"):
+            if any(node.get_role_name() == "label" and node.get_name() in {"Install", "Update"}
+                   for node, _ in walk(button)):
+                check(
+                    not button.get_state_set().contains(Atspi.StateType.SENSITIVE),
+                    "other games cannot be installed or updated during a download",
+                    frame,
+                )
         # The three things a progress bar is for. Waited for rather than read
         # once: the rate and the estimate deliberately say nothing until there
         # is enough history to divide by.
@@ -830,6 +1091,12 @@ print(":: done", flush=True)
             time.monotonic() + TIMEOUT,
         )
         check(True, "and it disappears when the download finishes")
+        restored = row_button(frame, "Smoke Test Racer", "Install")
+        check(
+            restored is not None and restored.get_state_set().contains(Atspi.StateType.SENSITIVE),
+            "the Install button is enabled again after completion",
+            frame,
+        )
 
         print("the editor")
         select_in_list(frame, "Library")
@@ -943,9 +1210,116 @@ print(":: done", flush=True)
             "and the packaged recipe is left alone",
         )
 
+        print("removal status and graceful close")
+        # Earlier checks deliberately used an unrecorded manifest-only title.
+        # Removal operates on the install record that a real download writes.
+        installed_records = os.path.join(state, "installed")
+        os.makedirs(installed_records, exist_ok=True)
+        with open(os.path.join(installed_records, "9NBLGGH2JHXJ.json"), "w") as f:
+            json.dump({"product_id": "9NBLGGH2JHXJ", "dir": unrecorded,
+                       "content_ids": [], "package_version": "9.9.9.9"}, f)
+        click_named(frame, "Refresh library, subscriptions and catalogue")
+        select_in_list(frame, "Installed")
+        time.sleep(0.5)
+        wait_for(frame, lambda root: not any("Checking for game updates" in t for t in texts(root)),
+                 "the automatic update check to finish", time.monotonic() + TIMEOUT)
+        remove = wait_for(
+            frame, lambda root: next(iter(find_all(root, role="button", name="Remove this title from disk")), None),
+            "the installed game's Remove button", time.monotonic() + TIMEOUT,
+        )
+        click(remove)
+        wait_for(frame, lambda root: any("Remove Minecraft for Windows?" in t for t in texts(root)),
+                 "the removal confirmation", time.monotonic() + TIMEOUT)
+        click_named(frame, "Remove")
+        wait_for(frame, lambda root: os.path.exists(os.path.join(home, "removal-started")),
+                 "the removal to start", time.monotonic() + TIMEOUT)
+        # Let the short starting toast expire: the persistent status must remain.
+        time.sleep(6)
+        check("Removing Minecraft for Windows" in texts(frame), "removal status remains visible", frame)
+        tooltip = wait_for(
+            frame, lambda root: next(iter(find_all(root, role="progress bar",
+                                                  name_contains="Removing Minecraft for Windows")), None),
+            "the spinner's activity tooltip", time.monotonic() + TIMEOUT,
+        )
+        check("Please wait" in tooltip.get_name(), "the spinner tooltip identifies the operation and game", frame)
+        select_in_list(frame, "Library")
+        click(row_button(frame, "Smoke Test Racer", "Install"))
+        wait_for(frame, lambda root: any("Removing Minecraft for Windows. Please wait" in t for t in texts(root)),
+                 "a specific busy message", time.monotonic() + TIMEOUT)
+        check(not os.path.exists(os.path.join(home, "download-started")), "busy click did not start another operation")
+        click_named(frame, "Close")
+        wait_for(frame, lambda root: bool(find_all(root, role="button", name="Finish and Close")),
+                 "the close confirmation during removal", time.monotonic() + TIMEOUT)
+        click_named(frame, "Keep Open")
+        wait_for(frame, lambda root: not find_all(root, role="dialog"),
+                 "the close dialog to dismiss", time.monotonic() + TIMEOUT)
+        check(gui.poll() is None, "cancelling close keeps the app open")
+        click_named(frame, "Close")
+        wait_for(frame, lambda root: bool(find_all(root, role="button", name="Finish and Close")),
+                 "the second close confirmation", time.monotonic() + TIMEOUT)
+        time.sleep(0.3)  # Let the dialog finish its opening animation.
+        click_named(frame, "Finish and Close")
+        wait_for(frame, lambda root: any("Ferestre will close when it is safe" in t for t in texts(root)),
+                 "the pending close status", time.monotonic() + TIMEOUT)
+        check(gui.poll() is None, "closing waits for the removal")
+        # Pending close is reversible while removal runs.
+        click_named(frame, "Keep Window Open")
+        click_named(frame, "Close")
+        wait_for(frame, lambda root: bool(find_all(root, role="button", name="Finish and Close")),
+                 "the close confirmation after keeping the window open", time.monotonic() + TIMEOUT)
+        time.sleep(0.3)  # Let the dialog finish its opening animation.
+        click_named(frame, "Finish and Close")
+        open(os.path.join(home, "release-removal"), "w").close()
+        check(gui.wait(timeout=TIMEOUT) == 0, "the app closes after removal finishes")
+        check(os.path.exists(os.path.join(home, "removal-finished")), "removal completed before exit")
+        stderr_before_restart = gui.stderr.read()
+
+        print("download cancellation waits for cleanup")
+        open(os.path.join(home, "hold-download"), "w").close()
+        gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        app = find_app(gui.pid, time.monotonic() + TIMEOUT)
+        frame = wait_for(app, lambda root: next(iter(find_all(root, role="frame")), None),
+                         "the restarted window", time.monotonic() + TIMEOUT)
+        select_in_list(frame, "Library")
+        wait_for(frame, lambda root: row_button(root, "Smoke Test Racer", "Install"),
+                 "the install action", time.monotonic() + TIMEOUT)
+        click(row_button(frame, "Smoke Test Racer", "Install"))
+        wait_for(frame, lambda root: bool(find_all(root, role="button", name="Install")),
+                 "install confirmation", time.monotonic() + TIMEOUT)
+        click_named(frame, "Install")
+        wait_for(frame, lambda root: os.path.exists(os.path.join(home, "download-started")),
+                 "the held download", time.monotonic() + TIMEOUT)
+        click_named(frame, "Close")
+        wait_for(frame, lambda root: bool(find_all(root, role="button", name="Stop Download and Close")),
+                 "download close confirmation", time.monotonic() + TIMEOUT)
+        click_named(frame, "Keep Open")
+        wait_for(frame, lambda root: not find_all(root, role="dialog"),
+                 "the close dialog to dismiss", time.monotonic() + TIMEOUT)
+        check(not os.path.exists(os.path.join(home, "download-stopping")), "dismissing close leaves the download running")
+        click_named(frame, "Close")
+        wait_for(frame, lambda root: bool(find_all(root, role="button", name="Stop Download and Close")),
+                 "the next close confirmation", time.monotonic() + TIMEOUT)
+        time.sleep(0.3)
+        click_named(frame, "Stop Download and Close")
+        wait_for(frame, lambda root: os.path.exists(os.path.join(home, "download-stopping")),
+                 "cancellation to reach the downloader", time.monotonic() + TIMEOUT)
+        check(gui.poll() is None, "the window stays alive during download cleanup")
+        check(any("Stopping the download and cleaning up" in t for t in texts(frame)),
+              "cleanup is explained while waiting", frame)
+        open(os.path.join(home, "release-cleanup"), "w").close()
+        check(gui.wait(timeout=TIMEOUT) == 0, "the app closes after download cleanup")
+        check(os.path.exists(os.path.join(home, "download-stopped")), "download cleanup completed before exit")
+        if b"panicked" in stderr_before_restart:
+            failures.append("the first window panicked")
+
     except Failure as e:
+        if "frame" in locals():
+            dump(frame, str(e))
         failures.append(str(e))
     finally:
+        # Release only this fixture's workers, even if an assertion failed.
+        for gate in ("release-removal", "release-cleanup"):
+            open(os.path.join(home, gate), "w").close()
         gui.terminate()
         try:
             gui.wait(timeout=5)

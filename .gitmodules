@@ -1,0 +1,7 @@
+[submodule "third_party/xodus-proton"]
+	path = third_party/xodus-proton
+	url = https://github.com/xodus-gaming/Proton.git
+	ignore = dirty
+[submodule "third_party/xodus-cli"]
+	path = third_party/xodus-cli
+	url = https://github.com/xodus-gaming/xodus.git

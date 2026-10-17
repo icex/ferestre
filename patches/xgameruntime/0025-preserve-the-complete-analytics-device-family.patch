@@ -1,0 +1,63 @@
+diff --git a/xsystemanalytics.c b/xsystemanalytics.c
+index 75b0982..7bdebb5 100644
+--- a/xsystemanalytics.c
++++ b/xsystemanalytics.c
+@@ -90,7 +90,7 @@ static void analytics_info_fallback( XSystemAnalyticsInfo *info )
+     RTL_OSVERSIONINFOEXW version = { .dwOSVersionInfoSize = sizeof(version) };
+ 
+     memset( info, 0, sizeof(*info) );
+-    strcpy( info->family, "Windows" );
++    strcpy( info->family, "Windows.Desktop" );
+     strcpy( info->form, "Desktop" );
+ 
+     if (!RtlGetVersion( &version ))
+@@ -109,8 +109,8 @@ static XSystemAnalyticsInfo* WINAPI x_system_analytics_XSystemGetAnalyticsInfo(
+     const WCHAR *analytics_info_str = RuntimeClass_Windows_System_Profile_AnalyticsInfo;
+     HSTRING analytics_info_class, deviceFamilyVersion, deviceFamily;
+     const WCHAR *deviceFamilyVersionStr, *deviceFamilyStr;
+-    XSystemAnalyticsInfo info;
+-    char *str, *splitter;
++    XSystemAnalyticsInfo info = {0};
++    char *str;
+     ULONGLONG version;
+     HRESULT status;
+     UINT32 strSize;
+@@ -165,14 +165,17 @@ static XSystemAnalyticsInfo* WINAPI x_system_analytics_XSystemGetAnalyticsInfo(
+         goto fallback;
+     }
+ 
+-    splitter = strchr( str, '.' );
+-    if (splitter)
++    /* GDK consumers classify the complete device family, e.g.
++     * Windows.Desktop; splitting it makes PlayFab Party see an unknown OS. */
++    if (strSize > sizeof(info.family))
+     {
+-        *splitter = '\0';
+-
+-        strcpy( info.family, str );
+-        strcpy( info.form, splitter + 1 );
++        WindowsDeleteString( deviceFamilyVersion );
++        WindowsDeleteString( deviceFamily );
++        free( str );
++        goto fallback;
+     }
++    memcpy( info.family, str, strSize );
++    strcpy( info.form, "Desktop" );
+ 
+     WindowsDeleteString( deviceFamily );
+     free( str );
+@@ -205,12 +208,14 @@ static XSystemAnalyticsInfo* WINAPI x_system_analytics_XSystemGetAnalyticsInfo(
+ 
+     info.hostingOsVersion = info.osVersion;
+ 
++    TRACE( "returning complete analytics device family %s.\n", debugstr_a(info.family) );
+     *__ret = info;
+ 
+     return __ret;
+ 
+ fallback:
+     analytics_info_fallback( __ret );
++    TRACE( "returning complete analytics device family %s.\n", debugstr_a(__ret->family) );
+     return __ret;
+ }
+ 

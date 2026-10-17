@@ -12,10 +12,11 @@ to one machine. Override any of these in your shell profile to relocate things:
 | variable | meaning | default |
 |---|---|---|
 | `XODUS_GAMES_DIR` | decrypted games, Proton prefixes, logs | `~/xbox-games` |
-| `XODUS_CLI_DIR` | directory holding `xodus-cli` / `xodus-service` | auto (`PATH`, then `~/src/xodus-cli/target/release`) |
+| `XODUS_CLI_DIR` | directory holding `xodus-cli` / `xodus-service` | auto (`PATH`, then `third_party/xodus-cli/target/release`) |
 | `XODUS_PROTON_DIR` | the installed Xodus Proton compat tool | auto (Steam's `compatibilitytools.d/xodus`) |
 | `XODUS_STEAM_DIR` | a Steam install (Proton wants `STEAM_COMPAT_CLIENT_INSTALL_PATH`) | auto (`~/.steam/steam`, `~/.local/share/Steam`, Flatpak) |
 | `XODUS_BUILD_DIR` | the Proton build tree | `~/src/xodus-build` |
+| `XODUS_SRC_DIR` | where the `xodus-proton` and `xodus-cli` trees live | `third_party/` in this repo |
 | `XGR_XUID` | optional: XUID your Windows saves were made under | unset |
 
 Run `sh -c '. scripts/xodus-env.sh; env | grep ^XODUS_'` to see what resolves
@@ -42,27 +43,38 @@ on your machine before starting.
 
 ## 1. Build and install the patched Xodus Proton
 
-```bash
-# the runtime fork, with submodules (git-lfs bypass: don't fetch gigabytes of
-# gstreamer test media, which otherwise leaves wine/ and openfst/ empty)
-git clone -b xodus/bleeding-edge https://github.com/xodus-gaming/proton ~/src/xodus-proton
-cd ~/src/xodus-proton
-git -c filter.lfs.smudge= -c filter.lfs.process= submodule update --init --force --recursive
+The runtime fork and the client are submodules of this repository, pinned at
+the commits the patch series is written against: `third_party/xodus-proton`
+(xodus-gaming/Proton, which pins its own Wine and xgameruntime trees) and
+`third_party/xodus-cli` (xodus-gaming/xodus).
 
+```bash
 # this repo, with the patches and scripts
 git clone https://github.com/icex/ferestre ~/src/ferestre
+cd ~/src/ferestre
+
+# the runtime fork, with its submodules (git-lfs bypass: don't fetch gigabytes
+# of gstreamer test media, which otherwise leaves wine/ and openfst/ empty)
+git -c filter.lfs.smudge= -c filter.lfs.process= \
+    submodule update --init --force --recursive third_party/xodus-proton
 
 # apply the local patches (they are plain git diffs against the fork)
-cd ~/src/xodus-proton/wine
+cd third_party/xodus-proton/wine
 git apply ~/src/ferestre/patches/wine/*.patch
 git -C dlls/xgameruntime apply ~/src/ferestre/patches/xgameruntime/*.patch
+git -C ../vkd3d-proton apply ~/src/ferestre/patches/vkd3d-proton/*.patch
 # the proton script patch is re-applied by the installer after every install
 
 # configure the build tree once (Xodus' own instructions), then build+install:
 mkdir -p ~/src/xodus-build && cd ~/src/xodus-build
-../xodus-proton/configure.sh --build-name=xodus --container-engine=docker
+~/src/ferestre/third_party/xodus-proton/configure.sh --build-name=xodus --container-engine=docker
 ~/src/ferestre/scripts/install-xodus-proton.sh
 ```
+
+The build tree stays where it was configured: Wine's generated Makefiles
+inside it carry its absolute path hundreds of thousands of times, so moving it
+means a full rebuild. Moving the *source* is fine -- only the top-level
+`Makefile`'s `SRCDIR` line names it.
 
 `install-xodus-proton.sh` invalidates the stale build stamps (editing the
 submodule alone changes nothing otherwise), builds, installs into Steam's
@@ -74,7 +86,7 @@ installed `xgameruntime.dll` is stale.
 
 ```bash
 cd ~/src/xodus-build
-rsync -a --exclude .git ~/src/xodus-proton/wine/dlls/kernelbase/ src-wine/dlls/kernelbase/
+rsync -a --exclude .git ~/src/ferestre/third_party/xodus-proton/wine/dlls/kernelbase/ src-wine/dlls/kernelbase/
 echo "WORKDIR=$PWD/obj-wine-x86_64 ~/src/ferestre/tools/in-container.sh \
   make -j$(nproc) dlls/kernelbase/x86_64-windows/kernelbase.dll" | newgrp docker
 # the installed copy is read-only; replace it explicitly
@@ -89,8 +101,13 @@ not the installed one.
 ## 2. Build xodus-cli and sign in
 
 ```bash
-git clone https://github.com/xodus-gaming/xodus-cli ~/src/xodus-cli
-cd ~/src/xodus-cli && cargo build --release      # ~/src/xodus-cli/target/release/{xodus-cli,xodus-service}
+cd ~/src/ferestre
+git submodule update --init third_party/xodus-cli
+cd third_party/xodus-cli
+# the client series, skipping 0001 (an earlier export that 0002 contains)
+for p in ../../patches/xodus-cli/*.patch; do
+    case $(basename "$p") in 0001-*) continue ;; esac; git apply "$p"; done
+cargo build --release                            # target/release/{xodus-cli,xodus-service}
 ./target/release/xodus-cli login                 # Microsoft sign-in in a window
 ```
 
@@ -220,6 +237,72 @@ found. The confirmed restoration used a read-only source backup and a local
 copy, not an automatic import feature. No account-specific folder name is
 needed in this recipe.
 
+### Halo Infinite — **playable; intermittent offline display unresolved**
+
+Use launcher 0.1.5 with runtime 11.0.20261010.1, a licensed Store/Game Pass
+installation and the shipped `9PP5G1F0C2B6.toml` recipe. Keep the original
+`HaloInfinite.exe` bootstrapper and anti-cheat files. The recipe enables
+`FERESTRE_IMAGE_VIEW=real-path` and `XGR_STRICT_MANUAL_QUEUES=1`.
+
+The image view needs Python 3, util-linux and enabled unprivileged user/mount
+namespaces. Licensed executable images live in private tmpfs mounts for the
+launch and its campaign handoff; the encrypted installation stays intact.
+The launch inherits its package manifest into child processes.
+
+Campaign, Academy and multiplayer have live confirmation, as does local saving.
+Intermittent offline display is unresolved. Cloud saves and purchases are not
+qualified. A Store/Xbox account mismatch dialog can be dismissed to play.
+Remove an older personal Halo recipe override, or update it to match the shipped
+recipe, since personal overrides take precedence (see Troubleshooting).
+
+### Minecraft Dungeons II — **playable**
+
+Use the shipped `9P5786PJB9RP.toml` recipe and matching updated runtime/service.
+Complete the Squid Coast tutorial before evaluating campaign progress after a
+restart: the user confirmed saving after tutorial completion. Mid-tutorial
+restarts alone did not establish a save failure. Cloud sync and multiplayer
+remain unqualified. Accept the bundled Visual C++ installer on a fresh prefix.
+
+### Goat Simulator 3 — **playable, player-confirmed offline and online**
+
+Use a runtime providing `xgameruntime.gamesave-interface4-legacy`. The game asks
+for `IXGameSaveImpl4` and, without it, plays on but never writes a save: a
+relaunch lists every San Angora slot as New Save. With the interface, a clean
+offline run loaded a new world in about 30 seconds, autosaved, and after a
+relaunch reloaded that save with its quest progress. Offline play is also
+player-confirmed.
+
+Online mode needs launcher 0.1.7 or later. The PlayFab Party library the game
+ships waits for Microsoft Gaming Services before loading
+`gameplatformservices.dll`, for up to
+`HKLM\Microsoft\GamingServices\ServiceRetryTimeout` (60 s when unset). Wine has
+no Gaming Services, so every wait ran out: with online features on a world took
+about three minutes to load and then barely responded, and Quit Game left the
+process running in either mode. The launcher's Proton shim now sets the timeout
+to 0 in each prefix that has no value of its own. On a clean prefix, online
+mode then reached the world in under 20 seconds at 60 fps, saved and reloaded
+like offline play, and Quit Game exited in a few seconds. The player confirmed
+online play on launcher 0.1.7. Peer joining and voice are untested. See `titles/9PDS2N82QNXG.toml` for current issues.
+
+### Retro Classics — **playable, player-confirmed**
+
+Use `titles/9MTVJ3HHTQGS.toml` with a runtime providing
+`d3d12.recording-allocator-lifetime` and
+`xgameruntime.gamesave-interface4-legacy`. Package 3.3.15.0 releases a D3D12
+command allocator while a list is still recording from it, which crashed the
+older vkd3d-proton during `Close`, and asks for the newer save interface.
+
+The recipe does not set `VKD3D_CONFIG`. `ferestre run` recognises the
+Ultralight libraries beside `RetroClassics.exe` and appends
+`retain_recording_allocators` to whatever `VKD3D_CONFIG` is already in effect,
+when the selected runtime provides the capability. `VKD3D_CONFIG=` (empty)
+turns that off. Launching without the launcher needs the variable set by hand.
+[Autodetection](AUTODETECTION.md) has the exact order.
+
+The player confirmed it playable; an isolated run also reached the catalogue
+and streamed Tennis. Cloud save synchronization, save restoration and broad
+game/controller coverage are not separately qualified.
+
 ## 5. Troubleshooting (every error we actually hit, and its fix)
 
 | symptom | cause | fix |
@@ -235,6 +318,7 @@ needed in this recipe.
 | `newgrp docker` prompts / hangs | user not in the docker group | `sudo usermod -aG docker $USER`, log out and in |
 | game runs but no picture / colour bars in videos | Steam's ffmpeg has no H.264 outside Steam | launcher sets `PROTON_PREFER_SYSTEM_FFMPEG=1`; needs a system ffmpeg with H.264 |
 | several instances make everything slow | stray processes from testing | `scripts/kill-gdk.sh` |
+| a title keeps an old state, summary or setting after an upgrade | a recipe in `~/.config/ferestre/titles/` replaces the shipped recipe of the same product id as a whole, including its `[status]` | delete the personal copy, or bring it up to date with the shipped one. Launcher 0.1.8 finds a title installed under its product id from its install record, so a copy kept only for `[install] dir` is no longer needed |
 
 ## 6. Debugging a launch
 

@@ -4,15 +4,40 @@ The goal is something a person can install and use: sign in, see the titles they
 own, download one, keep it updated, and play it — the role mcpelauncher plays
 for Bedrock on Android, for Microsoft Store titles on Linux.
 
+## Current qualification
+
+Release 0.1.8 keeps runtime 11.0.20261010.2. A recipe that names no install
+directory now uses the one the launcher recorded at install time, so titles
+downloaded under their product id no longer need a personal recipe copy, which
+had hidden later changes to the shipped recipe. Goat Simulator 3 is
+player-confirmed playable online. See [release qualification](RELEASE-0.1.8.md).
+
+0.1.7 keeps runtime 11.0.20261010.2 and sets
+`HKLM\Microsoft\GamingServices\ServiceRetryTimeout` to 0 in each prefix. PlayFab
+Party otherwise waits up to a minute for Gaming Services, which Wine lacks, every
+time it looks for `gameplatformservices.dll`; that was Goat Simulator 3's online
+stall and its Quit Game hang. Online mode now loads, plays and saves, and Quit
+Game exits. See [0.1.7 qualification](RELEASE-0.1.7.md).
+
+0.1.6 and runtime 11.0.20261010.2 added Retro Classics (player-confirmed)
+through the vkd3d-proton allocator-lifetime patch and the IXGameSaveImpl4 save
+interface, which also makes Goat Simulator 3 keep its saves. Titles without a
+recipe that ship Retro's Ultralight/WebCore engine get the backend setting
+automatically. See [0.1.6 qualification](RELEASE-0.1.6.md).
+
+0.1.5 and runtime 11.0.20261010.1 added Halo campaign support; Halo gameplay and
+saving have live confirmation, and Dungeons saving was confirmed after its
+tutorial. See [0.1.5 qualification](RELEASE-0.1.5.md).
+
 ## Where the work already is
 
-Three layers. Two exist.
+Three layers are implemented.
 
 | Layer | Does | State |
 |---|---|---|
 | Client | Microsoft sign-in, licences and content keys, MSIXVC download and decrypt | Exists upstream (Xodus), plus local fixes |
 | Runtime | Patched Proton/Wine + `xgameruntime.dll`, the GDK implementation | Exists here. ~1.4 GB installed |
-| Launcher | Library, install, update, configure, launch | **Does not exist** |
+| Launcher | Library, install, update, configure, launch | CLI and GTK4 GUI shipped |
 
 One constraint shapes everything: a title's executable is encrypted on disk and
 only exists decrypted inside a memfd passed to Wine. Nothing can start a title
@@ -215,6 +240,9 @@ honestly marked as unproven rather than planned.
       an issue — not learn a TOML schema first. Edits go to
       `$XDG_CONFIG_HOME/ferestre/titles/` and win over the packaged recipe, so an
       upgrade never reverts them and "what did I change" stays answerable.
+      An edit replaces the whole packaged recipe, its status included, so the
+      install directory is not kept there: a recipe that names none uses the
+      directory the launcher recorded at install time.
 
 - [x] **Add to Steam.** A non-Steam shortcut for the overlay, controller
       configuration and Remote Play. Writing `shortcuts.vdf` means rewriting a
@@ -482,7 +510,11 @@ These are judgement calls, not engineering ones:
 2. **Name.** Something that does not imply endorsement by Microsoft, Mojang,
    Valve or Xodus.
 3. **How the client is carried** — vendored, submodule, or a maintained fork —
-   given upstream will not take these changes.
+   given upstream will not take these changes. Since 2026-09-14 it is a
+   submodule (`third_party/xodus-cli`, pinned at the upstream commit the
+   series targets) with the patches applied on top, and the Proton fork is
+   carried the same way (`third_party/xodus-proton`). The licensing question
+   stands; the layout is settled.
 
 ## Known gaps, stated plainly
 

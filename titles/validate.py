@@ -218,16 +218,18 @@ def check_recipe(path, known):
 
     launch = data["launch"]
     fields(err, "[launch]", launch, required={"executable": str},
-           optional={"arguments": list, "environment": dict})
+           optional={"arguments": list, "env": dict, "environment": dict})
     check_windows_path(err, "[launch].executable", launch.get("executable", ""), must_be_exe=True)
     for arg in launch.get("arguments", []):
         if not isinstance(arg, str):
             err("[launch].arguments: every argument must be a string")
-    for key, value in launch.get("environment", {}).items():
+    if "env" in launch and "environment" in launch:
+        err("[launch]: use env or environment, not both")
+    for key, value in launch.get("env", launch.get("environment", {})).items():
         if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
-            err(f"[launch.environment]: '{key}' is not an environment variable name")
+            err(f"[launch.env]: '{key}' is not an environment variable name")
         if not isinstance(value, str):
-            err(f"[launch.environment].{key}: expected a string")
+            err(f"[launch.env].{key}: expected a string")
 
     runtime = data["runtime"]
     fields(err, "[runtime]", runtime, required={"requires": list}, optional={"wants": list})

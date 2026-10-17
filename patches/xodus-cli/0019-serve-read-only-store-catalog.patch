@@ -1,0 +1,548 @@
+From: Ferestre contributors
+Subject: Serve bounded read-only Microsoft catalog product and add-on requests
+
+--- a/crates/xodus-service/src/connection/router.rs
++++ b/crates/xodus-service/src/connection/router.rs
+@@ -31,6 +31,7 @@
+         let magic = u32::from_le_bytes(read_magic);
+         let res = match magic {
+             crate::XML_MAGIC => super::xml::handle(&mut socket, &mut context).await,
++            0x58445343 => super::catalog::handle(&mut socket).await,
+             crate::PROTO_MAGIC => super::proto::handle(&mut socket, &mut context).await,
+             _ => {
+                 tracing::error!("Unknown magic");
+--- a/crates/xodus-service/src/connection/mod.rs
++++ b/crates/xodus-service/src/connection/mod.rs
+@@ -1,3 +1,4 @@
++mod catalog;
+ mod license;
+ pub mod proto;
+ pub mod router;
+--- /dev/null
++++ b/crates/xodus-service/src/connection/catalog.rs
+@@ -0,0 +1,525 @@
++//! Read-only Store catalog bridge. Microsoft supplies relationships, product
++//! metadata and prices; listing a product never grants an account a license.
++//! The wire protocol is bounded, versioned and contains no credentials.
++use serde_json::Value;
++use std::collections::HashSet;
++use std::time::Duration;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++
++const MAX_REQUEST: usize = 24_000;
++const MAX_RESPONSE: usize = 8 * 1024 * 1024;
++const MAX_HTTP: usize = 16 * 1024 * 1024;
++const MAGIC: u32 = 0x58445343; // CSDX, separate from the released XML protocol
++const E_INVALIDARG: u32 = 0x80070057;
++const E_FAIL: u32 = 0x80004005;
++
++type Error = &'static str;
++
++struct Request {
++    kinds: u32,
++    associated: bool,
++    parent: String,
++    market: String,
++    language: String,
++    ids: Vec<String>,
++    actions: Vec<String>,
++}
++
++struct Reader<'a>(&'a [u8]);
++impl Reader<'_> {
++    fn integer(&mut self) -> Result<u32, Error> {
++        let b = self.0.get(..4).ok_or("truncated catalog request")?;
++        let n = u32::from_le_bytes(b.try_into().unwrap());
++        self.0 = &self.0[4..];
++        Ok(n)
++    }
++    fn text(&mut self) -> Result<String, Error> {
++        let n = self.integer()? as usize;
++        if n > 128 {
++            return Err("catalog input too long");
++        }
++        let b = self.0.get(..n).ok_or("truncated catalog input")?;
++        let s = std::str::from_utf8(b)
++            .map_err(|_| "invalid catalog input")?
++            .to_owned();
++        self.0 = &self.0[n..];
++        Ok(s)
++    }
++}
++fn valid_id(s: &str) -> bool {
++    matches!(s.len(), 12 | 16) && s.bytes().all(|c| c.is_ascii_alphanumeric())
++}
++fn parse_request(bytes: &[u8]) -> Result<Request, Error> {
++    let mut r = Reader(bytes);
++    if r.integer()? != 1 {
++        return Err("unsupported catalog protocol");
++    }
++    let mode = r.integer()?;
++    let kinds = r.integer()?;
++    let parent = r.text()?;
++    let market = r.text()?;
++    let language = r.text()?;
++    if mode > 1
++        || kinds == 0
++        || kinds & !31 != 0
++        || !valid_id(&parent)
++        || market.len() != 2
++        || !market.bytes().all(|c| c.is_ascii_alphabetic())
++        || language.is_empty()
++        || language.len() > 16
++        || !language
++            .bytes()
++            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
++    {
++        return Err("invalid catalog parameters");
++    }
++    let count = r.integer()?;
++    if count > 256 {
++        return Err("too many catalog IDs");
++    }
++    let mut ids = Vec::new();
++    for _ in 0..count {
++        let id = r.text()?;
++        if !valid_id(&id) {
++            return Err("invalid catalog ID");
++        }
++        ids.push(id);
++    }
++    let count = r.integer()?;
++    if count > 8 {
++        return Err("too many action filters");
++    }
++    let mut actions = Vec::new();
++    for _ in 0..count {
++        let action = r.text()?;
++        if !matches!(
++            action.as_str(),
++            "Purchase" | "License" | "Gift" | "Redeem" | "Details" | "Browse" | "Curate"
++        ) {
++            return Err("unsupported action filter");
++        }
++        actions.push(action);
++    }
++    if !r.0.is_empty() || (mode == 1 && !ids.is_empty()) || (mode == 0 && ids.is_empty()) {
++        return Err("invalid catalog request shape");
++    }
++    Ok(Request {
++        kinds,
++        associated: mode == 1,
++        parent,
++        market,
++        language,
++        ids,
++        actions,
++    })
++}
++
++async fn json(mut response: reqwest::Response) -> Result<Value, Error> {
++    tracing::debug!(
++        status = response.status().as_u16(),
++        "Store catalog HTTP response"
++    );
++    if !response.status().is_success() {
++        return Err("catalog HTTP failure");
++    }
++    if response
++        .content_length()
++        .is_some_and(|n| n > MAX_HTTP as u64)
++    {
++        return Err("catalog HTTP response too large");
++    }
++    let mut bytes = Vec::new();
++    while let Some(b) = response
++        .chunk()
++        .await
++        .map_err(|_| "catalog response failed")?
++    {
++        if b.len() > MAX_HTTP - bytes.len() {
++            return Err("catalog response too large");
++        }
++        bytes.extend_from_slice(&b);
++    }
++    serde_json::from_slice(&bytes).map_err(|_| "invalid catalog JSON")
++}
++
++async fn associated_ids(client: &reqwest::Client, req: &Request) -> Result<Vec<String>, Error> {
++    // This is the Xbox site's real Add-ons channel, including its opaque
++    // continuation tokens. Never use recommendations as product relationships.
++    let key = format!("ProductAddOns_{}", &req.parent[..12]);
++    let locale = format!(
++        "{}-{}",
++        req.language.split('-').next().unwrap_or("en"),
++        req.market
++    );
++    let mut continuation = String::new();
++    let mut seen_tokens = HashSet::new();
++    let mut ids = Vec::new();
++    let mut seen_ids = HashSet::new();
++    for _ in 0..128 {
++        let body = serde_json::json!({"ChannelId": key, "ChannelKeyToBeUsedInResponse": key,
++            "ReturnFilters": false, "EncodedCT": continuation});
++        let cv = format!(
++            "{:x}.0",
++            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
++        );
++        let value = json(
++            client
++                .post(format!(
++                    "https://emerald.xboxservices.com/xboxcomfd/browse?locale={locale}"
++                ))
++                .header("X-MS-API-Version", "1.1")
++                .header("MS-CV", cv)
++                .json(&body)
++                .send()
++                .await
++                .map_err(|_| "associated catalog transport failed")?,
++        )
++        .await?;
++        let channel = value
++            .get("channels")
++            .and_then(|v| v.get(&key))
++            .ok_or("missing associated catalog channel")?;
++        let products = channel
++            .get("products")
++            .and_then(Value::as_array)
++            .ok_or("missing associated products")?;
++        for product in products {
++            let id = product
++                .get("productId")
++                .and_then(Value::as_str)
++                .ok_or("invalid associated product")?;
++            if !valid_id(id) {
++                return Err("invalid associated product ID");
++            }
++            if seen_ids.insert(id.to_owned()) {
++                ids.push(id.to_owned());
++            }
++        }
++        if ids.len() > 2048 {
++            return Err("associated catalog exceeds limit");
++        }
++        continuation = channel
++            .get("encodedCT")
++            .and_then(Value::as_str)
++            .unwrap_or("")
++            .to_owned();
++        if continuation.is_empty() {
++            return Ok(ids);
++        }
++        if continuation.len() > 16_384 || !seen_tokens.insert(continuation.clone()) {
++            return Err("invalid associated catalog continuation");
++        }
++    }
++    Err("associated catalog paging exceeds limit")
++}
++
++fn string<'a>(v: &'a Value, name: &str) -> &'a str {
++    v.get(name).and_then(Value::as_str).unwrap_or("")
++}
++fn integer(out: &mut Vec<u8>, n: u32) {
++    out.extend(n.to_le_bytes());
++}
++fn text(out: &mut Vec<u8>, s: &str) -> Result<(), Error> {
++    if s.len() > 131_072 || s.contains('\0') {
++        return Err("invalid catalog text");
++    }
++    integer(out, s.len() as u32);
++    out.extend(s.as_bytes());
++    Ok(())
++}
++fn kind(p: &Value) -> u32 {
++    match string(p, "ProductKind") {
++        "Game" => 4,
++        "Durable" => 2,
++        "Consumable" => 1,
++        "UnmanagedConsumable" => 16,
++        "Pass" => 8,
++        _ => match string(p, "ProductType") {
++            "Game" => 4,
++            "Durable" => 2,
++            "Consumable" => 1,
++            "Subscription" => 8,
++            _ => 0,
++        },
++    }
++}
++fn date(s: &str) -> u64 {
++    chrono::DateTime::parse_from_rfc3339(s)
++        .ok()
++        .map(|d| d.timestamp().max(0) as u64)
++        .unwrap_or(0)
++}
++fn price(out: &mut Vec<u8>, availability: &Value) -> Result<(), Error> {
++    let price = &availability["OrderManagementData"]["Price"];
++    for field in ["MSRP", "ListPrice"] {
++        let n = price[field].as_f64().unwrap_or(0.0);
++        if !n.is_finite() || n < 0.0 || n > f32::MAX as f64 {
++            return Err("invalid catalog price");
++        }
++        out.extend((n as f32).to_le_bytes());
++    }
++    text(out, string(price, "CurrencyCode"))?;
++    out.extend(date(string(&availability["Conditions"], "EndDate")).to_le_bytes());
++    Ok(())
++}
++fn accepted(a: &Value, filters: &[String], purchasable: bool) -> bool {
++    let Some(actions) = a.get("Actions").and_then(Value::as_array) else {
++        return false;
++    };
++    let has = |f: &str| actions.iter().any(|a| a.as_str() == Some(f));
++    (!purchasable || has("Purchase")) && filters.iter().all(|f| has(f))
++}
++fn product(out: &mut Vec<u8>, p: &Value, req: &Request) -> Result<bool, Error> {
++    let k = kind(p);
++    let id = string(p, "ProductId");
++    if k & req.kinds == 0 {
++        return Ok(false);
++    }
++    if !valid_id(id) || id.len() != 12 {
++        return Err("invalid product identity");
++    }
++    let local = p["LocalizedProperties"]
++        .as_array()
++        .and_then(|v| v.first())
++        .ok_or("missing localized product")?;
++    let displays = p["DisplaySkuAvailabilities"]
++        .as_array()
++        .ok_or("missing product SKUs")?;
++    let requested_skus: Vec<_> = req
++        .ids
++        .iter()
++        .filter(|r| r.len() == 16 && &r[..12] == id)
++        .collect();
++    let whole_product = req.associated || req.ids.iter().any(|r| r == id);
++    let skus: Vec<_> = displays
++        .iter()
++        .filter(|d| {
++            (whole_product
++                || requested_skus
++                    .iter()
++                    .any(|r| &r[12..] == string(&d["Sku"], "SkuId")))
++                && d["Availabilities"]
++                    .as_array()
++                    .is_some_and(|aa| aa.iter().any(|a| accepted(a, &req.actions, req.associated)))
++        })
++        .collect();
++    if skus.is_empty() {
++        return Ok(false);
++    }
++    if skus.len() > 256 {
++        return Err("too many product SKUs");
++    }
++    integer(out, k);
++    for s in [
++        id,
++        string(local, "ProductTitle"),
++        string(local, "ProductDescription"),
++        string(local, "Language"),
++        string(&p["Properties"], "InAppOfferToken"),
++    ] {
++        text(out, s)?;
++    }
++    integer(out, skus.len() as u32);
++    for display in skus {
++        let sku = &display["Sku"];
++        let props = &sku["Properties"];
++        let sl = sku["LocalizedProperties"]
++            .as_array()
++            .and_then(|v| v.first())
++            .unwrap_or(local);
++        let sid = string(sku, "SkuId");
++        if sid.len() != 4 || !sid.bytes().all(|b| b.is_ascii_alphanumeric()) {
++            return Err("invalid SKU identity");
++        }
++        for s in [
++            sid,
++            string(sl, "SkuTitle"),
++            string(sl, "SkuDescription"),
++            string(sl, "Language"),
++        ] {
++            text(out, s)?;
++        }
++        integer(out, props["IsTrial"].as_bool().unwrap_or(false) as u32);
++        integer(
++            out,
++            props["Packages"].as_array().is_some_and(|p| !p.is_empty()) as u32,
++        );
++        let available: Vec<_> = display["Availabilities"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .filter(|a| accepted(a, &req.actions, req.associated))
++            .collect();
++        if available.len() > 256 {
++            return Err("too many availabilities");
++        }
++        integer(out, available.len() as u32);
++        for a in available {
++            text(out, string(a, "AvailabilityId"))?;
++            price(out, a)?;
++        }
++    }
++    let images = local["Images"].as_array().map(Vec::as_slice).unwrap_or(&[]);
++    if images.len() > 256 {
++        return Err("too many catalog images");
++    }
++    integer(out, images.len() as u32);
++    for image in images {
++        let raw = string(image, "Uri");
++        let uri = if raw.starts_with("//") {
++            format!("https:{raw}")
++        } else {
++            raw.to_owned()
++        };
++        for s in [
++            &uri,
++            string(image, "Caption"),
++            string(image, "ImagePurpose"),
++        ] {
++            text(out, s)?;
++        }
++        integer(
++            out,
++            image["Width"].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32,
++        );
++        integer(
++            out,
++            image["Height"].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32,
++        );
++    }
++    Ok(true)
++}
++
++async fn fetch(req: &Request) -> Result<Vec<u8>, Error> {
++    let client = reqwest::Client::builder()
++        .redirect(reqwest::redirect::Policy::none())
++        .timeout(Duration::from_secs(20))
++        .connect_timeout(Duration::from_secs(8))
++        .build()
++        .map_err(|_| "cannot build catalog client")?;
++    let ids = if req.associated {
++        associated_ids(&client, req).await?
++    } else {
++        req.ids.clone()
++    };
++    let mut unique = HashSet::new();
++    let ids: Vec<_> = ids
++        .iter()
++        .map(|s| &s[..12])
++        .filter(|s| unique.insert(s.to_string()))
++        .collect();
++    let mut out = Vec::new();
++    integer(&mut out, 1);
++    integer(&mut out, 0);
++    integer(&mut out, 0);
++    let mut count = 0;
++    for chunk in ids.chunks(20) {
++        let value = json(client.get(format!("https://displaycatalog.mp.microsoft.com/v7.0/products?bigIds={}&market={}&languages={}",chunk.join(","),req.market,req.language))
++            .send().await.map_err(|_| "product catalog transport failed")?).await?;
++        let products = value["Products"]
++            .as_array()
++            .ok_or("missing catalog products")?;
++        for p in products {
++            if !ids.contains(&string(p, "ProductId")) {
++                return Err("unexpected catalog product");
++            }
++            if product(&mut out, p, req)? {
++                count += 1;
++            }
++            if out.len() > MAX_RESPONSE {
++                return Err("catalog wire response exceeds limit");
++            }
++        }
++    }
++    out[8..12].copy_from_slice(&(count as u32).to_le_bytes());
++    tracing::info!(
++        products = count,
++        associated = req.associated,
++        "Store catalog query completed"
++    );
++    Ok(out)
++}
++
++pub(super) async fn handle(socket: &mut tokio::net::UnixStream) -> tokio::io::Result<()> {
++    let size = socket.read_u32_le().await? as usize;
++    if size == 0 || size > MAX_REQUEST {
++        return Err(std::io::ErrorKind::InvalidData.into());
++    }
++    let mut bytes = vec![0; size];
++    socket.read_exact(&mut bytes).await?;
++    let result = match parse_request(&bytes) {
++        Ok(req) => tokio::time::timeout(Duration::from_secs(45), fetch(&req))
++            .await
++            .unwrap_or(Err("catalog query timed out"))
++            .map_err(|e| (E_FAIL, e)),
++        Err(e) => Err((E_INVALIDARG, e)),
++    };
++    let bytes = match result {
++        Ok(b) => b,
++        Err((hr, e)) => {
++            tracing::warn!("Store catalog query failed: {e}");
++            let mut b = Vec::new();
++            integer(&mut b, 1);
++            integer(&mut b, hr);
++            integer(&mut b, 0);
++            b
++        }
++    };
++    socket.write_u32_le(MAGIC).await?;
++    socket.write_u32_le(bytes.len() as u32).await?;
++    socket.write_all(&bytes).await
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn filters_do_not_invent_ownership_or_ignore_kind_and_sku() {
++        let req = Request {
++            kinds: 2,
++            associated: true,
++            parent: "9TESTPARENT0".into(),
++            market: "US".into(),
++            language: "en-US".into(),
++            ids: vec![],
++            actions: vec![],
++        };
++        let p = serde_json::json!({"ProductId":"9TESTADDON00","ProductKind":"Durable","Properties":{"InAppOfferToken":"real-offer"},"LocalizedProperties":[{"ProductTitle":"café","ProductDescription":"description","Language":"en-US"}],"DisplaySkuAvailabilities":[{"Sku":{"SkuId":"0010","Properties":{}},"Availabilities":[{"AvailabilityId":"test","Actions":["Purchase"],"OrderManagementData":{"Price":{"MSRP":3.0,"ListPrice":2.0,"CurrencyCode":"USD"}}}]}]});
++        let mut out = Vec::new();
++        assert!(product(&mut out, &p, &req).unwrap());
++        assert!(out.windows(5).any(|w| w == "café".as_bytes()));
++        let mut req = req;
++        req.kinds = 4;
++        assert!(!product(&mut Vec::new(), &p, &req).unwrap());
++        req.kinds = 2;
++        req.actions = vec!["Gift".into()];
++        assert!(!product(&mut Vec::new(), &p, &req).unwrap());
++        req.actions.clear();
++        req.associated = false;
++        req.ids = vec!["9TESTADDON000011".into()];
++        assert!(!product(&mut Vec::new(), &p, &req).unwrap());
++    }
++    #[test]
++    fn request_is_versioned_and_rejects_paths_and_trailing_data() {
++        let mut b = vec![];
++        integer(&mut b, 1);
++        integer(&mut b, 0);
++        integer(&mut b, 31);
++        for s in ["9TESTPARENT0", "US", "en-US"] {
++            text(&mut b, s).unwrap();
++        }
++        integer(&mut b, 1);
++        text(&mut b, "9TESTADDON00").unwrap();
++        integer(&mut b, 0);
++        assert!(parse_request(&b).is_ok());
++        b.push(0);
++        assert!(parse_request(&b).is_err());
++        b.pop();
++        b[0] = 2;
++        assert!(parse_request(&b).is_err());
++        assert!(!valid_id("../badparent"));
++        for n in 0..b.len() {
++            assert!(parse_request(&b[..n]).is_err());
++        }
++    }
++}

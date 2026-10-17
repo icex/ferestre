@@ -12,8 +12,9 @@
 set -uo pipefail
 
 REPO_DIR=${REPO_DIR:-$(cd "$(dirname "$0")/.." && pwd)}
-BUILD_DIR=${BUILD_DIR:-${XODUS_BUILD_DIR:-$HOME/src/xodus-build}}
-WINE_SRC=${WINE_SRC:-$HOME/src/xodus-proton/wine}
+. "$REPO_DIR/scripts/xodus-env.sh"
+BUILD_DIR=${BUILD_DIR:-$XODUS_BUILD_DIR}
+WINE_SRC=${WINE_SRC:-$XODUS_SRC_DIR/xodus-proton/wine}
 TOOL_DIR=${TOOL_DIR:-${XODUS_PROTON_DIR:-$HOME/.steam/steam/compatibilitytools.d/xodus}}
 OBJ=$BUILD_DIR/obj-wine-x86_64
 INCUBE=$REPO_DIR/tools/in-container.sh

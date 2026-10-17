@@ -1,0 +1,932 @@
+diff --git a/crates/xodus-service/src/connection/license.rs b/crates/xodus-service/src/connection/license.rs
+new file mode 100644
+index 0000000..47fa480
+--- /dev/null
++++ b/crates/xodus-service/src/connection/license.rs
+@@ -0,0 +1,155 @@
++//! The fixed Store endpoint stays inside the credential-owning service. Build
++//! once, sign those bytes, send those bytes; never follow a signed redirect.
++use crate::simple_context::SimpleContext;
++use base64::Engine;
++use base64::engine::general_purpose::STANDARD;
++use std::time::Duration;
++use xodus::models::licensing::LicenseTokenResponse;
++use xodus::models::xgameruntime::xuser::{LicenseTokenIpcRequest, XSTSTokenRequest};
++
++const URL: &str = "https://licensing.mp.microsoft.com/v8.0/licenseToken";
++const MAX_RESPONSE: usize = 65536;
++const MAX_TOKEN: usize = 60000; // fits the IPC frame and the DLL result buffer
++const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
++type Error = &'static str;
++
++fn body(req: &LicenseTokenIpcRequest) -> Result<Vec<u8>, Error> {
++    let valid_id =
++        |s: &str| !s.is_empty() && s.len() <= 64 && s.bytes().all(|c| c.is_ascii_alphanumeric());
++    if !valid_id(&req.parent_product_id)
++        || req.product_ids.ids.len() > 256
++        || req.product_ids.ids.iter().any(|id| !valid_id(id))
++    {
++        return Err("invalid product IDs");
++    }
++    let custom = STANDARD
++        .decode(&req.custom_base64)
++        .map_err(|_| "invalid custom string")?;
++    let custom = std::str::from_utf8(&custom).map_err(|_| "invalid custom string")?;
++    if custom.is_empty() {
++        return Err("empty custom string");
++    }
++    // The Store expects a string containing an array, not an array value.
++    let ids = serde_json::to_string(&req.product_ids.ids).map_err(|_| "invalid product IDs")?;
++    serde_json::to_vec(&serde_json::json!({
++        "parentProductId": req.parent_product_id,
++        "enforceSellableBy": true,
++        "relatedProductIds": ids,
++        "customDeveloperString": custom,
++    }))
++    .map_err(|_| "cannot serialize request")
++}
++
++fn client_builder(timeout: Duration) -> reqwest::ClientBuilder {
++    reqwest::Client::builder()
++        .user_agent("XboxGameRuntime")
++        .redirect(reqwest::redirect::Policy::none())
++        .connect_timeout(Duration::from_secs(10))
++        .timeout(timeout)
++}
++
++fn client(timeout: Duration) -> Result<reqwest::Client, Error> {
++    client_builder(timeout)
++        .build()
++        .map_err(|_| "cannot create licensing client")
++}
++
++fn parse_response(bytes: &[u8]) -> Result<String, Error> {
++    let response: LicenseTokenResponse =
++        serde_json::from_slice(bytes).map_err(|_| "invalid token response")?;
++    let token = response.license_token;
++    // A JWT is nonempty ASCII base64url segments separated by dots. In
++    // particular it contains no XML, NUL or control bytes on our raw IPC path.
++    if token.is_empty()
++        || token.len() > MAX_TOKEN
++        || !token
++            .bytes()
++            .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
++    {
++        return Err("invalid license token");
++    }
++    Ok(token)
++}
++
++async fn post(
++    client: &reqwest::Client,
++    url: &str,
++    body: Vec<u8>,
++    authorization: &str,
++    signature: &str,
++) -> Result<String, Error> {
++    if authorization.is_empty() || signature.is_empty() {
++        return Err("missing signed authorization");
++    }
++    let mut response = client
++        .post(url)
++        .header("Authorization", authorization)
++        .header("Signature", signature)
++        .header("Content-Type", "application/json; charset=UTF-8")
++        .header("Cache-Control", "no-cache")
++        .body(body)
++        .send()
++        .await
++        .map_err(|_| "licensing transport failed")?;
++    if response.status() != reqwest::StatusCode::OK {
++        return Err("licensing HTTP failure");
++    }
++    if response
++        .content_length()
++        .is_some_and(|n| n > MAX_RESPONSE as u64)
++    {
++        return Err("token response too large");
++    }
++    let mut bytes = Vec::new();
++    while let Some(chunk) = response
++        .chunk()
++        .await
++        .map_err(|_| "licensing response failed")?
++    {
++        if chunk.len() > MAX_RESPONSE - bytes.len() {
++            return Err("token response too large");
++        }
++        bytes.extend_from_slice(&chunk);
++    }
++    parse_response(&bytes)
++}
++
++async fn fetch_with<F, Fut>(
++    xml: &[u8],
++    url: &str,
++    client: &reqwest::Client,
++    authorize: F,
++) -> Result<String, Error>
++where
++    F: FnOnce(XSTSTokenRequest) -> Fut,
++    Fut: std::future::Future<
++            Output = Result<xodus::models::xgameruntime::xuser::XSTSTokenResponse, Error>,
++        >,
++{
++    let req: LicenseTokenIpcRequest =
++        quick_xml::de::from_str(std::str::from_utf8(xml).map_err(|_| "invalid IPC request")?)
++            .map_err(|_| "invalid IPC request")?;
++    let bytes = body(&req)?;
++    let auth = authorize(XSTSTokenRequest {
++        url: url.into(),
++        relying_party: String::new(),
++        method: "POST".into(),
++        body_base64: STANDARD.encode(&bytes),
++        title_id: req.title_id,
++        title_client_id: req.title_client_id,
++    })
++    .await?;
++    post(client, url, bytes, &auth.token, &auth.signature).await
++}
++
++pub(super) async fn fetch(context: &mut SimpleContext, xml: &[u8]) -> Result<String, Error> {
++    fetch_with(xml, URL, &client(HTTP_TIMEOUT)?, |req| async move {
++        super::xml::xsts_token(context, req)
++            .await
++            .map_err(|_| "licensing authorization failed")
++    })
++    .await
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/xodus-service/src/connection/license/tests.rs b/crates/xodus-service/src/connection/license/tests.rs
+new file mode 100644
+index 0000000..f21d3ae
+--- /dev/null
++++ b/crates/xodus-service/src/connection/license/tests.rs
+@@ -0,0 +1,314 @@
++use super::*;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::TcpListener;
++
++fn request(custom: &str) -> LicenseTokenIpcRequest {
++    quick_xml::de::from_str(&format!("<LicenseTokenRequest><ParentProductId>9TESTSTORE0ID</ParentProductId><ProductIds><ProductId>9TESTADDON00</ProductId></ProductIds><CustomBase64>{}</CustomBase64><TitleId>123</TitleId></LicenseTokenRequest>", STANDARD.encode(custom))).unwrap()
++}
++
++#[test]
++fn custom_strings_round_trip_without_xml_or_json_damage() {
++    for custom in [
++        "plain",
++        "{\"nonce\":\"a\\b\"}",
++        "line\n\t\r\u{1}",
++        "română 🪟",
++    ] {
++        let bytes = body(&request(custom)).unwrap();
++        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
++        assert_eq!(value["customDeveloperString"], custom);
++        assert_eq!(value["relatedProductIds"], "[\"9TESTADDON00\"]");
++        assert_eq!(value["parentProductId"], "9TESTSTORE0ID");
++        assert_eq!(value["enforceSellableBy"], true);
++    }
++    assert!(body(&request("")).is_err());
++}
++
++#[test]
++fn response_requires_a_nonempty_top_level_string_and_valid_json() {
++    for bytes in [
++        br#"{"licenseToken":""}"#.as_slice(),
++        br#"{"licenseToken":null,"error":"secret"}"#,
++        br#"{"licenseToken":42,"other":"value"}"#,
++        br#"{"error":{"licenseToken":"a.b.c"}}"#,
++        br#"not-json "licenseToken":"a.b.c""#,
++        br#"{"licenseToken":"secret"#,
++        br#"{"licenseToken":"a.b.c","licenseToken":"d.e.f"}"#,
++        br#"{"licenseToken":"a\u0000b"}"#,
++    ] {
++        assert!(parse_response(bytes).is_err());
++    }
++    assert_eq!(
++        parse_response(br#"{"licenseToken":"\u0061.b.c","extra":true}"#).unwrap(),
++        "a.b.c"
++    );
++}
++
++async fn endpoint(
++    status: u16,
++    payload: Vec<u8>,
++    extra: &str,
++    delay: Duration,
++) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let url = format!(
++        "http://{}/v8.0/licenseToken",
++        listener.local_addr().unwrap()
++    );
++    let extra = extra.to_string();
++    let task = tokio::spawn(async move {
++        let (mut stream, _) = listener.accept().await.unwrap();
++        let mut bytes = Vec::new();
++        let mut buf = [0; 1024];
++        loop {
++            let n = stream.read(&mut buf).await.unwrap();
++            if n == 0 {
++                break;
++            }
++            bytes.extend_from_slice(&buf[..n]);
++            if let Some(end) = bytes.windows(4).position(|x| x == b"\r\n\r\n") {
++                let header = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
++                let length: usize = header
++                    .lines()
++                    .find_map(|x| x.strip_prefix("content-length: "))
++                    .unwrap()
++                    .parse()
++                    .unwrap();
++                if bytes.len() >= end + 4 + length {
++                    break;
++                }
++            }
++        }
++        tokio::time::sleep(delay).await;
++        let length = if extra.contains("Transfer-Encoding: chunked") {
++            String::new()
++        } else {
++            format!("Content-Length: {}\r\n", payload.len())
++        };
++        let header = format!("HTTP/1.1 {status} Test\r\n{length}Connection: close\r\n{extra}\r\n");
++        let _ = stream.write_all(header.as_bytes()).await;
++        let _ = stream.write_all(&payload).await;
++        bytes
++    });
++    (url, task)
++}
++
++#[tokio::test]
++async fn posts_exact_signed_bytes_and_returns_token() {
++    let (url, server) = endpoint(
++        200,
++        br#"{"licenseToken":"a.b.c"}"#.to_vec(),
++        "",
++        Duration::ZERO,
++    )
++    .await;
++    let bytes = body(&request("{\"nonce\":\"a\\b\"}")).unwrap();
++    assert_eq!(
++        post(
++            &client(HTTP_TIMEOUT).unwrap(),
++            &url,
++            bytes.clone(),
++            "fixture-auth",
++            "fixture-signature"
++        )
++        .await
++        .unwrap(),
++        "a.b.c"
++    );
++    let received = server.await.unwrap();
++    let split = received.windows(4).position(|x| x == b"\r\n\r\n").unwrap();
++    assert_eq!(&received[split + 4..], &bytes);
++    let headers = String::from_utf8_lossy(&received[..split]).to_ascii_lowercase();
++    assert!(headers.contains("authorization: fixture-auth\r\n"));
++    assert!(headers.contains("signature: fixture-signature\r\n"));
++}
++
++#[tokio::test]
++async fn redirects_never_reach_the_other_server() {
++    let sink = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    for status in [301, 302, 303, 307, 308] {
++        let (url, server) = endpoint(
++            status,
++            Vec::new(),
++            &format!("Location: http://{}/sink\r\n", sink.local_addr().unwrap()),
++            Duration::ZERO,
++        )
++        .await;
++        assert!(
++            post(
++                &client(HTTP_TIMEOUT).unwrap(),
++                &url,
++                b"{}".to_vec(),
++                "fixture-auth",
++                "fixture-signature"
++            )
++            .await
++            .is_err()
++        );
++        server.await.unwrap();
++        assert!(
++            tokio::time::timeout(Duration::from_millis(30), sink.accept())
++                .await
++                .is_err()
++        );
++    }
++}
++
++#[tokio::test]
++async fn refuses_errors_oversize_and_stalls_without_response_contents() {
++    for (status, payload, delay) in [
++        (401, b"SECRET".to_vec(), Duration::ZERO),
++        (503, b"SECRET".to_vec(), Duration::ZERO),
++        (200, vec![b'a'; MAX_RESPONSE + 1], Duration::ZERO),
++        (200, b"SECRET".to_vec(), Duration::from_millis(150)),
++    ] {
++        let (url, server) = endpoint(status, payload, "", delay).await;
++        let result = post(
++            &client(Duration::from_millis(50)).unwrap(),
++            &url,
++            b"{}".to_vec(),
++            "fixture-auth",
++            "fixture-signature",
++        )
++        .await;
++        assert!(result.is_err());
++        assert!(!result.unwrap_err().contains("SECRET"));
++        server.await.unwrap();
++    }
++}
++
++// Only compiled into the test executable. The normal service has no endpoint
++// override or synthetic credential mode. The Wine harness drives this fixture
++// over the real IPC framing and the production fetch/serialization/HTTP path.
++#[tokio::test]
++#[ignore = "launched by the Wine license-token regression harness"]
++async fn offline_service_fixture() {
++    use xodus::models::xgameruntime::xuser::XSTSTokenResponse;
++    let dir = std::env::var("XODUS_LICENSE_FIXTURE_DIR").expect("fixture directory");
++    let url = std::env::var("XODUS_LICENSE_FIXTURE_URL").expect("fixture endpoint");
++    let listener = tokio::net::UnixListener::bind(format!("{dir}/xodus.sock")).unwrap();
++    let mut builder = client_builder(Duration::from_millis(750));
++    if let Ok(path) = std::env::var("XODUS_LICENSE_FIXTURE_CA") {
++        // The same local endpoint must fail before the fixture CA is trusted.
++        let mut req = request("untrusted-cert-probe");
++        req.product_ids.ids.insert(0, "9TESTSTORE0ID".into());
++        let bytes = body(&req).unwrap();
++        assert!(
++            post(
++                &client(Duration::from_millis(750)).unwrap(),
++                &url,
++                bytes.clone(),
++                "fixture-auth",
++                &STANDARD.encode(&bytes)
++            )
++            .await
++            .is_err()
++        );
++        builder = builder.add_root_certificate(
++            reqwest::Certificate::from_pem(&std::fs::read(path).unwrap()).unwrap(),
++        );
++    }
++    let client = builder.build().unwrap();
++    std::fs::write(format!("{dir}/ready"), "ready").unwrap();
++    loop {
++        let (mut socket, _) = listener.accept().await.unwrap();
++        let url = url.clone();
++        let client = client.clone();
++        tokio::spawn(async move {
++            let mut header = [0; 8];
++            if socket.read_exact(&mut header).await.is_err() {
++                return;
++            }
++            assert_eq!(&header[..4], b"XSDX");
++            let message = u16::from_le_bytes([header[4], header[5]]);
++            let mut bytes = vec![0; u16::from_le_bytes([header[6], header[7]]) as usize];
++            socket.read_exact(&mut bytes).await.unwrap();
++            let payload = if message == 5 {
++                b"<XSTSTokenResponse><Token>fixture-auth</Token><Signature>fixture-signature</Signature><Xuid>1</Xuid><Gamertag>Fixture</Gamertag><Expiry>4102444800</Expiry></XSTSTokenResponse>".to_vec()
++            } else {
++                assert_eq!(message, 7);
++                let req: LicenseTokenIpcRequest =
++                    quick_xml::de::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
++                let custom =
++                    String::from_utf8(STANDARD.decode(&req.custom_base64).unwrap()).unwrap();
++                match custom.as_str() {
++                    "ipc-old-service" => {
++                        let _ = socket
++                            .write_all(&crate::connection::encode_message(
++                                crate::XML_MAGIC,
++                                1,
++                                Vec::new(),
++                            ))
++                            .await;
++                        return;
++                    }
++                    "ipc-disconnect" => return,
++                    "ipc-truncated" | "ipc-oversize" => {
++                        let size: u16 = if custom == "ipc-oversize" { 60001 } else { 10 };
++                        let mut header = b"XSDX\x08\x00".to_vec();
++                        header.extend_from_slice(&size.to_le_bytes());
++                        header.extend_from_slice(b"abc");
++                        let _ = socket.write_all(&header).await;
++                        return;
++                    }
++                    "ipc-stall" => {
++                        tokio::time::sleep(Duration::from_secs(55)).await;
++                        return;
++                    }
++                    _ => {}
++                }
++                let outcome = fetch_with(&bytes, &url, &client, |request| async move {
++                    assert_eq!(request.method, "POST");
++                    assert_eq!(request.title_id, "1298034544");
++                    assert_eq!(
++                        request.title_client_id,
++                        "00000000-0000-0000-0000-000000000000"
++                    );
++                    let bytes = STANDARD.decode(&request.body_base64).unwrap();
++                    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
++                    assert_eq!(body["parentProductId"], "9TESTSTORE0ID");
++                    assert_eq!(
++                        body["relatedProductIds"],
++                        "[\"9TESTSTORE0ID\",\"9TESTADDON00\"]"
++                    );
++                    // Bind the fixture Signature to the exact signed bytes.
++                    Ok(XSTSTokenResponse {
++                        token: "fixture-auth".into(),
++                        signature: STANDARD.encode(bytes),
++                        xuid: "1".into(),
++                        gamertag: "Fixture".into(),
++                        expiry: 4102444800,
++                    })
++                })
++                .await;
++                outcome.unwrap_or_default().into_bytes()
++            };
++            let frame = crate::connection::encode_message(crate::XML_MAGIC, message + 1, payload);
++            let _ = socket.write_all(&frame).await;
++        });
++    }
++}
++
++#[tokio::test]
++async fn chunked_bodies_are_parsed_and_bounded_without_content_length() {
++    for (body, succeeds) in [
++        (br#"{"licenseToken":"a.b.c"}"#.to_vec(), true),
++        (vec![b'a'; MAX_RESPONSE + 1], false),
++    ] {
++        let mut wire = format!("{:x}\r\n", body.len()).into_bytes();
++        wire.extend(body);
++        wire.extend_from_slice(b"\r\n0\r\n\r\n");
++        let (url, server) =
++            endpoint(200, wire, "Transfer-Encoding: chunked\r\n", Duration::ZERO).await;
++        let result = post(
++            &client(HTTP_TIMEOUT).unwrap(),
++            &url,
++            b"{}".to_vec(),
++            "fixture-auth",
++            "fixture-signature",
++        )
++        .await;
++        assert_eq!(result.is_ok(), succeeds);
++        server.await.unwrap();
++    }
++}
+diff --git a/crates/xodus-service/src/connection/mod.rs b/crates/xodus-service/src/connection/mod.rs
+index 4f5948a..68ab91b 100644
+--- a/crates/xodus-service/src/connection/mod.rs
++++ b/crates/xodus-service/src/connection/mod.rs
+@@ -1,3 +1,4 @@
++mod license;
+ pub mod proto;
+ pub mod router;
+ pub mod xml;
+diff --git a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/src/connection/xml.rs
+index 96aa02b..bfc79df 100644
+--- a/crates/xodus-service/src/connection/xml.rs
++++ b/crates/xodus-service/src/connection/xml.rs
+@@ -346,6 +346,194 @@ fn sign_for_with(
+     )
+ }
+ 
++pub(super) async fn xsts_token(
++    context: &mut SimpleContext,
++    req: XSTSTokenRequest,
++) -> Result<XSTSTokenResponse, Box<dyn std::error::Error + Send + Sync>> {
++    tracing::debug!("XSTS token request for {}", req.url);
++
++    // Read the persisted credential before any cache lookup: a logout
++    // invalidates access and a different login must never reuse an old identity.
++    let Token::Legacy(current_user) = context.tokens().get_user_sts_token()? else {
++        return Err("no signed-in credentials".into());
++    };
++    // STS refresh rotates credential bytes during ordinary SISU calls.
++    // Scope caches to the signed-in account, while requiring both its
++    // persisted identity and credentials to still exist after logout.
++    let account = context.tokens().get_user()?;
++    if account.puid.is_empty() {
++        return Err("signed-in account has no identity".into());
++    }
++    let session: [u8; 32] = Sha256::digest(account.puid.as_bytes()).into();
++    let title = req.title().map(|(id, client)| (id, client.to_string()));
++    let identity = match &title {
++        Some((id, client)) => {
++            identity_for(&context.client, context.tokens(), *id, client, session).await
++        }
++        None => None,
++    };
++    if title.is_some() && identity.is_none() {
++        return Err("the requested title identity could not be authenticated; retry later".into());
++    }
++    let issuer = match &identity {
++        Some(id) => xodus::api::xbox::RequestSigner::from_pkcs8(&id.key_pkcs8)
++            .ok_or("invalid title signing key")?,
++        None => SIGNER.clone(),
++    };
++    let mut endpoints = EndpointConfig {
++        default: endpoints_for(&context.client).await.unwrap_or(
++            xodus::models::xbox::TitleMgtResponse {
++                end_points: vec![],
++                signature_policies: vec![],
++            },
++        ),
++        title: None,
++    };
++    if let (Some((id, _)), Some(identity)) = (&title, &identity) {
++        match title_endpoints_for(&context.client, *id, identity).await {
++            Ok(list) => endpoints.title = Some(list),
++            Err(e) => tracing::warn!("title {id}: {e}"),
++        }
++    }
++    let relying_party = if req.relying_party.is_empty() {
++        endpoints.relying_party(&req.url)
++    } else {
++        req.relying_party.clone()
++    };
++    let cache_key = token_cache_key(&session, title.as_ref(), &relying_party, &issuer);
++    let now = chrono::Utc::now().timestamp();
++    if let Some(hit) = XSTS_CACHE
++        .lock()
++        .ok()
++        .and_then(|c| c.get(&cache_key).cloned())
++        .filter(|c| c.expiry > now + 60)
++    {
++        let signature = sign_for_with(&req, &hit.token, &endpoints, &hit.signer);
++        let payload = XSTSTokenResponse {
++            token: hit.token,
++            xuid: hit.xuid,
++            gamertag: hit.gamertag,
++            expiry: hit.expiry,
++            signature,
++        };
++        return Ok(payload);
++    }
++
++    let (xsts, signer) = if let Some(identity) = identity {
++        let signer = xodus::api::xbox::RequestSigner::from_pkcs8(&identity.key_pkcs8)
++            .ok_or("invalid title signing key")?;
++        let refused = NO_TITLE_CLAIM
++            .lock()
++            .map(|s| s.contains(&cache_key))
++            .unwrap_or(false);
++        let result = tokio::time::timeout(
++            AUTH_TIMEOUT,
++            xodus::api::xbox::request_xsts_token(
++                &context.client,
++                identity.user_token.clone(),
++                Some(identity.device_token.clone()),
++                if refused {
++                    None
++                } else {
++                    Some(identity.title_token.clone())
++                },
++                &relying_party,
++                Some(&signer),
++            ),
++        )
++        .await
++        .map_err(|_| "XSTS authorization timed out")?;
++        let xsts = match result {
++            Ok(token) => token,
++            Err(e)
++                if !refused
++                    && matches!(
++                        e.status(),
++                        Some(reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::FORBIDDEN)
++                    ) =>
++            {
++                // Some audiences accept the user/device chain only. Retry
++                // under the same key, scoped to this title and audience.
++                let token = tokio::time::timeout(
++                    AUTH_TIMEOUT,
++                    xodus::api::xbox::request_xsts_token(
++                        &context.client,
++                        identity.user_token.clone(),
++                        Some(identity.device_token.clone()),
++                        None,
++                        &relying_party,
++                        Some(&signer),
++                    ),
++                )
++                .await
++                .map_err(|_| "XSTS authorization without title claim timed out")?
++                .map_err(|e| {
++                    std::io::Error::other(format!(
++                        "XSTS authorization without title claim for {relying_party} failed: {e}"
++                    ))
++                })?;
++                tracing::warn!(
++                    "{relying_party} accepts this title's user/device token without a title claim"
++                );
++                if let Ok(mut set) = NO_TITLE_CLAIM.lock() {
++                    set.insert(cache_key.clone());
++                }
++                token
++            }
++            Err(e) => {
++                return Err(std::io::Error::other(format!(
++                    "XSTS authorization for {relying_party} failed: {e}"
++                ))
++                .into());
++            }
++        };
++        (xsts, signer)
++    } else {
++        let user_token = current_user;
++        let device_token = context
++            .device_token
++            .as_ref()
++            .ok_or("no device credentials")?
++            .clone();
++        let token = tokio::time::timeout(
++            AUTH_TIMEOUT,
++            xodus::api::xbox::try_run_with_signer(
++                &context.client,
++                device_token,
++                user_token,
++                &relying_party,
++                Some(&SIGNER),
++            ),
++        )
++        .await
++        .map_err(|_| "unclaimed Xbox authentication timed out")?
++        .map_err(std::io::Error::other)?;
++        (token, SIGNER.clone())
++    };
++    let token = xodus::api::xbox::get_xsts_auth_header(xsts.clone());
++    let signature = sign_for_with(&req, &token, &endpoints, &signer);
++    let payload = XSTSTokenResponse {
++        xuid: xsts.xuid().unwrap_or_default().to_string(),
++        gamertag: xsts.gamertag().unwrap_or_default().to_string(),
++        expiry: xsts.not_after.timestamp(),
++        token,
++        signature,
++    };
++    if let Ok(mut cache) = XSTS_CACHE.lock() {
++        cache.insert(
++            cache_key,
++            CachedToken {
++                signer,
++                token: payload.token.clone(),
++                xuid: payload.xuid.clone(),
++                gamertag: payload.gamertag.clone(),
++                expiry: payload.expiry,
++            },
++        );
++    }
++    Ok(payload)
++}
++
+ pub async fn parse_message(
+     context: &mut SimpleContext,
+     message_type: XodusMessageType,
+@@ -442,186 +630,26 @@ pub async fn parse_message(
+         }
+         XodusMessageType::XstsTokenRequest => {
+             let req = quick_xml::de::from_str::<XSTSTokenRequest>(std::str::from_utf8(&buffer)?)?;
+-            tracing::debug!("XSTS token request for {}", req.url);
+-
+-            // Read the persisted credential before any cache lookup: a logout
+-            // invalidates access and a different login must never reuse an old identity.
+-            let Token::Legacy(current_user) = context.tokens().get_user_sts_token()? else {
+-                return Ok(vec![]);
+-            };
+-            // STS refresh rotates credential bytes during ordinary SISU calls.
+-            // Scope caches to the signed-in account, while requiring both its
+-            // persisted identity and credentials to still exist after logout.
+-            let account = context.tokens().get_user()?;
+-            if account.puid.is_empty() {
+-                return Err("signed-in account has no identity".into());
+-            }
+-            let session: [u8; 32] = Sha256::digest(account.puid.as_bytes()).into();
+-            let title = req.title().map(|(id, client)| (id, client.to_string()));
+-            let identity = match &title {
+-                Some((id, client)) => {
+-                    identity_for(&context.client, context.tokens(), *id, client, session).await
+-                }
+-                None => None,
+-            };
+-            if title.is_some() && identity.is_none() {
+-                return Err(
+-                    "the requested title identity could not be authenticated; retry later".into(),
+-                );
+-            }
+-            let issuer = match &identity {
+-                Some(id) => xodus::api::xbox::RequestSigner::from_pkcs8(&id.key_pkcs8)
+-                    .ok_or("invalid title signing key")?,
+-                None => SIGNER.clone(),
+-            };
+-            let mut endpoints = EndpointConfig {
+-                default: endpoints_for(&context.client).await.unwrap_or(
+-                    xodus::models::xbox::TitleMgtResponse {
+-                        end_points: vec![],
+-                        signature_policies: vec![],
+-                    },
+-                ),
+-                title: None,
+-            };
+-            if let (Some((id, _)), Some(identity)) = (&title, &identity) {
+-                match title_endpoints_for(&context.client, *id, identity).await {
+-                    Ok(list) => endpoints.title = Some(list),
+-                    Err(e) => tracing::warn!("title {id}: {e}"),
+-                }
+-            }
+-            let relying_party = if req.relying_party.is_empty() {
+-                endpoints.relying_party(&req.url)
+-            } else {
+-                req.relying_party.clone()
+-            };
+-            let cache_key = token_cache_key(&session, title.as_ref(), &relying_party, &issuer);
+-            let now = chrono::Utc::now().timestamp();
+-            if let Some(hit) = XSTS_CACHE
+-                .lock()
+-                .ok()
+-                .and_then(|c| c.get(&cache_key).cloned())
+-                .filter(|c| c.expiry > now + 60)
++            let payload = xsts_token(context, req).await?;
++            Ok(quick_xml::se::to_string(&payload)?.into_bytes())
++        }
++        XodusMessageType::LicenseTokenRequest => {
++            // This response is the raw, validated JWT; an empty frame is failure.
++            // Do not expose authorization headers or response bodies in diagnostics.
++            match tokio::time::timeout(
++                Duration::from_secs(45),
++                super::license::fetch(context, &buffer),
++            )
++            .await
+             {
+-                let signature = sign_for_with(&req, &hit.token, &endpoints, &hit.signer);
+-                let payload = XSTSTokenResponse {
+-                    token: hit.token,
+-                    xuid: hit.xuid,
+-                    gamertag: hit.gamertag,
+-                    expiry: hit.expiry,
+-                    signature,
+-                };
+-                return Ok(quick_xml::se::to_string(&payload)?.into_bytes());
+-            }
+-
+-            let (xsts, signer) = if let Some(identity) = identity {
+-                let signer = xodus::api::xbox::RequestSigner::from_pkcs8(&identity.key_pkcs8)
+-                    .ok_or("invalid title signing key")?;
+-                let refused = NO_TITLE_CLAIM
+-                    .lock()
+-                    .map(|s| s.contains(&cache_key))
+-                    .unwrap_or(false);
+-                let result = tokio::time::timeout(
+-                    AUTH_TIMEOUT,
+-                    xodus::api::xbox::request_xsts_token(
+-                        &context.client,
+-                        identity.user_token.clone(),
+-                        Some(identity.device_token.clone()),
+-                        if refused {
+-                            None
+-                        } else {
+-                            Some(identity.title_token.clone())
+-                        },
+-                        &relying_party,
+-                        Some(&signer),
+-                    ),
+-                )
+-                .await
+-                .map_err(|_| "XSTS authorization timed out")?;
+-                let xsts = match result {
+-                    Ok(token) => token,
+-                    Err(e)
+-                        if !refused
+-                            && matches!(
+-                                e.status(),
+-                                Some(
+-                                    reqwest::StatusCode::BAD_REQUEST
+-                                        | reqwest::StatusCode::FORBIDDEN
+-                                )
+-                            ) =>
+-                    {
+-                        // Some audiences accept the user/device chain only. Retry
+-                        // under the same key, scoped to this title and audience.
+-                        let token = tokio::time::timeout(AUTH_TIMEOUT, xodus::api::xbox::request_xsts_token(
+-                            &context.client,
+-                            identity.user_token.clone(),
+-                            Some(identity.device_token.clone()),
+-                            None,
+-                            &relying_party,
+-                            Some(&signer),
+-                        ))
+-                        .await.map_err(|_| "XSTS authorization without title claim timed out")?
+-                        .map_err(|e| std::io::Error::other(format!("XSTS authorization without title claim for {relying_party} failed: {e}")))?;
+-                        tracing::warn!(
+-                            "{relying_party} accepts this title's user/device token without a title claim"
+-                        );
+-                        if let Ok(mut set) = NO_TITLE_CLAIM.lock() {
+-                            set.insert(cache_key.clone());
+-                        }
+-                        token
+-                    }
+-                    Err(e) => {
+-                        return Err(std::io::Error::other(format!(
+-                            "XSTS authorization for {relying_party} failed: {e}"
+-                        ))
+-                        .into());
+-                    }
+-                };
+-                (xsts, signer)
+-            } else {
+-                let user_token = current_user;
+-                let device_token = context
+-                    .device_token
+-                    .as_ref()
+-                    .ok_or("no device credentials")?
+-                    .clone();
+-                let token = tokio::time::timeout(
+-                    AUTH_TIMEOUT,
+-                    xodus::api::xbox::try_run_with_signer(
+-                        &context.client,
+-                        device_token,
+-                        user_token,
+-                        &relying_party,
+-                        Some(&SIGNER),
+-                    ),
+-                )
+-                .await
+-                .map_err(|_| "unclaimed Xbox authentication timed out")?
+-                .map_err(std::io::Error::other)?;
+-                (token, SIGNER.clone())
+-            };
+-            let token = xodus::api::xbox::get_xsts_auth_header(xsts.clone());
+-            let signature = sign_for_with(&req, &token, &endpoints, &signer);
+-            let payload = XSTSTokenResponse {
+-                xuid: xsts.xuid().unwrap_or_default().to_string(),
+-                gamertag: xsts.gamertag().unwrap_or_default().to_string(),
+-                expiry: xsts.not_after.timestamp(),
+-                token,
+-                signature,
+-            };
+-            if let Ok(mut cache) = XSTS_CACHE.lock() {
+-                cache.insert(
+-                    cache_key,
+-                    CachedToken {
+-                        signer,
+-                        token: payload.token.clone(),
+-                        xuid: payload.xuid.clone(),
+-                        gamertag: payload.gamertag.clone(),
+-                        expiry: payload.expiry,
+-                    },
+-                );
++                Ok(Ok(token)) => Ok(token.into_bytes()),
++                _ => {
++                    tracing::warn!("license-token request failed");
++                    Ok(Vec::new())
++                }
+             }
+-            Ok(quick_xml::se::to_string(&payload)?.into_bytes())
+         }
++
+         _ => Err("Unimplemented".into()),
+     }
+ }
+diff --git a/crates/xodus/proto/xodus/common.proto b/crates/xodus/proto/xodus/common.proto
+index f34f929..a45eace 100644
+--- a/crates/xodus/proto/xodus/common.proto
++++ b/crates/xodus/proto/xodus/common.proto
+@@ -10,4 +10,6 @@ enum XodusMessageType {
+     MSA_TOKEN_RESPONSE=4;
+     XSTS_TOKEN_REQUEST=5;
+     XSTS_TOKEN_RESPONSE=6;
++    LICENSE_TOKEN_REQUEST=7;
++    LICENSE_TOKEN_RESPONSE=8;
+ }
+diff --git a/crates/xodus/src/models/xgameruntime/xuser.rs b/crates/xodus/src/models/xgameruntime/xuser.rs
+index f999df4..07515ff 100644
+--- a/crates/xodus/src/models/xgameruntime/xuser.rs
++++ b/crates/xodus/src/models/xgameruntime/xuser.rs
+@@ -102,3 +102,23 @@ mod title_tests {
+         }
+     }
+ }
++
++/// XML IPC envelope. Custom data is base64 so XML cannot normalize or reject
++/// caller strings containing controls; JSON escaping belongs to the service.
++#[derive(Deserialize)]
++#[serde(rename_all = "PascalCase")]
++pub struct LicenseTokenIpcRequest {
++    pub parent_product_id: String,
++    pub product_ids: LicenseProductIds,
++    pub custom_base64: String,
++    #[serde(default)]
++    pub title_id: String,
++    #[serde(default)]
++    pub title_client_id: String,
++}
++
++#[derive(Deserialize)]
++pub struct LicenseProductIds {
++    #[serde(rename = "ProductId", default)]
++    pub ids: Vec<String>,
++}

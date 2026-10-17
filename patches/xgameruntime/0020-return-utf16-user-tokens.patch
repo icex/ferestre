@@ -1,0 +1,65 @@
+diff --git a/xuser.c b/xuser.c
+index 2fe2ad4..9426f32 100644
+--- a/xuser.c
++++ b/xuser.c
+@@ -510,16 +510,58 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Async( IXUserImpl6 *i
+     return hr;
+ }
+ 
++/* The async payload is UTF-8 for both entry points. The Unicode result must
++ * convert the strings, not reinterpret that payload as WCHAR pointers. Both
++ * the result buffer size and the documented token/signature counts are bytes. */
++static HRESULT token_and_signature_utf16_result( XAsyncBlock *async, SIZE_T buffer_size, void *buffer,
++                                                 XUserGetTokenAndSignatureUtf16Data **result, SIZE_T *used )
++{
++    XUserGetTokenAndSignatureData *data;
++    XUserGetTokenAndSignatureUtf16Data *wide = buffer;
++    void *payload;
++    SIZE_T size;
++    int token_count, signature_count = 0;
++    WCHAR *token, *signature;
++    HRESULT hr;
++
++    if (!async) return E_INVALIDARG;
++    if (!xgr_async_completed( async, &hr, &payload )) return E_PENDING;
++    if (FAILED(hr)) return hr;
++    if (!(data = payload)) return E_UNEXPECTED;
++    if (!(token_count = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, data->token, -1, NULL, 0 )))
++        return HRESULT_FROM_WIN32( GetLastError() );
++    if (data->signatureSize &&
++        !(signature_count = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, data->signature, -1, NULL, 0 )))
++        return HRESULT_FROM_WIN32( GetLastError() );
++    size = sizeof(*wide) + (token_count + signature_count) * sizeof(WCHAR);
++    if (used) *used = size;
++    if (!buffer) return S_OK;
++    if (buffer_size < size) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++
++    token = (WCHAR *)(wide + 1);
++    signature = signature_count ? token + token_count : NULL;
++    MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, data->token, -1, token, token_count );
++    if (signature)
++        MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, data->signature, -1, signature, signature_count );
++    wide->tokenCount = token_count * sizeof(WCHAR);
++    wide->signatureCount = signature_count * sizeof(WCHAR);
++    wide->token = token;
++    wide->signature = signature;
++    if (result) *result = wide;
++    return S_OK;
++}
++
+ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16ResultSize( IXUserImpl6 *iface, XAsyncBlock *async, SIZE_T *bufferSize )
+ {
+     TRACE( "iface %p, async %p, bufferSize %p.\n", iface, async, bufferSize );
+-    return token_and_signature_result( async, 0, NULL, NULL, bufferSize );
++    if (!bufferSize) return E_INVALIDARG;
++    return token_and_signature_utf16_result( async, 0, NULL, NULL, bufferSize );
+ }
+ 
+ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Result( IXUserImpl6 *iface, XAsyncBlock *async, SIZE_T bufferSize, void *buffer, XUserGetTokenAndSignatureUtf16Data **ptrToBuffer, SIZE_T *bufferUsed )
+ {
+     TRACE( "iface %p, async %p, bufferSize %Iu, buffer %p.\n", iface, async, bufferSize, buffer );
+-    return token_and_signature_result( async, bufferSize, buffer, (XUserGetTokenAndSignatureData **)ptrToBuffer, bufferUsed );
++    return token_and_signature_utf16_result( async, bufferSize, buffer, ptrToBuffer, bufferUsed );
+ }
+ 
+ static HRESULT WINAPI x_user_XUserResolveIssueWithUiAsync( IXUserImpl6 *iface, XUserHandle user, const char *url, XAsyncBlock *async )

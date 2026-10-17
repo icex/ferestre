@@ -1,0 +1,51 @@
+diff --git a/xgamesave.c b/xgamesave.c
+index ba14bd7..a2b46d9 100644
+--- a/xgamesave.c
++++ b/xgamesave.c
+@@ -97,6 +97,7 @@ struct wgs_index
+ struct XGameSaveProvider
+ {
+     LONG ref;
++    XGameSaveProviderHandle result_handle;
+     WCHAR *dir;
+     BOOL read_only;         /* set when the index could not be parsed */
+     struct wgs_index index;
+@@ -1066,6 +1067,7 @@ static HRESULT create_provider( XUserHandle user, const char *scid, struct XGame
+     if (!user || !scid || !out) return E_INVALIDARG;
+     if (!(p = calloc( 1, sizeof(*p) ))) return E_OUTOFMEMORY;
+     p->ref = 1;
++    p->result_handle = p;
+     list_init( &p->index.containers );
+ 
+     if (!(root = resolve_root()))
+@@ -1665,7 +1667,10 @@ static HRESULT WINAPI x_game_save_XGameSaveInitializeProviderAsync( IXGameSaveIm
+ 
+     if (!async) return E_INVALIDARG;
+     hr = create_provider( requestingUser, configurationId, &provider );
+-    xgr_async_complete( async, hr, provider );
++    TRACE( "save provider async result: %Iu bytes, hr %#lx.\n",
++           SUCCEEDED(hr) ? sizeof(XGameSaveProviderHandle) : (SIZE_T)0, hr );
++    xgr_async_complete_ex( async, hr, provider ? &provider->result_handle : NULL,
++                           SUCCEEDED(hr) ? sizeof(XGameSaveProviderHandle) : 0 );
+     return S_OK;
+ }
+ 
+@@ -1678,7 +1683,7 @@ static HRESULT WINAPI x_game_save_XGameSaveInitializeProviderResult( IXGameSaveI
+ 
+     if (!provider) return E_INVALIDARG;
+     if (!xgr_async_completed( async, &hr, &payload )) return E_PENDING;
+-    *provider = SUCCEEDED( hr ) ? payload : NULL;
++    *provider = SUCCEEDED( hr ) ? *(XGameSaveProviderHandle *)payload : NULL;
+     return hr;
+ }
+ 
+@@ -1716,7 +1721,8 @@ static HRESULT WINAPI x_game_save_XGameSaveGetRemainingQuotaAsync( IXGameSaveImp
+         free( remaining );
+         remaining = NULL;
+     }
+-    xgr_async_complete( async, hr, remaining );
++    TRACE( "save quota async result: %Iu bytes, hr %#lx.\n", SUCCEEDED(hr) ? sizeof(*remaining) : (SIZE_T)0, hr );
++    xgr_async_complete_ex( async, hr, remaining, SUCCEEDED(hr) ? sizeof(*remaining) : 0 );
+     return S_OK;
+ }
+ 

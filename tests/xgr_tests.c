@@ -26,6 +26,7 @@
 #define COBJMACROS
 #include <windows.h>
 #include <initguid.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,10 @@
 #include "xsystem.h"
 #include "xnetworking.h"
 #include "xasyncprovider.h"
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#endif
 
 #define E_GS_INVALID_CONTAINER_NAME    ((HRESULT)0x80830001L)
 #define E_GS_PROVIDED_BUFFER_TOO_SMALL ((HRESULT)0x80830007L)
@@ -160,6 +165,8 @@ static void test_xpackage(void)
 static void test_xuser(void)
 {
     XAsyncBlock async = { 0 };
+    SIZE_T result_size = 0, used = 0;
+    XUserHandle generic_user = NULL;
     XUserState state = 99;
     XUserLocalId local = { 0 };
     BOOLEAN guest = TRUE;
@@ -169,8 +176,20 @@ static void test_xuser(void)
     printf( "# XUser\n" );
     hr = IXUserImpl_XUserAddAsync( users, XUserAddOptions_AddDefaultUserSilently, &async );
     CHECK( SUCCEEDED( hr ), "XUserAddAsync succeeds (0x%08lx)", hr );
+    hr = IXThreadingImpl_XAsyncGetResultSize( threading, &async, &result_size );
+    CHECK( SUCCEEDED( hr ) && result_size == sizeof(XUserHandle),
+           "XUserAdd advertises the handle result size (%Iu bytes)", result_size );
+    hr = IXThreadingImpl_XAsyncGetResult( threading, &async, NULL, sizeof(generic_user) - 1,
+                                        &generic_user, &used );
+    CHECK( hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && !generic_user,
+           "a short generic user-result buffer is rejected without writing it" );
+    hr = IXThreadingImpl_XAsyncGetResult( threading, &async, NULL, sizeof(generic_user),
+                                        &generic_user, &used );
+    CHECK( SUCCEEDED( hr ) && generic_user && used == sizeof(generic_user),
+           "generic async retrieval returns the user handle bytes" );
     hr = IXUserImpl_XUserAddResult( users, &async, &user );
     CHECK( SUCCEEDED( hr ) && user, "XUserAddResult returns a user (0x%08lx)", hr );
+    CHECK( user == generic_user, "typed and generic user results identify the same user" );
     if (!user) return;
 
     hr = IXUserImpl_XUserGetState( users, user, &state );
@@ -195,6 +214,58 @@ static void test_xuser(void)
             hr = IXUserImpl6_XUserCheckPrivilege( u6, user, 0, XUserPrivilege_CrossPlay, &has, &reason );
             CHECK( SUCCEEDED( hr ) && has, "user holds the cross-play privilege" );
             CHECK( IXUserImpl6_XUserIsStoreUser( u6, user ), "user is a store user" );
+
+            /* The fixture returns ASCII token/signature strings over IPC. The
+             * UTF-16 entry point must return actual wide strings to the game. */
+            {
+                XAsyncBlock token_async = {0};
+                XUserGetTokenAndSignatureUtf16Data *wide = NULL;
+                XUserGetTokenAndSignatureData *narrow = NULL;
+                BYTE *buffer = malloc(512);
+                SIZE_T size = 0, used = 0;
+                SIZE_T expected = sizeof(*wide) + sizeof(L"fixture-auth") + sizeof(L"fixture-signature");
+
+                hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Async( u6, user, 0, L"GET",
+                        L"https://fixture.invalid/", 0, NULL, 0, NULL, &token_async );
+                CHECK( hr == S_OK, "UTF-16 token request starts" );
+                hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16ResultSize( u6, &token_async, &size );
+                CHECK( hr == S_OK && size == expected, "UTF-16 result size includes wide strings (%Iu)", size );
+                memset(buffer, 0x5a, 512);
+                hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Result( u6, &token_async, expected - 1,
+                        buffer, &wide, &used );
+                CHECK( hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && buffer[0] == 0x5a,
+                        "short UTF-16 buffer is rejected without writing" );
+                hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Result( u6, &token_async, 512,
+                        buffer, &wide, &used );
+                CHECK( hr == S_OK && wide == (void *)buffer && used == expected,
+                        "UTF-16 result reports the bytes written" );
+                CHECK( hr == S_OK && wide && wide->tokenCount == sizeof(L"fixture-auth") &&
+                        !memcmp(wide->token, L"fixture-auth", sizeof(L"fixture-auth")),
+                        "UTF-16 token is a terminated wide string with a byte count" );
+                CHECK( hr == S_OK && wide && wide->signatureCount == sizeof(L"fixture-signature") &&
+                        !memcmp(wide->signature, L"fixture-signature", sizeof(L"fixture-signature")),
+                        "UTF-16 signature is a terminated wide string with a byte count" );
+                CHECK( buffer[expected] == 0x5a, "UTF-16 result leaves the tail untouched" );
+                /* Retrieving the Unicode form must not corrupt the cached UTF-8 payload. */
+                hr = IXUserImpl6_XUserGetTokenAndSignatureResult( u6, &token_async, 512,
+                        buffer, &narrow, &used );
+                CHECK( hr == S_OK && narrow && !strcmp(narrow->token, "fixture-auth") &&
+                        !strcmp(narrow->signature, "fixture-signature"), "UTF-8 payload remains intact" );
+                {
+                    BYTE *large = malloc(100000);
+                    unsigned int n;
+                    for (n = 0; n < 100000; n++) large[n] = n % 251;
+                    memset(&token_async, 0, sizeof(token_async));
+                    hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Async(u6, user, 0, L"POST",
+                            L"https://fixture.invalid/large", 0, NULL, 100000, large, &token_async);
+                    CHECK(hr == S_OK, "100 KB signing request crosses the extended IPC frame intact");
+                    hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Result(u6, &token_async, 512, buffer, &wide, &used);
+                    CHECK(hr == S_OK && wide && !wcscmp(wide->signature, L"fixture-signature"),
+                          "extended signing request returns the service signature");
+                    free(large);
+                }
+                free(buffer);
+            }
         }
         else CHECK( 0, "query IXUserImpl6" );
     }
@@ -217,7 +288,8 @@ static BOOLEAN __stdcall find_container( const XGameSaveContainerInfo *info, voi
 
 static void test_xgamesave( const char *scid )
 {
-    XGameSaveProviderHandle provider = NULL;
+    XGameSaveProviderHandle provider = NULL, generic_provider = NULL;
+    SIZE_T result_size = 0, used = 0;
     XGameSaveContainerHandle container = NULL;
     XGameSaveUpdateHandle update = NULL;
     XAsyncBlock async = { 0 };
@@ -232,8 +304,32 @@ static void test_xgamesave( const char *scid )
     blob_expected_hash = hash_bytes( blob_payload, sizeof(blob_payload) );
 
     hr = IXGameSaveImpl3_XGameSaveInitializeProviderAsync( gs, user, scid, FALSE, &async );
+    hr = IXThreadingImpl_XAsyncGetResultSize( threading, &async, &result_size );
+    CHECK( SUCCEEDED(hr) && result_size == sizeof(XGameSaveProviderHandle),
+           "save initialization advertises a provider handle result (%Iu bytes)", result_size );
+    hr = IXThreadingImpl_XAsyncGetResult( threading, &async, NULL, sizeof(generic_provider),
+                                        &generic_provider, &used );
+    CHECK( SUCCEEDED(hr) && generic_provider && used == sizeof(generic_provider),
+           "generic async retrieval returns the save provider handle" );
     hr = IXGameSaveImpl3_XGameSaveInitializeProviderResult( gs, &async, &provider );
     CHECK( SUCCEEDED( hr ) && provider, "InitializeProvider succeeds (0x%08lx)", hr );
+    CHECK( provider == generic_provider, "typed and generic save provider results agree" );
+    if (provider)
+    {
+        XAsyncBlock quota_async = {0};
+        INT64 generic_quota = -1, typed_quota = -1;
+        hr = IXGameSaveImpl3_XGameSaveGetRemainingQuotaAsync( gs, provider, &quota_async );
+        CHECK( SUCCEEDED(hr), "remaining quota starts asynchronously" );
+        hr = IXThreadingImpl_XAsyncGetResultSize( threading, &quota_async, &result_size );
+        CHECK( SUCCEEDED(hr) && result_size == sizeof(INT64), "quota result advertises an INT64" );
+        hr = IXThreadingImpl_XAsyncGetResult( threading, &quota_async, NULL, sizeof(generic_quota),
+                                            &generic_quota, &used );
+        CHECK( SUCCEEDED(hr) && generic_quota >= 0 && used == sizeof(generic_quota),
+               "generic async retrieval returns quota bytes" );
+        hr = IXGameSaveImpl3_XGameSaveGetRemainingQuotaResult( gs, &quota_async, &typed_quota );
+        CHECK( SUCCEEDED(hr) && typed_quota == generic_quota, "typed and generic quota results agree" );
+    }
+
     if (!provider) return;
 
     IXGameSaveImpl3_XGameSaveGetRemainingQuota( gs, provider, &quota_before );
@@ -302,6 +398,68 @@ static BOOLEAN __stdcall count_product( const XStoreProduct *product, void *cont
     return TRUE;
 }
 
+struct retained_product
+{
+    const XStoreProduct *product;
+    const char *store_id;
+    char expected_id[64];
+};
+
+static BOOLEAN CALLBACK retain_product( const XStoreProduct *product, void *context )
+{
+    struct retained_product *retained = context;
+    retained->product = product;
+    retained->store_id = product->storeId;
+    snprintf( retained->expected_id, sizeof(retained->expected_id), "%s", product->storeId );
+    return TRUE;
+}
+
+static volatile unsigned int scrub_sum;
+static void __attribute__((noinline)) scrub_callback_stack(void)
+{
+    volatile BYTE scratch[4096];
+    unsigned int i, sum = 0;
+    for (i = 0; i < sizeof(scratch); ++i) { scratch[i] = 0x5a; sum += scratch[i]; }
+    scrub_sum = sum;
+}
+
+static void test_store_product_lifetime(void)
+{
+    XStoreContextHandle context = NULL;
+    XStoreProductQueryHandle query = NULL, other = NULL;
+    XAsyncBlock block = {0};
+    struct retained_product retained = {0}, second = {0};
+    HRESULT hr;
+    IXStoreImpl6_XStoreCreateContext( store, NULL, &context );
+    hr = IXStoreImpl6_XStoreQueryProductForCurrentGameAsync( store, context, &block );
+    if (hr == S_OK) hr = IXStoreImpl6_XStoreQueryProductForCurrentGameResult( store, &block, &query );
+    CHECK( hr == S_OK && query, "create a current-product query for lifetime checks" );
+    if (query)
+    {
+        hr = IXStoreImpl6_XStoreEnumerateProductsQuery( store, query, &retained, retain_product );
+        CHECK( hr == S_OK && retained.product, "enumeration exposes an owned product record" );
+        scrub_callback_stack();
+        if (retained.product)
+        {
+            BOOL stable = retained.product->storeId == retained.store_id;
+            CHECK( stable && !strncmp(retained.store_id, retained.expected_id, sizeof(retained.expected_id)),
+                   "product and identity survive callback stack reuse" );
+            memset( &block, 0, sizeof(block) );
+            IXStoreImpl6_XStoreQueryProductForCurrentGameAsync( store, context, &block );
+            IXStoreImpl6_XStoreQueryProductForCurrentGameResult( store, &block, &other );
+            IXStoreImpl6_XStoreEnumerateProductsQuery( store, other, &second, retain_product );
+            IXStoreImpl6_XStoreCloseProductsQueryHandle( store, other );
+            scrub_callback_stack();
+            stable = retained.product->storeId == retained.store_id;
+            CHECK( stable && !strncmp(retained.store_id, retained.expected_id, sizeof(retained.expected_id)) &&
+                   retained.product->productKind == XStoreProductKind_Game && retained.product->skusCount == 0,
+                   "closing another query preserves the retained product until its own query closes" );
+        }
+        IXStoreImpl6_XStoreCloseProductsQueryHandle( store, query );
+    }
+    IXStoreImpl6_XStoreCloseContextHandle( store, context );
+}
+
 static void test_xstore(void)
 {
     XStoreContextHandle ctx = NULL;
@@ -337,13 +495,61 @@ static void test_xstore(void)
     hr = IXStoreImpl6_XStoreQueryAddOnLicensesResultCount( store, &async, &addons );
     CHECK( SUCCEEDED( hr ) && addons == 0, "no add-on licences (%u)", addons );
 
-    /* licence token: empty but valid-sized */
-    memset( &async, 0, sizeof(async) );
-    IXStoreImpl6_XStoreQueryLicenseTokenAsync( store, ctx, NULL, 0, "test", &async );
-    hr = IXStoreImpl6_XStoreQueryLicenseTokenResultSize( store, &async, &size );
-    CHECK( SUCCEEDED( hr ) && size >= 1, "licence token size >= 1 (%zu)", (size_t)size );
-    hr = IXStoreImpl6_XStoreQueryLicenseTokenResult( store, &async, sizeof(buf), buf );
-    CHECK( SUCCEEDED( hr ), "licence token result succeeds (0x%08lx)", hr );
+    /* This exercises the actual DLL -> Rust serializer -> HTTP -> result path.
+     * The only injected component is the account/signing identity. */
+    {
+        static const struct { const char *custom; BOOL success; } cases[] = {
+            { "regression-test", TRUE }, { "{\"nonce\":\"a\\b\"}\n\t", TRUE },
+            { "română", TRUE }, { "slow", TRUE }, { "timeout", FALSE },
+            { "refused", FALSE }, { "empty", FALSE }, { "null", FALSE },
+            { "nested", FALSE }, { "malformed", FALSE }, { "truncated", FALSE },
+            { "oversize", FALSE }, { "redirect-302", FALSE },
+            { "redirect-307", FALSE }, { "redirect-308", FALSE },
+            { "ipc-old-service", FALSE }, { "ipc-disconnect", FALSE },
+            { "ipc-truncated", FALSE }, { "ipc-oversize", FALSE }, { "ipc-stall", FALSE },
+        };
+        static const char expected[] = "eyJhbGciOiJSUzI1NiJ9.Zml4dHVyZS1saWNlbmNlLXRva2Vu.c2lnbmF0dXJl";
+        unsigned int i, waited;
+        for (i = 0; i < sizeof(cases)/sizeof(cases[0]); i++)
+        {
+            char id1[32] = "9TESTSTORE0ID", id2[32] = "9TESTADDON00", custom[128];
+            const char *ids[] = { id1, id2 };
+            ULONGLONG started, elapsed;
+            strcpy(custom, cases[i].custom);
+            memset(&async, 0, sizeof(async));
+            started = GetTickCount64();
+            hr = IXStoreImpl6_XStoreQueryLicenseTokenAsync(store, ctx, ids, 2, custom, &async);
+            elapsed = GetTickCount64() - started;
+            CHECK(hr == S_OK, "license case %u starts (0x%08lx)", i, hr);
+            /* Inputs may cease to exist immediately after the API returns. */
+            memset(custom, '!', sizeof(custom)); memset(id1, '!', sizeof(id1)); memset(id2, '!', sizeof(id2));
+            if (!strcmp(cases[i].custom, "slow"))
+                CHECK(elapsed < 250, "license call returns before the 500-ms HTTP reply (%llu ms)", elapsed);
+            if (FAILED(hr)) continue;
+            for (waited = 0; waited < 6000; waited++)
+            {
+                hr = IXThreadingImpl_XAsyncGetStatus(threading, &async, FALSE);
+                if (hr != E_PENDING) break;
+                Sleep(10);
+            }
+            CHECK(hr != E_PENDING, "license case %u completes", i);
+            if (!strcmp(cases[i].custom, "ipc-stall"))
+                CHECK(hr == HRESULT_FROM_WIN32(ERROR_TIMEOUT) && GetTickCount64() - started >= 45000 &&
+                      GetTickCount64() - started < 55000, "stalled IPC fails at its 50-second deadline");
+            hr = IXStoreImpl6_XStoreQueryLicenseTokenResultSize(store, &async, &size);
+            if (!cases[i].success)
+            {
+                CHECK(FAILED(hr) && hr != E_PENDING, "license case %u refuses bad response (0x%08lx)", i, hr);
+                continue;
+            }
+            CHECK(hr == S_OK && size == sizeof(expected), "license case %u has exact token size", i);
+            memset(buf, '!', sizeof(buf));
+            hr = IXStoreImpl6_XStoreQueryLicenseTokenResult(store, &async, 4, buf);
+            CHECK(hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && buf[0] == '!', "short buffer is not written or consumed");
+            hr = IXStoreImpl6_XStoreQueryLicenseTokenResult(store, &async, sizeof(buf), buf);
+            CHECK(hr == S_OK && !strcmp(buf, expected) && buf[sizeof(expected)] == '!', "license case %u returns only the token and terminator", i);
+        }
+    }
 
     /* entitled products: an empty, enumerable, single-page query */
     memset( &async, 0, sizeof(async) );
@@ -450,6 +656,40 @@ static void test_storage_and_system(void)
         CHECK( SUCCEEDED( hr ) && buf[0], "console id returned" );
     }
     else CHECK( 0, "query XSystem" );
+
+    {
+        IXSystemAnalyticsImpl *analytics = NULL;
+        struct { UINT64 before; XSystemAnalyticsInfo info; UINT64 after; } guarded;
+        HMODULE combase = LoadLibraryA( "combase.dll" );
+        HRESULT (WINAPI *ro_init)( UINT32 ) = (void *)GetProcAddress( combase, "RoInitialize" );
+        void (WINAPI *ro_uninit)( void ) = (void *)GetProcAddress( combase, "RoUninitialize" );
+        unsigned int iteration;
+        BOOL initialized = FALSE;
+
+        hr = query( &CLSID_XSystemAnalyticsImpl, &IID_IXSystemAnalyticsImpl, (void **)&analytics );
+        CHECK( hr == S_OK && analytics, "query system analytics interface" );
+        if (analytics)
+        {
+            for (iteration = 0; iteration < 2; ++iteration)
+            {
+                XSystemAnalyticsInfo *result;
+                if (iteration && ro_init) initialized = SUCCEEDED( ro_init( 1 ) );
+                memset( &guarded, 0xa5, sizeof(guarded) );
+                result = analytics->lpVtbl->XSystemGetAnalyticsInfo( analytics, &guarded.info );
+                CHECK( result == &guarded.info && guarded.before == 0xa5a5a5a5a5a5a5a5ULL &&
+                       guarded.after == 0xa5a5a5a5a5a5a5a5ULL, "analytics preserves its aggregate return buffer %u", iteration );
+                CHECK( !strcmp( guarded.info.family, "Windows.Desktop" ) &&
+                       !strcmp( guarded.info.form, "Desktop" ),
+                       "analytics reports the complete family accepted by native Party %u", iteration );
+                CHECK( guarded.info.osVersion.major &&
+                       !memcmp( &guarded.info.osVersion, &guarded.info.hostingOsVersion, sizeof(XVersion) ),
+                       "analytics returns initialized, consistent OS versions %u", iteration );
+                if (initialized && ro_uninit) ro_uninit();
+            }
+            IXSystemAnalyticsImpl_Release( analytics );
+        }
+        if (combase) FreeLibrary( combase );
+    }
 
     {
         IXNetworkingImpl2 *net = NULL;
@@ -569,6 +809,27 @@ static HRESULT CALLBACK provider_fails_in_begin( XAsyncOp op, const XAsyncProvid
     return op == XAsyncOp_Begin ? E_FAIL : S_OK;
 }
 
+static volatile LONG failed_work_finished, failed_work_cleanup_safe;
+static HRESULT work_completion_result = E_FAIL;
+static HRESULT CALLBACK provider_fails_in_work( XAsyncOp op, const XAsyncProviderData *data )
+{
+    switch (op)
+    {
+    case XAsyncOp_Begin:
+        return IXThreadingImpl_XAsyncSchedule(threading_for_provider, data->async, 0);
+    case XAsyncOp_DoWork:
+        IXThreadingImpl_XAsyncComplete(threading_for_provider, data->async, work_completion_result, 0);
+        Sleep(30); /* The callback may free the user's block before work exits. */
+        InterlockedExchange((LONG *)&failed_work_finished, 1);
+        return E_PENDING;
+    case XAsyncOp_Cleanup:
+        if (failed_work_finished) InterlockedExchange((LONG *)&failed_work_cleanup_safe, 1);
+        return provider_fails_in_begin(op, data);
+    default:
+        return S_OK;
+    }
+}
+
 static HRESULT CALLBACK provider_completes_then_fails( XAsyncOp op, const XAsyncProviderData *data )
 {
     HRESULT hr = provider_completes_in_begin( op, data );
@@ -579,13 +840,14 @@ static HRESULT CALLBACK provider_completes_without_payload( XAsyncOp op, const X
 {
     if (op == XAsyncOp_Begin)
         IXThreadingImpl_XAsyncComplete( threading_for_provider, data->async, S_OK, 0 );
+    if (op == XAsyncOp_Cleanup) InterlockedIncrement((LONG *)&failed_begin_cleanups);
     return S_OK;
 }
 
 static void CALLBACK failed_begin_cb( XAsyncBlock *async )
 {
     HRESULT hr = IXThreadingImpl_XAsyncGetStatus( threading_for_provider, async, FALSE );
-    if (hr == E_FAIL && !failed_begin_cleanups)
+    if (hr == work_completion_result && !failed_begin_cleanups)
         InterlockedExchange( (LONG *)&failed_begin_callback_ok, 1 );
     VirtualFree( async, 0, MEM_RELEASE );
     InterlockedExchange( (LONG *)&completion_ran, 1 );
@@ -811,6 +1073,53 @@ static void test_xthreading(void)
     }
 
     {
+        XAsyncBlock *block = VirtualAlloc(NULL, sizeof(*block), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        int waited;
+        CHECK(block != NULL, "allocate a disposable failed-work block");
+        if (!block) return;
+        block->callback = failed_begin_cb;
+        block->context = &failed_begin_cookie;
+        InterlockedExchange((LONG *)&completion_ran, 0);
+        InterlockedExchange((LONG *)&failed_begin_cleanups, 0);
+        InterlockedExchange((LONG *)&failed_begin_callback_ok, 0);
+        InterlockedExchange((LONG *)&failed_begin_cleanup_context_ok, 0);
+        InterlockedExchange((LONG *)&failed_work_finished, 0);
+        InterlockedExchange((LONG *)&failed_work_cleanup_safe, 0);
+        hr = IXThreadingImpl_XAsyncBegin(threading, block, NULL, provider_fails_in_work,
+                                        "fails-in-work", provider_fails_in_work);
+        CHECK(hr == S_OK, "background failure starts successfully");
+        for (waited = 0; waited < 200 && !failed_begin_cleanups; waited++) Sleep(10);
+        CHECK(completion_ran && failed_begin_callback_ok, "background failure reports status before cleanup");
+        CHECK(failed_begin_cleanups == 1 && failed_work_cleanup_safe,
+              "background failure cleans up once, after worker and callback, without GetResult");
+        CHECK(failed_begin_cleanup_context_ok, "background cleanup uses a saved block after callback frees the original");
+    }
+
+    {
+        XAsyncBlock *block = VirtualAlloc(NULL, sizeof(*block), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        int waited;
+
+        work_completion_result = S_OK;
+        block->context = &failed_begin_cookie;
+        block->callback = failed_begin_cb;
+        InterlockedExchange((LONG *)&completion_ran, 0);
+        InterlockedExchange((LONG *)&failed_begin_cleanups, 0);
+        InterlockedExchange((LONG *)&failed_begin_callback_ok, 0);
+        InterlockedExchange((LONG *)&failed_begin_cleanup_context_ok, 0);
+        InterlockedExchange((LONG *)&failed_work_finished, 0);
+        InterlockedExchange((LONG *)&failed_work_cleanup_safe, 0);
+        hr = IXThreadingImpl_XAsyncBegin(threading, block, NULL, provider_fails_in_work,
+                                        "successful-work-without-result", provider_fails_in_work);
+        CHECK(hr == S_OK, "zero-result background operation starts");
+        for (waited = 0; waited < 200 && !failed_begin_cleanups; waited++) Sleep(10);
+        CHECK(completion_ran && failed_begin_callback_ok, "zero-result success reports status before cleanup");
+        CHECK(failed_begin_cleanups == 1 && failed_work_cleanup_safe,
+              "zero-result success releases its provider once after work without GetResult");
+        CHECK(failed_begin_cleanup_context_ok, "zero-result cleanup survives callback freeing the original block");
+        work_completion_result = E_FAIL;
+    }
+
+    {
         XAsyncBlock block = {0};
         UINT32 value = 0;
 
@@ -826,8 +1135,15 @@ static void test_xthreading(void)
         CHECK( hr == E_FAIL, "failed result remains readable after automatic cleanup (0x%08lx)", hr );
 
         memset( &block, 0, sizeof(block) );
+        InterlockedExchange((LONG *)&failed_begin_cleanups, 0);
         IXThreadingImpl_XAsyncBegin( threading, &block, NULL, provider_completes_without_payload,
                                      "older-zero-payload", provider_completes_without_payload );
+        CHECK(failed_begin_cleanups == 1, "inline zero-result success cleans up without a callback or result read");
+        {
+            SIZE_T used = 99;
+            hr = IXThreadingImpl_XAsyncGetResult(threading, &block, provider_completes_without_payload, 0, NULL, &used);
+            CHECK(hr == S_OK && used == 0, "detached zero-result success remains readable with zero bytes used");
+        }
         block.context = &failed_begin_cookie;
         IXThreadingImpl_XAsyncBegin( threading, &block, NULL, provider_fails_in_begin,
                                      "newer-failed-begin", provider_fails_in_begin );
@@ -896,10 +1212,463 @@ static void test_xthreading(void)
     }
 }
 
-int main(void)
+
+struct manual_probe
+{
+    LONG work_thread, completion_thread, cleaned, direct_thread;
+};
+
+static HRESULT CALLBACK manual_provider( XAsyncOp operation, const XAsyncProviderData *data )
+{
+    struct manual_probe *probe = data->context;
+    if (operation == XAsyncOp_DoWork)
+    {
+        InterlockedExchange( &probe->work_thread, GetCurrentThreadId() );
+        IXThreadingImpl_XAsyncComplete( threading, data->async, S_OK, sizeof(UINT32) );
+        return E_PENDING;
+    }
+    if (operation == XAsyncOp_GetResult) *(UINT32 *)data->buffer = 0x11223344;
+    if (operation == XAsyncOp_Cleanup) InterlockedIncrement( &probe->cleaned );
+    return S_OK;
+}
+
+static void CALLBACK manual_completed( XAsyncBlock *block )
+{
+    struct manual_probe *probe = block->context;
+    InterlockedExchange( &probe->completion_thread, GetCurrentThreadId() );
+}
+
+static void CALLBACK manual_direct( void *context, BOOLEAN canceled )
+{
+    struct manual_probe *probe = context;
+    InterlockedExchange( &probe->direct_thread, canceled ? -1 : GetCurrentThreadId() );
+}
+
+static void test_manual_queues(void)
+{
+    XTaskQueueHandle parent = NULL, other = NULL, composite = NULL, saved = NULL;
+    XTaskQueuePortHandle work_port = NULL, completion_port = NULL;
+    struct manual_probe probe = {0}, retained = {0};
+    XAsyncBlock block = {0};
+    DWORD owner = GetCurrentThreadId();
+    UINT32 value = 0;
+    HRESULT hr;
+    unsigned int iteration;
+
+    printf( "# Manual queue thread, port, and composite routing\n" );
+    hr = IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_Manual,
+                                          XTaskQueueDispatchMode_Manual, &parent );
+    CHECK( hr == S_OK && parent, "create the caller-dispatched queue" );
+    hr = IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_Manual,
+                                          XTaskQueueDispatchMode_Manual, &other );
+    CHECK( hr == S_OK && other, "create a distinct queue" );
+    if (!parent || !other) return;
+    IXThreadingImpl_XTaskQueueGetCurrentProcessTaskQueue( threading, &saved );
+
+    for (iteration = 0; iteration < 4; ++iteration)
+    {
+        memset( &probe, 0, sizeof(probe) );
+        memset( &block, 0, sizeof(block) );
+        block.context = &probe;
+        block.callback = manual_completed;
+        block.queue = parent;
+        if (iteration == 1)
+        {
+            IXThreadingImpl_XTaskQueueGetPort( threading, parent, XTaskQueuePort_Work, &work_port );
+            IXThreadingImpl_XTaskQueueGetPort( threading, other, XTaskQueuePort_Completion, &completion_port );
+            hr = IXThreadingImpl_XTaskQueueCreateComposite( threading, work_port, completion_port, &composite );
+            CHECK( hr == S_OK && composite, "composite retains the original port identities" );
+            block.queue = composite;
+        }
+        if (iteration == 3)
+        {
+            IXThreadingImpl_XTaskQueueSetCurrentProcessTaskQueue( threading, parent );
+            block.queue = NULL;
+        }
+        hr = IXThreadingImpl_XAsyncBegin( threading, &block, &probe, manual_provider, "manual-probe", manual_provider );
+        CHECK( hr == S_OK, "begin manual operation %u", iteration );
+        hr = IXThreadingImpl_XAsyncSchedule( threading, &block, iteration == 2 ? 10 : 0 );
+        CHECK( hr == S_OK, "schedule manual operation %u", iteration );
+        Sleep( 40 );
+        CHECK( !probe.work_thread && !probe.completion_thread,
+               "operation %u stays queued until the caller dispatches", iteration );
+        IXThreadingImpl_XTaskQueueDispatch( threading, other, XTaskQueuePort_Work, 0 );
+        IXThreadingImpl_XTaskQueueDispatch( threading, parent, XTaskQueuePort_Completion, 0 );
+        CHECK( !probe.work_thread, "the wrong queue and port cannot run work %u", iteration );
+        IXThreadingImpl_XTaskQueueDispatch( threading, parent, XTaskQueuePort_Work, 0 );
+        CHECK( probe.work_thread == owner && !probe.completion_thread,
+               "work %u runs on the dispatching thread and leaves completion queued", iteration );
+        IXThreadingImpl_XTaskQueueDispatch( threading, iteration == 1 ? parent : other,
+                                          XTaskQueuePort_Completion, 0 );
+        CHECK( !probe.completion_thread, "the wrong completion port cannot run callback %u", iteration );
+        IXThreadingImpl_XTaskQueueDispatch( threading, iteration == 1 ? other : parent,
+                                          XTaskQueuePort_Completion, 0 );
+        CHECK( probe.completion_thread == owner, "completion %u runs on the owning dispatch thread", iteration );
+        hr = IXThreadingImpl_XAsyncGetResult( threading, &block, manual_provider, sizeof(value), &value, NULL );
+        CHECK( hr == S_OK && value == 0x11223344 && probe.cleaned == 1,
+               "operation %u returns its result and cleans up exactly once", iteration );
+    }
+    IXThreadingImpl_XTaskQueueSetCurrentProcessTaskQueue( threading, saved );
+    memset( &probe, 0, sizeof(probe) );
+    hr = IXThreadingImpl_XTaskQueueSubmitCallback( threading, parent, XTaskQueuePort_Work, &probe, manual_direct );
+    Sleep( 30 );
+    CHECK( hr == S_OK && !probe.direct_thread, "a direct callback also waits for manual dispatch" );
+    IXThreadingImpl_XTaskQueueDispatch( threading, parent, XTaskQueuePort_Work, 0 );
+    CHECK( probe.direct_thread == owner, "a direct callback runs on the registered caller thread" );
+    memset( &probe, 0, sizeof(probe) );
+    hr = IXThreadingImpl_XTaskQueueSubmitDelayedCallback( threading, other, XTaskQueuePort_Work,
+                                                         1000, &probe, manual_direct );
+    CHECK( hr == S_OK, "accept delayed manual work" );
+    CHECK( !IXThreadingImpl_XTaskQueueDispatch( threading, other, XTaskQueuePort_Work, 0 ) &&
+           !probe.direct_thread, "manual work cannot run before its delay" );
+    hr = IXThreadingImpl_XTaskQueueTerminate( threading, other, TRUE, NULL, NULL );
+    CHECK( hr == S_OK && probe.direct_thread == -1,
+           "termination cancels delayed manual work before returning" );
+    probe.direct_thread = 0;
+    Sleep( 1100 );
+    CHECK( !IXThreadingImpl_XTaskQueueDispatch( threading, other, XTaskQueuePort_Work, 0 ) &&
+           !probe.direct_thread, "no timer can deliver work after termination" );
+    hr = IXThreadingImpl_XTaskQueueSubmitDelayedCallback( threading, other, XTaskQueuePort_Work,
+                                                         1, &probe, manual_direct );
+    CHECK( hr == E_ABORT, "a terminated queue rejects delayed work" );
+    if (composite)
+    {
+        memset( &probe, 0, sizeof(probe) );
+        hr = IXThreadingImpl_XTaskQueueSubmitCallback( threading, parent, XTaskQueuePort_Work,
+                                                      &retained, manual_direct );
+        CHECK( hr == S_OK, "queue parent work on a shared endpoint" );
+        hr = IXThreadingImpl_XTaskQueueSubmitDelayedCallback( threading, composite, XTaskQueuePort_Work,
+                                                             1000, &probe, manual_direct );
+        CHECK( hr == S_OK, "queue composite work on the shared endpoint" );
+        hr = IXThreadingImpl_XTaskQueueTerminate( threading, composite, TRUE, NULL, NULL );
+        CHECK( hr == S_OK && probe.direct_thread == -1 && !retained.direct_thread,
+               "terminating a composite cancels only its own callbacks" );
+        IXThreadingImpl_XTaskQueueDispatch( threading, parent, XTaskQueuePort_Work, 0 );
+        CHECK( retained.direct_thread == owner, "parent work survives composite termination" );
+    }
+    if (composite) IXThreadingImpl_XTaskQueueCloseHandle( threading, composite );
+    if (saved) IXThreadingImpl_XTaskQueueCloseHandle( threading, saved );
+    IXThreadingImpl_XTaskQueueCloseHandle( threading, other );
+    IXThreadingImpl_XTaskQueueCloseHandle( threading, parent );
+}
+
+
+/* ABI fixture results are synthetic; they exercise the facade, not cloud access. */
+static LONG pfx_progress_calls;
+static void WINAPI pfx_test_progress(XUserHandle u, UINT32 state, void *context)
+{
+    if (u == user && state == 3 && context == &pfx_progress_calls)
+        InterlockedIncrement(&pfx_progress_calls);
+}
+static void test_pfx_backend(void)
+{
+    IXGameSaveImpl4 *modern = NULL;
+    HMODULE core = LoadLibraryA("PlayFabCore.dll"), save = LoadLibraryA("PlayFabGameSave.dll");
+    LONG (WINAPI *closed_users)(void), (*final_uploads)(void);
+    struct PFXGameSaveConfigRequest request = { user, "4D5E6F70", "https://fixture.invalid", 0, NULL, NULL, NULL };
+    struct PFXGameSaveUiCallbacks ui = { 0 };
+    PFXGameSaveConfigHandle config = NULL;
+    XAsyncBlock a = { 0 };
+    HKEY key;
+    DWORD marker = 9, value = 0, bytes = sizeof(value);
+    SIZE_T size;
+    INT64 quota = -1;
+    char folder[128], small[2];
+    LONG before;
+    UINT32 state;
+    UINT64 current, total;
+    HRESULT hr;
+    printf("# PFX native SDK boundary (synthetic)\n");
+    CHECK(sizeof(request) == 56 && offsetof(struct PFXGameSaveConfigRequest, fileLocation) == 48, "configuration matches the public x64 GDK ABI");
+    CHECK(sizeof(struct PFXGameSaveDescriptor) == 64 && offsetof(struct PFXGameSaveDescriptor, time) == 40, "descriptor matches the public x64 GDK ABI");
+    CHECK(sizeof(ui) == 112, "UI callback table matches the public x64 GDK ABI");
+    CHECK(core && save, "native ABI fixtures load");
+    if (!core || !save) return;
+    {
+        HRESULT (WINAPI *register_runtime)(void) = (void *)GetProcAddress(GetModuleHandleA("xgameruntime.dll"), "DllRegisterServer");
+        HKEY discovery;
+        CHECK(register_runtime && register_runtime() == S_OK, "matching native save SDK registers the PFX facade");
+        hr = RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OneSettings\\xbox\\GamingRuntimeServices\\Settings",
+                0, KEY_READ, &discovery);
+        CHECK(hr == ERROR_SUCCESS, "native SDK can discover the available PFX facade");
+        if (hr == ERROR_SUCCESS) RegCloseKey(discovery);
+    }
+    closed_users = (void *)GetProcAddress(core, "PFFixtureClosedUsers");
+    final_uploads = (void *)GetProcAddress(core, "PFFixtureFinalUploads");
+    hr = g_query(&CLSID_XGameSaveImpl, &IID_IXGameSaveImpl4, (void **)&modern);
+    CHECK(hr == S_OK && modern, "PFX interface is available");
+    if (!modern) return;
+    RegCreateKeyExA(HKEY_LOCAL_MACHINE, "Software\\Microsoft\\GamingServices", 0, NULL, 0,
+                    KEY_ALL_ACCESS, NULL, &key, NULL);
+    RegSetValueExA(key, "ForceUseInprocGameSaves", 0, REG_DWORD, (BYTE *)&marker, sizeof(marker));
+    hr = IXGameSaveImpl4_PFXGameSaveInitializeConfig(modern, &request, &config);
+    CHECK(hr == S_OK && config, "valid configuration initializes the native backend (0x%08lx)", hr);
+    RegQueryValueExA(key, "ForceUseInprocGameSaves", NULL, NULL, (BYTE *)&value, &bytes);
+    CHECK(value == marker, "temporary provider override restores the pre-existing setting");
+    RegCloseKey(key);
+    if (!config) { IXGameSaveImpl4_Release(modern); return; }
+    ui.progressCallback = pfx_test_progress; ui.progressContext = &pfx_progress_calls;
+    hr = IXGameSaveImpl4_PFXGameSaveSetUiCallbacks(modern, &ui);
+    memset(&ui, 0, sizeof(ui));
+    CHECK(hr == S_OK, "callback registration copies caller-owned storage");
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiAsync(modern, config, &a);
+    CHECK(hr == S_OK, "native folder synchronization starts");
+    CHECK(IXThreadingImpl_XAsyncGetStatus(threading, &a, FALSE) == E_PENDING, "folder remains pending until native completion");
+    CHECK(IXThreadingImpl_XAsyncGetStatus(threading, &a, TRUE) == S_OK, "folder synchronization completes");
+    CHECK(pfx_progress_calls == 1, "native progress routes the correct Xbox user and context");
+    size = 0;
+    hr = IXThreadingImpl_XAsyncGetResultSize(threading, &a, &size);
+    CHECK(hr == S_OK && size == sizeof("C:\\pfx-fixture\\account-save"), "folder size is the native result size");
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult(modern, &a, sizeof(small), small);
+    CHECK(hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER), "small folder buffer retains the result for retry");
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult(modern, &a, sizeof(folder), folder);
+    CHECK(hr == S_OK && !strcmp(folder, "C:\\pfx-fixture\\account-save"), "folder retry returns the native path");
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetRemainingQuota(modern, config, &quota);
+    CHECK(hr == S_OK && quota == 987654321, "quota comes from the SDK");
+    hr = IXGameSaveImpl4_PFXGameSaveProgressUiGetProgress(modern, user, &state, &current, &total);
+    CHECK(hr == S_OK && state == 3 && current == 12 && total == 42, "native progress counters are preserved");
+    SetEnvironmentVariableA("PFX_FIXTURE_RESULT", "89237007");
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetRemainingQuota(modern, config, &quota);
+    CHECK(hr == (HRESULT)0x89237007, "quota preserves the backend error");
+    memset(&a, 0, sizeof(a));
+    hr = IXGameSaveImpl4_PFXGameSaveFilesUploadWithUiAsync(modern, config, 0, &a);
+    CHECK(hr == S_OK && IXThreadingImpl_XAsyncGetStatus(threading, &a, TRUE) == (HRESULT)0x89237007,
+          "upload completes with the real backend failure");
+    CHECK(IXGameSaveImpl4_PFXGameSaveFilesUploadWithUiResult(modern, &a) == (HRESULT)0x89237007,
+          "upload result preserves the backend failure");
+    SetEnvironmentVariableA("PFX_FIXTURE_RESULT", NULL);
+    SetEnvironmentVariableA("PFX_FIXTURE_OFFLINE", "1");
+    memset(&a, 0, sizeof(a));
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiAsync(modern, config, &a);
+    CHECK(hr == S_OK && IXThreadingImpl_XAsyncGetStatus(threading, &a, TRUE) == (HRESULT)0x80830004,
+          "offline synchronization reports the GRTS offline status");
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult(modern, &a, sizeof(folder), folder);
+    CHECK(hr == (HRESULT)0x80830004 && !strcmp(folder, "C:\\pfx-fixture\\account-save"),
+          "offline result includes usable local folder without claiming cloud success");
+    SetEnvironmentVariableA("PFX_FIXTURE_OFFLINE", NULL);
+    memset(&a, 0, sizeof(a));
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiAsync(modern, config, &a);
+    CHECK(hr == S_OK && IXThreadingImpl_XAsyncGetStatus(threading, &a, TRUE) == S_OK,
+          "user reconnects before final cloud synchronization");
+    IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult(modern, &a, sizeof(folder), folder);
+    before = closed_users();
+    memset(&a, 0, sizeof(a));
+    hr = IXGameSaveImpl4_PFXGameSaveFilesSetSaveDescriptionAsync(modern, config, "test", &a);
+    CHECK(hr == S_OK, "description operation starts");
+    IXGameSaveImpl4_PFXGameSaveFreeConfig(modern, config);
+    IXGameSaveImpl4_PFXGameSaveFreeConfig(modern, config);
+    CHECK(closed_users() == before, "pending operation retains the native user after repeated close");
+    CHECK(IXThreadingImpl_XAsyncGetStatus(threading, &a, TRUE) == S_OK &&
+          IXGameSaveImpl4_PFXGameSaveFilesSetSaveDescriptionResult(modern, &a) == S_OK,
+          "pending description survives config close");
+    { unsigned int attempts; for (attempts = 0; attempts < 200 && closed_users() == before; attempts++) Sleep(10); }
+    CHECK(final_uploads() == 1, "config close requests one final upload releasing the active device");
+    CHECK(closed_users() == before + 1, "final operation releases the native user exactly once");
+    CHECK(IXGameSaveImpl4_PFXGameSaveFilesGetRemainingQuota(modern, config, &quota) == E_INVALIDARG,
+          "closed config cannot access the backend");
+    IXGameSaveImpl4_Release(modern);
+}
+
+/* Slots of IXGameSaveImpl4 as numbered in the Microsoft.GDK.PC 2510.3.6286
+ * XGameSave and PFXGameSave headers, written out by hand so that a method
+ * added, dropped or reordered in xgamesave.idl fails here instead of calling
+ * the wrong function in a title. */
+static const struct
+{
+    const char *name;
+    size_t offset;
+    unsigned int slot;
+} gamesave4_slots[] =
+{
+    { "XGameSaveInitializeProvider", offsetof( IXGameSaveImpl4Vtbl, XGameSaveInitializeProvider ), 3 },
+    { "XGameSaveSubmitUpdateResult", offsetof( IXGameSaveImpl4Vtbl, XGameSaveSubmitUpdateResult ), 29 },
+    { "XGameSaveFilesGetFolderWithUiAsync", offsetof( IXGameSaveImpl4Vtbl, XGameSaveFilesGetFolderWithUiAsync ), 30 },
+    { "XGameSaveFilesGetFolderWithUiResult", offsetof( IXGameSaveImpl4Vtbl, XGameSaveFilesGetFolderWithUiResult ), 31 },
+    { "XGameSaveFilesGetRemainingQuota", offsetof( IXGameSaveImpl4Vtbl, XGameSaveFilesGetRemainingQuota ), 32 },
+    { "PFXGameSaveInitializeConfig", offsetof( IXGameSaveImpl4Vtbl, PFXGameSaveInitializeConfig ), 33 },
+    { "PFXGameSaveSetActiveDeviceChangedCallback", offsetof( IXGameSaveImpl4Vtbl, PFXGameSaveSetActiveDeviceChangedCallback ), 49 },
+};
+
+static void test_gamesave_interface4( const char *scid )
+{
+    static const char payload[] = "saved through IXGameSaveImpl4";
+    XGameSaveProviderHandle provider = NULL;
+    XGameSaveContainerHandle container = NULL;
+    XGameSaveUpdateHandle update = NULL;
+    PFXGameSaveConfigHandle config = (PFXGameSaveConfigHandle)0x1234;
+    IXGameSaveImpl4 *modern = NULL, *again = NULL;
+    IXGameSaveImpl3 *legacy = NULL;
+    IUnknown *unknown = NULL;
+    XAsyncBlock async = { 0 };
+    XGameSaveBlob *blobs;
+    UINT32 count, state = 0;
+    UINT64 current = 0, total = 0;
+    INT64 quota = -1;
+    SIZE_T size = 0;
+    char *folder;
+    unsigned int i;
+    HRESULT hr;
+
+    printf( "# XGameSave through IXGameSaveImpl4\n" );
+
+    hr = g_query( &CLSID_XGameSaveImpl, &IID_IXGameSaveImpl4, (void **)&modern );
+    CHECK( SUCCEEDED(hr) && modern, "IXGameSaveImpl4 is available (0x%08lx)", hr );
+    if (!modern) return;
+
+    CHECK( sizeof(IXGameSaveImpl4Vtbl) == 50 * sizeof(void *), "the vtable has fifty slots (%Iu)",
+           sizeof(IXGameSaveImpl4Vtbl) / sizeof(void *) );
+    for (i = 0; i < ARRAY_SIZE(gamesave4_slots); i++)
+        CHECK( gamesave4_slots[i].offset == gamesave4_slots[i].slot * sizeof(void *), "%s is slot %u (%Iu)",
+               gamesave4_slots[i].name, gamesave4_slots[i].slot, gamesave4_slots[i].offset / sizeof(void *) );
+
+    hr = IXGameSaveImpl4_QueryInterface( modern, &IID_IXGameSaveImpl3, (void **)&legacy );
+    CHECK( SUCCEEDED(hr) && (void *)legacy == (void *)modern, "IXGameSaveImpl3 is the same object" );
+    if (legacy)
+    {
+        hr = IXGameSaveImpl3_QueryInterface( legacy, &IID_IXGameSaveImpl4, (void **)&again );
+        CHECK( SUCCEEDED(hr) && again == modern, "IXGameSaveImpl3 answers IXGameSaveImpl4 with the same object" );
+        if (again) IXGameSaveImpl4_Release( again );
+        IXGameSaveImpl3_Release( legacy );
+    }
+    hr = IXGameSaveImpl4_QueryInterface( modern, &IID_IUnknown, (void **)&unknown );
+    CHECK( SUCCEEDED(hr) && (void *)unknown == (void *)modern, "IUnknown is the same object" );
+    if (unknown)
+    {
+        again = NULL;
+        hr = IUnknown_QueryInterface( unknown, &IID_IXGameSaveImpl4, (void **)&again );
+        CHECK( SUCCEEDED(hr) && again == modern, "IUnknown answers IXGameSaveImpl4 with the same object" );
+        if (again) IXGameSaveImpl4_Release( again );
+        IUnknown_Release( unknown );
+    }
+
+    /* A legacy round trip, every call through the new interface. */
+    hr = IXGameSaveImpl4_XGameSaveInitializeProvider( modern, user, scid, FALSE, &provider );
+    CHECK( SUCCEEDED(hr) && provider, "InitializeProvider succeeds through IXGameSaveImpl4 (0x%08lx)", hr );
+    if (provider)
+    {
+        hr = IXGameSaveImpl4_XGameSaveGetRemainingQuota( modern, provider, &quota );
+        CHECK( SUCCEEDED(hr) && quota > 0, "GetRemainingQuota reaches its slot (0x%08lx)", hr );
+        hr = IXGameSaveImpl4_XGameSaveCreateContainer( modern, provider, "interface4_container", &container );
+        CHECK( SUCCEEDED(hr) && container, "CreateContainer succeeds (0x%08lx)", hr );
+    }
+    if (container)
+    {
+        hr = IXGameSaveImpl4_XGameSaveCreateUpdate( modern, container, "Interface 4", &update );
+        CHECK( SUCCEEDED(hr), "CreateUpdate succeeds (0x%08lx)", hr );
+        hr = IXGameSaveImpl4_XGameSaveSubmitBlobWrite( modern, update, BLOB_NAME, (UINT8 *)payload, sizeof(payload) );
+        CHECK( SUCCEEDED(hr), "SubmitBlobWrite succeeds (0x%08lx)", hr );
+        hr = IXGameSaveImpl4_XGameSaveSubmitUpdate( modern, update );
+        CHECK( SUCCEEDED(hr), "SubmitUpdate succeeds (0x%08lx)", hr );
+        IXGameSaveImpl4_XGameSaveCloseUpdate( modern, update );
+
+        size = sizeof(XGameSaveBlob) + sizeof(payload) + 64;
+        blobs = malloc( size );
+        CHECK( blobs != NULL, "allocated the read buffer" );
+        if (blobs)
+        {
+            count = 1;
+            hr = IXGameSaveImpl4_XGameSaveReadBlobData( modern, container, NULL, &count, size, blobs );
+            CHECK( SUCCEEDED(hr) && count == 1 && blobs[0].info.size == sizeof(payload) &&
+                   !memcmp( blobs[0].data, payload, sizeof(payload) ),
+                   "ReadBlobData returns what was written (0x%08lx, %u)", hr, count );
+            free( blobs );
+        }
+        IXGameSaveImpl4_XGameSaveCloseContainer( modern, container );
+        hr = IXGameSaveImpl4_XGameSaveDeleteContainer( modern, provider, "interface4_container" );
+        CHECK( SUCCEEDED(hr), "DeleteContainer succeeds (0x%08lx)", hr );
+    }
+    if (provider) IXGameSaveImpl4_XGameSaveCloseProvider( modern, provider );
+
+    /* XGameSaveFiles: slots 30 and 31, with a real wait before the size. */
+    hr = IXGameSaveImpl4_XGameSaveFilesGetFolderWithUiAsync( modern, user, scid, &async );
+    CHECK( SUCCEEDED(hr), "FilesGetFolderWithUiAsync starts (0x%08lx)", hr );
+    hr = IXThreadingImpl_XAsyncGetStatus( threading, &async, TRUE );
+    CHECK( SUCCEEDED(hr), "FilesGetFolderWithUiAsync completes (0x%08lx)", hr );
+    size = 0;
+    hr = IXThreadingImpl_XAsyncGetResultSize( threading, &async, &size );
+    CHECK( SUCCEEDED(hr) && size > 1 && size < MAX_PATH, "the folder result has a plausible size (%Iu)", size );
+    if (SUCCEEDED(hr) && size > 1 && size < MAX_PATH)
+    {
+        folder = malloc( size );
+        CHECK( folder != NULL, "allocated the folder buffer" );
+        if (folder)
+        {
+            hr = IXGameSaveImpl4_XGameSaveFilesGetFolderWithUiResult( modern, &async, size, folder );
+            CHECK( SUCCEEDED(hr) && strlen( folder ) + 1 == size, "the folder is a terminated path (0x%08lx)", hr );
+            free( folder );
+        }
+    }
+
+    /* Invalid PFX calls must fail before loading a backend. */
+    memset( &async, 0, sizeof(async) );
+    hr = IXGameSaveImpl4_PFXGameSaveInitializeConfig( modern, NULL, &config );
+    CHECK( hr == E_INVALIDARG && !config, "PFXGameSaveInitializeConfig fails and clears its output (0x%08lx)", hr );
+    IXGameSaveImpl4_PFXGameSaveFreeConfig( modern, NULL );
+    {
+        const struct { const char *name; HRESULT hr; HRESULT expected; } cloud[] =
+        {
+            { "PFXGameSaveFilesGetFolderWithUiAsync", IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiAsync( modern, NULL, &async ), E_INVALIDARG },
+            { "PFXGameSaveFilesGetFolderWithUiResult", IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult( modern, &async, 0, NULL ), E_INVALIDARG },
+            { "PFXGameSaveFilesGetRemainingQuota", IXGameSaveImpl4_PFXGameSaveFilesGetRemainingQuota( modern, NULL, &quota ), E_INVALIDARG },
+            { "PFXGameSaveSetUiCallbacks", IXGameSaveImpl4_PFXGameSaveSetUiCallbacks( modern, NULL ), E_INVALIDARG },
+            { "PFXGameSaveProgressUiGetProgress", IXGameSaveImpl4_PFXGameSaveProgressUiGetProgress( modern, user, &state, &current, &total ), E_INVALIDARG },
+            { "PFXGameSaveSetProgressUiResponse", IXGameSaveImpl4_PFXGameSaveSetProgressUiResponse( modern, user, 0 ), E_INVALIDARG },
+            { "PFXGameSaveSetSyncFailedUiResponse", IXGameSaveImpl4_PFXGameSaveSetSyncFailedUiResponse( modern, user, 0 ), E_INVALIDARG },
+            { "PFXGameSaveSetActiveDeviceContentionUiResponse", IXGameSaveImpl4_PFXGameSaveSetActiveDeviceContentionUiResponse( modern, user, 0 ), E_INVALIDARG },
+            { "PFXGameSaveSetConflictUiResponse", IXGameSaveImpl4_PFXGameSaveSetConflictUiResponse( modern, user, 0 ), E_INVALIDARG },
+            { "PFXGameSaveSetOutOfStorageUiResponse", IXGameSaveImpl4_PFXGameSaveSetOutOfStorageUiResponse( modern, user, 0 ), E_INVALIDARG },
+            { "PFXGameSaveFilesUploadWithUiAsync", IXGameSaveImpl4_PFXGameSaveFilesUploadWithUiAsync( modern, NULL, 0, &async ), E_INVALIDARG },
+            { "PFXGameSaveFilesUploadWithUiResult", IXGameSaveImpl4_PFXGameSaveFilesUploadWithUiResult( modern, &async ), E_PENDING },
+            { "PFXGameSaveFilesSetSaveDescriptionAsync", IXGameSaveImpl4_PFXGameSaveFilesSetSaveDescriptionAsync( modern, NULL, "test", &async ), E_INVALIDARG },
+            { "PFXGameSaveFilesSetSaveDescriptionResult", IXGameSaveImpl4_PFXGameSaveFilesSetSaveDescriptionResult( modern, &async ), E_PENDING },
+            { "PFXGameSaveSetActiveDeviceChangedCallback", IXGameSaveImpl4_PFXGameSaveSetActiveDeviceChangedCallback( modern, NULL, NULL ), S_OK },
+        };
+
+        for (i = 0; i < ARRAY_SIZE(cloud); i++)
+            CHECK( cloud[i].hr == cloud[i].expected, "%s validates its arguments/status (0x%08lx)", cloud[i].name, cloud[i].hr );
+    }
+
+    IXGameSaveImpl4_Release( modern );
+}
+
+static void test_runtime_discovery( HMODULE mod )
+{
+    HRESULT (WINAPI *register_runtime)(void) = (void *)GetProcAddress( mod, "DllRegisterServer" );
+    const UINT64 expected = ((UINT64)35 << 48) | ((UINT64)112 << 32) | ((UINT64)20003 << 16);
+    static const WCHAR key[] = L"Software\\Microsoft\\GamingServices";
+    UINT64 current = 0, available = 0;
+    DWORD size, type;
+    LONG status;
+
+    printf( "# Gaming Services runtime discovery\n" );
+    CHECK( register_runtime != NULL, "runtime discovery can be registered before initialization" );
+    if (!register_runtime) return;
+    CHECK( register_runtime() == S_OK, "registering the emulated runtime succeeds" );
+    {
+        HKEY discovery;
+        LONG result = RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OneSettings\\xbox\\GamingRuntimeServices\\Settings",
+                0, KEY_READ, &discovery);
+        CHECK(result == ERROR_FILE_NOT_FOUND, "legacy registration does not advertise a missing native save backend");
+        if (!result) RegCloseKey(discovery);
+    }
+    size = sizeof(current);
+    status = RegGetValueW( HKEY_LOCAL_MACHINE, key, L"CurrentVersion", RRF_RT_REG_QWORD,
+                          &type, &current, &size );
+    CHECK( status == ERROR_SUCCESS && type == REG_QWORD && size == sizeof(current) && current == expected,
+           "current runtime version has the SDK's package-version QWORD layout" );
+    size = sizeof(available);
+    status = RegGetValueW( HKEY_LOCAL_MACHINE, key, L"AvailableVersion", RRF_RT_REG_QWORD,
+                          &type, &available, &size );
+    CHECK( status == ERROR_SUCCESS && type == REG_QWORD && available == current,
+           "available runtime version matches the installed implementation" );
+}
+
+int main(int argc, char **argv)
 {
     HMODULE mod;
-    HRESULT (WINAPI *init)( ULONG, ULONG );
+    HRESULT (WINAPI *init)( UINT64, UINT64 );
     HRESULT (WINAPI *query)( REFCLSID, REFIID, void ** );
     const char *scid = "00000000-0000-0000-0000-000000000001";
     HRESULT hr;
@@ -917,6 +1686,7 @@ int main(void)
     query = (void *)GetProcAddress( mod, "QueryApiImpl" );
     if (!init || !query) { printf( "Bail out! missing exports\n" ); return 100; }
     g_query = query;
+    test_runtime_discovery( mod );
     init( 10002, 7822 );
 
     if (FAILED( hr = query( &CLSID_XPackageImpl, &IID_IXPackageImpl3, (void **)&pkg ) ) ||
@@ -930,13 +1700,34 @@ int main(void)
         return 100;
     }
 
+    if (argc > 1 && !strcmp(argv[1], "--store-lifetime"))
+    {
+        test_store_product_lifetime();
+        printf( "%s: %d checks, %d failed\n", g_failed ? "FAILED" : "PASSED", g_run, g_failed );
+        return g_failed;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--manual-queues"))
+    {
+        test_manual_queues();
+        printf( "%s: %d checks, %d failed\n", g_failed ? "FAILED" : "PASSED", g_run, g_failed );
+        return g_failed;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--pfx"))
+    {
+        test_xuser();
+        test_pfx_backend();
+        printf("%s: %d checks, %d failed\n", g_failed ? "FAILED" : "PASSED", g_run, g_failed);
+        return g_failed;
+    }
     test_xpackage();
     test_xuser();
     test_xstore();
+    test_store_product_lifetime();
     test_xgameui();
     test_storage_and_system();
     test_xthreading();
     test_xgamesave( scid );
+    test_gamesave_interface4( scid );
 
     printf( "\n1..%d\n", g_run );
     printf( "%s: %d checks, %d failed\n", g_failed ? "FAILED" : "PASSED", g_run, g_failed );

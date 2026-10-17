@@ -37,6 +37,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import tomllib
 
 registry, tool_dir = sys.argv[1], sys.argv[2]
@@ -80,9 +81,18 @@ for capability in capabilities:
 
 out_path = os.path.join(tool_dir, "files", "share", "ferestre", "capabilities.json")
 os.makedirs(os.path.dirname(out_path), exist_ok=True)
-with open(out_path, "w") as f:
-    json.dump({"schema": 1, "capabilities": sorted(provided)}, f, indent=2)
-    f.write("\n")
+# Atomic replacement also breaks a hardlink used by local runtime candidates:
+# publishing a candidate manifest must not alter an already installed version.
+fd, temporary = tempfile.mkstemp(prefix=".capabilities-", dir=os.path.dirname(out_path))
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump({"schema": 1, "capabilities": sorted(provided)}, f, indent=2)
+        f.write("\n")
+    os.chmod(temporary, 0o644)
+    os.replace(temporary, out_path)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
 
 print(f":: {len(provided)}/{len(capabilities)} capabilities verified -> {out_path}")
 for name, why in missing:

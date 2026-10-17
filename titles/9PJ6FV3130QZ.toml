@@ -1,0 +1,26 @@
+# Player-reported compatibility status; keep the local override in sync.
+schema = 1
+
+[title]
+product-id = "9PJ6FV3130QZ"
+name = "Dune: Awakening"
+slug = "dune-awakening"
+
+[install]
+dir = "dune-awakening"
+
+[launch]
+executable = 'DuneSandbox\Binaries\WinGDK\DuneSandbox_BE.exe'
+
+[runtime]
+requires = [
+    "loader.memfd-main-image",
+    "xgameruntime.user",
+]
+wants = ["appmodel.package-identity"]
+
+[status]
+state = "playable"
+summary = "Gameplay confirmed by the player."
+last-verified = 2026-10-13
+verified-with = "Player confirmation; no additional gameplay test performed for this metadata update."

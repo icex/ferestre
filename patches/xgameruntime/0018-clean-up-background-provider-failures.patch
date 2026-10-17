@@ -1,0 +1,61 @@
+diff --git a/xthreading.c b/xthreading.c
+index 6100cce..fa2739c 100644
+--- a/xthreading.c
++++ b/xthreading.c
+@@ -216,11 +216,11 @@ static void release_async_op( struct x_async_op *op )
+ static void store_async_result( XAsyncBlock *async, HRESULT hr, void *payload, SIZE_T result_size );
+ static void deliver_async_completion( XAsyncBlock *async, struct x_async_op *keep_alive );
+ 
+-/* A failure returned by Begin is an async outcome with no payload. Its caller
++/* A provider failure is an async outcome with no payload. Its caller
+  * may only read GetStatus and never call GetResult, so retain the provider
+  * through Begin/work and the callback, then clean it up without a result read.
+  * An inline completion wins over the later return value. */
+-static void complete_failed_begin( struct x_async_op *op, HRESULT hr )
++static void complete_provider_failure( struct x_async_op *op, HRESULT hr )
+ {
+     BOOL drop = FALSE;
+ 
+@@ -236,7 +236,7 @@ static void complete_failed_begin( struct x_async_op *op, HRESULT hr )
+         op->cleanup_on_release = TRUE;
+         list_remove( &op->entry );
+         drop = TRUE;
+-        TRACE( "failed Begin for block %p completes asynchronously; cleanup follows delivery.\n", op->async );
++        TRACE( "failed provider for block %p completes asynchronously; cleanup follows delivery.\n", op->async );
+     }
+     LeaveCriticalSection( &async_ops_cs );
+     if (drop) release_async_op( op );
+@@ -258,6 +258,24 @@ static void x_threading_XAsyncComplete_helper( XAsyncBlock *async, HRESULT resul
+     struct x_async_op *op, *drop = NULL;
+     BOOL defer = FALSE;
+ 
++    /* Failed operations have no result to consume. Keep the provider alive
++     * through its worker and completion callback, then clean it up even when
++     * the caller only reads status. The same ownership rule applies to Begin
++     * and to a background provider failure. */
++    if (FAILED(result))
++    {
++        BOOL deliver;
++        if (!(op = acquire_async_op( async ))) return;
++        complete_provider_failure( op, result );
++        EnterCriticalSection( &async_ops_cs );
++        deliver = !op->begin_running && op->deliver_pending;
++        if (deliver) op->deliver_pending = FALSE;
++        LeaveCriticalSection( &async_ops_cs );
++        if (deliver) deliver_async_completion( async, op );
++        release_async_op( op );
++        return;
++    }
++
+     EnterCriticalSection( &async_ops_cs );
+     op = find_async_op( async );
+     if (!op)
+@@ -543,7 +561,7 @@ static HRESULT WINAPI x_threading_XAsyncBegin( IXThreadingImpl *iface, XAsyncBlo
+      * the completion we accepted is still queued. An already completed
+      * operation keeps its first result. */
+     if (FAILED(hr) && hr != E_PENDING)
+-        complete_failed_begin( op, hr );
++        complete_provider_failure( op, hr );
+ 
+     EnterCriticalSection( &async_ops_cs );
+     op->begin_running = FALSE;

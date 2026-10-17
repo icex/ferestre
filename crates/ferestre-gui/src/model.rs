@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use ferestre_core::autofix;
 use ferestre_core::catalog::Product;
 use ferestre_core::gamepass;
 use ferestre_core::install::Record;
@@ -56,13 +57,17 @@ impl Action {
             Action::Update => "Update",
             Action::Adopt => "Set up",
             Action::Stop => "Stop",
-            Action::Installing => "Installing…",
+            Action::Installing => "Installing..",
             Action::Blocked(_) => "Play",
         }
     }
 
     pub fn is_enabled(&self) -> bool {
         !matches!(self, Action::Blocked(_) | Action::Installing)
+    }
+
+    pub fn is_enabled_during_download(&self, downloading: bool) -> bool {
+        self.is_enabled() && !(downloading && matches!(self, Action::Install | Action::Update))
     }
 
     /// The `ferestre` arguments this action runs, or `None` when it runs nothing.
@@ -105,7 +110,7 @@ struct TitleView {
 /// `Unknown` is the startup state and is not a failure: the window has to be
 /// useful before anyone signs in, so an unasked library never blocks a launch.
 /// It only stops the window claiming a title is *not* owned on no evidence.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Ownership {
     #[default]
     Unknown,
@@ -189,6 +194,10 @@ pub struct Inputs<'a> {
     /// launcher has a version and no record, and showing "Installed" when the
     /// tree plainly says 1.26.4501.0 is throwing away an answer we have.
     pub installed_version: &'a dyn Fn(&Recipe) -> Option<String>,
+    /// Where the title is installed, when that is known. Handed to
+    /// [`autofix::infer`] so a row is assessed against the same recipe `ferestre
+    /// run` will use, engine defaults included.
+    pub game_dir: &'a dyn Fn(&Recipe) -> Option<PathBuf>,
 }
 
 /// Work out the button and the words for one recipe.
@@ -276,7 +285,9 @@ fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
         return blocked("install the patched runtime first".into());
     };
 
-    let assessment = runtime::assess(recipe, runtime, inputs.registry);
+    let game_dir = (inputs.game_dir)(recipe);
+    let inferred = autofix::infer(recipe, game_dir.as_deref());
+    let assessment = runtime::assess(&inferred.recipe, runtime, inputs.registry);
     if !assessment.is_satisfied() {
         // `assess` writes a paragraph for a terminal. A row gets one line.
         let line = row_sized(&assessment.explanation, &recipe.title.name);
@@ -388,8 +399,19 @@ pub fn gamepass(
         .map(|product_id| {
             let key = product_id.to_ascii_uppercase();
             let product = inputs.catalog.get(&key);
+            let recipe = inputs
+                .recipes
+                .iter()
+                .find(|recipe| recipe.matches(product_id));
+            let compatibility = recipe.or_else(|| {
+                product?
+                    .bundled_ids
+                    .iter()
+                    .find_map(|id| inputs.recipes.iter().find(|recipe| recipe.matches(id)))
+            });
             let name = product
                 .map(|p| p.name.clone())
+                .or_else(|| recipe.map(|recipe| recipe.title.name.clone()))
                 .unwrap_or_else(|| product_id.clone());
             let installed = (inputs.installed_product)(product_id);
             let installing = (inputs.installing)(product_id);
@@ -399,13 +421,22 @@ pub fn gamepass(
             // account's tier fails at the licence step with "not entitled to
             // this content" -- after several minutes and a partial container --
             // and the catalogue knew all along.
-            let covered = tiers.covered(product_id, held);
+            let covered = if installing || installed {
+                None
+            } else {
+                tiers.covered(product_id, held)
+            };
             let mut parts = vec![match covered {
                 Some(false) => "Not in your Game Pass tier".to_string(),
                 _ => "Included with PC Game Pass".to_string(),
             }];
             if let Some(note) = download_note(inputs, product) {
                 parts.push(note);
+            }
+            if let Some(recipe) = compatibility {
+                if !recipe.status.summary.is_empty() {
+                    parts.push(recipe.status.summary.clone());
+                }
             }
             let action = match (installed, runnable) {
                 _ if installing => {
@@ -447,10 +478,14 @@ pub fn gamepass(
                 product_id: product_id.clone(),
                 name,
                 subtitle: parts.join("  ·  "),
-                badge: None,
+                badge: Some(state_label(
+                    compatibility
+                        .map(|recipe| recipe.status.state)
+                        .unwrap_or(TitleState::Untested),
+                )),
                 image: product.and_then(|p| p.image.clone()),
                 owned: false,
-                has_recipe: false,
+                has_recipe: recipe.is_some(),
                 installed,
                 update: None,
                 unsupported: runnable == Some(false),
@@ -601,6 +636,7 @@ fn sort_key(a: &LibraryRow, b: &LibraryRow) -> std::cmp::Ordering {
         .cmp(&b.is_named())
         .reverse()
         .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        .then_with(|| a.product_id.cmp(&b.product_id))
 }
 
 fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
@@ -869,12 +905,22 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
 /// report, a Store URL and a recipe filename all carry, and someone pasting one
 /// in should find the row.
 pub fn search<'a>(rows: &'a [LibraryRow], query: &str) -> Vec<&'a LibraryRow> {
-    let needle = query.trim().to_lowercase();
+    let normalize = |text: &str| {
+        text.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let needle = normalize(query);
+    let terms: Vec<&str> = needle.split_whitespace().collect();
     rows.iter()
         .filter(|row| {
-            needle.is_empty()
-                || row.name.to_lowercase().contains(&needle)
-                || row.product_id.to_lowercase().contains(&needle)
+            let name = normalize(&row.name);
+            let id = row.product_id.to_lowercase();
+            terms
+                .iter()
+                .all(|term| name.contains(term) || id.contains(term))
         })
         .collect()
 }
@@ -1055,6 +1101,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         }
     }
 
@@ -1123,6 +1170,8 @@ mod tests {
     const NO_VERSION_ON_DISK: &dyn Fn(&Recipe) -> Option<String> = &|_| None;
     /// And where the window has not started anything.
     const NOTHING_RUNNING: &dyn Fn(&str) -> bool = &|_| false;
+    /// And where no installed engine shapes the recipe.
+    const NO_GAME_DIR: &dyn Fn(&Recipe) -> Option<PathBuf> = &|_| None;
     /// And where an undescribed title is not on disk either.
     const NOT_ON_DISK: &dyn Fn(&str) -> bool = &|_| false;
     /// And so nothing on disk describes itself.
@@ -1324,6 +1373,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert_eq!(rows[0].action, Action::Update);
         assert!(
@@ -1424,6 +1474,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
 
         let by_id: BTreeMap<&str, &LibraryRow> =
@@ -1476,6 +1527,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert_eq!(
             rows.iter()
@@ -1520,6 +1572,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         let by_id: BTreeMap<&str, &LibraryRow> =
             rows.iter().map(|r| (r.product_id.as_str(), r)).collect();
@@ -1578,6 +1631,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert!(
             rows[0].subtitle.contains("No PC version"),
@@ -1624,6 +1678,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         let row = rows
             .iter()
@@ -1683,6 +1738,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert!(
             rows[0].subtitle.contains("Bundle of 1 title"),
@@ -1731,6 +1787,7 @@ mod tests {
                 product_describes_itself: NOTHING_DESCRIBES_ITSELF,
                 installing: NOTHING_INSTALLING,
                 running: NOTHING_RUNNING,
+                game_dir: NO_GAME_DIR,
             },
             &listing,
             &gamepass::Tiers::default(),
@@ -1795,6 +1852,7 @@ mod tests {
             product_describes_itself: describes,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert_eq!(rows.len(), 1, "the row exists at all");
         assert_eq!(rows[0].name, "Only On Disk");
@@ -1826,6 +1884,7 @@ mod tests {
             product_describes_itself: with_manifest,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert_eq!(rows[0].action, Action::Play);
 
@@ -1843,6 +1902,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert_eq!(
             rows[0].action,
@@ -1855,6 +1915,30 @@ mod tests {
     /// catalogue and not in the tier this account holds, and the only way to
     /// find that out used to be to start the download and have the licence step
     /// refuse it several minutes in.
+    #[test]
+    fn gamepass_search_results_report_compatibility_without_claiming_unknown_games_work() {
+        let recipes = vec![
+            recipe("9ZZTESTGAME1", "playable", &[]),
+            recipe("9ZZTESTGAME2", "broken", &[]),
+        ];
+        let rows = gamepass(
+            &inputs(&recipes, None, &Ownership::Unknown, NOTHING_INSTALLED),
+            &[
+                "9ZZTESTGAME1".into(),
+                "9ZZTESTGAME2".into(),
+                "9ZZTESTGAME3".into(),
+            ],
+            &gamepass::Tiers::default(),
+            &[],
+        );
+        let by_id = |id: &str| rows.iter().find(|row| row.product_id == id).unwrap();
+        assert_eq!(by_id("9ZZTESTGAME1").badge.unwrap().0, "Playable");
+        assert_eq!(by_id("9ZZTESTGAME2").badge.unwrap().0, "Does not run");
+        assert_eq!(by_id("9ZZTESTGAME3").badge.unwrap().0, "Untested");
+        assert!(by_id("9ZZTESTGAME1").subtitle.contains("a summary"));
+        assert_eq!(search(&rows, "game1")[0].badge.unwrap().0, "Playable");
+    }
+
     #[test]
     fn a_gamepass_title_outside_the_held_tier_says_so_before_the_download() {
         let listing = vec!["9MSVBF0KZFVW".to_string(), "9MSVVM5NS9L6".to_string()];
@@ -1885,6 +1969,7 @@ mod tests {
                 product_describes_itself: NOTHING_DESCRIBES_ITSELF,
                 installing: NOTHING_INSTALLING,
                 running: NOTHING_RUNNING,
+                game_dir: NO_GAME_DIR,
             },
             &listing,
             &tiers,
@@ -1938,9 +2023,10 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: downloading,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert_eq!(rows[0].action, Action::Installing);
-        assert_eq!(rows[0].action.label(), "Installing…");
+        assert_eq!(rows[0].action.label(), "Installing..");
         assert!(!rows[0].action.is_enabled());
         assert_eq!(
             rows[0].action.command("9ZZTESTGDK1"),
@@ -1977,6 +2063,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["aardvark", "Zebra", "9ZZTESTNEW3"]);
@@ -2009,6 +2096,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert_eq!(rows[0].action, Action::Update);
         assert_eq!(rows[0].update, Some(true));
@@ -2041,6 +2129,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
+            game_dir: NO_GAME_DIR,
         });
         assert_eq!(rows[0].update, None);
         assert_eq!(rows[0].action, Action::Play, "not nagged, not hidden");
@@ -2158,6 +2247,7 @@ mod tests {
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
             installing: NOTHING_INSTALLING,
             running,
+            game_dir: NO_GAME_DIR,
         });
         assert_eq!(rows[0].action, Action::Stop);
         assert_eq!(rows[0].action.label(), "Stop");
@@ -2212,6 +2302,27 @@ mod tests {
             "an id pasted from a Store URL or an issue should find its row"
         );
         assert!(search(&rows, "nothing at all").is_empty());
+    }
+
+    #[test]
+    fn one_download_disables_install_and_update_but_allows_play() {
+        for action in [Action::Install, Action::Update] {
+            assert!(action.is_enabled_during_download(false));
+            assert!(!action.is_enabled_during_download(true));
+        }
+        assert!(Action::Play.is_enabled_during_download(true));
+        assert!(Action::Stop.is_enabled_during_download(true));
+        assert!(!Action::Installing.is_enabled_during_download(true));
+        assert_eq!(Action::Installing.label(), "Installing..");
+    }
+
+    #[test]
+    fn search_handles_words_and_punctuation() {
+        let rows = rows_named(&[("9NR1R1XWLCNB", "Forza Horizon 6: Standard Edition")]);
+        for query in ["FORZA   6", "horizon forza", "6 standard", "forza-horizon"] {
+            assert_eq!(search(&rows, query).len(), 1, "{query}");
+        }
+        assert!(search(&rows, "forza 5").is_empty());
     }
 
     #[test]

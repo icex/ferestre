@@ -29,18 +29,35 @@ executable = 'Goat2\Binaries\WinGDK\Goat2-WinGDK-Shipping.exe'
 requires = [
     "loader.memfd-main-image",
     "xgameruntime.analytics-info",
+    "xgameruntime.analytics-device-family",
+    "xgameruntime.store-product-lifetime",
+    "xgameruntime.gamesave-interface4-legacy",
 ]
 
 [status]
-state   = "playable-with-issues"
-summary = "Boots and plays; online connectivity is being verified."
-last-verified = 2026-09-06
+state = "playable"
+summary = "Playable, confirmed by the player offline and online. New games save and resume across relaunches, and Quit Game exits. Peer joining and voice are untested."
+last-verified = 2026-10-11
+verified-with = "Game Pass package; player-confirmed offline play, and online play on launcher 0.1.7; automated clean-prefix runs on runtime 11.0.20261010.2: offline and online-enabled new saves reach the world in under 40 s (online measured at 60 fps), autosave, reload after a relaunch with progress, and Quit Game exits in seconds"
 
 [[issues]]
-symptom = "Online features do not work."
-cause = """
-The title polls the user state in a tight loop and never gets what it wants: one \
-run counted 27,932 XUserDuplicateHandle and 27,931 XUserCloseHandle calls beside \
-9,333 XUserGetId, which is a retry that never succeeds rather than a title doing \
-work. What it is waiting for has not been established."""
-fix = "none known"
+symptom = "Progress is not kept: after a relaunch every San Angora slot reads New Save"
+cause = "The game asks for the save interface IXGameSaveImpl4 (IID ab4ae4fb-6508-4950-a032-45fd4bf8c43b). Without it, it plays on but never writes a save."
+fix = "Update the runtime to one providing xgameruntime.gamesave-interface4-legacy. Saves made before that do not exist to recover; nothing was written."
+log-match = "ab4ae4fb-6508-4950-a032-45fd4bf8c43b"
+
+[[issues]]
+symptom = "With online features enabled a world takes minutes to load and then barely responds; Quit Game closes the window but the process keeps running"
+cause = "The shipped PlayFab Party library waits for Microsoft Gaming Services before loading gameplatformservices.dll, for up to HKLM\\Microsoft\\GamingServices\\ServiceRetryTimeout (60 s when unset). Wine has no Gaming Services, so each wait ran out: repeatedly in online mode, and on shutdown, where the main thread stayed parked in Party."
+fix = "Update the launcher to 0.1.7 or later, which sets ServiceRetryTimeout to 0 in the prefix before launching. With an older launcher, run `reg add HKLM\\Microsoft\\GamingServices /v ServiceRetryTimeout /t REG_DWORD /d 0 /f` in the prefix."
+
+[[issues]]
+symptom = "Online sign-in reports unknown network error GS3-NF-2"
+cause = "The runtime truncated Windows.Desktop to Windows, which the shipped PlayFab Party library did not recognize."
+fix = "Update the runtime to one providing analytics-device-family. Peer joining and voice remain untested."
+log-match = "GS3-NF-2"
+
+[[issues]]
+symptom = "The game crashes while processing owned Store products"
+cause = "Product callbacks received stack data that expired before the game finished using it."
+fix = "Update the runtime to one providing store-product-lifetime; product data now remains valid until its query handle closes."

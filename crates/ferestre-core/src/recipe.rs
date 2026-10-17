@@ -86,7 +86,11 @@ pub struct Launch {
     /// The executable inside the package, as the client expects it.
     pub executable: String,
     /// Extra environment the title needs, beyond what every title gets.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[serde(
+        default,
+        alias = "environment",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
     pub env: std::collections::BTreeMap<String, String>,
 }
 
@@ -408,6 +412,24 @@ mod tests {
             Recipe::blank("9ZZTESTNEW1", "Halo: CE").title.slug,
             "halo-ce"
         );
+    }
+
+    #[test]
+    fn documented_environment_alias_matches_the_existing_env_key() {
+        for key in ["env", "environment"] {
+            let mut text = Recipe::blank("9ZZTESTNEW1", "Test Title")
+                .to_toml()
+                .unwrap();
+            text = text.replace(
+                "executable = \"\"",
+                &format!("executable = \"Game.exe\"\n{key} = {{ TEST_VALUE = \"enabled\" }}"),
+            );
+            let parsed = Recipe::parse(&text).unwrap();
+            assert_eq!(
+                parsed.launch.env.get("TEST_VALUE").map(String::as_str),
+                Some("enabled")
+            );
+        }
     }
 
     #[test]

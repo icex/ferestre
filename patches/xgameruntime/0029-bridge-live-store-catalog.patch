@@ -1,0 +1,450 @@
+From: Ferestre contributors
+Subject: Bridge opt-in live XStore catalog queries and retain product pages
+
+--- a/xstore.c
++++ b/xstore.c
+@@ -23,19 +23,17 @@
+ #define WIN32_NO_STATUS
+ #include "private.h"
+ #include "unixlib.h"
++#include <math.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+-
+-/*
+- * Store, from the point of view of one locally-installed, fully-owned game
+- * playing offline: the base game licence is active and perpetual, there are no
+- * add-ons or entitled products, nothing is a trial, and no updates are pending.
+- * The server-backed identifiers (collections id, purchase id)
+- * come back empty, which is correct for a title that never reaches Xbox Live.
+- * Licence tokens are fetched asynchronously by the credential-owning service.
+- * These are the answers that let a title get past its startup licence check
+- * instead of dying on an E_NOTIMPL.
+- */
++WINE_DECLARE_DEBUG_CHANNEL(storetrace);
++static char q_empty[] = "";
++
++/* Legacy titles retain their existing offline license/entitlement behavior.
++ * XGR_STORE_CATALOG=1 opts a title into live read-only product queries through
++ * the credential service's separately versioned catalog protocol. Catalog
++ * results describe what can be listed; they never grant add-on ownership.
++ * License-token requests keep their released authenticated implementation. */
+ 
+ struct x_store_context
+ {
+@@ -47,13 +45,13 @@
+     BOOL valid;
+ };
+ 
+-/* A product query. There is no store catalogue to talk to, so the only product
+- * that can be described is the one running: its identity is in
+- * MicrosoftGame.config and the person is plainly entitled to it, because they
+- * are playing it. `has_current` says whether this query should report it. */
++/* Legacy current-game data and opt-in immutable catalog snapshots share the
++ * query handle. Pages retain the snapshot independently of earlier handles. */
+ struct x_store_product_query
+ {
+     BOOL has_current;
++    struct store_catalog_snapshot *catalog;
++    UINT32 start, page_size;
+     XStoreProduct product;
+     char store_id[64], title[256], description[512], language[32], empty[1];
+ };
+@@ -115,6 +113,225 @@
+     return complete_query( async, FALSE );
+ }
+ 
++/* Live catalog snapshots own every string/SKU/image until the last page is
++ * closed. Each page independently retains the immutable snapshot. */
++struct store_catalog_snapshot
++{
++    LONG ref;
++    UINT32 count;
++    XStoreProduct *products;
++    char *strings, *next_string, *strings_end;
++};
++static const char store_catalog_identity;
++
++static void store_catalog_release( struct store_catalog_snapshot *s )
++{
++    UINT32 i, j;
++    if (!s || InterlockedDecrement( &s->ref )) return;
++    for (i = 0; s->products && i < s->count; i++)
++    {
++        XStoreProduct *p = s->products + i;
++        for (j = 0; p->skus && j < p->skusCount; j++) free( p->skus[j].availabilities );
++        free( p->skus ); free( p->images );
++    }
++    free( s->products ); free( s->strings ); free( s );
++}
++
++struct catalog_reader { const unsigned char *p, *end; BOOL valid; };
++static UINT32 catalog_read_u32( struct catalog_reader *r )
++{
++    UINT32 n = 0;
++    if (r->end - r->p < 4) { r->valid = FALSE; return 0; }
++    memcpy( &n, r->p, 4 ); r->p += 4; return n;
++}
++static char *catalog_read_text( struct catalog_reader *r, struct store_catalog_snapshot *s )
++{
++    UINT32 n = catalog_read_u32( r );
++    char *out = s->next_string;
++    if (!r->valid || n > 131072 || r->end - r->p < n || s->strings_end - out <= n || memchr(r->p,0,n))
++    { r->valid = FALSE; return NULL; }
++    memcpy( out, r->p, n ); out[n] = 0;
++    r->p += n; s->next_string += n + 1; return out;
++}
++static void catalog_read_price( struct catalog_reader *r, struct store_catalog_snapshot *s, XStorePrice *price, time_t *end )
++{
++    char *currency;
++    if (r->end - r->p < 8) { r->valid = FALSE; return; }
++    memcpy( &price->basePrice, r->p, 4 ); memcpy( &price->price, r->p + 4, 4 ); r->p += 8;
++    currency = catalog_read_text( r, s ); price->currencyCode = currency;
++    if (r->end - r->p < 8 || !currency) { r->valid = FALSE; return; }
++    memcpy( end, r->p, 8 ); r->p += 8;
++    price->isOnSale = price->price < price->basePrice;
++    price->saleEndDate = price->isOnSale ? *end : 0;
++    snprintf( price->formattedBasePrice, sizeof(price->formattedBasePrice), "%.2f %.3s", price->basePrice, currency );
++    snprintf( price->formattedPrice, sizeof(price->formattedPrice), "%.2f %.3s", price->price, currency );
++}
++static HRESULT catalog_decode( const void *wire, ULONG size, UINT32 page_size, struct x_store_product_query **result )
++{
++    struct catalog_reader r = { wire, (const unsigned char *)wire + size, TRUE };
++    struct store_catalog_snapshot *s;
++    struct x_store_product_query *q;
++    UINT32 count, i, j, k;
++    HRESULT hr;
++
++    if (catalog_read_u32( &r ) != 1) return E_FAIL;
++    hr = catalog_read_u32( &r ); count = catalog_read_u32( &r );
++    if (!r.valid) return E_FAIL;
++    if (FAILED(hr)) return hr;
++    if (count > 2048) return E_FAIL;
++    if (!(s = calloc( 1, sizeof(*s) ))) return E_OUTOFMEMORY;
++    s->ref = 1; s->count = count;
++    if (!(s->strings = malloc( (SIZE_T)size * 2 + 1 )) ||
++        !(s->products = calloc( count ? count : 1, sizeof(*s->products) ))) goto oom;
++    s->next_string = s->strings; s->strings_end = s->strings + (SIZE_T)size * 2 + 1;
++    for (i = 0; i < count && r.valid; i++)
++    {
++        XStoreProduct *p = s->products + i;
++        p->productKind = catalog_read_u32( &r );
++        p->storeId = catalog_read_text( &r, s ); p->title = catalog_read_text( &r, s );
++        p->description = catalog_read_text( &r, s ); p->language = catalog_read_text( &r, s );
++        p->inAppOfferToken = catalog_read_text( &r, s ); p->linkUri = q_empty;
++        p->skusCount = catalog_read_u32( &r );
++        if (!r.valid || p->skusCount > 256) { p->skusCount = 0; goto malformed; }
++        if (!(p->skus = calloc( p->skusCount ? p->skusCount : 1, sizeof(*p->skus) ))) { p->skusCount = 0; goto oom; }
++        for (j = 0; j < p->skusCount && r.valid; j++)
++        {
++            XStoreSku *sku = p->skus + j;
++            sku->skuId = catalog_read_text( &r, s ); sku->title = catalog_read_text( &r, s );
++            sku->description = catalog_read_text( &r, s ); sku->language = catalog_read_text( &r, s );
++            sku->isTrial = !!catalog_read_u32( &r ); p->hasDigitalDownload |= !!catalog_read_u32( &r );
++            sku->collectionData.campaignId = q_empty; sku->collectionData.developerOfferId = p->inAppOfferToken;
++            sku->availabilitiesCount = catalog_read_u32( &r );
++            if (!r.valid || sku->availabilitiesCount > 256) { sku->availabilitiesCount = 0; goto malformed; }
++            if (!(sku->availabilities = calloc( sku->availabilitiesCount ? sku->availabilitiesCount : 1, sizeof(*sku->availabilities) ))) goto oom;
++            for (k = 0; k < sku->availabilitiesCount && r.valid; k++)
++            {
++                XStoreAvailability *a = sku->availabilities + k;
++                a->availabilityId = catalog_read_text( &r, s );
++                catalog_read_price( &r, s, &a->price, &a->endDate );
++            }
++            if (sku->availabilitiesCount) sku->price = sku->availabilities[0].price;
++        }
++        if (p->skusCount) p->price = p->skus[0].price;
++        p->imagesCount = catalog_read_u32( &r );
++        if (!r.valid || p->imagesCount > 256) { p->imagesCount = 0; goto malformed; }
++        if (!(p->images = calloc( p->imagesCount ? p->imagesCount : 1, sizeof(*p->images) ))) goto oom;
++        for (j = 0; j < p->imagesCount && r.valid; j++)
++        {
++            XStoreImage *image = p->images + j;
++            image->uri = catalog_read_text( &r, s ); image->caption = catalog_read_text( &r, s );
++            image->imagePurposeTag = catalog_read_text( &r, s );
++            image->width = catalog_read_u32( &r ); image->height = catalog_read_u32( &r );
++        }
++    }
++    if (!r.valid || r.p != r.end) goto malformed;
++    if (!(q = calloc( 1, sizeof(*q) ))) goto oom;
++    q->catalog = s; q->page_size = page_size; *result = q;
++    TRACE_(storetrace)( "catalog snapshot: %u products, page size %u.\n", count, page_size );
++    return S_OK;
++oom:
++    store_catalog_release( s ); return E_OUTOFMEMORY;
++malformed:
++    store_catalog_release( s ); return E_FAIL;
++}
++
++struct catalog_operation
++{
++    struct store_catalog_params ipc;
++    unsigned char request[24000];
++    struct x_store_product_query *result;
++    UINT32 page_size;
++};
++static void catalog_operation_free( struct catalog_operation *op )
++{
++    if (op->result) { store_catalog_release( op->result->catalog ); free( op->result ); }
++    free( op->ipc.response ); free( op );
++}
++static HRESULT CALLBACK catalog_provider( XAsyncOp operation, const XAsyncProviderData *data )
++{
++    struct catalog_operation *op = data->context;
++    NTSTATUS status;
++    HRESULT hr;
++    switch (operation)
++    {
++    case XAsyncOp_Begin:
++        return IXThreadingImpl_XAsyncSchedule( x_threading_impl, data->async, 0 );
++    case XAsyncOp_DoWork:
++        status = XGR_UNIX_CALL( store_catalog, &op->ipc );
++        hr = status == STATUS_IO_TIMEOUT ? HRESULT_FROM_WIN32( ERROR_TIMEOUT ) : status ? E_FAIL :
++             catalog_decode( op->ipc.response, op->ipc.response_size, op->page_size, &op->result );
++        TRACE_(storetrace)( "catalog operation completed: hr %#lx.\n", hr );
++        IXThreadingImpl_XAsyncComplete( x_threading_impl, data->async, hr, SUCCEEDED(hr) ? sizeof(op->result) : 0 );
++        return E_PENDING;
++    case XAsyncOp_GetResult:
++        memcpy( data->buffer, &op->result, sizeof(op->result) ); op->result = NULL; return S_OK;
++    case XAsyncOp_Cleanup:
++        catalog_operation_free( op ); return S_OK;
++    default:
++        return S_OK;
++    }
++}
++static BOOL catalog_enabled(void)
++{
++    char enabled[8];
++    return GetEnvironmentVariableA( "XGR_STORE_CATALOG", enabled, sizeof(enabled) ) && !strcmp(enabled,"1");
++}
++static BOOL catalog_write_u32( struct catalog_operation *op, UINT32 n )
++{
++    if (op->ipc.request_size > sizeof(op->request) - 4) return FALSE;
++    memcpy( op->request + op->ipc.request_size, &n, 4 ); op->ipc.request_size += 4; return TRUE;
++}
++static BOOL catalog_write_text( struct catalog_operation *op, const char *s )
++{
++    SIZE_T n = strnlen( s, 129 );
++    if (n > 128 || !catalog_write_u32(op,n) || n > sizeof(op->request) - op->ipc.request_size) return FALSE;
++    memcpy( op->request + op->ipc.request_size, s, n ); op->ipc.request_size += n; return TRUE;
++}
++static BOOL catalog_valid_id( const char *s )
++{
++    SIZE_T n, i;
++    if (!s || ((n = strnlen(s,17)) != 12 && n != 16)) return FALSE;
++    for (i = 0; i < n; i++)
++        if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z'))) return FALSE;
++    return TRUE;
++}
++static HRESULT catalog_begin( const char *parent, XStoreProductKind kinds, BOOL associated,
++                              UINT32 page_size, const char **ids, SIZE_T count,
++                              const char **actions, SIZE_T action_count, XAsyncBlock *async )
++{
++    struct catalog_operation *op;
++    WCHAR locale_w[LOCALE_NAME_MAX_LENGTH], market_w[8];
++    char locale[32] = "en-US", market[8] = "US";
++    SIZE_T i;
++    HRESULT hr;
++    if (!async || !catalog_valid_id(parent) || !kinds || (kinds & ~31) || !page_size || count > 256 ||
++        action_count > 8 || (count && !ids) || (action_count && !actions) || (!associated && !count)) return E_INVALIDARG;
++    for (i = 0; i < count; i++) if (!catalog_valid_id(ids[i])) return E_INVALIDARG;
++    for (i = 0; i < action_count; i++) if (!actions[i]) return E_INVALIDARG;
++    if (!(op = calloc(1,sizeof(*op)))) return E_OUTOFMEMORY;
++    op->page_size = page_size; op->ipc.request = op->request;
++    if (GetUserDefaultLocaleName(locale_w,ARRAY_SIZE(locale_w)))
++        WideCharToMultiByte(CP_UTF8,0,locale_w,-1,locale,sizeof(locale),NULL,NULL);
++    if (GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT,LOCALE_SISO3166CTRYNAME,market_w,ARRAY_SIZE(market_w)))
++        WideCharToMultiByte(CP_UTF8,0,market_w,-1,market,sizeof(market),NULL,NULL);
++    catalog_write_u32(op,1); catalog_write_u32(op,associated); catalog_write_u32(op,kinds);
++    if (!catalog_write_text(op,parent) || !catalog_write_text(op,market) || !catalog_write_text(op,locale)) goto invalid;
++    catalog_write_u32(op,count);
++    for (i = 0; i < count; i++)
++    {
++        TRACE_(storetrace)( "requested Store ID %s.\n", debugstr_a(ids[i]) );
++        if (!catalog_write_text(op,ids[i])) goto invalid;
++    }
++    catalog_write_u32(op,action_count);
++    for (i = 0; i < action_count; i++) if (!catalog_write_text(op,actions[i])) goto invalid;
++    if (!(op->ipc.response = malloc(XGR_CATALOG_MAX))) { catalog_operation_free(op); return E_OUTOFMEMORY; }
++    hr = IXThreadingImpl_XAsyncBegin( x_threading_impl, async, op, &store_catalog_identity, "StoreCatalog", catalog_provider );
++    if (FAILED(hr)) catalog_operation_free(op);
++    return hr;
++invalid:
++    catalog_operation_free(op); return E_INVALIDARG;
++}
++
+ static HRESULT query_result( XAsyncBlock *async, XStoreProductQueryHandle *out )
+ {
+     void *payload;
+@@ -122,6 +339,8 @@
+ 
+     if (!out) return E_INVALIDARG;
+     if (!xgr_async_completed( async, &hr, &payload )) return E_PENDING;
++    if (SUCCEEDED(hr) && (SIZE_T)async->internal[3] == sizeof(*out))
++        return IXThreadingImpl_XAsyncGetResult( x_threading_impl, async, &store_catalog_identity, sizeof(*out), out, NULL );
+     *out = SUCCEEDED( hr ) ? payload : NULL;
+     return hr;
+ }
+@@ -198,6 +417,12 @@
+ static HRESULT WINAPI x_store_XStoreQueryAssociatedProductsAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, XStoreProductKind productKinds, UINT32 maxItemsToRetrievePerPage, XAsyncBlock *async )
+ {
+     TRACE( "iface %p, storeContextHandle %p, productKinds %#x, async %p.\n", iface, storeContextHandle, productKinds, async );
++    if (catalog_enabled())
++    {
++        char parent[64];
++        if (!storeContextHandle || !xgr_config_element("StoreId",parent,sizeof(parent))) return E_INVALIDARG;
++        return catalog_begin(parent,productKinds,TRUE,maxItemsToRetrievePerPage,NULL,0,NULL,0,async);
++    }
+     return complete_empty_query( async );
+ }
+ 
+@@ -210,6 +435,12 @@
+ static HRESULT WINAPI x_store_XStoreQueryProductsAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, XStoreProductKind productKinds, const char **storeIds, SIZE_T storeIdsCount, const char **actionFilters, SIZE_T actionFiltersCount, XAsyncBlock *async )
+ {
+     TRACE( "iface %p, storeContextHandle %p, productKinds %#x, storeIdsCount %Iu, async %p.\n", iface, storeContextHandle, productKinds, storeIdsCount, async );
++    if (catalog_enabled())
++    {
++        char parent[64];
++        if (!storeContextHandle || !xgr_config_element("StoreId",parent,sizeof(parent))) return E_INVALIDARG;
++        return catalog_begin(parent,productKinds,FALSE,256,storeIds,storeIdsCount,actionFilters,actionFiltersCount,async);
++    }
+     return complete_empty_query( async );
+ }
+ 
+@@ -261,6 +492,12 @@
+     TRACE( "iface %p, productQueryHandle %p, context %p, callback %p.\n", iface, productQueryHandle, context, callback );
+ 
+     if (!callback) return E_INVALIDARG;
++    if (q && q->catalog)
++    {
++        UINT32 i, end = q->start + min(q->page_size,q->catalog->count - q->start);
++        for (i = q->start; i < end; i++) if (!callback(q->catalog->products + i,context)) break;
++        return S_OK;
++    }
+     if (!q || !q->has_current) return S_OK;
+ 
+     /* The one product that can be described honestly: the game running now.
+@@ -277,13 +514,26 @@
+ 
+ static BOOLEAN WINAPI x_store_XStoreProductsQueryHasMorePages( IXStoreImpl6 *iface, const XStoreProductQueryHandle productQueryHandle )
+ {
++    struct x_store_product_query *q = productQueryHandle;
++
+     TRACE( "iface %p, productQueryHandle %p.\n", iface, productQueryHandle );
+-    return FALSE;
++    return q && q->catalog && q->page_size < q->catalog->count - q->start;
+ }
+ 
+ static HRESULT WINAPI x_store_XStoreProductsQueryNextPageAsync( IXStoreImpl6 *iface, const XStoreProductQueryHandle productQueryHandle, XAsyncBlock *async )
+ {
++    struct x_store_product_query *q = productQueryHandle, *next;
++
+     TRACE( "iface %p, productQueryHandle %p, async %p.\n", iface, productQueryHandle, async );
++    if (q && q->catalog)
++    {
++        if (!async) return E_INVALIDARG;
++        if (!(next = calloc(1,sizeof(*next)))) return E_OUTOFMEMORY;
++        next->catalog = q->catalog; InterlockedIncrement(&next->catalog->ref);
++        next->page_size = q->page_size;
++        next->start = q->start + min(q->page_size,q->catalog->count - q->start);
++        xgr_async_complete(async,S_OK,next); return S_OK;
++    }
+     return complete_empty_query( async );
+ }
+ 
+@@ -296,6 +546,7 @@
+ static void WINAPI x_store_XStoreCloseProductsQueryHandle( IXStoreImpl6 *iface, XStoreProductQueryHandle productQueryHandle )
+ {
+     TRACE( "iface %p, productQueryHandle %p.\n", iface, productQueryHandle );
++    if (productQueryHandle) store_catalog_release(((struct x_store_product_query *)productQueryHandle)->catalog);
+     free( productQueryHandle );
+ }
+ 
+@@ -808,6 +1059,8 @@
+ static HRESULT WINAPI x_store_XStoreQueryAssociatedProductsForStoreIdAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, const char *storeId, XStoreProductKind productKinds, UINT32 maxItemsToRetrievePerPage, XAsyncBlock *async )
+ {
+     TRACE( "iface %p, storeContextHandle %p, storeId %s, async %p.\n", iface, storeContextHandle, debugstr_a( storeId ), async );
++    if (catalog_enabled())
++        return storeContextHandle ? catalog_begin(storeId,productKinds,TRUE,maxItemsToRetrievePerPage,NULL,0,NULL,0,async) : E_INVALIDARG;
+     return complete_empty_query( async );
+ }
+ 
+--- a/unixlib.h
++++ b/unixlib.h
+@@ -69,10 +69,20 @@
+     char token[XGR_LICENSE_TOKEN_MAX];
+ };
+ 
++#define XGR_CATALOG_MAX (8 * 1024 * 1024)
++struct store_catalog_params
++{
++    const void *request;
++    ULONG request_size;
++    void *response;
++    ULONG response_size;
++};
++
+ enum xgr_funcs
+ {
+     unix_xsts_token,
+     unix_license_token,
++    unix_store_catalog,
+     unix_funcs_count,
+ };
+ 
+--- a/unixlib.c
++++ b/unixlib.c
+@@ -31,6 +31,7 @@
+ #include <unistd.h>
+ #include <errno.h>
+ #include <poll.h>
++#include <fcntl.h>
+ #include <time.h>
+ #include <sys/socket.h>
+ #include <sys/un.h>
+@@ -463,10 +464,45 @@
+     return status;
+ }
+ 
++/* Separate bounded catalog framing leaves all released IPC messages intact. */
++static NTSTATUS store_catalog( void *args )
++{
++    struct store_catalog_params *params = args;
++    unsigned char header[8];
++    unsigned int size;
++    long long deadline = license_now_ms() + 50000;
++    int fd;
++    NTSTATUS status = STATUS_UNSUCCESSFUL;
++
++    params->response_size = 0;
++    if (!params->request_size || params->request_size > 24000 || !params->response)
++        return STATUS_INVALID_PARAMETER;
++    if ((fd = connect_service()) < 0) return STATUS_NOT_FOUND;
++    fcntl(fd,F_SETFL,fcntl(fd,F_GETFL) | O_NONBLOCK);
++    errno = 0;
++    header[0] = 'C'; header[1] = 'S'; header[2] = 'D'; header[3] = 'X';
++    size = params->request_size;
++    header[4] = size; header[5] = size >> 8; header[6] = size >> 16; header[7] = size >> 24;
++    if (!license_io( fd, header, 8, TRUE, deadline ) ||
++        !license_io( fd, (void *)params->request, size, TRUE, deadline ) ||
++        !license_io( fd, header, 8, FALSE, deadline )) goto done;
++    if (memcmp( header, "CSDX", 4 )) goto done;
++    size = header[4] | ((unsigned int)header[5] << 8) | ((unsigned int)header[6] << 16) | ((unsigned int)header[7] << 24);
++    if (size < 12 || size > XGR_CATALOG_MAX) goto done;
++    if (!license_io( fd, params->response, size, FALSE, deadline )) goto done;
++    params->response_size = size;
++    status = STATUS_SUCCESS;
++done:
++    if (status && errno == ETIMEDOUT) status = STATUS_IO_TIMEOUT;
++    close( fd );
++    return status;
++}
++
+ const unixlib_entry_t __wine_unix_call_funcs[] =
+ {
+     xsts_token,
+     license_token,
++    store_catalog,
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );

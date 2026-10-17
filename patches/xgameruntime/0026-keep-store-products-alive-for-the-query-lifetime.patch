@@ -1,0 +1,86 @@
+diff --git a/xstore.c b/xstore.c
+index d753831..1f4296f 100644
+--- a/xstore.c
++++ b/xstore.c
+@@ -54,8 +54,30 @@ struct x_store_license
+ struct x_store_product_query
+ {
+     BOOL has_current;
++    XStoreProduct product;
++    char store_id[64], title[256], description[512], language[32], empty[1];
+ };
+ 
++static void init_current_product( struct x_store_product_query *q )
++{
++    if (!xgr_config_element( "StoreId", q->store_id, sizeof(q->store_id) )) q->store_id[0] = 0;
++    if (!xgr_config_attr( "<ShellVisuals", " DefaultDisplayName=\"", q->title, sizeof(q->title) ) || !q->title[0])
++        strcpy( q->title, "Game" );
++    if (!xgr_config_attr( "<ShellVisuals", " Description=\"", q->description, sizeof(q->description) ) || !q->description[0])
++        strcpy( q->description, q->title );
++    strcpy( q->language, "en" );
++    q->product.storeId = q->store_id;
++    q->product.title = q->title;
++    q->product.description = q->description;
++    q->product.language = q->language;
++    q->product.inAppOfferToken = q->empty;
++    q->product.linkUri = q->empty;
++    q->product.price.currencyCode = q->empty;
++    q->product.productKind = XStoreProductKind_Game;
++    q->product.hasDigitalDownload = TRUE;
++    q->product.isInUserCollection = TRUE;
++}
++
+ /* Fill an XStoreGameLicense.skuStoreId from MicrosoftGame.config's StoreId, or
+  * a neutral placeholder. It only needs to be a stable, non-empty SKU string. */
+ static void store_sku_id( char *out, SIZE_T cap )
+@@ -83,6 +105,7 @@ static HRESULT complete_query( XAsyncBlock *async, BOOL with_current )
+         return S_OK;
+     }
+     q->has_current = with_current;
++    if (with_current) init_current_product( q );
+     xgr_async_complete( async, S_OK, q );
+     return S_OK;
+ }
+@@ -235,9 +258,6 @@ static HRESULT WINAPI x_store_XStoreQueryProductForPackageResult( IXStoreImpl6 *
+ static HRESULT WINAPI x_store_XStoreEnumerateProductsQuery( IXStoreImpl6 *iface, const XStoreProductQueryHandle productQueryHandle, void *context, XStoreProductQueryCallback *callback )
+ {
+     struct x_store_product_query *q = productQueryHandle;
+-    char store_id[64], title[256], description[512], language[32], empty[1];
+-    XStoreProduct product;
+-
+     TRACE( "iface %p, productQueryHandle %p, context %p, callback %p.\n", iface, productQueryHandle, context, callback );
+ 
+     if (!callback) return E_INVALIDARG;
+@@ -249,29 +269,9 @@ static HRESULT WINAPI x_store_XStoreEnumerateProductsQuery( IXStoreImpl6 *iface,
+      * their own licence to get this far. Nothing is claimed about add-ons;
+      * those really are unknown offline, and saying otherwise would be worse
+      * than saying nothing. */
+-    if (!xgr_config_element( "StoreId", store_id, sizeof(store_id) )) store_id[0] = 0;
+-    if (!xgr_config_attr( "<ShellVisuals", " DefaultDisplayName=\"", title, sizeof(title) ) || !title[0])
+-        strcpy( title, "Game" );
+-    if (!xgr_config_attr( "<ShellVisuals", " Description=\"", description, sizeof(description) ) || !description[0])
+-        strcpy( description, title );
+-    strcpy( language, "en" );
+-    empty[0] = 0;
+-
+-    memset( &product, 0, sizeof(product) );
+-    product.storeId = store_id;
+-    product.title = title;
+-    product.description = description;
+-    product.language = language;
+-    product.inAppOfferToken = empty;
+-    product.linkUri = empty;
+-    product.price.currencyCode = empty;
+-    product.productKind = XStoreProductKind_Game;
+-    product.hasDigitalDownload = TRUE;
+-    product.isInUserCollection = TRUE;
+-
+-    TRACE( "reporting the running game as a product: store %s, title %s\n",
+-           debugstr_a( store_id ), debugstr_a( title ) );
+-    callback( &product, context );
++    TRACE( "reporting the running game as a product: store %s, title %s (query-owned product)\n",
++           debugstr_a( q->store_id ), debugstr_a( q->title ) );
++    callback( &q->product, context );
+     return S_OK;
+ }
+ 

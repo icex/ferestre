@@ -61,6 +61,13 @@ Pronounced roughly *feh-RESS-treh*.
 
 ## Status
 
+Release **0.1.10** pairs with runtime **11.0.20261013.3**. Forza Horizon 6
+is playable, with shader startup, native PlayFab saves and Continue confirmed.
+Its marketplace is still under qualification. Dune: Awakening is marked
+playable from player confirmation. Game Pass tiers refresh independently of
+the catalog, and searches and paging include the full PC catalog.
+See [the release qualification](docs/RELEASE-0.1.10.md) for tested scope.
+
 Honest version, because this is early. Every row here was run on a real machine,
 not inferred from the fact that it downloaded:
 
@@ -68,11 +75,15 @@ not inferred from the fact that it downloaded:
 |---|---|---|
 | **Minecraft for Windows** (Bedrock) | Store | Playable. Signs in to Xbox Live, loads the profile, and **joins third-party servers from the in-game list** |
 | **Clair Obscur: Expedition 33** | Store / Game Pass | Playable — saves, video, full game |
+| **Retro Classics** | Game Pass | Playable — player-confirmed; needs a runtime with the allocator-lifetime and save-interface fixes |
+| **Hollow Knight: Silksong** | Game Pass | Playable — player-confirmed |
 | **DREDGE** | Game Pass | Playable |
 | **Stardew Valley** | Game Pass | Playable |
 | **DOOM 64** | Game Pass | Playable |
 | **Overthrown** | Game Pass | Playable |
-| **Goat Simulator 3** | Game Pass | Playable; online connectivity is being verified |
+| **Minecraft Dungeons II** | Game Pass Ultimate | Playable — sign-in and gameplay work; saving confirmed after finishing the tutorial |
+| **Halo Infinite** | Store / Game Pass Ultimate | Playable — campaign, training and multiplayer; intermittent offline display under investigation |
+| **Goat Simulator 3** | Game Pass | Playable — player-confirmed offline and online; saves resume; peer joining and voice untested |
 | **Age of Empires Definitive Edition** | Game Pass | Playable — boots, starts a custom game, and plays |
 | **Forza Horizon 5** | Store | Playable with restored Windows saves; Forza Online and the live Festival Playlist work |
 
@@ -95,6 +106,11 @@ sizes, lists what a Game Pass subscription includes, installs with a progress
 bar and a time remaining, detects updates, and launches. See
 [docs/ROADMAP.md](docs/ROADMAP.md) for what is still missing and
 [docs/RECIPES.md](docs/RECIPES.md) for doing any of it by hand.
+
+Active operations stay visible, and the top-right spinner's tooltip names the
+current task. Closing during a download or removal asks first: downloads stop
+and keep their game files for resuming, removals finish, and the window waits
+for cleanup before exiting.
 
 Two things the window is careful about, because both are easy to get wrong in a
 way that looks like it works. Titles whose package this runtime cannot open --
