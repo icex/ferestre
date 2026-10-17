@@ -343,7 +343,10 @@ pub fn cache_path(state_dir: &Path) -> PathBuf {
 pub fn save_cache(state_dir: &Path, entries: &[Entry]) -> anyhow::Result<()> {
     std::fs::create_dir_all(state_dir)?;
     let document = serde_json::json!({ "count": entries.len(), "items": entries });
-    std::fs::write(cache_path(state_dir), serde_json::to_vec_pretty(&document)?)?;
+    crate::cache::write(
+        &cache_path(state_dir),
+        &serde_json::to_vec_pretty(&document)?,
+    )?;
     Ok(())
 }
 

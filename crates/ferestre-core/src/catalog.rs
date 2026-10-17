@@ -581,7 +581,7 @@ impl Cache {
             schema: CACHE_SCHEMA,
             product: product.clone(),
         };
-        std::fs::write(path, serde_json::to_vec_pretty(&entry)?)?;
+        crate::cache::write(&path, &serde_json::to_vec_pretty(&entry)?)?;
         Ok(())
     }
 

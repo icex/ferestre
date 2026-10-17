@@ -304,7 +304,10 @@ pub fn save_cache(
         product_ids: product_ids.to_vec(),
         tiers: tiers.clone(),
     };
-    std::fs::write(cache_path(state_dir), serde_json::to_vec_pretty(&listing)?)?;
+    crate::cache::write(
+        &cache_path(state_dir),
+        &serde_json::to_vec_pretty(&listing)?,
+    )?;
     Ok(())
 }
 

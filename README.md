@@ -154,6 +154,20 @@ directly. Everything has to go through the client's `run` path.
 - Not upstreamable to Xodus: they operate a clean-room policy that excludes
   AI-assisted contributions, so this stays a downstream fork.
 
+## Library sizes and cached lists
+
+Every game row shows either measured disk usage for its game directory or the
+Store's PC download size. Wine prefixes and cached downloads are separate from
+the installed game total; unavailable sizes are labelled explicitly.
+
+Owned games, subscription access and the public Game Pass catalogue open from
+disk cache. Ownership checks are reused for five minutes and public Game Pass
+listings for 24 hours. The refresh button checks immediately. Account changes
+invalidate cached ownership, and a detected subscription change refreshes the
+Game Pass listing. Failed or interrupted refreshes preserve the last complete
+snapshot. Closing during a list/account/update refresh exits immediately;
+downloads still stop with cleanup, and removals finish before closing.
+
 ## Documentation
 
 - [docs/RECIPES.md](docs/RECIPES.md) — build the runtime, sign in, download a

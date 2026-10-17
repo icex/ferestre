@@ -45,6 +45,28 @@ impl Account {
     }
 }
 
+/// Public account metadata used to bind the cached library to its owner.
+/// Tokens remain exclusively in the client's keyring.
+pub fn cache_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("account.json")
+}
+
+pub fn load_cache(state_dir: &Path) -> Option<Account> {
+    parse(&std::fs::read_to_string(cache_path(state_dir)).ok()?).ok()
+}
+
+pub fn save_cache(state_dir: &Path, account: &Account) -> Result<()> {
+    crate::cache::write(&cache_path(state_dir), &serde_json::to_vec(account)?)
+}
+
+pub fn same_identity(left: &Account, right: &Account) -> bool {
+    if !left.xuid.is_empty() && !right.xuid.is_empty() {
+        left.xuid == right.xuid
+    } else {
+        left.gamertag == right.gamertag
+    }
+}
+
 /// Ask the client who is signed in. Fails when nobody is.
 pub fn command(xodus_cli: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(xodus_cli);

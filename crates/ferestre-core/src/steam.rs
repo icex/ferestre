@@ -230,6 +230,38 @@ pub struct Shortcut {
     pub icon: String,
 }
 
+/// A saved shortcut must survive unmounting an AppImage. The CLI inside the
+/// mount is suitable for immediate child processes, but not a Steam target.
+pub fn shortcut_program(appimage: Option<&std::ffi::OsStr>, cli: &Path) -> PathBuf {
+    appimage
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cli.to_path_buf())
+}
+
+#[cfg(test)]
+mod shortcut_program_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn persisted_target_uses_appimage_and_native_installs_use_the_cli() {
+        let cli = Path::new("/tmp/.mount_ferestre/usr/bin/ferestre");
+        let image = OsStr::new("/opt/My Games/Ferestre.AppImage");
+        let program = shortcut_program(Some(image), cli);
+        let shortcut = Shortcut::new(
+            "Game",
+            &program,
+            program.parent().unwrap(),
+            "run 9P5786PJB9RP",
+        );
+        assert_eq!(shortcut.exe, "\"/opt/My Games/Ferestre.AppImage\"");
+        assert_eq!(shortcut.start_dir, "\"/opt/My Games\"");
+        assert_eq!(shortcut_program(None, cli), cli);
+        assert_eq!(shortcut_program(Some(OsStr::new("")), cli), cli);
+    }
+}
+
 impl Shortcut {
     /// Steam stores `Exe` and `StartDir` quoted, and a path with a space in it
     /// silently fails to launch when they are not.

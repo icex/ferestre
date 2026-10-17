@@ -46,6 +46,7 @@ struct Ui {
     /// Set while a background task runs, so a second click cannot queue a
     /// duplicate sign-in or a duplicate library fetch.
     busy: Rc<RefCell<Option<String>>>,
+    wait_on_close: Rc<RefCell<bool>>,
     activity: gtk::Box,
     activity_title: gtk::Label,
     activity_detail: gtk::Label,
@@ -250,6 +251,7 @@ fn build_ui(app: &adw::Application) {
         search: search.clone(),
         spinner,
         busy: Rc::new(RefCell::new(None)),
+        wait_on_close: Rc::new(RefCell::new(false)),
         activity,
         activity_title,
         activity_detail,
@@ -303,7 +305,7 @@ fn build_ui(app: &adw::Application) {
             ui.scroll.vadjustment().set_value(0.0);
             render(&ui);
             if section == Section::GamePass {
-                refresh_entitlements(&ui);
+                refresh_entitlements(&ui, false);
             }
             refresh_updates(&ui);
         }
@@ -337,7 +339,7 @@ fn build_ui(app: &adw::Application) {
             // Reload means "check again", and the Game Pass catalogue is a
             // thing that changes without anything here doing so.
             fetch_gamepass(&ui, true);
-            refresh_entitlements(&ui);
+            refresh_entitlements(&ui, true);
         }
     ));
 
@@ -363,8 +365,8 @@ fn build_ui(app: &adw::Application) {
     }
 
     window.present();
-    refresh_entitlements(&ui);
-    fetch_gamepass(&ui, true);
+    refresh_entitlements(&ui, false);
+    fetch_gamepass(&ui, false);
     // Tier upgrades happen outside this window. Recheck without taking the
     // download's busy flag or touching its process.
     glib::timeout_add_seconds_local(
@@ -380,7 +382,7 @@ fn build_ui(app: &adw::Application) {
                 if !window.is_visible() {
                     return glib::ControlFlow::Break;
                 }
-                refresh_entitlements(&ui);
+                refresh_entitlements(&ui, false);
                 glib::ControlFlow::Continue
             }
         ),
@@ -643,7 +645,12 @@ fn draw_list(
     // be searchable, and learning their names must not depend on paging.
     let unnamed_off_page: Vec<String> = rows
         .iter()
-        .filter(|row| !row.is_named())
+        .filter(|row| {
+            !row.is_named()
+                || !model
+                    .catalog
+                    .contains_key(&row.product_id.to_ascii_uppercase())
+        })
         .map(|row| row.product_id.clone())
         .collect();
     let rows: Vec<LibraryRow> = rows.into_iter().filter(|row| keep(row)).collect();
@@ -757,6 +764,60 @@ fn render_gamepass(ui: &Ui, page: &gtk::Box) {
     );
 }
 
+/// Scan visible installed games off the GTK thread. Reload invalidates the
+/// totals, and a result from the previous generation cannot repopulate them.
+fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
+    let (generation, wanted) = {
+        let mut model = ui.model.borrow_mut();
+        let wanted: Vec<_> = rows
+            .iter()
+            .filter(|row| row.installed)
+            .filter_map(|row| {
+                let key = row.product_id.to_ascii_uppercase();
+                if model.disk_usage.contains_key(&key) || model.sizes_pending.contains(&key) {
+                    return None;
+                }
+                let dir = model.records.get(&key).map(|r| r.dir.clone()).or_else(|| {
+                    model
+                        .recipe_for(&row.product_id)
+                        .and_then(|recipe| model.game_dir(recipe))
+                });
+                model.sizes_pending.insert(key.clone());
+                Some((key, dir))
+            })
+            .collect();
+        (model.size_generation, wanted)
+    };
+    if wanted.is_empty() {
+        return;
+    }
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let scanned = gio::spawn_blocking(move || {
+            wanted
+                .into_iter()
+                .map(|(key, dir)| {
+                    let bytes = dir.and_then(|dir| ferestre_core::install::disk_usage(&dir));
+                    (key, bytes)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        if let Ok(scanned) = scanned {
+            let mut model = ui.model.borrow_mut();
+            if model.size_generation != generation {
+                return;
+            }
+            for (key, bytes) in scanned {
+                model.sizes_pending.remove(&key);
+                model.disk_usage.insert(key, bytes);
+            }
+            drop(model);
+            render(&ui);
+        }
+    });
+}
+
 fn render_rows(ui: &Ui, page: &gtk::Box, keep: impl Fn(&LibraryRow) -> bool, empty_message: &str) {
     let section = ui.model.borrow().section;
     let downloading = ui
@@ -775,6 +836,7 @@ fn render_rows(ui: &Ui, page: &gtk::Box, keep: impl Fn(&LibraryRow) -> bool, emp
     // Persist the clamped page. Otherwise Previous decrements a stale page
     // number and keeps showing the last page after the list shrinks.
     ui.model.borrow_mut().page = drawn.page;
+    fetch_disk_usage(ui, &drawn.rows);
 
     let group = adw::PreferencesGroup::builder().build();
     // Deliberately not an early return: an empty list is exactly when the
@@ -1031,6 +1093,32 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
         }
     }
     action_row.add_prefix(&icon);
+
+    let size_text = {
+        let model = ui.model.borrow();
+        let key = row.product_id.to_ascii_uppercase();
+        let download_id = row
+            .install_as
+            .as_ref()
+            .map(|(id, _)| id)
+            .unwrap_or(&row.product_id);
+        let download = model
+            .catalog
+            .get(&download_id.to_ascii_uppercase())
+            .and_then(|p| p.download_bytes);
+        model::game_size_label(row.installed, model.disk_usage.get(&key).copied(), download)
+    };
+    let size = gtk::Label::builder()
+        .label(&size_text)
+        .css_classes(["dim-label", "caption"])
+        .valign(gtk::Align::Center)
+        .build();
+    size.set_tooltip_text(Some(if row.installed {
+        "Allocated space used by the game directory; Wine prefix and download cache are separate"
+    } else {
+        "PC download size from the Microsoft Store; installed disk usage may differ"
+    }));
+    action_row.add_suffix(&size);
 
     if let Some((text, css)) = row.badge {
         let badge = gtk::Label::builder()
@@ -1289,9 +1377,9 @@ fn account_menu(ui: &Ui) {
             .tooltip_text(tooltip)
             .css_classes(["flat"])
             .build();
-        button.set_child(Some(
-            &gtk::Label::builder().label(label).xalign(0.0).build(),
-        ));
+        if let Some(label) = button.child().and_downcast::<gtk::Label>() {
+            label.set_xalign(0.0);
+        }
         button
     };
 
@@ -1433,6 +1521,7 @@ fn sign_out(ui: &Ui) {
                     model.entitlements_checked = false;
                     if let Some(paths) = model.paths.as_ref() {
                         let _ = std::fs::remove_file(library::cache_path(paths.state_dir()));
+                        let _ = std::fs::remove_file(account::cache_path(paths.state_dir()));
                     }
                 }
                 render(&ui);
@@ -1464,7 +1553,45 @@ fn cli_binary() -> PathBuf {
 /// Its own process group: `ferestre run` is a chain -- launcher, client, Proton,
 /// then the game -- and signalling only the process this window started would
 /// leave the game running with nothing tracking it.
+/// A GUI launch may have no terminal. Surface missing media dependencies in
+/// the window as well as in the CLI diagnostic, without delaying the launch.
+fn warn_about_media(ui: &Ui, product_id: &str) {
+    let runtime = {
+        let model = ui.model.borrow();
+        model.paths.as_ref().and_then(|paths| {
+            let recipe = model.recipe_for(product_id)?;
+            let inferred = ferestre_core::autofix::infer(recipe, model.game_dir(recipe).as_deref());
+            let selected = ferestre_core::runtime::selected(paths.config_dir(), product_id);
+            ferestre_core::runtime::select(
+                &inferred.recipe,
+                &model.runtimes,
+                selected.as_deref(),
+                model.registry.as_ref(),
+            )
+            .ok()
+            .map(|runtime| runtime.path.clone())
+        })
+    };
+    let Some(runtime) = runtime else {
+        return;
+    };
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let checked =
+            gio::spawn_blocking(move || ferestre_core::media::missing_libav_dependencies(&runtime))
+                .await;
+        if let Ok(Ok(missing)) = checked {
+            if !missing.is_empty() {
+                let message = format!("Videos may be black or silent: missing {}. Fedora: install compat-ffmpeg4 from RPM Fusion. Run ferestre doctor for details.", missing.join(", "));
+                ui.toasts
+                    .add_toast(adw::Toast::builder().title(&message).timeout(15).build());
+            }
+        }
+    });
+}
+
 fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
+    warn_about_media(ui, product_id);
     use std::os::unix::process::CommandExt;
 
     let program = cli_binary();
@@ -1693,6 +1820,7 @@ fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&str>, what:
     }
     let control = cancel::DownloadControl::default();
     *ui.download_control.borrow_mut() = Some(control.clone());
+    show_activity(ui);
     let program = cli_binary();
     let mut args = vec!["install".to_string(), product_id.to_string()];
     if let Some(dir) = dir.map(str::trim).filter(|d| !d.is_empty()) {
@@ -1788,11 +1916,13 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
         report_busy(ui);
         return;
     }
+    *ui.wait_on_close.borrow_mut() = args.first() == Some(&"uninstall");
     let program = cli_binary();
     let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     let runtime_install = owned == ["install-runtime"];
     let control = runtime_install.then(cancel::DownloadControl::default);
     *ui.download_control.borrow_mut() = control.clone();
+    show_activity(ui);
     let tick = if runtime_install {
         // A runtime archive is large and GitHub cannot provide a stable byte
         // total before the redirect. Keep progress visibly moving throughout
@@ -2111,7 +2241,7 @@ fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {
         return;
     }
 
-    let program = cli_binary();
+    let program = steam::shortcut_program(std::env::var_os("APPIMAGE").as_deref(), &cli_binary());
     let start_dir = program.parent().unwrap_or(Path::new("/")).to_path_buf();
     let shortcut = steam::Shortcut::new(name, &program, &start_dir, format!("run {product_id}"));
 
@@ -2152,6 +2282,7 @@ fn begin(ui: &Ui, what: &str) -> bool {
     if ui.busy.borrow().is_some() || *ui.closing.borrow() {
         return false;
     }
+    *ui.wait_on_close.borrow_mut() = false;
     *ui.busy.borrow_mut() = Some(what.to_string());
     ui.spinner.start();
     show_activity(ui);
@@ -2160,6 +2291,7 @@ fn begin(ui: &Ui, what: &str) -> bool {
 
 fn finish(ui: &Ui) {
     *ui.busy.borrow_mut() = None;
+    *ui.wait_on_close.borrow_mut() = false;
     *ui.download_control.borrow_mut() = None;
     ui.spinner.stop();
     show_activity(ui);
@@ -2195,6 +2327,8 @@ fn show_activity(ui: &Ui) {
         "Stopping the download and cleaning up. The window will stay open when cleanup finishes."
     } else if closing {
         "Finishing this operation. Ferestre will close when it is safe."
+    } else if !*ui.wait_on_close.borrow() && ui.download_control.borrow().is_none() {
+        "You can close the window while this refresh runs. Cached lists are kept."
     } else {
         "Please wait for this to finish before starting another operation."
     };
@@ -2220,6 +2354,9 @@ fn request_close(ui: &Ui) -> glib::Propagation {
     let Some(what) = ui.busy.borrow().clone() else {
         return glib::Propagation::Proceed;
     };
+    if !*ui.wait_on_close.borrow() && ui.download_control.borrow().is_none() {
+        return glib::Propagation::Proceed;
+    }
     if *ui.closing.borrow() || ui.close_dialog_open.replace(true) {
         return glib::Propagation::Stop;
     }
@@ -2325,11 +2462,26 @@ fn refresh_account(ui: &Ui) {
         if let Ok(Some((account, avatar))) = result {
             {
                 let mut model = ui.model.borrow_mut();
+                let changed = model
+                    .account
+                    .as_ref()
+                    .map_or(true, |previous| !account::same_identity(previous, &account));
+                if changed {
+                    model.ownership = Ownership::Unknown;
+                    model.subscriptions.clear();
+                    model.entitlements_checked = false;
+                    if let Some(paths) = model.paths.as_ref() {
+                        let _ = std::fs::remove_file(library::cache_path(paths.state_dir()));
+                    }
+                }
+                if let Some(paths) = model.paths.as_ref() {
+                    let _ = account::save_cache(paths.state_dir(), &account);
+                }
                 model.account = Some(account);
                 model.avatar = avatar;
             }
-            render_account_button(&ui);
-            refresh_entitlements(&ui);
+            render(&ui);
+            refresh_entitlements(&ui, false);
         }
     });
 }
@@ -2383,7 +2535,20 @@ fn refresh_updates(ui: &Ui) {
 
 /// Read account access independently of downloads and catalogue artwork.
 /// A failed request retains the last successful snapshot.
-fn refresh_entitlements(ui: &Ui) {
+fn refresh_entitlements(ui: &Ui, force: bool) {
+    if !force {
+        let model = ui.model.borrow();
+        if model.entitlements_checked
+            && model.paths.as_ref().is_some_and(|p| {
+                ferestre_core::cache::is_fresh(
+                    &library::cache_path(p.state_dir()),
+                    ferestre_core::cache::LIBRARY_MAX_AGE,
+                )
+            })
+        {
+            return;
+        }
+    }
     if (ui.busy.borrow().is_some() && ui.download.current.borrow().is_none())
         || *ui.fetching_entitlements.borrow()
     {
@@ -2421,14 +2586,17 @@ fn refresh_entitlements(ui: &Ui) {
             if ui.model.borrow().account != account {
                 return;
             }
-            let changed = {
+            let (changed, subscriptions_changed) = {
                 let model = ui.model.borrow();
-                !model.entitlements_checked || model.ownership != Ownership::Known(entries.clone())
+                (
+                    model.ownership != Ownership::Known(entries.clone()),
+                    model.subscriptions != gamepass::active(&entries),
+                )
             };
             let _ = ferestre_core::library::save_cache(&state_dir, &entries);
             ui.model.borrow_mut().set_ownership(entries);
             if changed {
-                fetch_gamepass(&ui, true);
+                fetch_gamepass(&ui, subscriptions_changed);
                 render(&ui);
             }
         }
@@ -2562,7 +2730,15 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
             !model.gamepass.is_empty() && !model.tiers.included.is_empty(),
         )
     };
-    if have && !force {
+    if have
+        && !force
+        && paths.as_ref().is_some_and(|dir| {
+            ferestre_core::cache::is_fresh(
+                &gamepass::cache_path(dir),
+                ferestre_core::cache::GAMEPASS_MAX_AGE,
+            )
+        })
+    {
         return;
     }
     // Not the `busy` flag: this is a background list, and holding the window's
@@ -2719,6 +2895,9 @@ mod catalog_regressions {
             runtimes: Vec::new(),
             registry: None,
             records: BTreeMap::new(),
+            disk_usage: BTreeMap::new(),
+            sizes_pending: Default::default(),
+            size_generation: 0,
             installed_products: Default::default(),
             ownership: Ownership::Unknown,
             catalog: BTreeMap::new(),

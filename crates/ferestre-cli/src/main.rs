@@ -634,6 +634,15 @@ fn cmd_run(
     }
     start_service(&dirs, service_socket.as_deref())?;
 
+    if let Ok(missing) = ferestre_core::media::missing_libav_dependencies(&dirs.proton_dir) {
+        if !missing.is_empty() {
+            eprintln!(
+                "-- videos may be black or silent: missing {}. {}",
+                missing.join(", "),
+                ferestre_core::media::DEPENDENCY_HINT
+            );
+        }
+    }
     run_teed(plan.to_command(), &launch::log_path(recipe, &dirs))
 }
 
@@ -1902,6 +1911,23 @@ fn doctor_checks(paths: &Paths) -> Vec<Check> {
     match InstalledRuntime::discover(paths) {
         Ok(rt) => {
             checks.push(Check::ok("runtime", "patched Proton").with_detail(rt.label()));
+            checks.push(
+                match ferestre_core::media::missing_libav_dependencies(&rt.path) {
+                    Ok(missing) if missing.is_empty() => {
+                        Check::ok("media", "GStreamer libav dependencies available")
+                    }
+                    Ok(missing) => Check::warn(
+                        "media",
+                        "videos may be black or silent: missing media libraries",
+                    )
+                    .with_detail(missing.join(", "))
+                    .with_hint(ferestre_core::media::DEPENDENCY_HINT),
+                    Err(error) => {
+                        Check::warn("media", "could not check GStreamer libav dependencies")
+                            .with_detail(error.to_string())
+                    }
+                },
+            );
             // Spelled out rather than imported: the registry name is the
             // stable thing, and the constant holding it in core is private.
             checks.push(if rt.provides("loader.memfd-main-image") {

@@ -210,6 +210,30 @@ pub fn tree_size(dir: &Path) -> u64 {
         .sum()
 }
 
+/// Allocated bytes for game files, without following symlinks or counting a
+/// hardlinked inode twice. Unlike file lengths, this handles sparse packages.
+/// An unreadable tree has no trustworthy total.
+pub fn disk_usage(dir: &Path) -> Option<u64> {
+    use std::collections::BTreeSet;
+    use std::os::unix::fs::MetadataExt;
+
+    fn walk(path: &Path, seen: &mut BTreeSet<(u64, u64)>) -> Option<u64> {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if metadata.file_type().is_symlink() || !seen.insert((metadata.dev(), metadata.ino())) {
+            return Some(0);
+        }
+        let mut bytes = metadata.blocks().saturating_mul(512);
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(path).ok()? {
+                bytes = bytes.saturating_add(walk(&entry.ok()?.path(), seen)?);
+            }
+        }
+        Some(bytes)
+    }
+
+    walk(&dir.canonicalize().ok()?, &mut BTreeSet::new())
+}
+
 /// An RFC 3339 timestamp for now, in UTC.
 ///
 /// Written by hand rather than by pulling in a date crate, because the only
@@ -510,6 +534,23 @@ mod tests {
 
     /// The guard on the one irreversible thing here. A record is a JSON file
     /// anybody can edit, so the path in it is checked rather than trusted.
+    #[test]
+    fn disk_usage_counts_allocations_once_and_does_not_follow_links() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let dir = std::env::temp_dir().join(format!("ferestre-allocated-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = std::fs::File::create(dir.join("sparse")).unwrap();
+        file.set_len(1_000_000_000).unwrap();
+        std::fs::hard_link(dir.join("sparse"), dir.join("hardlink")).unwrap();
+        symlink("/", dir.join("outside")).unwrap();
+        let expected = std::fs::metadata(&dir).unwrap().blocks() * 512
+            + file.metadata().unwrap().blocks() * 512;
+        assert_eq!(disk_usage(&dir), Some(expected));
+        assert!(disk_usage(&dir).unwrap() < 1_000_000_000);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(disk_usage(&dir), None);
+    }
+
     #[test]
     fn shallow_paths_and_symlinks_are_refused() {
         assert!(safe_to_remove(Path::new("/")).is_err());

@@ -29,7 +29,7 @@ trap cleanup EXIT
 say() { printf '\033[1m:: %s\033[0m\n' "$*"; }
 fail() { printf '\033[31m!! %s\033[0m\n' "$*" >&2; exit 1; }
 
-DLL=$OBJ/dlls/gameinput/x86_64-windows/gameinput.dll
+DLL=${GAMEINPUT_DLL:-$OBJ/dlls/gameinput/x86_64-windows/gameinput.dll}
 
 if [ "${REBUILD:-0}" != "0" ]; then
     say "rebuilding gameinput.dll"
@@ -66,8 +66,16 @@ echo
 say "running enabled (WINE_GAMEINPUT=1)"
 WINE_GAMEINPUT=1 run "$WORK/gameinput_tests.exe" enabled | tee "$WORK/enabled.txt"
 
+say "compiling the deterministic XInput backend and gamepad probe"
+"$INCUBE" x86_64-w64-mingw32-gcc -O1 -shared -o "$WORK/xinput1_3.dll" "$REPO_DIR/tests/xinput_fixture.c" \
+    || fail "XInput fixture did not build"
+"$INCUBE" x86_64-w64-mingw32-gcc -O1 -o "$WORK/gameinput_gamepad_tests.exe" "$REPO_DIR/tests/gameinput_gamepad_tests.c" \
+    -I"$OBJ/include" -I"$WINE_SRC/include" -luuid || fail "gamepad probe did not build"
+say "running connected gamepad enumeration, input and rumble"
+WINE_GAMEINPUT=1 WINEDLLOVERRIDES=xinput1_3=n run "$WORK/gameinput_gamepad_tests.exe" | tee "$WORK/gamepad.txt"
+
 echo
-if grep -q "^PASSED" "$WORK/gated.txt" && grep -q "^PASSED" "$WORK/enabled.txt"; then
+if grep -q "^PASSED" "$WORK/gated.txt" && grep -q "^PASSED" "$WORK/enabled.txt" && grep -q "^PASSED" "$WORK/gamepad.txt"; then
     printf '\033[32m==> ALL GAMEINPUT TESTS PASSED\033[0m\n'
     exit 0
 fi

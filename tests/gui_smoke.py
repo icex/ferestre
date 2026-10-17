@@ -27,6 +27,9 @@ import json
 import os
 import re
 import shutil
+import shlex
+import http.server
+import threading
 import subprocess
 import sys
 import tempfile
@@ -315,6 +318,8 @@ def press(node, pid):
     box = node.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
     x = origin_x + box.x + box.width // 2
     y = origin_y + box.y + box.height // 2
+    Atspi.generate_mouse_event(x, y, "abs")
+    time.sleep(0.15)
     Atspi.generate_mouse_event(x, y, "b1c")
 
 
@@ -669,7 +674,8 @@ if sys.argv[1:2] == ["uninstall"]:
 if sys.argv[1:2] == ["run"]:
     # Long enough that starting and exiting are separate redraws, as they are
     # for a real title: each one rebuilds the row the person just clicked.
-    time.sleep(2)
+    (home / "run-started").touch()
+    time.sleep(4)
     sys.exit(0)
 if sys.argv[1:2] != ["install"]:
     sys.exit(0)
@@ -699,6 +705,17 @@ print(":: done", flush=True)
 """
         )
     os.chmod(stub, 0o755)
+
+    # The mount-local CLI is fine for children; a saved Steam target must use
+    # APPIMAGE. Spaces exercise Steam's quoted Exe/StartDir fields as well.
+    image = os.path.join(home, "My Games", "Ferestre.AppImage")
+    os.makedirs(os.path.dirname(image))
+    with open(image, "w") as f:
+        f.write("#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+    os.chmod(image, 0o755)
+    env["APPIMAGE"] = image
+    shortcuts = os.path.join(home, "steam", "userdata", "1", "config", "shortcuts.vdf")
+    os.makedirs(os.path.dirname(shortcuts))
 
     gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     deadline = time.monotonic() + TIMEOUT
@@ -872,6 +889,9 @@ print(":: done", flush=True)
         select_in_list(frame, "Library")
         wait_for(frame, lambda root: "Minecraft for Windows" in texts(root), "return to library", time.monotonic() + TIMEOUT)
 
+        labels = texts(frame)
+        check(any("on disk" in t for t in labels), "installed rows show measured disk usage in Library", frame)
+        check("12.5 GB download" in labels, "catalog rows show a separate download size label", frame)
         print("installing asks before it downloads")
         install = row_button(frame, "Smoke Test Racer", "Install")
         check(install is not None, "an owned MSIXVC title offers an install", frame)
@@ -1031,6 +1051,7 @@ print(":: done", flush=True)
             frame,
         )
 
+        check("8.1 GB download" in labels, "Game Pass rows carry the same size label", frame)
         print("a download says how far, how fast and how long")
         select_in_list(frame, "Library")
         wait_for(
@@ -1123,6 +1144,19 @@ print(":: done", flush=True)
             f"and an Add to Steam ({len(steam)} for {recipe_count} recipes)",
             frame,
         )
+        click(steam[0])
+        wait_for(frame, lambda root: os.path.isfile(shortcuts),
+                 "the saved Steam shortcut", time.monotonic() + TIMEOUT)
+        with open(shortcuts, "rb") as f:
+            shortcut_bytes = f.read()
+
+        def shortcut_string(key):
+            return shortcut_bytes.split(b"\x01" + key.encode() + b"\0", 1)[1].split(b"\0", 1)[0].decode()
+
+        check(shortcut_string("Exe") == f'"{image}"', "Steam target is the persistent AppImage", frame)
+        check(shortcut_string("StartDir") == f'"{os.path.dirname(image)}"', "Steam start directory is persistent", frame)
+        saved_options = shortcut_string("LaunchOptions")
+        check(saved_options.startswith("run "), "Steam shortcut keeps the title launch options", frame)
         click(edit[0])
         labels = wait_for(
             frame,
@@ -1221,6 +1255,9 @@ print(":: done", flush=True)
         click_named(frame, "Refresh library, subscriptions and catalogue")
         select_in_list(frame, "Installed")
         time.sleep(0.5)
+        wait_for(frame, lambda root: any("on disk" in t for t in texts(root)),
+                 "measured disk usage in Installed", time.monotonic() + TIMEOUT)
+        check(True, "Installed rows show disk usage too")
         wait_for(frame, lambda root: not any("Checking for game updates" in t for t in texts(root)),
                  "the automatic update check to finish", time.monotonic() + TIMEOUT)
         remove = wait_for(
@@ -1273,6 +1310,14 @@ print(":: done", flush=True)
         check(gui.wait(timeout=TIMEOUT) == 0, "the app closes after removal finishes")
         check(os.path.exists(os.path.join(home, "removal-finished")), "removal completed before exit")
         stderr_before_restart = gui.stderr.read()
+        # Simulate the mount-local CLI disappearing once the GUI exits.
+        os.rename(stub, stub + ".unmounted")
+        launched = subprocess.run([image, *shlex.split(saved_options)], env=env,
+                                  capture_output=True, text=True, check=True)
+        check(json.loads(launched.stdout) == shlex.split(saved_options),
+              "saved shortcut launches after the GUI and its inner CLI are gone")
+        os.rename(stub + ".unmounted", stub)
+
 
         print("download cancellation waits for cleanup")
         open(os.path.join(home, "hold-download"), "w").close()
@@ -1309,6 +1354,89 @@ print(":: done", flush=True)
         open(os.path.join(home, "release-cleanup"), "w").close()
         check(gui.wait(timeout=TIMEOUT) == 0, "the app closes after download cleanup")
         check(os.path.exists(os.path.join(home, "download-stopped")), "download cleanup completed before exit")
+        print("cached lists survive restarts; refreshing lists never blocks close")
+        # Count requests at a refused local proxy: a fresh cached catalogue must
+        # not be fetched at startup, even when account metadata is refreshed.
+        class CountingProxy(http.server.BaseHTTPRequestHandler):
+            requests = []
+            def do_CONNECT(self):
+                self.requests.append(self.path)
+                self.send_error(502)
+            def log_message(self, *args):
+                pass
+        proxy = http.server.ThreadingHTTPServer(("127.0.0.1", 0), CountingProxy)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        proxy_url = f"http://127.0.0.1:{proxy.server_port}"
+        for variable in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+            env[variable] = proxy_url
+        client_dir = os.path.join(home, "client")
+        os.makedirs(client_dir, exist_ok=True)
+        fixture_account = {"gamertag": "Fixture Player", "xuid": "fixture-player"}
+        for filename in (os.path.join(state, "account.json"), os.path.join(home, "client-account.json")):
+            with open(filename, "w") as f:
+                json.dump(fixture_account, f)
+        client = os.path.join(client_dir, "xodus-cli")
+        with open(client, "w") as f:
+            f.write("""#!/usr/bin/env python3
+import json, os, sys, time
+from pathlib import Path
+home = Path(os.environ['HOME'])
+with (home / 'client-calls').open('a') as log:
+    log.write(sys.argv[1] + '\\n')
+if sys.argv[1] == 'account':
+    print((home / 'client-account.json').read_text())
+elif sys.argv[1] == 'library':
+    (home / 'refresh-started').touch()
+    (home / 'refresh-child-pid').write_text(str(os.getpid()))
+    while (home / 'hold-refresh').exists():
+        time.sleep(.05)
+    print(json.dumps({'items': [{'productId': '9ZZSMOKEGAME', 'productType': 'Game', 'status': 'Active'}]}))
+""")
+        os.chmod(client, 0o755)
+        for filename in ("library.json", "gamepass.json"):
+            os.utime(os.path.join(state, filename), None)
+        cached_library = open(os.path.join(state, "library.json"), "rb").read()
+        gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        app = find_app(gui.pid, time.monotonic() + TIMEOUT)
+        frame = wait_for(app, lambda root: next(iter(find_all(root, role="frame")), None),
+                         "cached restart window", time.monotonic() + TIMEOUT)
+        wait_for(frame, lambda root: "Fixture Player" in texts(root), "cached account identity", time.monotonic() + TIMEOUT)
+        time.sleep(1)
+        calls = open(os.path.join(home, "client-calls")).read().splitlines()
+        check("account" in calls and "library" not in calls, "fresh cached ownership is reused across app loads")
+        check(not any("catalog.gamepass.com" in request for request in CountingProxy.requests),
+              "fresh Game Pass listing is not fetched again on startup")
+        check(open(os.path.join(state, "library.json"), "rb").read() == cached_library,
+              "unchanged startup preserves the cached game list")
+        # Request an actual library refresh and hold its child, then close.
+        open(os.path.join(home, "hold-refresh"), "w").close()
+        click(find_all(frame, role="button", name_contains="Fixture Player")[0])
+        wait_for(frame, lambda root: bool(find_all(root, role="button", name="Reload library")),
+                 "the account menu", time.monotonic() + TIMEOUT)
+        click_named(frame, "Reload library")
+        wait_for(frame, lambda root: os.path.exists(os.path.join(home, "refresh-started")),
+                 "a list refresh to start", time.monotonic() + TIMEOUT)
+        click_named(frame, "Close")
+        check(gui.wait(timeout=5) == 0, "closing during list refresh exits immediately without Finish and Close")
+        check(open(os.path.join(state, "library.json"), "rb").read() == cached_library,
+              "closing an unfinished refresh retains the last complete cache")
+        os.unlink(os.path.join(home, "hold-refresh"))
+        # An external account change must bypass a still-fresh ownership
+        # cache. Its public catalogue remains reusable across accounts.
+        with open(os.path.join(home, "client-account.json"), "w") as f:
+            json.dump({"gamertag": "Other Fixture Player", "xuid": "other-fixture-player"}, f)
+        gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        app = find_app(gui.pid, time.monotonic() + TIMEOUT)
+        frame = wait_for(app, lambda root: next(iter(find_all(root, role="frame")), None),
+                         "account change window", time.monotonic() + TIMEOUT)
+        wait_for(frame, lambda root: any("Other Fixture Player" in t for t in texts(root)),
+                 "changed account metadata", time.monotonic() + TIMEOUT)
+        wait_for(frame, lambda root: json.load(open(os.path.join(state, "library.json"))).get("count") == 1,
+                 "ownership to refresh for the new account", time.monotonic() + TIMEOUT)
+        check(True, "switching accounts invalidates fresh cached ownership")
+        click_named(frame, "Close")
+        check(gui.wait(timeout=5) == 0, "the account-change window closes normally")
+        proxy.shutdown()
         if b"panicked" in stderr_before_restart:
             failures.append("the first window panicked")
 
@@ -1320,6 +1448,10 @@ print(":: done", flush=True)
         # Release only this fixture's workers, even if an assertion failed.
         for gate in ("release-removal", "release-cleanup"):
             open(os.path.join(home, gate), "w").close()
+        try:
+            os.unlink(os.path.join(home, "hold-refresh"))
+        except FileNotFoundError:
+            pass
         gui.terminate()
         try:
             gui.wait(timeout=5)

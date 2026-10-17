@@ -508,6 +508,27 @@ fn plural(count: usize, noun: &str) -> String {
     }
 }
 
+/// Sizes stay separate from compatibility and version messages, in every
+/// section. A catalog download size is never presented as measured disk use.
+pub fn game_size_label(
+    installed: bool,
+    measured: Option<Option<u64>>,
+    download: Option<u64>,
+) -> String {
+    if installed {
+        match measured {
+            Some(Some(bytes)) => format!("{} on disk", ferestre_core::human_bytes(bytes)),
+            Some(None) => "Disk usage unavailable".to_string(),
+            None => "Measuring disk usage…".to_string(),
+        }
+    } else {
+        match download.filter(|bytes| *bytes > 0) {
+            Some(bytes) => format!("{} download", ferestre_core::human_bytes(bytes)),
+            None => "Size unavailable".to_string(),
+        }
+    }
+}
+
 /// One row of the library: something owned, something described, or both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryRow {

@@ -78,6 +78,9 @@ pub struct Model {
     pub runtimes: Vec<InstalledRuntime>,
     pub registry: Option<Registry>,
     pub records: BTreeMap<String, Record>,
+    pub disk_usage: BTreeMap<String, Option<u64>>,
+    pub sizes_pending: BTreeSet<String>,
+    pub size_generation: u64,
     /// Store product ids read from package metadata below `games_dir`. This is
     /// separate from records because a title can have been installed before
     /// Ferestre existed, or live in a human-named directory.
@@ -237,6 +240,10 @@ impl Model {
             );
         }
 
+        let account = paths
+            .as_ref()
+            .and_then(|p| ferestre_core::account::load_cache(p.state_dir()));
+        let entitlements_checked = ownership.is_known();
         Model {
             paths,
             recipes,
@@ -244,16 +251,19 @@ impl Model {
             runtimes,
             registry,
             records,
+            disk_usage: BTreeMap::new(),
+            sizes_pending: BTreeSet::new(),
+            size_generation: 0,
             installed_products,
             ownership,
             catalog,
             icons,
             available: BTreeMap::new(),
-            account: None,
+            account,
             avatar,
             gamepass,
             subscriptions,
-            entitlements_checked: false,
+            entitlements_checked,
             tiers,
             section: Section::Library,
             query: String::new(),
@@ -270,6 +280,7 @@ impl Model {
     pub fn reload(&mut self) {
         let fresh = Model::load();
         *self = Model {
+            size_generation: self.size_generation.wrapping_add(1),
             ownership: std::mem::take(&mut self.ownership),
             catalog: std::mem::take(&mut self.catalog),
             icons: std::mem::take(&mut self.icons),

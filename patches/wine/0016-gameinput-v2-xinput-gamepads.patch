@@ -1,0 +1,295 @@
+diff --git a/dlls/gameinput/gameinput.c b/dlls/gameinput/gameinput.c
+index d342bc9..860f349 100644
+--- a/dlls/gameinput/gameinput.c
++++ b/dlls/gameinput/gameinput.c
+@@ -27,6 +27,7 @@
+ #include "devfiltertypes.h"
+ #include "devquery.h"
+ #include "hidusage.h"
++#include "xinput.h"
+ #include "ddk/hidsdi.h"
+ 
+ #include "initguid.h"
+@@ -737,7 +738,7 @@ static HRESULT create_dispatcher( IGameInputDispatcher **out )
+  * that initialises its input through GameInput waits for a keyboard and mouse
+  * to be enumerated before it leaves its loading screen (Minecraft sits at 41%
+  * forever otherwise). Present one of each as always-connected devices of the
+- * built-in (I8042) family. Readings are not produced yet. */
++ * built-in (I8042) family. XInput gamepads use the same v2 device interface. */
+ struct virtual_device
+ {
+     IGameInputDevice_v2 IGameInputDevice_v2_iface;
+@@ -746,6 +747,8 @@ struct virtual_device
+     GameInputDeviceInfo_v2 info;
+     GameInputKeyboardInfo_v2 keyboard;
+     GameInputMouseInfo_v2 mouse;
++    GameInputGamepadInfo_v2 gamepad;
++    DWORD xinput_index;
+ };
+ 
+ static struct virtual_device *impl_from_IGameInputDevice_v2( IGameInputDevice_v2 *iface )
+@@ -798,7 +801,12 @@ static HRESULT WINAPI virtual_device_GetHapticInfo( IGameInputDevice_v2 *iface,
+ 
+ static GameInputDeviceStatus WINAPI virtual_device_GetDeviceStatus( IGameInputDevice_v2 *iface )
+ {
++    struct virtual_device *device = impl_from_IGameInputDevice_v2( iface );
++    XINPUT_STATE state;
++
+     TRACE( "iface %p.\n", iface );
++    if (device->kind == GameInputKindGamepad && XInputGetState( device->xinput_index, &state ))
++        return GameInputDeviceNoStatus;
+     return GameInputDeviceConnected | GameInputDeviceInputEnabled;
+ }
+ 
+@@ -822,6 +830,16 @@ static void WINAPI virtual_device_SetForceFeedbackMotorGain( IGameInputDevice_v2
+ 
+ static void WINAPI virtual_device_SetRumbleState( IGameInputDevice_v2 *iface, const GameInputRumbleParams *params )
+ {
++    struct virtual_device *device = impl_from_IGameInputDevice_v2( iface );
++    XINPUT_VIBRATION vibration = {0};
++
++    if (device->kind != GameInputKindGamepad) return;
++    if (params)
++    {
++        vibration.wLeftMotorSpeed = max( 0.0f, min( 1.0f, params->lowFrequency ) ) * 65535;
++        vibration.wRightMotorSpeed = max( 0.0f, min( 1.0f, params->highFrequency ) ) * 65535;
++    }
++    XInputSetState( device->xinput_index, &vibration );
+ }
+ 
+ static HRESULT WINAPI virtual_device_DirectInputEscape( IGameInputDevice_v2 *iface, uint32_t command, const void *input,
+@@ -849,7 +867,20 @@ static const IGameInputDevice_v2Vtbl virtual_device_vtbl =
+ 
+ static struct virtual_device virtual_keyboard = { {&virtual_device_vtbl}, 1, GameInputKindKeyboard };
+ static struct virtual_device virtual_mouse    = { {&virtual_device_vtbl}, 1, GameInputKindMouse };
+-static struct virtual_device *virtual_devices[] = { &virtual_keyboard, &virtual_mouse };
++/* Use Wine's XInput backend: it already maps HID/SDL pads, including Steam
++ * Input's virtual Xbox pad. Do not enumerate a second copy through DevQuery. */
++static struct virtual_device virtual_gamepads[XUSER_MAX_COUNT] =
++{
++    { {&virtual_device_vtbl}, 1, GameInputKindGamepad },
++    { {&virtual_device_vtbl}, 1, GameInputKindGamepad },
++    { {&virtual_device_vtbl}, 1, GameInputKindGamepad },
++    { {&virtual_device_vtbl}, 1, GameInputKindGamepad },
++};
++static struct virtual_device *virtual_devices[] =
++{
++    &virtual_keyboard, &virtual_mouse,
++    &virtual_gamepads[0], &virtual_gamepads[1], &virtual_gamepads[2], &virtual_gamepads[3],
++};
+ 
+ static void virtual_device_init( struct virtual_device *device, const char *name, BYTE id_byte, uint16_t usage_id )
+ {
+@@ -874,7 +905,7 @@ static void virtual_device_init( struct virtual_device *device, const char *name
+         device->keyboard.maxSimultaneousKeys = 6;
+         info->keyboardInfo = &device->keyboard;
+     }
+-    else
++    else if (device->kind == GameInputKindMouse)
+     {
+         device->mouse.supportedButtons = GameInputMouseLeftButton | GameInputMouseRightButton | GameInputMouseMiddleButton |
+                                          GameInputMouseButton4 | GameInputMouseButton5;
+@@ -888,9 +919,34 @@ static void virtual_device_init( struct virtual_device *device, const char *name
+ static void virtual_devices_init( void )
+ {
+     static BOOL done;
++    unsigned int i;
++
+     if (done) return;
+     virtual_device_init( &virtual_keyboard, "Keyboard", 0x4b, HID_USAGE_GENERIC_KEYBOARD );
+     virtual_device_init( &virtual_mouse, "Mouse", 0x4d, HID_USAGE_GENERIC_MOUSE );
++    for (i = 0; i < ARRAY_SIZE(virtual_gamepads); i++)
++    {
++        struct virtual_device *device = &virtual_gamepads[i];
++        virtual_device_init( device, "XInput Gamepad", 0x50 + i, HID_USAGE_GENERIC_GAMEPAD );
++        device->xinput_index = i;
++        device->info.deviceFamily = GameInputFamilyXbox360;
++        device->info.gamepadInfo = &device->gamepad;
++        device->gamepad.menuButtonLabel = GameInputLabelXboxMenu;
++        device->gamepad.viewButtonLabel = GameInputLabelXboxView;
++        device->gamepad.aButtonLabel = GameInputLabelXboxA;
++        device->gamepad.bButtonLabel = GameInputLabelXboxB;
++        device->gamepad.xButtonLabel = GameInputLabelXboxX;
++        device->gamepad.yButtonLabel = GameInputLabelXboxY;
++        device->gamepad.dpadUpLabel = GameInputLabelXboxDPadUp;
++        device->gamepad.dpadDownLabel = GameInputLabelXboxDPadDown;
++        device->gamepad.dpadLeftLabel = GameInputLabelXboxDPadLeft;
++        device->gamepad.dpadRightLabel = GameInputLabelXboxDPadRight;
++        device->gamepad.leftShoulderButtonLabel = GameInputLabelXboxLeftShoulder;
++        device->gamepad.rightShoulderButtonLabel = GameInputLabelXboxRightShoulder;
++        device->gamepad.leftThumbstickButtonLabel = GameInputLabelXboxLeftStickButton;
++        device->gamepad.rightThumbstickButtonLabel = GameInputLabelXboxRightStickButton;
++        device->info.supportedRumbleMotors = GameInputRumbleLowFrequency | GameInputRumbleHighFrequency;
++    }
+     done = TRUE;
+ }
+ 
+@@ -901,6 +957,8 @@ struct virtual_reading
+     IGameInputReading_v2 IGameInputReading_v2_iface;
+     LONG refcount;
+     struct virtual_device *device;
++    XINPUT_STATE xinput;
++    uint64_t timestamp;
+ };
+ 
+ static struct virtual_reading *impl_from_IGameInputReading_v2( IGameInputReading_v2 *iface )
+@@ -932,8 +990,10 @@ static ULONG WINAPI virtual_reading_AddRef( IGameInputReading_v2 *iface )
+ 
+ static ULONG WINAPI virtual_reading_Release( IGameInputReading_v2 *iface )
+ {
+-    /* static objects, never freed */
+-    return InterlockedDecrement( &impl_from_IGameInputReading_v2( iface )->refcount );
++    struct virtual_reading *reading = impl_from_IGameInputReading_v2( iface );
++    ULONG ref = InterlockedDecrement( &reading->refcount );
++    if (!ref && reading->device->kind == GameInputKindGamepad) free( reading );
++    return ref;
+ }
+ 
+ static GameInputKind WINAPI virtual_reading_GetInputKind( IGameInputReading_v2 *iface )
+@@ -943,7 +1003,8 @@ static GameInputKind WINAPI virtual_reading_GetInputKind( IGameInputReading_v2 *
+ 
+ static uint64_t WINAPI virtual_reading_GetTimestamp( IGameInputReading_v2 *iface )
+ {
+-    return GetTickCount64() * 1000;
++    struct virtual_reading *reading = impl_from_IGameInputReading_v2( iface );
++    return reading->device->kind == GameInputKindGamepad ? reading->timestamp : GetTickCount64() * 1000;
+ }
+ 
+ static void WINAPI virtual_reading_GetDevice( IGameInputReading_v2 *iface, IGameInputDevice_v2 **device )
+@@ -1151,7 +1212,41 @@ static bool WINAPI virtual_reading_GetMouseState( IGameInputReading_v2 *iface, G
+ static bool WINAPI virtual_reading_GetSensorsState( IGameInputReading_v2 *iface, GameInputSensorsState *state ) { return FALSE; }
+ static bool WINAPI virtual_reading_GetArcadeStickState( IGameInputReading_v2 *iface, GameInputArcadeStickState *state ) { return FALSE; }
+ static bool WINAPI virtual_reading_GetFlightStickState( IGameInputReading_v2 *iface, GameInputFlightStickState *state ) { return FALSE; }
+-static bool WINAPI virtual_reading_GetGamepadState( IGameInputReading_v2 *iface, GameInputGamepadState *state ) { return FALSE; }
++static float gamepad_axis( SHORT value )
++{
++    return value < 0 ? value / 32768.0f : value / 32767.0f;
++}
++
++static bool WINAPI virtual_reading_GetGamepadState( IGameInputReading_v2 *iface, GameInputGamepadState *state )
++{
++    struct virtual_reading *reading = impl_from_IGameInputReading_v2( iface );
++    const XINPUT_GAMEPAD *pad = &reading->xinput.Gamepad;
++    static const struct { WORD xinput; GameInputGamepadButtons gameinput; } buttons[] =
++    {
++        {XINPUT_GAMEPAD_START, GameInputGamepadMenu}, {XINPUT_GAMEPAD_BACK, GameInputGamepadView},
++        {XINPUT_GAMEPAD_A, GameInputGamepadA}, {XINPUT_GAMEPAD_B, GameInputGamepadB},
++        {XINPUT_GAMEPAD_X, GameInputGamepadX}, {XINPUT_GAMEPAD_Y, GameInputGamepadY},
++        {XINPUT_GAMEPAD_DPAD_UP, GameInputGamepadDPadUp}, {XINPUT_GAMEPAD_DPAD_DOWN, GameInputGamepadDPadDown},
++        {XINPUT_GAMEPAD_DPAD_LEFT, GameInputGamepadDPadLeft}, {XINPUT_GAMEPAD_DPAD_RIGHT, GameInputGamepadDPadRight},
++        {XINPUT_GAMEPAD_LEFT_SHOULDER, GameInputGamepadLeftShoulder},
++        {XINPUT_GAMEPAD_RIGHT_SHOULDER, GameInputGamepadRightShoulder},
++        {XINPUT_GAMEPAD_LEFT_THUMB, GameInputGamepadLeftThumbstick},
++        {XINPUT_GAMEPAD_RIGHT_THUMB, GameInputGamepadRightThumbstick},
++    };
++    unsigned int i;
++
++    if (!state || reading->device->kind != GameInputKindGamepad) return FALSE;
++    memset( state, 0, sizeof(*state) );
++    for (i = 0; i < ARRAY_SIZE(buttons); i++)
++        if (pad->wButtons & buttons[i].xinput) state->buttons |= buttons[i].gameinput;
++    state->leftTrigger = pad->bLeftTrigger / 255.0f;
++    state->rightTrigger = pad->bRightTrigger / 255.0f;
++    state->leftThumbstickX = gamepad_axis( pad->sThumbLX );
++    state->leftThumbstickY = gamepad_axis( pad->sThumbLY );
++    state->rightThumbstickX = gamepad_axis( pad->sThumbRX );
++    state->rightThumbstickY = gamepad_axis( pad->sThumbRY );
++    return TRUE;
++}
+ static bool WINAPI virtual_reading_GetRacingWheelState( IGameInputReading_v2 *iface, GameInputRacingWheelState *state ) { return FALSE; }
+ static bool WINAPI virtual_reading_GetUiNavigationState( IGameInputReading_v2 *iface, GameInputUiNavigationState *state ) { return FALSE; }
+ 
+@@ -1199,12 +1294,44 @@ static struct virtual_reading *virtual_reading_for( GameInputKind kind, IGameInp
+     return NULL;
+ }
+ 
++/* Gamepad readings own a snapshot, so a later poll cannot change a reading
++ * the title retained. The existing keyboard/mouse objects remain static. */
++static HRESULT gamepad_reading( GameInputKind kind, IGameInputDevice_v2 *device,
++                                IGameInputReading_v2 *reference, IGameInputReading_v2 **out )
++{
++    struct virtual_reading *reading, *previous;
++    XINPUT_STATE state;
++    unsigned int i;
++
++    if (!(kind & GameInputKindGamepad)) return GAMEINPUT_E_READING_NOT_FOUND;
++    if (!device && reference && reference->lpVtbl == &virtual_reading_vtbl)
++        device = &impl_from_IGameInputReading_v2( reference )->device->IGameInputDevice_v2_iface;
++    for (i = 0; i < ARRAY_SIZE(virtual_gamepads); i++)
++    {
++        if (device && device != &virtual_gamepads[i].IGameInputDevice_v2_iface) continue;
++        if (XInputGetState( i, &state )) continue;
++        if (reference && reference->lpVtbl == &virtual_reading_vtbl)
++        {
++            previous = impl_from_IGameInputReading_v2( reference );
++            if (previous->device == &virtual_gamepads[i] && previous->xinput.dwPacketNumber == state.dwPacketNumber)
++                continue;
++        }
++        if (!(reading = calloc( 1, sizeof(*reading) ))) return E_OUTOFMEMORY;
++        reading->IGameInputReading_v2_iface.lpVtbl = &virtual_reading_vtbl;
++        reading->refcount = 1;
++        reading->device = &virtual_gamepads[i];
++        reading->xinput = state;
++        reading->timestamp = GetTickCount64() * 1000;
++        *out = &reading->IGameInputReading_v2_iface;
++        return S_OK;
++    }
++    return GAMEINPUT_E_READING_NOT_FOUND;
++}
++
+ /* IGameInput_v2 -- the interface Minecraft (and other recent GDK titles) query
+  * for. It shares one game_input object (and refcount) with the v0 interface;
+- * the vtable differs, so it needs its own thunks. Readings come back empty and
+- * callback registrations succeed with a token but never fire -- enough for a
+- * title to initialise its input system and run rather than treating a missing
+- * GameInput runtime as fatal. */
++ * the vtable differs, so it needs its own thunks. Keyboard/mouse readings use
++ * raw input; connected gamepads are enumerated and read through XInput. */
+ 
+ static struct game_input *impl_from_v2_IGameInput( IGameInput_v2 *iface )
+ {
+@@ -1263,6 +1390,12 @@ static HRESULT WINAPI game_input_v2_GetCurrentReading( IGameInput_v2 *iface, Gam
+     TRACE( "impl %p, kind %#x, device %p, reading %p.\n", impl_from_v2_IGameInput( iface ), kind, device, reading );
+ 
+     if (!reading) return E_POINTER;
++    *reading = NULL;
++    if (kind & GameInputKindGamepad)
++    {
++        HRESULT hr = gamepad_reading( kind, device, NULL, reading );
++        if (hr != GAMEINPUT_E_READING_NOT_FOUND) return hr;
++    }
+     if (!(r = virtual_reading_for( kind, device )))
+     {
+         *reading = NULL;
+@@ -1278,11 +1411,9 @@ static HRESULT WINAPI game_input_v2_GetNextReading( IGameInput_v2 *iface, IGameI
+ {
+     TRACE( "impl %p, reference %p, kind %#x, device %p, reading %p.\n", impl_from_v2_IGameInput( iface ), reference, kind, device, reading );
+ 
+-    /* There is only ever the one current reading, so nothing is newer than a
+-     * reference: this is how a title's drain loop terminates. */
+     if (!reading) return E_POINTER;
+     *reading = NULL;
+-    return GAMEINPUT_E_READING_NOT_FOUND;
++    return gamepad_reading( kind, device, reference, reading );
+ }
+ 
+ static HRESULT WINAPI game_input_v2_GetPreviousReading( IGameInput_v2 *iface, IGameInputReading_v2 *reference,
+@@ -1336,6 +1467,7 @@ static HRESULT WINAPI game_input_v2_RegisterDeviceCallback( IGameInput_v2 *iface
+         {
+             struct virtual_device *vd = virtual_devices[i];
+             if (!(vd->kind & kind)) continue;
++            if (!(virtual_device_GetDeviceStatus( &vd->IGameInputDevice_v2_iface ) & GameInputDeviceConnected)) continue;
+             if (device && device != &vd->IGameInputDevice_v2_iface) continue;
+             TRACE( "reporting %s connected\n", vd->info.displayName );
+             callback( *token, context, &vd->IGameInputDevice_v2_iface, GetTickCount64() * 1000,
+diff --git a/dlls/gameinput/Makefile.in b/dlls/gameinput/Makefile.in
+index 629352a..f95809d 100644
+--- a/dlls/gameinput/Makefile.in
++++ b/dlls/gameinput/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE     = gameinput.dll
+-IMPORTS    = cfgmgr32 hid user32
++IMPORTS    = cfgmgr32 hid user32 xinput1_3
+ EXTRADEFS  = -D_GAMEINPUT_
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native

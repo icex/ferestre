@@ -16,6 +16,7 @@
 pub mod account;
 pub mod appx;
 pub mod autofix;
+pub mod cache;
 pub mod capability;
 pub mod catalog;
 pub mod gamepass;
@@ -23,6 +24,7 @@ pub mod http;
 pub mod install;
 pub mod launch;
 pub mod library;
+pub mod media;
 pub mod paths;
 pub mod playfab;
 pub mod recipe;
