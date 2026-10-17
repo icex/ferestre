@@ -32,6 +32,24 @@ pub const BATCH: usize = 20;
 pub const DEFAULT_MARKET: &str = "US";
 pub const DEFAULT_LANGUAGE: &str = "en-us";
 
+/// Store artwork that can be used for a non-Steam game's library page.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Artwork {
+    pub portrait: Option<String>,
+    pub landscape: Option<String>,
+    pub hero: Option<String>,
+    pub logo: Option<String>,
+}
+
+impl Artwork {
+    pub fn is_empty(&self) -> bool {
+        self.portrait.is_none()
+            && self.landscape.is_none()
+            && self.hero.is_none()
+            && self.logo.is_none()
+    }
+}
+
 /// What the catalog knows about one product that a launcher would show.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Product {
@@ -44,6 +62,8 @@ pub struct Product {
     /// a 1080px one we then throw most of away.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    #[serde(default, skip_serializing_if = "Artwork::is_empty")]
+    pub artwork: Artwork,
     /// What an install will actually cost, counting only the packages that run
     /// on a desktop. Summing every platform's package instead reports a title
     /// as twice its size, because most carry an Xbox build too.
@@ -383,6 +403,41 @@ fn pick_image(images: &[Image]) -> Option<String> {
         .map(|(_, _, _, uri)| absolute(&uri))
 }
 
+fn pick_artwork(images: &[Image]) -> Artwork {
+    let choose = |purposes: &[&str], wide_logo: bool| {
+        purposes.iter().find_map(|purpose| {
+            images
+                .iter()
+                .filter(|image| image.purpose.as_deref() == Some(*purpose))
+                .filter(|image| {
+                    !wide_logo
+                        || image
+                            .width
+                            .zip(image.height)
+                            .is_some_and(|(w, h)| h > 0 && w as f64 / h as f64 > 1.5)
+                })
+                .filter(|image| image.uri.as_deref().is_some_and(|url| !url.is_empty()))
+                .max_by_key(|image| {
+                    image.width.unwrap_or(0) as u64 * image.height.unwrap_or(0) as u64
+                })
+                .and_then(|image| image.uri.as_deref())
+                .map(absolute)
+        })
+    };
+    Artwork {
+        portrait: choose(&["Poster", "BrandedKeyArt", "BoxArt"], false),
+        landscape: choose(
+            &["TitledHeroArt", "SuperHeroArt", "Hero", "Screenshot"],
+            false,
+        ),
+        hero: choose(
+            &["SuperHeroArt", "Hero", "TitledHeroArt", "Screenshot"],
+            false,
+        ),
+        logo: choose(&["Logo", "TitleLogo"], true),
+    }
+}
+
 /// Catalog image URIs come back protocol-relative (`//store-images...`).
 fn absolute(uri: &str) -> String {
     match uri.strip_prefix("//") {
@@ -490,6 +545,9 @@ pub fn parse(json: &str) -> Result<Vec<Product>> {
                     .and_then(|l| l.publisher.clone())
                     .filter(|s| !s.is_empty()),
                 image: localized.and_then(|l| pick_image(&l.images)),
+                artwork: localized
+                    .map(|l| pick_artwork(&l.images))
+                    .unwrap_or_default(),
                 download_bytes: download_bytes.filter(|b| *b > 0),
                 last_update,
                 content_ids,
@@ -1029,6 +1087,36 @@ mod tests {
         assert!(
             url.contains("market=GB") && url.contains("languages=en-gb"),
             "{url}"
+        );
+    }
+
+    #[test]
+    fn steam_artwork_keeps_portrait_and_wide_assets_separate() {
+        let products = parse(
+            r#"{"Products":[{"ProductId":"9ZZARTTEST","LocalizedProperties":[{
+            "ProductTitle":"Artwork", "Images":[
+                {"ImagePurpose":"Poster","Uri":"//img/portrait","Width":720,"Height":1080},
+                {"ImagePurpose":"SuperHeroArt","Uri":"//img/hero","Width":3840,"Height":2160},
+                {"ImagePurpose":"TitledHeroArt","Uri":"//img/header","Width":1920,"Height":1080},
+                {"ImagePurpose":"Logo","Uri":"//img/icon","Width":300,"Height":300},
+                {"ImagePurpose":"Logo","Uri":"//img/title-logo","Width":1000,"Height":300}
+            ]}]}]}"#,
+        )
+        .unwrap();
+        let product = &products[0];
+        assert_eq!(product.image.as_deref(), Some("https://img/icon"));
+        assert_eq!(
+            product.artwork.portrait.as_deref(),
+            Some("https://img/portrait")
+        );
+        assert_eq!(
+            product.artwork.landscape.as_deref(),
+            Some("https://img/header")
+        );
+        assert_eq!(product.artwork.hero.as_deref(), Some("https://img/hero"));
+        assert_eq!(
+            product.artwork.logo.as_deref(),
+            Some("https://img/title-logo")
         );
     }
 

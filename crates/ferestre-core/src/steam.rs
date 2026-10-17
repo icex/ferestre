@@ -310,13 +310,51 @@ impl Shortcut {
     }
 }
 
+/// Match the launch identity first, so renamed titles and old mount-local
+/// targets are updated too. Fall back to the display name for older entries.
+pub fn existing_shortcut<'a>(document: &'a Value, shortcut: &Shortcut) -> Option<&'a Value> {
+    let entries = document.get("shortcuts")?.as_map()?;
+    entries
+        .iter()
+        .find(|(_, entry)| same_launch(entry, shortcut))
+        .or_else(|| {
+            entries.iter().find(|(_, entry)| {
+                entry.get("AppName").and_then(Value::as_str) == Some(shortcut.app_name.as_str())
+            })
+        })
+        .map(|(_, entry)| entry)
+}
+
+fn same_launch(entry: &Value, shortcut: &Shortcut) -> bool {
+    !shortcut.launch_options.is_empty()
+        && entry
+            .get("LaunchOptions")
+            .and_then(Value::as_str)
+            .is_some_and(|options| {
+                options
+                    .split_whitespace()
+                    .map(str::to_ascii_lowercase)
+                    .eq(shortcut
+                        .launch_options
+                        .split_whitespace()
+                        .map(str::to_ascii_lowercase))
+            })
+}
+
+/// Existing Steam ids carry controller configurations, play history and art.
+/// Editing the executable must not replace that identity with a newly derived id.
+pub fn effective_app_id(document: &Value, shortcut: &Shortcut) -> u32 {
+    match existing_shortcut(document, shortcut).and_then(|entry| entry.get("appid")) {
+        Some(Value::Int(id)) if *id != 0 => *id as u32,
+        _ => shortcut.app_id(),
+    }
+}
+
 /// Add or replace a shortcut in a parsed `shortcuts.vdf`, keeping everything
 /// else exactly as it was.
 ///
-/// Matching is by `AppName`, not by app id: the id is derived from the exe, so
-/// a launcher that changed where it installs would add a second entry for the
-/// same game rather than updating the first. Returns whether an existing entry
-/// was replaced.
+/// Matching uses the launch options or title, preserving the existing app id
+/// and personal settings. Returns whether an existing entry was updated.
 pub fn upsert(document: &mut Value, shortcut: &Shortcut) -> Result<bool> {
     let shortcuts = document
         .as_map()
@@ -333,11 +371,14 @@ pub fn upsert(document: &mut Value, shortcut: &Shortcut) -> Result<bool> {
         bail!("\"shortcuts\" is not a map");
     };
 
-    let existing = entries.iter().position(|(_, v)| {
-        v.get("AppName")
-            .and_then(Value::as_str)
-            .is_some_and(|name| name == shortcut.app_name)
-    });
+    let existing = entries
+        .iter()
+        .position(|(_, entry)| same_launch(entry, shortcut))
+        .or_else(|| {
+            entries.iter().position(|(_, entry)| {
+                entry.get("AppName").and_then(Value::as_str) == Some(shortcut.app_name.as_str())
+            })
+        });
 
     match existing {
         Some(at) => {
@@ -348,10 +389,21 @@ pub fn upsert(document: &mut Value, shortcut: &Shortcut) -> Result<bool> {
             if let Value::Map(fields) = &mut merged {
                 let ours = shortcut.to_value();
                 for (name, value) in ours.as_map().unwrap_or(&[]) {
-                    if matches!(
+                    if !matches!(
                         name.as_str(),
-                        "tags" | "IsHidden" | "AllowOverlay" | "AllowDesktopConfig"
+                        "AppName" | "Exe" | "StartDir" | "LaunchOptions" | "icon"
                     ) {
+                        // Missing appid is the sole exception; repair old entries.
+                        if name == "appid"
+                            && !fields
+                                .iter()
+                                .any(|(key, _)| key.eq_ignore_ascii_case("appid"))
+                        {
+                            fields.push((name.clone(), value.clone()));
+                        }
+                        continue;
+                    }
+                    if name == "icon" && shortcut.icon.is_empty() {
                         continue;
                     }
                     match fields
@@ -373,6 +425,135 @@ pub fn upsert(document: &mut Value, shortcut: &Shortcut) -> Result<bool> {
             Ok(false)
         }
     }
+}
+
+/// Fully downloaded PNG assets. Steam stores library art next to shortcuts,
+/// named by the *stored* unsigned app id (SGDBoop uses the same conventions).
+#[derive(Debug, Default, Clone)]
+pub struct ArtworkFiles {
+    pub icon: Option<PathBuf>,
+    pub portrait: Option<PathBuf>,
+    pub landscape: Option<PathBuf>,
+    pub hero: Option<PathBuf>,
+    pub logo: Option<PathBuf>,
+}
+
+/// Fetch Store images off the UI thread, with persistent URL-keyed caching.
+/// Missing or failed artwork never makes a runnable shortcut fail.
+pub fn prepare_artwork(
+    cache: &crate::catalog::Cache,
+    product: &crate::catalog::Product,
+    fallback_icon: Option<&Path>,
+) -> (ArtworkFiles, Vec<String>) {
+    use std::hash::{Hash, Hasher};
+    let slots = [
+        ("icon", product.image.as_deref(), 256, 256),
+        ("portrait", product.artwork.portrait.as_deref(), 600, 900),
+        ("landscape", product.artwork.landscape.as_deref(), 920, 430),
+        ("hero", product.artwork.hero.as_deref(), 1920, 620),
+        ("logo", product.artwork.logo.as_deref(), 640, 360),
+    ];
+    let fetched = std::thread::scope(|scope| {
+        let workers: Vec<_> = slots
+            .into_iter()
+            .filter_map(|(kind, url, w, h)| {
+                let url = url?;
+                Some(scope.spawn(move || {
+                    // Steam crops wide assets itself. Fetch their full width
+                    // rather than shrinking a 16:9 source into a shallow box.
+                    let mut params = vec![("format", "png".into()), ("w", w.to_string())];
+                    if kind != "hero" && kind != "landscape" {
+                        params.push(("h", h.to_string()));
+                    }
+                    let url = crate::http::with_params(url, &params);
+                    let mut hash = std::collections::hash_map::DefaultHasher::new();
+                    url.hash(&mut hash);
+                    let dir = cache.dir().join("steam-artwork");
+                    let path = dir.join(format!("{kind}-{:016x}.png", hash.finish()));
+                    let result = crate::http::download(&url, &path).and_then(|()| {
+                        let bytes = std::fs::read(&path)?;
+                        if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                            let _ = std::fs::remove_file(&path);
+                            bail!("{kind}: the image server did not return a PNG");
+                        }
+                        Ok(path)
+                    });
+                    (kind, result)
+                }))
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join())
+            .collect::<Vec<_>>()
+    });
+    let mut files = ArtworkFiles::default();
+    let mut failures = Vec::new();
+    for result in fetched {
+        match result {
+            Ok((kind, Ok(path))) => match kind {
+                "icon" => files.icon = Some(path),
+                "portrait" => files.portrait = Some(path),
+                "landscape" => files.landscape = Some(path),
+                "hero" => files.hero = Some(path),
+                "logo" => files.logo = Some(path),
+                _ => unreachable!(),
+            },
+            Ok((_, Err(error))) => failures.push(error.to_string()),
+            Err(_) => failures.push("an artwork download failed".into()),
+        }
+    }
+    if files.icon.is_none() {
+        files.icon = fallback_icon
+            .filter(|path| path.is_file())
+            .map(Path::to_path_buf);
+    }
+    (files, failures)
+}
+
+/// Fill missing artwork for this Steam account. Keep personal artwork and copy
+/// the icon into Steam's own persistent directory so cache cleanup cannot break it.
+pub fn install_artwork(
+    shortcut_file: &Path,
+    app_id: u32,
+    files: &ArtworkFiles,
+) -> (Option<PathBuf>, Vec<String>) {
+    let grid = shortcut_file
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("grid");
+    let mut icon = None;
+    let mut failures = Vec::new();
+    for (suffix, source) in [
+        ("_icon", &files.icon),
+        ("p", &files.portrait),
+        ("", &files.landscape),
+        ("_hero", &files.hero),
+        ("_logo", &files.logo),
+    ] {
+        let stem = format!("{app_id}{suffix}");
+        let existing = ["png", "jpg", "jpeg", "webp", "ico"]
+            .into_iter()
+            .map(|ext| grid.join(format!("{stem}.{ext}")))
+            .find(|path| path.is_file());
+        if let Some(path) = existing {
+            if suffix == "_icon" {
+                icon = Some(path);
+            }
+            continue;
+        }
+        let Some(source) = source else { continue };
+        let destination = grid.join(format!("{stem}.png"));
+        match std::fs::read(source)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| crate::cache::write(&destination, &bytes))
+        {
+            Ok(()) if suffix == "_icon" => icon = Some(destination),
+            Ok(()) => {}
+            Err(error) => failures.push(format!("{suffix}: {error}")),
+        }
+    }
+    (icon, failures)
 }
 
 /// An empty `shortcuts.vdf`, for the case where there is not one yet.
@@ -596,13 +777,14 @@ mod tests {
         for (key, value) in fields.iter_mut() {
             match key.as_str() {
                 "AllowOverlay" => *value = Value::Int(0),
+                "LastPlayTime" => *value = Value::Int(123456),
                 "tags" => *value = Value::Map(vec![("0".into(), Value::Str("ferestre".into()))]),
                 _ => {}
             }
         }
 
         let moved = Shortcut::new(
-            "Test Title",
+            "Renamed Test Title",
             Path::new("/new/ferestre"),
             Path::new("/new"),
             "run 9ZZTESTGAME1",
@@ -620,6 +802,17 @@ mod tests {
             Some("\"/new/ferestre\"")
         );
         assert_eq!(
+            entry.get("AppName").unwrap().as_str(),
+            Some("Renamed Test Title")
+        );
+        assert_eq!(
+            entry.get("appid"),
+            Some(&Value::Int(first.app_id() as i32)),
+            "Steam identity and controller settings survive an executable change"
+        );
+        assert_eq!(effective_app_id(&document, &moved), first.app_id());
+        assert_eq!(entry.get("LastPlayTime"), Some(&Value::Int(123456)));
+        assert_eq!(
             entry.get("AllowOverlay"),
             Some(&Value::Int(0)),
             "their setting stands"
@@ -632,6 +825,78 @@ mod tests {
 
     /// A path with a space in it is the normal case, and an unquoted one fails
     /// to launch with no error anyone can see.
+    #[test]
+    fn artwork_is_cached_and_installed_for_the_stored_shortcut_id() {
+        use std::io::{Read, Write};
+        const PNG: &[u8] = include_bytes!("../tests/fixtures/steam-art.png");
+        let dir = std::env::temp_dir().join(format!("ferestre-steam-art-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/art", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            for _ in 0..5 {
+                let (mut stream, _) = server.accept().unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).unwrap() > 0);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    PNG.len()
+                )
+                .unwrap();
+                stream.write_all(PNG).unwrap();
+            }
+        });
+        let cache = crate::catalog::Cache::new(dir.join("cache"));
+        let product = serde_json::from_value(serde_json::json!({
+            "product_id":"9ZZTESTART1", "name":"Art Game", "image":url,
+            "artwork":{"portrait":url,"landscape":url,"hero":url,"logo":url}
+        }))
+        .unwrap();
+        let (files, failures) = prepare_artwork(&cache, &product, None);
+        assert!(failures.is_empty(), "{failures:?}");
+        worker.join().unwrap(); // The server closes: a warm lookup cannot refetch.
+        let (warm, failures) = prepare_artwork(&cache, &product, None);
+        assert!(
+            failures.is_empty(),
+            "cached assets must work offline: {failures:?}"
+        );
+        assert_eq!(warm.icon, files.icon);
+        let shortcut_file = dir.join("userdata/1/config/shortcuts.vdf");
+        let app_id = 3212345678;
+        let (icon, failures) = install_artwork(&shortcut_file, app_id, &files);
+        assert!(failures.is_empty());
+        let grid = shortcut_file.parent().unwrap().join("grid");
+        assert_eq!(icon, Some(grid.join(format!("{app_id}_icon.png"))));
+        for suffix in ["_icon", "p", "", "_hero", "_logo"] {
+            assert_eq!(
+                std::fs::read(grid.join(format!("{app_id}{suffix}.png"))).unwrap(),
+                PNG
+            );
+        }
+        // Re-adding fills gaps while leaving personal art intact.
+        let custom = grid.join(format!("{app_id}p.png"));
+        std::fs::write(&custom, b"personal cover").unwrap();
+        install_artwork(&shortcut_file, app_id, &files);
+        assert_eq!(std::fs::read(custom).unwrap(), b"personal cover");
+        let unavailable = dir.join("missing.png");
+        let (icon, failures) = install_artwork(
+            &dir.join("userdata/2/config/shortcuts.vdf"),
+            app_id,
+            &ArtworkFiles {
+                icon: files.icon.clone(),
+                hero: Some(unavailable),
+                ..Default::default()
+            },
+        );
+        assert!(
+            icon.unwrap().is_file(),
+            "one missing asset must not discard the icon"
+        );
+        assert_eq!(failures.len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn paths_are_quoted() {
         let shortcut = Shortcut::new(

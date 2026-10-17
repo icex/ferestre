@@ -31,6 +31,7 @@ import shlex
 import http.server
 import threading
 import subprocess
+import struct
 import sys
 import tempfile
 import time
@@ -407,6 +408,28 @@ def row_button(root, title, label):
     return None
 
 
+def check_game_row_layout(root, title, size, action):
+    button = row_button(root, title, action)
+    check(button is not None, f"{title} keeps its {action} action", root)
+    row = button.get_parent()
+    while row and row.get_role_name() != "list item":
+        row = row.get_parent()
+    check(row is not None, "the action belongs to a game row", root)
+    title_label = find_all(row, role="label", name=title)[0]
+    details = find_all(row, role="label", name_contains=size)
+    check(len(details) == 1 and details[0].get_name().count(size) == 1,
+          "size appears once, in the details line", row)
+    bounds = lambda node: node.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+    top, bottom, control = bounds(title_label), bounds(details[0]), bounds(button)
+    check(bottom.y >= top.y + top.height - 1, "details sit below the game title", row)
+    text_center = (top.y + bottom.y + bottom.height) / 2
+    check(abs(control.y + control.height / 2 - text_center) <= 4,
+          "right-hand actions are centered across both text lines", row)
+    check(control.x >= top.x + top.width, "actions stay to the right of the text", row)
+    check(any(bounds(image).width >= 40 and bounds(image).height >= 40
+              for image in find_all(row, role="image")), "the game icon spans both text lines", row)
+
+
 def dump(root, why):
     print(f"\n--- accessibility tree ({why}) ---", file=sys.stderr)
     for node, depth in walk(root):
@@ -650,6 +673,37 @@ last-verified = 2026-10-10
                 },
                 f,
             )
+
+    # Local PNGs exercise actual Add to Steam downloads, cache reuse and grid
+    # installation without reaching an external artwork service.
+    art_png = open("crates/ferestre-core/tests/fixtures/steam-art.png", "rb").read()
+    class ArtworkServer(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(art_png)))
+            self.end_headers()
+            self.wfile.write(art_png)
+        def log_message(self, *args):
+            pass
+    art_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ArtworkServer)
+    threading.Thread(target=art_server.serve_forever, daemon=True).start()
+    art_url = f"http://127.0.0.1:{art_server.server_port}/art.png"
+    env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost"
+    for filename in glob.glob(os.path.join(recipes_dir, "*.toml")):
+        with open(filename, "rb") as f:
+            title = tomllib.load(f).get("title", {})
+        pid = title.get("product-id")
+        if not pid:
+            continue
+        path = os.path.join(catalog, f"{pid.upper()}.json")
+        entry = json.load(open(path)) if os.path.exists(path) else {
+            "schema": schema, "market": "US", "language": "en-us",
+            "product": {"product_id": pid, "name": title["name"]}}
+        entry["product"]["image"] = art_url
+        entry["product"]["artwork"] = {slot: art_url for slot in ("portrait", "landscape", "hero", "logo")}
+        with open(path, "w") as f:
+            json.dump(entry, f)
 
     # The window is run from a copy, with a stub `ferestre` beside it, because
     # that is how it picks its CLI -- a sibling first, the path second. Two
@@ -895,7 +949,9 @@ print(":: done", flush=True)
 
         labels = texts(frame)
         check(any("on disk" in t for t in labels), "installed rows show measured disk usage in Library", frame)
-        check("12.5 GB download" in labels, "catalog rows show a separate download size label", frame)
+        check(any("12.5 GB download" in t for t in labels), "catalog rows show download size in their details", frame)
+        check_game_row_layout(frame, "Smoke Test Racer", "12.5 GB", "Install")
+        check_game_row_layout(frame, "Minecraft for Windows", "on disk", "Play")
         print("installing asks before it downloads")
         install = row_button(frame, "Smoke Test Racer", "Install")
         check(install is not None, "an owned MSIXVC title offers an install", frame)
@@ -1055,7 +1111,8 @@ print(":: done", flush=True)
             frame,
         )
 
-        check("8.1 GB download" in labels, "Game Pass rows carry the same size label", frame)
+        check(any("8.1 GB download" in t for t in labels), "Game Pass rows use the same size details", frame)
+        check_game_row_layout(frame, "Subscription Racer", "8.1 GB", "Install")
         print("a download says how far, how fast and how long")
         select_in_list(frame, "Library")
         wait_for(
@@ -1161,6 +1218,35 @@ print(":: done", flush=True)
         check(shortcut_string("StartDir") == f'"{os.path.dirname(image)}"', "Steam start directory is persistent", frame)
         saved_options = shortcut_string("LaunchOptions")
         check(saved_options.startswith("run "), "Steam shortcut keeps the title launch options", frame)
+        stored_id = struct.unpack("<I", shortcut_bytes.split(b"\x02appid\0", 1)[1][:4])[0]
+        icon_path = shortcut_string("icon")
+        grid = os.path.join(os.path.dirname(shortcuts), "grid")
+        check(icon_path == os.path.join(grid, f"{stored_id}_icon.png") and os.path.isfile(icon_path),
+              "Steam gets a persistent game icon in its own directory", frame)
+        for suffix in ("p", "", "_hero", "_logo"):
+            check(open(os.path.join(grid, f"{stored_id}{suffix}.png"), "rb").read() == art_png,
+                  f"Steam artwork {suffix or 'landscape'} uses the stored app id", frame)
+        # Reproduce an older shortcut, including a renamed title and vanished
+        # AppImage mount, then re-add. Keep the id/controller configuration.
+        saved_name = shortcut_string("AppName")
+        legacy = shortcut_bytes.replace(b"\x01Exe\0" + shortcut_string("Exe").encode() + b"\0",
+                                        b'\x01Exe\0"/tmp/.mount_old/usr/bin/ferestre"\0')
+        legacy = legacy.replace(b"\x01AppName\0" + saved_name.encode() + b"\0", b"\x01AppName\0Old title name\0")
+        legacy = legacy.replace(b"\x01icon\0" + icon_path.encode() + b"\0", b"\x01icon\0\0")
+        with open(shortcuts, "wb") as f:
+            f.write(legacy)
+        os.unlink(icon_path)
+        previous_mtime = os.stat(shortcuts).st_mtime_ns
+        click(find_all(frame, role="button", name_contains="Add to Steam")[0])
+        wait_for(frame, lambda root: os.stat(shortcuts).st_mtime_ns != previous_mtime,
+                 "the existing Steam shortcut to update", time.monotonic() + TIMEOUT)
+        shortcut_bytes = open(shortcuts, "rb").read()
+        check(shortcut_bytes.count(b"\x01AppName\0") == 1, "re-adding updates instead of duplicating the shortcut", frame)
+        check(shortcut_string("AppName") == saved_name and shortcut_string("Exe") == f'"{image}"',
+              "re-adding repairs the old title and mount-local executable", frame)
+        check(struct.unpack("<I", shortcut_bytes.split(b"\x02appid\0", 1)[1][:4])[0] == stored_id,
+              "updating preserves the Steam app id and controller configuration identity", frame)
+        check(os.path.isfile(shortcut_string("icon")), "re-adding fills the missing game icon", frame)
         click(edit[0])
         labels = wait_for(
             frame,
@@ -1504,6 +1590,7 @@ elif sys.argv[1] == 'library':
             dump(frame, str(e))
         failures.append(str(e))
     finally:
+        art_server.shutdown()
         # Release only this fixture's workers, even if an assertion failed.
         for gate in ("release-removal", "release-cleanup"):
             open(os.path.join(home, gate), "w").close()

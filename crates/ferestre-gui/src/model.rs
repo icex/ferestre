@@ -343,23 +343,13 @@ fn bundle_child<'a>(inputs: &'a Inputs, product: Option<&Product>) -> Option<&'a
         .filter(|child| child.is_runnable_here() == Some(true))
 }
 
-/// What can be said about a title's download, as a phrase for a row.
-///
-/// `None` only when the catalog has not been asked yet. Everything else has an
-/// answer, and each of them is a different answer: 35 of the Game Pass titles
-/// this account can see have no size of their own, and they split into bundles
-/// whose size belongs to a child and products the catalog lists no package for
-/// at all. A row that says nothing for both is a row that looks broken for one
-/// and misleading for the other.
-fn download_note(inputs: &Inputs, product: Option<&Product>) -> Option<String> {
+/// Package and bundle context, without duplicating the shared size phrase.
+fn package_note(inputs: &Inputs, product: Option<&Product>) -> Option<String> {
     let product = product?;
 
     if !product.bundled_ids.is_empty() {
         return Some(match bundle_child(inputs, Some(product)) {
-            Some(child) => match child.size_label().as_str() {
-                "" => format!("bundle — install {}", child.name),
-                size => format!("bundle — install {} ({size})", child.name),
-            },
+            Some(child) => format!("bundle — install {}", child.name),
             // The children are fetched with the page, so this is a moment
             // rather than a state; saying how many there are beats saying
             // nothing while it resolves.
@@ -367,7 +357,7 @@ fn download_note(inputs: &Inputs, product: Option<&Product>) -> Option<String> {
         });
     }
     match product.size_label() {
-        size if !size.is_empty() => Some(size),
+        size if !size.is_empty() => None,
         _ if product.has_packages && !product.has_pc_package => Some("no PC version".into()),
         _ if !product.has_packages => Some("the catalog lists no package for it".into()),
         // A PC package with no size on it. Rare, and not worth a sentence.
@@ -430,7 +420,10 @@ pub fn gamepass(
                 Some(false) => "Not in your Game Pass tier".to_string(),
                 _ => "Included with PC Game Pass".to_string(),
             }];
-            if let Some(note) = download_note(inputs, product) {
+            if installed {
+                parts.insert(0, installed_version_or(inputs.records.get(&key), product));
+            }
+            if let Some(note) = package_note(inputs, product) {
                 parts.push(note);
             }
             if let Some(recipe) = compatibility {
@@ -444,7 +437,6 @@ pub fn gamepass(
                     Action::Installing
                 }
                 (true, _) => {
-                    parts.push("installed".into());
                     if (inputs.product_describes_itself)(product_id) {
                         Action::Play
                     } else {
@@ -508,8 +500,8 @@ fn plural(count: usize, noun: &str) -> String {
     }
 }
 
-/// Sizes stay separate from compatibility and version messages, in every
-/// section. A catalog download size is never presented as measured disk use.
+/// The single size phrase for the details line in every section. A catalog
+/// download size is never presented as measured disk use.
 pub fn game_size_label(
     installed: bool,
     measured: Option<Option<u64>>,
@@ -794,13 +786,9 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
                 product_id: product_id.to_string(),
                 name: name.clone(),
                 subtitle: format!(
-                    "Bundle of {}  ·  installs {}{}",
+                    "Bundle of {}  ·  installs {}",
                     plural(children.len(), "title"),
                     child.name,
-                    match child.size_label().as_str() {
-                        "" => String::new(),
-                        size => format!("  ·  {size}"),
-                    }
                 ),
                 badge: None,
                 image: product.and_then(|p| p.image.clone()),
@@ -870,12 +858,9 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
             } else {
                 "the catalog lists no package for it"
             };
-            let size = p.size_label();
-            match (p.publisher.as_deref(), size.is_empty()) {
-                (Some(publisher), false) => format!("{publisher}  ·  {size}  ·  {tail}"),
-                (Some(publisher), true) => format!("{publisher}  ·  {tail}"),
-                (None, false) => format!("{size}  ·  {tail}"),
-                (None, true) => {
+            match p.publisher.as_deref() {
+                Some(publisher) => format!("{publisher}  ·  {tail}"),
+                None => {
                     let mut chars = tail.chars();
                     chars
                         .next()
@@ -887,6 +872,11 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
             }
         }
         None => "No recipe yet".to_string(),
+    };
+    let subtitle = if on_disk {
+        installed_status(inputs.records.get(key), product, None, None)
+    } else {
+        subtitle
     };
     LibraryRow {
         product_id: product_id.to_string(),
@@ -1153,6 +1143,7 @@ mod tests {
             name: name.into(),
             publisher: Some("Test Studios".into()),
             image: Some("https://img/logo".into()),
+            artwork: Default::default(),
             download_bytes: Some(2_490_064_896),
             last_update: None,
             content_ids: content_ids.iter().map(|s| s.to_string()).collect(),
@@ -1716,8 +1707,8 @@ mod tests {
             row.subtitle
         );
         assert!(
-            row.subtitle.contains("2.5 GB"),
-            "the child's size is the bundle's answer: {}",
+            !row.subtitle.contains("2.5 GB"),
+            "the shared details line supplies the child's size once: {}",
             row.subtitle
         );
         // Pressing Install works, and installs the child. Before this the row
@@ -1832,8 +1823,8 @@ mod tests {
         );
         assert!(runnable.subtitle.contains("Included with PC Game Pass"));
         assert!(
-            runnable.subtitle.contains("2.5 GB"),
-            "the size before the download: {}",
+            !runnable.subtitle.contains("2.5 GB"),
+            "download size is supplied once by the shared details line: {}",
             runnable.subtitle
         );
 
@@ -1878,6 +1869,10 @@ mod tests {
         assert_eq!(rows.len(), 1, "the row exists at all");
         assert_eq!(rows[0].name, "Only On Disk");
         assert!(rows[0].installed, "and it shows up under Installed");
+        assert!(
+            rows[0].subtitle.starts_with("Version 1.26.4501.0"),
+            "installed titles without recipes still show their version"
+        );
     }
 
     /// The package manifest names the entry point, so there is nothing to ask.

@@ -431,7 +431,11 @@ fn render(ui: &Ui) {
         .margin_start(12)
         .margin_end(12)
         .build();
-    let clamp = adw::Clamp::builder().child(&page).build();
+    let clamp = adw::Clamp::builder()
+        .maximum_size(1200)
+        .tightening_threshold(1000)
+        .child(&page)
+        .build();
     ui.content.append(&clamp);
 
     if let Some(problem) = ui.model.borrow().problem.clone() {
@@ -1097,15 +1101,18 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
     // parse and the row draws with no title at all. The same goes for any
     // subtitle that names a title, which the bundle rows do.
     let action_row = adw::ActionRow::builder()
-        .subtitle_lines(2)
+        .title_lines(1)
+        .subtitle_lines(1)
         .tooltip_text(&row.product_id)
         .build();
     action_row.set_use_markup(false);
     action_row.set_title(&row.name);
-    action_row.set_subtitle(&row.subtitle);
 
     let icon = gtk::Image::builder()
-        .pixel_size(40)
+        .pixel_size(48)
+        .width_request(48)
+        .height_request(48)
+        .valign(gtk::Align::Center)
         .icon_name("applications-games-symbolic")
         .margin_top(6)
         .margin_bottom(6)
@@ -1136,28 +1143,41 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             .and_then(|p| p.download_bytes);
         model::game_size_label(row.installed, model.disk_usage.get(&key).copied(), download)
     };
-    let size = gtk::Label::builder()
-        .label(&size_text)
-        .css_classes(["dim-label", "caption"])
-        .valign(gtk::Align::Center)
-        .build();
-    size.set_tooltip_text(Some(if row.installed {
-        "Allocated space used by the game directory; cached for up to 24 hours and refreshed after install changes. Wine prefix and download cache are separate"
+    // One title line, one details line. Keep status and sizes beside the
+    // version instead of competing with the title and buttons for row width.
+    let (version, description) = if row.subtitle.starts_with("Version ") {
+        match row.subtitle.split_once("  ·  ") {
+            Some((version, rest)) => (Some(version), rest),
+            None => (Some(row.subtitle.as_str()), ""),
+        }
     } else {
-        "PC download size from the Microsoft Store; installed disk usage may differ"
-    }));
-    action_row.add_suffix(&size);
-
-    if let Some((text, css)) = row.badge {
-        let badge = gtk::Label::builder()
-            .label(text)
-            .css_classes([css, "caption"])
-            .valign(gtk::Align::Center)
-            .width_chars(12)
-            .xalign(1.0)
-            .build();
-        action_row.add_suffix(&badge);
+        (None, row.subtitle.as_str())
+    };
+    let mut details = Vec::new();
+    if let Some(version) = version {
+        details.push(version.to_string());
     }
+    details.push(size_text);
+    if let Some((badge, _)) = row.badge {
+        details.push(badge.to_string());
+    }
+    if !description.is_empty() {
+        details.push(description.to_string());
+    }
+    let details = details.join("  ·  ");
+    action_row.set_subtitle(&details);
+    action_row.set_tooltip_text(Some(&format!(
+        "{}\n{}\n{}",
+        row.name, details, row.product_id
+    )));
+
+    let actions = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .valign(gtk::Align::Center)
+        .margin_start(8)
+        .build();
+    action_row.add_suffix(&actions);
 
     let store = gtk::Button::builder()
         .icon_name("web-browser-symbolic")
@@ -1167,7 +1187,7 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
         .build();
     let store_url = format!("{STORE_PAGE}{}", row.product_id);
     store.connect_clicked(move |button| open_link(button, &store_url));
-    action_row.add_suffix(&store);
+    actions.append(&store);
 
     // Anything on disk can be removed, recipe or not -- and the rows that most
     // need it are the ones with no recipe, because a failed install leaves
@@ -1186,7 +1206,7 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             ui,
             move |_| confirm_remove(&ui, &product_id, &name)
         ));
-        action_row.add_suffix(&remove);
+        actions.append(&remove);
     }
 
     // A shortcut needs something that will launch. A recipe is one; a title on
@@ -1206,7 +1226,7 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             ui,
             move |_| choose_runtime(&ui, &product_id, &name)
         ));
-        action_row.add_suffix(&runtime);
+        actions.append(&runtime);
 
         let to_steam = gtk::Button::builder()
             .icon_name("list-add-symbolic")
@@ -1221,7 +1241,7 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             ui,
             move |_| add_to_steam(&ui, &product_id, &name)
         ));
-        action_row.add_suffix(&to_steam);
+        actions.append(&to_steam);
 
         let edit = gtk::Button::builder()
             .icon_name("document-edit-symbolic")
@@ -1236,19 +1256,20 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             ui,
             move |_| open_editor(&ui, &product_id, &name)
         ));
-        action_row.add_suffix(&edit);
+        actions.append(&edit);
     }
 
     // A greyed-out "Play" is a button that says a title might work if you found
     // the right thing to click. It never will: the reason is in the subtitle
     // and on the row, and the Store link beside it is the thing to press.
     if let Action::Blocked(reason) = &row.action {
-        action_row.set_tooltip_text(Some(reason));
+        action_row.set_tooltip_text(Some(&format!("{}\n{}\n{}", row.name, details, reason)));
         return action_row;
     }
 
     let button = gtk::Button::builder()
         .label(row.action.label())
+        .width_request(88)
         .valign(gtk::Align::Center)
         .css_classes(["suggested-action"])
         .build();
@@ -1321,7 +1342,7 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             ));
         }
     }
-    action_row.add_suffix(&button);
+    actions.append(&button);
     action_row.set_activatable_widget(Some(&button));
     action_row
 }
@@ -2269,30 +2290,118 @@ fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {
         return;
     }
 
+    if !begin(ui, &format!("Adding {name} to Steam")) {
+        report_busy(ui);
+        return;
+    }
+    let (cache, product, market, fallback_icon) = {
+        let model = ui.model.borrow();
+        let key = product_id.to_ascii_uppercase();
+        (
+            model.catalog_cache(),
+            model.catalog.get(&key).cloned(),
+            model.market(),
+            model.icons.get(&key).cloned(),
+        )
+    };
     let program = steam::shortcut_program(std::env::var_os("APPIMAGE").as_deref(), &cli_binary());
     let start_dir = program.parent().unwrap_or(Path::new("/")).to_path_buf();
     let shortcut = steam::Shortcut::new(name, &program, &start_dir, format!("run {product_id}"));
-
-    // Every account, because guessing which one a person uses and getting it
-    // wrong looks exactly like the feature not working.
-    let mut added = 0;
-    for file in &files {
-        let result = steam::load(file).and_then(|mut document| {
-            steam::upsert(&mut document, &shortcut)?;
-            steam::save(file, &document)
-        });
+    let product_id = product_id.to_string();
+    let name = name.to_string();
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || -> anyhow::Result<_> {
+            let mut failures = Vec::new();
+            let artwork = if let Some(cache) = cache {
+                // Older metadata caches have only the small list icon. Refresh
+                // this one title on demand to learn its larger library assets.
+                let mut product = product.or_else(|| cache.get(&product_id));
+                if product.as_ref().map_or(true, |p| p.artwork.is_empty()) {
+                    let (found, errors) =
+                        catalog::revalidate(&cache, &[product_id], &market.0, &market.1, true);
+                    failures.extend(errors);
+                    if let Some(fresh) = found.into_iter().next() {
+                        product = Some(fresh);
+                    }
+                }
+                if let Some(product) = product {
+                    let (files, errors) =
+                        steam::prepare_artwork(&cache, &product, fallback_icon.as_deref());
+                    failures.extend(errors);
+                    files
+                } else {
+                    steam::ArtworkFiles {
+                        icon: fallback_icon,
+                        ..Default::default()
+                    }
+                }
+            } else {
+                steam::ArtworkFiles {
+                    icon: fallback_icon,
+                    ..Default::default()
+                }
+            };
+            anyhow::ensure!(
+                !steam::is_running(),
+                "Close Steam first; it started while artwork was being fetched"
+            );
+            let mut added = 0;
+            let mut updated = 0;
+            for file in &files {
+                let result = steam::load(file).and_then(|mut document| {
+                    let mut shortcut = shortcut.clone();
+                    let app_id = steam::effective_app_id(&document, &shortcut);
+                    let previous_icon = steam::existing_shortcut(&document, &shortcut)
+                        .and_then(|entry| entry.get("icon"))
+                        .and_then(steam::Value::as_str)
+                        .filter(|path| {
+                            !path.is_empty()
+                                && Path::new(path).is_file()
+                                && *path != program.to_string_lossy()
+                        })
+                        .map(str::to_string);
+                    let (icon, errors) = steam::install_artwork(file, app_id, &artwork);
+                    failures.extend(errors);
+                    shortcut.icon = previous_icon
+                        .or_else(|| icon.map(|p| p.to_string_lossy().into_owned()))
+                        .unwrap_or_default();
+                    let replaced = steam::upsert(&mut document, &shortcut)?;
+                    steam::save(file, &document)?;
+                    Ok(replaced)
+                });
+                match result {
+                    Ok(true) => updated += 1,
+                    Ok(false) => added += 1,
+                    Err(error) => failures.push(format!("{}: {error}", file.display())),
+                }
+            }
+            Ok((added, updated, failures))
+        })
+        .await;
+        finish(&ui);
         match result {
-            Ok(()) => added += 1,
-            Err(e) => ui
+            Ok(Ok((added, updated, failures))) if added + updated > 0 => {
+                let action = if added == 0 { "Updated" } else { "Added" };
+                let detail = if failures.is_empty() {
+                    "Restart Steam to see it."
+                } else {
+                    "Some artwork was unavailable. Restart Steam to see it."
+                };
+                ui.toasts.add_toast(adw::Toast::new(&format!(
+                    "{action} \"{name}\" in Steam. {detail}"
+                )));
+            }
+            Ok(Ok((_, _, errors))) => ui.toasts.add_toast(adw::Toast::new(&format!(
+                "Could not add to Steam: {}",
+                errors.join("; ")
+            ))),
+            Ok(Err(error)) => ui.toasts.add_toast(adw::Toast::new(&error.to_string())),
+            Err(_) => ui
                 .toasts
-                .add_toast(adw::Toast::new(&format!("{}: {e}", file.display()))),
+                .add_toast(adw::Toast::new("Could not finish adding to Steam")),
         }
-    }
-    if added > 0 {
-        ui.toasts.add_toast(adw::Toast::new(&format!(
-            "Added \"{name}\" to Steam. Restart Steam to see it."
-        )));
-    }
+    });
 }
 
 fn account_pressed(ui: &Ui) {

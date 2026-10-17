@@ -156,7 +156,9 @@ directly. Everything has to go through the client's `run` path.
 
 ## Library sizes and cached lists
 
-Every game row shows either measured disk usage for its game directory or the
+Library, Game Pass, Installed and Updates use the same two-line game rows:
+icon and title, then version/size/status details, with actions centered on the
+right. Sizes appear once. Every game row shows either measured disk usage for its game directory or the
 Store's PC download size. Wine prefixes and cached downloads are separate from
 the installed game total; unavailable sizes are labelled explicitly. Disk usage
 measurements persist across restarts and list refreshes for 24 hours. Install
@@ -174,6 +176,13 @@ invalidate cached ownership, and a detected subscription change refreshes the
 Game Pass listing. Failed or interrupted refreshes preserve the last complete
 snapshot. Closing during a list/account/update refresh exits immediately;
 downloads still stop with cleanup, and removals finish before closing.
+
+Add to Steam saves the persistent AppImage target and the game's icon, with
+portrait cover, landscape cover, hero banner and title logo when the Store
+provides them. Re-adding updates the existing shortcut by launch identity or
+name and retains its Steam ID, settings, play history and custom artwork.
+Downloads are cached, and copied artwork lives in Steam's own `config/grid`
+directory. Close Steam before adding or updating a shortcut.
 
 ## Documentation
 
