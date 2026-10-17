@@ -212,6 +212,8 @@ summary="Synthetic account fixture"
         profiles["profiles"][0]["signed_in"]=False
         write(home/"profiles.json",json.dumps(profiles))
         settings.unlink()
+        # Explicit sign-out clears the legacy account cache as well as keys.
+        (state/"account.json").unlink(missing_ok=True)
         gui=subprocess.Popen([home/"bin/ferestre-gui"],env=env,stderr=subprocess.PIPE)
         app=s.find_app(gui.pid,time.monotonic()+20)
         frame=s.wait_for(app,lambda root:next(iter(s.find_all(root,role="frame",name="Ferestre")),None),"signed-out restart",time.monotonic()+20)
