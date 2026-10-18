@@ -80,9 +80,6 @@ row.library-row label.title {
 .presence-dot.ingame {
   background-color: @accent_color;
 }
-.presence-dot.failed {
-  background-color: @error_color;
-}
 .presence-dot.pending {
   background-color: @sidebar_bg_color;
   box-shadow: inset 0 0 0 2px alpha(@window_fg_color, 0.4);
@@ -1852,7 +1849,7 @@ fn render_account_button(ui: &Ui) {
     let badge = if model.account.is_some() {
         ui.presence.borrow().badge()
     } else {
-        ferestre_core::presence::Badge::Hidden
+        ferestre_core::presence::Badge::HIDDEN
     };
     let status = badge.label();
     let dot = presence_ui::dot(&badge);
@@ -2141,12 +2138,12 @@ fn sign_out(ui: &Ui) {
         .as_ref()
         .map(|r| r.store.clone())
         .or_else(|| presence_ui::player(ui));
-    // The saved account is removed just below, before the client runs, and
-    // the client is its own process, which a closed window does not stop.
-    note_close(
-        ui,
-        "You can close the window. You will still be signed out.",
-    );
+    // Until the client has been started, closing the window must wait: the
+    // runners are still saying goodbye, and a window gone before the client
+    // starts would leave the person told they were signed out while the
+    // client still holds the tokens.
+    *ui.wait_on_close.borrow_mut() = true;
+    show_activity(ui);
     // Before the client runs, not after: a window closed while it signs out
     // never reaches the code below, and the next one would open showing the
     // old account and its library from these files. If sign-out then fails,
@@ -2159,15 +2156,21 @@ fn sign_out(ui: &Ui) {
     }
     let ui = ui.clone();
     glib::spawn_future_local(async move {
-        if let Some(leaving) = &leaving {
-            presence_ui::stop_for(&ui, leaving).await;
+        presence_ui::stop_for(&ui, leaving.as_deref()).await;
+        let mut logout = scope_store(account::logout_command(&client), roles.as_ref());
+        let failed = move |e: std::io::Error| format!("{}: {e}", client.display());
+        let started = deadline::start(&mut logout).map_err(&failed);
+        if started.is_ok() {
+            // The saved account is already gone, and the client is its own
+            // process, which a closed window does not stop.
+            *ui.wait_on_close.borrow_mut() = false;
+            note_close(
+                &ui,
+                "You can close the window. You will still be signed out.",
+            );
         }
         let result = gio::spawn_blocking(move || {
-            deadline::status(
-                &mut scope_store(account::logout_command(&client), roles.as_ref()),
-                deadline::CLIENT_QUESTION,
-            )
-            .map_err(|e| format!("{}: {e}", client.display()))
+            deadline::wait(&mut started?, deadline::CLIENT_QUESTION).map_err(failed)
         })
         .await;
         finish(&ui);

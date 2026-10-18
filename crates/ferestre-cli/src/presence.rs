@@ -14,8 +14,16 @@
 //! The window can change its mind while the game runs, with two signals to
 //! this process (never to its group, which holds the game):
 //! - SIGUSR1 stops the runner, for "Show me online" switched off or the
-//!   Player signing out.
-//! - SIGUSR2 starts one again if the saved preference is on.
+//!   Player signing out. A sign-out leaves the saved preference on, so this
+//!   one does not read it.
+//! - SIGUSR2 makes the runner follow the saved preference: one is started if
+//!   it is on and none is up, and the one up is stopped if it is off. A
+//!   runner still telling Xbox goodbye counts as none: the new one starts as
+//!   soon as it has gone, so switching off and on quickly ends up on.
+//!
+//! Neither is decided from what the window last heard, which can be a moment
+//! behind. Two signals close together leave the later one, which is the
+//! later choice.
 //!
 //! The handlers are in place before the first relayed line, and the window
 //! signals only a launch it has heard from, so neither signal can arrive to
@@ -31,8 +39,10 @@ use std::time::Duration;
 use ferestre_core::accounts::{Profiles, Selection};
 use ferestre_core::presence::{self, Disabled, Event};
 
-/// How long the runner gets to say goodbye to Xbox once its stdin closes.
-const GOODBYE: Duration = Duration::from_secs(5);
+/// How long the runner gets to say goodbye to Xbox once its stdin closes. The
+/// client gives its own request 5 s, timed from after it has noticed; this
+/// leaves it room to finish rather than be killed halfway.
+const GOODBYE: Duration = Duration::from_secs(7);
 const POLL: Duration = Duration::from_millis(200);
 
 static REQUEST: AtomicI32 = AtomicI32::new(0);
@@ -98,7 +108,9 @@ impl Running {
                 return None;
             }
         };
-        relay(&Event::Starting);
+        relay(&Event::Starting {
+            player: Some(setup.player.clone()),
+        });
         let stdin = child.stdin.take();
         let stdout = child.stdout.take()?;
         let (done, drained) = mpsc::channel();
@@ -121,6 +133,11 @@ impl Running {
     /// Close stdin: the runner says goodbye to Xbox and exits by itself.
     fn ask_to_stop(&mut self) {
         self.stdin = None;
+    }
+
+    /// Whether it has been asked to stop and is on its way out.
+    fn stopping(&self) -> bool {
+        self.stdin.is_none()
     }
 
     fn exited(&mut self) -> bool {
@@ -180,20 +197,37 @@ impl Presence {
         let done = Arc::new(AtomicBool::new(false));
         let finished = Arc::clone(&done);
         let worker = std::thread::spawn(move || {
+            // Asked for a runner once the current one has gone. A runner that
+            // ends by itself, on a fatal error or `busy`, is not restarted.
+            let mut start = false;
             while !finished.load(Ordering::SeqCst) {
                 match REQUEST.swap(0, Ordering::SeqCst) {
                     libc::SIGUSR1 => {
+                        start = false;
                         if let Some(runner) = running.as_mut() {
                             runner.ask_to_stop();
                         }
                     }
-                    libc::SIGUSR2 if running.is_none() => running = begin(&setup),
+                    libc::SIGUSR2 => match running.as_mut() {
+                        Some(runner) if !runner.stopping() => {
+                            if !wanted(&setup) {
+                                runner.ask_to_stop();
+                            }
+                        }
+                        // `begin` reads the preference again when it is
+                        // time, and says why if there is still nothing to do.
+                        _ => start = true,
+                    },
                     _ => {}
                 }
                 if running.as_mut().is_some_and(Running::exited) {
                     if let Some(runner) = running.take() {
                         runner.finish();
                     }
+                }
+                if start && running.is_none() {
+                    start = false;
+                    running = begin(&setup);
                 }
                 std::thread::sleep(POLL);
             }
@@ -208,17 +242,25 @@ impl Presence {
     }
 }
 
+/// Whether the Player wants a runner now.
+fn wanted(setup: &Setup) -> bool {
+    setup.signed_in && presence::sharing(&setup.config_dir, &setup.player)
+}
+
 /// Start a runner, or say why there is none.
 fn begin(setup: &Setup) -> Option<Running> {
-    if !setup.signed_in {
-        relay(&Event::Disabled(Disabled::SignedOut));
-        return None;
-    }
-    if !presence::sharing(&setup.config_dir, &setup.player) {
-        relay(&Event::Disabled(Disabled::Off));
-        return None;
-    }
-    Running::spawn(setup)
+    let reason = if !setup.signed_in {
+        Disabled::SignedOut
+    } else if !presence::sharing(&setup.config_dir, &setup.player) {
+        Disabled::Off
+    } else {
+        return Running::spawn(setup);
+    };
+    relay(&Event::Disabled {
+        reason,
+        player: Some(setup.player.clone()),
+    });
+    None
 }
 
 impl Drop for Presence {
@@ -273,6 +315,13 @@ mod tests {
     struct Scratch(PathBuf);
 
     impl Scratch {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("ferestre-presence-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
         fn path(&self) -> &Path {
             &self.0
         }
@@ -283,6 +332,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+
+    /// The signals go to the whole test process, and the request they leave
+    /// is one static, so the tests that send them take turns.
+    static SIGNALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -295,64 +348,139 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_runner_follows_the_launch_and_the_windows_signals() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = Scratch(
-            std::env::temp_dir().join(format!("ferestre-presence-runner-{}", std::process::id())),
-        );
-        std::fs::create_dir_all(root.path()).unwrap();
-        let log = root.path().join("runner.log");
-        let client = root.path().join("xodus-cli");
-        std::fs::write(
-            &client,
-            format!(
-                "#!/bin/sh\necho \"$*\" >> '{log}'\n\
-                 echo '{{\"schema\":1,\"event\":\"online\",\"title\":\"Fixture\",\"heartbeat_after\":60}}'\n\
-                 cat > /dev/null\necho closed >> '{log}'\necho '{{\"event\":\"offline\"}}'\n",
-                log = log.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let config = root.path().join("config");
-        let lines = || {
-            std::fs::read_to_string(&log)
+    fn signal(which: libc::c_int) {
+        // Safety: this process, with a handler `Presence::start` installed.
+        unsafe { libc::kill(libc::getpid(), which) };
+    }
+
+    /// A client whose runner logs its argv, says it is online, and on stdin
+    /// EOF logs "closed", takes `goodbye` seconds telling Xbox, then logs
+    /// "gone" and exits.
+    struct Fixture {
+        root: Scratch,
+        log: PathBuf,
+        config: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(name: &str, goodbye: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let root = Scratch::new(name);
+            let log = root.path().join("runner.log");
+            let client = root.path().join("xodus-cli");
+            std::fs::write(
+                &client,
+                format!(
+                    "#!/bin/sh\necho \"$*\" >> '{log}'\n\
+                     echo '{{\"schema\":1,\"event\":\"online\",\"title\":\"Fixture\",\"heartbeat_after\":60}}'\n\
+                     cat > /dev/null\necho closed >> '{log}'\nsleep {goodbye}\n\
+                     echo '{{\"event\":\"offline\"}}'\necho gone >> '{log}'\n",
+                    log = log.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let config = root.path().join("config");
+            Self { root, log, config }
+        }
+
+        fn setup(&self) -> Setup {
+            Setup {
+                client: self.root.path().join("xodus-cli"),
+                config_dir: self.config.clone(),
+                player: PLAYER.into(),
+                signed_in: true,
+                game_dir: self.root.path().join("game"),
+            }
+        }
+
+        fn lines(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.log)
                 .unwrap_or_default()
                 .lines()
                 .map(str::to_string)
-                .collect::<Vec<_>>()
-        };
-        let started =
-            |lines: &[String]| lines.iter().filter(|l| l.contains("presence run")).count();
-        let closed = |lines: &[String]| lines.iter().filter(|l| *l == "closed").count();
-        let setup = Setup {
-            client: client.clone(),
-            config_dir: config.clone(),
-            player: PLAYER.into(),
-            signed_in: true,
-            game_dir: root.path().join("game"),
-        };
-        let launch = Presence::start(Some(setup));
-        wait_until("the first runner", || started(&lines()) == 1);
-        assert!(lines()[0].starts_with(&format!(
+                .collect()
+        }
+
+        fn count(&self, what: &str) -> usize {
+            self.lines().iter().filter(|l| l.contains(what)).count()
+        }
+
+        fn share(&self, on: bool) {
+            presence::set_sharing(&self.config, PLAYER, on).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_runner_follows_the_launch_and_the_windows_signals() {
+        let _turn = SIGNALS.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new("follow", "0");
+        let launch = Presence::start(Some(fixture.setup()));
+        wait_until("the first runner", || fixture.count("presence run") == 1);
+        assert!(fixture.lines()[0].starts_with(&format!(
             "--profile {PLAYER} presence run --json --game-dir "
         )));
         // Switched off in the window: the runner's stdin closes.
-        unsafe { libc::kill(libc::getpid(), libc::SIGUSR1) };
-        wait_until("the runner to be stopped", || closed(&lines()) == 1);
-        // Asked to start again while the Player's preference is off: nothing.
-        presence::set_sharing(&config, PLAYER, false).unwrap();
-        std::thread::sleep(POLL * 2);
-        unsafe { libc::kill(libc::getpid(), libc::SIGUSR2) };
+        fixture.share(false);
+        signal(libc::SIGUSR1);
+        wait_until("the runner to be stopped", || fixture.count("gone") == 1);
+        // Asked to follow a preference that is off: nothing.
+        signal(libc::SIGUSR2);
         std::thread::sleep(POLL * 3);
-        assert_eq!(started(&lines()), 1);
-        presence::set_sharing(&config, PLAYER, true).unwrap();
-        unsafe { libc::kill(libc::getpid(), libc::SIGUSR2) };
-        wait_until("a second runner", || started(&lines()) == 2);
-        // The game exits: dropping the launch closes the runner's stdin and
-        // waits for it.
+        assert_eq!(fixture.count("presence run"), 1);
+        fixture.share(true);
+        signal(libc::SIGUSR2);
+        wait_until("a second runner", || fixture.count("presence run") == 2);
+        // Off again, told only to follow the preference: it stops.
+        fixture.share(false);
+        signal(libc::SIGUSR2);
+        wait_until("the second runner to stop", || fixture.count("gone") == 2);
+        // On and straight back off: the later choice holds. A runner may have
+        // started in between, but none is left up.
+        fixture.share(true);
+        signal(libc::SIGUSR2);
+        fixture.share(false);
+        signal(libc::SIGUSR1);
+        std::thread::sleep(POLL * 3);
+        wait_until("no runner left up", || {
+            fixture.count("presence run") == fixture.count("gone")
+        });
+        // The game exits with a runner up: dropping the launch closes its
+        // stdin and waits for it.
+        let runs = fixture.count("presence run");
+        fixture.share(true);
+        signal(libc::SIGUSR2);
+        wait_until("another runner", || {
+            fixture.count("presence run") == runs + 1
+        });
         drop(launch);
-        assert_eq!(closed(&lines()), 2);
+        assert_eq!(fixture.count("gone"), runs + 1);
+    }
+
+    #[test]
+    fn off_and_on_again_while_the_runner_says_goodbye_ends_up_on() {
+        let _turn = SIGNALS.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new("goodbye", "1");
+        let launch = Presence::start(Some(fixture.setup()));
+        wait_until("the first runner", || fixture.count("presence run") == 1);
+        fixture.share(false);
+        signal(libc::SIGUSR1);
+        wait_until("the runner to be told", || fixture.count("closed") == 1);
+        // Switched on again while it is still telling Xbox goodbye.
+        std::thread::sleep(Duration::from_millis(300));
+        fixture.share(true);
+        signal(libc::SIGUSR2);
+        wait_until("a runner after the first has gone", || {
+            fixture.count("presence run") == 2
+        });
+        let lines = fixture.lines();
+        let gone = lines.iter().position(|l| l == "gone").unwrap();
+        let second = lines
+            .iter()
+            .rposition(|l| l.contains("presence run"))
+            .unwrap();
+        assert!(gone < second, "two runners at once: {lines:?}");
+        drop(launch);
+        assert_eq!(fixture.count("gone"), 2);
     }
 }

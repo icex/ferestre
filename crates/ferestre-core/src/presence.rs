@@ -233,12 +233,28 @@ pub enum Event {
     },
     Offline,
     Busy,
-    /// Launch side: a runner was started.
-    Starting,
-    /// Launch side: no runner, and why.
-    Disabled(Disabled),
+    /// Launch side: a runner was started, for this Player.
+    Starting {
+        player: Option<String>,
+    },
+    /// Launch side: no runner for this Player, and why.
+    Disabled {
+        reason: Disabled,
+        player: Option<String>,
+    },
     /// Launch side: the runner process has exited.
     Ended,
+}
+
+impl Event {
+    /// The Player a launch says it reports for. Only the launch's own lines
+    /// say, and the first of them comes before any line from the client.
+    pub fn player(&self) -> Option<&str> {
+        match self {
+            Event::Starting { player } | Event::Disabled { player, .. } => player.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 /// Control characters and length cut from text that ends up in a label.
@@ -261,6 +277,13 @@ pub fn parse_event(line: &str) -> Option<Event> {
     }
     let text = |key: &str| object.get(key).and_then(Value::as_str).map(clean);
     let number = |key: &str| object.get(key).and_then(Value::as_u64);
+    let player = || {
+        object
+            .get("player")
+            .and_then(Value::as_str)
+            .filter(|id| crate::accounts::valid_profile_id(id))
+            .map(str::to_string)
+    };
     Some(match object.get("event")?.as_str()? {
         "online" => Event::Online {
             title: text("title").filter(|t| !t.is_empty())?,
@@ -276,12 +299,15 @@ pub fn parse_event(line: &str) -> Option<Event> {
         },
         "offline" => Event::Offline,
         "busy" => Event::Busy,
-        "starting" => Event::Starting,
-        "disabled" => Event::Disabled(match object.get("reason")?.as_str()? {
-            "off" => Disabled::Off,
-            "signed-out" => Disabled::SignedOut,
-            _ => return None,
-        }),
+        "starting" => Event::Starting { player: player() },
+        "disabled" => Event::Disabled {
+            reason: match object.get("reason")?.as_str()? {
+                "off" => Disabled::Off,
+                "signed-out" => Disabled::SignedOut,
+                _ => return None,
+            },
+            player: player(),
+        },
         "ended" => Event::Ended,
         _ => return None,
     })
@@ -304,11 +330,11 @@ pub fn event_json(event: &Event) -> String {
         }
         Event::Offline => json!({"event":"offline"}),
         Event::Busy => json!({"event":"busy"}),
-        Event::Starting => json!({"event":"starting"}),
-        Event::Disabled(reason) => json!({"event":"disabled","reason":match reason {
+        Event::Starting { player } => json!({"event":"starting","player":player}),
+        Event::Disabled { reason, player } => json!({"event":"disabled","reason":match reason {
             Disabled::Off => "off",
             Disabled::SignedOut => "signed-out",
-        }}),
+        },"player":player}),
         Event::Ended => json!({"event":"ended"}),
     };
     value.to_string()
@@ -330,22 +356,33 @@ pub enum Runner {
     Idle,
     Starting,
     Online(String),
-    Retrying(String),
+    /// Why, and the game it was reporting before, if it got that far.
+    Retrying {
+        reason: String,
+        title: Option<String>,
+    },
     /// Stopped for good on this launch until somebody acts.
     Failed(ErrorCode),
 }
 
 impl Runner {
     pub fn apply(&mut self, event: &Event) {
+        let title = self.title().map(str::to_string);
         *self = match event {
-            Event::Starting => Runner::Starting,
+            Event::Starting { .. } => Runner::Starting,
             Event::Online { title, .. } => Runner::Online(title.clone()),
-            Event::Retrying { reason, .. } => Runner::Retrying(describe_retry(reason)),
-            Event::Error { fatal: false, code } => Runner::Retrying(code.message()),
+            Event::Retrying { reason, .. } => Runner::Retrying {
+                reason: describe_retry(reason),
+                title,
+            },
+            Event::Error { fatal: false, code } => Runner::Retrying {
+                reason: code.message(),
+                title,
+            },
             Event::Error { fatal: true, code } => Runner::Failed(code.clone()),
             // A fatal error outlives the process that reported it.
             Event::Ended if matches!(self, Runner::Failed(_)) => return,
-            Event::Offline | Event::Busy | Event::Disabled(_) | Event::Ended => Runner::Idle,
+            Event::Offline | Event::Busy | Event::Disabled { .. } | Event::Ended => Runner::Idle,
         }
     }
 
@@ -353,8 +390,17 @@ impl Runner {
     pub fn live(&self) -> bool {
         matches!(
             self,
-            Runner::Starting | Runner::Online(_) | Runner::Retrying(_)
+            Runner::Starting | Runner::Online(_) | Runner::Retrying { .. }
         )
+    }
+
+    /// The game a live runner is reporting, as far as it has said.
+    pub fn title(&self) -> Option<&str> {
+        match self {
+            Runner::Online(title) => Some(title),
+            Runner::Retrying { title, .. } => title.as_deref(),
+            _ => None,
+        }
     }
 }
 
@@ -425,56 +471,69 @@ pub enum Availability {
     Ready,
 }
 
-/// The dot and the words beside the account.
+/// What Xbox shows, as the dot and the words beside the account.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Badge {
+pub enum Shown {
     Hidden,
     Checking,
     Unknown,
     /// Sharing is off and Xbox shows nothing.
     Off,
     Offline,
-    /// Online, and not because of a game this launcher reported.
+    /// Online, and not with the game this launcher reports.
     Online(Vec<DeviceTitle>),
     Away,
+    /// Xbox lists the game this launcher reports.
     Playing(String),
-    Reconnecting(String),
-    Problem(String),
+}
+
+/// The dot, its words and its tooltip. The colour and the words are only
+/// ever Xbox's answer to `presence get`; what this launcher's runner says
+/// goes in `note`, for the tooltip, because a runner whose post was accepted
+/// is not yet proof that friends see the game.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Badge {
+    pub shown: Shown,
+    pub note: Option<String>,
 }
 
 impl Badge {
+    pub const HIDDEN: Badge = Badge {
+        shown: Shown::Hidden,
+        note: None,
+    };
+
     pub fn label(&self) -> Option<String> {
-        Some(match self {
-            Badge::Hidden => return None,
-            Badge::Checking => "Checking".into(),
-            Badge::Unknown => "Unknown".into(),
-            Badge::Off => "Off".into(),
-            Badge::Offline => "Offline".into(),
-            Badge::Online(_) => "Online".into(),
-            Badge::Away => "Away".into(),
-            Badge::Playing(title) => format!("Playing {title}"),
-            Badge::Reconnecting(_) => "Reconnecting".into(),
-            Badge::Problem(_) => "Not shared".into(),
+        Some(match &self.shown {
+            Shown::Hidden => return None,
+            Shown::Checking => "Checking".into(),
+            Shown::Unknown => "Unknown".into(),
+            Shown::Off => "Off".into(),
+            Shown::Offline => "Offline".into(),
+            Shown::Online(_) => "Online".into(),
+            Shown::Away => "Away".into(),
+            Shown::Playing(title) => format!("Playing {title}"),
         })
     }
 
     /// The modifier class on `presence-dot`; grey without one.
     pub fn css_class(&self) -> Option<&'static str> {
-        match self {
-            Badge::Online(_) => Some("online"),
-            Badge::Away => Some("away"),
-            Badge::Playing(_) => Some("ingame"),
-            Badge::Checking | Badge::Reconnecting(_) => Some("pending"),
-            Badge::Problem(_) => Some("failed"),
+        match self.shown {
+            Shown::Online(_) => Some("online"),
+            Shown::Away => Some("away"),
+            Shown::Playing(_) => Some("ingame"),
+            Shown::Checking => Some("pending"),
             _ => None,
         }
     }
 
-    pub fn tooltip(&self) -> Option<String> {
-        let label = self.label()?;
-        let detail = match self {
-            Badge::Online(titles) if titles.is_empty() => "Online on another device".to_string(),
-            Badge::Online(titles) => format!(
+    /// The lines after "Status: …": what Xbox's answer means, then what the
+    /// runner says, if anything.
+    pub fn detail(&self) -> Option<String> {
+        let meaning = match &self.shown {
+            Shown::Hidden => return None,
+            Shown::Online(titles) if titles.is_empty() => Some("Online on another device".into()),
+            Shown::Online(titles) => Some(format!(
                 "Online on another device: {}",
                 titles
                     .iter()
@@ -485,14 +544,21 @@ impl Badge {
                     })
                     .collect::<Vec<_>>()
                     .join(", ")
-            ),
-            Badge::Off => "Not sharing the games you play".into(),
-            Badge::Unknown => "Could not check your status".into(),
-            Badge::Reconnecting(reason) if !reason.is_empty() => reason.clone(),
-            Badge::Problem(reason) => reason.clone(),
-            _ => return Some(format!("Status: {label}")),
+            )),
+            Shown::Off => Some("Not sharing the games you play".into()),
+            Shown::Unknown => Some("Could not check your status".into()),
+            _ => None,
         };
-        Some(format!("Status: {label}\n{detail}"))
+        let lines: Vec<String> = meaning.into_iter().chain(self.note.clone()).collect();
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
+    pub fn tooltip(&self) -> Option<String> {
+        let label = self.label()?;
+        Some(match self.detail() {
+            Some(detail) => format!("Status: {label}\n{detail}"),
+            None => format!("Status: {label}"),
+        })
     }
 }
 
@@ -501,7 +567,7 @@ impl Badge {
 pub fn strongest<'a>(runners: impl IntoIterator<Item = &'a Runner>) -> Option<&'a Runner> {
     let rank = |r: &Runner| match r {
         Runner::Online(_) => 4,
-        Runner::Retrying(_) => 3,
+        Runner::Retrying { .. } => 3,
         Runner::Failed(_) => 2,
         Runner::Starting => 1,
         Runner::Idle => 0,
@@ -512,9 +578,17 @@ pub fn strongest<'a>(runners: impl IntoIterator<Item = &'a Runner>) -> Option<&'
         .max_by_key(|r| rank(r))
 }
 
-/// What the badge shows. The runner speaks for the game it is reporting;
-/// otherwise Xbox's own answer does, whatever the switch says, because friends
-/// can see a console even when this launcher shares nothing.
+/// Whether Xbox's name for a title is the runner's. The runner names the game
+/// from its package, Xbox from its catalogue; the two are expected to agree,
+/// and when they do not the badge says Online and the tooltip says why.
+fn same_title(xbox: &str, runner: &str) -> bool {
+    xbox.trim().eq_ignore_ascii_case(runner.trim())
+}
+
+/// What the badge shows. Xbox's own answer decides it, whatever the switch
+/// says, because friends can see a console even when this launcher shares
+/// nothing. A runner can only say "Playing" once Xbox lists its game; its
+/// retries and failures are notes, and only while sharing is on.
 pub fn badge(
     availability: Availability,
     sharing: bool,
@@ -522,25 +596,39 @@ pub fn badge(
     server: &Server,
 ) -> Badge {
     if availability != Availability::Ready {
-        return Badge::Hidden;
+        return Badge::HIDDEN;
     }
-    match runner {
-        Some(Runner::Online(title)) => return Badge::Playing(title.clone()),
-        Some(Runner::Retrying(reason)) => return Badge::Reconnecting(reason.clone()),
-        Some(Runner::Failed(code)) => return Badge::Problem(code.message()),
-        _ => {}
-    }
-    match server {
-        Server::Known(status) => match status.state {
-            State::Online => Badge::Online(status.titles.clone()),
-            State::Away => Badge::Away,
-            State::Offline if sharing => Badge::Offline,
-            State::Offline => Badge::Off,
-        },
-        _ if !sharing => Badge::Hidden,
-        Server::Failed => Badge::Unknown,
-        Server::Unknown => Badge::Checking,
-    }
+    let reporting = runner.and_then(Runner::title);
+    let shown = match server {
+        Server::Known(status) => {
+            let listed = reporting.and_then(|title| {
+                status
+                    .titles
+                    .iter()
+                    .find(|t| same_title(&t.name, title))
+                    .map(|t| t.name.clone())
+            });
+            match (listed, &status.state) {
+                (Some(title), State::Online | State::Away) => Shown::Playing(title),
+                (_, State::Online) => Shown::Online(status.titles.clone()),
+                (_, State::Away) => Shown::Away,
+                (_, State::Offline) if sharing => Shown::Offline,
+                (_, State::Offline) => Shown::Off,
+            }
+        }
+        _ if !sharing => Shown::Hidden,
+        Server::Failed => Shown::Unknown,
+        Server::Unknown => Shown::Checking,
+    };
+    let note = match runner.filter(|_| sharing && shown != Shown::Hidden) {
+        Some(Runner::Online(title)) if !matches!(shown, Shown::Playing(_)) => {
+            Some(format!("Reporting {title}; Xbox does not list it yet"))
+        }
+        Some(Runner::Retrying { reason, .. }) => Some(format!("Reconnecting: {reason}")),
+        Some(Runner::Failed(code)) => Some(format!("Not shared: {}", code.message())),
+        _ => None,
+    };
+    Badge { shown, note }
 }
 
 /// The line under the switch.
@@ -556,7 +644,7 @@ pub fn caption(availability: Availability, sharing: bool, runner: Option<&Runner
     }
     match runner {
         Some(Runner::Online(title)) => format!("Playing {title}"),
-        Some(Runner::Retrying(_)) => "Reconnecting to Xbox…".into(),
+        Some(Runner::Retrying { .. }) => "Reconnecting to Xbox…".into(),
         Some(Runner::Failed(code)) => code.message(),
         _ => "Friends will see the games you play from Ferestre".into(),
     }
@@ -705,9 +793,18 @@ mod tests {
             },
             Event::Offline,
             Event::Busy,
-            Event::Starting,
-            Event::Disabled(Disabled::Off),
-            Event::Disabled(Disabled::SignedOut),
+            Event::Starting {
+                player: Some(PLAYER.into()),
+            },
+            Event::Starting { player: None },
+            Event::Disabled {
+                reason: Disabled::Off,
+                player: Some(PLAYER.into()),
+            },
+            Event::Disabled {
+                reason: Disabled::SignedOut,
+                player: None,
+            },
             Event::Ended,
         ];
         for event in events {
@@ -719,6 +816,12 @@ mod tests {
         let relayed = relay_line(&parse_event(line).unwrap());
         assert!(!relayed.contains("secret"), "{relayed}");
         assert_eq!(parse_relay("-- presence {\"event\":\"busy\"}"), None);
+        // The Player is a profile id or nothing, never a path or a label.
+        let starting = parse_event(&format!(r#"{{"event":"starting","player":"{PLAYER}"}}"#));
+        assert_eq!(starting.as_ref().and_then(Event::player), Some(PLAYER));
+        let odd = parse_event(r#"{"event":"starting","player":"../Owner"}"#).unwrap();
+        assert_eq!(odd, Event::Starting { player: None });
+        assert_eq!(Event::Offline.player(), None);
     }
 
     #[test]
@@ -795,17 +898,20 @@ mod tests {
 
         let ready = Availability::Ready;
         let known = |s: &Status| Server::Known(s.clone());
+        let shown = |sharing, runner: Option<&Runner>, server: &Server| {
+            badge(ready, sharing, runner, server).shown
+        };
         let online = badge(ready, false, None, &known(&status));
         assert_eq!(online.label().as_deref(), Some("Online"));
         assert_eq!(online.css_class(), Some("online"));
         assert!(online.tooltip().unwrap().contains("Halo on XboxSeries"));
-        assert_eq!(badge(ready, true, None, &known(&away)), Badge::Away);
-        assert_eq!(badge(ready, true, None, &known(&offline)), Badge::Offline);
-        assert_eq!(badge(ready, false, None, &known(&offline)), Badge::Off);
-        assert_eq!(badge(ready, true, None, &Server::Unknown), Badge::Checking);
-        assert_eq!(badge(ready, false, None, &Server::Unknown), Badge::Hidden);
-        assert_eq!(badge(ready, true, None, &Server::Failed), Badge::Unknown);
-        assert_eq!(badge(ready, false, None, &Server::Failed), Badge::Hidden);
+        assert_eq!(shown(true, None, &known(&away)), Shown::Away);
+        assert_eq!(shown(true, None, &known(&offline)), Shown::Offline);
+        assert_eq!(shown(false, None, &known(&offline)), Shown::Off);
+        assert_eq!(shown(true, None, &Server::Unknown), Shown::Checking);
+        assert_eq!(shown(false, None, &Server::Unknown), Shown::Hidden);
+        assert_eq!(shown(true, None, &Server::Failed), Shown::Unknown);
+        assert_eq!(shown(false, None, &Server::Failed), Shown::Hidden);
         for availability in [
             Availability::Checking,
             Availability::Unsupported,
@@ -813,37 +919,80 @@ mod tests {
         ] {
             assert_eq!(
                 badge(availability, true, None, &known(&status)),
-                Badge::Hidden
+                Badge::HIDDEN
             );
         }
-        // The runner speaks for its game, ahead of a server answer that may
-        // be minutes old.
-        let playing = Runner::Online("Halo".into());
-        let badge_now = badge(ready, true, Some(&playing), &known(&offline));
-        assert_eq!(badge_now.label().as_deref(), Some("Playing Halo"));
-        assert_eq!(badge_now.css_class(), Some("ingame"));
+
+        // "Playing" only once Xbox lists the game the runner reports. Before
+        // that the runner's claim is a note, and Xbox's answer stays.
+        let playing = Runner::Online("Presence Game".into());
+        let before = badge(ready, true, Some(&playing), &known(&offline));
+        assert_eq!(before.shown, Shown::Offline);
+        assert!(before
+            .tooltip()
+            .unwrap()
+            .contains("Reporting Presence Game; Xbox does not list it yet"));
+        let listed = parse_status(
+            br#"{"schema":1,"state":"Online","devices":[{"type":"PC","titles":[{"id":"9","name":"presence game"}]}]}"#,
+        )
+        .unwrap();
+        let now = badge(ready, true, Some(&playing), &known(&listed));
+        assert_eq!(now.label().as_deref(), Some("Playing presence game"));
+        assert_eq!(now.css_class(), Some("ingame"));
+        assert_eq!(now.note, None);
+        // Xbox listing a game is Xbox's answer whatever the switch says; the
+        // runner is not mentioned once sharing is off.
+        let switched_off = badge(ready, false, Some(&playing), &known(&status));
+        assert_eq!(switched_off.shown, Shown::Online(status.titles.clone()));
+        assert_eq!(switched_off.note, None);
+
+        // Reconnecting after it was shown: still the game, while Xbox lists it.
+        let mut again = playing.clone();
+        again.apply(&Event::Retrying {
+            reason: "network".into(),
+            in_secs: Some(15),
+        });
+        let badge_now = badge(ready, true, Some(&again), &known(&listed));
+        assert_eq!(badge_now.shown, Shown::Playing("presence game".into()));
+        assert!(badge_now
+            .tooltip()
+            .unwrap()
+            .ends_with("\nReconnecting: Cannot reach Xbox"));
+        // A runner reconnecting or failed changes the tooltip, not the dot.
         let mut retrying = Runner::Idle;
         retrying.apply(&Event::Retrying {
             reason: "unavailable".into(),
             in_secs: Some(30),
         });
         let badge_now = badge(ready, true, Some(&retrying), &known(&status));
-        assert_eq!(badge_now.label().as_deref(), Some("Reconnecting"));
-        assert!(badge_now.tooltip().unwrap().contains("Xbox is unavailable"));
+        assert_eq!(badge_now.label().as_deref(), Some("Online"));
+        assert_eq!(badge_now.css_class(), Some("online"));
+        assert!(badge_now
+            .tooltip()
+            .unwrap()
+            .contains("Reconnecting: Xbox is unavailable"));
         assert_eq!(
             describe_retry("server error 500"),
             "Xbox answered: server error 500"
         );
         let failed = Runner::Failed(ErrorCode::NoTitleIdentity);
-        let badge_now = badge(ready, true, Some(&failed), &known(&status));
-        assert_eq!(badge_now.css_class(), Some("failed"));
+        let badge_now = badge(ready, true, Some(&failed), &known(&offline));
+        assert_eq!(badge_now.shown, Shown::Offline);
+        assert_eq!(badge_now.css_class(), None);
         assert!(badge_now
             .tooltip()
             .unwrap()
-            .contains("Online status unavailable for this game"));
+            .contains("Not shared: Online status unavailable for this game"));
+        // Switched off, an earlier failure is no longer the badge's business.
+        let badge_now = badge(ready, false, Some(&failed), &known(&offline));
+        assert_eq!(badge_now.shown, Shown::Off);
         assert_eq!(
-            badge(ready, true, Some(&Runner::Starting), &known(&away)),
-            Badge::Away
+            badge_now.tooltip().as_deref(),
+            Some("Status: Off\nNot sharing the games you play")
+        );
+        assert_eq!(
+            badge(ready, true, Some(&Runner::Starting), &known(&away)).shown,
+            Shown::Away
         );
     }
 
@@ -851,7 +1000,7 @@ mod tests {
     fn runner_state_follows_its_events_and_a_fatal_error_stays() {
         let mut runner = Runner::default();
         assert!(!runner.live());
-        runner.apply(&Event::Starting);
+        runner.apply(&Event::Starting { player: None });
         assert!(runner.live());
         runner.apply(&Event::Online {
             title: "Halo".into(),
@@ -862,7 +1011,13 @@ mod tests {
             fatal: false,
             code: ErrorCode::Network,
         });
-        assert_eq!(runner, Runner::Retrying("Cannot reach Xbox".into()));
+        assert_eq!(
+            runner,
+            Runner::Retrying {
+                reason: "Cannot reach Xbox".into(),
+                title: Some("Halo".into())
+            }
+        );
         runner.apply(&Event::Offline);
         assert_eq!(runner, Runner::Idle);
         runner.apply(&Event::Error {
@@ -872,7 +1027,7 @@ mod tests {
         runner.apply(&Event::Ended);
         assert_eq!(runner, Runner::Failed(ErrorCode::Forbidden));
         assert!(!runner.live());
-        runner.apply(&Event::Starting);
+        runner.apply(&Event::Starting { player: None });
         runner.apply(&Event::Busy);
         assert_eq!(runner, Runner::Idle);
 
@@ -880,7 +1035,10 @@ mod tests {
             Runner::Idle,
             Runner::Failed(ErrorCode::Network),
             Runner::Online("Halo".into()),
-            Runner::Retrying(String::new()),
+            Runner::Retrying {
+                reason: String::new(),
+                title: None,
+            },
         ];
         assert_eq!(strongest(&all), Some(&Runner::Online("Halo".into())));
         assert_eq!(strongest(&[Runner::Idle]), None);

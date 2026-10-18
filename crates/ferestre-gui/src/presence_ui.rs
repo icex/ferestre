@@ -7,7 +7,9 @@
 //! events from the launch's stderr, which goes to the launch's output file
 //! (see `state::follow_lines`), asks Xbox what it shows with `presence
 //! get`, and changes a running launch's mind with SIGUSR1 (stop) and SIGUSR2
-//! (start again).
+//! (follow the saved preference). Which one is sent depends only on what the
+//! person chose, never on what the window last heard from the runner, which
+//! can be a moment behind; the launch sorts out the rest.
 
 use super::*;
 use ferestre_core::presence::{self, Availability, Badge, Event, Runner, Server};
@@ -15,17 +17,32 @@ use std::time::{Duration, Instant};
 
 /// How often Xbox is asked, from the window's minute timer.
 const ASK_EVERY: Duration = Duration::from_secs(5 * 60);
-/// How long a Player's sign-out waits for runners to tell Xbox goodbye.
-const GOODBYE: Duration = Duration::from_secs(5);
+/// How long a Player's sign-out waits for runners to tell Xbox goodbye: the
+/// client's own 5 s for the request, and room for it to notice and exit.
+const GOODBYE: Duration = Duration::from_secs(7);
 
 pub(super) struct Launch {
     pid: u32,
-    /// The Player the launch was started for.
+    /// The Player the launch reports for, as its first line says. Until then
+    /// a guess from the roles, and it is not signalled anyway.
     player: Option<String>,
     /// Whether it has relayed anything yet. It does only once its signal
     /// handlers are in place, so before that it is never signalled.
     heard: bool,
+    /// Its Player signed out: it is never asked to start a runner again.
+    signed_out: bool,
     runner: Runner,
+}
+
+impl Launch {
+    fn signal(&self, signal: libc::c_int) {
+        // Safety: the launcher this window started, by its own pid and not
+        // its group, which also holds the game. Only once it has been heard,
+        // so its handlers are in place.
+        if self.heard {
+            unsafe { libc::kill(self.pid as i32, signal) };
+        }
+    }
 }
 
 #[derive(Default)]
@@ -236,15 +253,24 @@ fn set_sharing(ui: &Ui, on: bool) {
         let mut state = ui.presence.borrow_mut();
         state.sharing = on;
         state.report_failure = on;
-        for launch in state.mine().filter(|l| l.heard) {
-            let signal = match (on, launch.runner.live()) {
-                (true, false) => libc::SIGUSR2,
-                (false, true) => libc::SIGUSR1,
-                _ => continue,
-            };
-            // Safety: the launcher this window started, by its own pid and not
-            // its group, which also holds the game.
-            unsafe { libc::kill(launch.pid as i32, signal) };
+        // Every launch of this Player, whatever its runner last said: one
+        // that said "online" a moment ago may be on its way out, and one
+        // that said nothing yet may be about to start.
+        for launch in state.mine() {
+            if !on {
+                launch.signal(libc::SIGUSR1);
+            } else if !launch.signed_out {
+                launch.signal(libc::SIGUSR2);
+            }
+        }
+        if !on {
+            // A failure belongs to sharing that is now off.
+            let player = state.player.clone();
+            for launch in state.launches.values_mut() {
+                if launch.player == player && matches!(launch.runner, Runner::Failed(_)) {
+                    launch.runner = Runner::Idle;
+                }
+            }
         }
     }
     update(ui);
@@ -260,6 +286,7 @@ pub(super) fn launch_started(ui: &Ui, key: &str, pid: u32) {
             pid,
             player,
             heard: false,
+            signed_out: false,
             runner: Runner::Idle,
         },
     );
@@ -268,6 +295,12 @@ pub(super) fn launch_started(ui: &Ui, key: &str, pid: u32) {
 /// An event relayed by the launch with this pid. A late line from an earlier
 /// launch of the same title is dropped.
 pub(super) fn launch_event(ui: &Ui, key: &str, pid: u32, event: Event) {
+    let config = ui
+        .model
+        .borrow()
+        .paths
+        .as_ref()
+        .map(|p| p.config_dir().to_path_buf());
     let failure = {
         let mut state = ui.presence.borrow_mut();
         let current = state.player.clone();
@@ -275,7 +308,30 @@ pub(super) fn launch_event(ui: &Ui, key: &str, pid: u32, event: Event) {
             return;
         };
         launch.heard = true;
+        if let Some(player) = event.player() {
+            launch.player = Some(player.to_string());
+        }
         launch.runner.apply(&event);
+        // The launch read the preference before it said this. If the switch
+        // has changed since, or its Player has signed out, the window's
+        // signal may have come before the launch could take it, so send the
+        // one it needs now.
+        if let (Some(config), Some(player)) = (&config, event.player()) {
+            match &event {
+                Event::Starting { .. }
+                    if launch.signed_out || !presence::sharing(config, player) =>
+                {
+                    launch.signal(libc::SIGUSR1)
+                }
+                Event::Disabled {
+                    reason: presence::Disabled::Off,
+                    ..
+                } if !launch.signed_out && presence::sharing(config, player) => {
+                    launch.signal(libc::SIGUSR2)
+                }
+                _ => {}
+            }
+        }
         let mine = launch.player.is_some() && launch.player == current;
         let failure = match &event {
             Event::Retrying { reason, .. } => Some(presence::describe_retry(reason)),
@@ -296,8 +352,9 @@ pub(super) fn launch_event(ui: &Ui, key: &str, pid: u32, event: Event) {
         );
     }
     update(ui);
-    // The runner has told Xbox goodbye; see what Xbox shows now.
-    if matches!(event, Event::Ended) {
+    // Xbox took the post, or the runner has told it goodbye: the badge is
+    // what Xbox shows, so ask it now.
+    if matches!(event, Event::Online { .. } | Event::Ended) {
         refresh(ui, false);
     }
 }
@@ -310,17 +367,22 @@ pub(super) fn launch_ended(ui: &Ui, key: &str) {
 }
 
 /// Before a Player signs out: stop their runners and give each a few seconds
-/// to tell Xbox goodbye, which needs the token the sign-out removes.
-pub(super) async fn stop_for(ui: &Ui, player: &str) {
+/// to tell Xbox goodbye, which needs the token the sign-out removes. `None`
+/// is an account the window cannot name, and stops every launch; so does a
+/// launch that has not said whose it is.
+pub(super) async fn stop_for(ui: &Ui, player: Option<&str>) {
     let stopping: Vec<String> = {
-        let state = ui.presence.borrow();
+        let mut state = ui.presence.borrow_mut();
         state
             .launches
-            .iter()
-            .filter(|(_, l)| l.heard && l.runner.live() && l.player.as_deref() == Some(player))
+            .iter_mut()
+            .filter(|(_, l)| match (player, l.player.as_deref()) {
+                (Some(player), Some(theirs)) => player == theirs,
+                _ => true,
+            })
             .map(|(key, l)| {
-                // Safety: as in `set_sharing`, the launcher's own pid.
-                unsafe { libc::kill(l.pid as i32, libc::SIGUSR1) };
+                l.signed_out = true;
+                l.signal(libc::SIGUSR1);
                 key.clone()
             })
             .collect()
@@ -421,6 +483,9 @@ pub(super) fn dot(badge: &Badge) -> Option<gtk::Box> {
     }
     let name = format!("Status: {label}");
     dot.update_property(&[gtk::accessible::Property::Label(&name)]);
+    if let Some(detail) = badge.detail() {
+        dot.update_property(&[gtk::accessible::Property::Description(&detail)]);
+    }
     dot.set_tooltip_text(badge.tooltip().as_deref());
     Some(dot)
 }

@@ -40,22 +40,33 @@ From a terminal, the same file turns it off:
 
 ## The status dot
 
-The dot and the text beside your name show what Xbox reports for you. Ferestre
-asks Xbox every five minutes and whenever you open the account menu. Updates
-from a running game show immediately.
+The dot and the text beside your name show what Xbox reports for you, and
+nothing else. Ferestre asks Xbox every five minutes, whenever you open the
+account menu, and right after a game's status is sent or taken down.
 
 | Text | Meaning |
 |---|---|
-| Playing *game* | A game started through Ferestre is showing |
-| Online | Xbox shows you online from another device |
+| Playing *game* | Xbox lists the game started through Ferestre |
+| Online | Xbox shows you online, but not with that game, for example from a console |
 | Away | Xbox shows you away on another device |
-| Offline | Online status is on, but nothing is showing right now |
-| Off | Online status is off, and no other device shows you online |
-| Reconnecting | Xbox could not be reached. Ferestre keeps trying, and the tooltip says why |
-| Not shared | Xbox refused, or this game has no identity to report |
+| Offline | Online status is on, but Xbox shows nothing right now |
+| Off | Online status is off, and Xbox shows nothing |
+| Unknown | Xbox could not be asked |
 
 The dot shows Xbox's answer even when the switch is off. If you are signed in
 on a console, friends can see you there, and so does the dot.
+
+What Ferestre is doing for a running game is in the dot's tooltip, under
+Xbox's answer:
+
+- "Reporting *game*; Xbox does not list it yet": the game's status was sent
+  and accepted, and the next check should show it.
+- "Reconnecting: …": Xbox could not be reached. Ferestre keeps trying.
+- "Not shared: …": Xbox refused, or this game has no identity to report. It
+  is not tried again until the game is started again or the switch is turned
+  off and on.
+
+The account menu says the same under **Show me online**.
 
 ## Where it works
 
@@ -93,5 +104,7 @@ The launcher never holds an Xbox token. `ferestre run` starts the client's
 client prints its progress as JSON lines, which `ferestre run` passes on to its
 own stderr as `:: presence {...}` lines. That is also how the window follows a
 game it started. The window can stop or restart a running launch's status by
-sending SIGUSR1 or SIGUSR2 to that `ferestre run` process. The signal goes to
-the process only, never to its group, which also holds the game.
+sending SIGUSR1 (stop) or SIGUSR2 (follow the saved setting) to that
+`ferestre run` process. The signal goes to the process only, never to its
+group, which also holds the game. Each launch also says which Player its
+status belongs to, so signing out reaches the right games.

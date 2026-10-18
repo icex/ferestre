@@ -378,7 +378,7 @@ fn logout(ui: &Ui, id: String) {
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         // A Player's runners need its token to tell Xbox goodbye.
-        presence_ui::stop_for(&ui, &id).await;
+        presence_ui::stop_for(&ui, Some(&id)).await;
         let result = gio::spawn_blocking(move || {
             deadline::status(
                 std::process::Command::new(&client)
