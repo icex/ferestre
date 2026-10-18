@@ -41,7 +41,8 @@ class ClientDependencies(unittest.TestCase):
                         XDG_CONFIG_HOME=str(self.home / "config"),
                         XDG_STATE_HOME=str(self.home / "state"),
                         XDG_CACHE_HOME=str(self.home / "cache"),
-                        FERESTRE_OS_RELEASE=str(self.home / "os-release"))
+                        FERESTRE_OS_RELEASE=str(self.home / "os-release"),
+                        FERESTRE_OSTREE_MARKER=str(self.home / "ostree-booted"))
         self.env.pop("LD_LIBRARY_PATH", None)
 
     def tearDown(self):
@@ -78,6 +79,20 @@ class ClientDependencies(unittest.TestCase):
         self.assertIn("sudo dnf install webkit2gtk4.1", self.client_check()["hint"])
         self.os_release("ID=cachyos\nID_LIKE=arch\n")
         self.assertIn("sudo pacman -S webkit2gtk-4.1", self.client_check()["hint"])
+
+        # An image-based Fedora layers it with rpm-ostree, and SteamOS gets
+        # no command, because nothing installed into it lasts.
+        (self.home / "ostree-booted").write_text("")
+        self.assertNotIn("pacman", self.client_check()["hint"])
+        self.os_release("ID=fedora\nVARIANT_ID=kinoite\n")
+        atomic = self.client_check()
+        self.assertIn("rpm-ostree install webkit2gtk4.1", atomic["hint"])
+        self.assertNotIn("dnf", atomic["hint"])
+        (self.home / "ostree-booted").unlink()
+        self.os_release("ID=steamos\nID_LIKE=arch\n")
+        steamos = self.client_check()
+        self.assertNotIn("pacman", steamos["hint"])
+        self.assertIn("read-only", steamos["hint"])
 
         # A distribution with no known package still names the library.
         self.os_release("ID=gentoo\n")
