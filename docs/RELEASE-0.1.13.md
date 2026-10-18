@@ -1,8 +1,74 @@
 # Ferestre 0.1.13
 
-This launcher update pairs with runtime **11.0.20261018.1**. The new runtime
+This launcher update pairs with runtime **11.0.20261018.2**. The new runtime
 is required for separate Store and Player accounts and for the GameInput
-gamepad fixes. The controller fixes in the launcher work with older runtimes.
+gamepad fixes, and carries the runtime fixes from the code review below. The
+controller fixes in the launcher work with older runtimes.
+
+**Releases are now signed.** From this release on, the launcher only installs
+runtimes signed with the project's release key, and refuses older runtimes
+unless asked. Runtime 11.0.20261018.2 is the first signed runtime; earlier
+runtimes stay usable once installed, but `ferestre install-runtime` no longer
+downloads them.
+
+## Online status
+
+- While a game started through Ferestre runs, from the window, a Steam
+  shortcut or `ferestre run`, your Xbox friends see you playing it. It is
+  reported with the game's own identity, and nothing is reported when no game
+  is running.
+- On by default after sign-in. **Show me online** in the account menu turns
+  it off per Player account.
+- A dot next to your name at the bottom left shows what Xbox reports for you:
+  Playing, Online, Away, Offline, Off or Unknown.
+
+Verified live with three real accounts and Stardew Valley: the status
+appeared while the game ran and was removed after it quit. See
+[PRESENCE.md](PRESENCE.md).
+
+## Signed game package headers
+
+- The client now checks Microsoft's signature on every game package header
+  before it trusts anything in it, and refuses a header that does not verify,
+  turns integrity checks off, or names a different package than the package
+  service did.
+- Neither Ferestre nor the client ships the key. The first install fetches it
+  anonymously from Microsoft Gaming Services in the Store and keeps it only if
+  its SHA-256 matches the pinned fingerprint. Until then, or if fetching fails,
+  installs go on with a warning; `XODUS_REQUIRE_SIGNED_PACKAGE=1` refuses
+  them instead. See [PACKAGE-SIGNATURES.md](PACKAGE-SIGNATURES.md).
+
+Verified against the headers of eleven installed retail games, and with a
+fresh Stardew Valley install with signatures required.
+
+## Code review fixes
+
+A review of the whole codebase found 114 distinct problems (6 high, 31
+medium, 77 low), all fixed here.
+
+- **Runtime downloads** no longer fail on slow links after 60 seconds; they
+  time out only when the transfer stalls.
+- **Remove and `uninstall`** only ever delete one title's own folder. Empty or
+  `..` ids, home, the games folder and folders holding other titles are
+  refused.
+- **Install to** is a library folder: each title gets its own subfolder.
+- **Stop** asks the game to close and waits 15 seconds before ending it. A
+  second press ends it at once.
+- **Downloads** are checked page by page against the package's hash tree, and
+  a failed download or extract fails instead of reporting success. Package
+  file names can no longer write outside the install folder. Partial
+  downloads show as incomplete.
+- **Recipe installs** no longer fail when the only runtime is a managed one.
+  One bad recipe file no longer hides the rest.
+- **Xbox service:** service tokens are bound to the title they were issued
+  for, and the licensing audience is checked against a fixed set of hosts.
+- **Sign-in window** only accepts messages from Microsoft login pages. Store
+  tickets are no longer written to logs, and the keyring file never falls
+  back to the shared temp directory.
+- **Runtime (11.0.20261018.2):** task queue termination and cancellation,
+  token requests kept off title queues, save, UI and certificate fixes in
+  xgameruntime; GameInput hotplug and ordering, ntdll and kernelbase fixes,
+  and a heap overflow in `concrt140` fixed in Wine.
 
 ## Controllers (#10)
 
