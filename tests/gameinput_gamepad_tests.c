@@ -106,6 +106,86 @@ static void test_hotplug(IGameInput_v2 *input, void (WINAPI *set_state)(DWORD, c
     CloseHandle(hotplug.event);
 }
 
+/* The order one callback hears things in. A pad that drops out while a
+ * registration is still reporting what is connected must reach the callback as
+ * connected and then gone -- never gone and then, from the registration's
+ * older list, connected, which leaves a title holding a pad that is not there.
+ * The keyboard is reported first, and its callback switches slot 1 off and
+ * gives the pad thread several of its polls to notice before returning. */
+static struct
+{
+    CRITICAL_SECTION cs;
+    IGameInputDevice_v2 *device[16];
+    GameInputDeviceStatus current[16];
+    LONG count;
+    void (WINAPI *set_state)(DWORD, const XINPUT_STATE *, BOOL);
+} order;
+
+static void WINAPI order_callback(GameInputCallbackToken token, void *context, IGameInputDevice_v2 *device,
+                                  uint64_t timestamp, GameInputDeviceStatus current, GameInputDeviceStatus previous)
+{
+    XINPUT_STATE idle = {1};
+    const GameInputDeviceInfo_v2 *info = NULL;
+    BOOL keyboard;
+
+    EnterCriticalSection(&order.cs);
+    if (order.count < 16)
+    {
+        order.device[order.count] = device;
+        order.current[order.count] = current;
+    }
+    order.count++;
+    LeaveCriticalSection(&order.cs);
+
+    keyboard = IGameInputDevice_v2_GetDeviceInfo(device, &info) == S_OK && info &&
+               (info->supportedInput & GameInputKindKeyboard);
+    if (keyboard && (current & GameInputDeviceConnected))
+    {
+        order.set_state(1, &idle, FALSE);
+        Sleep(500);
+    }
+}
+
+static void test_registration_order(IGameInput_v2 *input, void (WINAPI *set_state)(DWORD, const XINPUT_STATE *, BOOL))
+{
+    IGameInputDevice_v2 *pads[4] = {0};
+    BOOL believed[4] = {0};
+    XINPUT_STATE idle = {1};
+    GameInputCallbackToken token = 0;
+    unsigned int npads = 0, i, j, wrong = 0;
+    const GameInputDeviceInfo_v2 *info;
+    HRESULT hr;
+
+    InitializeCriticalSection(&order.cs);
+    order.set_state = set_state;
+    set_state(1, &idle, TRUE);
+    Sleep(300);
+    hr = IGameInput_v2_RegisterDeviceCallback(input, NULL, GameInputKindKeyboard | GameInputKindGamepad,
+                                             GameInputDeviceConnected, GameInputBlockingEnumeration, NULL,
+                                             order_callback, &token);
+    OK(hr == S_OK, "registration for keyboard and pads");
+    Sleep(500);
+    OK(IGameInput_v2_UnregisterCallback(input, token), "UnregisterCallback");
+    OK(order.count <= 16, "a handful of reports (%ld)", order.count);
+
+    /* Replay what the callback was told, in order, as a title keeping a pad
+     * list would, and compare that with what the pads say now. */
+    for (i = 0; i < (unsigned int)order.count && i < 16; i++)
+    {
+        info = NULL;
+        if (IGameInputDevice_v2_GetDeviceInfo(order.device[i], &info) != S_OK || !info ||
+            !(info->supportedInput & GameInputKindGamepad)) continue;
+        for (j = 0; j < npads && pads[j] != order.device[i]; j++) {}
+        if (j == npads && npads < 4) pads[npads++] = order.device[i];
+        if (j < 4) believed[j] = !!(order.current[i] & GameInputDeviceConnected);
+    }
+    for (j = 0; j < npads; j++)
+        if (believed[j] != !!(IGameInputDevice_v2_GetDeviceStatus(pads[j]) & GameInputDeviceConnected)) wrong++;
+    OK(npads == 2, "both pads were reported (%u)", npads);
+    OK(!wrong, "the pads the callback was told about match the pads there are (%u wrong)", wrong);
+    DeleteCriticalSection(&order.cs);
+}
+
 /* Run this thread's messages for a while. */
 static void pump(DWORD ms)
 {
@@ -392,6 +472,7 @@ int main(void)
     IGameInput_v2_UnregisterCallback(input, token);
 
     test_hotplug(input, set_state);
+    test_registration_order(input, set_state);
     test_mouse_registration(input);
 
 done:
