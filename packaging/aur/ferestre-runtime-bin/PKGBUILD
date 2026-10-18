@@ -49,6 +49,13 @@ depends=(
   'systemd-libs' 'libusb'       # libudev for winebus.so; libusb for wineusb.so
   'libgudev'                    # libgstgl
 
+  # Gamepads. winebus.so dlopens libSDL2-2.0.so.0, and the launcher routes
+  # DualShock 4 and DualSense pads through it (hidraw would hide them from
+  # XInput); this Proton's evdev bus only takes Steam's virtual pad, so without
+  # SDL2 a PlayStation pad reaches no title at all. sdl2-compat is what Arch
+  # ships as libSDL2-2.0.so.0 now, and it provides sdl2.
+  'sdl2-compat'
+
   # TLS inside the title: bcrypt.so, crypt32.so and secur32.so all dlopen
   # gnutls. Without it a title's own HTTPS fails while the host's works.
   'gnutls' 'gmp'
@@ -70,7 +77,6 @@ depends=(
 optdepends=(
   'steam: registers the runtime as a Steam compatibility tool, and provides the STEAM_COMPAT_CLIENT_INSTALL_PATH Proton expects'
   'ferestre-git: the front end that actually launches titles with this runtime'
-  'sdl2: gamepads through winebus SDL backend (udev/hidraw covers most controllers without it)'
   'libcups: printing from a title (localspl.so, winspool.so)'
   'v4l-utils: webcam capture (qcap.so)'
   'libgcrypt: alternative crypto backend for bcrypt.so'

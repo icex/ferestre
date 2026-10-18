@@ -2622,6 +2622,19 @@ fn doctor_checks(paths: &Paths) -> Vec<Check> {
                 Check::warn("runtime", "publishes no capability list")
                     .with_hint("what it provides was probed from the files on disk, so a title's requirements cannot be verified before launch")
             });
+            // A warning, not a failure: only PlayStation pads depend on it.
+            checks.push(match ferestre_core::sdl::find_sdl2(&rt.path) {
+                Ok(Some(path)) => Check::ok("input", "SDL2 available for PlayStation pads")
+                    .with_detail(path.display().to_string()),
+                Ok(None) => Check::warn(
+                    "input",
+                    "no SDL2: a DualShock 4 or DualSense will not reach any title",
+                )
+                .with_detail(ferestre_core::sdl::SDL2_SONAME)
+                .with_hint(ferestre_core::sdl::DEPENDENCY_HINT),
+                Err(error) => Check::warn("input", "could not check for SDL2")
+                    .with_detail(format!("{error:#}")),
+            });
         }
         Err(err) => checks.push(
             Check::fail("runtime", "no patched Proton")

@@ -38,3 +38,28 @@ libraries; the diagnostic does not certify a particular movie.
 Ferestre warns about missing plugin dependencies before launching a title.
 Until the runtime ships a decoder-enabled FFmpeg build with its full dependency
 set, these compatibility packages are required for its libav-based decoding.
+
+## SDL2 for PlayStation controllers
+
+Ferestre hands DualShock 4 and DualSense pads to Wine through SDL, because a
+GDK title sees gamepads only through XInput and GameInput, and a pad Wine
+reads as raw HID is neither. Wine loads the host's `libSDL2-2.0.so.0` for
+this; the runtime does not include one. Without it a PlayStation pad does
+not reach any title at all.
+
+| Distribution | Command |
+|---|---|
+| Ubuntu / Debian | `sudo apt install libsdl2-2.0-0` |
+| Fedora | `sudo dnf install sdl2-compat` |
+| Arch / CachyOS | `sudo pacman -S sdl2-compat` (the `ferestre-runtime-bin` package depends on it) |
+
+`sdl2-compat` provides SDL2 on top of SDL3, and is what current Fedora and
+Arch install in place of SDL2. `ferestre doctor` reports **SDL2 available for
+PlayStation pads** when the 64-bit library resolves, and a launch prints a
+warning when it does not.
+
+A title that reads Sony HID itself, for haptics, adaptive triggers or
+PlayStation button prompts, can have raw HID back: set `PROTON_ENABLE_HIDRAW=1`
+(or `PROTON_DISABLE_HIDRAW=0`) in the environment, in the recipe's
+`[launch.env]`, or in Proton's `user_settings.py`. Ferestre then leaves the
+choice to Proton.

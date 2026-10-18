@@ -66,11 +66,44 @@ fi
 # finds no controller at all (issue 10: a Bluetooth DualShock 4 did nothing in
 # Minecraft Dungeons II without Steam). This is the list Valve's own proton
 # script uses for the same purpose, not "1", which would also take hidraw away
-# from wheels and flight sticks. `-` rather than `:-` keeps any value already
-# exported, including an empty one; a title that reads Sony HID itself sets
-# PROTON_DISABLE_HIDRAW=0 in its recipe. Exported before the `reg add` below,
-# so the Wine session that call may start already has it.
-export PROTON_DISABLE_HIDRAW="${PROTON_DISABLE_HIDRAW-0x054C/0x05C4,0x054C/0x09CC,0x054C/0x0BA0,0x054C/0x0CE6,0x054C/0x0DF2}"
+# from wheels and flight sticks. Exported before the `reg add` below, so the
+# Wine session that call may start already has it.
+#
+# Only a default, for when nobody has said anything about hidraw. winebus reads
+# PROTON_DISABLE_HIDRAW first and a match there wins outright, so exporting it
+# beside someone's PROTON_ENABLE_HIDRAW -- the usual way to get DualSense
+# haptics and PlayStation prompts in a title that reads Sony HID itself --
+# would quietly undo theirs. Either name counts wherever it is set: exported,
+# from a recipe's [launch.env] (even empty), or in Proton's user_settings.py,
+# which Proton applies only for names the environment lacks, so a default
+# exported here would beat that file too.
+#
+# SDL is the only route left once hidraw is gone: winebus dlopens the host's
+# libSDL2-2.0.so.0, the runtime does not ship one, and its evdev bus hands
+# every pad but Steam's virtual one to another backend. Without SDL2 a
+# DualShock 4 or DualSense reaches nothing at all, so say so.
+sony_hidraw_preference() {
+    [ -n "${PROTON_DISABLE_HIDRAW+x}" ] || [ -n "${PROTON_ENABLE_HIDRAW+x}" ] ||
+        grep -Eqs '^[^#]*PROTON_(DIS|EN)ABLE_HIDRAW' "$PROTON_DIR/user_settings.py"
+}
+host_has_sdl2() {
+    # What winebus can load from: this library path (Proton only puts its own
+    # files/lib, which has no SDL2, in front of it), then the loader's cache.
+    # No cache to ask -- no ldconfig, or none written -- is no evidence of a
+    # missing library, so that stays quiet.
+    ( set -f; IFS=:
+      for dir in ${LD_LIBRARY_PATH:-}; do
+          [ -n "$dir" ] && [ -e "$dir/libSDL2-2.0.so.0" ] && exit 0
+      done
+      exit 1 ) && return 0
+    sdl2_cache=$(PATH="$PATH:/sbin:/usr/sbin" ldconfig -p 2>/dev/null) || return 0
+    printf '%s\n' "$sdl2_cache" | grep -q 'libSDL2-2\.0\.so\.0 (.*x86-64'
+}
+if ! sony_hidraw_preference; then
+    export PROTON_DISABLE_HIDRAW="0x054C/0x05C4,0x054C/0x09CC,0x054C/0x0BA0,0x054C/0x0CE6,0x054C/0x0DF2"
+    host_has_sdl2 ||
+        echo "-- PlayStation pads go through SDL2 and libSDL2-2.0.so.0 was not found: a DualShock 4 or DualSense will not reach the title. Install SDL2 (sdl2-compat on Arch and Fedora, libsdl2-2.0-0 on Debian and Ubuntu); see docs/DEPENDENCIES.md" >&2
+fi
 
 # Before loading gameplatformservices.dll, PlayFab Party (and anything else
 # built on the GDK's loader for it) waits for Microsoft Gaming Services'
