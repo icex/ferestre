@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Hand-written fixture for the app-model regression tests, not a real
+     package. Its Publisher uses XML escapes, which the package family name has
+     to be derived from in decoded form, and its attributes are laid out the
+     ways XML allows and a naive search does not expect: single quotes, a tab
+     before a name, spaces around '='. A comment and a wrapper element come
+     before the real <Application> so that only an exact element match finds
+     it: <Application Id="FromAComment"> -->
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
+  <Identity	Name='Contoso.EscapedPublisher'
+            Publisher="CN=Contoso &amp; Sons, O=&quot;Contoso, Ltd.&quot;, L=&#x5A;&#252;rich, C=CH"
+            Version = "3.1.4.1"
+            ProcessorArchitecture="x64" />
+  <Applications>
+    <Application Id='Launcher' Executable="Contoso.exe" EntryPoint="Contoso.App" />
+  </Applications>
+</Package>
