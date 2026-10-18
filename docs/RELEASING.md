@@ -27,8 +27,12 @@ runtime that is unsigned or signed by any other key.
   `file:<name> version:<version>`, where `<version>` is the tag without its
   prefix (`0.1.14` for `v0.1.14`, `11.0.20260907` for
   `runtime-11.0.20260907`). The trusted comment is signed too. The launcher
-  accepts a signature only when its `file:` field names the file it
-  downloaded, so a valid signature cannot be moved onto a different file.
+  accepts a runtime's signature only when its `file:` field names the file it
+  downloaded and its `version:` field names the release it took the file
+  from, so a valid signature cannot be moved onto a different file or
+  replayed under another release. Only letters, digits, `.`, `_` and `-` are
+  accepted in a version, starting with a letter or digit; the script refuses
+  anything else, because the launcher would.
 - Before signing, the script checks that the release's own key is the one the
   launcher trusts. For the launcher, it checks that the `ferestre` binary in
   the tarball contains the signing key's public half. For the runtime, it

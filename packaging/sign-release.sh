@@ -18,9 +18,10 @@
 # Each signature's trusted comment is exactly `file:<name> version:<VERSION>`,
 # where VERSION is the release's version as its tag states it, without the
 # tag's prefix (0.1.13 for v0.1.13, 11.0.20260907 for runtime-11.0.20260907).
-# The trusted comment is covered by the signature, so a verifier that checks
-# the file: field cannot be handed a validly signed but different artefact
-# under this one's name, and a reader can see which release a file came from.
+# The trusted comment is covered by the signature. The launcher checks both
+# fields against the runtime release it is installing (ferestre-core
+# signing::Artefact), so a validly signed artefact cannot be passed off under
+# another file's name or replayed as another release.
 #
 # Only the tag-triggered publish jobs run this; a manual workflow run is never
 # signed. See docs/RELEASING.md for the key itself.
