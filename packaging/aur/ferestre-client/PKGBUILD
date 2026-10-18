@@ -81,7 +81,7 @@ _commit=3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
 # in .SRCINFO, and regenerate the sha256sums -- the patch files themselves may
 # have changed too.
 #
-_patchrev=8cf4d9156c8406bb816cf0f9c1157ae52b78fcda
+_patchrev=764e0dcd5498fda9fbfb5830acc0ff8a4aa4cf58
 _patchurl="https://raw.githubusercontent.com/icex/ferestre/$_patchrev/patches/xodus-cli"
 
 # Every patch after 0001 is part of one ordered series. Keep the downloaded,
