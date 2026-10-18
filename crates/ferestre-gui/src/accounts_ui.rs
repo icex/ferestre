@@ -303,6 +303,9 @@ fn show(ui: &Ui, profiles: accounts::Profiles) {
                     window.close();
                     render(&ui);
                     refresh_account(&ui);
+                    // Running games keep the Player they started with, and so
+                    // do their runners. The badge follows the new Player.
+                    presence_ui::refresh(&ui, true);
                     ui.toasts
                         .add_toast(toast("Accounts saved for future launches"));
                 }
@@ -374,6 +377,8 @@ fn logout(ui: &Ui, id: String) {
     let worker_id = id.clone();
     let ui = ui.clone();
     glib::spawn_future_local(async move {
+        // A Player's runners need its token to tell Xbox goodbye.
+        presence_ui::stop_for(&ui, Some(&id)).await;
         let result = gio::spawn_blocking(move || {
             deadline::status(
                 std::process::Command::new(&client)

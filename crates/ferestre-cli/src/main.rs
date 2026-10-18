@@ -22,6 +22,7 @@
 //!     the rule `tools/xsts_probe.py` already follows.
 
 mod cancel;
+mod presence;
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
@@ -626,6 +627,10 @@ struct PreparedLaunch {
     options: launch::Options,
     plan: launch::Plan,
     service_socket: Option<PathBuf>,
+    /// The account roles in force, if any, and the client's profile listing
+    /// when it was read for them: the presence runner names the Player.
+    roles: Option<accounts::Selection>,
+    profiles: Option<accounts::Profiles>,
 }
 
 /// Everything a launch decides before it starts anything: the recipe, the
@@ -705,11 +710,12 @@ fn prepare_launch(
     // XUID: inheriting it would name their saves after somebody else, and
     // report that XUID whenever the live lookup has not answered yet.
     let mut own_xuid = true;
+    let mut profiles = None;
     if let Some(roles) = &roles {
         // Read even for a dry run: the Player decides which prefix the plan
         // names.
-        let profiles = accounts::fetch(&dirs.xodus_cli())?;
-        let (store, player) = roles.selected(&profiles)?;
+        let listed = profiles.insert(accounts::fetch(&dirs.xodus_cli())?);
+        let (store, player) = roles.selected(listed)?;
         if roles.split() && !runtime.provides(accounts::CAPABILITY) {
             bail!("This runtime cannot separate Store and Player identities. Select an account-sharing runtime, or clear the account role selections.");
         }
@@ -775,6 +781,8 @@ fn prepare_launch(
         options,
         plan,
         service_socket,
+        roles,
+        profiles,
     })
 }
 
@@ -788,6 +796,8 @@ fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Resu
         options,
         plan,
         service_socket,
+        roles,
+        mut profiles,
     } = prepared;
     // Held while the title runs: an install, update or removal of it waits
     // for this, and this does not start while one of those is under way.
@@ -860,6 +870,22 @@ fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Resu
         eprintln!("-- stopped before {} started", recipe.title.name);
         return Ok(ExitCode::from(exit_code_from(None, Some(signal))));
     }
+    // Friends see the game while it runs, through the client and as the
+    // Player. Without roles the client's default account is the Player, and
+    // only the profile listing says which one that is. A client that cannot
+    // answer goes without, quietly.
+    if roles.is_none() {
+        profiles = accounts::fetch(&dirs.xodus_cli()).ok();
+    }
+    // Dropped when this returns, once the title has exited: the runner then
+    // tells Xbox the game has stopped.
+    let _presence = presence::Presence::start(presence::setup(
+        &dirs.xodus_cli(),
+        paths.config_dir(),
+        roles.as_ref(),
+        profiles.as_ref(),
+        &game_dir,
+    ));
 
     if let Ok(missing) = ferestre_core::media::missing_libav_dependencies(
         &dirs.proton_dir,

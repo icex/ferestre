@@ -26,3 +26,6 @@ adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
 # A oneshot, to wait on a D-Bus signal from async code. Already in the tree
 # through glib.
 futures-channel = "0.3"
+# To read a channel of runner events on the main loop. Also in the tree
+# through glib.
+futures-util = { version = "0.3", default-features = false }

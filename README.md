@@ -135,6 +135,13 @@ runtimes refuse instead of launching with the wrong account. Microsoft's and
 publishers' own account-sharing rules still apply. See
 [docs/ACCOUNT-SHARING-PROPOSAL.md](docs/ACCOUNT-SHARING-PROPOSAL.md).
 
+**Online status.** While a game started through Ferestre runs, from the
+window, a Steam shortcut or `ferestre run`, your Xbox friends see you playing
+it. Ferestre reports it with the game's own identity and reports nothing when no
+game is running. It is on by default after sign-in. To turn it off for a Player
+account, switch off **Show me online** in the account menu. See
+[docs/PRESENCE.md](docs/PRESENCE.md).
+
 **Controllers.** Xbox pads, DualShock 4 and DualSense pads reach GDK titles
 through Wine's XInput and GameInput. PlayStation pads go through SDL, which
 needs the host's SDL2 (`sdl2-compat` on Arch and Fedora). From a Steam
@@ -219,6 +226,8 @@ directory. Close Steam before adding or updating a shortcut.
   run, generated from the recipes, and how to report one.
 - [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) — host libraries for video,
   controllers and sign-in, per distribution.
+- [docs/PRESENCE.md](docs/PRESENCE.md) — what friends see while you play, and
+  how to turn it off.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — the plan for turning this into a launcher.
 - [notes/](notes/) — the debugging write-ups. Worth reading if you want to know
   *why* something is the way it is; several were genuinely hard to find.

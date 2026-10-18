@@ -33,6 +33,7 @@ on:
       - 'Cargo.lock'
       - 'tests/gui_smoke.py'
       - 'tests/gui_accounts.py'
+      - 'tests/gui_presence.py'
       - 'tests/gui_client_deps.py'
       - 'tests/fake_packagekit.py'
       - 'tests/test_download_cancel.py'
@@ -71,6 +72,7 @@ on:
       - 'Cargo.lock'
       - 'tests/gui_smoke.py'
       - 'tests/gui_accounts.py'
+      - 'tests/gui_presence.py'
       - 'tests/gui_client_deps.py'
       - 'tests/fake_packagekit.py'
       - 'tests/test_download_cancel.py'
@@ -300,7 +302,8 @@ jobs:
 
       # Offline, loopback only: the service, the download integrity checks
       # (msixvc's hash tree and retries, the CLI's path and commit rules),
-      # the profile store and the file-backed key chain.
+      # the presence runner (a local server and a fake token provider; it
+      # never signs in), the profile store and the file-backed key chain.
       - name: Apply the client series and test it offline
         run: |
           set -euo pipefail
@@ -349,6 +352,13 @@ jobs:
         run: |
           xvfb-run -a --server-args='-screen 0 1280x900x24' \
             dbus-run-session -- python3 tests/gui_accounts.py
+
+      # The client is a script that advertises presence-v1 and plays back
+      # runner events, so this signs nothing in and posts nothing.
+      - name: Online status while a game runs (offline)
+        run: |
+          xvfb-run -a --server-args='-screen 0 1280x900x24' \
+            dbus-run-session -- python3 tests/gui_presence.py
 
       # PackageKit is a fake on a private bus standing in for the system one,
       # and the missing library is a fixture, so this installs nothing.

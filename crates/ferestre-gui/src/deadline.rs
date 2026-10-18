@@ -117,6 +117,17 @@ pub fn status(command: &mut Command, limit: Duration) -> std::io::Result<ExitSta
     wait_until(&mut child, Instant::now() + limit, limit)
 }
 
+/// Start `command` the way [`status`] does, for a caller that has something
+/// to do between starting it and waiting for it.
+pub fn start(command: &mut Command) -> std::io::Result<Child> {
+    spawn(command)
+}
+
+/// Wait for a child from [`start`], with a deadline.
+pub fn wait(child: &mut Child, limit: Duration) -> std::io::Result<ExitStatus> {
+    wait_until(child, Instant::now() + limit, limit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

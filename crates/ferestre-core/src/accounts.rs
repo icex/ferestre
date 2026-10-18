@@ -29,10 +29,24 @@ pub struct Profiles {
     pub profiles: Vec<Profile>,
 }
 
+/// A client profile id: 32 lower-case hex digits, safe in a path or argv.
+pub fn valid_profile_id(id: &str) -> bool {
+    valid_hex(id, 32)
+}
+
 fn valid_hex(s: &str, length: usize) -> bool {
     s.len() == length
         && s.bytes()
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+impl Profiles {
+    /// Whether the client lists this capability. Features newer than the
+    /// account split (online status, `presence-v1`) are probed here, so an
+    /// older client simply goes without them.
+    pub fn supports(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|c| c == capability)
+    }
 }
 
 pub fn parse_profiles(bytes: &[u8]) -> Result<Profiles> {

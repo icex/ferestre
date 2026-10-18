@@ -325,6 +325,7 @@ dependencies = [
  "anyhow",
  "ferestre-core",
  "futures-channel",
+ "futures-util",
  "gtk4",
  "libadwaita",
  "libc",
