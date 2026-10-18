@@ -131,14 +131,14 @@ pub fn load(state_dir: &Path, product_id: &str) -> Option<Record> {
     serde_json::from_str(&text).ok()
 }
 
+/// Write a record. Through a temporary file and a rename, as the caches are:
+/// truncating in place and then being killed leaves an empty file, which
+/// [`load`] reads as "never installed" -- the title drops out of Installed and
+/// an account-sharing launch loses the store content it needs.
 pub fn save(state_dir: &Path, record: &Record) -> Result<()> {
     let path = record_path(state_dir, &record.product_id)
         .ok_or_else(|| anyhow!("not a usable product id: {:?}", record.product_id))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, serde_json::to_vec_pretty(record)?)?;
-    Ok(())
+    crate::cache::write(&path, &serde_json::to_vec_pretty(record)?)
 }
 
 pub fn forget(state_dir: &Path, product_id: &str) -> Result<()> {
@@ -161,34 +161,362 @@ pub fn forget(state_dir: &Path, product_id: &str) -> Result<()> {
 /// directory.
 ///
 /// Refused: anything that is not a directory, a symlink (deleting through one
-/// is how a link in a game directory takes the target with it), the home
-/// directory itself, and any path within two levels of the filesystem root --
-/// `/usr`, `/home/someone` and `/` are all things a launcher has no business
-/// removing whatever a record says.
+/// is how a link in a game directory takes the target with it), a path with a
+/// `..` in it, the home directory, and anything within two levels of the
+/// filesystem root -- `/usr`, `/home/someone` and `/` are all things a
+/// launcher has no business removing whatever a record says. The comparisons
+/// are made on the resolved path, so `~/xbox-games/..` is the home directory
+/// it is, and so is `/home/u` reached as `/var/home/u`.
+///
+/// When the launcher's own directories can be resolved, everything
+/// [`check_removable`] refuses is refused here too, so a caller that has not
+/// been told about that check is still covered by it.
 pub fn safe_to_remove(dir: &Path) -> Result<()> {
-    use anyhow::bail;
+    let resolved = check_shape(dir)?;
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = Path::new(&home);
+        let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+        if resolved == home {
+            anyhow::bail!("{} is the home directory", dir.display());
+        }
+    }
+    if let Ok(paths) = crate::paths::Paths::from_env() {
+        check_removable(dir, &paths)?;
+    }
+    Ok(())
+}
 
-    if !dir.is_dir() {
-        bail!("{} is not a directory", dir.display());
+/// The structural half of [`safe_to_remove`]: a real, absolute, deep enough
+/// directory with no `..`. Returns the resolved path.
+fn check_shape(dir: &Path) -> Result<PathBuf> {
+    use anyhow::bail;
+    use std::path::Component;
+
+    if !dir.is_absolute() {
+        bail!("{} is not an absolute path", dir.display());
+    }
+    if dir.components().any(|c| matches!(c, Component::ParentDir)) {
+        bail!(
+            "{} contains \"..\"; name the directory itself",
+            dir.display()
+        );
     }
     if dir.is_symlink() {
         bail!("{} is a symlink; remove it by hand", dir.display());
     }
-    if !dir.is_absolute() {
-        bail!("{} is not an absolute path", dir.display());
+    if !dir.is_dir() {
+        bail!("{} is not a directory", dir.display());
     }
-    let depth = dir.components().count();
+    let resolved = dir
+        .canonicalize()
+        .map_err(|e| anyhow!("{}: {e}", dir.display()))?;
     // RootDir plus two names: `/a/b` has three components, and is the shallowest
     // thing worth allowing.
-    if depth < 3 {
+    if resolved.components().count() < 3 || dir.components().count() < 3 {
         bail!("{} is too close to the root to remove", dir.display());
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        if dir == Path::new(&home) {
-            bail!("{} is the home directory", dir.display());
+    Ok(resolved)
+}
+
+/// Whether `dir` may be deleted as one title's folder (or one title's
+/// prefix).
+///
+/// Everything [`safe_to_remove`] checks for shape, and then what only the
+/// launcher's directories can say. Refused:
+///
+///   * the home directory, the games directory, the launcher's state, config
+///     and cache directories, the XDG base directories, the runtime, client
+///     and build trees, Steam -- and any directory that contains one of them;
+///   * a directory holding another title's recorded install;
+///   * a directory with another download or another title's prefix directly
+///     inside it. That is what a library folder chosen as an install
+///     destination looks like, and removing "the title" would remove the
+///     library.
+pub fn check_removable(dir: &Path, paths: &crate::paths::Paths) -> Result<()> {
+    use anyhow::bail;
+
+    let resolved = check_shape(dir)?;
+    let resolve = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+
+    for (what, protected) in protected_dirs(paths) {
+        let protected = resolve(&protected);
+        if protected == resolved {
+            bail!("{} is {what}; it is never removed", dir.display());
+        }
+        if protected.starts_with(&resolved) {
+            bail!(
+                "{} contains {what} ({}); it is never removed",
+                dir.display(),
+                protected.display()
+            );
+        }
+    }
+
+    let mut owners = Vec::new();
+    for record in all(paths.state_dir()) {
+        if !record.dir.is_absolute() {
+            continue;
+        }
+        let recorded = resolve(&record.dir);
+        if recorded == resolved {
+            owners.push(record.product_id);
+        } else if recorded.starts_with(&resolved) {
+            bail!(
+                "{} holds the install of {} ({}); remove that first",
+                dir.display(),
+                record.product_id,
+                record.dir.display()
+            );
+        }
+    }
+    if owners.len() > 1 {
+        bail!(
+            "{} is recorded as the folder of {}; it is not one title's folder",
+            dir.display(),
+            owners.join(" and ")
+        );
+    }
+
+    if let Ok(entries) = std::fs::read_dir(&resolved) {
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if child.join(CONTAINER).is_file() || child.join(PARTIAL_CONTAINER).is_file() {
+                bail!(
+                    "{} has another download inside it ({}); it looks like a library \
+                     folder, not one title's folder",
+                    dir.display(),
+                    child.display()
+                );
+            }
+            if name.ends_with("-proton") && child.join("pfx").is_dir() {
+                bail!(
+                    "{} has a title's Wine prefix inside it ({}); it looks like a games \
+                     folder, not one title's folder",
+                    dir.display(),
+                    child.display()
+                );
+            }
         }
     }
     Ok(())
+}
+
+/// The directories nothing may remove, or remove the parent of, with what to
+/// call each in a refusal.
+fn protected_dirs(paths: &crate::paths::Paths) -> Vec<(&'static str, PathBuf)> {
+    let home = paths.home().to_path_buf();
+    let mut dirs = vec![
+        ("the home directory", home.clone()),
+        ("the games directory", paths.games_dir().to_path_buf()),
+        (
+            "the launcher's state directory",
+            paths.state_dir().to_path_buf(),
+        ),
+        (
+            "the launcher's config directory",
+            paths.config_dir().to_path_buf(),
+        ),
+        (
+            "the launcher's cache directory",
+            paths.cache_dir().to_path_buf(),
+        ),
+        ("the runtimes directory", paths.runtimes_dir()),
+        ("the build directory", paths.build_dir().to_path_buf()),
+        ("a standard XDG directory", home.join(".local/share")),
+        ("a standard XDG directory", home.join(".local/state")),
+        ("a standard XDG directory", home.join(".config")),
+        ("a standard XDG directory", home.join(".cache")),
+    ];
+    for (what, dir) in [
+        ("the launcher's installed tree", paths.tree_dir()),
+        ("the client directory", paths.cli_dir()),
+        ("the runtime", paths.runtime_dir()),
+        ("Steam", paths.steam_dir()),
+    ] {
+        if let Some(dir) = dir {
+            dirs.push((what, dir.to_path_buf()));
+        }
+    }
+    for name in [
+        "XDG_DATA_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_RUNTIME_DIR",
+    ] {
+        if let Some(value) = paths.var(name).filter(|v| Path::new(v).is_absolute()) {
+            dirs.push(("a standard XDG directory", PathBuf::from(value)));
+        }
+    }
+    dirs
+}
+
+/// Where to install a title, given what someone typed into "Install to".
+///
+/// The typed folder is a library: the title goes into `folder` inside it, so
+/// choosing `/mnt/games` never makes `/mnt/games` the title's own folder, and
+/// removing the title later can only ever remove `/mnt/games/<folder>`.
+/// `folder` is the title's usual directory name, such as a recipe's
+/// [`crate::recipe::Recipe::install_dir`] or the lowercase product id.
+///
+/// The one exception is a folder that already is this title's install --
+/// its recorded directory, or a folder whose package names this product --
+/// which is used as it is, so a repair or an update lands on the existing
+/// files rather than in a new copy one level down. A download that was
+/// cancelled before it named its product counts as this title's too, chosen
+/// directly or found at `<chosen>/<folder>`: a first download has no record
+/// yet, and Resume has to continue it rather than be refused.
+///
+/// `<chosen>/<folder>` may already exist only if it is empty, this title's,
+/// or such a download. Anything else in it is somebody's files, and they
+/// would go with the title when it is removed.
+///
+/// A leading `~` means the home directory; anything else must be absolute.
+pub fn resolve_destination(
+    typed: &str,
+    folder: &str,
+    product_id: &str,
+    paths: &crate::paths::Paths,
+) -> Result<PathBuf> {
+    use anyhow::bail;
+    use std::path::Component;
+
+    let typed = typed.trim();
+    let chosen = if typed == "~" {
+        paths.home().to_path_buf()
+    } else if let Some(rest) = typed.strip_prefix("~/") {
+        paths.home().join(rest)
+    } else {
+        PathBuf::from(typed)
+    };
+    if typed.is_empty() || !chosen.is_absolute() {
+        bail!(
+            "\"{typed}\" is not a folder to install into; give a full path such as {}",
+            paths.games_dir().display()
+        );
+    }
+    if chosen
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        bail!("\"{typed}\" contains \"..\"; give the folder itself");
+    }
+    let folder_path = Path::new(folder);
+    if folder.is_empty()
+        || !folder_path
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+    {
+        bail!("\"{folder}\" is not a folder name");
+    }
+
+    let resolve = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let owner = |dir: &Path| owner_of(dir, product_id, paths);
+
+    let destination = match owner(&chosen) {
+        Owner::This | Owner::Unknown => chosen,
+        Owner::Other(other) => bail!(
+            "{} is the folder of {other}; choose the folder your games go in",
+            chosen.display()
+        ),
+        Owner::Nobody => chosen.join(folder_path),
+    };
+
+    match owner(&destination) {
+        Owner::This | Owner::Unknown => {}
+        Owner::Other(other) => bail!(
+            "{} already holds the files of {other}; choose another folder",
+            destination.display()
+        ),
+        Owner::Nobody => {
+            if destination.exists() && !destination.is_dir() {
+                bail!(
+                    "{} is a file, not a folder; choose another folder",
+                    destination.display()
+                );
+            }
+            let occupied = std::fs::read_dir(&destination)
+                .map(|mut entries| entries.next().is_some())
+                .unwrap_or(false);
+            if occupied {
+                bail!(
+                    "{} already exists and holds other files; the title needs a folder \
+                     of its own, and removing it later would remove those too. Move them \
+                     or choose another folder",
+                    destination.display()
+                );
+            }
+        }
+    }
+    let resolved = resolve(&destination);
+    for (what, protected) in protected_dirs(paths) {
+        let protected = resolve(&protected);
+        if protected == resolved || protected.starts_with(&resolved) {
+            bail!(
+                "{} is {what}, or contains it; a title cannot be installed there",
+                destination.display()
+            );
+        }
+    }
+    Ok(destination)
+}
+
+/// Whose files a folder holds, as far as [`resolve_destination`] can tell.
+enum Owner {
+    /// This product's: its recorded install, or a package naming it.
+    This,
+    /// Another product's, by its record or its package.
+    Other(String),
+    /// A download that started and has not got as far as naming its
+    /// product. A first download leaves no record until it succeeds and the
+    /// package's config is often not there yet, so this is what a cancelled
+    /// first download looks like -- and it has to be resumable.
+    Unknown,
+    /// No package at all: nothing, or somebody's other files.
+    Nobody,
+}
+
+fn owner_of(dir: &Path, product_id: &str, paths: &crate::paths::Paths) -> Owner {
+    if !dir.is_dir() {
+        return Owner::Nobody;
+    }
+    let resolve = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let resolved = resolve(dir);
+    let mut recorded_here = all(paths.state_dir())
+        .into_iter()
+        .filter(|record| record.dir.is_absolute() && resolve(&record.dir) == resolved)
+        .map(|record| record.product_id)
+        .collect::<Vec<_>>();
+    if recorded_here
+        .iter()
+        .any(|id| id.eq_ignore_ascii_case(product_id))
+    {
+        return if recorded_here.len() == 1 {
+            Owner::This
+        } else {
+            recorded_here.retain(|id| !id.eq_ignore_ascii_case(product_id));
+            Owner::Other(recorded_here.join(" and "))
+        };
+    }
+    if !recorded_here.is_empty() {
+        return Owner::Other(recorded_here.join(" and "));
+    }
+    let installed = looks_installed(dir);
+    let partial = is_partial(dir);
+    if !installed && !partial {
+        return Owner::Nobody;
+    }
+    match store_id(dir) {
+        Some(id) if id.eq_ignore_ascii_case(product_id) => Owner::This,
+        Some(id) => Owner::Other(id),
+        None if partial => Owner::Unknown,
+        None => Owner::Other("a title the launcher cannot name".into()),
+    }
 }
 
 /// Bytes used by a directory tree, following no symlinks.
@@ -380,6 +708,10 @@ fn rfc3339(seconds: u64) -> String {
 /// The package header the client leaves beside an installed title.
 const CONTAINER: &str = ".xodus-streaming.msixvc";
 
+/// What the client downloads into, renamed to [`CONTAINER`] only once the
+/// whole download has finished. While it is there, the download is not.
+pub const PARTIAL_CONTAINER: &str = ".xodus-streaming-tmp.msixvc";
+
 /// The content id of what is actually on disk.
 ///
 /// Read out of the XVD header of the container the client keeps after a
@@ -489,15 +821,24 @@ fn attribute(element: &str, name: &str) -> Option<String> {
 /// 4 MB `.xodus-streaming-tmp.msixvc`. The launcher believed it, wrote a record,
 /// and the title sat in the library claiming to be installed forever.
 ///
-/// Any one of the three is enough, because the three describe different
-/// legitimate layouts: a decrypted tree with a manifest, a package whose header
-/// the client kept beside it, or both. The *temporary* container deliberately
-/// does not count -- it is exactly what a half-finished download leaves.
+/// Two layouts count. A package whose finished header the client kept beside
+/// it is an install. So is a decrypted tree with a manifest, as long as no
+/// download is still under way in it: the client writes the package's files in
+/// whatever order they arrive, so the manifest can be there long before the
+/// rest, and the *temporary* container is exactly what a half-finished
+/// download leaves. [`is_partial`] says which titles are in that state.
 pub fn looks_installed(dir: &Path) -> bool {
     dir.join(CONTAINER).is_file()
-        || ["appxmanifest.xml", "AppxManifest.xml"]
+        || (["appxmanifest.xml", "AppxManifest.xml"]
             .iter()
             .any(|name| dir.join(name).is_file())
+            && !is_partial(dir))
+}
+
+/// Whether a download into this directory started and has not finished: the
+/// state to offer Resume or Remove for, rather than Play.
+pub fn is_partial(dir: &Path) -> bool {
+    dir.join(PARTIAL_CONTAINER).exists()
 }
 
 /// Product ids named by installed packages below a games directory.
@@ -783,6 +1124,13 @@ mod tests {
         assert!(safe_to_remove(Path::new("/")).is_err());
         assert!(safe_to_remove(Path::new("/usr")).is_err(), "one level down");
         assert!(safe_to_remove(Path::new("relative/path")).is_err());
+        // Deep enough as text, and the root once resolved.
+        assert!(safe_to_remove(Path::new("/usr/lib/../..")).is_err());
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = Path::new(&home);
+            assert!(safe_to_remove(&home.join("xbox-games/..")).is_err());
+            assert!(safe_to_remove(&home.join("x/../..")).is_err());
+        }
         assert!(
             safe_to_remove(Path::new("/nonexistent/deep/enough")).is_err(),
             "a path that is not there is not a directory to remove"
@@ -792,6 +1140,308 @@ mod tests {
         std::fs::create_dir_all(dir.join("game")).expect("temp dir");
         assert!(safe_to_remove(&dir.join("game")).is_ok());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A scratch home with a games directory, resolved the way the launcher
+    /// resolves it.
+    struct Home {
+        root: PathBuf,
+        paths: crate::paths::Paths,
+    }
+
+    impl Home {
+        fn new(tag: &str) -> Home {
+            let root = std::env::temp_dir()
+                .join(format!("ferestre-home-{tag}-{}", std::process::id()))
+                .join("home/tester");
+            let _ = std::fs::remove_dir_all(root.parent().unwrap().parent().unwrap());
+            std::fs::create_dir_all(root.join("xbox-games")).unwrap();
+            let paths = crate::paths::Paths::resolve(&crate::paths::Env::from_map([(
+                "HOME",
+                root.to_str().unwrap(),
+            )]))
+            .unwrap();
+            Home { root, paths }
+        }
+
+        fn games(&self) -> PathBuf {
+            self.root.join("xbox-games")
+        }
+
+        fn game(&self, name: &str) -> PathBuf {
+            let dir = self.games().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(CONTAINER), b"header").unwrap();
+            dir
+        }
+    }
+
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.root.parent().unwrap().parent().unwrap());
+        }
+    }
+
+    /// `ferestre uninstall ..` and `uninstall ""` were both reproduced
+    /// deleting a home directory and a games directory. Neither path is a
+    /// title's folder, however it is spelled.
+    #[test]
+    fn the_home_and_games_directories_are_never_removable() {
+        let home = Home::new("guard");
+        let game = home.game("example");
+        let p = &home.paths;
+
+        assert!(check_removable(&game, p).is_ok());
+        for refused in [
+            home.games(),
+            home.games().join(""),
+            home.games().join(".."),
+            home.games().join("example/.."),
+            home.games().join("example/../.."),
+            home.root.clone(),
+            home.root.parent().unwrap().to_path_buf(),
+        ] {
+            assert!(
+                check_removable(&refused, p).is_err(),
+                "{} must be refused",
+                refused.display()
+            );
+        }
+        // The launcher's own directories, once they exist.
+        for dir in [p.state_dir(), p.config_dir(), p.cache_dir()] {
+            std::fs::create_dir_all(dir).unwrap();
+            assert!(check_removable(dir, p).is_err(), "{}", dir.display());
+            assert!(
+                check_removable(dir.parent().unwrap(), p).is_err(),
+                "{}",
+                dir.display()
+            );
+        }
+        // Reached through a symlinked parent, the home directory is still it.
+        let link = home.root.parent().unwrap().join("alias");
+        std::os::unix::fs::symlink(&home.root, &link).unwrap();
+        assert!(check_removable(&link.join("xbox-games"), p).is_err());
+        assert!(check_removable(&link.join("xbox-games/example"), p).is_ok());
+    }
+
+    /// A library folder chosen as an install destination: other games and
+    /// prefixes inside it, and a record naming it.
+    #[test]
+    fn a_folder_holding_other_titles_is_not_one_titles_folder() {
+        let home = Home::new("library");
+        let library = home.root.join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(library.join("appxmanifest.xml"), "<Package/>").unwrap();
+        let p = &home.paths;
+        assert!(check_removable(&library, p).is_ok());
+
+        std::fs::create_dir_all(library.join("other-game")).unwrap();
+        std::fs::write(library.join("other-game").join(PARTIAL_CONTAINER), b"x").unwrap();
+        let err = check_removable(&library, p).unwrap_err().to_string();
+        assert!(err.contains("another download"), "{err}");
+        std::fs::remove_dir_all(library.join("other-game")).unwrap();
+
+        std::fs::create_dir_all(library.join("other-proton/pfx")).unwrap();
+        let err = check_removable(&library, p).unwrap_err().to_string();
+        assert!(err.contains("prefix"), "{err}");
+        std::fs::remove_dir_all(library.join("other-proton")).unwrap();
+
+        // Another title's recorded install lives below it.
+        let nested = library.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let mut other = record(&[]);
+        other.product_id = "9ZZOTHERGAME".into();
+        other.dir = nested.clone();
+        save(p.state_dir(), &other).unwrap();
+        let err = check_removable(&library, p).unwrap_err().to_string();
+        assert!(err.contains("9ZZOTHERGAME"), "{err}");
+        // That title's own folder is still removable.
+        assert!(check_removable(&nested, p).is_ok());
+        forget(p.state_dir(), "9ZZOTHERGAME").unwrap();
+
+        // Two titles recorded in the same folder: neither owns it.
+        for id in ["9ZZTESTGAME1", "9ZZTESTGAME2"] {
+            let mut shared = record(&[]);
+            shared.product_id = id.into();
+            shared.dir = library.clone();
+            save(p.state_dir(), &shared).unwrap();
+        }
+        assert!(check_removable(&library, p).is_err());
+    }
+
+    #[test]
+    fn install_to_names_a_library_and_the_title_gets_its_own_folder() {
+        let home = Home::new("destination");
+        let p = &home.paths;
+        let library = home.root.join("library");
+        std::fs::create_dir_all(library.join("someone-elses-stuff")).unwrap();
+
+        assert_eq!(
+            resolve_destination(library.to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p).unwrap(),
+            library.join("fh5")
+        );
+        // A recipe's layout below the chosen folder is kept.
+        assert_eq!(
+            resolve_destination(library.to_str().unwrap(), "bedrock/game", "9NBLGGH2JHXJ", p)
+                .unwrap(),
+            library.join("bedrock/game")
+        );
+        // "~" is the home directory, not a folder called "~".
+        assert_eq!(
+            resolve_destination("~/library", "fh5", "9NNX1VVR3KNQ", p).unwrap(),
+            library.join("fh5")
+        );
+        assert_eq!(
+            resolve_destination(" ~ ", "fh5", "9NNX1VVR3KNQ", p).unwrap(),
+            home.root.join("fh5")
+        );
+        for bad in ["", "relative/dir", "~someone/games", "/mnt/../etc"] {
+            assert!(
+                resolve_destination(bad, "fh5", "9NNX1VVR3KNQ", p).is_err(),
+                "{bad:?}"
+            );
+        }
+        for bad in ["", "..", "../x", "/abs"] {
+            assert!(
+                resolve_destination(library.to_str().unwrap(), bad, "9NNX1VVR3KNQ", p).is_err(),
+                "folder {bad:?}"
+            );
+        }
+
+        // Choosing the title's own folder repairs it in place: by its record,
+        // or by the package's own Store id.
+        let own = home.game("fh5");
+        std::fs::write(
+            own.join("MicrosoftGame.Config"),
+            "<Game><StoreId>9NNX1VVR3KNQ</StoreId></Game>",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_destination(own.to_str().unwrap(), "fh5", "9nnx1vvr3knq", p).unwrap(),
+            own
+        );
+        let recorded = home.root.join("elsewhere/forza");
+        std::fs::create_dir_all(&recorded).unwrap();
+        let mut forza = record(&[]);
+        forza.product_id = "9NNX1VVR3KNQ".into();
+        forza.dir = recorded.clone();
+        save(p.state_dir(), &forza).unwrap();
+        assert_eq!(
+            resolve_destination(recorded.to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p).unwrap(),
+            recorded
+        );
+        // Somebody else's game in the way is refused, not mixed into.
+        assert!(resolve_destination(own.to_str().unwrap(), "fh5", "9ZZOTHERGAME", p).is_err());
+        // The parent of the games directory cannot become a title's folder by
+        // way of its name.
+        assert!(resolve_destination(
+            home.root.parent().unwrap().to_str().unwrap(),
+            "tester",
+            "9NNX1VVR3KNQ",
+            p
+        )
+        .is_err());
+    }
+
+    /// A first download leaves no record until it finishes, and its config
+    /// usually has not arrived when it is cancelled. Resume has to land on
+    /// it again, wherever it was, not be refused as somebody else's title.
+    #[test]
+    fn a_cancelled_first_download_can_be_resumed_where_it_is() {
+        let home = Home::new("resume");
+        let p = &home.paths;
+        let partial = |dir: &Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(PARTIAL_CONTAINER), b"part").unwrap();
+        };
+
+        let library = home.root.join("library");
+        partial(&library.join("fh5"));
+        let fh5 = library.join("fh5");
+        assert_eq!(
+            resolve_destination(library.to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p).unwrap(),
+            fh5
+        );
+        assert_eq!(
+            resolve_destination(fh5.to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p).unwrap(),
+            fh5
+        );
+        partial(&home.games().join("fh5"));
+        assert_eq!(
+            resolve_destination(home.games().to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p).unwrap(),
+            home.games().join("fh5")
+        );
+
+        // Once the download names its product, or a record names another
+        // one, it is that title's and nobody else resumes into it.
+        std::fs::write(
+            fh5.join("MicrosoftGame.Config"),
+            "<Game><StoreId>9ZZOTHERGAME</StoreId></Game>",
+        )
+        .unwrap();
+        for typed in [&library, &fh5] {
+            let err = resolve_destination(typed.to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("9ZZOTHERGAME"), "{err}");
+        }
+        let games_fh5 = home.games().join("fh5");
+        let mut other = record(&[]);
+        other.product_id = "9ZZOTHERGAME".into();
+        other.dir = games_fh5.clone();
+        save(p.state_dir(), &other).unwrap();
+        let err = resolve_destination(home.games().to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("9ZZOTHERGAME"), "{err}");
+    }
+
+    /// The title's own folder is what Remove deletes later, so it cannot be
+    /// a folder that already holds somebody's other files.
+    #[test]
+    fn a_title_is_not_installed_over_somebody_elses_files() {
+        let home = Home::new("occupied");
+        let p = &home.paths;
+        let library = home.root.join("lib2");
+        std::fs::create_dir_all(library.join("fh5")).unwrap();
+        // An empty folder of the right name is fine.
+        assert_eq!(
+            resolve_destination(library.to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p).unwrap(),
+            library.join("fh5")
+        );
+        std::fs::write(library.join("fh5/my-notes.txt"), b"mine").unwrap();
+        let err = resolve_destination(library.to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("other files"), "{err}");
+        // Choosing that folder itself puts the title one level down, which
+        // is empty, so that is allowed and leaves the notes alone.
+        assert_eq!(
+            resolve_destination(
+                library.join("fh5").to_str().unwrap(),
+                "fh5",
+                "9NNX1VVR3KNQ",
+                p
+            )
+            .unwrap(),
+            library.join("fh5/fh5")
+        );
+        // A file where the folder would go.
+        std::fs::write(library.join("bedrock"), b"not a folder").unwrap();
+        assert!(
+            resolve_destination(library.to_str().unwrap(), "bedrock", "9NBLGGH2JHXJ", p).is_err()
+        );
+        // A package that names nothing and is not a download in progress is
+        // still somebody's.
+        let nameless = home.game("nameless");
+        assert!(resolve_destination(
+            home.games().to_str().unwrap(),
+            "nameless",
+            "9NNX1VVR3KNQ",
+            p
+        )
+        .is_err());
+        assert!(resolve_destination(nameless.to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p).is_err());
     }
 
     #[test]
@@ -823,8 +1473,24 @@ mod tests {
             "and neither is one holding only the temporary container"
         );
 
+        // The client writes files in whatever order they arrive, so the
+        // manifest can land long before the download finishes.
         std::fs::write(dir.join("appxmanifest.xml"), b"<Package/>").expect("write");
+        assert!(
+            !looks_installed(&dir),
+            "a manifest beside an unfinished download is not an install"
+        );
+        assert!(is_partial(&dir));
+
+        std::fs::remove_file(dir.join(PARTIAL_CONTAINER)).expect("finish");
         assert!(looks_installed(&dir), "a manifest is a decrypted title");
+        assert!(!is_partial(&dir));
+
+        // An update in progress over a finished install: the old header is
+        // still there, and so is most of the old build.
+        std::fs::write(dir.join(CONTAINER), b"header").expect("write");
+        std::fs::write(dir.join(PARTIAL_CONTAINER), b"partial").expect("write");
+        assert!(looks_installed(&dir));
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -172,6 +172,14 @@ pub struct Saves {
 #[serde(deny_unknown_fields)]
 pub struct Recipe {
     pub schema: u32,
+    /// Written by the launcher from a package manifest, not by a person.
+    ///
+    /// A guessed recipe is a stopgap until somebody writes a tested one, so it
+    /// ranks below a packaged recipe for the same title, where an edited one
+    /// ranks above it. The editor clears this when someone saves their own
+    /// version: from then on it is theirs.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub generated: bool,
     pub title: Title,
     #[serde(default)]
     pub install: Install,
@@ -185,6 +193,80 @@ pub struct Recipe {
     pub setup: Vec<Setup>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub saves: Vec<Saves>,
+    /// The prefix, relative to the games directory, of a generated recipe this
+    /// one replaced in [`Recipe::load_layered`]. Never read from or written to
+    /// a file. The two recipes rarely share a slug, and the prefix holds the
+    /// saves, so [`crate::paths::Paths::prefix_dir`] keeps using this one until
+    /// the replacement's own prefix exists.
+    #[serde(skip)]
+    pub superseded_prefix: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// One recipe file that could not be used, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadProblem {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+impl std::fmt::Display for LoadProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.error)
+    }
+}
+
+/// The one variable a recipe with this slug may take a directory from:
+/// `<SLUG>_DIR` for `install.dir-env`, `<SLUG>_PREFIX` for
+/// `install.prefix-env`, with the slug uppercased and its dashes made
+/// underscores (`halo-infinite` gives `HALO_INFINITE_DIR`).
+pub fn location_variable(slug: &str, suffix: &str) -> String {
+    format!("{}{suffix}", slug.to_ascii_uppercase().replace('-', "_"))
+}
+
+/// Whether `name` is a variable a recipe with this slug may take a directory
+/// from, `suffix` being `_DIR` (`install.dir-env`) or `_PREFIX`
+/// (`install.prefix-env`).
+///
+/// Those exist so an install the shell scripts made keeps working, and every
+/// one of them is named after its title: `BEDROCK_DIR`, `FH5_PREFIX`. So the
+/// name has to be exactly the title's own, [`location_variable`]. A pattern
+/// with a list of exceptions would still let a recipe name `CARGO_TARGET_DIR`
+/// or `PULSE_RUNTIME_DIR`, and whatever that holds would become the title's
+/// folder -- the thing an uninstall deletes. The launcher's own variables and
+/// the system's are refused even when a slug spells one (`xdg-runtime`), for
+/// the same reason. `titles/validate.py` applies the same rule.
+pub fn is_location_variable(name: &str, slug: &str, suffix: &str) -> bool {
+    const RESERVED: [&str; 7] = [
+        "XODUS_",
+        "FERESTRE_",
+        "XDG_",
+        "STEAM_",
+        "PROTON_",
+        "WINE",
+        "APPDIR",
+    ];
+    let mut bytes = name.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_uppercase())
+        && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        && matches!(suffix, "_DIR" | "_PREFIX")
+        && name == location_variable(slug, suffix)
+        && !RESERVED.iter().any(|reserved| name.starts_with(reserved))
+}
+
+/// Whether `slug` is lowercase letters, digits and dashes, starting with a
+/// letter or digit. It names the install directory, the prefix and the log
+/// file, so anything else -- a `/`, a `..` -- would put those somewhere the
+/// recipe chose rather than in the games directory.
+pub fn is_slug(slug: &str) -> bool {
+    let mut bytes = slug.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// The schema version this build understands. A recipe from the future is
@@ -201,6 +283,28 @@ impl Recipe {
                 SCHEMA
             );
         }
+        if !is_slug(&recipe.title.slug) {
+            anyhow::bail!(
+                "[title].slug \"{}\" must be lowercase letters, digits and dashes",
+                recipe.title.slug
+            );
+        }
+        for (key, name, suffix) in [
+            ("dir-env", &recipe.install.dir_env, "_DIR"),
+            ("prefix-env", &recipe.install.prefix_env, "_PREFIX"),
+        ] {
+            if let Some(name) = name {
+                if !is_location_variable(name, &recipe.title.slug, suffix) {
+                    anyhow::bail!(
+                        "[install].{key} \"{name}\" is not a variable this recipe may take a \
+                         directory from: it must be {}, named after the slug, and not one of \
+                         the launcher's or the system's own (XODUS_*, FERESTRE_*, XDG_*, \
+                         STEAM_*, PROTON_*, WINE*)",
+                        location_variable(&recipe.title.slug, suffix)
+                    );
+                }
+            }
+        }
         Ok(recipe)
     }
 
@@ -212,22 +316,64 @@ impl Recipe {
 
     /// Every recipe in a directory, sorted by product id so output is stable.
     /// `capabilities.toml` is the runtime registry, not a title.
+    ///
+    /// Strict: the first file that does not parse fails the whole call. That
+    /// is right for the repository's own recipes, which CI checks; a launch
+    /// reads through [`Recipe::load_layered`], which is not.
     pub fn load_dir(dir: &Path) -> anyhow::Result<Vec<Recipe>> {
+        let (found, problems) = Self::load_dir_report(dir);
+        if let Some(problem) = problems.into_iter().next() {
+            anyhow::bail!("{problem}");
+        }
+        Ok(found)
+    }
+
+    /// Every recipe in a directory that parses, and a problem for each file
+    /// that does not.
+    pub fn load_dir_report(dir: &Path) -> (Vec<Recipe>, Vec<LoadProblem>) {
         let mut found = Vec::new();
-        for entry in
-            std::fs::read_dir(dir).map_err(|e| anyhow::anyhow!("{}: {e}", dir.display()))?
-        {
-            let path = entry?.path();
+        let mut problems = Vec::new();
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                problems.push(LoadProblem {
+                    path: dir.to_path_buf(),
+                    error: e.to_string(),
+                });
+                return (found, problems);
+            }
+        };
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for entry in entries {
+            match entry {
+                Ok(entry) => paths.push(entry.path()),
+                Err(e) => problems.push(LoadProblem {
+                    path: dir.to_path_buf(),
+                    error: e.to_string(),
+                }),
+            }
+        }
+        paths.sort();
+        for path in paths {
             if path.extension().and_then(|e| e.to_str()) != Some("toml") {
                 continue;
             }
             if path.file_stem().and_then(|s| s.to_str()) == Some("capabilities") {
                 continue;
             }
-            found.push(Recipe::load(&path)?);
+            let loaded = std::fs::read_to_string(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|text| Self::parse(&text));
+            match loaded {
+                Ok(recipe) => found.push(recipe),
+                Err(e) => problems.push(LoadProblem {
+                    path,
+                    error: e.to_string(),
+                }),
+            }
         }
         found.sort_by(|a, b| a.title.product_id.cmp(&b.title.product_id));
-        Ok(found)
+        (found, problems)
     }
 
     /// Recipes from several directories, later ones winning.
@@ -236,17 +382,63 @@ impl Recipe {
     /// `titles/` is read-only in an AppImage or a system package, and a person
     /// who fixed a launch must not lose it to the next upgrade. A directory
     /// that does not exist is not an error -- most machines have no edits.
+    ///
+    /// A file that does not parse is skipped and named on stderr, never fatal.
+    /// One typo, a recipe written by a newer build, or a file cut short by a
+    /// crash would otherwise take every other title with it, and an override
+    /// that cannot be read leaves the packaged recipe for that title in place.
+    /// [`Recipe::load_layered_report`] hands the problems to the caller
+    /// instead. The `Result` stays so the signature does not change; it is
+    /// never an error.
     pub fn load_layered(dirs: &[std::path::PathBuf]) -> anyhow::Result<Vec<Recipe>> {
+        let (recipes, problems) = Self::load_layered_report(dirs);
+        for problem in problems {
+            eprintln!("-- skipped a recipe that could not be read: {problem}");
+        }
+        Ok(recipes)
+    }
+
+    /// [`Recipe::load_layered`], with the files that could not be used
+    /// returned rather than printed.
+    ///
+    /// The order is packaged, then generated, then edited: a later directory
+    /// wins, except that a recipe the launcher generated never replaces one
+    /// that somebody wrote. A guess made from a package manifest before a
+    /// tested recipe existed would otherwise hide that recipe -- its
+    /// environment, its setup steps, its requirements -- for good.
+    pub fn load_layered_report(dirs: &[std::path::PathBuf]) -> (Vec<Recipe>, Vec<LoadProblem>) {
         let mut by_product: BTreeMap<String, Recipe> = BTreeMap::new();
+        let mut problems = Vec::new();
         for dir in dirs {
             if !dir.is_dir() {
                 continue;
             }
-            for recipe in Recipe::load_dir(dir)? {
-                by_product.insert(recipe.title.product_id.to_ascii_uppercase(), recipe);
+            let (recipes, mut found) = Recipe::load_dir_report(dir);
+            problems.append(&mut found);
+            for mut recipe in recipes {
+                let key = recipe.title.product_id.to_ascii_uppercase();
+                match by_product.get_mut(&key) {
+                    Some(existing) if recipe.generated && !existing.generated => {
+                        existing.superseded_prefix = Some(recipe.prefix_dir());
+                    }
+                    Some(existing) => {
+                        if existing.generated && !recipe.generated {
+                            recipe.superseded_prefix = Some(existing.prefix_dir());
+                        }
+                        *existing = recipe;
+                    }
+                    None => {
+                        by_product.insert(key, recipe);
+                    }
+                }
             }
         }
-        Ok(by_product.into_values().collect())
+        for recipe in by_product.values_mut() {
+            if recipe.superseded_prefix.as_deref() == Some(recipe.prefix_dir().as_str()) {
+                recipe.superseded_prefix = None;
+            }
+        }
+        (by_product.into_values().collect(), problems)
     }
 
     /// A recipe with nothing filled in but the identity, for a title nobody has
@@ -260,6 +452,7 @@ impl Recipe {
         let slug = slugify(name, product_id);
         Recipe {
             schema: SCHEMA,
+            generated: false,
             title: Title {
                 product_id: product_id.to_ascii_uppercase(),
                 name: name.to_string(),
@@ -286,6 +479,7 @@ impl Recipe {
             issues: Vec::new(),
             setup: Vec::new(),
             saves: Vec::new(),
+            superseded_prefix: None,
         }
     }
 
@@ -305,8 +499,43 @@ impl Recipe {
         ))
     }
 
-    /// Write this recipe into a directory, named by product id.
+    /// Write this recipe into a directory, named by product id, replacing any
+    /// recipe already there.
+    ///
+    /// Written to a temporary file and renamed into place, so a crash leaves
+    /// the previous recipe or the new one and never half of either.
     pub fn save_to(&self, dir: &Path) -> anyhow::Result<PathBuf> {
+        let path = self.file_in(dir)?;
+        crate::cache::write(&path, self.to_toml()?.as_bytes())?;
+        Ok(path)
+    }
+
+    /// Write this recipe into a directory only if no recipe for the product
+    /// is there yet; `Ok(None)` when one is.
+    ///
+    /// For recipes the launcher writes by itself. Whatever is already there
+    /// was either written by a person or by an earlier detection, and in
+    /// neither case is a fresh guess a reason to replace it.
+    pub fn save_new_to(&self, dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+        let path = self.file_in(dir)?;
+        let temporary = dir.join(format!(
+            ".{}.{}.new",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id()
+        ));
+        crate::cache::write(&temporary, self.to_toml()?.as_bytes())?;
+        // A hard link fails when the name is taken, which makes "only if
+        // absent" one step rather than a check and a write with a gap between.
+        let linked = std::fs::hard_link(&temporary, &path);
+        let _ = std::fs::remove_file(&temporary);
+        match linked {
+            Ok(()) => Ok(Some(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("{}: {e}", path.display())),
+        }
+    }
+
+    fn file_in(&self, dir: &Path) -> anyhow::Result<PathBuf> {
         if self.title.product_id.is_empty()
             || !self
                 .title
@@ -317,12 +546,10 @@ impl Recipe {
             anyhow::bail!("not a usable product id: {:?}", self.title.product_id);
         }
         std::fs::create_dir_all(dir)?;
-        let path = dir.join(format!(
+        Ok(dir.join(format!(
             "{}.toml",
             self.title.product_id.to_ascii_uppercase()
-        ));
-        std::fs::write(&path, self.to_toml()?)?;
-        Ok(path)
+        )))
     }
 
     /// Match a recipe by product id or slug, case-insensitively, because people
@@ -496,6 +723,329 @@ mod tests {
         assert_eq!(layered[1].title.product_id, "9ZZTESTNEW2");
 
         std::fs::remove_dir_all(&root).expect("cleans up");
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("ferestre-recipe-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    /// One unreadable file used to make every title disappear. Now it is
+    /// skipped and named, and the packaged recipe it would have overridden
+    /// stays.
+    #[test]
+    fn one_bad_file_does_not_take_the_other_recipes_with_it() {
+        let root = scratch("lenient");
+        let packaged = root.join("packaged");
+        let user = root.join("user");
+
+        let mut shipped = Recipe::blank("9ZZTESTNEW1", "Test Title");
+        shipped.launch.executable = "shipped.exe".into();
+        shipped.save_to(&packaged).expect("writes");
+        Recipe::blank("9ZZTESTNEW2", "Other Title")
+            .save_to(&packaged)
+            .expect("writes");
+
+        std::fs::create_dir_all(&user).unwrap();
+        // An override cut short, a typo, and a recipe from a newer schema.
+        std::fs::write(
+            user.join("9ZZTESTNEW1.toml"),
+            "schema = 1\n[title]\nproduct-",
+        )
+        .unwrap();
+        std::fs::write(user.join("typo.toml"), MINIMAL.replace("slug =", "slugg =")).unwrap();
+        std::fs::write(
+            user.join("future.toml"),
+            MINIMAL.replace("schema = 1", "schema = 2"),
+        )
+        .unwrap();
+
+        let (layered, problems) = Recipe::load_layered_report(&[packaged.clone(), user.clone()]);
+        assert_eq!(layered.len(), 2, "{layered:?}");
+        assert_eq!(layered[0].launch.executable, "shipped.exe");
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert!(problems
+            .iter()
+            .any(|p| p.path == user.join("9ZZTESTNEW1.toml")));
+        assert!(problems
+            .iter()
+            .any(|p| p.path == user.join("future.toml") && p.error.contains('2')));
+
+        // The plain call keeps its signature and does not fail either.
+        assert_eq!(
+            Recipe::load_layered(&[packaged, user.clone()])
+                .expect("never an error")
+                .len(),
+            2
+        );
+        // The strict reader is still strict, for CI.
+        assert!(Recipe::load_dir(&user).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A recipe guessed from a package manifest ranks below a tested one, and
+    /// an edited one above it.
+    #[test]
+    fn a_generated_recipe_never_hides_a_packaged_one() {
+        let root = scratch("generated");
+        let packaged = root.join("packaged");
+        let user = root.join("user");
+
+        let mut shipped = Recipe::blank("9ZZTESTNEW1", "Test Title");
+        shipped.launch.executable = "shipped.exe".into();
+        shipped.save_to(&packaged).expect("writes");
+
+        let mut guessed = Recipe::blank("9ZZTESTNEW1", "9ZZTESTNEW1");
+        guessed.generated = true;
+        guessed.launch.executable = "guessed.exe".into();
+        guessed.save_to(&user).expect("writes");
+        // A title only the launcher has seen keeps its generated recipe.
+        let mut lone = Recipe::blank("9ZZTESTNEW3", "Lone");
+        lone.generated = true;
+        lone.save_to(&user).expect("writes");
+
+        let dirs = [packaged.clone(), user.clone()];
+        let layered = Recipe::load_layered(&dirs).unwrap();
+        assert_eq!(layered.len(), 2);
+        assert_eq!(layered[0].launch.executable, "shipped.exe");
+        assert!(!layered[0].generated);
+        // The generated recipe's prefix is remembered, because it holds the
+        // saves and its slug was not the shipped one's.
+        assert_eq!(
+            layered[0].superseded_prefix.as_deref(),
+            Some("9zztestnew1-proton")
+        );
+        assert!(layered[1].generated);
+
+        // Saved from the editor, it is the person's own and wins.
+        guessed.generated = false;
+        guessed.launch.executable = "edited.exe".into();
+        guessed.save_to(&user).expect("writes");
+        let layered = Recipe::load_layered(&dirs).unwrap();
+        assert_eq!(layered[0].launch.executable, "edited.exe");
+        assert_eq!(layered[0].superseded_prefix, None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_generated_mark_survives_a_round_trip_and_is_absent_otherwise() {
+        let mut recipe = Recipe::blank("9ZZTESTNEW1", "Test Title");
+        recipe.launch.executable = "Game.exe".into();
+        let text = recipe.to_toml().unwrap();
+        assert!(!text.contains("generated"), "{text}");
+        assert!(!Recipe::parse(&text).unwrap().generated);
+        recipe.generated = true;
+        let text = recipe.to_toml().unwrap();
+        assert!(Recipe::parse(&text).unwrap().generated, "{text}");
+    }
+
+    #[test]
+    fn writing_a_recipe_replaces_it_whole_and_a_detection_never_replaces_one() {
+        let root = scratch("save");
+        let mut recipe = Recipe::blank("9ZZTESTNEW1", "Test Title");
+        recipe.launch.executable = "first.exe".into();
+        let path = recipe.save_to(&root).expect("writes");
+        recipe.launch.executable = "second.exe".into();
+        assert_eq!(recipe.save_to(&root).unwrap(), path);
+        assert_eq!(Recipe::load(&path).unwrap().launch.executable, "second.exe");
+
+        // Someone's own recipe is there: a fresh guess leaves it alone.
+        let mut guess = Recipe::blank("9ZZTESTNEW1", "Guess");
+        guess.generated = true;
+        assert_eq!(guess.save_new_to(&root).unwrap(), None);
+        assert_eq!(Recipe::load(&path).unwrap().launch.executable, "second.exe");
+        // A title with nothing yet gets it.
+        let mut other = Recipe::blank("9ZZTESTNEW2", "Other");
+        other.generated = true;
+        let written = other.save_new_to(&root).unwrap().expect("written");
+        assert!(Recipe::load(&written).unwrap().generated);
+        // Nothing but the two recipes is left behind.
+        let mut names: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["9ZZTESTNEW1.toml", "9ZZTESTNEW2.toml"]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_slug_that_would_leave_the_games_directory_is_refused() {
+        for slug in [
+            "../../.config/autostart/x",
+            "a/b",
+            "Upper",
+            "",
+            "-dash",
+            "a b",
+        ] {
+            let text = MINIMAL.replace("slug = \"example\"", &format!("slug = {slug:?}"));
+            let err = Recipe::parse(&text).expect_err(slug).to_string();
+            assert!(err.contains("slug"), "{err}");
+        }
+        assert!(Recipe::parse(&MINIMAL.replace("\"example\"", "\"9x-2\"")).is_ok());
+    }
+
+    #[test]
+    fn only_a_titles_own_directory_variables_may_be_named() {
+        for (slug, dir, prefix) in [
+            ("bedrock", "BEDROCK_DIR", "BEDROCK_PREFIX"),
+            ("fh5", "FH5_DIR", "FH5_PREFIX"),
+            ("exp33", "EXP33_DIR", "EXP33_PREFIX"),
+            ("halo-infinite", "HALO_INFINITE_DIR", "HALO_INFINITE_PREFIX"),
+        ] {
+            assert!(is_location_variable(dir, slug, "_DIR"), "{dir}");
+            assert!(is_location_variable(prefix, slug, "_PREFIX"), "{prefix}");
+            // Each key takes its own one, not the other's.
+            assert!(!is_location_variable(prefix, slug, "_DIR"), "{prefix}");
+            assert!(!is_location_variable(dir, slug, "_PREFIX"), "{dir}");
+            let text = MINIMAL.replace("slug = \"example\"", &format!("slug = {slug:?}"));
+            let text = format!("{text}\n[install]\ndir-env = {dir:?}\nprefix-env = {prefix:?}\n");
+            assert!(Recipe::parse(&text).is_ok(), "{slug}");
+        }
+        for name in [
+            "XODUS_GAMES_DIR",
+            "XDG_RUNTIME_DIR",
+            "XDG_STATE_HOME",
+            "HOME",
+            "PWD",
+            "TMPDIR",
+            "FERESTRE_SCRIPTS_DIR",
+            "STEAM_DIR",
+            "PROTON_DIR",
+            "WINEPREFIX",
+            "_DIR",
+            "lower_dir",
+            "A-B_DIR",
+            // Shaped like a title's variable, but somebody else's.
+            "CARGO_TARGET_DIR",
+            "PULSE_RUNTIME_DIR",
+            "PIPEWIRE_RUNTIME_DIR",
+            "BEDROCK_DIR",
+            "EXAMPLE_PREFIX",
+        ] {
+            for (key, suffix) in [("dir-env", "_DIR"), ("prefix-env", "_PREFIX")] {
+                if name == location_variable("example", suffix) {
+                    continue;
+                }
+                assert!(!is_location_variable(name, "example", suffix), "{name}");
+                let text = format!("{MINIMAL}\n[install]\n{key} = {name:?}\n");
+                let err = Recipe::parse(&text).expect_err(name).to_string();
+                assert!(err.contains(&location_variable("example", suffix)), "{err}");
+            }
+        }
+        // A slug that spells one of the launcher's or the system's own
+        // variables does not make it the title's.
+        for slug in ["xdg-runtime", "xodus-games", "steam", "proton"] {
+            let name = location_variable(slug, "_DIR");
+            assert!(!is_location_variable(&name, slug, "_DIR"), "{name}");
+        }
+    }
+
+    /// Every key SCHEMA.md documents has to be one this parser takes, or a
+    /// recipe written from the documentation passes the validator and then
+    /// cannot be loaded. `[launch].arguments` was exactly that.
+    #[test]
+    fn every_key_the_schema_documents_is_accepted() {
+        let schema = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../titles/SCHEMA.md");
+        let Ok(text) = std::fs::read_to_string(&schema) else {
+            return; // packaged crate without the repository around it
+        };
+        let mut table = String::new();
+        let mut checked = 0;
+        for line in text.lines() {
+            if let Some(heading) = line.strip_prefix("### `") {
+                table = heading.split('`').next().unwrap_or_default().to_string();
+                continue;
+            }
+            if line.starts_with("## ") {
+                table.clear();
+            }
+            if table.is_empty() || !line.starts_with("| `") {
+                continue;
+            }
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            let kind = cells.get(2).copied().unwrap_or_default();
+            // `env` (alias `environment`): every backticked name in the key
+            // column is a key.
+            let keys: Vec<&str> = cells[1]
+                .split('`')
+                .enumerate()
+                .filter(|(i, _)| i % 2 == 1)
+                .map(|(_, k)| k)
+                .collect();
+            for key in keys {
+                let value = match kind {
+                    "string" => "\"x\"",
+                    "number" => "1.5",
+                    "date" => "2026-01-01",
+                    "table" => "{ A_B = \"1\" }",
+                    k if k.starts_with("array") => "[]",
+                    other => panic!("{table}.{key}: undocumented type {other:?}"),
+                };
+                let value = match (table.as_str(), key) {
+                    ("[title]", "slug") => "\"example\"",
+                    ("[install]", "dir-env") => "\"EXAMPLE_DIR\"",
+                    ("[install]", "prefix-env") => "\"EXAMPLE_PREFIX\"",
+                    ("[status]", "state") => "\"broken\"",
+                    _ => value,
+                };
+                let recipe = with_key(&table, key, value);
+                if let Err(e) = Recipe::parse(&recipe) {
+                    panic!("{table} {key} is documented but refused: {e}\n{recipe}");
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 30, "only {checked} documented keys were found");
+    }
+
+    /// The minimal recipe with one key set, in whichever table it belongs to.
+    fn with_key(table: &str, key: &str, value: &str) -> String {
+        let mut tables: Vec<(String, Vec<String>)> = vec![
+            ("".into(), vec!["schema = 1".into()]),
+            (
+                "[title]".into(),
+                vec![
+                    "product-id = \"9NBLGGH2JHXJ\"".into(),
+                    "name = \"Example\"".into(),
+                    "slug = \"example\"".into(),
+                ],
+            ),
+            ("[launch]".into(), vec!["executable = 'Example.exe'".into()]),
+            (
+                "[status]".into(),
+                vec!["state = \"playable\"".into(), "summary = \"Runs.\"".into()],
+            ),
+        ];
+        let required = [
+            ("[[setup]]", vec!["action = \"substitute-xcurl\""]),
+            ("[[saves]]", vec!["kind = \"wgs\""]),
+            ("[[issues]]", vec!["symptom = \"s\"", "cause = \"c\""]),
+        ];
+        let line = format!("{key} = {value}");
+        match tables.iter_mut().find(|(name, _)| name == table) {
+            Some((_, lines)) => {
+                lines.retain(|l| !l.starts_with(&format!("{key} =")));
+                lines.push(line);
+            }
+            None => {
+                let mut lines: Vec<String> = required
+                    .iter()
+                    .find(|(name, _)| *name == table)
+                    .map(|(_, l)| l.iter().map(|s| s.to_string()).collect())
+                    .unwrap_or_default();
+                lines.retain(|l| !l.starts_with(&format!("{key} =")));
+                lines.push(line);
+                tables.push((table.to_string(), lines));
+            }
+        }
+        tables
+            .into_iter()
+            .map(|(name, lines)| format!("{name}\n{}\n", lines.join("\n")))
+            .collect()
     }
 
     #[test]

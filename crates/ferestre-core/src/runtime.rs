@@ -115,21 +115,30 @@ impl InstalledRuntime {
         })
     }
 
-    /// Examine the runtime [`Paths`] resolved.
+    /// The runtime a launch would use when nothing more specific was chosen.
     ///
-    /// The search order lives there, with the rest of what `xodus-env.sh`
-    /// resolves; a second copy of it here would be one to drift. A directory
-    /// that came from `XODUS_PROTON_DIR` is used as given, so a wrong override
-    /// is an error naming it rather than a silent fall-through to some other
-    /// install the user did not choose.
+    /// A directory that came from `XODUS_PROTON_DIR` is used as given, so a
+    /// wrong override is an error naming it rather than a silent fall-through
+    /// to some other install the user did not choose. Otherwise it is the
+    /// newest of [`all`]: the managed downloads in the state directory as well
+    /// as the legacy Steam compatibility tool. An AppImage brings no runtime of
+    /// its own, so looking only at the legacy places reported "no runtime" on
+    /// exactly the machines `ferestre install-runtime` had set up.
     pub fn discover(paths: &Paths) -> anyhow::Result<Self> {
-        let dir = paths.runtime_dir().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no patched Proton runtime found. Install one (ferestre install-runtime), \
-                 or set XODUS_PROTON_DIR to an existing compatibility tool"
-            )
-        })?;
-        Self::at(dir)
+        if let Some(dir) = paths.runtime_override() {
+            return Self::at(dir);
+        }
+        if let Some(runtime) = all(paths).into_iter().next() {
+            return Ok(runtime);
+        }
+        if let Some(dir) = paths.runtime_dir() {
+            // Found by probing but not usable: say what is wrong with it.
+            return Self::at(dir);
+        }
+        anyhow::bail!(
+            "no patched Proton runtime found. Install one (ferestre install-runtime), \
+             or set XODUS_PROTON_DIR to an existing compatibility tool"
+        )
     }
 
     pub fn provides(&self, capability: &str) -> bool {
@@ -151,6 +160,10 @@ pub struct Release {
     pub tag: String,
     pub asset_name: String,
     pub url: String,
+    /// The minisign signature published beside the archive
+    /// (`<asset>.minisig`), if the release has one. A caller must not install
+    /// an archive that has none; see [`verify_release_file`].
+    pub signature_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -173,13 +186,20 @@ pub fn latest_release(json: &str) -> anyhow::Result<Release> {
         if !release.tag_name.starts_with("runtime-") {
             continue;
         }
-        if let Some(asset) = release.assets.into_iter().find(|asset| {
+        if let Some(asset) = release.assets.iter().find(|asset| {
             asset.name.starts_with("ferestre-runtime-") && asset.name.ends_with(".tar.xz")
         }) {
+            let signature = format!("{}.minisig", asset.name);
+            let signature_url = release
+                .assets
+                .iter()
+                .find(|other| other.name == signature)
+                .map(|other| other.browser_download_url.clone());
             return Ok(Release {
-                tag: release.tag_name,
-                asset_name: asset.name,
-                url: asset.browser_download_url,
+                tag: release.tag_name.clone(),
+                asset_name: asset.name.clone(),
+                url: asset.browser_download_url.clone(),
+                signature_url,
             });
         }
     }
@@ -239,8 +259,10 @@ pub fn all(paths: &Paths) -> Vec<InstalledRuntime> {
 
 /// Per-title runtime choices kept outside shipped recipes. A release can update
 /// the compatibility matrix without overwriting the runtime a person chose.
+///
+/// Unknown keys are tolerated: a file a newer build wrote must still give this
+/// one the choices it can read, rather than read as no choices at all.
 #[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 struct Selections {
     #[serde(default)]
     titles: BTreeMap<String, PathBuf>,
@@ -250,27 +272,53 @@ fn selections_file(config_dir: &Path) -> PathBuf {
     config_dir.join("runtime-selections.toml")
 }
 
+/// The saved choices. `Ok(default)` when there is no file; an error naming
+/// the file when there is one that cannot be read.
+fn read_selections(config_dir: &Path) -> anyhow::Result<Selections> {
+    let file = selections_file(config_dir);
+    let text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Selections::default()),
+        Err(e) => anyhow::bail!("{}: {e}", file.display()),
+    };
+    toml::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "{}: {e}\nfix the file, or move it aside to forget every saved runtime choice",
+            file.display()
+        )
+    })
+}
+
 /// Read a local runtime choice for a Store product id.
+///
+/// A file that cannot be read is said on stderr and treated as no choice, so
+/// a launch still happens -- with the automatic runtime, which the message
+/// says.
 pub fn selected(config_dir: &Path, product_id: &str) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(selections_file(config_dir)).ok()?;
-    let selections: Selections = toml::from_str(&text).ok()?;
-    selections
-        .titles
-        .get(&product_id.to_ascii_uppercase())
-        .cloned()
+    match read_selections(config_dir) {
+        Ok(selections) => selections
+            .titles
+            .get(&product_id.to_ascii_uppercase())
+            .cloned(),
+        Err(e) => {
+            eprintln!("-- ignoring the saved runtime choices: {e}");
+            None
+        }
+    }
 }
 
 /// Persist a local runtime choice. Passing `None` restores automatic selection.
+///
+/// A file that is there and cannot be read is an error, not a blank slate:
+/// rewriting it with only this one choice would silently throw away every
+/// other title's.
 pub fn set_selected(
     config_dir: &Path,
     product_id: &str,
     path: Option<&Path>,
 ) -> anyhow::Result<()> {
     let file = selections_file(config_dir);
-    let mut selections: Selections = std::fs::read_to_string(&file)
-        .ok()
-        .and_then(|text| toml::from_str(&text).ok())
-        .unwrap_or_default();
+    let mut selections = read_selections(config_dir)?;
     match path {
         Some(path) => {
             selections
@@ -281,16 +329,33 @@ pub fn set_selected(
             selections.titles.remove(&product_id.to_ascii_uppercase());
         }
     }
-    std::fs::create_dir_all(config_dir)?;
-    let temporary = file.with_extension("toml.part");
-    std::fs::write(&temporary, toml::to_string_pretty(&selections)?)?;
-    std::fs::rename(temporary, file)?;
-    Ok(())
+    crate::cache::write(&file, toml::to_string_pretty(&selections)?.as_bytes())
+}
+
+/// The runtime a person asked for, for one title: their choice for that title
+/// if they made one, otherwise the one `XODUS_PROTON_DIR` names.
+///
+/// `XODUS_PROTON_DIR` is a choice too, made for every title at once, so it is
+/// the requested runtime rather than one more candidate that a newer managed
+/// download would quietly outrank. A value that is not a runtime is an error
+/// naming it, as [`InstalledRuntime::discover`] has always made it.
+pub fn requested(paths: &Paths, product_id: &str) -> anyhow::Result<Option<PathBuf>> {
+    if let Some(chosen) = selected(paths.config_dir(), product_id) {
+        return Ok(Some(chosen));
+    }
+    match paths.runtime_override() {
+        Some(dir) => InstalledRuntime::at(dir).map(|runtime| Some(runtime.path)),
+        None => Ok(None),
+    }
 }
 
 /// Pick the requested runtime, or the newest compatible installed runtime.
 /// A path is only accepted when it names one of the discovered installs; this
 /// prevents a stale title override from silently running an arbitrary Proton.
+///
+/// Refuses before anything else can look at the answer, which leaves a caller
+/// no way to launch anyway or to explain the refusal. [`choose`] is the one to
+/// use before a launch.
 pub fn select<'a>(
     recipe: &Recipe,
     runtimes: &'a [InstalledRuntime],
@@ -301,16 +366,169 @@ pub fn select<'a>(
         .iter()
         .filter(|rt| assess(recipe, rt, registry).is_satisfied());
     if let Some(path) = requested {
-        return candidates.find(|rt| rt.path == path).ok_or_else(|| {
-            anyhow::anyhow!(
-                "{}: selected runtime is unavailable or incompatible",
-                path.display()
-            )
-        });
+        return candidates
+            .find(|rt| same_path(&rt.path, path))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{}: selected runtime is unavailable or incompatible",
+                    path.display()
+                )
+            });
     }
     candidates
         .next()
         .ok_or_else(|| anyhow::anyhow!("no installed runtime satisfies {}", recipe.title.name))
+}
+
+/// The runtime a launch would use, and what it is missing.
+#[derive(Debug, Clone)]
+pub struct Choice<'a> {
+    pub runtime: &'a InstalledRuntime,
+    /// Whether the runtime satisfies the recipe, with the words for why not.
+    /// The decision whether to launch is the caller's: a probed runtime that
+    /// "could not be seen" to have something may well have it, and `--force`
+    /// exists for a person who knows better than the recipe.
+    pub assessment: Assessment,
+}
+
+/// Pick the runtime for a launch without refusing on the recipe's behalf.
+///
+/// The requested runtime when there is one, whatever it is missing -- someone
+/// chose it -- and an error only when it is not installed. Otherwise the
+/// newest runtime that satisfies the recipe, and failing that the newest
+/// runtime, so the caller can show what is missing, suggest an update, and
+/// honour `--force`. An error only when there is no runtime at all.
+pub fn choose<'a>(
+    recipe: &Recipe,
+    runtimes: &'a [InstalledRuntime],
+    requested: Option<&Path>,
+    registry: Option<&Registry>,
+) -> anyhow::Result<Choice<'a>> {
+    let choice = |runtime: &'a InstalledRuntime| Choice {
+        runtime,
+        assessment: assess(recipe, runtime, registry),
+    };
+    if let Some(path) = requested {
+        return runtimes
+            .iter()
+            .find(|rt| same_path(&rt.path, path))
+            .map(choice)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{}: the runtime chosen for {} is not installed; choose another, or \
+                     clear the choice to use the newest",
+                    path.display(),
+                    recipe.title.name
+                )
+            });
+    }
+    let mut assessed = runtimes.iter().map(choice);
+    let first = assessed.next().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no patched Proton runtime is installed. Install one (ferestre install-runtime), \
+             or set XODUS_PROTON_DIR to an existing compatibility tool"
+        )
+    })?;
+    if first.assessment.is_satisfied() {
+        return Ok(first);
+    }
+    Ok(assessed
+        .find(|candidate| candidate.assessment.is_satisfied())
+        .unwrap_or(first))
+}
+
+/// Two names for the same runtime: a choice saved through a symlink, or with
+/// a trailing slash, still names the install it meant.
+fn same_path(a: &Path, b: &Path) -> bool {
+    a == b
+        || a.canonicalize()
+            .ok()
+            .is_some_and(|a| b.canonicalize().ok().is_some_and(|b| a == b))
+}
+
+/// The public half of the key release artefacts are signed with, in
+/// minisign's format (the second line of a `.pub` file).
+///
+/// PLACEHOLDER: no real key is committed yet. Until this is replaced with the
+/// release key, [`verify_release_file`] refuses everything, so a build made
+/// from this tree cannot install a runtime it has not verified.
+pub const RELEASE_PUBLIC_KEY: &str = "REPLACE-WITH-THE-MINISIGN-RELEASE-PUBLIC-KEY";
+
+/// Check a downloaded release artefact against its minisign signature and the
+/// key built into the launcher.
+///
+/// `signature` is the text of the `.minisig` file published beside the
+/// artefact. The archive is read in chunks, so a 300 MB runtime is never held
+/// in memory. A SHA256SUMS file from the same release would only say the
+/// download matches what the release says; a signature says the release is
+/// ours.
+///
+/// `expected_name` is the name of the asset that was asked for. A good
+/// signature only says *some* file was signed with the release key, so the
+/// signed (trusted) comment also has to name this one: `minisign -S` writes
+/// `file:<name>` there by default, and release CI must keep that. Without the
+/// check, whoever can swap a release's assets could serve another signed
+/// file, such as an older runtime, under this one's name.
+pub fn verify_release_file(
+    path: &Path,
+    signature: &str,
+    expected_name: &str,
+) -> anyhow::Result<()> {
+    verify_file_with_key(RELEASE_PUBLIC_KEY, path, signature, expected_name)
+}
+
+/// [`verify_release_file`] with an explicit public key.
+pub fn verify_file_with_key(
+    public_key: &str,
+    path: &Path,
+    signature: &str,
+    expected_name: &str,
+) -> anyhow::Result<()> {
+    use std::io::Read;
+
+    let key = minisign_verify::PublicKey::from_base64(public_key.trim()).map_err(|e| {
+        anyhow::anyhow!(
+            "this build carries no usable release key ({e}), so nothing it downloads can be \
+             verified"
+        )
+    })?;
+    let signature = minisign_verify::Signature::decode(signature)
+        .map_err(|e| anyhow::anyhow!("the signature for {} is unreadable: {e}", path.display()))?;
+    let mut verifier = key.verify_stream(&signature).map_err(|e| {
+        anyhow::anyhow!("{} is not signed with the release key: {e}", path.display())
+    })?;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    let mut buffer = vec![0u8; 1 << 16];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        verifier.update(&buffer[..read]);
+    }
+    verifier.finalize().map_err(|e| {
+        anyhow::anyhow!(
+            "{} does not match its signature ({e}); it was not installed",
+            path.display()
+        )
+    })?;
+    // Only read now that the global signature has vouched for it.
+    let names_it = signature
+        .trusted_comment()
+        .split('\t')
+        .any(|field| field.strip_prefix("file:") == Some(expected_name));
+    if expected_name.is_empty() || !names_it {
+        anyhow::bail!(
+            "{} is signed, but as a different file (\"{}\") from the {expected_name} that was \
+             asked for; it was not installed",
+            path.display(),
+            signature.trusted_comment()
+        );
+    }
+    Ok(())
 }
 
 fn read_capabilities(dir: &Path) -> anyhow::Result<(BTreeSet<Capability>, CapabilitySource)> {
@@ -1039,6 +1257,437 @@ hangs"""
                 .path,
             old.path()
         );
+    }
+
+    #[test]
+    fn a_saved_choice_file_that_cannot_be_read_is_not_overwritten() {
+        // Rewriting it with only the new choice would throw away every other
+        // title's without a word.
+        let config = TempDir::new("runtime-choice-corrupt");
+        let file = config.path().join("runtime-selections.toml");
+        std::fs::write(&file, "[titles\nbroken = ").unwrap();
+        let chosen = Path::new("/opt/ferestre/runtimes/11.0.2");
+        let err = set_selected(config.path(), "9NNX1VVR3KNQ", Some(chosen))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("runtime-selections.toml"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "[titles\nbroken = "
+        );
+        assert_eq!(selected(config.path(), "9NNX1VVR3KNQ"), None);
+
+        // A key from a newer build is no reason to lose the choices.
+        std::fs::write(
+            &file,
+            "future = 1\n[titles]\n9NNX1VVR3KNQ = \"/opt/a\"\n9PPT8K6GQHRZ = \"/opt/b\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            selected(config.path(), "9PPT8K6GQHRZ").as_deref(),
+            Some(Path::new("/opt/b"))
+        );
+        set_selected(config.path(), "9NNX1VVR3KNQ", Some(chosen)).unwrap();
+        assert_eq!(
+            selected(config.path(), "9PPT8K6GQHRZ").as_deref(),
+            Some(Path::new("/opt/b"))
+        );
+        assert_eq!(
+            selected(config.path(), "9NNX1VVR3KNQ").as_deref(),
+            Some(chosen)
+        );
+    }
+
+    /// The gate after the choice decides whether to launch; the choice itself
+    /// must hand it a runtime and the reasons, not refuse first.
+    #[test]
+    fn choosing_leaves_the_refusal_to_the_caller() {
+        let probed = fake_runtime("choose-probed", true, true);
+        probed.write("version", "11.0.3\n");
+        let lacking = fake_runtime("choose-lacking", true, false);
+        lacking.write("version", "11.0.2\n");
+        lacking.write(MANIFEST_PATH, r#"["loader.memfd-main-image"]"#);
+        let complete = fake_runtime("choose-complete", true, false);
+        complete.write("version", "11.0.1\n");
+        complete.write(
+            MANIFEST_PATH,
+            r#"["loader.memfd-main-image", "gameinput.v2"]"#,
+        );
+        let recipe = Recipe::parse(RECIPE).unwrap();
+        let mut runtimes = vec![
+            InstalledRuntime::at(probed.path()).unwrap(),
+            InstalledRuntime::at(lacking.path()).unwrap(),
+            InstalledRuntime::at(complete.path()).unwrap(),
+        ];
+        runtimes.sort_by(runtime_order);
+
+        // The newest one that satisfies the recipe, even if older.
+        let choice = choose(&recipe, &runtimes, None, None).unwrap();
+        assert_eq!(choice.runtime.path, complete.path());
+        assert!(choice.assessment.is_satisfied());
+
+        // A probed runtime that was asked for is handed over with its doubts,
+        // where select() refused it outright.
+        assert!(select(&recipe, &runtimes, Some(probed.path()), None).is_err());
+        let choice = choose(&recipe, &runtimes, Some(probed.path()), None).unwrap();
+        assert_eq!(choice.runtime.path, probed.path());
+        assert_eq!(choice.assessment.source, CapabilitySource::Probed);
+        assert!(!choice.assessment.is_satisfied());
+
+        // Nothing satisfies it: the newest, with what it is missing, so the
+        // caller can explain it and honour --force.
+        let only_lacking = vec![InstalledRuntime::at(lacking.path()).unwrap()];
+        assert!(select(&recipe, &only_lacking, None, None).is_err());
+        let choice = choose(&recipe, &only_lacking, None, None).unwrap();
+        assert_eq!(choice.runtime.path, lacking.path());
+        assert!(choice
+            .assessment
+            .matched
+            .missing_required
+            .contains("gameinput.v2"));
+
+        // A choice that is not installed, and no runtime at all, are errors.
+        assert!(choose(&recipe, &runtimes, Some(Path::new("/nonexistent")), None).is_err());
+        let err = choose(&recipe, &[], None, None).unwrap_err().to_string();
+        assert!(err.contains("install-runtime"), "{err}");
+    }
+
+    /// A managed runtime in the state directory, which is all an AppImage
+    /// user has.
+    fn managed_paths(state: &Path, extra: &[(&str, &str)]) -> Paths {
+        let mut vars = vec![
+            ("HOME", "/home/tester".to_string()),
+            ("XDG_STATE_HOME", state.display().to_string()),
+            (
+                "XDG_CONFIG_HOME",
+                state.join("config").display().to_string(),
+            ),
+        ];
+        vars.extend(extra.iter().map(|(k, v)| (*k, v.to_string())));
+        Paths::resolve(&Env::from_map(vars)).unwrap()
+    }
+
+    #[test]
+    fn discovery_finds_a_runtime_install_runtime_put_in_the_state_directory() {
+        let state = TempDir::new("managed-state");
+        let managed = state.path().join("ferestre/runtimes/11.0.5");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::write(managed.join("proton"), "close_fds=False\n").unwrap();
+        let paths = managed_paths(state.path(), &[]);
+        assert_eq!(paths.runtime_dir(), None);
+        let found = InstalledRuntime::discover(&paths).expect("the managed runtime");
+        assert_eq!(found.path, managed);
+    }
+
+    #[test]
+    fn the_runtime_override_is_the_requested_runtime() {
+        let state = TempDir::new("override-state");
+        let managed = state.path().join("ferestre/runtimes/99.0.0");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::write(managed.join("proton"), "close_fds=False\n").unwrap();
+        std::fs::write(managed.join("version"), "99.0.0\n").unwrap();
+        let named = fake_runtime("override-named", true, true);
+        named.write("version", "1.0.0\n");
+        let paths = managed_paths(
+            state.path(),
+            &[("XODUS_PROTON_DIR", &named.path().display().to_string())],
+        );
+
+        // Newer managed downloads do not outrank the one that was named.
+        assert_eq!(
+            InstalledRuntime::discover(&paths).unwrap().path,
+            named.path()
+        );
+        assert_eq!(
+            requested(&paths, "9NBLGGH2JHXJ").unwrap().as_deref(),
+            Some(named.path())
+        );
+        let runtimes = all(&paths);
+        let recipe = Recipe::parse(RECIPE).unwrap();
+        let wanted = requested(&paths, "9NBLGGH2JHXJ").unwrap();
+        let choice = choose(&recipe, &runtimes, wanted.as_deref(), None).unwrap();
+        assert_eq!(choice.runtime.path, named.path());
+
+        // A per-title choice is more specific than the variable.
+        let config = paths.config_dir().to_path_buf();
+        set_selected(&config, "9NBLGGH2JHXJ", Some(&managed)).unwrap();
+        assert_eq!(
+            requested(&paths, "9NBLGGH2JHXJ").unwrap().as_deref(),
+            Some(managed.as_path())
+        );
+        std::fs::remove_dir_all(&config).unwrap();
+
+        // A wrong value is an error naming it, not a silent fall back.
+        let wrong = TempDir::new("override-wrong");
+        let paths = managed_paths(
+            state.path(),
+            &[("XODUS_PROTON_DIR", &wrong.path().display().to_string())],
+        );
+        let err = requested(&paths, "9NBLGGH2JHXJ").unwrap_err().to_string();
+        assert!(err.contains(&wrong.path().display().to_string()), "{err}");
+        assert!(InstalledRuntime::discover(&paths).is_err());
+    }
+
+    #[test]
+    fn a_runtime_release_carries_its_signature() {
+        let release = latest_release(
+            r#"[{"tag_name":"runtime-11.0.20261018","assets":[
+                {"name":"ferestre-runtime-11.0.20261018.tar.xz","browser_download_url":"https://example.invalid/runtime"},
+                {"name":"ferestre-runtime-11.0.20261018.tar.xz.minisig","browser_download_url":"https://example.invalid/runtime.minisig"}
+            ]}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            release.signature_url.as_deref(),
+            Some("https://example.invalid/runtime.minisig")
+        );
+        let unsigned = latest_release(
+            r#"[{"tag_name":"runtime-1","assets":[
+                {"name":"ferestre-runtime-1.tar.xz","browser_download_url":"https://example.invalid/r"}]}]"#,
+        )
+        .unwrap();
+        assert_eq!(unsigned.signature_url, None);
+    }
+
+    /// A minisign key pair made here, for this test only, and a signer that
+    /// writes what `minisign -S` writes: a BLAKE2b-512 prehash signed with
+    /// Ed25519, and a global signature over that and the trusted comment.
+    struct TestSigner {
+        key: ed25519_dalek::SigningKey,
+        key_id: [u8; 8],
+    }
+
+    impl TestSigner {
+        fn generate() -> TestSigner {
+            use sha2::Digest;
+            let mut seed_source = sha2::Sha256::new();
+            seed_source.update(std::process::id().to_le_bytes());
+            seed_source.update(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+                    .to_le_bytes(),
+            );
+            let seed: [u8; 32] = seed_source.finalize().into();
+            let mut key_id = [0u8; 8];
+            key_id.copy_from_slice(&seed[..8]);
+            TestSigner {
+                key: ed25519_dalek::SigningKey::from_bytes(&seed),
+                key_id,
+            }
+        }
+
+        fn public_key(&self) -> String {
+            let mut bytes = b"Ed".to_vec();
+            bytes.extend_from_slice(&self.key_id);
+            bytes.extend_from_slice(self.key.verifying_key().as_bytes());
+            base64(&bytes)
+        }
+
+        /// Signed as `minisign -S -m <name>` signs, with the default
+        /// trusted comment naming the file.
+        fn sign(&self, data: &[u8], name: &str) -> String {
+            use ed25519_dalek::Signer;
+            let signature = self.key.sign(&blake2b512(data)).to_bytes();
+            let mut line = b"ED".to_vec();
+            line.extend_from_slice(&self.key_id);
+            line.extend_from_slice(&signature);
+            let trusted = format!("timestamp:0\tfile:{name}\thashed");
+            let mut global = signature.to_vec();
+            global.extend_from_slice(trusted.as_bytes());
+            let global = self.key.sign(&global).to_bytes();
+            format!(
+                "untrusted comment: test signature\n{}\ntrusted comment: {trusted}\n{}\n",
+                base64(&line),
+                base64(&global)
+            )
+        }
+    }
+
+    fn base64(bytes: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(TABLE[(n >> (18 - 6 * i) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    /// BLAKE2b with a 64-byte digest and no key (RFC 7693), which is what
+    /// minisign prehashes with. Only for signing in this test.
+    fn blake2b512(data: &[u8]) -> [u8; 64] {
+        const IV: [u64; 8] = [
+            0x6a09e667f3bcc908,
+            0xbb67ae8584caa73b,
+            0x3c6ef372fe94f82b,
+            0xa54ff53a5f1d36f1,
+            0x510e527fade682d1,
+            0x9b05688c2b3e6c1f,
+            0x1f83d9abfb41bd6b,
+            0x5be0cd19137e2179,
+        ];
+        const SIGMA: [[usize; 16]; 10] = [
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+            [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
+            [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+            [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
+            [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+            [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
+            [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+            [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
+            [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
+        ];
+        fn compress(h: &mut [u64; 8], block: &[u8; 128], counter: u128, last: bool) {
+            let mut m = [0u64; 16];
+            for (i, word) in m.iter_mut().enumerate() {
+                *word = u64::from_le_bytes(block[i * 8..i * 8 + 8].try_into().unwrap());
+            }
+            let mut v = [0u64; 16];
+            v[..8].copy_from_slice(h);
+            v[8..].copy_from_slice(&IV);
+            v[12] ^= counter as u64;
+            v[13] ^= (counter >> 64) as u64;
+            if last {
+                v[14] = !v[14];
+            }
+            let mut g = |a: usize, b: usize, c: usize, d: usize, x: u64, y: u64| {
+                v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
+                v[d] = (v[d] ^ v[a]).rotate_right(32);
+                v[c] = v[c].wrapping_add(v[d]);
+                v[b] = (v[b] ^ v[c]).rotate_right(24);
+                v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
+                v[d] = (v[d] ^ v[a]).rotate_right(16);
+                v[c] = v[c].wrapping_add(v[d]);
+                v[b] = (v[b] ^ v[c]).rotate_right(63);
+            };
+            for round in 0..12 {
+                let s = &SIGMA[round % 10];
+                g(0, 4, 8, 12, m[s[0]], m[s[1]]);
+                g(1, 5, 9, 13, m[s[2]], m[s[3]]);
+                g(2, 6, 10, 14, m[s[4]], m[s[5]]);
+                g(3, 7, 11, 15, m[s[6]], m[s[7]]);
+                g(0, 5, 10, 15, m[s[8]], m[s[9]]);
+                g(1, 6, 11, 12, m[s[10]], m[s[11]]);
+                g(2, 7, 8, 13, m[s[12]], m[s[13]]);
+                g(3, 4, 9, 14, m[s[14]], m[s[15]]);
+            }
+            for i in 0..8 {
+                h[i] ^= v[i] ^ v[i + 8];
+            }
+        }
+        let mut h = IV;
+        h[0] ^= 0x0101_0000 ^ 64;
+        let mut counter: u128 = 0;
+        let mut blocks = data.chunks(128).peekable();
+        if blocks.peek().is_none() {
+            compress(&mut h, &[0u8; 128], 0, true);
+        }
+        while let Some(chunk) = blocks.next() {
+            let mut block = [0u8; 128];
+            block[..chunk.len()].copy_from_slice(chunk);
+            counter += chunk.len() as u128;
+            compress(&mut h, &block, counter, blocks.peek().is_none());
+        }
+        let mut out = [0u8; 64];
+        for (i, word) in h.iter().enumerate() {
+            out[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn the_test_hash_is_blake2b() {
+        // RFC 7693, appendix A.
+        let hex: String = blake2b512(b"abc")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            hex,
+            "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d1\
+             7d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923"
+        );
+    }
+
+    #[test]
+    fn a_release_artefact_is_installed_only_with_a_good_signature() {
+        const NAME: &str = "ferestre-runtime-test.tar.xz";
+        let dir = TempDir::new("signature");
+        let archive = dir.path().join(NAME);
+        // Larger than one read, so the streaming path is what is checked.
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&archive, &data).unwrap();
+
+        let signer = TestSigner::generate();
+        let key = signer.public_key();
+        let signature = signer.sign(&data, NAME);
+        verify_file_with_key(&key, &archive, &signature, NAME).expect("a good signature verifies");
+
+        // One byte changed.
+        let mut tampered = data.clone();
+        tampered[123_456] ^= 1;
+        std::fs::write(&archive, &tampered).unwrap();
+        let err = verify_file_with_key(&key, &archive, &signature, NAME)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match"), "{err}");
+        std::fs::write(&archive, &data).unwrap();
+
+        // Signed by somebody else's key that claims the release key's id, so
+        // what refuses it is the Ed25519 check, not the id comparison.
+        let mut other = TestSigner::generate();
+        assert_ne!(
+            other.key.verifying_key(),
+            signer.key.verifying_key(),
+            "two different keys"
+        );
+        other.key_id = signer.key_id;
+        let err = verify_file_with_key(&key, &archive, &other.sign(&data, NAME), NAME)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match"), "{err}");
+        // Not a signature at all.
+        assert!(verify_file_with_key(&key, &archive, "garbage", NAME).is_err());
+
+        // A genuine signature, for another file of the release: an older
+        // runtime served under this one's name.
+        let older = signer.sign(&data, "ferestre-runtime-older.tar.xz");
+        let err = verify_file_with_key(&key, &archive, &older, NAME)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("different file"), "{err}");
+        // A name that only starts like the expected one is not it.
+        let longer = signer.sign(&data, &format!("{NAME}.old"));
+        assert!(verify_file_with_key(&key, &archive, &longer, NAME).is_err());
+        // Editing the comment to name the right file breaks the global
+        // signature, so the name cannot be relabelled after signing.
+        let relabelled = older.replace(
+            "file:ferestre-runtime-older.tar.xz",
+            &format!("file:{NAME}"),
+        );
+        assert_ne!(relabelled, older);
+        let err = verify_file_with_key(&key, &archive, &relabelled, NAME)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match"), "{err}");
+        assert!(verify_file_with_key(&key, &archive, &signature, "").is_err());
+
+        // The placeholder key verifies nothing, so a build that still has it
+        // cannot install an archive it did not check.
+        assert!(verify_release_file(&archive, &signature, NAME).is_err());
     }
 
     // --- assessment ----------------------------------------------------------
