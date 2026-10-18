@@ -285,15 +285,15 @@ summary="Synthetic presence fixture"
         s.check(runner["explicit"] and runner["profile"] == PLAYER and runner["env_profile"] is None,
                 "the runner is the Player's, with no Store account inherited")
         s.check(runner["args"] == ["presence", "run", "--json", "--game-dir", str(game)], "the runner gets the game directory")
-        status(frame, f"Playing {TITLE}")
+        status_detail(frame, "Online", f"Playing {TITLE}")
         s.check("Player: Player Fixture" in account_line(frame), "Player label kept while playing", frame)
 
         # A runner reconnecting changes the dot's description, not what Xbox
         # shows, which is what the dot and its name say.
         write(home / "runner-retry", "")
-        status_detail(frame, f"Playing {TITLE}", "Reconnecting: Xbox is unavailable")
+        status_detail(frame, "Online", "Reconnecting: Xbox is unavailable")
         write(home / "runner-online", "")
-        status_detail(frame, f"Playing {TITLE}", "Reconnecting", present=False)
+        status_detail(frame, "Online", "Reconnecting", present=False)
         no_status_toast(frame, "a retry that was not asked for is shown in the badge only")
 
         # Switched off while playing: the runner's stdin closes, the setting is saved.
@@ -305,14 +305,14 @@ summary="Synthetic presence fixture"
                    "the switch to be saved", deadline())
         s.wait_for(frame, lambda root: len(closed_runners()) == 1, "the runner's stdin to close", deadline())
         caption(app, "Friends see your status from other devices only")
-        status(frame, "Off")
+        status_detail(frame, "Offline", "Not sharing the games you play")
         s.check((home / "game-started").exists(), "switching off leaves the game running")
 
         # Switched on again while the same game runs: a new runner.
         s.click(switch)
         s.wait_for(frame, lambda root: len(presence_calls("run")) == 2, "a second runner", deadline())
         s.wait_for(frame, lambda root: json.loads(preference.read_text())["players"][PLAYER]["share_games"], "the switch on again", deadline())
-        status(frame, f"Playing {TITLE}")
+        status_detail(frame, "Online", f"Playing {TITLE}")
 
         # Off and straight back on, before the runner has answered: one runner
         # is up at the end, whichever signal the launch took first.
@@ -321,34 +321,34 @@ summary="Synthetic presence fixture"
         s.wait_for(frame, lambda root: json.loads(preference.read_text())["players"][PLAYER]["share_games"], "the switch on", deadline())
         time.sleep(1)
         s.wait_for(frame, lambda root: runners_up() == 1, "one runner up after off and on", deadline())
-        status(frame, f"Playing {TITLE}")
+        status_detail(frame, "Online", f"Playing {TITLE}")
         # On... and straight back off: none is left up. This is the one that
         # must never be wrong.
         s.click(switch)
         s.wait_for(frame, lambda root: runners_up() == 0, "the runner to stop", deadline())
-        status(frame, "Off")
+        status_detail(frame, "Offline", "Not sharing the games you play")
         s.click(switch)
         s.click(switch)
         s.wait_for(frame, lambda root: not json.loads(preference.read_text())["players"][PLAYER]["share_games"], "the switch off", deadline())
         time.sleep(1)
         s.wait_for(frame, lambda root: runners_up() == 0, "no runner up after on and off", deadline())
-        status(frame, "Off")
+        status_detail(frame, "Offline", "Not sharing the games you play")
         caption(app, "Friends see your status from other devices only")
         s.click(switch)
         s.wait_for(frame, lambda root: runners_up() == 1, "a runner once it is on again", deadline())
-        status(frame, f"Playing {TITLE}")
+        status_detail(frame, "Online", f"Playing {TITLE}")
         close_menu()
 
         # The game exits: its runner is stopped with it.
         end_game()
         s.wait_for(frame, lambda root: runners_up() == 0, "the runner to stop with the game", deadline())
-        status(frame, "Offline")
+        status_detail(frame, "Offline", "Not sharing", present=False)
 
         # Closing the window does not end a game, so it does not end its status.
         runs = len(presence_calls("run"))
         play(frame)
         s.wait_for(frame, lambda root: len(presence_calls("run")) == runs + 1, "a runner for the next launch", deadline())
-        status(frame, f"Playing {TITLE}")
+        status_detail(frame, "Online", f"Playing {TITLE}")
         s.click_named(frame, "Close")
         # The window asks first, since the game keeps running without it.
         keep = s.wait_for(frame, lambda root: next(iter(s.find_all(root, role="button", name="Keep Open")), None),
@@ -365,7 +365,7 @@ summary="Synthetic presence fixture"
         runs = len(presence_calls("run"))
         play(frame)
         s.wait_for(frame, lambda root: len(presence_calls("run")) == runs + 1, "a runner after restarting", deadline())
-        status(frame, f"Playing {TITLE}")
+        status_detail(frame, "Online", f"Playing {TITLE}")
         dialog = open_accounts(app, frame)
         s.click_named(dialog, "Sign out Player Fixture")
         s.wait_for(frame, lambda root: any(c.get("args") == ["logout"] for c in calls()), "the Player's logout", deadline())

@@ -40,18 +40,25 @@ From a terminal, the same file turns it off:
 
 ## The status dot
 
-The dot and the text beside your name show what Xbox reports for you, and
-nothing else. Ferestre asks Xbox every five minutes, whenever you open the
-account menu, and right after a game's status is sent or taken down.
+The dot and the word beside your name show what Xbox reports for you, and
+nothing else: **Online** (green) or **Offline** (grey). Ferestre asks Xbox
+every five minutes, whenever you open the account menu, and right after a
+game's status is sent or taken down. Until Xbox first answers, there is no
+dot.
 
-| Text | Meaning |
+The tooltip says more:
+
+| Tooltip | Meaning |
 |---|---|
 | Playing *game* | Xbox lists the game started through Ferestre |
-| Online | Xbox shows you online, but not with that game, for example from a console |
-| Away | Xbox shows you away on another device |
-| Offline | Online status is on, but Xbox shows nothing right now |
-| Off | Online status is off, and Xbox shows nothing |
-| Unknown | Xbox could not be asked |
+| Online on another device | Xbox shows you online, but not with that game, for example from a console |
+| Away on another device | Xbox shows you away on another device |
+| Not sharing the games you play | **Show me online** is off |
+| Could not check your status | Xbox could not be asked |
+
+With **Show me online** on and no game running, the dot says Offline:
+Ferestre is not an Xbox title and does not show you online on its own. Start
+a game from Ferestre and it turns Online within a few seconds.
 
 The dot shows Xbox's answer even when the switch is off. If you are signed in
 on a console, friends can see you there, and so does the dot.
