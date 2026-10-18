@@ -81,9 +81,9 @@ _commit=3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
 # in .SRCINFO, and regenerate the sha256sums -- the patch files themselves may
 # have changed too.
 #
-# NOT YET REPINNED: 81f460b has none of 0022, 0023 or 0024, so all three of
-# their URLs below 404 until this names a published commit that has them
-# (and .SRCINFO with it). The sha256sums already match the patch files in this
+# NOT YET REPINNED: 81f460b has none of 0022, 0023, 0024 or 0025, so their
+# URLs below 404 until this names a published commit that has them (and
+# .SRCINFO with it). The sha256sums already match the patch files in this
 # tree, and pkgrel is already 6 for them.
 _patchrev=81f460b6a713bdc08f21f179e3c05ebc7aa14b33
 _patchurl="https://raw.githubusercontent.com/icex/ferestre/$_patchrev/patches/xodus-cli"
@@ -114,6 +114,7 @@ _patches=(
   "0022-check-what-the-download-writes-and-stop-when-it-fails.patch"
   "0023-keep-accounts-consistent-and-the-service-up.patch"
   "0024-harden-token-audiences.patch"
+  "0025-hold-the-package-header-to-the-package-service-hash.patch"
 )
 source=("xodus::git+https://github.com/xodus-gaming/xodus.git#commit=$_commit")
 for _patch in "${_patches[@]}"; do
@@ -144,7 +145,8 @@ sha256sums=(
   '529cb5505ba5a026ea0ee467e6bdbff0b196b4dfab6958735d967d91dec4c976'
   '4622b38bd65263c27943fbb2fd29a6b4762b7142f0c7c6769e6d09a5e3665f8e'
   'bd45c8ac307f73837ce67461a25692c519f031d0bb18148305fe1b77c7734bdc'
-  '142c9b29aefaa985b2c82cbc7c716c9b7cd3eca3979e151e66dd67ee4be72c63'
+  '09fa469ecd38e15883c22c260e7355f597e534b66e1601bd57242bcbcbaeb97e'
+  '5d3ad5a6a9ecc898626f3a9f06f47567569377c3491de36f5cd9fe7e779713a5'
 )
 
 prepare() {

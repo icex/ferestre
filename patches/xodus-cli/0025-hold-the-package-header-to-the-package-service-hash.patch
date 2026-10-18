@@ -1,0 +1,611 @@
+From: Ferestre contributors
+Subject: Hold the package header to the package service's hash
+
+The package service is reached over TLS with the account's token, and the
+CDN roots it lists are plain http. A streaming install checks every page
+against the package's hash tree and the tree against the top hash in the
+header, but nothing held the header itself, so a download rewritten in
+transit -- header, tree and pages together -- was installed.
+
+When the package service gives a HashOfHashes for the package, the header's
+top hash (top_hash_block_hash, the SHA-256 of the top page of the hash tree)
+must equal it. It is compared as soon as the header is read, before the tree
+it names is, and a header that does not match is refused with an error that
+says so; nothing is installed. A HashOfHashes that is not a SHA-256 in hex or
+base64 is refused as well. XvdFile::parse_anchored does the check; the
+streaming install uses it when the package came from the package service.
+Reading HashOfHashes as the top hash is an interpretation: no package seen
+so far carries one, so it is unconfirmed, and a package that carries one
+meaning something else fails with that error rather than installing.
+
+When the service gives none -- every package seen so far, Stardew Valley's
+among them, has no HashOfHashes and an empty FileHash for each file -- the
+install goes ahead as before and says on stderr that the header is checked
+against nothing outside the download. The per-file FileHash is not used:
+nothing in the header corresponds to it, and a streaming install never reads
+a whole file. XODUS_REQUIRE_HTTPS_CDN=1 still refuses plain http roots.
+
+diff --git a/crates/msixvc/src/xvd.rs b/crates/msixvc/src/xvd.rs
+index 72387e7..5f6cd2d 100644
+--- a/crates/msixvc/src/xvd.rs
++++ b/crates/msixvc/src/xvd.rs
+@@ -356,6 +356,22 @@ pub struct SegmentFile {
+     pub keep_encrypted: bool,
+ }
+ 
++/// The package header's top hash is not the one it was required to have.
++#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
++#[error(
++    "the package header's top hash {} is not the expected {}",
++    hex32(found),
++    hex32(expected)
++)]
++pub struct TopHashMismatch {
++    pub found: [u8; 32],
++    pub expected: [u8; 32],
++}
++
++fn hex32(bytes: &[u8; 32]) -> String {
++    bytes.iter().map(|b| format!("{b:02x}")).collect()
++}
++
+ /// A page whose contents do not hash to what the package's hash tree says.
+ #[derive(Debug, thiserror::Error)]
+ #[error("page {page} of the package does not match its hash tree")]
+@@ -700,7 +716,7 @@ impl XvdFile {
+     where
+         Reader: AsyncRead + AsyncSeek + Unpin,
+     {
+-        Self::parse_ex(file, false).await
++        Self::parse_ex(file, false, None).await
+     }
+ 
+     /// Parse a package and check it against itself before trusting any of it.
+@@ -716,12 +732,32 @@ impl XvdFile {
+     where
+         Reader: AsyncRead + AsyncSeek + Unpin,
+     {
+-        Self::parse_ex(file, true).await
++        Self::parse_ex(file, true, None).await
++    }
++
++    /// Parse a package as `parse_verified` does, with its header held to a
++    /// top hash that came from somewhere else.
++    ///
++    /// `top_hash` is what the header's `top_hash_block_hash` must be, taken
++    /// from a source the download itself cannot change, such as an
++    /// authenticated package service. The header is compared before anything
++    /// it describes is read, and a header that does not match is refused, so
++    /// the chain from the top hash down to every page is anchored outside the
++    /// download.
++    pub async fn parse_anchored<Reader>(
++        file: Reader,
++        top_hash: &[u8; 32],
++    ) -> Result<Self, Box<dyn std::error::Error>>
++    where
++        Reader: AsyncRead + AsyncSeek + Unpin,
++    {
++        Self::parse_ex(file, true, Some(top_hash)).await
+     }
+ 
+     async fn parse_ex<Reader>(
+         mut file: Reader,
+         verify: bool,
++        top_hash: Option<&[u8; 32]>,
+     ) -> Result<Self, Box<dyn std::error::Error>>
+     where
+         Reader: AsyncRead + AsyncSeek + Unpin,
+@@ -731,6 +767,14 @@ impl XvdFile {
+             file.read_exact(&mut buf).await?;
+             XvdHeader::try_from_array(&buf)?
+         };
++        if let Some(expected) = top_hash
++            && xvd_header.top_hash_block_hash != *expected
++        {
++            return Err(Box::new(TopHashMismatch {
++                found: xvd_header.top_hash_block_hash,
++                expected: *expected,
++            }));
++        }
+         if xvd_header.number_of_hashed_pages().0 == 0 {
+             return Err(Box::new(Error::new(
+                 ErrorKind::InvalidData,
+@@ -1499,6 +1543,13 @@ pub mod testing {
+     }
+ 
+     pub fn package() -> Package {
++        package_with(|_| {})
++    }
++
++    /// The same package with its drive pages changed by `rewrite`, and its
++    /// hash tree and header top hash rebuilt to match: what someone able to
++    /// rewrite the whole download could serve.
++    pub fn package_with(rewrite: impl Fn(&mut [Vec<u8>])) -> Package {
+         let mut buf = XvdHeader::buffer();
+         let len = buf.len();
+         buf.copy_from_slice(&header_bytes(&[0; 32])[..len]);
+@@ -1515,6 +1566,7 @@ pub mod testing {
+         user_data[8..12].copy_from_slice(&1u32.to_le_bytes());
+         let mut data_pages = vec![user_data];
+         data_pages.extend((0..DRIVE_PAGES).map(drive_page_bytes));
++        rewrite(&mut data_pages[1..]);
+ 
+         let level0 = level_pages(&data_pages.iter().map(|p| entry(p)).collect::<Vec<_>>());
+         let level1 = level_pages(&level0.iter().map(|p| entry(p)).collect::<Vec<_>>());
+@@ -1554,9 +1606,10 @@ mod tests {
+     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+     use tokio::net::TcpListener;
+ 
+-    use super::testing::{DRIVE_PAGES, Package, package};
++    use super::testing::{DRIVE_PAGES, Package, package, package_with};
+     use super::{
+-        PAGE_SIZE, PageHashMismatch, RetryPolicy, SegmentFile, XvdFile, package_relative_path,
++        PAGE_SIZE, PageHashMismatch, RetryPolicy, SegmentFile, TopHashMismatch, XvdFile,
++        package_relative_path,
+     };
+ 
+     fn flip(bytes: &mut [u8], offset: usize) {
+@@ -1653,6 +1706,58 @@ mod tests {
+         assert!(XvdFile::parse(Cursor::new(bytes)).await.is_ok());
+     }
+ 
++    fn top_hash(p: &Package) -> [u8; 32] {
++        p.bytes[0x240..0x260].try_into().unwrap()
++    }
++
++    #[tokio::test]
++    async fn an_anchored_package_verifies_when_its_top_hash_matches() {
++        let p = package();
++        let xvd = XvdFile::parse_anchored(Cursor::new(p.bytes.clone()), &top_hash(&p))
++            .await
++            .unwrap();
++        assert!(xvd.verified);
++        assert_eq!(xvd.hashes.hashes.len(), 1 + DRIVE_PAGES);
++    }
++
++    #[tokio::test]
++    async fn an_anchored_package_with_another_top_hash_is_refused() {
++        let p = package();
++        let mut expected = top_hash(&p);
++        expected[31] ^= 0x01;
++        let err = XvdFile::parse_anchored(Cursor::new(p.bytes.clone()), &expected)
++            .await
++            .err()
++            .unwrap();
++        let mismatch = err.downcast_ref::<TopHashMismatch>().expect("{err}");
++        assert_eq!(mismatch.found, top_hash(&p));
++        assert_eq!(mismatch.expected, expected);
++        assert!(err.to_string().contains("top hash"), "{err}");
++
++        // A consistent rewrite -- other drive pages, a tree and a header top
++        // hash rebuilt to match -- checks out against itself, but not against
++        // the top hash of the package it replaced.
++        let rewritten = package_with(|drive| drive[5][0] ^= 0x01);
++        assert_ne!(top_hash(&rewritten), top_hash(&p));
++        assert!(parse_verified(&rewritten.bytes).await.is_ok());
++        let err = XvdFile::parse_anchored(Cursor::new(rewritten.bytes), &top_hash(&p))
++            .await
++            .err()
++            .unwrap();
++        assert!(err.downcast_ref::<TopHashMismatch>().is_some(), "{err}");
++
++        // A rewritten header is refused on its own, before the tree it names
++        // is read at all: here there is nothing after the header to read.
++        let mut bytes = p.bytes.clone();
++        flip(&mut bytes, 0x240);
++        let truncated = bytes[..PAGE_SIZE].to_vec();
++        let err = XvdFile::parse_anchored(Cursor::new(truncated), &top_hash(&p))
++            .await
++            .err()
++            .unwrap();
++        assert!(err.downcast_ref::<TopHashMismatch>().is_some(), "{err}");
++    }
++
+     #[tokio::test]
+     async fn a_damaged_metadata_page_is_refused() {
+         let p = package();
+diff --git a/crates/xodus-cli/src/commands/download.rs b/crates/xodus-cli/src/commands/download.rs
+index 63943ab..89edd99 100644
+--- a/crates/xodus-cli/src/commands/download.rs
++++ b/crates/xodus-cli/src/commands/download.rs
+@@ -55,7 +55,7 @@ pub async fn run(
+     };
+     println!();
+     for file in files {
+-        let url = match package_url(&file.cdn_root_paths, &file.relative_url) {
++        let url = match package_url(&file.cdn_root_paths, &file.relative_url, false) {
+             Ok(url) => url,
+             Err(err) => {
+                 eprintln!("{err}");
+diff --git a/crates/xodus-cli/src/commands/streaming.rs b/crates/xodus-cli/src/commands/streaming.rs
+index dc136d6..07a9ad6 100644
+--- a/crates/xodus-cli/src/commands/streaming.rs
++++ b/crates/xodus-cli/src/commands/streaming.rs
+@@ -10,15 +10,15 @@ use futures_util::{TryStreamExt, stream};
+ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+ use msixvc::layout::PAGE_SIZE;
+ use msixvc::streaming;
+-use msixvc::xvd::{SegmentFile, XvdFile, package_relative_path};
++use msixvc::xvd::{SegmentFile, TopHashMismatch, XvdFile, package_relative_path};
+ use tokio::fs::File;
+-use tokio::io::{AsyncRead, AsyncWriteExt};
++use tokio::io::{AsyncRead, AsyncSeek, AsyncWriteExt};
+ use tokio::sync::mpsc::{Receiver, Sender};
+ use uuid::Uuid;
+ use xodus::tokens::TokenManager;
+ 
+ use crate::license::get_license;
+-use crate::package::{get_content_id, get_packages, package_url};
++use crate::package::{get_content_id, get_packages, header_anchor, package_url, unanchored_note};
+ 
+ struct Job {
+     name: String,
+@@ -69,19 +69,22 @@ pub async fn run(
+             f,
+             l,
+             &source,
++            None,
+             tx,
+             rx,
+         )
+         .await
+     } else {
+-        let vurl = if source.starts_with("http://") || source.starts_with("https://") {
++        // The top hash the package service vouches for, when the package came
++        // from it and it gave one. A URL given directly has nothing to go by.
++        let (vurl, anchor) = if source.starts_with("http://") || source.starts_with("https://") {
+             if source.starts_with("http://") {
+                 eprintln!(
+                     "warning: {source} is plain http; the package's pages are checked against \
+                      its hash tree, but nothing vouches for its header"
+                 );
+             }
+-            source
++            (source, None)
+         } else {
+             let content_id = if Uuid::try_parse(&source).is_err() {
+                 let content_id_task = get_content_id(client, source, market.clone()).await;
+@@ -127,8 +130,18 @@ pub async fn run(
+                 }
+                 return ExitCode::FAILURE;
+             };
+-            match package_url(&file.cdn_root_paths, &file.relative_url) {
+-                Ok(url) => url,
++            let anchor = match header_anchor(&package) {
++                Ok(anchor) => anchor,
++                Err(err) => {
++                    eprintln!("{err}");
++                    return ExitCode::FAILURE;
++                }
++            };
++            if anchor.is_none() {
++                eprintln!("{}", unanchored_note(file));
++            }
++            match package_url(&file.cdn_root_paths, &file.relative_url, anchor.is_some()) {
++                Ok(url) => (url, anchor),
+                 Err(err) => {
+                     eprintln!("{err}");
+                     return ExitCode::FAILURE;
+@@ -175,6 +188,7 @@ pub async fn run(
+             http_file,
+             l,
+             url,
++            anchor,
+             tx,
+             rx,
+         )
+@@ -256,6 +270,7 @@ async fn run_cli_reader<Reader>(
+     reader: Reader,
+     l: u64,
+     url: &str,
++    anchor: Option<[u8; 32]>,
+     tx: Sender<ProgressEvent>,
+     mut rx: Receiver<ProgressEvent>,
+ ) -> Result<(), String>
+@@ -321,6 +336,7 @@ where
+         reader,
+         l,
+         url,
++        anchor,
+         &tx,
+     )
+     .await;
+@@ -398,6 +414,33 @@ fn needs_download(
+     std::fs::metadata(out.join(relative)).map_or(true, |m| m.len() != written_len(remote))
+ }
+ 
++/// Parse a package being downloaded, checked before anything in it is believed.
++///
++/// With `anchor`, the header's top hash must be the one the package service
++/// gave, and a header that is not is refused before the tree it names is read:
++/// see `XvdFile::parse_anchored`. Without one, the package is checked against
++/// itself only, as `XvdFile::parse_verified` does.
++async fn read_header<Reader>(
++    remote_file: &mut Reader,
++    anchor: Option<&[u8; 32]>,
++) -> Result<XvdFile, String>
++where
++    Reader: AsyncRead + AsyncSeek + Unpin,
++{
++    let parsed = match anchor {
++        Some(top_hash) => XvdFile::parse_anchored(remote_file, top_hash).await,
++        None => XvdFile::parse_verified(remote_file).await,
++    };
++    parsed.map_err(|err| match err.downcast_ref::<TopHashMismatch>() {
++        Some(mismatch) => format!(
++            "refusing this download: {mismatch}, which the package service gave as its \
++             HashOfHashes. The package was changed on its way here, or the CDN served \
++             another package; nothing from it was installed"
++        ),
++        None => stopped("read the package header")(err),
++    })
++}
++
+ /// Read the container the last install committed, for what it says is there.
+ async fn read_installed(final_path: &Path) -> Result<HashMap<String, SegmentFile>, String> {
+     let mut file = File::open(final_path).await.map_err(|e| e.to_string())?;
+@@ -464,6 +507,7 @@ async fn run_reader<Reader>(
+     reader: Reader,
+     l: u64,
+     url: &str,
++    anchor: Option<[u8; 32]>,
+     tx: &Sender<ProgressEvent>,
+ ) -> Result<(), String>
+ where
+@@ -479,11 +523,7 @@ where
+     let mut remote_file = streaming::PrefixCacheFile::new(reader, l, cache_path.clone())
+         .await
+         .map_err(stopped("open the download cache"))?;
+-    // Checked against itself before anything in it is believed: see
+-    // `XvdFile::parse_verified`.
+-    let remote_xvd = XvdFile::parse_verified(&mut remote_file)
+-        .await
+-        .map_err(stopped("read the package header"))?;
++    let remote_xvd = read_header(&mut remote_file, anchor.as_ref()).await?;
+     let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
+ 
+     let files = remote_xvd
+@@ -850,6 +890,42 @@ mod tests {
+         assert!(!cache.exists());
+     }
+ 
++    /// The header is held to the package service's top hash when there is
++    /// one: a match is read, a mismatch refused before the tree is read, and
++    /// with no hash the package is checked against itself as before.
++    #[tokio::test]
++    async fn the_header_is_held_to_the_package_services_hash() {
++        let p = msixvc::xvd::testing::package();
++        let top: [u8; 32] = p.bytes[0x240..0x260].try_into().unwrap();
++        let read = |bytes: Vec<u8>, anchor: Option<[u8; 32]>| async move {
++            read_header(&mut std::io::Cursor::new(bytes), anchor.as_ref()).await
++        };
++
++        // Match.
++        assert!(read(p.bytes.clone(), Some(top)).await.is_ok());
++        // Absent: the package is still checked against itself.
++        assert!(read(p.bytes.clone(), None).await.is_ok());
++        let mut damaged = p.bytes.clone();
++        damaged[p.tree_start * PAGE_SIZE + 3] ^= 1;
++        let err = read(damaged, None).await.err().unwrap();
++        assert!(err.contains("hash tree is damaged"), "{err}");
++
++        // Mismatch: a package rewritten whole, consistent with itself, under
++        // the hash of the package the service named.
++        let rewritten = msixvc::xvd::testing::package_with(|drive| drive[2][9] ^= 1);
++        assert!(read(rewritten.bytes.clone(), None).await.is_ok());
++        let err = read(rewritten.bytes, Some(top)).await.err().unwrap();
++        assert!(err.starts_with("refusing this download"), "{err}");
++        assert!(err.contains("HashOfHashes"), "{err}");
++        assert!(!err.contains("trying again"), "{err}");
++        // The header alone is enough to refuse.
++        let err = read(p.bytes[..PAGE_SIZE].to_vec(), Some([0; 32]))
++            .await
++            .err()
++            .unwrap();
++        assert!(err.starts_with("refusing this download"), "{err}");
++    }
++
+     /// A package on disk, the parsed package, and a job for pages 5..8 of its
+     /// drive plus a little of page 8.
+     async fn fixture(dir: &Path) -> (std::path::PathBuf, XvdFile, Job, Vec<u8>) {
+diff --git a/crates/xodus-cli/src/package.rs b/crates/xodus-cli/src/package.rs
+index 568caca..c80059a 100644
+--- a/crates/xodus-cli/src/package.rs
++++ b/crates/xodus-cli/src/package.rs
+@@ -1,7 +1,7 @@
+ use inquire::Select;
+ use xodus::XBOX_LIVE_PACKAGES_PC;
+ use xodus::api::displaycatalog::find_products_by_id;
+-use xodus::models::packagespc::{PackageDetails, PackageResponse};
++use xodus::models::packagespc::{PackageDetails, PackageFile, PackageResponse};
+ use xodus::models::secrets::Token;
+ use xodus::tokens::TokenManager;
+ 
+@@ -19,6 +19,75 @@ pub fn available_version(package: &PackageDetails) -> Option<&str> {
+     Some(&version[..prefix_len])
+ }
+ 
++/// The top hash a package's header must carry, as the authenticated package
++/// service gives it.
++///
++/// The package service is reached over TLS with the account's token; the CDN it
++/// points to is usually plain http. Its `HashOfHashes` is taken to be the
++/// header's `top_hash_block_hash`: the SHA-256 of the top page of the hash
++/// tree, which is itself a page of hashes, and the one value that every other
++/// check of the download hangs from. Holding the header to it means a download
++/// rewritten on its way -- header, tree and pages together -- is refused rather
++/// than installed.
++///
++/// A SHA-256 in hex or base64 is accepted. Anything else in that field is
++/// refused, since a value this client cannot read is not one it can check.
++/// `None` when the service gives no value, which so far is every package seen:
++/// the install then goes ahead as before, and the caller says so.
++///
++/// The per-file `FileHash` is not used: nothing in the package header
++/// corresponds to it, and a streaming install never reads a whole file to
++/// compare it with a whole-file digest.
++pub fn header_anchor(package: &PackageDetails) -> Result<Option<[u8; 32]>, String> {
++    let Some(value) = package
++        .hash_of_hashes
++        .as_deref()
++        .map(str::trim)
++        .filter(|value| !value.is_empty())
++    else {
++        return Ok(None);
++    };
++    sha256_digest(value).map(Some).ok_or_else(|| {
++        format!(
++            "refusing this package: the package service vouches for it with HashOfHashes \
++             {value:?}, which is not a SHA-256 digest, so the download cannot be checked \
++             against it"
++        )
++    })
++}
++
++/// A SHA-256 digest written as 64 hex digits or as base64.
++fn sha256_digest(value: &str) -> Option<[u8; 32]> {
++    use base64::Engine;
++    if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
++        let mut digest = [0u8; 32];
++        for (i, byte) in digest.iter_mut().enumerate() {
++            *byte = u8::from_str_radix(&value[2 * i..2 * i + 2], 16).ok()?;
++        }
++        return Some(digest);
++    }
++    base64::engine::general_purpose::STANDARD
++        .decode(value)
++        .ok()?
++        .try_into()
++        .ok()
++}
++
++/// What to say about a package the service gave no header hash for.
++pub fn unanchored_note(file: &PackageFile) -> String {
++    let mut note = String::from(
++        "note: the package service gave no HashOfHashes for this package, so its header \
++         is checked against nothing outside the download",
++    );
++    if !file.file_hash.trim().is_empty() {
++        note.push_str(
++            " (it gave a FileHash, which has no counterpart in the package header and \
++             is not used)",
++        );
++    }
++    note
++}
++
+ /// Set to `1` to refuse a download when the package service lists only plain
+ /// http CDN roots for it.
+ pub const REQUIRE_HTTPS_CDN_ENV: &str = "XODUS_REQUIRE_HTTPS_CDN";
+@@ -30,20 +99,34 @@ pub const REQUIRE_HTTPS_CDN_ENV: &str = "XODUS_REQUIRE_HTTPS_CDN";
+ /// it is, and so far that has meant plain `http://`: the Xbox package CDN hosts
+ /// answer https with a certificate for other names, so asking them for the
+ /// same path over https fails every time. Over http the pages are still
+-/// checked against the package's hash tree, but the header that vouches for
+-/// that tree is not, so a note says so. `XODUS_REQUIRE_HTTPS_CDN=1` refuses
+-/// such a package instead. A root in any other scheme is refused.
+-pub fn package_url(cdn_roots: &[String], relative_url: &str) -> Result<String, String> {
++/// checked against the package's hash tree. The header that vouches for that
++/// tree is held to the package service's hash when it gives one (`anchored`,
++/// see `header_anchor`); when it does not, nothing vouches for the header, and
++/// a note says so. `XODUS_REQUIRE_HTTPS_CDN=1` refuses a plain http package
++/// either way. A root in any other scheme is refused.
++pub fn package_url(
++    cdn_roots: &[String],
++    relative_url: &str,
++    anchored: bool,
++) -> Result<String, String> {
+     let url = package_url_with(
+         cdn_roots,
+         relative_url,
+         std::env::var(REQUIRE_HTTPS_CDN_ENV).is_ok_and(|v| v == "1"),
+     )?;
+     if !has_scheme(&url, "https://") {
+-        eprintln!(
+-            "note: the package service lists only plain http for this package; its pages \
+-             are checked against its hash tree, but nothing vouches for its header"
+-        );
++        if anchored {
++            eprintln!(
++                "note: the package service lists only plain http for this package; its \
++                 header is held to the hash the package service gives, and its pages to \
++                 the header's hash tree"
++            );
++        } else {
++            eprintln!(
++                "note: the package service lists only plain http for this package; its pages \
++                 are checked against its hash tree, but nothing vouches for its header"
++            );
++        }
+     }
+     Ok(url)
+ }
+@@ -244,6 +327,68 @@ mod tests {
+         assert_eq!(available_version(&with_build_id), Some("3.688.109.0"));
+     }
+ 
++    fn details(hash_of_hashes: Option<&str>) -> PackageDetails {
++        PackageDetails {
++            package_found: true,
++            content_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
++            version_id: "version-id".into(),
++            package_files: Vec::new(),
++            version: "1.0.0.0".into(),
++            hash_of_hashes: hash_of_hashes.map(str::to_string),
++            update_predownload: false,
++            availability_date: "2026-09-08T00:00:00Z".into(),
++        }
++    }
++
++    #[test]
++    fn the_header_anchor_is_the_services_hash_of_hashes() {
++        let digest: [u8; 32] = std::array::from_fn(|i| (i * 9 + 1) as u8);
++        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
++        use base64::Engine;
++        let b64 = base64::engine::general_purpose::STANDARD.encode(digest);
++        for value in [
++            hex.clone(),
++            hex.to_ascii_uppercase(),
++            b64,
++            format!(" {hex}\n"),
++        ] {
++            assert_eq!(
++                header_anchor(&details(Some(&value))),
++                Ok(Some(digest)),
++                "{value:?}"
++            );
++        }
++        // Absent, null or empty: nothing to hold the header to.
++        for value in [None, Some(""), Some("  ")] {
++            assert_eq!(header_anchor(&details(value)), Ok(None), "{value:?}");
++        }
++        // Present but not a SHA-256: refused, not ignored.
++        for value in [
++            "not a digest",
++            &hex[..62],
++            &format!("{hex}00"),
++            "AAAAAAAAAAAAAAAAAAAAAAAAAAA=", // 20 bytes
++            &format!("{}zz", &hex[..62]),
++        ] {
++            let err = header_anchor(&details(Some(value))).unwrap_err();
++            assert!(err.starts_with("refusing this package"), "{value:?}: {err}");
++        }
++        // The service's answer as it comes, with the field missing or null.
++        let missing: PackageDetails = serde_json::from_value(serde_json::json!({
++            "PackageFound": true, "ContentId": "c", "VersionId": "v", "PackageFiles": [],
++            "Version": "1.0.0.0", "UpdatePredownload": false, "AvailabilityDate": "d"
++        }))
++        .unwrap();
++        assert_eq!(header_anchor(&missing), Ok(None));
++        let given: PackageDetails = serde_json::from_value(serde_json::json!({
++            "PackageFound": true, "ContentId": "c", "VersionId": "v", "PackageFiles": [],
++            "Version": "1.0.0.0", "HashOfHashes": hex, "UpdatePredownload": false,
++            "AvailabilityDate": "d"
++        }))
++        .unwrap();
++        assert_eq!(header_anchor(&given), Ok(Some(digest)));
++    }
++
+     #[test]
+     fn packages_are_fetched_from_the_roots_the_service_lists() {
+         let roots = |r: &[&str]| r.iter().map(|s| s.to_string()).collect::<Vec<_>>();
