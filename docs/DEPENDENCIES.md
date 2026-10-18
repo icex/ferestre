@@ -16,6 +16,47 @@ Halo Infinite also needs Python 3 and util-linux (`unshare`, `mount`, `umount`),
 with unprivileged user and mount namespaces enabled. Its licensed executable
 view exists only in private tmpfs mounts for the lifetime of the launch.
 
+## WebKitGTK for sign-in
+
+The Xbox client (`xodus-cli`) shows Microsoft's sign-in page in a WebKitGTK
+window. A browser cannot stand in for it: the page needs request headers and a
+JavaScript bridge back to the client. The client therefore links
+`libwebkit2gtk-4.1.so.0`, and through it `libjavascriptcoregtk-4.1.so.0`,
+`libsoup-3.0.so.0` and `libgtk-3.so.0`. Without them the system's loader
+refuses to start the client for any command, not only sign-in, and the exit
+status is 127. The AppImage does not bundle WebKitGTK. Install your
+distribution's package:
+
+| Distribution | Command |
+|---|---|
+| Ubuntu / Debian (and Mint, Pop!_OS, KDE neon) | `sudo apt install libwebkit2gtk-4.1-0` |
+| Fedora (and Nobara) | `sudo dnf install webkit2gtk4.1` |
+| Arch (and CachyOS, EndeavourOS, Manjaro) | `sudo pacman -S webkit2gtk-4.1` |
+| openSUSE | `sudo zypper install libwebkit2gtk-4_1-0` |
+| Fedora Silverblue, Kinoite, Bazzite and other rpm-ostree images | `rpm-ostree install webkit2gtk4.1`, then restart |
+
+The package brings the other three libraries with it.
+
+SteamOS keeps its system read-only, and every system update replaces it, so a
+package installed into it does not last. Ferestre gives no command there.
+
+`ferestre doctor` reports **Xbox client libraries available** when the client's
+libraries resolve. When they do not, it lists the missing ones and the command
+for the distribution named in `/etc/os-release`. The window checks the same
+thing when it opens. It shows a banner while the client cannot start, and
+**Sign in** explains the problem instead of failing. Where PackageKit is
+available (KDE Discover and GNOME Software use it), the banner's **Install…**
+button installs the package through it, and your desktop asks for your
+password. Otherwise the dialog offers the command to copy into a terminal.
+An rpm-ostree image is never offered the PackageKit install, because the
+package only takes effect after a restart.
+
+Ferestre stays open until an install it started has finished.
+Once the library is installed the banner goes away, and an install started
+from Sign in carries on signing in. If you install it some other way, from a
+terminal or a software centre, the window notices when you come back to it,
+press Refresh, or press Sign in or the banner's button.
+
 ## Video playback with current runtimes
 
 The GStreamer libav plugin in runtimes through `11.0.20261013.3` uses the

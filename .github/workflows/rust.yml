@@ -23,8 +23,11 @@ on:
       - 'Cargo.lock'
       - 'tests/gui_smoke.py'
       - 'tests/gui_accounts.py'
+      - 'tests/gui_client_deps.py'
+      - 'tests/fake_packagekit.py'
       - 'tests/test_download_cancel.py'
       - 'tests/test_media_dependencies.py'
+      - 'tests/test_client_dependencies.py'
       - 'tools/xsts_probe.py'
       - 'tools/test_xsts_probe.py'
       - 'titles/**'
@@ -44,8 +47,11 @@ on:
       - 'Cargo.lock'
       - 'tests/gui_smoke.py'
       - 'tests/gui_accounts.py'
+      - 'tests/gui_client_deps.py'
+      - 'tests/fake_packagekit.py'
       - 'tests/test_download_cancel.py'
       - 'tests/test_media_dependencies.py'
+      - 'tests/test_client_dependencies.py'
       - 'tools/xsts_probe.py'
       - 'tools/test_xsts_probe.py'
       - 'titles/**'
@@ -95,7 +101,7 @@ jobs:
         run: cargo test --workspace
 
       - name: Download cancellation (offline)
-        run: cargo build -p ferestre-cli && python3 tests/test_download_cancel.py && python3 tests/test_media_dependencies.py
+        run: cargo build -p ferestre-cli && python3 tests/test_download_cancel.py && python3 tests/test_media_dependencies.py && python3 tests/test_client_dependencies.py
 
       - name: Launch helper tests
         run: python3 -m unittest discover -s tests -p 'test_*image_view.py' && python3 tests/test_proton_wine_shim.py
@@ -185,3 +191,10 @@ jobs:
         run: |
           xvfb-run -a --server-args='-screen 0 1280x900x24' \
             dbus-run-session -- python3 tests/gui_accounts.py
+
+      # PackageKit is a fake on a private bus standing in for the system one,
+      # and the missing library is a fixture, so this installs nothing.
+      - name: Missing WebKitGTK offered for install (offline)
+        run: |
+          xvfb-run -a --server-args='-screen 0 1280x900x24' \
+            dbus-run-session -- python3 tests/gui_client_deps.py

@@ -23,3 +23,6 @@ anyhow.workspace = true
 libc.workspace = true
 gtk = { package = "gtk4", version = "0.9", features = ["v4_10"] }
 adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
+# A oneshot, to wait on a D-Bus signal from async code. Already in the tree
+# through glib.
+futures-channel = "0.3"

@@ -11,8 +11,10 @@
 //! executable has to stay a child of the process that opened it.
 mod accounts_ui;
 mod cancel;
+mod client_check;
 mod editor;
 mod model;
+mod packagekit;
 mod progress;
 mod state;
 
@@ -109,6 +111,13 @@ struct Ui {
     /// a game runs for hours and must not hold the window's other work.
     running: Rc<RefCell<BTreeMap<String, u32>>>,
     running_servers: Rc<RefCell<BTreeMap<String, (PathBuf, PathBuf)>>>,
+    /// Says the Xbox client cannot start, for as long as that is true.
+    banner: adw::Banner,
+    /// Why the client cannot start, when the last check found it could not.
+    client_blocked: Rc<RefCell<Option<client_check::Blocked>>>,
+    /// A PackageKit install asked for while another task held the window, and
+    /// what to carry on with after it. Started by the next finish.
+    install_owed: Rc<Cell<Option<client_check::Owed>>>,
 }
 
 fn main() -> glib::ExitCode {
@@ -271,8 +280,17 @@ fn build_ui(app: &adw::Application) {
     activity.append(&activity_detail);
     activity.append(&keep_open);
 
+    // Under the header and outside the content, like the activity panel: it
+    // has to survive every redraw, and it is about the whole window.
+    let banner = adw::Banner::builder()
+        .use_markup(false)
+        .revealed(false)
+        .visible(false)
+        .build();
+
     let content_view = adw::ToolbarView::new();
     content_view.add_top_bar(&content_header);
+    content_view.add_top_bar(&banner);
     content_view.add_bottom_bar(&activity);
     content_view.add_bottom_bar(&download.root);
     content_view.set_content(Some(&toasts));
@@ -324,6 +342,9 @@ fn build_ui(app: &adw::Application) {
         fetching_entitlements: Rc::new(RefCell::new(false)),
         entitlements_owed: Rc::new(Cell::new(false)),
         download: download.clone(),
+        banner: banner.clone(),
+        client_blocked: Rc::new(RefCell::new(None)),
+        install_owed: Rc::new(Cell::new(None)),
     };
 
     window.connect_close_request(glib::clone!(
@@ -403,6 +424,7 @@ fn build_ui(app: &adw::Application) {
             fetch_gamepass(&ui, true);
             refresh_entitlements(&ui, true);
             refresh_updates(&ui, true);
+            client_check::check(&ui, None, false);
         }
     ));
 
@@ -410,6 +432,22 @@ fn build_ui(app: &adw::Application) {
         #[strong]
         ui,
         move |_| account_pressed(&ui)
+    ));
+    banner.connect_button_clicked(glib::clone!(
+        #[strong]
+        ui,
+        move |_| client_check::banner_pressed(&ui)
+    ));
+    // Coming back from a terminal or a software centre is when the library
+    // most likely appeared.
+    window.connect_is_active_notify(glib::clone!(
+        #[strong]
+        ui,
+        move |window| {
+            if window.is_active() {
+                client_check::check_if_blocked(&ui);
+            }
+        }
     ));
 
     render(&ui);
@@ -428,6 +466,7 @@ fn build_ui(app: &adw::Application) {
     }
 
     window.present();
+    client_check::check(&ui, None, false);
     refresh_entitlements(&ui, false);
     fetch_gamepass(&ui, false);
     // Tier upgrades happen outside this window. The listing is reused for a
@@ -2826,7 +2865,13 @@ fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {
 fn account_pressed(ui: &Ui) {
     if ui.model.borrow().account.is_some() {
         account_menu(ui);
-    } else if ui.model.borrow().roles.is_some() {
+        return;
+    }
+    // A client the loader refuses cannot sign in: say why and offer the fix.
+    if client_check::blocks(ui, account_pressed) {
+        return;
+    }
+    if ui.model.borrow().roles.is_some() {
         accounts_ui::open(ui);
     } else {
         sign_in(ui);
@@ -2871,6 +2916,11 @@ fn finish(ui: &Ui) {
     glib::idle_add_local_once(move || {
         if *ui.closing.borrow() && ui.busy.borrow().is_none() {
             ui.window.close();
+        } else if ui.busy.borrow().is_none() && ui.install_owed.get().is_some() {
+            // Only once the window is free, or it would be owed again.
+            if let Some((package, then)) = ui.install_owed.take() {
+                client_check::install(&ui, package, then);
+            }
         } else if ui.entitlements_owed.get() {
             refresh_entitlements(&ui, true);
         }
