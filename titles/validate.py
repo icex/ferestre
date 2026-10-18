@@ -38,6 +38,12 @@ SETUP_ACTIONS = {"substitute-xcurl"}   # a runner has to implement each of these
 SETUP_WHEN = {"after-install", "every-launch"}
 SAVE_KINDS = {"wgs", "files"}
 RECIPE_NAME = re.compile(r"[0-9A-Z]{12}\.toml")
+# dir-env and prefix-env name a title's own directory, as the shell scripts
+# did (BEDROCK_DIR, FH5_PREFIX). The launcher's and the system's variables are
+# out: XODUS_GAMES_DIR or XDG_RUNTIME_DIR as a title's folder is what an
+# uninstall would delete. crates/ferestre-core/src/recipe.rs has the same rule.
+LOCATION_VARIABLE = re.compile(r"[A-Z][A-Z0-9_]*_(DIR|PREFIX)")
+RESERVED_VARIABLES = ("XODUS_", "FERESTRE_", "XDG_", "STEAM_", "PROTON_", "WINE", "APPDIR")
 
 NUM = (int, float)
 TYPE_NAMES = {str: "a string", int: "an integer", float: "a number", bool: "a boolean",
@@ -184,9 +190,13 @@ def check_recipe(path, known):
     fields(err, "(top level)", data,
            required={"schema": int, "title": dict, "launch": dict,
                      "runtime": dict, "status": dict},
-           optional={"install": dict, "setup": list, "saves": list, "issues": list})
+           optional={"install": dict, "setup": list, "saves": list, "issues": list,
+                     "generated": bool})
     if data.get("schema") != 1:
         err(f"schema: expected 1, got {data.get('schema')!r}")
+    if "generated" in data:
+        err("generated: only the launcher sets this, on a recipe it guessed; "
+            "a recipe here is written by a person")
     if problems:
         return None, problems
 
@@ -213,16 +223,18 @@ def check_recipe(path, known):
     if "prefix" in install:
         check_relative_path(err, "[install].prefix", install["prefix"])
     for key in ("dir-env", "prefix-env"):
-        if key in install and not re.fullmatch(r"[A-Z][A-Z0-9_]*", install[key]):
-            err(f"[install].{key}: '{install[key]}' is not an environment variable name")
+        if key not in install:
+            continue
+        name = install[key]
+        if not LOCATION_VARIABLE.fullmatch(name) or name.startswith(RESERVED_VARIABLES):
+            err(f"[install].{key}: '{name}' is not a variable a recipe may take a directory "
+                "from: it must end in _DIR or _PREFIX and must not be one of the launcher's "
+                "own (XODUS_*, FERESTRE_*, XDG_*, STEAM_*, PROTON_*, WINE*)")
 
     launch = data["launch"]
     fields(err, "[launch]", launch, required={"executable": str},
-           optional={"arguments": list, "env": dict, "environment": dict})
+           optional={"env": dict, "environment": dict})
     check_windows_path(err, "[launch].executable", launch.get("executable", ""), must_be_exe=True)
-    for arg in launch.get("arguments", []):
-        if not isinstance(arg, str):
-            err("[launch].arguments: every argument must be a string")
     if "env" in launch and "environment" in launch:
         err("[launch]: use env or environment, not both")
     for key, value in launch.get("env", launch.get("environment", {})).items():
@@ -274,6 +286,13 @@ def check_recipe(path, known):
     fields(err, "[status]", status, required={"state": str, "summary": str},
            optional={"stops-at": str, "blocked-by": str,
                      "last-verified": datetime.date, "verified-with": str})
+    # These go into one row of a Markdown table. A line break ends the row,
+    # and the generated page would carry half a sentence.
+    for where, value in (("[title].name", title.get("name")),
+                         ("[status].summary", status.get("summary")),
+                         ("[status].stops-at", status.get("stops-at"))):
+        if isinstance(value, str) and ("\n" in value or "\r" in value):
+            err(f"{where}: must be one line; it is a cell in the compatibility matrix")
     state = status.get("state")
     if state not in STATES:
         err(f"[status].state: '{state}' is not one of {', '.join(STATES)}")
@@ -320,6 +339,11 @@ def check_recipe(path, known):
     return data, problems
 
 
+def cell(value):
+    """Text for one Markdown table cell: a '|' would start another column."""
+    return " ".join(str(value).split()).replace("|", "\\|")
+
+
 def matrix(recipes):
     """The compatibility table, generated so it cannot drift from the recipes."""
     rank = list(STATES)
@@ -333,8 +357,9 @@ def matrix(recipes):
         if status.get("stops-at"):
             note += f" Stops at: {status['stops-at']}."
         out.append("| {} | `{}` | {} | {} | {} |".format(
-            r["title"]["name"], r["title"]["product-id"], STATES[status["state"]],
-            note, status.get("last-verified", "never")))
+            cell(r["title"]["name"]), cell(r["title"]["product-id"]),
+            STATES[status["state"]], cell(note),
+            cell(status.get("last-verified", "never"))))
     return "\n".join(out)
 
 
