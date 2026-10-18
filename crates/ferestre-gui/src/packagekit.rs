@@ -37,6 +37,59 @@ const ERROR_NOT_AUTHORIZED: u32 = 48;
 /// No timeout. A transaction method returns at once, but a slow daemon is
 /// still better waited for than reported as a failure it is not.
 const NO_TIMEOUT: i32 = i32::MAX;
+/// How long a cancelled transaction gets to say it has finished before the
+/// window stops waiting for it anyway.
+const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A way to cancel an install from outside it.
+///
+/// A transaction waiting on a package manager lock another program holds, or
+/// on a password prompt nobody answers, never finishes by itself, and there
+/// was no way to end it from the window. Cancelling asks PackageKit to cancel
+/// the transaction, and stops waiting if it has not finished shortly after.
+#[derive(Clone, Default)]
+pub struct Cancel(Rc<RefCell<CancelState>>);
+
+#[derive(Default)]
+struct CancelState {
+    requested: bool,
+    hook: Option<Box<dyn FnOnce()>>,
+}
+
+impl Cancel {
+    pub fn cancel(&self) {
+        let hook = {
+            let mut state = self.0.borrow_mut();
+            state.requested = true;
+            state.hook.take()
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    pub fn requested(&self) -> bool {
+        self.0.borrow().requested
+    }
+
+    /// What cancelling does while a transaction runs. Run at once when
+    /// cancelling was asked for before it started.
+    fn arm(&self, hook: Box<dyn FnOnce()>) {
+        let mut state = self.0.borrow_mut();
+        if state.requested {
+            drop(state);
+            hook();
+        } else {
+            state.hook = Some(hook);
+        }
+    }
+
+    fn disarm(&self) {
+        self.0.borrow_mut().hook = None;
+    }
+}
+
+const CANCELLED: &str = "the installation was cancelled";
 
 async fn system_bus() -> Result<gio::DBusConnection, String> {
     gio::bus_get_future(gio::BusType::System)
@@ -76,14 +129,18 @@ pub async fn available() -> bool {
 }
 
 /// Install `package` by name: resolve it to a package id, then install that.
-pub async fn install(package: &str) -> Result<(), String> {
+pub async fn install(package: &str, cancel: &Cancel) -> Result<(), String> {
     let bus = system_bus().await?;
     let found = run(
         &bus,
         "Resolve",
         (FILTER_NOT_INSTALLED, vec![package.to_string()]).to_variant(),
+        cancel,
     )
     .await?;
+    if cancel.requested() {
+        return Err(CANCELLED.into());
+    }
     let Some(id) = ferestre_core::client_deps::pick_package_id(&found, package) else {
         return Err(format!(
             "the package manager has no {package} to install. Is it already installed, or are the package lists out of date?"
@@ -93,6 +150,7 @@ pub async fn install(package: &str) -> Result<(), String> {
         &bus,
         "InstallPackages",
         (FLAG_ONLY_TRUSTED, vec![id.to_string()]).to_variant(),
+        cancel,
     )
     .await?;
     Ok(())
@@ -103,6 +161,8 @@ struct Progress {
     packages: Vec<String>,
     error: Option<(u32, String)>,
     exit: Option<u32>,
+    /// The window stopped waiting for a cancelled transaction.
+    abandoned: bool,
     done: Option<oneshot::Sender<()>>,
 }
 
@@ -114,12 +174,34 @@ impl Progress {
     }
 }
 
+/// Whichever of two futures finishes first: `Ok` with the first one's output,
+/// `Err` with the second's.
+async fn first<A: std::future::Future, B: std::future::Future>(
+    a: A,
+    b: B,
+) -> Result<A::Output, B::Output> {
+    use std::task::Poll;
+    let mut a = std::pin::pin!(a);
+    let mut b = std::pin::pin!(b);
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(value) = std::future::Future::poll(a.as_mut(), cx) {
+            return Poll::Ready(Ok(value));
+        }
+        if let Poll::Ready(value) = std::future::Future::poll(b.as_mut(), cx) {
+            return Poll::Ready(Err(value));
+        }
+        Poll::Pending
+    })
+    .await
+}
+
 /// One transaction: create it, call `method` on it, and wait for Finished.
 /// Returns the package ids it reported.
 async fn run(
     bus: &gio::DBusConnection,
     method: &str,
     args: glib::Variant,
+    cancel: &Cancel,
 ) -> Result<Vec<String>, String> {
     let reply = bus
         .call_future(
@@ -231,6 +313,49 @@ async fn run(
         ),
     );
 
+    // Ended by a cancel the daemon never answered. Raced against the whole
+    // exchange below, because a daemon stuck on a lock may not even reply to
+    // the method call.
+    let (abort_sender, abort) = oneshot::channel::<()>();
+    let abort_sender = Rc::new(RefCell::new(Some(abort_sender)));
+    cancel.arm(Box::new(glib::clone!(
+        #[strong]
+        bus,
+        #[strong]
+        owner,
+        #[strong]
+        path,
+        #[strong]
+        progress,
+        move || {
+            glib::spawn_future_local(async move {
+                // Cancel(): the daemon answers with Finished(cancelled).
+                let _ = bus
+                    .call_future(
+                        Some(&owner),
+                        &path,
+                        TRANSACTION,
+                        "Cancel",
+                        None,
+                        None,
+                        gio::DBusCallFlags::NONE,
+                        -1,
+                    )
+                    .await;
+            });
+            glib::timeout_add_local_once(CANCEL_GRACE, move || {
+                let mut progress = progress.borrow_mut();
+                if progress.exit.is_none() {
+                    progress.abandoned = true;
+                    if let Some(abort) = abort_sender.borrow_mut().take() {
+                        let _ = abort.send(());
+                    }
+                }
+                progress.end();
+            });
+        }
+    )));
+
     let called = async {
         let call = |method: &str, args: glib::Variant| {
             // To the same daemon the signals are taken from.
@@ -258,10 +383,14 @@ async fn run(
             .map_err(|e| format!("PackageKit: {e}"))?;
         let _ = finished.await;
         Ok::<_, String>(())
-    }
-    .await;
+    };
+    let called = first(called, abort).await.unwrap_or(Ok(()));
+    cancel.disarm();
     bus.signal_unsubscribe(signals);
     bus.signal_unsubscribe(vanished);
+    if progress.borrow().abandoned {
+        return Err(CANCELLED.into());
+    }
     called?;
 
     let progress = progress.take();
@@ -270,11 +399,60 @@ async fn run(
         (_, Some((ERROR_NOT_AUTHORIZED, _))) => {
             Err("the installation was not authorised".to_string())
         }
-        (Some(EXIT_CANCELLED), _) => Err("the installation was cancelled".to_string()),
+        (Some(EXIT_CANCELLED), _) => Err(CANCELLED.to_string()),
         (_, Some((_, details))) => Err(details),
         (None, None) => Err("PackageKit stopped before the transaction finished".to_string()),
         (Some(exit), None) => Err(format!(
             "PackageKit ended the transaction with status {exit}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn cancelling_runs_what_the_running_transaction_armed() {
+        let cancel = Cancel::default();
+        let ran = Rc::new(Cell::new(0));
+        let hook = |ran: &Rc<Cell<u32>>| {
+            let ran = Rc::clone(ran);
+            Box::new(move || ran.set(ran.get() + 1)) as Box<dyn FnOnce()>
+        };
+        cancel.arm(hook(&ran));
+        assert_eq!(ran.get(), 0);
+        cancel.cancel();
+        assert_eq!(ran.get(), 1);
+        assert!(cancel.requested());
+        cancel.cancel();
+        assert_eq!(ran.get(), 1, "a transaction is cancelled once");
+        // Asked for before the next transaction started: it is cancelled as
+        // soon as it arms.
+        cancel.arm(hook(&ran));
+        assert_eq!(ran.get(), 2);
+
+        let finished = Cancel::default();
+        finished.arm(hook(&ran));
+        finished.disarm();
+        finished.cancel();
+        assert_eq!(ran.get(), 2, "a finished transaction has nothing to cancel");
+    }
+
+    /// The wait for a transaction is raced against giving up on it, because a
+    /// daemon stuck on a lock may not even answer the method call.
+    #[test]
+    fn giving_up_ends_a_wait_that_would_never_end() {
+        let context = glib::MainContext::new();
+        let (_never_sender, never) = oneshot::channel::<()>();
+        let (give_up, abort) = oneshot::channel::<()>();
+        give_up.send(()).unwrap();
+        assert!(context.block_on(first(never, abort)).is_err());
+
+        let (done, finished) = oneshot::channel::<u32>();
+        let (_keep, abort) = oneshot::channel::<()>();
+        done.send(7).unwrap();
+        assert_eq!(context.block_on(first(finished, abort)).unwrap(), Ok(7));
     }
 }

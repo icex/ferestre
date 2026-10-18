@@ -108,6 +108,9 @@ summary="Synthetic account fixture"
         game=home/"games/account-test"
         write(game/"MicrosoftGame.config",f'<Game><Identity Name="Fixture.AccountGame" Publisher="CN=Fixture" Version="1.0.0.0"/><ExecutableList><Executable Name="Game.exe"/></ExecutableList><StoreId>{PRODUCT}</StoreId></Game>')
         write(game/"Game.exe","fixture")
+        # The package header a finished install leaves: a folder with no header
+        # and no manifest is a download that has not finished, not an install.
+        write(game/".xodus-streaming.msixvc","")
         state=home/"state/ferestre"
         write(state/f"installed/{PRODUCT}.json",json.dumps({"product_id":PRODUCT,"dir":str(game),"content_ids":["00000000-0000-0000-0000-000000000003"],"package_version":"1.0.0.0"}))
         write(home/"cache/ferestre/catalog"/f"{PRODUCT}.json",json.dumps({"schema":1,"market":"US","language":"en-us","product":{"product_id":PRODUCT,"name":"Account Test Game","has_packages":True,"has_pc_package":True,"package_format":"MSIXVC"}}))

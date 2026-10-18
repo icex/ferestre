@@ -72,6 +72,10 @@ impl Section {
 
 pub struct Model {
     pub roles: Option<Selection>,
+    /// Why `account-roles.json` could not be read, while it cannot. The rest
+    /// of the window still works; what belongs to an account waits until the
+    /// file is reset, because without it the window cannot tell whose it is.
+    pub roles_error: Option<String>,
     pub profiles: Option<Profiles>,
     /// Titles whose licence the selected Store account was refused at launch
     /// this session, as uppercase product ids. Stronger than anything the
@@ -88,10 +92,11 @@ pub struct Model {
     pub disk_usage: BTreeMap<String, Option<u64>>,
     pub sizes_pending: BTreeSet<String>,
     pub size_generation: u64,
-    /// Store product ids read from package metadata below `games_dir`. This is
-    /// separate from records because a title can have been installed before
-    /// Ferestre existed, or live in a human-named directory.
-    pub installed_products: BTreeSet<String>,
+    /// Store product ids read from package metadata below `games_dir`, with
+    /// the folder each is in. This is separate from records because a title
+    /// can have been installed before Ferestre existed, or live in a
+    /// human-named directory.
+    pub installed_products: BTreeMap<String, PathBuf>,
 
     /// Fetched, not loaded: these survive a rebuild.
     pub ownership: Ownership,
@@ -153,6 +158,9 @@ impl Model {
         if let Some(state) = self.private_state_dir() {
             forget_saved_account(&state);
         }
+        if let Some(cache) = self.account_cache_dir() {
+            forget_saved_avatar(&cache);
+        }
     }
 
     pub fn load() -> Self {
@@ -165,7 +173,10 @@ impl Model {
             }
         };
 
-        let mut paths = paths;
+        // An unreadable role file used to take the paths with it, which left
+        // nothing working -- not even the Accounts dialog that could fix it.
+        // Only what belongs to an account waits for it now.
+        let mut roles_error = None;
         let roles = match paths
             .as_ref()
             .map(|p| accounts::load(p.config_dir()))
@@ -173,20 +184,24 @@ impl Model {
         {
             Ok(roles) => roles.flatten(),
             Err(error) => {
-                problem = Some(format!("Account roles: {error}"));
-                paths = None;
+                roles_error = Some(format!("{error:#}"));
+                problem = Some(format!(
+                    "Account roles could not be read ({error:#}). Reset them to choose the \
+                     Store and Player accounts again."
+                ));
                 None
             }
         };
+        let account_scoped = roles_error.is_none();
         let private_state = paths
             .as_ref()
             .map(|p| accounts::private_state(p.state_dir(), roles.as_ref()));
         let account_cache = paths
             .as_ref()
             .map(|p| accounts::private_state(p.cache_dir(), roles.as_ref()));
-        let recipes = paths
+        let (recipes, skipped) = paths
             .as_ref()
-            .map(|p| Recipe::load_layered(&p.title_dirs()).unwrap_or_default())
+            .map(|p| load_recipes(&p.title_dirs()))
             .unwrap_or_default();
         let registry = paths
             .as_ref()
@@ -209,7 +224,7 @@ impl Model {
         let records = adopt_existing(paths.as_ref(), &recipes, records);
         let installed_products = paths
             .as_ref()
-            .map(|p| install::installed_products(p.games_dir()))
+            .map(|p| installed_products(p.games_dir()))
             .unwrap_or_default();
 
         // The last listing, and whatever the catalog already knows about it.
@@ -218,6 +233,7 @@ impl Model {
         // again" rather than "start".
         let ownership = paths
             .as_ref()
+            .filter(|_| account_scoped)
             .and_then(|_| library::load_cache(private_state.as_deref()?))
             .map(Ownership::Known)
             .unwrap_or_default();
@@ -291,22 +307,26 @@ impl Model {
                 )
             })
             .unwrap_or_default();
-        let avatar = paths
-            .as_ref()
-            .map(|_| {
-                ferestre_core::account::avatar_path(account_cache.as_deref().unwrap(), AVATAR_PX)
-            })
-            .filter(|p| p.is_file());
-
-        if problem.is_none() && recipes.is_empty() {
-            problem = Some(
-                "No title recipes found. Point FERESTRE_TITLES at the titles/ directory.".into(),
-            );
+        if problem.is_none() {
+            problem = match skipped.as_slice() {
+                [] if recipes.is_empty() => Some(
+                    "No title recipes found. Point FERESTRE_TITLES at the titles/ directory."
+                        .into(),
+                ),
+                [] => None,
+                [only] => Some(format!("A recipe file was skipped: {only}")),
+                [first, rest @ ..] => Some(format!(
+                    "{} recipe files were skipped. The first: {first}",
+                    rest.len() + 1
+                )),
+            };
         }
 
         let account = paths
             .as_ref()
+            .filter(|_| account_scoped)
             .and_then(|_| ferestre_core::account::load_cache(private_state.as_deref()?));
+        let avatar = saved_avatar(account.as_ref(), account_cache.as_deref());
         let entitlements_checked = ownership.is_known();
         let available = paths
             .as_ref()
@@ -319,6 +339,7 @@ impl Model {
             .unwrap_or_default();
         Model {
             roles,
+            roles_error,
             profiles: None,
             refused: BTreeSet::new(),
             paths,
@@ -389,13 +410,50 @@ impl Model {
         };
     }
 
+    /// Whether the title is installed, not merely started: a folder appears
+    /// the moment a download begins, and a stopped one is not a title to play.
     pub fn is_installed(&self, recipe: &Recipe) -> bool {
-        self.game_dir(recipe).is_some_and(|dir| dir.is_dir())
+        self.game_dir(recipe)
+            .is_some_and(|dir| install_complete(&dir))
+    }
+
+    /// Whether a download of this product stopped and left files where the
+    /// title goes, so the row offers to resume it rather than to play it.
+    pub fn incomplete(&self, product_id: &str) -> bool {
+        let dir = match self.recipe_for(product_id) {
+            Some(recipe) => self.game_dir(recipe),
+            None => self
+                .paths
+                .as_ref()
+                .map(|p| p.games_dir().join(product_id.to_ascii_lowercase())),
+        };
+        dir.is_some_and(|dir| !install_complete(&dir) && has_entries(&dir))
     }
 
     /// Where a title is, or would be, installed.
+    ///
+    /// Where it was installed wins over where its recipe would put it, unless
+    /// the recipe's directory variable is set: a title installed somewhere
+    /// else through "Install to" is there, and looking for it in the default
+    /// place made it look uninstalled -- no Play, no Remove, and Install
+    /// downloading it all again.
     pub fn game_dir(&self, recipe: &Recipe) -> Option<PathBuf> {
-        self.paths.as_ref()?.install_dir(recipe).ok()
+        let paths = self.paths.as_ref()?;
+        let from_env = recipe
+            .install
+            .dir_env
+            .as_deref()
+            .is_some_and(|name| paths.var(name).is_some());
+        if !from_env {
+            if let Some(record) = self
+                .records
+                .get(&recipe.title.product_id.to_ascii_uppercase())
+                .filter(|record| record.dir.is_dir())
+            {
+                return Some(record.dir.clone());
+            }
+        }
+        paths.install_dir(recipe).ok()
     }
 
     /// The version in the package manifest on disk, if the title is there.
@@ -403,8 +461,7 @@ impl Model {
     /// A title installed outside this launcher has a version and no record;
     /// reading it costs one small file and is better than showing "Installed".
     pub fn installed_version(&self, recipe: &Recipe) -> Option<String> {
-        let dir = self.paths.as_ref()?.install_dir(recipe).ok()?;
-        install::package_version(&dir)
+        install::package_version(&self.game_dir(recipe)?)
     }
 
     /// Wine's own way of shutting a title down: the server for its prefix, and
@@ -413,15 +470,7 @@ impl Model {
     /// survives, and the row would say stopped while it kept running.
     pub fn wineserver(&self, recipe: &Recipe) -> Option<(PathBuf, PathBuf)> {
         let paths = self.paths.as_ref()?;
-        let inferred = ferestre_core::autofix::infer(recipe, self.game_dir(recipe).as_deref());
-        let selected = runtime::selected(paths.config_dir(), &recipe.title.product_id);
-        let runtime = runtime::select(
-            &inferred.recipe,
-            &self.runtimes,
-            selected.as_deref(),
-            self.registry.as_ref(),
-        )
-        .ok()?;
+        let runtime = self.launch_runtime(recipe).ok()?;
         let server = runtime.path.join("files/bin/wineserver");
         if !server.is_file() {
             return None;
@@ -434,15 +483,139 @@ impl Model {
         Some((server, prefix.join("pfx")))
     }
 
-    /// Where installing this product would put it: the recipe's directory when
-    /// there is one, and games_dir/<product id> when there is not -- the same
-    /// two answers `ferestre install` gives, so the dialog cannot promise a
-    /// path the command would not use.
+    /// The runtime a launch of this recipe would use, judged the way its row is.
+    pub fn launch_runtime(&self, recipe: &Recipe) -> Result<&InstalledRuntime, String> {
+        let paths = self.paths.as_ref().ok_or("nowhere to look for a runtime")?;
+        let inferred = ferestre_core::autofix::infer(recipe, self.game_dir(recipe).as_deref());
+        let selected = runtime::selected(paths.config_dir(), &recipe.title.product_id);
+        crate::model::launch_runtime(
+            &inferred.recipe,
+            &self.runtimes,
+            selected.as_deref(),
+            self.registry.as_ref(),
+        )
+        .map(|(runtime, _)| runtime)
+    }
+
+    /// The runtime a title's launch would use, for its row's tooltip: whether
+    /// it was chosen for the title, or picked as the newest that fits.
+    pub fn runtime_note(&self, product_id: &str) -> Option<String> {
+        let paths = self.paths.as_ref()?;
+        let recipe = self.recipe_for(product_id)?;
+        let chosen = runtime::selected(paths.config_dir(), product_id).is_some();
+        let runtime = self.launch_runtime(recipe).ok()?;
+        Some(if chosen {
+            format!("Runtime: {} (chosen for this title)", runtime.label())
+        } else {
+            format!("Runtime: {}", runtime.label())
+        })
+    }
+
+    /// The library folder "Install to" offers for this product, the folder the
+    /// title gets inside it, and where that puts it by default.
+    ///
+    /// Below the games directory the title's folder is its path relative to
+    /// it -- a recipe may put a package one level down, as Bedrock's does --
+    /// and elsewhere it is the last component of where it was installed.
+    pub fn install_target(&self, product_id: &str) -> Option<(PathBuf, PathBuf, PathBuf)> {
+        let paths = self.paths.as_ref()?;
+        let default = self.install_destination(product_id)?;
+        let (library, folder) = match default.strip_prefix(paths.games_dir()) {
+            Ok(relative) if !relative.as_os_str().is_empty() => {
+                (paths.games_dir().to_path_buf(), relative.to_path_buf())
+            }
+            _ => (
+                default.parent()?.to_path_buf(),
+                PathBuf::from(default.file_name()?),
+            ),
+        };
+        Some((library, folder, default))
+    }
+
+    /// What is in `dir`, as a destination for installing `product_id`.
+    pub fn inspect_folder(&self, product_id: &str, dir: &Path) -> crate::model::Folder {
+        use crate::model::Folder;
+        let Ok(meta) = std::fs::metadata(dir) else {
+            return Folder::Missing;
+        };
+        if !meta.is_dir() {
+            return Folder::NotADirectory;
+        }
+        let key = product_id.to_ascii_uppercase();
+        let recorded = self
+            .records
+            .get(&key)
+            .is_some_and(|record| same_folder(&record.dir, dir));
+        if recorded || store_id(dir).is_some_and(|id| id == key) {
+            return Folder::This;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Folder::Other;
+        };
+        let names: Vec<_> = entries.flatten().map(|e| e.file_name()).collect();
+        if names.is_empty() {
+            return Folder::Empty;
+        }
+        if store_id(dir).is_none()
+            && names
+                .iter()
+                .any(|n| n.to_string_lossy().starts_with(".xodus-streaming"))
+        {
+            return Folder::Download;
+        }
+        Folder::Other
+    }
+
+    /// The folder "Remove from disk" deletes, found the way `ferestre
+    /// uninstall` finds it: the record, then the recipe's directory, then
+    /// games_dir/<product id>. A stopped download has no record, and those are
+    /// exactly the folders that most need removing.
+    pub fn removal_dir(&self, product_id: &str) -> Option<PathBuf> {
+        let paths = self.paths.as_ref()?;
+        if let Some(record) = self.records.get(&product_id.to_ascii_uppercase()) {
+            return Some(record.dir.clone());
+        }
+        // Records the window dropped as stale still count: uninstall reads them.
+        if let Some(record) = install::load(paths.state_dir(), product_id) {
+            return Some(record.dir);
+        }
+        self.recipe_for(product_id)
+            .and_then(|recipe| paths.install_dir(recipe).ok())
+            .or_else(|| {
+                let guess = paths.games_dir().join(product_id.to_ascii_lowercase());
+                guess.is_dir().then_some(guess)
+            })
+            .filter(|dir| dir.is_dir())
+    }
+
+    /// The title's Wine prefixes on disk: the one every launch used before
+    /// accounts had roles, and one per Player that has launched it since.
+    pub fn prefixes(&self, product_id: &str) -> Vec<PathBuf> {
+        let Some(base) = self
+            .paths
+            .as_ref()
+            .zip(self.recipe_for(product_id))
+            .and_then(|(paths, recipe)| paths.prefix_dir(recipe).ok())
+        else {
+            return Vec::new();
+        };
+        player_prefixes(&base)
+    }
+
+    /// Where installing this product puts it by default: where it is already
+    /// installed, so an update or a repair goes over it; otherwise the
+    /// recipe's directory when there is one, and games_dir/<product id> when
+    /// there is not -- the answers `ferestre install` gives without a folder.
     pub fn install_destination(&self, product_id: &str) -> Option<PathBuf> {
         let paths = self.paths.as_ref()?;
         match self.recipe_for(product_id) {
-            Some(recipe) => paths.install_dir(recipe).ok(),
-            None => Some(paths.games_dir().join(product_id.to_ascii_lowercase())),
+            Some(recipe) => self.game_dir(recipe),
+            None => Some(
+                self.records
+                    .get(&product_id.to_ascii_uppercase())
+                    .map(|record| record.dir.clone())
+                    .unwrap_or_else(|| paths.games_dir().join(product_id.to_ascii_lowercase())),
+            ),
         }
     }
 
@@ -455,18 +628,35 @@ impl Model {
     /// row called itself installed and offered to set it up.
     pub fn product_is_installed(&self, product_id: &str) -> bool {
         self.installed_products
-            .contains(&product_id.to_ascii_uppercase())
+            .contains_key(&product_id.to_ascii_uppercase())
             || self
                 .paths
                 .as_ref()
                 .map(|p| p.games_dir().join(product_id.to_ascii_lowercase()))
-                .is_some_and(|dir| install::looks_installed(&dir))
+                .is_some_and(|dir| install_complete(&dir))
+    }
+
+    /// Where a title with no recipe is on disk, when anything says: its
+    /// record, the folder whose package names it, or games_dir/<product id>.
+    pub fn product_dir(&self, product_id: &str) -> Option<PathBuf> {
+        let key = product_id.to_ascii_uppercase();
+        self.records
+            .get(&key)
+            .map(|record| record.dir.clone())
+            .or_else(|| self.installed_products.get(&key).cloned())
+            .or_else(|| {
+                let guess = self
+                    .paths
+                    .as_ref()?
+                    .games_dir()
+                    .join(product_id.to_ascii_lowercase());
+                guess.is_dir().then_some(guess)
+            })
     }
 
     /// The entry point the installed package declares, if it is on disk.
     pub fn detected_executable(&self, recipe: &Recipe) -> Option<String> {
-        let dir = self.paths.as_ref()?.install_dir(recipe).ok()?;
-        install::executable(&dir)
+        install::executable(&self.game_dir(recipe)?)
     }
 
     /// What the installed package says it launches, if anything did install it
@@ -533,6 +723,202 @@ pub fn forget_saved_account(state_dir: &Path) {
     let _ = std::fs::remove_file(ferestre_core::account::cache_path(state_dir));
 }
 
+/// Remove the saved picture of the account that signed out, so the next one
+/// to sign in -- or nobody -- is not shown with it.
+pub fn forget_saved_avatar(account_cache_dir: &Path) {
+    let _ = std::fs::remove_file(ferestre_core::account::avatar_path(
+        account_cache_dir,
+        AVATAR_PX,
+    ));
+}
+
+/// The saved picture, for a saved account only: a picture with nobody signed
+/// in is the last person's.
+fn saved_avatar(account: Option<&Account>, account_cache_dir: Option<&Path>) -> Option<PathBuf> {
+    account?;
+    Some(ferestre_core::account::avatar_path(
+        account_cache_dir?,
+        AVATAR_PX,
+    ))
+    .filter(|p| p.is_file())
+}
+
+/// Move an unreadable `account-roles.json` aside, so the window can start
+/// without roles and the Accounts dialog can write a new one. Kept rather than
+/// deleted: it may be a newer build's file, wanted back after an upgrade.
+pub fn set_aside_roles(config_dir: &Path) -> std::io::Result<PathBuf> {
+    let file = config_dir.join("account-roles.json");
+    let aside = (0..)
+        .map(|n| match n {
+            0 => config_dir.join("account-roles.json.unreadable"),
+            n => config_dir.join(format!("account-roles.json.unreadable.{n}")),
+        })
+        .find(|path| !path.exists())
+        .expect("an unused name");
+    std::fs::rename(file, &aside)?;
+    Ok(aside)
+}
+
+/// A file for a launch's diagnostic output, created afresh for each launch and
+/// readable only by its owner: it can name accounts and paths.
+pub fn launch_output(state_dir: &Path, key: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let dir = state_dir.join("launches");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    let name: String = key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let path = dir.join(format!("{name}.stderr"));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
+    Ok((path, file))
+}
+
+/// The last `count` lines of a file, each cut to a sensible length, without
+/// reading more than its last 64 KiB.
+pub fn tail_lines(path: &Path, count: usize) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const WINDOW: u64 = 64 * 1024;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let length = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = length.saturating_sub(WINDOW);
+    let mut bytes = Vec::new();
+    if file.seek(SeekFrom::Start(start)).is_err() || file.read_to_end(&mut bytes).is_err() {
+        return Vec::new();
+    }
+    let mut lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
+    // A window that starts mid-file starts mid-line.
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let lines: Vec<String> = lines
+        .into_iter()
+        .map(|line| {
+            String::from_utf8_lossy(&line[..line.len().min(512)])
+                .trim_end()
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines[lines.len().saturating_sub(count)..].to_vec()
+}
+
+/// The temporary container a download writes into, renamed when it ends.
+const DOWNLOADING: &str = ".xodus-streaming-tmp.msixvc";
+
+/// Whether `dir` holds a finished install. The package header and manifest
+/// land early in a download, so their being there is not enough while the
+/// temporary container is still beside them.
+pub fn install_complete(dir: &Path) -> bool {
+    install::looks_installed(dir) && !dir.join(DOWNLOADING).exists()
+}
+
+fn has_entries(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
+}
+
+fn same_folder(a: &Path, b: &Path) -> bool {
+    let normal = |p: &Path| p.components().collect::<PathBuf>();
+    normal(a) == normal(b)
+        || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
+/// The `<StoreId>` in a package's MicrosoftGame.config, uppercase.
+fn store_id(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(install::game_config(dir)?).ok()?;
+    let start = text.find("<StoreId>")? + "<StoreId>".len();
+    let value = text[start..].split_once("</StoreId>")?.0.trim();
+    (!value.is_empty()).then(|| value.to_ascii_uppercase())
+}
+
+/// Finished installs directly below `games_dir`, by the product id their
+/// package names, with the folder each is in.
+fn installed_products(games_dir: &Path) -> BTreeMap<String, PathBuf> {
+    let mut found = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(games_dir) else {
+        return found;
+    };
+    let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    dirs.sort();
+    for dir in dirs {
+        if dir.is_dir() && install_complete(&dir) {
+            if let Some(id) = store_id(&dir) {
+                found.entry(id).or_insert(dir);
+            }
+        }
+    }
+    found
+}
+
+/// A title's base Wine prefix and every Player's copy of it that exists:
+/// `<parent>/players/<namespace>/<name>`, as `accounts::player_prefix` makes.
+fn player_prefixes(base: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    if base.is_dir() {
+        found.push(base.to_path_buf());
+    }
+    let (Some(parent), Some(name)) = (base.parent(), base.file_name()) else {
+        return found;
+    };
+    let mut players: Vec<PathBuf> = std::fs::read_dir(parent.join("players"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path().join(name))
+        .filter(|path| path.is_dir() && !path.is_symlink())
+        .collect();
+    players.sort();
+    found.extend(players);
+    found
+}
+
+/// Recipes from each directory, later ones winning, as
+/// `Recipe::load_layered` reads them -- except that a file that cannot be
+/// read is skipped and named, rather than costing every other recipe. One
+/// typo used to empty the whole library.
+fn load_recipes(dirs: &[PathBuf]) -> (Vec<Recipe>, Vec<String>) {
+    let mut by_product: BTreeMap<String, Recipe> = BTreeMap::new();
+    let mut skipped = Vec::new();
+    for dir in dirs.iter().filter(|dir| dir.is_dir()) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                skipped.push(format!("{}: {error}", dir.display()));
+                continue;
+            }
+        };
+        let mut found: Vec<Recipe> = Vec::new();
+        let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        files.sort();
+        for path in files {
+            if path.extension().and_then(|e| e.to_str()) != Some("toml")
+                || path.file_stem().and_then(|s| s.to_str()) == Some("capabilities")
+            {
+                continue;
+            }
+            match Recipe::load(&path) {
+                Ok(recipe) => found.push(recipe),
+                Err(error) => skipped.push(format!("{error:#}")),
+            }
+        }
+        found.sort_by(|a, b| a.title.product_id.cmp(&b.title.product_id));
+        for recipe in found {
+            by_product.insert(recipe.title.product_id.to_ascii_uppercase(), recipe);
+        }
+    }
+    (by_product.into_values().collect(), skipped)
+}
+
 /// Icons already on disk from a previous run. Nothing is fetched here: a window
 /// that waits on a hundred HTTP requests before it appears is not a window.
 fn existing_icons(cache: &Cache, catalog: &BTreeMap<String, Product>) -> BTreeMap<String, PathBuf> {
@@ -584,6 +970,373 @@ fn adopt_existing(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Folder;
+    use ferestre_core::paths::Env;
+
+    /// A scratch directory, removed when dropped.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "ferestre-gui-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn config(store_id: &str) -> String {
+        format!("<Game><StoreId>{store_id}</StoreId></Game>")
+    }
+
+    /// A finished install of `store_id` in `dir`.
+    fn installed(dir: &Path, store_id: &str) {
+        write(&dir.join("MicrosoftGame.config"), &config(store_id));
+        write(&dir.join("appxmanifest.xml"), "<Package/>");
+        write(&dir.join(".xodus-streaming.msixvc"), "");
+    }
+
+    fn recipe(product_id: &str, dir: Option<&str>) -> Recipe {
+        let install = dir.map_or(String::new(), |d| format!("[install]\ndir = \"{d}\"\n"));
+        Recipe::parse(&format!(
+            "schema = 1\n[title]\nproduct-id = \"{product_id}\"\nname = \"Test\"\n\
+             slug = \"test\"\n[launch]\nexecutable = \"Game.exe\"\n{install}\
+             [status]\nstate = \"untested\"\nsummary = \"s\"\n"
+        ))
+        .unwrap()
+    }
+
+    fn model_at(root: &Path) -> Model {
+        let root = root.display().to_string();
+        let paths = Paths::resolve(&Env::from_map([
+            ("HOME", format!("{root}/home")),
+            ("XODUS_GAMES_DIR", format!("{root}/games")),
+            ("XDG_STATE_HOME", format!("{root}/state")),
+            ("XDG_CONFIG_HOME", format!("{root}/config")),
+            ("XDG_CACHE_HOME", format!("{root}/cache")),
+        ]))
+        .unwrap();
+        Model {
+            roles: None,
+            roles_error: None,
+            profiles: None,
+            refused: Default::default(),
+            paths: Some(paths),
+            recipes: Vec::new(),
+            runtime: None,
+            runtimes: Vec::new(),
+            registry: None,
+            records: BTreeMap::new(),
+            disk_usage: BTreeMap::new(),
+            sizes_pending: Default::default(),
+            size_generation: 0,
+            installed_products: Default::default(),
+            ownership: Default::default(),
+            catalog: BTreeMap::new(),
+            icons: BTreeMap::new(),
+            available: BTreeMap::new(),
+            account: None,
+            avatar: None,
+            gamepass: Vec::new(),
+            gamepass_merchandised: Default::default(),
+            subscriptions: Vec::new(),
+            entitlements_checked: false,
+            tiers: Default::default(),
+            section: Section::Library,
+            query: String::new(),
+            page: 0,
+            show_unsupported: false,
+            problem: None,
+        }
+    }
+
+    fn record(product_id: &str, dir: &Path) -> Record {
+        Record {
+            product_id: product_id.into(),
+            dir: dir.to_path_buf(),
+            content_ids: vec![],
+            installed_at: None,
+            package_version: None,
+        }
+    }
+
+    /// The package header and manifest arrive early in a download. With the
+    /// temporary container still beside them, the title is not installed.
+    #[test]
+    fn a_download_still_in_progress_is_not_an_install() {
+        let scratch = Scratch::new("partial");
+        let dir = scratch.0.join("games/test");
+        installed(&dir, "9ZZTESTGAME1");
+        assert!(install_complete(&dir));
+        write(&dir.join(DOWNLOADING), "");
+        assert!(!install_complete(&dir));
+        assert!(
+            installed_products(&scratch.0.join("games")).is_empty(),
+            "a partial download is not an installed product"
+        );
+
+        let mut model = model_at(&scratch.0);
+        model.recipes = vec![recipe("9ZZTESTGAME1", None)];
+        assert!(!model.is_installed(&model.recipes[0]));
+        assert!(model.incomplete("9ZZTESTGAME1"));
+        std::fs::remove_file(dir.join(DOWNLOADING)).unwrap();
+        assert!(model.is_installed(&model.recipes[0]));
+        assert!(!model.incomplete("9ZZTESTGAME1"));
+        // A folder nothing arrived in is neither.
+        std::fs::create_dir_all(scratch.0.join("games/9zzemptyone1")).unwrap();
+        assert!(!model.incomplete("9ZZEMPTYONE1"));
+    }
+
+    /// Installed with "Install to" somewhere else, a title whose recipe names
+    /// a folder is found where it was installed, not looked for where the
+    /// recipe would have put it.
+    #[test]
+    fn a_title_is_found_where_it_was_installed() {
+        let scratch = Scratch::new("record");
+        let elsewhere = scratch.0.join("mnt/forza-horizon-6");
+        installed(&elsewhere, "9NR1R1XWLCNB");
+        let mut model = model_at(&scratch.0);
+        model.recipes = vec![recipe("9NR1R1XWLCNB", Some("forza-horizon-6"))];
+        assert!(!model.is_installed(&model.recipes[0]));
+        model
+            .records
+            .insert("9NR1R1XWLCNB".into(), record("9NR1R1XWLCNB", &elsewhere));
+        assert_eq!(model.game_dir(&model.recipes[0]), Some(elsewhere.clone()));
+        assert!(model.is_installed(&model.recipes[0]));
+    }
+
+    /// Remove finds the folder the way `ferestre uninstall` does, so a
+    /// download that stopped before anything was recorded can be removed.
+    #[test]
+    fn remove_finds_what_uninstall_would_remove() {
+        let scratch = Scratch::new("removal");
+        let mut model = model_at(&scratch.0);
+        assert_eq!(model.removal_dir("9ZZNOTHING01"), None);
+
+        let guess = scratch.0.join("games/9zzpartial01");
+        write(&guess.join(DOWNLOADING), "x");
+        assert_eq!(model.removal_dir("9ZZPARTIAL01"), Some(guess));
+
+        model.recipes = vec![recipe("9ZZRECIPE001", Some("described"))];
+        let described = scratch.0.join("games/described");
+        std::fs::create_dir_all(&described).unwrap();
+        assert_eq!(model.removal_dir("9ZZRECIPE001"), Some(described));
+
+        let recorded = scratch.0.join("mnt/somewhere");
+        installed(&recorded, "9ZZRECIPE001");
+        model
+            .records
+            .insert("9ZZRECIPE001".into(), record("9ZZRECIPE001", &recorded));
+        assert_eq!(model.removal_dir("9ZZRECIPE001"), Some(recorded));
+    }
+
+    /// With account roles, each Player plays in a prefix of its own. All of
+    /// them are saved games, and all of them are listed.
+    #[test]
+    fn every_players_prefix_is_listed() {
+        let scratch = Scratch::new("prefixes");
+        let mut model = model_at(&scratch.0);
+        model.recipes = vec![recipe("9ZZRECIPE001", None)];
+        assert!(model.prefixes("9ZZRECIPE001").is_empty());
+        let games = scratch.0.join("games");
+        for dir in [
+            "test-proton/pfx",
+            "players/bbbb/test-proton/pfx",
+            "players/aaaa/test-proton/pfx",
+            "players/cccc/other-proton/pfx",
+        ] {
+            std::fs::create_dir_all(games.join(dir)).unwrap();
+        }
+        assert_eq!(
+            model.prefixes("9ZZRECIPE001"),
+            vec![
+                games.join("test-proton"),
+                games.join("players/aaaa/test-proton"),
+                games.join("players/bbbb/test-proton"),
+            ]
+        );
+    }
+
+    #[test]
+    fn install_to_knows_a_titles_folder_from_someone_elses() {
+        let scratch = Scratch::new("inspect");
+        let mut model = model_at(&scratch.0);
+        let root = &scratch.0;
+        assert_eq!(
+            model.inspect_folder("9ZZA", &root.join("none")),
+            Folder::Missing
+        );
+        write(&root.join("file"), "x");
+        assert_eq!(
+            model.inspect_folder("9ZZA", &root.join("file")),
+            Folder::NotADirectory
+        );
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        assert_eq!(
+            model.inspect_folder("9ZZA", &root.join("empty")),
+            Folder::Empty
+        );
+        installed(&root.join("mine"), "9ZZA");
+        assert_eq!(
+            model.inspect_folder("9zza", &root.join("mine")),
+            Folder::This
+        );
+        installed(&root.join("theirs"), "9ZZB");
+        assert_eq!(
+            model.inspect_folder("9ZZA", &root.join("theirs")),
+            Folder::Other
+        );
+        write(&root.join("partial").join(DOWNLOADING), "x");
+        assert_eq!(
+            model.inspect_folder("9ZZA", &root.join("partial")),
+            Folder::Download
+        );
+        write(&root.join("library/Some Game/game.exe"), "x");
+        assert_eq!(
+            model.inspect_folder("9ZZA", &root.join("library")),
+            Folder::Other
+        );
+        model
+            .records
+            .insert("9ZZA".into(), record("9ZZA", &root.join("library")));
+        assert_eq!(
+            model.inspect_folder("9ZZA", &root.join("library/")),
+            Folder::This,
+            "the folder its record names is its own, whatever is in it"
+        );
+    }
+
+    #[test]
+    fn install_to_offers_the_library_and_keeps_the_titles_folder() {
+        let scratch = Scratch::new("target");
+        let mut model = model_at(&scratch.0);
+        let games = scratch.0.join("games");
+        model.recipes = vec![recipe("9NBLGGH2JHXJ", Some("bedrock/game"))];
+        assert_eq!(
+            model.install_target("9NBLGGH2JHXJ"),
+            Some((
+                games.clone(),
+                PathBuf::from("bedrock/game"),
+                games.join("bedrock/game")
+            ))
+        );
+        assert_eq!(
+            model.install_target("9ZZNORECIPE1"),
+            Some((
+                games.clone(),
+                PathBuf::from("9zznorecipe1"),
+                games.join("9zznorecipe1")
+            ))
+        );
+
+        // Installed elsewhere: an update goes over it, wherever it is.
+        let elsewhere = scratch.0.join("mnt/big/game");
+        installed(&elsewhere, "9NBLGGH2JHXJ");
+        model
+            .records
+            .insert("9NBLGGH2JHXJ".into(), record("9NBLGGH2JHXJ", &elsewhere));
+        assert_eq!(
+            model.install_target("9NBLGGH2JHXJ"),
+            Some((scratch.0.join("mnt/big"), PathBuf::from("game"), elsewhere))
+        );
+    }
+
+    /// One unreadable recipe used to empty the whole library.
+    #[test]
+    fn a_bad_recipe_file_is_skipped_and_named() {
+        let scratch = Scratch::new("recipes");
+        let packaged = scratch.0.join("titles");
+        let user = scratch.0.join("user");
+        let good = |id: &str, name: &str| {
+            format!(
+                "schema = 1\n[title]\nproduct-id = \"{id}\"\nname = \"{name}\"\n\
+                 slug = \"s{id}\"\n[launch]\nexecutable = \"Game.exe\"\n\
+                 [status]\nstate = \"untested\"\nsummary = \"s\"\n"
+            )
+        };
+        write(&packaged.join("a.toml"), &good("9ZZA", "Packaged A"));
+        write(&packaged.join("b.toml"), &good("9ZZB", "Packaged B"));
+        write(&packaged.join("capabilities.toml"), "not = a recipe");
+        write(&user.join("a.toml"), &good("9ZZA", "Edited A"));
+        write(&user.join("broken.toml"), "schema = 1\n[title\n");
+        let (recipes, skipped) = load_recipes(&[packaged, user, scratch.0.join("missing")]);
+        let names: Vec<_> = recipes.iter().map(|r| r.title.name.as_str()).collect();
+        assert_eq!(names, ["Edited A", "Packaged B"]);
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(skipped[0].contains("broken.toml"), "{skipped:?}");
+    }
+
+    #[test]
+    fn an_unreadable_roles_file_is_set_aside_not_deleted() {
+        let scratch = Scratch::new("roles");
+        let file = scratch.0.join("account-roles.json");
+        write(&file, "{\"store\":1}");
+        let aside = set_aside_roles(&scratch.0).unwrap();
+        assert!(!file.exists());
+        assert_eq!(std::fs::read_to_string(&aside).unwrap(), "{\"store\":1}");
+        write(&file, "again");
+        let second = set_aside_roles(&scratch.0).unwrap();
+        assert_ne!(aside, second, "an earlier copy is kept");
+        assert!(set_aside_roles(&scratch.0).is_err(), "nothing left to move");
+    }
+
+    /// The picture is cached by size alone, so with nobody signed in a saved
+    /// one is the previous account's.
+    #[test]
+    fn the_saved_picture_goes_with_the_account() {
+        let scratch = Scratch::new("avatar");
+        let picture = ferestre_core::account::avatar_path(&scratch.0, AVATAR_PX);
+        write(&picture, "png");
+        let someone =
+            ferestre_core::account::parse(r#"{"gamertag":"Someone","xuid":"25"}"#).unwrap();
+        assert_eq!(saved_avatar(None, Some(&scratch.0)), None);
+        assert_eq!(
+            saved_avatar(Some(&someone), Some(&scratch.0)),
+            Some(picture.clone())
+        );
+        forget_saved_avatar(&scratch.0);
+        assert!(!picture.exists());
+        assert_eq!(saved_avatar(Some(&someone), Some(&scratch.0)), None);
+    }
+
+    /// The launcher's diagnostics go to a file of the window's, not a pipe:
+    /// the title outlives the window.
+    #[test]
+    fn a_launchs_output_is_kept_in_a_private_file_and_its_tail_read_back() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("launch");
+        let (path, mut file) = launch_output(&scratch.0, "9ZZA/../x").unwrap();
+        assert_eq!(path.parent().unwrap(), scratch.0.join("launches"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        for n in 0..100 {
+            writeln!(file, "line {n}").unwrap();
+        }
+        file.write_all(b"\xff not utf-8\n!! the reason\n").unwrap();
+        let tail = tail_lines(&path, 3);
+        assert_eq!(tail, ["line 99", "\u{fffd} not utf-8", "!! the reason"]);
+        // A new launch starts the file afresh.
+        let (_, _) = launch_output(&scratch.0, "9ZZA/../x").unwrap();
+        assert!(tail_lines(&path, 3).is_empty());
+    }
 
     #[test]
     fn forgetting_the_saved_account_removes_its_library_too() {
