@@ -127,6 +127,10 @@ save after a restart, and a subscription lapsing during play.
 
 ## Other fixes
 
+- **Add All to Steam:** the Installed list's header adds every installed game
+  to Steam in one go, after asking. Games already in Steam are updated in
+  place. Two titles that share a name, such as two editions, now get a
+  shortcut each instead of sharing one.
 - The video dependency check looks where Proton does, including Steam's own
   FFmpeg, so Steam users no longer get a false warning.
 - Signing out somewhere else (`xodus-cli logout`, an expired token) no longer
