@@ -148,6 +148,8 @@ summary="Synthetic account fixture"
         def choose_player(dialog,label):
             combo=s.find_all(dialog,role="combo box")[1]
             s.click(s.find_all(combo,role="toggle button")[0])
+            # Only the dropdown's own popup: the accounts list below it has a
+            # row with the same name, and pressing that selects nothing.
             def popup_row(root):
                 for node in s.find_all(root,name=label):
                     if node.get_role_name()!="label":continue
@@ -156,9 +158,11 @@ summary="Synthetic account fixture"
                         if ancestor.get_role_name()=="list item":return ancestor
                         ancestor=ancestor.get_parent()
                 return None
-            row=s.wait_for(app,popup_row,"player choice",time.monotonic()+20)
+            row=s.wait_for(combo,popup_row,"player choice",time.monotonic()+20)
             s.press(row,gui.pid)
-            s.wait_for(dialog,lambda root:s.find_all(root,role="combo box",name=label),"selected player",time.monotonic()+20)
+            # The dropdown's accessible name is its role ("Player account"), so
+            # read the choice back from the summary that describes the pair.
+            s.wait_for(dialog,lambda root:any(f"{label} plays with" in t for t in s.texts(root)),"selected player",time.monotonic()+20)
         choose_player(dialog,"Player Fixture")
         s.click_named(dialog,"Apply accounts")
         settings=home/"config/ferestre/account-roles.json"

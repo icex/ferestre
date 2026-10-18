@@ -236,6 +236,9 @@ fn show(ui: &Ui, profiles: accounts::Profiles) {
             },
             profile.label
         );
+        // GTK before 4.16 names a labelled button after its label, which would
+        // leave every row with the same "Sign out".
+        action.reset_relation(gtk::AccessibleRelation::LabelledBy);
         action.update_property(&[gtk::accessible::Property::Label(&name)]);
         let (id, signed_in) = (profile.id.clone(), profile.signed_in);
         action.connect_clicked(glib::clone!(
