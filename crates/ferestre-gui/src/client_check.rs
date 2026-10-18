@@ -134,8 +134,7 @@ pub(super) fn banner_pressed(ui: &Ui) {
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         if !recheck(&ui).await {
-            ui.toasts
-                .add_toast(adw::Toast::new("The Xbox client can start now"));
+            ui.toasts.add_toast(toast("The Xbox client can start now"));
             return;
         }
         let installable = ui
@@ -223,7 +222,7 @@ fn explain(ui: &Ui, then: Option<fn(&Ui)>) {
         "copy" => {
             if let Some(command) = &command {
                 ui.window.clipboard().set_text(command);
-                ui.toasts.add_toast(adw::Toast::new("Command copied"));
+                ui.toasts.add_toast(toast("Command copied"));
             }
         }
         "install" => {
@@ -246,7 +245,7 @@ pub(super) fn install(ui: &Ui, package: &'static str, then: Option<fn(&Ui)>) {
     }
     if let Some(what) = ui.busy.borrow().clone() {
         if ui.install_owed.replace(Some((package, then))).is_none() {
-            ui.toasts.add_toast(adw::Toast::new(&format!(
+            ui.toasts.add_toast(toast(format!(
                 "{package} will be installed when {} finishes",
                 what.to_lowercase()
             )));
@@ -257,19 +256,25 @@ pub(super) fn install(ui: &Ui, package: &'static str, then: Option<fn(&Ui)>) {
         report_busy(ui);
         return;
     }
-    // Held open throughout. Closing the last window ends the process, and
-    // with it a Resolve or a password prompt that has not reached the
-    // install yet, so nothing would be installed.
-    *ui.wait_on_close.borrow_mut() = true;
-    show_activity(ui);
+    // Not held open: a transaction waiting on another package manager's lock
+    // or on a password prompt nobody answers never finishes, and holding the
+    // window for it meant it could not be closed at all. It can be cancelled
+    // from the activity panel, and once the install itself has started the
+    // package manager carries on without the window.
+    let cancel = packagekit::Cancel::default();
+    *ui.package_cancel.borrow_mut() = Some(cancel.clone());
+    note_close(
+        ui,
+        "You can close the window. Once your password has been accepted, the \
+         installation carries on without it.",
+    );
     let ui = ui.clone();
     glib::spawn_future_local(async move {
-        let result = packagekit::install(package).await;
+        let result = packagekit::install(package, &cancel).await;
         finish(&ui);
         match result {
             Ok(()) => {
-                ui.toasts
-                    .add_toast(adw::Toast::new(&format!("Installed {package}")));
+                ui.toasts.add_toast(toast(format!("Installed {package}")));
                 check(&ui, then, true);
             }
             Err(error) => ui.toasts.add_toast(

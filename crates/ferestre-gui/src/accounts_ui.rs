@@ -11,16 +11,18 @@ pub(super) fn open(ui: &Ui) {
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = gio::spawn_blocking(move || -> anyhow::Result<accounts::Profiles> {
-            let status = std::process::Command::new(&client)
-                .arg("migrate-accounts")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()?;
+            let status = deadline::status(
+                std::process::Command::new(&client)
+                    .arg("migrate-accounts")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null()),
+                deadline::CLIENT_QUESTION,
+            )?;
             anyhow::ensure!(
                 status.success(),
                 "Cannot load accounts. Update the client and unlock your keychain."
             );
-            accounts::fetch(&client)
+            fetch_profiles(&client)
         })
         .await;
         finish(&ui);
@@ -29,7 +31,7 @@ pub(super) fn open(ui: &Ui) {
         }
         match result {
             Ok(Ok(profiles)) => show(&ui, profiles),
-            _ => ui.toasts.add_toast(adw::Toast::new(
+            _ => ui.toasts.add_toast(toast(
                 "Could not load accounts. Update the client and unlock your keychain.",
             )),
         }
@@ -302,7 +304,7 @@ fn show(ui: &Ui, profiles: accounts::Profiles) {
                     render(&ui);
                     refresh_account(&ui);
                     ui.toasts
-                        .add_toast(adw::Toast::new("Accounts saved for future launches"));
+                        .add_toast(toast("Accounts saved for future launches"));
                 }
                 Err(error) => ui.toasts.add_toast(
                     adw::Toast::builder()
@@ -351,7 +353,7 @@ fn add_account(ui: &Ui) {
             return;
         }
         if !matches!(result,Ok(Ok(status)) if status.success()) {
-            ui.toasts.add_toast(adw::Toast::new(
+            ui.toasts.add_toast(toast(
                 "Sign-in was cancelled or failed. Your selected accounts were kept.",
             ));
         }
@@ -373,10 +375,12 @@ fn logout(ui: &Ui, id: String) {
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = gio::spawn_blocking(move || {
-            std::process::Command::new(&client)
-                .args(["--profile", &worker_id, "logout"])
-                .stdout(std::process::Stdio::null())
-                .status()
+            deadline::status(
+                std::process::Command::new(&client)
+                    .args(["--profile", &worker_id, "logout"])
+                    .stdout(std::process::Stdio::null()),
+                deadline::CLIENT_QUESTION,
+            )
         })
         .await;
         finish(&ui);
@@ -396,8 +400,12 @@ fn logout(ui: &Ui, id: String) {
             let mut stale = Vec::new();
             if let Some(paths) = model.paths.as_ref() {
                 stale.push(paths.state_dir().join("accounts").join(&id));
+                // And its picture, which is cached by size alone: the next
+                // account would otherwise be shown with this one's.
+                state::forget_saved_avatar(&paths.cache_dir().join("accounts").join(&id));
                 if signs_out_store && model.roles.is_none() {
                     stale.push(paths.state_dir().to_path_buf());
+                    state::forget_saved_avatar(paths.cache_dir());
                 }
             }
             for dir in stale {
@@ -420,7 +428,7 @@ fn logout(ui: &Ui, id: String) {
             drop(model);
             refresh_account(&ui);
         } else {
-            ui.toasts.add_toast(adw::Toast::new(
+            ui.toasts.add_toast(toast(
                 "Could not sign out this account. Check your keychain.",
             ));
         }

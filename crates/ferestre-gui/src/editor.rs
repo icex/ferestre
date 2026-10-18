@@ -104,6 +104,18 @@ impl Draft {
     }
 }
 
+/// A title's folder as a recipe's `install.dir`: relative to the games
+/// directory, which is the only place a recipe may name. `None` for a folder
+/// outside it, or the games directory itself.
+pub fn relative_install_dir(games_dir: &std::path::Path, dir: &std::path::Path) -> Option<String> {
+    let relative = dir.strip_prefix(games_dir).ok()?;
+    let normal = relative
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    let text = relative.to_str()?;
+    (normal && !text.is_empty()).then(|| text.to_string())
+}
+
 fn non_empty(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
@@ -242,7 +254,7 @@ pub fn present(
             };
             let mut edited = recipe.borrow().clone();
             if let Err(complaint) = draft.apply(&mut edited) {
-                toasts.add_toast(adw::Toast::new(&complaint));
+                toasts.add_toast(crate::toast(&complaint));
                 return;
             }
             match edited.save_to(&titles_dir) {
@@ -250,7 +262,7 @@ pub fn present(
                     on_saved(path);
                     dialog.close();
                 }
-                Err(e) => toasts.add_toast(adw::Toast::new(&format!("Could not save: {e}"))),
+                Err(e) => toasts.add_toast(crate::toast(format!("Could not save: {e}"))),
             }
         }
     ));
@@ -376,5 +388,37 @@ mod tests {
         let mut applied = blank();
         moved.apply(&mut applied).expect("applies");
         assert_eq!(applied.install.dir.as_deref(), Some("somewhere-else"));
+    }
+
+    /// "Set up" on a title with no recipe fills in where the title is, so the
+    /// saved recipe points at it rather than at its name's slug.
+    #[test]
+    fn set_up_points_at_the_folder_the_title_is_in() {
+        let games = std::path::Path::new("/home/u/Games");
+        let at = |dir: &str| relative_install_dir(games, std::path::Path::new(dir));
+        assert_eq!(
+            at("/home/u/Games/9nr1r1xwlcnb").as_deref(),
+            Some("9nr1r1xwlcnb")
+        );
+        assert_eq!(
+            at("/home/u/Games/Forza Horizon/game").as_deref(),
+            Some("Forza Horizon/game")
+        );
+        assert_eq!(
+            at("/mnt/elsewhere/fh5"),
+            None,
+            "a recipe can only name a folder under games"
+        );
+        assert_eq!(at("/home/u/Games"), None);
+
+        let mut recipe = Recipe::blank("9NR1R1XWLCNB", "Forza Horizon 6");
+        recipe.install.dir = at("/home/u/Games/9nr1r1xwlcnb");
+        let draft = Draft {
+            executable: "Game.exe".into(),
+            ..Draft::from_recipe(&recipe)
+        };
+        assert_eq!(draft.install_dir, "9nr1r1xwlcnb");
+        draft.apply(&mut recipe).expect("applies");
+        assert_eq!(recipe.install_dir(), "9nr1r1xwlcnb");
     }
 }

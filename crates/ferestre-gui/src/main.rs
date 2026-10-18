@@ -12,11 +12,13 @@
 mod accounts_ui;
 mod cancel;
 mod client_check;
+mod deadline;
 mod editor;
 mod model;
 mod packagekit;
 mod progress;
 mod state;
+mod stop;
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -63,6 +65,30 @@ row.library-row label.title {
 }
 ";
 
+/// A toast that shows its text as written.
+///
+/// Since libadwaita 1.4 a toast's title is Pango markup unless told otherwise,
+/// and game names and error text are not markup: "Command & Conquer" or a
+/// "<DIR>" in an error drew an empty toast, so Play, Stop and Install went
+/// unconfirmed. Every toast is made here, or with `use_markup(false)`.
+fn toast(text: impl AsRef<str>) -> adw::Toast {
+    adw::Toast::builder()
+        .title(text.as_ref())
+        .use_markup(false)
+        .build()
+}
+
+/// A row whose title and subtitle are shown as written, for the same reason.
+fn plain_row(title: &str, subtitle: Option<&str>) -> adw::ActionRow {
+    let row = adw::ActionRow::new();
+    row.set_use_markup(false);
+    row.set_title(title);
+    if let Some(subtitle) = subtitle {
+        row.set_subtitle(subtitle);
+    }
+    row
+}
+
 /// Everything a callback needs to redraw the window, in one place so it can
 /// hold one clone instead of nine.
 #[derive(Clone)]
@@ -90,16 +116,36 @@ struct Ui {
     keep_open: gtk::Button,
     closing: Rc<RefCell<bool>>,
     close_dialog_open: Rc<RefCell<bool>>,
+    /// Closing was confirmed with titles still running.
+    close_while_running: Rc<Cell<bool>>,
     download_control: Rc<RefCell<Option<cancel::DownloadControl>>>,
     /// Product ids whose name has been looked up, so a lookup that came back
     /// with nothing is not repeated on every redraw.
     asked_names: Rc<RefCell<std::collections::BTreeSet<String>>>,
+    /// The same for art: requested, or failed, until the next Refresh.
+    asked_icons: Rc<RefCell<std::collections::BTreeSet<String>>>,
     /// Set while the Game Pass listing is being fetched, so opening the section
     /// twice does not ask twice.
     fetching_gamepass: Rc<RefCell<bool>>,
     fetching_names: Rc<Cell<bool>>,
     catalog_generation: Rc<Cell<u64>>,
     fetching_entitlements: Rc<RefCell<bool>>,
+    /// Background checks that failed in a row, and when the next may run on
+    /// its own. Offline, or signed out, a check every minute was a client
+    /// process and a keyring every minute for nothing.
+    entitlement_failures: Rc<Cell<u32>>,
+    entitlements_retry_at: Rc<Cell<Option<std::time::Instant>>>,
+    gamepass_failures: Rc<Cell<u32>>,
+    gamepass_retry_at: Rc<Cell<Option<std::time::Instant>>>,
+    /// Whether a failed Game Pass fetch has been reported since the last
+    /// Refresh, so a redraw does not queue the same toast again.
+    gamepass_reported: Rc<Cell<bool>>,
+    /// Set while the update check runs. Its own flag rather than `busy`: it is
+    /// background work, and it must never hold Install, Remove or Sign in.
+    checking_updates: Rc<Cell<bool>>,
+    /// An account refresh that could not start because another task held the
+    /// window. Owed until it runs, like `entitlements_owed`.
+    account_owed: Rc<Cell<bool>>,
     /// A forced ownership check that could not start because another task held
     /// the window. Owed until it runs: the next finish or timer tick starts it,
     /// so a Refresh pressed during a background check is not lost for a day.
@@ -109,7 +155,7 @@ struct Ui {
     /// Titles this window started that have not exited, by product id, each
     /// mapped to the process group to signal. Deliberately not the `busy` flag:
     /// a game runs for hours and must not hold the window's other work.
-    running: Rc<RefCell<BTreeMap<String, u32>>>,
+    running: Rc<RefCell<BTreeMap<String, stop::Launch>>>,
     running_servers: Rc<RefCell<BTreeMap<String, (PathBuf, PathBuf)>>>,
     /// Says the Xbox client cannot start, for as long as that is true.
     banner: adw::Banner,
@@ -118,6 +164,9 @@ struct Ui {
     /// A PackageKit install asked for while another task held the window, and
     /// what to carry on with after it. Started by the next finish.
     install_owed: Rc<Cell<Option<client_check::Owed>>>,
+    /// Cancels the PackageKit install in progress, from the activity panel.
+    package_cancel: Rc<RefCell<Option<packagekit::Cancel>>>,
+    cancel_package: gtk::Button,
 }
 
 fn main() -> glib::ExitCode {
@@ -276,9 +325,15 @@ fn build_ui(app: &adw::Application) {
         .halign(gtk::Align::Start)
         .visible(false)
         .build();
+    let cancel_package = gtk::Button::builder()
+        .label("Cancel Installation")
+        .halign(gtk::Align::Start)
+        .visible(false)
+        .build();
     activity.append(&activity_title);
     activity.append(&activity_detail);
     activity.append(&keep_open);
+    activity.append(&cancel_package);
 
     // Under the header and outside the content, like the activity panel: it
     // has to survive every redraw, and it is about the whole window.
@@ -332,19 +387,30 @@ fn build_ui(app: &adw::Application) {
         keep_open: keep_open.clone(),
         closing: Rc::new(RefCell::new(false)),
         close_dialog_open: Rc::new(RefCell::new(false)),
+        close_while_running: Rc::new(Cell::new(false)),
         download_control: Rc::new(RefCell::new(None)),
         running: Rc::new(RefCell::new(BTreeMap::new())),
         running_servers: Rc::new(RefCell::new(BTreeMap::new())),
         asked_names: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
+        asked_icons: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
         fetching_gamepass: Rc::new(RefCell::new(false)),
         fetching_names: Rc::new(Cell::new(false)),
         catalog_generation: Rc::new(Cell::new(0)),
         fetching_entitlements: Rc::new(RefCell::new(false)),
         entitlements_owed: Rc::new(Cell::new(false)),
+        entitlement_failures: Rc::new(Cell::new(0)),
+        entitlements_retry_at: Rc::new(Cell::new(None)),
+        gamepass_failures: Rc::new(Cell::new(0)),
+        gamepass_retry_at: Rc::new(Cell::new(None)),
+        gamepass_reported: Rc::new(Cell::new(false)),
+        checking_updates: Rc::new(Cell::new(false)),
+        account_owed: Rc::new(Cell::new(false)),
         download: download.clone(),
         banner: banner.clone(),
         client_blocked: Rc::new(RefCell::new(None)),
         install_owed: Rc::new(Cell::new(None)),
+        package_cancel: Rc::new(RefCell::new(None)),
+        cancel_package: cancel_package.clone(),
     };
 
     window.connect_close_request(glib::clone!(
@@ -357,6 +423,17 @@ fn build_ui(app: &adw::Application) {
         ui,
         move |_| {
             *ui.closing.borrow_mut() = false;
+            show_activity(&ui);
+        }
+    ));
+    cancel_package.connect_clicked(glib::clone!(
+        #[strong]
+        ui,
+        move |button| {
+            if let Some(cancel) = ui.package_cancel.borrow().as_ref() {
+                cancel.cancel();
+            }
+            button.set_sensitive(false);
             show_activity(&ui);
         }
     ));
@@ -418,6 +495,8 @@ fn build_ui(app: &adw::Application) {
             ui.catalog_generation
                 .set(ui.catalog_generation.get().wrapping_add(1));
             ui.asked_names.borrow_mut().clear();
+            ui.asked_icons.borrow_mut().clear();
+            ui.gamepass_reported.set(false);
             render(&ui);
             // Reload means "check again", and the Game Pass catalogue is a
             // thing that changes without anything here doing so.
@@ -539,8 +618,25 @@ fn render(ui: &Ui) {
 
     if let Some(problem) = ui.model.borrow().problem.clone() {
         let group = adw::PreferencesGroup::builder().title("Not ready").build();
-        let row = adw::ActionRow::builder().title(&problem).build();
+        // An error names files and quotes their text, which is not markup.
+        let row = plain_row(&problem, None);
+        row.set_title_lines(4);
         row.add_css_class("error");
+        if ui.model.borrow().roles_error.is_some() {
+            let reset = gtk::Button::builder()
+                .label("Reset")
+                .valign(gtk::Align::Center)
+                .tooltip_text(
+                    "Set the unreadable account roles file aside and choose accounts again",
+                )
+                .build();
+            reset.connect_clicked(glib::clone!(
+                #[strong]
+                ui,
+                move |_| reset_account_roles(&ui)
+            ));
+            row.add_suffix(&reset);
+        }
         group.add(&row);
         page.append(&group);
     }
@@ -580,15 +676,38 @@ fn render(ui: &Ui) {
     }
 }
 
+/// Set an unreadable `account-roles.json` aside and start over without roles.
+fn reset_account_roles(ui: &Ui) {
+    let config = ui
+        .model
+        .borrow()
+        .paths
+        .as_ref()
+        .map(|p| p.config_dir().to_path_buf());
+    let Some(config) = config else { return };
+    match state::set_aside_roles(&config) {
+        Ok(aside) => {
+            ui.model.borrow_mut().reload();
+            render(ui);
+            ui.toasts.add_toast(toast(format!(
+                "Account roles were reset. The old file was kept as {}.",
+                aside.display()
+            )));
+            refresh_account(ui);
+        }
+        Err(error) => ui
+            .toasts
+            .add_toast(toast(format!("Could not reset the account roles: {error}"))),
+    }
+}
+
 fn render_runtime(ui: &Ui, page: &gtk::Box) {
     let packaged = std::env::var("FERESTRE_PACKAGE_VERSION").ok();
     let release = adw::PreferencesGroup::new();
-    release.add(
-        &adw::ActionRow::builder()
-            .title("Ferestre release")
-            .subtitle(ferestre_core::package_version(packaged.as_deref()))
-            .build(),
-    );
+    release.add(&plain_row(
+        "Ferestre release",
+        Some(ferestre_core::package_version(packaged.as_deref())),
+    ));
     page.append(&release);
 
     let model = ui.model.borrow();
@@ -596,11 +715,8 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
     let group = adw::PreferencesGroup::builder()
         .title("Patched Proton")
         .build();
-    let row = adw::ActionRow::builder()
-        .title(&title)
-        .subtitle(&subtitle)
-        .subtitle_lines(3)
-        .build();
+    let row = plain_row(&title, Some(&subtitle));
+    row.set_subtitle_lines(3);
     if model.runtime.is_none() {
         let install = gtk::Button::builder()
             .label("Install")
@@ -623,13 +739,9 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
             .description("New launches use the newest compatible version. A title-specific choice is kept locally.")
             .build();
         for runtime in &model.runtimes {
-            versions.add(
-                &adw::ActionRow::builder()
-                    .title(runtime.label())
-                    .subtitle(runtime.path.display().to_string())
-                    .subtitle_lines(2)
-                    .build(),
-            );
+            let row = plain_row(&runtime.label(), Some(&runtime.path.display().to_string()));
+            row.set_subtitle_lines(2);
+            versions.add(&row);
         }
         page.append(&versions);
     }
@@ -640,7 +752,7 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
             .description("What this build provides. A recipe names the ones it needs.")
             .build();
         for capability in &runtime.provides {
-            let row = adw::ActionRow::builder().title(capability).build();
+            let row = plain_row(capability, None);
             if let Some(symptom) = model.registry.as_ref().and_then(|r| r.symptom(capability)) {
                 row.set_subtitle(symptom);
                 row.set_subtitle_lines(2);
@@ -687,10 +799,26 @@ struct Drawn {
     pending_names: usize,
 }
 
+/// Which names have been asked for, and whether a lookup is still running.
+/// A name asked for and not found is not "still looking": the catalog does not
+/// describe every product, and those rows would otherwise read as pending for
+/// as long as the window was open.
+struct NameLookups<'a> {
+    asked: &'a std::collections::BTreeSet<String>,
+    fetching: bool,
+}
+
+impl NameLookups<'_> {
+    fn pending(&self, product_id: &str) -> bool {
+        self.fetching || !self.asked.contains(&product_id.to_ascii_uppercase())
+    }
+}
+
 fn draw_list(
     model: &Model,
-    running: &BTreeMap<String, u32>,
+    running: &BTreeMap<String, stop::Launch>,
     downloading: Option<&str>,
+    names: NameLookups,
     section: Section,
     keep: impl Fn(&LibraryRow) -> bool,
 ) -> Drawn {
@@ -710,13 +838,22 @@ fn draw_list(
         })
     };
     let installed = |r: &Recipe| model.is_installed(r);
+    let incomplete = |id: &str| model.incomplete(id);
+    let selected_runtime = |id: &str| {
+        model
+            .paths
+            .as_ref()
+            .and_then(|paths| ferestre_core::runtime::selected(paths.config_dir(), id))
+    };
     let installed_version = |r: &Recipe| model.installed_version(r);
     let installed_product = |id: &str| model.product_is_installed(id);
     let describes_itself = |id: &str| model.product_executable(id).is_some();
     let game_dir = |r: &Recipe| model.game_dir(r);
     let inputs = Inputs {
         recipes: &model.recipes,
-        runtime: model.runtime.as_ref(),
+        runtimes: &model.runtimes,
+        selected_runtime: &selected_runtime,
+        incomplete: &incomplete,
         registry: model.registry.as_ref(),
         ownership: &model.ownership,
         catalog: &model.catalog,
@@ -819,6 +956,20 @@ fn draw_list(
             row.outside_tier = false;
             row.unsupported = false;
         }
+        // Every kind of row, not only the ones with a recipe: a running title
+        // that still offered Play was started twice in one prefix, and the
+        // first copy could no longer be stopped from here.
+        let child_running = row.install_as.as_ref().is_some_and(|(id, _)| running(id));
+        if running(&row.product_id) || child_running {
+            row.action = Action::Stop;
+            if !row.subtitle.contains("running") {
+                row.subtitle = if row.subtitle.is_empty() {
+                    "running".into()
+                } else {
+                    format!("{}  ·  running", row.subtitle)
+                };
+            }
+        }
     }
     let unsupported = rows.iter().filter(|row| row.unsupported).count();
     let outside_tier = rows.iter().filter(|row| row.outside_tier).count();
@@ -827,10 +978,11 @@ fn draw_list(
     let unnamed_off_page: Vec<String> = rows
         .iter()
         .filter(|row| {
-            !row.is_named()
+            (!row.is_named()
                 || !model
                     .catalog
-                    .contains_key(&row.product_id.to_ascii_uppercase())
+                    .contains_key(&row.product_id.to_ascii_uppercase()))
+                && names.pending(&row.product_id)
         })
         .map(|row| row.product_id.clone())
         .collect();
@@ -1102,6 +1254,10 @@ fn render_rows(
         &ui.model.borrow(),
         &ui.running.borrow(),
         downloading.as_deref(),
+        NameLookups {
+            asked: &ui.asked_names.borrow(),
+            fetching: ui.fetching_names.get(),
+        },
         section,
         keep,
     );
@@ -1128,7 +1284,8 @@ fn render_rows(
         } else {
             format!("Nothing matches {query:?}")
         };
-        let row = adw::ActionRow::builder().title(&message).build();
+        // The query is whatever was typed, "&" included.
+        let row = plain_row(&message, None);
         row.add_css_class("dim-label");
         group.add(&row);
     } else {
@@ -1287,14 +1444,16 @@ fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
             &automatic_product,
             None,
         ) {
-            automatic_ui.toasts.add_toast(adw::Toast::new(&format!(
-                "Could not save runtime choice: {error}"
-            )));
-        } else {
-            automatic_dialog.close();
             automatic_ui
                 .toasts
-                .add_toast(adw::Toast::new("Runtime selection reset to automatic"));
+                .add_toast(toast(format!("Could not save runtime choice: {error}")));
+        } else {
+            automatic_dialog.close();
+            // The row is judged against the runtime its launch will use.
+            render(&automatic_ui);
+            automatic_ui
+                .toasts
+                .add_toast(toast("Runtime selection reset to automatic"));
         }
     });
     content.append(&automatic);
@@ -1317,14 +1476,15 @@ fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
                 &selected_product,
                 Some(&path),
             ) {
-                selected_ui.toasts.add_toast(adw::Toast::new(&format!(
-                    "Could not save runtime choice: {error}"
-                )));
-            } else {
-                selected_dialog.close();
                 selected_ui
                     .toasts
-                    .add_toast(adw::Toast::new("Runtime selected for this title"));
+                    .add_toast(toast(format!("Could not save runtime choice: {error}")));
+            } else {
+                selected_dialog.close();
+                render(&selected_ui);
+                selected_ui
+                    .toasts
+                    .add_toast(toast("Runtime selected for this title"));
             }
         });
         content.append(&choice);
@@ -1409,10 +1569,13 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
     }
     let details = details.join("  ·  ");
     action_row.set_subtitle(&details);
-    action_row.set_tooltip_text(Some(&format!(
-        "{}\n{}\n{}",
-        row.name, details, row.product_id
-    )));
+    // Which runtime Play would use: the per-title choice changes it, and a
+    // row that hid that made "Choose runtime" look as if it did nothing.
+    let runtime_note = ui.model.borrow().runtime_note(&row.product_id);
+    action_row.set_tooltip_text(Some(&match &runtime_note {
+        Some(note) => format!("{}\n{}\n{}\n{}", row.name, details, note, row.product_id),
+        None => format!("{}\n{}\n{}", row.name, details, row.product_id),
+    }));
 
     // Said where the Play button is, not only in a dimmed subtitle the eye
     // skips: pressing Play would end at the licence step.
@@ -1519,9 +1682,11 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
         }
     }
     // Anything on disk can be removed, recipe or not -- and the rows that most
-    // need it are the ones with no recipe, because a failed install leaves
-    // exactly that and there was previously no way to say so.
-    if row.installed {
+    // need it are the ones with no recipe, or a download that stopped, because
+    // a failed install leaves exactly that. Not while it runs: its files, and
+    // with the box ticked its saves, would go from under it.
+    let on_disk = row.installed || row.action == Action::Resume;
+    if on_disk && row.action != Action::Stop {
         let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
         item(
             "user-trash-symbolic",
@@ -1569,10 +1734,31 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             ));
         }
         Action::Stop => {
-            button.set_tooltip_text(Some("Ask the title to close"));
+            // A bundle row runs its child, under the child's id.
+            let running_id = match &row.install_as {
+                Some((child, _))
+                    if !ui
+                        .running
+                        .borrow()
+                        .contains_key(&row.product_id.to_ascii_uppercase()) =>
+                {
+                    child.clone()
+                }
+                _ => row.product_id.clone(),
+            };
+            let asked = ui
+                .running
+                .borrow()
+                .get(&running_id.to_ascii_uppercase())
+                .is_some_and(|launch| launch.asked.is_some());
+            button.set_tooltip_text(Some(if asked {
+                "Asked to close. Press again to end it now"
+            } else {
+                "Ask the title to close. It is ended if it has not closed in 15 seconds"
+            }));
             button.remove_css_class("suggested-action");
             button.add_css_class("destructive-action");
-            let product_id = row.product_id.clone();
+            let product_id = running_id;
             let name = row.name.clone();
             button.connect_clicked(glib::clone!(
                 #[strong]
@@ -1591,7 +1777,10 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             // Launching a game is fire-and-forget: it runs for hours and the
             // window has nothing to update when it ends. Installing is not --
             // it changes what every row says about itself.
-            let waits = matches!(row.action, Action::Install | Action::Update);
+            let waits = matches!(
+                row.action,
+                Action::Install | Action::Resume | Action::Update
+            );
             let plays = matches!(row.action, Action::Play);
             let updating = matches!(row.action, Action::Update);
             // A bundle installs its child, and the dialog names the child: a
@@ -1865,8 +2054,7 @@ fn confirm_sign_out(ui: &Ui) {
 /// the first time it changed.
 fn sign_out(ui: &Ui) {
     let Some(client) = ui.model.borrow().xodus_cli() else {
-        ui.toasts
-            .add_toast(adw::Toast::new("The Xodus client was not found"));
+        ui.toasts.add_toast(toast("The Xodus client was not found"));
         return;
     };
     if !begin(ui, "Signing out") {
@@ -1887,13 +2075,17 @@ fn sign_out(ui: &Ui) {
     if let Some(state) = ui.model.borrow().private_state_dir() {
         state::forget_saved_account(&state);
     }
+    if let Some(cache) = ui.model.borrow().account_cache_dir() {
+        state::forget_saved_avatar(&cache);
+    }
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = gio::spawn_blocking(move || {
-            scope_store(account::logout_command(&client), roles.as_ref())
-                .stdin(std::process::Stdio::null())
-                .status()
-                .map_err(|e| format!("{}: {e}", client.display()))
+            deadline::status(
+                &mut scope_store(account::logout_command(&client), roles.as_ref()),
+                deadline::CLIENT_QUESTION,
+            )
+            .map_err(|e| format!("{}: {e}", client.display()))
         })
         .await;
         finish(&ui);
@@ -1901,15 +2093,13 @@ fn sign_out(ui: &Ui) {
             Ok(Ok(status)) if status.success() => {
                 ui.model.borrow_mut().forget_account();
                 render(&ui);
-                ui.toasts.add_toast(adw::Toast::new("Signed out"));
+                ui.toasts.add_toast(toast("Signed out"));
             }
             Ok(Ok(status)) => ui
                 .toasts
-                .add_toast(adw::Toast::new(&format!("Sign out exited {status}"))),
-            Ok(Err(e)) => ui.toasts.add_toast(adw::Toast::new(&e)),
-            Err(_) => ui
-                .toasts
-                .add_toast(adw::Toast::new("Could not run the client")),
+                .add_toast(toast(format!("Sign out exited {status}"))),
+            Ok(Err(e)) => ui.toasts.add_toast(toast(&e)),
+            Err(_) => ui.toasts.add_toast(toast("Could not run the client")),
         }
     });
 }
@@ -1936,22 +2126,16 @@ fn warn_about_media(ui: &Ui, product_id: &str) {
         let model = ui.model.borrow();
         model.paths.as_ref().and_then(|paths| {
             let recipe = model.recipe_for(product_id)?;
-            let inferred = ferestre_core::autofix::infer(recipe, model.game_dir(recipe).as_deref());
-            let selected = ferestre_core::runtime::selected(paths.config_dir(), product_id);
-            ferestre_core::runtime::select(
-                &inferred.recipe,
-                &model.runtimes,
-                selected.as_deref(),
-                model.registry.as_ref(),
-            )
-            .ok()
-            // The Steam install too: Proton searches its FFmpeg 4 first.
-            .map(|runtime| {
-                (
-                    runtime.path.clone(),
-                    paths.steam_dir().map(Path::to_path_buf),
-                )
-            })
+            model
+                .launch_runtime(recipe)
+                .ok()
+                // The Steam install too: Proton searches its FFmpeg 4 first.
+                .map(|runtime| {
+                    (
+                        runtime.path.clone(),
+                        paths.steam_dir().map(Path::to_path_buf),
+                    )
+                })
         })
     };
     let Some((runtime, steam)) = runtime else {
@@ -1966,15 +2150,28 @@ fn warn_about_media(ui: &Ui, product_id: &str) {
         if let Ok(Ok(missing)) = checked {
             if !missing.is_empty() {
                 let message = format!("Videos may be black or silent: missing {}. Fedora: install compat-ffmpeg4 from RPM Fusion. Run ferestre doctor for details.", missing.join(", "));
-                ui.toasts
-                    .add_toast(adw::Toast::builder().title(&message).timeout(15).build());
+                ui.toasts.add_toast(
+                    adw::Toast::builder()
+                        .title(&message)
+                        .use_markup(false)
+                        .timeout(15)
+                        .build(),
+                );
             }
         }
     });
 }
 
 fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
-    let (roles, server) = {
+    let key = product_id.to_ascii_uppercase();
+    // A second `ferestre run` in the same prefix would replace the first in
+    // the window's records, and the first could no longer be stopped.
+    if ui.running.borrow().contains_key(&key) {
+        ui.toasts
+            .add_toast(toast(format!("{name} is already running")));
+        return;
+    }
+    let (roles, server, state_dir) = {
         let model = ui.model.borrow();
         if let Some(roles) = &model.roles {
             let result = model
@@ -1990,6 +2187,7 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
                 ui.toasts.add_toast(
                     adw::Toast::builder()
                         .title(error.to_string())
+                        .use_markup(false)
                         .priority(adw::ToastPriority::High)
                         .timeout(15)
                         .build(),
@@ -1997,30 +2195,19 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
                 return;
             }
             if roles.split() {
-                let supported = model
-                    .paths
-                    .as_ref()
-                    .zip(model.recipe_for(product_id))
-                    .and_then(|(paths, recipe)| {
-                        let inferred = ferestre_core::autofix::infer(
-                            recipe,
-                            model.game_dir(recipe).as_deref(),
-                        );
-                        let selected =
-                            ferestre_core::runtime::selected(paths.config_dir(), product_id);
-                        ferestre_core::runtime::select(
-                            &inferred.recipe,
-                            &model.runtimes,
-                            selected.as_deref(),
-                            model.registry.as_ref(),
-                        )
-                        .ok()
-                    })
+                let recipe = model.recipe_for(product_id);
+                let shares = recipe
+                    .and_then(|recipe| model.launch_runtime(recipe).ok())
                     .is_some_and(|runtime| runtime.provides(accounts::CAPABILITY));
-                if !supported {
-                    ui.toasts.add_toast(adw::Toast::builder()
-                        .title("Select an account-sharing runtime for this game using its runtime button, then try again.")
-                        .priority(adw::ToastPriority::High).timeout(15).build());
+                if let Some(refusal) = model::account_sharing_refusal(recipe.is_some(), shares) {
+                    ui.toasts.add_toast(
+                        adw::Toast::builder()
+                            .title(refusal)
+                            .use_markup(false)
+                            .priority(adw::ToastPriority::High)
+                            .timeout(15)
+                            .build(),
+                    );
                     return;
                 }
             }
@@ -2030,6 +2217,7 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
             model
                 .recipe_for(product_id)
                 .and_then(|r| model.wineserver(r)),
+            model.paths.as_ref().map(|p| p.state_dir().to_path_buf()),
         )
     };
     warn_about_media(ui, product_id);
@@ -2059,48 +2247,41 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
 
     // The reason a launch failed is on the launcher's stderr ("not entitled to
     // this content", "Player account is signed out"), not in its exit status.
-    // Keep a short tail for the toast and pass every line on as before.
-    command.stderr(std::process::Stdio::piped());
-    let mut child = match command.spawn() {
+    // It goes to a file of its own rather than a pipe into this window: the
+    // title outlives the window, and a pipe whose reader has gone made the
+    // launcher's own output fail, losing the rest of the launch log. The tail
+    // is read back when the launch ends.
+    let output = state_dir
+        .as_deref()
+        .and_then(|dir| state::launch_output(dir, &key).ok());
+    match &output {
+        Some((_, file)) => match file.try_clone() {
+            Ok(file) => command.stderr(file),
+            Err(_) => command.stderr(std::process::Stdio::inherit()),
+        },
+        None => command.stderr(std::process::Stdio::inherit()),
+    };
+    let output = output.map(|(path, _)| path);
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
             ui.toasts
-                .add_toast(adw::Toast::new(&format!("{}: {e}", program.display())));
+                .add_toast(toast(format!("{}: {e}", program.display())));
             return;
         }
     };
-    let (tail_sender, tail) = std::sync::mpsc::channel();
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            use std::io::{BufRead, Write};
-            let mut kept = std::collections::VecDeque::with_capacity(64);
-            let mut reader = std::io::BufReader::new(stderr);
-            let mut line = Vec::new();
-            while matches!(reader.read_until(b'\n', &mut line), Ok(n) if n > 0) {
-                let _ = std::io::stderr().write_all(&line);
-                if kept.len() == 64 {
-                    kept.pop_front();
-                }
-                kept.push_back(
-                    String::from_utf8_lossy(&line[..line.len().min(512)])
-                        .trim_end()
-                        .to_string(),
-                );
-                line.clear();
-            }
-            let _ = tail_sender.send(Vec::from(kept));
-        });
-    }
 
-    let key = product_id.to_ascii_uppercase();
     // setsid makes the child its own group leader, so the group id is its pid.
-    ui.running.borrow_mut().insert(key.clone(), child.id());
+    let pgid = child.id();
+    ui.running.borrow_mut().insert(
+        key.clone(),
+        stop::Launch::new(pgid, std::time::Instant::now()),
+    );
     if let Some(server) = server {
         ui.running_servers.borrow_mut().insert(key.clone(), server);
     }
     render(ui);
-    ui.toasts
-        .add_toast(adw::Toast::new(&format!("Starting {name}")));
+    ui.toasts.add_toast(toast(format!("Starting {name}")));
 
     // Wait off the main thread, and deliberately without the `busy` flag: a
     // game runs for hours and must not hold up the rest of the window.
@@ -2110,20 +2291,34 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
         let mut child = child;
         let status = gio::spawn_blocking(move || {
             let status = child.wait();
-            // The launcher has exited, so its stderr is at EOF unless something
-            // it started kept the pipe. Do not wait on that for long.
-            let reason = tail
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .ok()
+            let reason = output
+                .map(|path| state::tail_lines(&path, 64))
                 .and_then(|lines| model::launch_failure(&lines));
             (status, reason)
         })
         .await;
-        ui.running.borrow_mut().remove(&key);
-        ui.running_servers.borrow_mut().remove(&key);
+        let stopped = ui
+            .running
+            .borrow()
+            .get(&key)
+            .is_some_and(|launch| launch.pgid == pgid && launch.asked.is_some());
+        if ui
+            .running
+            .borrow()
+            .get(&key)
+            .is_some_and(|launch| launch.pgid == pgid)
+        {
+            ui.running.borrow_mut().remove(&key);
+            ui.running_servers.borrow_mut().remove(&key);
+        }
         render(&ui);
         match status {
             Ok((Ok(status), _)) if status.success() => {}
+            // Asked to stop, and it did: the exit status says how it was
+            // ended, not that anything went wrong.
+            Ok((Ok(_), _)) if stopped => {
+                ui.toasts.add_toast(toast(format!("{name} closed")));
+            }
             Ok((Ok(status), reason)) => {
                 if reason.as_deref().is_some_and(model::is_licence_refusal) {
                     ui.model.borrow_mut().refused.insert(key.clone());
@@ -2148,66 +2343,127 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
             }
             _ => ui
                 .toasts
-                .add_toast(adw::Toast::new(&format!("{name}: could not be waited on"))),
+                .add_toast(toast(format!("{name}: could not be waited on"))),
         }
     });
 }
 
-/// Ask a running title to close.
+/// Stop a title this window started: ask it to close, then end it.
 ///
-/// SIGTERM to the whole group, not SIGKILL: a game killed outright loses
-/// whatever it had not written, and saves are most of why these titles are run
-/// here at all. A title that ignores it keeps running and the row keeps saying
-/// so, which is honest -- the window does not pretend to have stopped it.
+/// The first press asks, the way closing the game's window would, so it can
+/// save -- ending it outright loses whatever it had not written, and a save
+/// being written at that moment can be left torn. If it has not exited within
+/// [`stop::CLOSE_WAIT`], or Stop is pressed again, the prefix is ended. A
+/// press that is the second click of the double-click that started it, or of
+/// the one that asked, does nothing.
 fn stop_title(ui: &Ui, product_id: &str, name: &str) {
     let key = product_id.to_ascii_uppercase();
-    let Some(pgid) = ui.running.borrow().get(&key).copied() else {
+    let Some(launch) = ui.running.borrow().get(&key).cloned() else {
         return;
     };
-    // Safety: a signal to a process group this window created.
-    let sent = unsafe { libc::kill(-(pgid as i32), libc::SIGTERM) };
-    if sent != 0 {
-        ui.toasts.add_toast(adw::Toast::new(&format!(
-            "Could not signal {name}: {}",
-            std::io::Error::last_os_error()
-        )));
+    match stop::press(&launch, std::time::Instant::now()) {
+        stop::Press::Ignore => {}
+        stop::Press::End => end_title(ui, &key, launch.pgid, name),
+        stop::Press::Ask => ask_title_to_close(ui, &key, launch.pgid, name),
     }
+}
 
-    // And Wine's own way, because the signal above does not reach the game.
-    // wineserver detaches, so the title is reparented out of the group this
-    // window created and survives it -- measured, with the row saying stopped
-    // while Minecraft was still running. `wineserver -k` ends the prefix.
-    let server = ui.running_servers.borrow().get(&key).cloned();
-    if let Some((server, prefix)) = server {
-        if let Ok(child) = std::process::Command::new(server)
-            .env("WINEPREFIX", prefix)
-            .arg("-k")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            // Reaped, because stopping a title is something people do more than
-            // once and an unwaited child is a zombie each time.
-            glib::spawn_future_local(async move {
-                let mut child = child;
-                let _ = gio::spawn_blocking(move || child.wait()).await;
-            });
-        }
+/// The wineserver and prefix of a running title. Worked out again when the
+/// launch had none to record: a title with no recipe gets one from `run` on
+/// its way past, so by now there is one to read.
+fn running_server(ui: &Ui, key: &str) -> Option<(PathBuf, PathBuf)> {
+    if let Some(server) = ui.running_servers.borrow().get(key).cloned() {
+        return Some(server);
     }
-    ui.toasts
-        .add_toast(adw::Toast::new(&format!("Asked {name} to close")));
+    if ui.model.borrow().recipe_for(key).is_none() {
+        ui.model.borrow_mut().reload();
+    }
+    let server = {
+        let model = ui.model.borrow();
+        model.recipe_for(key).and_then(|r| model.wineserver(r))
+    };
+    if let Some(server) = &server {
+        ui.running_servers
+            .borrow_mut()
+            .insert(key.to_string(), server.clone());
+    }
+    server
+}
+
+fn ask_title_to_close(ui: &Ui, key: &str, pgid: u32, name: &str) {
+    let Some(server) = running_server(ui, key) else {
+        // Nothing to ask through: no runtime or prefix is known for it.
+        end_title(ui, key, pgid, name);
+        return;
+    };
+    let asked_at = std::time::Instant::now();
+    if let Some(launch) = ui.running.borrow_mut().get_mut(key) {
+        launch.asked = Some(asked_at);
+    }
+    render(ui);
+    let ui = ui.clone();
+    let key = key.to_string();
+    let name = name.to_string();
+    glib::spawn_future_local(async move {
+        let (wineserver, prefix) = server;
+        let asked = gio::spawn_blocking(move || stop::ask_to_close(&wineserver, &prefix))
+            .await
+            .unwrap_or(false);
+        if !still_asking(&ui, &key, pgid, asked_at) {
+            return;
+        }
+        if !asked {
+            // No window to ask: it is still starting, or has none.
+            end_title(&ui, &key, pgid, &name);
+            return;
+        }
+        ui.toasts.add_toast(toast(format!(
+            "Asked {name} to close. Press Stop again to end it now."
+        )));
+        let remaining = stop::CLOSE_WAIT.saturating_sub(asked_at.elapsed());
+        glib::timeout_add_local_once(remaining, move || {
+            if still_asking(&ui, &key, pgid, asked_at) {
+                end_title(&ui, &key, pgid, &name);
+            }
+        });
+    });
+}
+
+/// Whether the launch asked to close at `asked_at` is still running and still
+/// waiting on that request: not exited, not relaunched.
+fn still_asking(ui: &Ui, key: &str, pgid: u32, asked_at: std::time::Instant) -> bool {
+    ui.running
+        .borrow()
+        .get(key)
+        .is_some_and(|launch| launch.pgid == pgid && launch.asked == Some(asked_at))
+}
+
+fn end_title(ui: &Ui, key: &str, pgid: u32, name: &str) {
+    // Marked as stopped on purpose, so its exit is not reported as a failure.
+    if let Some(launch) = ui.running.borrow_mut().get_mut(key) {
+        launch.asked.get_or_insert_with(std::time::Instant::now);
+    }
+    let server = running_server(ui, key);
+    if let Some(child) = stop::end(pgid, server.as_ref()) {
+        // Reaped, because stopping a title is something people do more than
+        // once and an unwaited child is a zombie each time.
+        glib::spawn_future_local(async move {
+            let mut child = child;
+            let _ = gio::spawn_blocking(move || child.wait()).await;
+        });
+    }
+    ui.toasts.add_toast(toast(format!("Ending {name}")));
 }
 
 fn spawn_cli(ui: &Ui, args: &[&str]) {
     let program = cli_binary();
     match std::process::Command::new(&program).args(args).spawn() {
-        Ok(_) => ui.toasts.add_toast(adw::Toast::new(&format!(
-            "Started: ferestre {}",
-            args.join(" ")
-        ))),
+        Ok(_) => ui
+            .toasts
+            .add_toast(toast(format!("Started: ferestre {}", args.join(" ")))),
         Err(e) => ui
             .toasts
-            .add_toast(adw::Toast::new(&format!("{}: {e}", program.display()))),
+            .add_toast(toast(format!("{}: {e}", program.display()))),
     }
 }
 
@@ -2316,7 +2572,7 @@ impl DownloadBar {
 /// for machine-readable progress instead, and prints one JSON line per quarter
 /// second. A client too old to know about that simply prints nothing this can
 /// read, and the bar stays indeterminate rather than breaking.
-fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&str>, what: &str) {
+fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&Path>, what: &str) {
     if !begin(ui, &format!("{what} {name}")) {
         report_busy(ui);
         return;
@@ -2325,9 +2581,9 @@ fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&str>, what:
     *ui.download_control.borrow_mut() = Some(control.clone());
     show_activity(ui);
     let program = cli_binary();
-    let mut args = vec!["install".to_string(), product_id.to_string()];
-    if let Some(dir) = dir.map(str::trim).filter(|d| !d.is_empty()) {
-        args.push(dir.to_string());
+    let mut args: Vec<std::ffi::OsString> = vec!["install".into(), product_id.into()];
+    if let Some(dir) = dir {
+        args.push(dir.as_os_str().to_owned());
     }
 
     ui.download.start(product_id, name, what);
@@ -2389,26 +2645,24 @@ fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&str>, what:
         match result {
             Ok(Ok(status)) if status.success() => {
                 ui.model.borrow_mut().reload();
-                ui.toasts.add_toast(adw::Toast::new(&format!(
-                    "Finished {} {name}",
-                    what.to_lowercase()
-                )));
+                ui.toasts
+                    .add_toast(toast(format!("Finished {} {name}", what.to_lowercase())));
             }
             _ if stopped => {
                 ui.model.borrow_mut().reload();
-                ui.toasts.add_toast(adw::Toast::new(
+                ui.toasts.add_toast(toast(
                     "Download stopped. Downloaded files kept for resuming.",
                 ));
             }
             Ok(Ok(status)) => {
                 ui.model.borrow_mut().reload();
                 ui.toasts
-                    .add_toast(adw::Toast::new(&format!("{what} {name} exited {status}")));
+                    .add_toast(toast(format!("{what} {name} exited {status}")));
             }
-            Ok(Err(e)) => ui.toasts.add_toast(adw::Toast::new(&e)),
+            Ok(Err(e)) => ui.toasts.add_toast(toast(&e)),
             Err(_) => ui
                 .toasts
-                .add_toast(adw::Toast::new("The install could not be started")),
+                .add_toast(toast("The install could not be started")),
         }
         render(&ui);
     });
@@ -2447,7 +2701,7 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
         None
     };
     ui.toasts
-        .add_toast(adw::Toast::new(&format!("{what} — this can take a while")));
+        .add_toast(toast(format!("{what} — this can take a while")));
 
     let ui = ui.clone();
     let what = what.to_string();
@@ -2480,23 +2734,27 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
                 // re-read it before it can say anything different.
                 ui.model.borrow_mut().reload();
                 render(&ui);
-                ui.toasts
-                    .add_toast(adw::Toast::new(&format!("{what} finished")));
+                ui.toasts.add_toast(toast(format!("{what} finished")));
             }
             _ if stopped => {
-                ui.toasts
-                    .add_toast(adw::Toast::new("Runtime download stopped"));
+                ui.toasts.add_toast(toast("Runtime download stopped"));
             }
             Ok(Ok(status)) => {
                 ui.model.borrow_mut().reload();
                 render(&ui);
                 ui.toasts
-                    .add_toast(adw::Toast::new(&format!("{what} exited {status}")))
+                    .add_toast(toast(format!("{what} exited {status}")))
             }
-            Ok(Err(e)) => ui.toasts.add_toast(adw::Toast::new(&e)),
+            Ok(Err(e)) => ui.toasts.add_toast(toast(&e)),
             Err(_) => ui
                 .toasts
-                .add_toast(adw::Toast::new(&format!("{what}: the process crashed"))),
+                .add_toast(toast(format!("{what}: the process crashed"))),
+        }
+        // On a first run the runtime download is started instead of the
+        // account refresh, which then never happened: Play stayed refused
+        // with "identities are still loading" for the whole session.
+        if runtime_install {
+            refresh_account(&ui);
         }
     });
 }
@@ -2511,17 +2769,26 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
         report_busy(ui);
         return;
     }
-    let (default_dir, size, free) = {
+    // Rewriting a title's files while it runs leaves it reading half of each
+    // build.
+    if ui
+        .running
+        .borrow()
+        .contains_key(&product_id.to_ascii_uppercase())
+    {
+        ui.toasts
+            .add_toast(toast(format!("Stop {name} before updating it")));
+        return;
+    }
+    let (target, size) = {
         let model = ui.model.borrow();
-        let dir = model.install_destination(product_id);
         let product = model.catalog.get(&product_id.to_ascii_uppercase());
         let size = product.map(|p| p.size_label()).filter(|s| !s.is_empty());
-        let free = dir.as_deref().and_then(free_space_label);
-        (dir, size, free)
+        (model.install_target(product_id), size)
     };
-    let Some(default_dir) = default_dir else {
+    let Some((library, folder, _)) = target else {
         ui.toasts
-            .add_toast(adw::Toast::new("Cannot work out where to put it"));
+            .add_toast(toast("Cannot work out where to put it"));
         return;
     };
 
@@ -2530,11 +2797,9 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
     } else {
         format!("Install {name}?")
     };
-    let body = match (&size, &free) {
-        (Some(size), Some(free)) => format!("{size} to download. {free}"),
-        (Some(size), None) => format!("{size} to download."),
-        (None, Some(free)) => format!("The catalog does not give a size. {free}"),
-        (None, None) => "The catalog does not give a size.".to_string(),
+    let body = match &size {
+        Some(size) => format!("{size} to download."),
+        None => "The catalog does not give a size.".to_string(),
     };
 
     let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
@@ -2545,14 +2810,58 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
     dialog.set_close_response("cancel");
 
     // The destination is editable, because "somewhere on your smallest disk" is
-    // not a decision to make on someone's behalf for 160 GB.
+    // not a decision to make on someone's behalf for 160 GB. It names the
+    // library folder; the title gets a folder of its own inside it, said
+    // below the field as it is typed.
     let where_to = adw::EntryRow::builder()
         .title("Install to")
-        .text(default_dir.to_string_lossy().as_ref())
+        .text(library.to_string_lossy().as_ref())
+        .build();
+    let destination = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .margin_top(6)
+        .css_classes(["caption", "dim-label"])
         .build();
     let group = adw::PreferencesGroup::new();
     group.add(&where_to);
-    dialog.set_extra_child(Some(&group));
+    let extra = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    extra.append(&group);
+    extra.append(&destination);
+    dialog.set_extra_child(Some(&extra));
+
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    type Resolve = Rc<dyn Fn(&str) -> Result<PathBuf, String>>;
+    let resolve: Resolve = {
+        let ui = ui.clone();
+        let product_id = product_id.to_string();
+        Rc::new(move |text: &str| {
+            let model = ui.model.borrow();
+            model::install_destination(text, home.as_deref(), &folder, &|dir| {
+                model.inspect_folder(&product_id, dir)
+            })
+        })
+    };
+    let show = {
+        let resolve = Rc::clone(&resolve);
+        let dialog = dialog.clone();
+        let destination = destination.clone();
+        move |text: &str| match resolve(text) {
+            Ok(dir) => {
+                let free = free_space_label(&dir).unwrap_or_default();
+                destination.set_label(&format!("Installs into {}. {free}", dir.display()));
+                destination.remove_css_class("error");
+                dialog.set_response_enabled("install", true);
+            }
+            Err(why) => {
+                destination.set_label(&why);
+                destination.add_css_class("error");
+                dialog.set_response_enabled("install", false);
+            }
+        }
+    };
+    show(&where_to.text());
+    where_to.connect_changed(move |entry| show(&entry.text()));
 
     let window = ui.window.clone();
     let ui = ui.clone();
@@ -2562,9 +2871,11 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
         if response != "install" {
             return;
         }
-        let dir = where_to.text().to_string();
         let what = if updating { "Updating" } else { "Installing" };
-        spawn_install(&ui, &product_id, &name, Some(dir.trim()), what);
+        match resolve(&where_to.text()) {
+            Ok(dir) => spawn_install(&ui, &product_id, &name, Some(&dir), what),
+            Err(why) => ui.toasts.add_toast(toast(why)),
+        }
     });
     dialog.present(Some(&window));
 }
@@ -2575,46 +2886,49 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
 /// different amount of work to undo depending on whether it is 4 MB of a failed
 /// download or 45 GB of a game -- and because a launcher deleting a directory
 /// the person cannot see named is a launcher nobody should trust.
+///
+/// The folder is the one `ferestre uninstall` will delete, found the same way,
+/// so a download that stopped before anything recorded it can be removed too.
+/// Sizes are measured off the window's thread: walking a large title on a
+/// cold disk froze the window before the question even appeared.
 fn confirm_remove(ui: &Ui, product_id: &str, name: &str) {
     if ui.busy.borrow().is_some() || *ui.closing.borrow() {
         report_busy(ui);
         return;
     }
-    let dir = {
+    let key = product_id.to_ascii_uppercase();
+    if ui.running.borrow().contains_key(&key) {
+        ui.toasts
+            .add_toast(toast(format!("Stop {name} before removing it")));
+        return;
+    }
+    let (dir, prefixes, measured) = {
         let model = ui.model.borrow();
-        model
-            .records
-            .get(&product_id.to_ascii_uppercase())
-            .map(|record| record.dir.clone())
+        (
+            model.removal_dir(product_id),
+            model.prefixes(product_id),
+            current_disk_usage(&model, &key),
+        )
     };
-    let Some(dir) = dir else {
-        ui.toasts.add_toast(adw::Toast::new(
-            "Nothing is recorded on disk for this title",
-        ));
+    let Some(dir) = dir.filter(|dir| dir.is_dir()) else {
+        ui.toasts
+            .add_toast(toast(format!("Nothing of {name} is on disk to remove")));
         return;
     };
 
-    let size = ferestre_core::install::tree_size(&dir);
-    let prefix = ui
-        .model
-        .borrow()
-        .recipe_for(product_id)
-        .and_then(|recipe| {
-            ui.model
-                .borrow()
-                .paths
-                .as_ref()
-                .and_then(|paths| paths.prefix_dir(recipe).ok())
-        })
-        .filter(|p| p.is_dir());
-
-    let body = format!(
-        "{} will be deleted, freeing {}.\n\nThe title stays in your library and can be \
-         installed again.",
-        dir.display(),
-        ferestre_core::human_bytes(size)
-    );
-    let dialog = adw::AlertDialog::new(Some(&format!("Remove {name}?")), Some(&body));
+    let body =
+        {
+            let dir = dir.clone();
+            move |size: Option<u64>| {
+                format!(
+                "{} will be deleted, freeing {}.\n\nThe title stays in your library and can be \
+                 installed again.",
+                dir.display(),
+                size.map_or_else(|| "space (measuring…)".to_string(), ferestre_core::human_bytes)
+            )
+            }
+        };
+    let dialog = adw::AlertDialog::new(Some(&format!("Remove {name}?")), Some(&body(measured)));
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("remove", "Remove");
     dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
@@ -2624,14 +2938,41 @@ fn confirm_remove(ui: &Ui, product_id: &str, name: &str) {
     // Off by default, and it says why: removing it silently along with the
     // files throws away the one thing somebody would want back, and leaving it
     // unmentioned is how a `stardew-valley-proton` sits there afterwards with
-    // nothing explaining what it is.
-    let also_prefix = prefix.as_ref().map(|path| {
+    // nothing explaining what it is. With account roles, each Player has a
+    // copy of its own, and every one is listed.
+    let base = prefixes
+        .first()
+        .and_then(|p| p.parent())
+        .map(Path::to_path_buf);
+    let prefix_label = {
+        let names: Vec<String> = prefixes
+            .iter()
+            .map(|path| {
+                base.as_deref()
+                    .and_then(|base| path.strip_prefix(base).ok())
+                    .unwrap_or(path)
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        move |sizes: Option<&[u64]>| {
+            let lines: Vec<String> = names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| match sizes.and_then(|s| s.get(i)) {
+                    Some(size) => format!("{name}, {}", ferestre_core::human_bytes(*size)),
+                    None => format!("{name}, measuring…"),
+                })
+                .collect();
+            format!(
+                "Also delete saved games and settings:\n{}",
+                lines.join("\n")
+            )
+        }
+    };
+    let also_prefix = (!prefixes.is_empty()).then(|| {
         let check = gtk::CheckButton::builder()
-            .label(format!(
-                "Also delete saved games and settings ({}, in {})",
-                ferestre_core::human_bytes(ferestre_core::install::tree_size(path)),
-                path.file_name().unwrap_or_default().to_string_lossy()
-            ))
+            .label(prefix_label(None))
             .active(false)
             .margin_top(6)
             .build();
@@ -2639,12 +2980,45 @@ fn confirm_remove(ui: &Ui, product_id: &str, name: &str) {
         check
     });
 
+    {
+        let dialog = dialog.clone();
+        let check = also_prefix.clone();
+        let dir = dir.clone();
+        let prefixes = prefixes.clone();
+        glib::spawn_future_local(async move {
+            let measured_dir = measured;
+            let sizes = gio::spawn_blocking(move || {
+                let dir_size = match measured_dir {
+                    Some(size) => size,
+                    None => ferestre_core::install::tree_size(&dir),
+                };
+                let prefix_sizes: Vec<u64> = prefixes
+                    .iter()
+                    .map(|p| ferestre_core::install::tree_size(p))
+                    .collect();
+                (dir_size, prefix_sizes)
+            })
+            .await;
+            if let Ok((dir_size, prefix_sizes)) = sizes {
+                dialog.set_body(&body(Some(dir_size)));
+                if let Some(check) = check {
+                    check.set_label(Some(&prefix_label(Some(&prefix_sizes))));
+                }
+            }
+        });
+    }
+
     let window = ui.window.clone();
     let ui = ui.clone();
     let product_id = product_id.to_string();
     let name = name.to_string();
     dialog.connect_response(None, move |_, response| {
         if response != "remove" {
+            return;
+        }
+        if ui.running.borrow().contains_key(&key) {
+            ui.toasts
+                .add_toast(toast(format!("Stop {name} before removing it")));
             return;
         }
         let mut args = vec!["uninstall", &product_id, "--yes"];
@@ -2680,10 +3054,19 @@ fn free_space_label(dir: &Path) -> Option<String> {
 fn open_editor(ui: &Ui, product_id: &str, name: &str) {
     let (recipe, titles_dir) = {
         let model = ui.model.borrow();
-        let mut recipe = model
-            .recipe_for(product_id)
-            .cloned()
-            .unwrap_or_else(|| Recipe::blank(product_id, name));
+        let mut recipe = model.recipe_for(product_id).cloned().unwrap_or_else(|| {
+            let mut blank = Recipe::blank(product_id, name);
+            // Where the title is, not where its name's slug would put it: a
+            // title found by its package in a folder of another name, or left
+            // in games/<product id> by an install with no recipe, otherwise
+            // got a recipe pointing at a folder that does not exist.
+            blank.install.dir = model
+                .paths
+                .as_ref()
+                .zip(model.product_dir(product_id))
+                .and_then(|(paths, dir)| editor::relative_install_dir(paths.games_dir(), &dir));
+            blank
+        });
         // Fill the executable in from the package's own manifest rather than
         // asking someone to find an .exe in a tree of thousands. Only when the
         // field is empty: a recipe that names something else names it because
@@ -2698,7 +3081,7 @@ fn open_editor(ui: &Ui, product_id: &str, name: &str) {
     };
     let Some(titles_dir) = titles_dir else {
         ui.toasts
-            .add_toast(adw::Toast::new("Nowhere to save an edit: HOME is not set"));
+            .add_toast(toast("Nowhere to save an edit: HOME is not set"));
         return;
     };
 
@@ -2707,7 +3090,7 @@ fn open_editor(ui: &Ui, product_id: &str, name: &str) {
     editor::present(&window, recipe, titles_dir, move |path| {
         ui.model.borrow_mut().reload();
         render(&ui);
-        ui.toasts.add_toast(adw::Toast::new(&format!(
+        ui.toasts.add_toast(toast(format!(
             "Saved {}",
             path.file_name().unwrap_or_default().to_string_lossy()
         )));
@@ -2719,7 +3102,7 @@ fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {
     // underneath a running Steam is simply lost. Refusing is the only honest
     // behaviour; writing it and saying nothing would look like a bug in Steam.
     if steam::is_running() {
-        ui.toasts.add_toast(adw::Toast::new(
+        ui.toasts.add_toast(toast(
             "Close Steam first — it overwrites its shortcuts file when it exits",
         ));
         return;
@@ -2732,13 +3115,12 @@ fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {
         .as_ref()
         .and_then(|p| p.steam_dir().map(Path::to_owned));
     let Some(steam_dir) = steam_dir else {
-        ui.toasts
-            .add_toast(adw::Toast::new("No Steam installation found"));
+        ui.toasts.add_toast(toast("No Steam installation found"));
         return;
     };
     let files = steam::shortcut_files(&steam_dir);
     if files.is_empty() {
-        ui.toasts.add_toast(adw::Toast::new(
+        ui.toasts.add_toast(toast(
             "No Steam account on this machine has a shortcuts file",
         ));
         return;
@@ -2846,18 +3228,17 @@ fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {
                 } else {
                     "Some artwork was unavailable. Restart Steam to see it."
                 };
-                ui.toasts.add_toast(adw::Toast::new(&format!(
-                    "{action} \"{name}\" in Steam. {detail}"
-                )));
+                ui.toasts
+                    .add_toast(toast(format!("{action} \"{name}\" in Steam. {detail}")));
             }
-            Ok(Ok((_, _, errors))) => ui.toasts.add_toast(adw::Toast::new(&format!(
+            Ok(Ok((_, _, errors))) => ui.toasts.add_toast(toast(format!(
                 "Could not add to Steam: {}",
                 errors.join("; ")
             ))),
-            Ok(Err(error)) => ui.toasts.add_toast(adw::Toast::new(&error.to_string())),
+            Ok(Err(error)) => ui.toasts.add_toast(toast(error.to_string())),
             Err(_) => ui
                 .toasts
-                .add_toast(adw::Toast::new("Could not finish adding to Steam")),
+                .add_toast(toast("Could not finish adding to Steam")),
         }
     });
 }
@@ -2909,6 +3290,8 @@ fn finish(ui: &Ui) {
     *ui.wait_on_close.borrow_mut() = false;
     ui.close_note.set(None);
     *ui.download_control.borrow_mut() = None;
+    *ui.package_cancel.borrow_mut() = None;
+    ui.cancel_package.set_sensitive(true);
     ui.spinner.stop();
     show_activity(ui);
     // Let the completion callback reload records before closing the window.
@@ -2921,6 +3304,8 @@ fn finish(ui: &Ui) {
             if let Some((package, then)) = ui.install_owed.take() {
                 client_check::install(&ui, package, then);
             }
+        } else if ui.account_owed.get() {
+            refresh_account(&ui);
         } else if ui.entitlements_owed.get() {
             refresh_entitlements(&ui, true);
         }
@@ -2932,6 +3317,8 @@ fn show_activity(ui: &Ui) {
     let closing = *ui.closing.borrow();
     ui.activity.set_visible(busy.is_some());
     ui.keep_open.set_visible(closing);
+    ui.cancel_package
+        .set_visible(busy.is_some() && ui.package_cancel.borrow().is_some());
     let Some(what) = busy.as_deref() else {
         ui.spinner.set_tooltip_text(Some("No activity"));
         ui.spinner
@@ -2972,15 +3359,73 @@ fn report_busy(ui: &Ui) {
     } else {
         return;
     };
-    ui.toasts.add_toast(adw::Toast::new(&message));
+    ui.toasts.add_toast(toast(&message));
+}
+
+/// Closing while a title runs is allowed -- the title is its own process and
+/// keeps running -- but it is said first, because the window then cannot stop
+/// it, and a window opened later does not know it is running.
+fn confirm_close_while_running(ui: &Ui) -> glib::Propagation {
+    let running: Vec<String> = ui.running.borrow().keys().cloned().collect();
+    if running.is_empty() || ui.close_while_running.get() {
+        return glib::Propagation::Proceed;
+    }
+    if ui.close_dialog_open.replace(true) {
+        return glib::Propagation::Stop;
+    }
+    let names: Vec<String> = {
+        let model = ui.model.borrow();
+        running
+            .iter()
+            .map(|key| {
+                model
+                    .catalog
+                    .get(key)
+                    .map(|p| p.name.clone())
+                    .or_else(|| model.recipe_for(key).map(|r| r.title.name.clone()))
+                    .unwrap_or_else(|| key.clone())
+            })
+            .collect()
+    };
+    let body = match names.as_slice() {
+        [one] => format!(
+            "{one} is still running. It keeps running after the window closes, but it can \
+             then only be stopped from the game itself."
+        ),
+        many => format!(
+            "{} are still running. They keep running after the window closes, but they can \
+             then only be stopped from the games themselves.",
+            many.join(", ")
+        ),
+    };
+    let dialog = adw::AlertDialog::new(Some("Close Ferestre?"), Some(&body));
+    dialog.add_response("cancel", "Keep Open");
+    dialog.add_response("close", "Close");
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let window = ui.window.clone();
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, response| {
+        *ui.close_dialog_open.borrow_mut() = false;
+        if response == "close" {
+            ui.close_while_running.set(true);
+            ui.window.close();
+        } else if *ui.closing.borrow() {
+            // A close that waited for a task, and then for this answer.
+            *ui.closing.borrow_mut() = false;
+            show_activity(&ui);
+        }
+    });
+    dialog.present(Some(&window));
+    glib::Propagation::Stop
 }
 
 fn request_close(ui: &Ui) -> glib::Propagation {
     let Some(what) = ui.busy.borrow().clone() else {
-        return glib::Propagation::Proceed;
+        return confirm_close_while_running(ui);
     };
     if !*ui.wait_on_close.borrow() && ui.download_control.borrow().is_none() {
-        return glib::Propagation::Proceed;
+        return confirm_close_while_running(ui);
     }
     if *ui.closing.borrow() || ui.close_dialog_open.replace(true) {
         return glib::Propagation::Stop;
@@ -3025,24 +3470,29 @@ fn request_close(ui: &Ui) -> glib::Propagation {
 
 fn sign_in(ui: &Ui) {
     let Some(client) = ui.model.borrow().xodus_cli() else {
-        ui.toasts.add_toast(adw::Toast::new(
+        ui.toasts.add_toast(toast(
             "The Xodus client was not found. `ferestre doctor` says where it is looked for.",
         ));
         return;
     };
+    if ui.model.borrow().roles_error.is_some() {
+        ui.toasts.add_toast(toast(
+            "The account roles file cannot be read. Reset it first: the button is at the top of the window.",
+        ));
+        return;
+    }
     if !begin(ui, "Signing in") {
         report_busy(ui);
         return;
     }
-    ui.toasts
-        .add_toast(adw::Toast::new("Loading sign-in options"));
+    ui.toasts.add_toast(toast("Loading sign-in options"));
 
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = gio::spawn_blocking(move || {
             // A signed-out default profile must be reauthenticated through Add
             // account, which verifies and reuses its existing save namespace.
-            if accounts::fetch(&client).is_ok() {
+            if fetch_profiles(&client).is_ok() {
                 return Ok(None);
             }
             account::login_command(&client)
@@ -3058,9 +3508,9 @@ fn sign_in(ui: &Ui) {
             Ok(Ok(Some(status))) if status.success() => refresh_account(&ui),
             Ok(Ok(Some(status))) => ui
                 .toasts
-                .add_toast(adw::Toast::new(&format!("Sign-in exited {status}"))),
-            Ok(Err(e)) => ui.toasts.add_toast(adw::Toast::new(&e)),
-            Err(_) => ui.toasts.add_toast(adw::Toast::new("The client crashed")),
+                .add_toast(toast(format!("Sign-in exited {status}"))),
+            Ok(Err(e)) => ui.toasts.add_toast(toast(&e)),
+            Err(_) => ui.toasts.add_toast(toast("The client crashed")),
         }
     });
 }
@@ -3077,9 +3527,17 @@ fn refresh_account(ui: &Ui) {
     let (Some(client), Some(cache_dir)) = (client, cache_dir) else {
         return;
     };
-    if !begin(ui, "Refreshing account") {
+    // Whose account it is depends on the role file; until it can be read, a
+    // refresh would answer for whichever account is the default.
+    if ui.model.borrow().roles_error.is_some() {
         return;
     }
+    if !begin(ui, "Refreshing account") {
+        // Owed rather than dropped: the next finish starts it.
+        ui.account_owed.set(true);
+        return;
+    }
+    ui.account_owed.set(false);
     note_close(ui, REFRESH_CLOSE_NOTE);
 
     /// What the client said. Only `SignedOut` is allowed to clear the saved
@@ -3095,13 +3553,13 @@ fn refresh_account(ui: &Ui) {
         let expected = roles.clone();
         let result = gio::spawn_blocking(move || {
             let profiles = if roles.is_some() {
-                accounts::fetch(&client).ok()
+                fetch_profiles(&client).ok()
             } else {
                 None
             };
             let answer = (|| {
                 let mut command = scope_store(account::command(&client), roles.as_ref());
-                let Ok(output) = command.output() else {
+                let Ok(output) = deadline::output(&mut command, deadline::CLIENT_QUESTION) else {
                     return Answer::Unknown;
                 };
                 if !output.status.success() {
@@ -3181,6 +3639,18 @@ fn refresh_account(ui: &Ui) {
     });
 }
 
+/// The client's accounts, as `accounts::fetch` reads them, with a deadline.
+fn fetch_profiles(client: &Path) -> anyhow::Result<accounts::Profiles> {
+    let mut command = std::process::Command::new(client);
+    command.args(["account-profiles", "--json"]);
+    let output = deadline::output(&mut command, deadline::CLIENT_QUESTION)?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Cannot read account profiles; update the client and check that your keychain is unlocked"
+    );
+    accounts::parse_profiles(&output.stdout)
+}
+
 fn scope_store(
     mut command: std::process::Command,
     roles: Option<&accounts::Selection>,
@@ -3212,16 +3682,15 @@ fn refresh_updates(ui: &Ui, force: bool) {
     let (Some(client), Some(state_dir)) = (client, state_dir) else {
         return;
     };
-    if records.is_empty() {
+    if records.is_empty() || ui.model.borrow().roles_error.is_some() {
         return;
     }
-    if !begin(ui, "Checking for game updates") {
-        if force {
-            report_busy(ui);
-        }
+    // Background work with a flag of its own, not the window's busy slot:
+    // one stalled request used to refuse every Install, Remove and Sign in
+    // with "Checking for game updates" until the window was restarted.
+    if ui.checking_updates.replace(true) {
         return;
     }
-    note_close(ui, REFRESH_CLOSE_NOTE);
     let roles = ui.model.borrow().roles.clone();
     let ui = ui.clone();
     glib::spawn_future_local(async move {
@@ -3232,20 +3701,19 @@ fn refresh_updates(ui: &Ui, force: bool) {
                 let content_id = &record.content_ids[0];
                 let mut command = std::process::Command::new(&client);
                 command.args(["update", content_id, "--json"]);
-                let version = scope_store(command, roles.as_ref())
-                    .stderr(std::process::Stdio::null())
-                    .output()
-                    .ok()
-                    .filter(|output| output.status.success())
-                    .and_then(|output| {
-                        serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()
-                    })
-                    .and_then(|value| {
-                        value["version"]
-                            .as_str()
-                            .filter(|v| !v.is_empty())
-                            .map(str::to_string)
-                    });
+                let version = deadline::output(
+                    &mut scope_store(command, roles.as_ref()),
+                    deadline::CLIENT_QUESTION,
+                )
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok())
+                .and_then(|value| {
+                    value["version"]
+                        .as_str()
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_string)
+                });
                 // Preserve last-known results on failure, but also throttle
                 // retries across restarts until tomorrow or manual Refresh.
                 let version = ferestre_core::updates::save(&state_dir, &record, version.clone())
@@ -3255,7 +3723,7 @@ fn refresh_updates(ui: &Ui, force: bool) {
             available
         })
         .await;
-        finish(&ui);
+        ui.checking_updates.set(false);
         if ui.model.borrow().roles != expected {
             return;
         }
@@ -3281,6 +3749,13 @@ fn refresh_updates(ui: &Ui, force: bool) {
 fn refresh_entitlements(ui: &Ui, force: bool) {
     // A Refresh that had to wait is still a Refresh.
     let force = force || ui.entitlements_owed.get();
+    {
+        let model = ui.model.borrow();
+        // Nobody to ask about, or no way to tell whose library it would be.
+        if (model.account.is_none() && model.roles.is_none()) || model.roles_error.is_some() {
+            return;
+        }
+    }
     if !force {
         let model = ui.model.borrow();
         if model.entitlements_checked
@@ -3293,6 +3768,14 @@ fn refresh_entitlements(ui: &Ui, force: bool) {
         {
             return;
         }
+        // A check that failed waits a while before trying again by itself.
+        if ui
+            .entitlements_retry_at
+            .get()
+            .is_some_and(|at| std::time::Instant::now() < at)
+        {
+            return;
+        }
     }
     let blocked = ui.busy.borrow().is_some() && ui.download.current.borrow().is_none();
     if blocked || *ui.fetching_entitlements.borrow() {
@@ -3300,7 +3783,7 @@ fn refresh_entitlements(ui: &Ui, force: bool) {
         // does not, so keep the request and say when it will run, once.
         if force && blocked && !ui.entitlements_owed.replace(true) {
             if let Some(what) = ui.busy.borrow().as_deref() {
-                ui.toasts.add_toast(adw::Toast::new(&format!(
+                ui.toasts.add_toast(toast(format!(
                     "{what} is running. Your library will be checked when it finishes."
                 )));
             }
@@ -3325,12 +3808,13 @@ fn refresh_entitlements(ui: &Ui, force: bool) {
     glib::spawn_future_local(async move {
         let expected = roles.clone();
         let result = gio::spawn_blocking(move || {
-            let output = scope_store(
-                ferestre_core::library::library_command(&client, &Default::default()),
-                roles.as_ref(),
+            let output = deadline::output(
+                &mut scope_store(
+                    ferestre_core::library::library_command(&client, &Default::default()),
+                    roles.as_ref(),
+                ),
+                deadline::CLIENT_LISTING,
             )
-            .stderr(std::process::Stdio::null())
-            .output()
             .ok()?;
             if !output.status.success() {
                 return None;
@@ -3339,7 +3823,16 @@ fn refresh_entitlements(ui: &Ui, force: bool) {
         })
         .await;
         ui.fetching_entitlements.replace(false);
+        if !matches!(result, Ok(Some(_))) {
+            let failures = ui.entitlement_failures.get().saturating_add(1);
+            ui.entitlement_failures.set(failures);
+            ui.entitlements_retry_at.set(Some(
+                std::time::Instant::now() + model::retry_delay(failures),
+            ));
+        }
         if let Ok(Some(entries)) = result {
+            ui.entitlement_failures.set(0);
+            ui.entitlements_retry_at.set(None);
             // Ignore a response for an account that signed out or changed
             // while the query was in flight.
             if ui.model.borrow().roles != expected {
@@ -3372,10 +3865,15 @@ fn refresh_library(ui: &Ui) {
         (model.xodus_cli(), model.catalog_cache())
     };
     let (Some(client), Some(cache)) = (client, cache) else {
-        ui.toasts
-            .add_toast(adw::Toast::new("The Xodus client was not found"));
+        ui.toasts.add_toast(toast("The Xodus client was not found"));
         return;
     };
+    if ui.model.borrow().roles_error.is_some() {
+        ui.toasts.add_toast(toast(
+            "The account roles file cannot be read. Reset it first: the button is at the top of the window.",
+        ));
+        return;
+    }
     if !begin(ui, "Refreshing your library") {
         report_busy(ui);
         return;
@@ -3389,20 +3887,20 @@ fn refresh_library(ui: &Ui) {
         .iter()
         .map(|r| r.title.product_id.clone())
         .collect();
-    ui.toasts
-        .add_toast(adw::Toast::new("Asking what this account owns"));
+    ui.toasts.add_toast(toast("Asking what this account owns"));
 
     let roles = ui.model.borrow().roles.clone();
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let expected = roles.clone();
         let result = gio::spawn_blocking(move || {
-            let output = scope_store(
-                ferestre_core::library::library_command(&client, &Default::default()),
-                roles.as_ref(),
+            let output = deadline::output(
+                &mut scope_store(
+                    ferestre_core::library::library_command(&client, &Default::default()),
+                    roles.as_ref(),
+                ),
+                deadline::CLIENT_LISTING,
             )
-            .stderr(std::process::Stdio::null())
-            .output()
             .map_err(|e| format!("{}: {e}", client.display()))?;
             if !output.status.success() {
                 return Err(format!("{} exited {}", client.display(), output.status));
@@ -3458,14 +3956,10 @@ fn refresh_library(ui: &Ui) {
                         failures.len()
                     )
                 };
-                ui.toasts.add_toast(adw::Toast::new(&message));
+                ui.toasts.add_toast(toast(&message));
             }
-            Ok(Err(e)) => ui
-                .toasts
-                .add_toast(adw::Toast::new(&format!("Library: {e}"))),
-            Err(_) => ui
-                .toasts
-                .add_toast(adw::Toast::new("Library: the client crashed")),
+            Ok(Err(e)) => ui.toasts.add_toast(toast(format!("Library: {e}"))),
+            Err(_) => ui.toasts.add_toast(toast("Library: the client crashed")),
         }
     });
 }
@@ -3502,6 +3996,17 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
     {
         return;
     }
+    // Every redraw of the section asks for this when there is no listing, so
+    // a failure has to wait before it is tried again -- otherwise offline,
+    // each keystroke in the search box was another pair of requests.
+    if !force
+        && ui
+            .gamepass_retry_at
+            .get()
+            .is_some_and(|at| std::time::Instant::now() < at)
+    {
+        return;
+    }
     // Not the `busy` flag: this is a background list, and holding the window's
     // sign-in and library buttons hostage to it would be out of proportion.
     if !ui.fetching_gamepass.replace(true) {
@@ -3518,15 +4023,23 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
             .await;
             ui.fetching_gamepass.replace(false);
             let Ok(Ok((listing, tiers))) = fetched else {
+                let failures = ui.gamepass_failures.get().saturating_add(1);
+                ui.gamepass_failures.set(failures);
+                ui.gamepass_retry_at.set(Some(
+                    std::time::Instant::now() + model::retry_delay(failures),
+                ));
                 // Silent on purpose when there is already a listing: a failed
                 // refresh of a public list is not worth a toast over the top of
-                // whatever someone is doing.
-                if !have {
+                // whatever someone is doing. Said once otherwise, until the
+                // next Refresh, not once per attempt.
+                if !have && !ui.gamepass_reported.replace(true) {
                     ui.toasts
-                        .add_toast(adw::Toast::new("Could not fetch the Game Pass catalogue"));
+                        .add_toast(toast("Could not fetch the Game Pass catalogue"));
                 }
                 return;
             };
+            ui.gamepass_failures.set(0);
+            ui.gamepass_retry_at.set(None);
             // The merchandised list is what is kept: which ids the tier feed
             // added is worth knowing again on the next start.
             if let Some(dir) = paths {
@@ -3555,11 +4068,7 @@ fn fetch_names(ui: &Ui, product_ids: Vec<String>) {
     }
     let (cache, market, wanted) = {
         let model = ui.model.borrow();
-        let mut asked = ui.asked_names.borrow_mut();
-        let wanted: Vec<String> = product_ids
-            .into_iter()
-            .filter(|id| asked.insert(id.to_ascii_uppercase()))
-            .collect();
+        let wanted = model::unasked(product_ids, &mut ui.asked_names.borrow_mut());
         (model.catalog_cache(), model.market(), wanted)
     };
     let Some(cache) = cache else { return };
@@ -3617,6 +4126,13 @@ fn fetch_names(ui: &Ui, product_ids: Vec<String>) {
 fn fetch_icons(ui: &Ui, product_ids: Vec<String>) {
     let (cache, wanted) = {
         let model = ui.model.borrow();
+        // Each id once until Refresh, as for names: every redraw asked again
+        // for icons still downloading, and forever for one that failed.
+        let product_ids: Vec<String> = product_ids
+            .into_iter()
+            .filter(|id| model.catalog.contains_key(&id.to_ascii_uppercase()))
+            .collect();
+        let product_ids = model::unasked(product_ids, &mut ui.asked_icons.borrow_mut());
         let wanted: Vec<(String, catalog::Product)> = product_ids
             .into_iter()
             .filter_map(|id| {
@@ -3660,6 +4176,7 @@ mod catalog_regressions {
     fn fixture() -> Model {
         Model {
             roles: None,
+            roles_error: None,
             profiles: None,
             refused: Default::default(),
             paths: None,
@@ -3711,6 +4228,15 @@ mod catalog_regressions {
         assert!(!model.entitlements_checked);
     }
 
+    /// Nothing has been asked of the catalog yet.
+    fn no_lookups() -> NameLookups<'static> {
+        static NONE: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        NameLookups {
+            asked: &NONE,
+            fetching: false,
+        }
+    }
+
     fn snapshot(ultimate: bool) -> Vec<ferestre_core::library::Entry> {
         ferestre_core::library::parse(if ultimate {
             r#"[{"productId":"CFQ7TTC0P85B","status":"Revoked","productType":"Pass"},
@@ -3728,9 +4254,14 @@ mod catalog_regressions {
         let running = BTreeMap::new();
         model.subscriptions = vec!["Game Pass Premium"];
         let draw = |model: &Model| {
-            draw_list(model, &running, None, Section::GamePass, |row| {
-                !row.known_uninstallable()
-            })
+            draw_list(
+                model,
+                &running,
+                None,
+                no_lookups(),
+                Section::GamePass,
+                |row| !row.known_uninstallable(),
+            )
         };
         assert_eq!(
             draw(&model).rows.len(),
@@ -3754,6 +4285,7 @@ mod catalog_regressions {
             &model,
             &BTreeMap::new(),
             Some("9NR1R1XWLCNB"),
+            no_lookups(),
             Section::GamePass,
             |row| !row.known_uninstallable(),
         );
@@ -3770,12 +4302,117 @@ mod catalog_regressions {
             .gamepass
             .extend((0..50).map(|i| format!("9ZZTEST{i:05}")));
         model.page = 99;
-        let drawn = draw_list(&model, &BTreeMap::new(), None, Section::GamePass, |row| {
-            !row.known_uninstallable()
-        });
+        let drawn = draw_list(
+            &model,
+            &BTreeMap::new(),
+            None,
+            no_lookups(),
+            Section::GamePass,
+            |row| !row.known_uninstallable(),
+        );
         assert_eq!(drawn.pending_names, 51);
         assert!(drawn.want_names.contains(&"9NR1R1XWLCNB".into()));
         assert!(drawn.page < 99);
         assert!(!drawn.rows.is_empty());
+    }
+
+    /// A name the catalog has been asked for and did not describe is not
+    /// "still being looked up": counting it kept "Looking up 3 title names…"
+    /// on screen for good, and a search with no matches blamed it.
+    #[test]
+    fn names_asked_for_and_not_found_are_no_longer_pending() {
+        let mut model = fixture();
+        model.set_ownership(snapshot(false));
+        model
+            .gamepass
+            .extend((0..3).map(|i| format!("9ZZTEST{i:05}")));
+        let asked: std::collections::BTreeSet<String> = model
+            .gamepass
+            .iter()
+            .map(|id| id.to_ascii_uppercase())
+            .collect();
+        let draw = |fetching| {
+            draw_list(
+                &model,
+                &BTreeMap::new(),
+                None,
+                NameLookups {
+                    asked: &asked,
+                    fetching,
+                },
+                Section::GamePass,
+                |row| !row.known_uninstallable(),
+            )
+        };
+        assert_eq!(
+            draw(true).pending_names,
+            4,
+            "still pending while a lookup runs"
+        );
+        assert_eq!(draw(false).pending_names, 0);
+    }
+
+    /// Rows with no recipe and Game Pass rows showed Play while the title they
+    /// started was running, and a second Play started it again in the same
+    /// prefix.
+    #[test]
+    fn a_running_title_offers_stop_whatever_kind_of_row_it_is() {
+        let mut model = fixture();
+        model.set_ownership(snapshot(true));
+        model
+            .installed_products
+            .insert("9NR1R1XWLCNB".into(), PathBuf::from("/games/9nr1r1xwlcnb"));
+        let running: BTreeMap<String, stop::Launch> = [(
+            "9NR1R1XWLCNB".to_string(),
+            stop::Launch::new(42, std::time::Instant::now()),
+        )]
+        .into();
+        for section in [Section::GamePass, Section::Library] {
+            if section == Section::Library {
+                // Owned outright, with no recipe: an undescribed row.
+                model.ownership = Ownership::Known(
+                    ferestre_core::library::parse(
+                        r#"[{"productId":"9NR1R1XWLCNB","productType":"Game","status":"Active"}]"#,
+                    )
+                    .unwrap(),
+                );
+            }
+            let drawn = draw_list(&model, &running, None, no_lookups(), section, |_| true);
+            let row = drawn
+                .rows
+                .iter()
+                .find(|row| row.product_id.eq_ignore_ascii_case("9NR1R1XWLCNB"))
+                .unwrap_or_else(|| panic!("no row in {section:?}"));
+            assert_eq!(row.action, Action::Stop, "{section:?}");
+            assert!(row.subtitle.contains("running"), "{}", row.subtitle);
+        }
+    }
+
+    /// Every toast is plain text. Since libadwaita 1.4 a toast's title is
+    /// markup unless told otherwise, and a title like "Command & Conquer" or an
+    /// error with "<DIR>" in it drew an empty toast.
+    #[test]
+    fn every_toast_is_plain_text() {
+        let sources = [
+            ("main.rs", include_str!("main.rs")),
+            ("accounts_ui.rs", include_str!("accounts_ui.rs")),
+            ("client_check.rs", include_str!("client_check.rs")),
+            ("editor.rs", include_str!("editor.rs")),
+        ];
+        let forbidden = ["adw::Toast", "::new("].concat();
+        let builder = ["Toast", "::builder()"].concat();
+        for (file, text) in sources {
+            assert!(
+                !text.contains(&forbidden),
+                "{file} makes a toast that parses markup; use toast()"
+            );
+            for (at, _) in text.match_indices(&builder) {
+                let statement = &text[at..at + text[at..].find(".build()").expect("built")];
+                assert!(
+                    statement.contains(".use_markup(false)"),
+                    "{file}: a built toast must turn markup off: {statement}"
+                );
+            }
+        }
     }
 }
