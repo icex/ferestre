@@ -24,7 +24,15 @@ FFmpeg 4 ABI (`libavcodec.so.58`, `libavformat.so.58`, `libavfilter.so.7`,
 `libavcodec-freeworld`, does not supply these older library names. Without them,
 intro videos and cutscenes can be black or silent even when the game runs.
 
-On Fedora, enable [RPM Fusion](https://rpmfusion.org/Configuration), then run:
+A Steam install already provides them. Steam ships these four sonames in
+`ubuntu12_64/video` and `ubuntu12_32/video`, and Proton puts those directories
+first on its library path when Ferestre hands it the Steam install. `ferestre
+doctor` checks the same directories, in the same order, so it reports nothing
+missing when Steam is found. A shell `LD_LIBRARY_PATH` does not count: the
+launch removes it before starting Proton.
+
+Without a Steam install (or with one that lacks these files), install a
+compatibility package. On Fedora, enable [RPM Fusion](https://rpmfusion.org/Configuration), then run:
 
 ```sh
 sudo dnf install compat-ffmpeg4
@@ -37,7 +45,9 @@ libraries; the diagnostic does not certify a particular movie.
 
 Ferestre warns about missing plugin dependencies before launching a title.
 Until the runtime ships a decoder-enabled FFmpeg build with its full dependency
-set, these compatibility packages are required for its libav-based decoding.
+set, Steam's copy or these compatibility packages are required for its
+libav-based decoding. Set `XODUS_STEAM_DIR` if your Steam install is somewhere
+Ferestre does not look.
 
 ## SDL2 for PlayStation controllers
 

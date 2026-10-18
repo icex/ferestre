@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Exercise doctor with a real ELF dependency missing, then available to Proton."""
+"""Exercise doctor with a real ELF dependency missing, then available to Proton
+through Steam's video directory or the runtime's own libraries."""
 import json
 import os
 from pathlib import Path
@@ -26,7 +27,12 @@ class MediaDependencies(unittest.TestCase):
                             "-o", dependency, home / "dependency.c"], check=True)
             subprocess.run(["cc", "-shared", "-fPIC", "-o", plugins / "libgstlibav.so",
                             home / "plugin.c", dependency], check=True)
+            # An empty Steam install: the real one ships Steam's FFmpeg 4, which
+            # would otherwise satisfy or mask the fixture's search path.
+            steam = home / "steam"
+            steam.mkdir()
             env = dict(os.environ, HOME=temporary, XODUS_PROTON_DIR=str(runtime),
+                       XODUS_STEAM_DIR=str(steam),
                        XODUS_GAMES_DIR=str(home / "games"), XODUS_CLI_DIR=str(home / "client"),
                        XDG_CONFIG_HOME=str(home / "config"), XDG_STATE_HOME=str(home / "state"),
                        XDG_CACHE_HOME=str(home / "cache"))
@@ -41,6 +47,20 @@ class MediaDependencies(unittest.TestCase):
             self.assertEqual(missing["status"], "warn")
             self.assertIn(dependency.name, missing["detail"])
             self.assertIn("compat-ffmpeg4", missing["hint"])
+
+            # The launch drops an inherited LD_LIBRARY_PATH before Proton runs,
+            # so a library found only through it does not count.
+            inherited = dict(env, LD_LIBRARY_PATH=str(home))
+            result = subprocess.run([binary, "doctor", "--json"], env=inherited, capture_output=True, text=True)
+            checks = json.loads(result.stdout)["checks"]
+            self.assertEqual(next(c for c in checks if c["section"] == "media")["status"], "warn")
+
+            # Proton puts Steam's video directory on the path, ahead of the runtime.
+            video = steam / "ubuntu12_64/video"
+            video.mkdir(parents=True)
+            dependency = dependency.rename(video / dependency.name)
+            self.assertEqual(media_check()["status"], "ok")
+
             dependency.rename(lib / dependency.name)
             resolved = media_check()
             self.assertEqual(resolved["status"], "ok")

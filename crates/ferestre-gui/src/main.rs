@@ -1644,17 +1644,24 @@ fn warn_about_media(ui: &Ui, product_id: &str) {
                 model.registry.as_ref(),
             )
             .ok()
-            .map(|runtime| runtime.path.clone())
+            // The Steam install too: Proton searches its FFmpeg 4 first.
+            .map(|runtime| {
+                (
+                    runtime.path.clone(),
+                    paths.steam_dir().map(Path::to_path_buf),
+                )
+            })
         })
     };
-    let Some(runtime) = runtime else {
+    let Some((runtime, steam)) = runtime else {
         return;
     };
     let ui = ui.clone();
     glib::spawn_future_local(async move {
-        let checked =
-            gio::spawn_blocking(move || ferestre_core::media::missing_libav_dependencies(&runtime))
-                .await;
+        let checked = gio::spawn_blocking(move || {
+            ferestre_core::media::missing_libav_dependencies(&runtime, steam.as_deref())
+        })
+        .await;
         if let Ok(Ok(missing)) = checked {
             if !missing.is_empty() {
                 let message = format!("Videos may be black or silent: missing {}. Fedora: install compat-ffmpeg4 from RPM Fusion. Run ferestre doctor for details.", missing.join(", "));
