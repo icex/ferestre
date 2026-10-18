@@ -315,6 +315,16 @@ jobs:
           cargo test --locked -p xodus-cli
           cargo test --locked -p xodus --features key-chain-file --test key_chain_file
 
+      # The presence runner lives in the command-line client, which links the
+      # WebKitGTK sign-in window, so it needs those headers to build at all.
+      # Its tests run against a local server with a fake token provider and
+      # never sign in.
+      - name: Test the client's presence runner offline
+        run: |
+          sudo apt-get install -y libwebkit2gtk-4.1-dev
+          cd third_party/xodus-cli
+          cargo test --locked -p xodus-cli presence
+
   gui:
     runs-on: ubuntu-latest
     steps:
