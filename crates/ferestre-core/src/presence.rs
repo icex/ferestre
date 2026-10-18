@@ -503,28 +503,20 @@ impl Badge {
         note: None,
     };
 
-    pub fn label(&self) -> Option<String> {
+    /// Online or Offline, nothing else; what kind of online goes in
+    /// [`Badge::detail`]. Nothing while the first answer is awaited, so the
+    /// badge never says Offline before Xbox has.
+    pub fn label(&self) -> Option<&'static str> {
         Some(match &self.shown {
-            Shown::Hidden => return None,
-            Shown::Checking => "Checking".into(),
-            Shown::Unknown => "Unknown".into(),
-            Shown::Off => "Off".into(),
-            Shown::Offline => "Offline".into(),
-            Shown::Online(_) => "Online".into(),
-            Shown::Away => "Away".into(),
-            Shown::Playing(title) => format!("Playing {title}"),
+            Shown::Hidden | Shown::Checking => return None,
+            Shown::Online(_) | Shown::Away | Shown::Playing(_) => "Online",
+            Shown::Unknown | Shown::Off | Shown::Offline => "Offline",
         })
     }
 
     /// The modifier class on `presence-dot`; grey without one.
     pub fn css_class(&self) -> Option<&'static str> {
-        match self.shown {
-            Shown::Online(_) => Some("online"),
-            Shown::Away => Some("away"),
-            Shown::Playing(_) => Some("ingame"),
-            Shown::Checking => Some("pending"),
-            _ => None,
-        }
+        (self.label() == Some("Online")).then_some("online")
     }
 
     /// The lines after "Status: …": what Xbox's answer means, then what the
@@ -532,6 +524,7 @@ impl Badge {
     pub fn detail(&self) -> Option<String> {
         let meaning = match &self.shown {
             Shown::Hidden => return None,
+            Shown::Playing(title) => Some(format!("Playing {title}")),
             Shown::Online(titles) if titles.is_empty() => Some("Online on another device".into()),
             Shown::Online(titles) => Some(format!(
                 "Online on another device: {}",
@@ -545,9 +538,10 @@ impl Badge {
                     .collect::<Vec<_>>()
                     .join(", ")
             )),
+            Shown::Away => Some("Away on another device".into()),
             Shown::Off => Some("Not sharing the games you play".into()),
             Shown::Unknown => Some("Could not check your status".into()),
-            _ => None,
+            Shown::Checking | Shown::Offline => None,
         };
         let lines: Vec<String> = meaning.into_iter().chain(self.note.clone()).collect();
         (!lines.is_empty()).then(|| lines.join("\n"))
@@ -902,13 +896,24 @@ mod tests {
             badge(ready, sharing, runner, server).shown
         };
         let online = badge(ready, false, None, &known(&status));
-        assert_eq!(online.label().as_deref(), Some("Online"));
+        assert_eq!(online.label(), Some("Online"));
         assert_eq!(online.css_class(), Some("online"));
         assert!(online.tooltip().unwrap().contains("Halo on XboxSeries"));
         assert_eq!(shown(true, None, &known(&away)), Shown::Away);
         assert_eq!(shown(true, None, &known(&offline)), Shown::Offline);
         assert_eq!(shown(false, None, &known(&offline)), Shown::Off);
         assert_eq!(shown(true, None, &Server::Unknown), Shown::Checking);
+        assert_eq!(badge(ready, true, None, &Server::Unknown).label(), None);
+        assert_eq!(
+            badge(ready, true, None, &known(&away)).label(),
+            Some("Online")
+        );
+        let failed_check = badge(ready, true, None, &Server::Failed);
+        assert_eq!(failed_check.label(), Some("Offline"));
+        assert_eq!(
+            failed_check.tooltip().as_deref(),
+            Some("Status: Offline\nCould not check your status")
+        );
         assert_eq!(shown(false, None, &Server::Unknown), Shown::Hidden);
         assert_eq!(shown(true, None, &Server::Failed), Shown::Unknown);
         assert_eq!(shown(false, None, &Server::Failed), Shown::Hidden);
@@ -937,8 +942,12 @@ mod tests {
         )
         .unwrap();
         let now = badge(ready, true, Some(&playing), &known(&listed));
-        assert_eq!(now.label().as_deref(), Some("Playing presence game"));
-        assert_eq!(now.css_class(), Some("ingame"));
+        assert_eq!(now.label(), Some("Online"));
+        assert_eq!(now.css_class(), Some("online"));
+        assert_eq!(
+            now.tooltip().as_deref(),
+            Some("Status: Online\nPlaying presence game")
+        );
         assert_eq!(now.note, None);
         // Xbox listing a game is Xbox's answer whatever the switch says; the
         // runner is not mentioned once sharing is off.
@@ -965,7 +974,7 @@ mod tests {
             in_secs: Some(30),
         });
         let badge_now = badge(ready, true, Some(&retrying), &known(&status));
-        assert_eq!(badge_now.label().as_deref(), Some("Online"));
+        assert_eq!(badge_now.label(), Some("Online"));
         assert_eq!(badge_now.css_class(), Some("online"));
         assert!(badge_now
             .tooltip()
@@ -988,7 +997,7 @@ mod tests {
         assert_eq!(badge_now.shown, Shown::Off);
         assert_eq!(
             badge_now.tooltip().as_deref(),
-            Some("Status: Off\nNot sharing the games you play")
+            Some("Status: Offline\nNot sharing the games you play")
         );
         assert_eq!(
             badge(ready, true, Some(&Runner::Starting), &known(&away)).shown,

@@ -74,16 +74,6 @@ row.library-row label.title {
 .presence-dot.online {
   background-color: @success_color;
 }
-.presence-dot.away {
-  background-color: @warning_color;
-}
-.presence-dot.ingame {
-  background-color: @accent_color;
-}
-.presence-dot.pending {
-  background-color: @sidebar_bg_color;
-  box-shadow: inset 0 0 0 2px alpha(@window_fg_color, 0.4);
-}
 ";
 
 /// A toast that shows its text as written.
