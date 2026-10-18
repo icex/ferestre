@@ -522,6 +522,16 @@ impl Model {
     pub fn install_target(&self, product_id: &str) -> Option<(PathBuf, PathBuf, PathBuf)> {
         let paths = self.paths.as_ref()?;
         let default = self.install_destination(product_id)?;
+        // A library recorded as the title's folder (see `inspect_folder`) is
+        // offered as the library it is, with the title's usual folder inside.
+        if install::library_evidence(&default, product_id, paths).is_some() {
+            let folder = PathBuf::from(self.recipe_for(product_id).map_or_else(
+                || product_id.to_ascii_lowercase(),
+                |recipe| recipe.install_dir().to_string(),
+            ));
+            let inside = default.join(&folder);
+            return Some((default, folder, inside));
+        }
         let (library, folder) = match default.strip_prefix(paths.games_dir()) {
             Ok(relative) if !relative.as_os_str().is_empty() => {
                 (paths.games_dir().to_path_buf(), relative.to_path_buf())
@@ -549,7 +559,19 @@ impl Model {
             .get(&key)
             .is_some_and(|record| same_folder(&record.dir, dir));
         if recorded || store_id(dir).is_some_and(|id| id == key) {
-            return Folder::This;
+            // Not when it looks like a library: the old "Install to" put a
+            // title straight into the library chosen and recorded that. The
+            // title then gets a folder of its own inside it, as `ferestre
+            // install` gives it.
+            let library = self
+                .paths
+                .as_ref()
+                .and_then(|paths| install::library_evidence(dir, &key, paths));
+            return if library.is_some() {
+                Folder::Other
+            } else {
+                Folder::This
+            };
         }
         let Ok(entries) = std::fs::read_dir(dir) else {
             return Folder::Other;
@@ -1155,14 +1177,60 @@ mod tests {
             model.inspect_folder("9ZZA", &root.join("library")),
             Folder::Other
         );
+        // The folder its record names is its own...
         model
             .records
             .insert("9ZZA".into(), record("9ZZA", &root.join("library")));
         assert_eq!(
             model.inspect_folder("9ZZA", &root.join("library/")),
-            Folder::This,
-            "the folder its record names is its own, whatever is in it"
+            Folder::This
         );
+        // ...unless it holds other titles: what the old "Install to" recorded
+        // when it installed a title straight into a library. By its record,
+        // or by its package mixed into the library, it is not the title's.
+        installed(&root.join("library/Other Game"), "9ZZB");
+        assert_eq!(
+            model.inspect_folder("9ZZA", &root.join("library")),
+            Folder::Other,
+            "a recorded folder holding another game is a library"
+        );
+        installed(&root.join("library"), "9ZZA");
+        model.records.clear();
+        assert_eq!(
+            model.inspect_folder("9ZZA", &root.join("library")),
+            Folder::Other
+        );
+        // Nor is the games directory, whatever a record says.
+        let games = root.join("games");
+        std::fs::create_dir_all(&games).unwrap();
+        model.records.insert("9ZZA".into(), record("9ZZA", &games));
+        assert_eq!(model.inspect_folder("9ZZA", &games), Folder::Other);
+    }
+
+    /// A library recorded as the title's folder is offered as a library: the
+    /// title's usual folder goes inside it, and the dialog's default resolves
+    /// there rather than into the library itself.
+    #[test]
+    fn install_to_offers_a_recorded_library_as_a_library() {
+        let scratch = Scratch::new("recorded-library");
+        let mut model = model_at(&scratch.0);
+        let library = scratch.0.join("mnt/games");
+        installed(&library, "9NBLGGH2JHXJ");
+        installed(&library.join("Other Game"), "9ZZB");
+        model.recipes = vec![recipe("9NBLGGH2JHXJ", Some("bedrock/game"))];
+        model
+            .records
+            .insert("9NBLGGH2JHXJ".into(), record("9NBLGGH2JHXJ", &library));
+        let (offered, folder, default) = model.install_target("9NBLGGH2JHXJ").unwrap();
+        assert_eq!(offered, library);
+        assert_eq!(folder, PathBuf::from("bedrock/game"));
+        assert_eq!(default, library.join("bedrock/game"));
+        let resolved =
+            crate::model::install_destination(offered.to_str().unwrap(), None, &folder, &|dir| {
+                model.inspect_folder("9NBLGGH2JHXJ", dir)
+            })
+            .unwrap();
+        assert_eq!(resolved, library.join("bedrock/game"));
     }
 
     #[test]

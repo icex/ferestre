@@ -1431,13 +1431,18 @@ fn install_destination(
                     .map_err(|e| usage(&format!("{e:#}")))?
             }
         }
-        (None, Some(recipe)) => paths.install_dir(recipe)?,
+        (None, Some(recipe)) => {
+            own_folder_or_inside(paths, product_id, Some(recipe), paths.install_dir(recipe)?)?
+        }
         // An update of a title with no recipe goes where it was installed,
         // not into a second copy under the games directory.
-        (None, None) => install::load(paths.state_dir(), product_id)
+        (None, None) => match install::load(paths.state_dir(), product_id)
             .map(|record| record.dir)
             .filter(|dir| dir.is_absolute() && dir.is_dir())
-            .unwrap_or_else(|| paths.games_dir().join(product_id.to_ascii_lowercase())),
+        {
+            Some(dir) => own_folder_or_inside(paths, product_id, None, dir)?,
+            None => paths.games_dir().join(product_id.to_ascii_lowercase()),
+        },
     };
     if let Some(reason) = protected_reason(&dest, paths) {
         return Err(usage(&format!(
@@ -1452,6 +1457,42 @@ fn install_destination(
         )));
     }
     Ok(dest)
+}
+
+/// `dir`, where the title is recorded or set to be, unless that looks like a
+/// library of games ([`install::library_evidence`]) -- what the old "Install
+/// to" recorded when it put a title straight into the library chosen. Then
+/// the title goes into a folder of its own inside it, by the library rules,
+/// rather than being installed into the library again.
+fn own_folder_or_inside(
+    paths: &Paths,
+    product_id: &str,
+    recipe: Option<&Recipe>,
+    dir: PathBuf,
+) -> Result<PathBuf> {
+    let Some(why) = install::library_evidence(&dir, product_id, paths) else {
+        return Ok(dir);
+    };
+    let typed = dir.to_str().ok_or_else(|| {
+        usage(&format!(
+            "{}: the install folder has to be valid UTF-8",
+            dir.display()
+        ))
+    })?;
+    let folder = game_folder(recipe, product_id)?;
+    let inside = install::resolve_destination(
+        typed,
+        folder.to_str().unwrap_or_default(),
+        product_id,
+        paths,
+    )
+    .map_err(|e| usage(&format!("{e:#}")))?;
+    eprintln!(
+        ":: {} is recorded as {product_id}'s folder, but {why}; installing into {} instead",
+        dir.display(),
+        inside.display()
+    );
+    Ok(inside)
 }
 
 /// The folder a title gets inside a library: the recipe's install directory
@@ -1528,7 +1569,12 @@ fn is_default_folder(
     dir: &Path,
 ) -> Result<bool> {
     let mut defaults = vec![paths.games_dir().join(game_folder(recipe, product_id)?)];
-    if let Some(dir) = recipe.and_then(|recipe| paths.install_dir(recipe).ok()) {
+    // Where it is recorded, unless that is a library the old "Install to"
+    // recorded as the title's folder: chosen again, it is a library now.
+    if let Some(dir) = recipe
+        .and_then(|recipe| paths.install_dir(recipe).ok())
+        .filter(|dir| install::library_evidence(dir, product_id, paths).is_none())
+    {
         defaults.push(dir);
     }
     Ok(defaults
@@ -6256,6 +6302,42 @@ summary = "Runs."
         assert_eq!(
             install_destination(&paths, "9ZZPARTIAL01", None, Some(&library)).unwrap(),
             partial
+        );
+    }
+
+    /// The old "Install to" installed a title straight into the library
+    /// chosen and recorded the library. Neither the record, nor the window
+    /// passing that folder back, makes the library the title's folder again:
+    /// the next install goes into a folder of the title's own inside it.
+    #[test]
+    fn a_library_recorded_as_the_titles_folder_gets_a_folder_for_it() {
+        let home = Home::new("recorded-library");
+        let recipe = Recipe::parse(&game_recipe("[install]\ndir = \"testgame/package\"")).unwrap();
+        let paths = home.paths();
+        let library = home.root().join("mnt/games");
+        installed_package(&library, GAME);
+        installed_package(&library.join("Other Game"), "9ZZOTHERGAME");
+        record(&paths, GAME, &library);
+        assert_eq!(
+            paths.install_dir(&recipe).unwrap(),
+            library,
+            "it runs from there"
+        );
+
+        let inside = library.join("testgame/package");
+        for chosen in [None, Some(library.as_path())] {
+            assert_eq!(
+                install_destination(&paths, GAME, Some(&recipe), chosen).unwrap(),
+                inside,
+                "{chosen:?}"
+            );
+        }
+        // A title with no recipe, recorded the same way.
+        let id = "9ZZNORECIPE1";
+        record(&paths, id, &library);
+        assert_eq!(
+            install_destination(&paths, id, None, None).unwrap(),
+            library.join("9zznorecipe1")
         );
     }
 

@@ -306,6 +306,90 @@ pub fn check_removable(dir: &Path, paths: &crate::paths::Paths) -> Result<()> {
     Ok(())
 }
 
+/// Why `dir` is not `product_id`'s own folder although its record, or the
+/// package in it, says it is: it looks like a library of games. `None` when
+/// nothing says so.
+///
+/// "Install to" once installed a title straight into the folder chosen, so
+/// a record can name a whole library -- `/mnt/games`, with the title's package
+/// mixed in among other games. Taking such a folder as the title's own would
+/// put every update and repair into the library again, and make the library
+/// what Remove removes. The evidence is what [`check_removable`] looks for,
+/// and one thing more that only makes sense knowing the title: it is, or
+/// holds, one of the launcher's own directories; another title's record is
+/// below it, or more than one title is recorded in it; or directly inside it
+/// is another download, a title's Wine prefix, the Players' prefixes, or a
+/// package that names another product. One other title's record naming the
+/// folder is not evidence on its own: that is simply that title's folder.
+pub fn library_evidence(
+    dir: &Path,
+    product_id: &str,
+    paths: &crate::paths::Paths,
+) -> Option<String> {
+    let resolve = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let resolved = resolve(dir);
+    for (what, protected) in protected_dirs(paths) {
+        let protected = resolve(&protected);
+        if protected == resolved {
+            return Some(format!("it is {what}"));
+        }
+        if protected.starts_with(&resolved) {
+            return Some(format!("it holds {what}"));
+        }
+    }
+    let mut recorded_here = Vec::new();
+    for record in all(paths.state_dir()) {
+        if !record.dir.is_absolute() {
+            continue;
+        }
+        let recorded = resolve(&record.dir);
+        if recorded == resolved {
+            recorded_here.push(record.product_id);
+        } else if recorded.starts_with(&resolved)
+            && !record.product_id.eq_ignore_ascii_case(product_id)
+        {
+            return Some(format!("it holds the install of {}", record.product_id));
+        }
+    }
+    if recorded_here.len() > 1 {
+        return Some(format!(
+            "it is recorded as the folder of {}",
+            recorded_here.join(" and ")
+        ));
+    }
+    for entry in std::fs::read_dir(&resolved).into_iter().flatten().flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let child = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if child.join(CONTAINER).is_file() || child.join(PARTIAL_CONTAINER).is_file() {
+            return Some(format!("another download is in it ({name})"));
+        }
+        if name.ends_with("-proton") && child.join("pfx").is_dir() {
+            return Some(format!("a title's Wine prefix is in it ({name})"));
+        }
+        if name == "players"
+            && std::fs::read_dir(&child)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|namespace| {
+                    let name = namespace.file_name();
+                    let name = name.to_string_lossy();
+                    name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+        {
+            return Some("the Players' Wine prefixes are in it".into());
+        }
+        if let Some(other) = store_id(&child).filter(|id| !id.eq_ignore_ascii_case(product_id)) {
+            return Some(format!("the package of {other} is in it ({name})"));
+        }
+    }
+    None
+}
+
 /// The directories nothing may remove, or remove the parent of, with what to
 /// call each in a refusal.
 fn protected_dirs(paths: &crate::paths::Paths) -> Vec<(&'static str, PathBuf)> {
@@ -492,11 +576,18 @@ fn owner_of(dir: &Path, product_id: &str, paths: &crate::paths::Paths) -> Owner 
         .filter(|record| record.dir.is_absolute() && resolve(&record.dir) == resolved)
         .map(|record| record.product_id)
         .collect::<Vec<_>>();
+    // A folder that looks like a library is nobody's in particular, whatever
+    // its records or package say: the title goes into a folder of its own
+    // inside it ([`library_evidence`]). This is what the old "Install to"
+    // left, when it put titles straight into the library chosen.
+    let library = || library_evidence(dir, product_id, paths).is_some();
     if recorded_here
         .iter()
         .any(|id| id.eq_ignore_ascii_case(product_id))
     {
-        return if recorded_here.len() == 1 {
+        return if library() {
+            Owner::Nobody
+        } else if recorded_here.len() == 1 {
             Owner::This
         } else {
             recorded_here.retain(|id| !id.eq_ignore_ascii_case(product_id));
@@ -504,7 +595,11 @@ fn owner_of(dir: &Path, product_id: &str, paths: &crate::paths::Paths) -> Owner 
         };
     }
     if !recorded_here.is_empty() {
-        return Owner::Other(recorded_here.join(" and "));
+        return if library() {
+            Owner::Nobody
+        } else {
+            Owner::Other(recorded_here.join(" and "))
+        };
     }
     let installed = looks_installed(dir);
     let partial = is_partial(dir);
@@ -512,6 +607,7 @@ fn owner_of(dir: &Path, product_id: &str, paths: &crate::paths::Paths) -> Owner 
         return Owner::Nobody;
     }
     match store_id(dir) {
+        Some(_) if library() => Owner::Nobody,
         Some(id) if id.eq_ignore_ascii_case(product_id) => Owner::This,
         Some(id) => Owner::Other(id),
         None if partial => Owner::Unknown,
@@ -1341,6 +1437,114 @@ mod tests {
             p
         )
         .is_err());
+    }
+
+    /// The old "Install to" put a title straight into the library chosen and
+    /// recorded the library as its folder. Such a folder is not taken as the
+    /// title's own again, by its record or by the package mixed into it: the
+    /// next install goes into a folder of the title's own inside it.
+    #[test]
+    fn a_library_recorded_as_a_titles_folder_is_not_its_folder() {
+        let home = Home::new("recorded-library");
+        let p = &home.paths;
+        let id = "9NNX1VVR3KNQ";
+        let library = home.root.join("mnt/games");
+        let config = |dir: &Path, id: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join("MicrosoftGame.config"),
+                format!("<Game><StoreId>{id}</StoreId></Game>"),
+            )
+            .unwrap();
+        };
+        // The title's package, put straight into the library, beside a game
+        // of another product.
+        config(&library, id);
+        std::fs::write(library.join(CONTAINER), b"").unwrap();
+        config(&library.join("Other Game"), "9ZZOTHERGAME");
+        let mut forza = record(&[]);
+        forza.product_id = id.into();
+        forza.dir = library.clone();
+        save(p.state_dir(), &forza).unwrap();
+
+        let why = library_evidence(&library, id, p).unwrap();
+        assert!(why.contains("9ZZOTHERGAME"), "{why}");
+        assert_eq!(
+            resolve_destination(library.to_str().unwrap(), "fh5", id, p).unwrap(),
+            library.join("fh5")
+        );
+        // Two titles put there and recorded so: a library to either, and to a
+        // third title.
+        let mut halo = record(&[]);
+        halo.product_id = "9ZZHALOHALO1".into();
+        halo.dir = library.clone();
+        save(p.state_dir(), &halo).unwrap();
+        for (title, folder) in [
+            (id, "fh5"),
+            ("9ZZHALOHALO1", "halo"),
+            ("9ZZTHIRD0001", "third"),
+        ] {
+            assert_eq!(
+                resolve_destination(library.to_str().unwrap(), folder, title, p).unwrap(),
+                library.join(folder),
+                "{title}"
+            );
+        }
+        // One other title's own folder is still that title's, not a library.
+        let theirs = home.root.join("theirs");
+        config(&theirs, "9ZZOTHERGAME");
+        let mut other = record(&[]);
+        other.product_id = "9ZZOTHERGAME".into();
+        other.dir = theirs.clone();
+        save(p.state_dir(), &other).unwrap();
+        assert_eq!(library_evidence(&theirs, id, p), None);
+        let err = resolve_destination(theirs.to_str().unwrap(), "fh5", id, p)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("9ZZOTHERGAME"), "{err}");
+
+        // Each other sign of a library, on its own.
+        type Make<'a> = &'a dyn Fn(&Path);
+        let signs: [(&str, Make); 4] = [
+            ("download", &|dir| {
+                std::fs::create_dir_all(dir.join("x")).unwrap();
+                std::fs::write(dir.join("x").join(PARTIAL_CONTAINER), b"").unwrap();
+            }),
+            ("Wine prefix", &|dir| {
+                std::fs::create_dir_all(dir.join("x-proton/pfx")).unwrap()
+            }),
+            ("Players", &|dir| {
+                std::fs::create_dir_all(dir.join("players").join("a".repeat(64))).unwrap()
+            }),
+            ("install of 9ZZRECORDED1", &|dir| {
+                let mut other = record(&[]);
+                other.product_id = "9ZZRECORDED1".into();
+                other.dir = dir.join("deep/down");
+                save(p.state_dir(), &other).unwrap();
+            }),
+        ];
+        for (i, (what, make)) in signs.iter().enumerate() {
+            let dir = home.root.join(format!("lib{i}"));
+            config(&dir, id);
+            assert_eq!(library_evidence(&dir, id, p), None);
+            make(&dir);
+            let why = library_evidence(&dir, id, p).expect(what);
+            assert!(why.contains(what), "{what}: {why}");
+        }
+        // The games directory itself, recorded as a title's folder.
+        let why = library_evidence(&home.games(), id, p).unwrap();
+        assert!(why.contains("games directory"), "{why}");
+
+        // A title's own folder, with its own subfolders, is still its own.
+        let own = home.game("fh5");
+        config(&own, id);
+        config(&own.join("Content"), id);
+        std::fs::create_dir_all(own.join("players")).unwrap();
+        assert_eq!(library_evidence(&own, id, p), None);
+        assert_eq!(
+            resolve_destination(own.to_str().unwrap(), "fh5", id, p).unwrap(),
+            own
+        );
     }
 
     /// A first download leaves no record until it finishes, and its config
