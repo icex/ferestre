@@ -30,7 +30,12 @@ const APP: &str = "ferestre";
 /// and a checkout all carry `scripts/`, and `install-xodus-proton.sh` reads
 /// `patches/` out of the same place. Probing for it stops us pointing at some
 /// unrelated ancestor of wherever the binary happens to sit.
-const TREE_MARKER: &str = "scripts";
+///
+/// The shim rather than the directory, because plenty of people have a
+/// `~/scripts` of their own, and a binary in `~/.cargo/bin` or `~/.local/bin`
+/// has `$HOME` among its ancestors. Every launch execs this file, so a tree
+/// without it is no use to the launcher anyway.
+const TREE_MARKER: &str = "scripts/proton-wine-shim.sh";
 
 /// Steam installs, in the order xodus-env.sh probes them.
 fn steam_candidates(home: &Path) -> [PathBuf; 4] {
@@ -51,6 +56,10 @@ fn steam_candidates(home: &Path) -> [PathBuf; 4] {
 pub struct Env {
     vars: BTreeMap<String, String>,
     exe: Option<PathBuf>,
+    /// The directory relative path variables are taken against. The launch
+    /// later changes into the game directory, so a relative value left as it
+    /// is would mean something else by the time anything used it.
+    cwd: Option<PathBuf>,
     exists: Box<dyn Fn(&Path) -> bool>,
 }
 
@@ -59,16 +68,23 @@ impl std::fmt::Debug for Env {
         f.debug_struct("Env")
             .field("vars", &self.vars.len())
             .field("exe", &self.exe)
+            .field("cwd", &self.cwd)
             .finish_non_exhaustive()
     }
 }
 
 impl Env {
     /// The real process environment, probing the real filesystem.
+    ///
+    /// A variable whose name or value is not UTF-8 is left out rather than
+    /// read: `std::env::vars` panics on the first one, and a `PWD` in a
+    /// Latin-1 directory is not a reason for the launcher not to start. None of
+    /// the variables resolution reads can be one of those and still work.
     pub fn from_process() -> Self {
         Env {
-            vars: std::env::vars().collect(),
+            vars: utf8_vars(std::env::vars_os()),
             exe: std::env::current_exe().ok(),
+            cwd: std::env::current_dir().ok(),
             exists: Box::new(|p| p.exists()),
         }
     }
@@ -88,6 +104,7 @@ impl Env {
                 .map(|(k, v)| (k.into(), v.into()))
                 .collect(),
             exe: None,
+            cwd: None,
             exists: Box::new(|_| false),
         }
     }
@@ -110,6 +127,13 @@ impl Env {
         self
     }
 
+    /// The working directory relative path variables are resolved against.
+    /// Without one, a relative value is ignored as if it were unset.
+    pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
     /// A variable, with empty treated as unset -- `${VAR:-default}` in the
     /// shell does the same, and `XODUS_CLI_DIR=` is how xodus-env.sh itself
     /// records "looked, found nothing".
@@ -120,8 +144,12 @@ impl Env {
             .filter(|v| !v.is_empty())
     }
 
+    /// A path variable, made absolute. A relative `XODUS_GAMES_DIR=games`
+    /// would otherwise be read from wherever the launcher was started, and
+    /// then again from inside the game directory once the launch changes into
+    /// it.
     fn path(&self, name: &str) -> Option<PathBuf> {
-        self.var(name).map(PathBuf::from)
+        absolute(self.var(name)?, self.cwd.as_deref())
     }
 
     fn exists(&self, p: &Path) -> bool {
@@ -134,12 +162,14 @@ impl Env {
 
     /// The directory of `name` on `PATH`, the way `command -v` finds it. An
     /// empty PATH element means the working directory, which is not somewhere
-    /// we want to run a client from, so it is skipped.
+    /// we want to run a client from, so it is skipped -- and so is any other
+    /// relative element, `.` or `bin`, which names the working directory too
+    /// and would name the game directory by the time the client ran.
     fn on_path(&self, name: &str) -> Option<PathBuf> {
         let path = self.var("PATH")?;
         path.split(':')
-            .filter(|d| !d.is_empty())
             .map(Path::new)
+            .filter(|d| d.is_absolute())
             .find(|d| self.exists(&d.join(name)))
             .map(Path::to_path_buf)
     }
@@ -160,11 +190,14 @@ pub struct Paths {
     titles: Option<PathBuf>,
     steam: Option<PathBuf>,
     runtime: Option<PathBuf>,
+    /// Whether `runtime` came from `XODUS_PROTON_DIR` rather than a probe.
+    runtime_explicit: bool,
     cli_dir: Option<PathBuf>,
     state: PathBuf,
     cache: PathBuf,
     config: PathBuf,
     vars: BTreeMap<String, String>,
+    cwd: Option<PathBuf>,
 }
 
 impl Paths {
@@ -209,6 +242,7 @@ impl Paths {
         // The resolved Steam directory comes first, which is how a Flatpak
         // Steam gets found: it is the fourth Steam candidate but not one of the
         // three compat-tool candidates xodus-env.sh lists.
+        let runtime_explicit = env.path("XODUS_PROTON_DIR").is_some();
         let runtime = env
             .path("XODUS_PROTON_DIR")
             // Release archives keep the runtime beside the packaged scripts.
@@ -264,11 +298,13 @@ impl Paths {
             titles,
             steam,
             runtime,
+            runtime_explicit,
             cli_dir,
             state: xdg(env, "XDG_STATE_HOME", ".local/state").join(APP),
             cache: xdg(env, "XDG_CACHE_HOME", ".cache").join(APP),
             config: xdg(env, "XDG_CONFIG_HOME", ".config").join(APP),
             vars: env.vars.clone(),
+            cwd: env.cwd.clone(),
         })
     }
 
@@ -327,6 +363,14 @@ impl Paths {
     /// The patched Proton found through the legacy environment and Steam paths.
     pub fn runtime_dir(&self) -> Option<&Path> {
         self.runtime.as_deref()
+    }
+
+    /// The runtime someone named with `XODUS_PROTON_DIR`, as opposed to one
+    /// found by probing. Naming one is a choice, so it is treated as the
+    /// requested runtime rather than as one more candidate a newer download
+    /// would outrank -- and a wrong value is an error, not a silent fall back.
+    pub fn runtime_override(&self) -> Option<&Path> {
+        self.runtime.as_deref().filter(|_| self.runtime_explicit)
     }
 
     /// Independently downloaded runtime releases. Each child is a versioned
@@ -441,32 +485,53 @@ impl Paths {
     /// path from the recipe is, because a recipe is data from a file that may
     /// not be ours.
     ///
-    /// A recipe that names no directory falls back to where the launcher
-    /// recorded installing the title, while that directory is still there. A
+    /// Otherwise it is where the launcher recorded installing the title, while
+    /// that directory still holds the package, whatever the recipe names. A
     /// title downloaded before it had a recipe went to `<product id>`, not to
-    /// the slug a recipe shipped later defaults to; without this, the only way
-    /// to find it was a copy of the recipe in the user's titles directory, and
-    /// that copy then hid every later change to the shipped one.
+    /// the slug a recipe shipped later defaults to, and a title installed
+    /// somewhere chosen in the install dialog is wherever that was; without
+    /// this, either one read as not installed, and the next Install fetched
+    /// the whole title again to the default place. A half-finished update
+    /// still counts: the record says where the title lives, and resuming it
+    /// anywhere else would start from nothing.
+    ///
+    /// Only then the recipe's own directory, or the slug.
     pub fn install_dir(&self, recipe: &Recipe) -> Result<PathBuf> {
-        if let Some(dir) = self.recipe_env(recipe.install.dir_env.as_deref()) {
+        if let Some(dir) = self.recipe_env(recipe.install.dir_env.as_deref(), recipe)? {
             return Ok(dir);
         }
-        if recipe.install.dir.is_none() {
-            if let Some(record) = crate::install::load(&self.state, &recipe.title.product_id) {
-                if record.dir.is_dir() {
-                    return Ok(record.dir);
-                }
+        if let Some(record) = crate::install::load(&self.state, &recipe.title.product_id) {
+            if record.dir.is_absolute()
+                && record.dir.is_dir()
+                && (crate::install::looks_installed(&record.dir)
+                    || crate::install::is_partial(&record.dir))
+            {
+                return Ok(record.dir);
             }
         }
         self.under_games(recipe.install_dir(), "install dir", recipe)
     }
 
     /// The title's Wine prefix (`STEAM_COMPAT_DATA_PATH`).
+    ///
+    /// When a shipped recipe has replaced one the launcher generated, the
+    /// generated one's prefix is kept while the shipped one's does not exist
+    /// yet. The two usually have different slugs, and the prefix is where the
+    /// saves are: following the new slug would start the title with none.
     pub fn prefix_dir(&self, recipe: &Recipe) -> Result<PathBuf> {
-        if let Some(dir) = self.recipe_env(recipe.install.prefix_env.as_deref()) {
+        if let Some(dir) = self.recipe_env(recipe.install.prefix_env.as_deref(), recipe)? {
             return Ok(dir);
         }
-        self.under_games(&recipe.prefix_dir(), "prefix", recipe)
+        let prefix = self.under_games(&recipe.prefix_dir(), "prefix", recipe)?;
+        if !prefix.exists() {
+            if let Some(earlier) = recipe.superseded_prefix.as_deref() {
+                let earlier = self.under_games(earlier, "prefix", recipe)?;
+                if earlier.is_dir() {
+                    return Ok(earlier);
+                }
+            }
+        }
+        Ok(prefix)
     }
 
     /// The launch log, named as the shell scripts name it so an existing log
@@ -476,8 +541,27 @@ impl Paths {
         self.under_games(&name, "log file", recipe)
     }
 
-    fn recipe_env(&self, name: Option<&str>) -> Option<PathBuf> {
-        self.var(name?).map(PathBuf::from)
+    /// A recipe's `dir-env` or `prefix-env`. The name is data from a file
+    /// that may not be ours, so it has to be one of the variables that exist
+    /// to name a title's directory (`BEDROCK_DIR`, `FH5_PREFIX`): pointing it
+    /// at `XODUS_GAMES_DIR` or `XDG_RUNTIME_DIR` would hand the whole games
+    /// directory, or the session's runtime directory, to an uninstall. The
+    /// value is the user's own and may be anywhere, but it is made absolute,
+    /// since the launch changes directory before anything reads it.
+    fn recipe_env(&self, name: Option<&str>, recipe: &Recipe) -> Result<Option<PathBuf>> {
+        let Some(name) = name else {
+            return Ok(None);
+        };
+        if !crate::recipe::is_location_variable(name) {
+            bail!(
+                "{}: \"{name}\" is not a variable a recipe may take a directory from \
+                 (it must end in _DIR or _PREFIX, and not be one of the launcher's own)",
+                recipe.title.product_id
+            );
+        }
+        Ok(self
+            .var(name)
+            .and_then(|value| absolute(value, self.cwd.as_deref())))
     }
 
     /// Join a recipe-supplied relative path to the games directory, refusing
@@ -508,6 +592,28 @@ impl Paths {
             );
         }
         Ok(self.games.join(path))
+    }
+}
+
+/// Keep the variables that are valid UTF-8, name and value both, and drop the
+/// rest.
+fn utf8_vars<I>(vars: I) -> BTreeMap<String, String>
+where
+    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+{
+    vars.into_iter()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect()
+}
+
+/// A path value made absolute against `cwd`. `None` for a relative value when
+/// there is no working directory to take it against.
+fn absolute(value: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        cwd.map(|cwd| cwd.join(path))
     }
 }
 
@@ -761,7 +867,7 @@ summary = "Runs."
         let e = env(&[])
             .with_exe("/home/tester/src/ferestre/target/debug/ferestre")
             .with_existing([
-                "/home/tester/src/ferestre/scripts",
+                "/home/tester/src/ferestre/scripts/proton-wine-shim.sh",
                 "/home/tester/src/ferestre/third_party/xodus-cli/target/release",
                 "/home/tester/src/xodus-cli/target/release",
             ]);
@@ -779,7 +885,7 @@ summary = "Runs."
         let packaged = Paths::resolve(
             &env(&[])
                 .with_exe("/usr/bin/ferestre")
-                .with_existing(["/usr/lib/ferestre/scripts"]),
+                .with_existing(["/usr/lib/ferestre/scripts/proton-wine-shim.sh"]),
         )
         .unwrap();
         assert_eq!(packaged.tree_dir(), Some(Path::new("/usr/lib/ferestre")));
@@ -794,7 +900,7 @@ summary = "Runs."
             &env(&[("APPDIR", "/tmp/.mount_ferestreAB")])
                 .with_exe("/tmp/.mount_ferestreAB/usr/bin/ferestre")
                 .with_existing([
-                    "/tmp/.mount_ferestreAB/usr/lib/ferestre/scripts",
+                    "/tmp/.mount_ferestreAB/usr/lib/ferestre/scripts/proton-wine-shim.sh",
                     "/tmp/.mount_ferestreAB/usr/lib/ferestre/titles",
                 ]),
         )
@@ -809,7 +915,7 @@ summary = "Runs."
             &env(&[])
                 .with_exe("/home/tester/src/ferestre/target/debug/deps/ferestre_core-1234")
                 .with_existing([
-                    "/home/tester/src/ferestre/scripts",
+                    "/home/tester/src/ferestre/scripts/proton-wine-shim.sh",
                     "/home/tester/src/ferestre/titles",
                 ]),
         )
@@ -827,7 +933,7 @@ summary = "Runs."
             &env(&[("PATH", "/usr/bin")])
                 .with_exe("/opt/ferestre/usr/bin/ferestre")
                 .with_existing([
-                    format!("{root}/scripts"),
+                    format!("{root}/scripts/proton-wine-shim.sh"),
                     format!("{root}/client"),
                     format!("{root}/runtime"),
                     "/usr/bin/xodus-cli".to_string(),
@@ -865,10 +971,12 @@ summary = "Runs."
     }
 
     #[test]
-    fn a_recorded_install_is_found_without_a_recipe_naming_its_directory() {
+    fn a_recorded_install_is_found_wherever_it_was_put() {
         let root = std::env::temp_dir().join(format!("ferestre-recorded-{}", std::process::id()));
-        let downloaded = root.join("games/9nblggh2jhxj");
+        let _ = std::fs::remove_dir_all(&root);
+        let downloaded = root.join("elsewhere/9nblggh2jhxj");
         std::fs::create_dir_all(&downloaded).unwrap();
+        std::fs::write(downloaded.join("appxmanifest.xml"), "<Package/>").unwrap();
         let state = root.join("state");
         let p = paths(&[
             ("XDG_STATE_HOME", state.to_str().unwrap()),
@@ -884,19 +992,197 @@ summary = "Runs."
         crate::install::save(p.state_dir(), &record).unwrap();
 
         assert_eq!(p.install_dir(&recipe("")).unwrap(), downloaded);
-        // A directory the recipe names is still where the recipe says.
+        // A recipe that names a fixed directory does not hide an install the
+        // launcher put somewhere else: the record says where it went.
         assert_eq!(
-            p.install_dir(&recipe("[install]\ndir = \"elsewhere\""))
+            p.install_dir(&recipe("[install]\ndir = \"bedrock/game\""))
                 .unwrap(),
-            root.join("games/elsewhere")
+            downloaded
         );
-        // A record whose directory has gone is not followed.
-        std::fs::remove_dir_all(&downloaded).unwrap();
+        // An update that stopped halfway is still this title's folder.
+        std::fs::write(downloaded.join(".xodus-streaming-tmp.msixvc"), b"part").unwrap();
+        assert_eq!(p.install_dir(&recipe("")).unwrap(), downloaded);
+        // An env override still wins over everything.
+        let with_env = paths(&[
+            ("XDG_STATE_HOME", state.to_str().unwrap()),
+            ("XODUS_GAMES_DIR", root.join("games").to_str().unwrap()),
+            ("EXAMPLE_DIR", "/mnt/example"),
+        ]);
+        assert_eq!(
+            with_env
+                .install_dir(&recipe("[install]\ndir-env = \"EXAMPLE_DIR\""))
+                .unwrap(),
+            Path::new("/mnt/example")
+        );
+        // A directory that holds nothing of the title is not followed.
+        std::fs::remove_file(downloaded.join("appxmanifest.xml")).unwrap();
+        std::fs::remove_file(downloaded.join(".xodus-streaming-tmp.msixvc")).unwrap();
         assert_eq!(
             p.install_dir(&recipe("")).unwrap(),
             root.join("games/example")
         );
+        // Nor is one that has gone.
+        std::fs::remove_dir_all(&downloaded).unwrap();
+        assert_eq!(
+            p.install_dir(&recipe("[install]\ndir = \"bedrock/game\""))
+                .unwrap(),
+            root.join("games/bedrock/game")
+        );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_shipped_recipe_keeps_the_prefix_of_the_generated_one_it_replaced() {
+        let root = std::env::temp_dir().join(format!("ferestre-superseded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let games = root.join("games");
+        let p = paths(&[("XODUS_GAMES_DIR", games.to_str().unwrap())]);
+        let mut shipped = recipe("");
+        shipped.superseded_prefix = Some("detected-name-proton".into());
+
+        // Nothing there yet: the shipped recipe's own prefix.
+        assert_eq!(
+            p.prefix_dir(&shipped).unwrap(),
+            games.join("example-proton")
+        );
+        // The generated recipe's prefix holds the saves, so it is kept.
+        std::fs::create_dir_all(games.join("detected-name-proton")).unwrap();
+        assert_eq!(
+            p.prefix_dir(&shipped).unwrap(),
+            games.join("detected-name-proton")
+        );
+        // Once the shipped recipe's own prefix exists, that is the one.
+        std::fs::create_dir_all(games.join("example-proton")).unwrap();
+        assert_eq!(
+            p.prefix_dir(&shipped).unwrap(),
+            games.join("example-proton")
+        );
+        // And the remembered name gets no more trust than the recipe's.
+        let _ = std::fs::remove_dir_all(games.join("example-proton"));
+        shipped.superseded_prefix = Some("../../escape".into());
+        assert!(p.prefix_dir(&shipped).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_home_scripts_directory_is_not_mistaken_for_the_tree() {
+        // `cargo install` puts the binary in ~/.cargo/bin, two levels below
+        // $HOME, and plenty of people keep a ~/scripts of their own.
+        let p = Paths::resolve(
+            &env(&[])
+                .with_exe("/home/tester/.cargo/bin/ferestre")
+                .with_existing([
+                    "/home/tester/scripts",
+                    "/home/tester/runtime",
+                    "/usr/lib/ferestre/scripts/proton-wine-shim.sh",
+                ]),
+        )
+        .unwrap();
+        assert_eq!(p.tree_dir(), Some(Path::new("/usr/lib/ferestre")));
+        assert_eq!(
+            p.scripts_dir(),
+            Some(Path::new("/usr/lib/ferestre/scripts"))
+        );
+        assert_eq!(p.runtime_dir(), None);
+    }
+
+    #[test]
+    fn relative_values_are_taken_against_the_starting_directory() {
+        let p = Paths::resolve(
+            &env(&[
+                ("XODUS_GAMES_DIR", "games"),
+                ("XODUS_CLI_DIR", "./client"),
+                ("EXAMPLE_DIR", "mine/example"),
+            ])
+            .with_cwd("/home/tester/work"),
+        )
+        .unwrap();
+        assert_eq!(p.games_dir(), Path::new("/home/tester/work/games"));
+        assert_eq!(p.cli_dir(), Some(Path::new("/home/tester/work/./client")));
+        assert_eq!(
+            p.install_dir(&recipe("[install]\ndir-env = \"EXAMPLE_DIR\""))
+                .unwrap(),
+            Path::new("/home/tester/work/mine/example")
+        );
+
+        // With no starting directory to go by, a relative value is not used.
+        let p = paths(&[("XODUS_GAMES_DIR", "games")]);
+        assert_eq!(p.games_dir(), Path::new("/home/tester/xbox-games"));
+    }
+
+    #[test]
+    fn relative_path_entries_are_not_searched_for_the_client() {
+        // The launch changes into the game directory, so "." would mean the
+        // game package by then.
+        let e = env(&[("PATH", ".:bin:/usr/bin")])
+            .with_cwd("/home/tester/client")
+            .with_existing([".", "./xodus-cli", "bin/xodus-cli", "/usr/bin/xodus-cli"]);
+        let p = Paths::resolve(&e).unwrap();
+        assert_eq!(p.cli_dir(), Some(Path::new("/usr/bin")));
+    }
+
+    #[test]
+    fn a_recipe_cannot_borrow_the_launchers_own_variables() {
+        for name in [
+            "XODUS_GAMES_DIR",
+            "XDG_RUNTIME_DIR",
+            "HOME",
+            "FERESTRE_TITLES",
+            "STEAM_COMPAT_DATA_PATH",
+        ] {
+            let p = paths(&[(name, "/home/tester/xbox-games")]);
+            let mut r = recipe("");
+            r.install.dir_env = Some(name.into());
+            let err = p.install_dir(&r).unwrap_err().to_string();
+            assert!(err.contains(name), "{err}");
+            let mut r = recipe("");
+            r.install.prefix_env = Some(name.into());
+            assert!(p.prefix_dir(&r).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_runtime_override_is_told_apart_from_a_probed_runtime() {
+        let p = paths(&[("XODUS_PROTON_DIR", "/mnt/proton")]);
+        assert_eq!(p.runtime_override(), Some(Path::new("/mnt/proton")));
+        let probed = Paths::resolve(&env(&[]).with_existing([
+            "/home/tester/.steam/steam",
+            "/home/tester/.steam/steam/compatibilitytools.d/xodus",
+        ]))
+        .unwrap();
+        assert!(probed.runtime_dir().is_some());
+        assert_eq!(probed.runtime_override(), None);
+    }
+
+    /// `std::env::vars` panics on a variable that is not UTF-8, so this runs
+    /// the resolution in a child process that has one.
+    #[test]
+    fn a_variable_that_is_not_utf8_does_not_stop_the_launcher() {
+        use std::os::unix::ffi::OsStrExt;
+        const CHILD: &str = "FERESTRE_TEST_NON_UTF8_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let env = Env::from_process();
+            assert_eq!(env.var("FERESTRE_TEST_PLAIN"), Some("kept"));
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "paths::tests::a_variable_that_is_not_utf8_does_not_stop_the_launcher",
+                "--quiet",
+            ])
+            .env(CHILD, "1")
+            .env("FERESTRE_TEST_PLAIN", "kept")
+            .env(
+                "FERESTRE_TEST_LATIN1",
+                std::ffi::OsStr::from_bytes(b"/home/u/D\xe9p\xf4t"),
+            )
+            .env(std::ffi::OsStr::from_bytes(b"FERESTRE_\xff_NAME"), "value")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "the child panicked: {status}");
     }
 
     #[test]
