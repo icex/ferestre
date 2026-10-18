@@ -60,6 +60,18 @@ if [ -z "${WINE_PACKAGE_MANIFEST:-}" ]; then
     done
 fi
 
+# PlayStation pads through SDL, as Xbox-style gamepads. Wine prefers raw HID
+# for DualShock 4 and DualSense, and a raw-HID pad is never an XInput device,
+# so a GDK title -- which sees gamepads only through XInput and GameInput --
+# finds no controller at all (issue 10: a Bluetooth DualShock 4 did nothing in
+# Minecraft Dungeons II without Steam). This is the list Valve's own proton
+# script uses for the same purpose, not "1", which would also take hidraw away
+# from wheels and flight sticks. `-` rather than `:-` keeps any value already
+# exported, including an empty one; a title that reads Sony HID itself sets
+# PROTON_DISABLE_HIDRAW=0 in its recipe. Exported before the `reg add` below,
+# so the Wine session that call may start already has it.
+export PROTON_DISABLE_HIDRAW="${PROTON_DISABLE_HIDRAW-0x054C/0x05C4,0x054C/0x09CC,0x054C/0x0BA0,0x054C/0x0CE6,0x054C/0x0DF2}"
+
 # Before loading gameplatformservices.dll, PlayFab Party (and anything else
 # built on the GDK's loader for it) waits for Microsoft Gaming Services'
 # watchdog for up to HKLM\Microsoft\GamingServices\ServiceRetryTimeout, 60 s

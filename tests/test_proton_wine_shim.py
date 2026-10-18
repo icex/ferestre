@@ -83,5 +83,37 @@ class GamingServicesWaitTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertTrue(calls[0].startswith('run reg add HKLM\\Microsoft\\GamingServices '))
 
+class PlayStationPadTests(unittest.TestCase):
+    """Sony pads go through SDL so a GDK title sees them as XInput gamepads (issue 10)."""
+    SONY = '0x054C/0x05C4,0x054C/0x09CC,0x054C/0x0BA0,0x054C/0x0CE6,0x054C/0x0DF2'
+
+    def run_shim(self, root, **extra):
+        proton = root / 'runtime'
+        proton.mkdir()
+        calls = root / 'calls'
+        launcher = proton / 'proton'
+        launcher.write_text('#!/bin/sh\n'
+                            'printf "%s|%s\\n" "$*" "${PROTON_DISABLE_HIDRAW-unset}" >> "$CALLS"\n')
+        launcher.chmod(0o755)
+        env = {k: v for k, v in os.environ.items()
+               if k not in ['FERESTRE_IMAGE_VIEW', 'PROTON_DISABLE_HIDRAW']}
+        env.update(PROTON_DIR=str(proton), STEAM_COMPAT_DATA_PATH=str(root/'prefix'),
+                   XODUS_GAMES_DIR=str(root/'games'), CALLS=str(calls), **extra)
+        subprocess.run([str(SHIM), 'Game.exe'], env=env, cwd=root, check=True,
+                       capture_output=True, text=True)
+        return calls.read_text().splitlines()
+
+    def test_sony_pads_default_to_sdl_for_the_session_and_the_game(self):
+        with tempfile.TemporaryDirectory(prefix='ferestre shim ') as tmp:
+            calls = self.run_shim(Path(tmp))
+        # The prefix's reg add may start the Wine session the game then joins.
+        self.assertEqual([c.split('|')[1] for c in calls], [self.SONY, self.SONY])
+
+    def test_an_explicit_value_is_kept_even_empty_or_zero(self):
+        for value in ['0', '', '0x054C/0x09CC']:
+            with tempfile.TemporaryDirectory(prefix='ferestre shim ') as tmp:
+                calls = self.run_shim(Path(tmp), PROTON_DISABLE_HIDRAW=value)
+            self.assertEqual(calls[-1], 'run Game.exe|' + value, value)
+
 if __name__ == '__main__':
     unittest.main()

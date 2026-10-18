@@ -1015,6 +1015,15 @@ fn register_winrt_classes(
             Err(e) => eprintln!("-- could not register {}: {e}", class.name),
         }
     }
+    // `wine reg` started a session for the prefix -- services, winedevice and
+    // the input bus -- with this process's environment, not the title's. A
+    // title launched while it lingers joins it, and its input settings (the
+    // shim's PROTON_DISABLE_HIDRAW, a recipe's override) never reach the bus
+    // that enumerates controllers. Let it end first.
+    let _ = Command::new(runtime.path.join("files/bin/wineserver"))
+        .arg("-w")
+        .env("WINEPREFIX", prefix.join("pfx"))
+        .status();
 }
 
 /// Describe an installed title from its own package, if it is installed and the

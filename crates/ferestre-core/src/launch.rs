@@ -448,6 +448,23 @@ summary = "Runs."
         }
     }
 
+    /// Steam lists the physical pads it wraps in SDL_GAMECONTROLLER_IGNORE_DEVICES
+    /// (every Sony pad among them) and describes its virtual pads in
+    /// SteamVirtualGamepadInfo. Wine's input bus reads both; stripped, a
+    /// DualShock under Steam Input would reach the title twice -- once through
+    /// Steam's virtual pad and once through SDL, which the proton shim now
+    /// prefers for Sony pads.
+    #[test]
+    fn steams_controller_hints_reach_the_title() {
+        for name in [
+            "SDL_GAMECONTROLLER_IGNORE_DEVICES",
+            "SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD",
+            "SteamVirtualGamepadInfo",
+        ] {
+            assert!(!STEAM_ENVIRONMENT.contains(&name), "{name} is stripped");
+        }
+    }
+
     #[test]
     fn the_default_plan_keeps_the_game_identity_steam_input_needs() {
         let plan = plan(&recipe(""), &dirs(), &Options::default());
