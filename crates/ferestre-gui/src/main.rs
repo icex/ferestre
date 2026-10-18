@@ -699,6 +699,25 @@ fn render(ui: &Ui) {
     }
 }
 
+/// The Installed list's "Add All to Steam", for every installed title on
+/// every page, whatever the search shows.
+fn add_all_to_steam_button(ui: &Ui, titles: Vec<(String, String)>) -> gtk::Button {
+    let button = gtk::Button::builder()
+        .child(
+            &adw::ButtonContent::builder()
+                .icon_name("list-add-symbolic")
+                .label("Add All to Steam")
+                .build(),
+        )
+        .tooltip_text("Add a Steam shortcut for every installed game")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .build();
+    let ui = ui.clone();
+    button.connect_clicked(move |_| confirm_add_all_to_steam(&ui, titles.clone()));
+    button
+}
+
 /// Set an unreadable `account-roles.json` aside and start over without roles.
 fn reset_account_roles(ui: &Ui) {
     let config = ui
@@ -816,6 +835,9 @@ struct Drawn {
     /// Rows the list holds after the filter and before a search narrows it:
     /// what a heading counting this list should say.
     listed: usize,
+    /// Those rows' product ids and names, every page of them: what an action
+    /// on the whole list applies to.
+    kept: Vec<(String, String)>,
     /// Rows in the whole list still waiting for a name while a search is
     /// running. A search cannot match what has not been fetched, and saying
     /// "nothing matches" during that is telling somebody something untrue.
@@ -1013,6 +1035,10 @@ fn draw_list(
     let metadata_ids: Vec<String> = rows.iter().map(|row| row.product_id.clone()).collect();
     let rows: Vec<LibraryRow> = rows.into_iter().filter(|row| keep(row)).collect();
     let listed = rows.len();
+    let kept = rows
+        .iter()
+        .map(|row| (row.product_id.clone(), row.name.clone()))
+        .collect();
 
     let matching = model::search(&rows, &model.query);
     let view = model::paginate(&matching, model.page, PER_PAGE);
@@ -1023,6 +1049,7 @@ fn draw_list(
     Drawn {
         page: view.page,
         listed,
+        kept,
         pending_names: unnamed_off_page.len(),
         want_names: metadata_ids
             .into_iter()
@@ -1291,6 +1318,13 @@ fn render_rows(
     fetch_disk_usage(ui, &drawn.rows);
 
     let group = adw::PreferencesGroup::builder().build();
+    if section == Section::Installed && !drawn.kept.is_empty() {
+        group.set_title(&match listed {
+            1 => "1 game".to_string(),
+            n => format!("{n} games"),
+        });
+        group.set_header_suffix(Some(&add_all_to_steam_button(ui, drawn.kept.clone())));
+    }
     // Deliberately not an early return: an empty list is exactly when the
     // reader most needs the switch below, because the filter may be the reason
     // it is empty.
@@ -3344,6 +3378,12 @@ fn open_editor(ui: &Ui, product_id: &str, name: &str) {
 }
 
 fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {
+    add_to_steam_titles(ui, vec![(product_id.to_string(), name.to_string())]);
+}
+
+/// Where Steam keeps shortcuts, or a toast saying why there is nowhere to put
+/// them.
+fn steam_shortcut_files(ui: &Ui) -> Option<Vec<PathBuf>> {
     // Steam rewrites shortcuts.vdf from memory when it exits, so an edit made
     // underneath a running Steam is simply lost. Refusing is the only honest
     // behaviour; writing it and saying nothing would look like a bug in Steam.
@@ -3351,7 +3391,7 @@ fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {
         ui.toasts.add_toast(toast(
             "Close Steam first — it overwrites its shortcuts file when it exits",
         ));
-        return;
+        return None;
     }
 
     let steam_dir = ui
@@ -3362,29 +3402,95 @@ fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {
         .and_then(|p| p.steam_dir().map(Path::to_owned));
     let Some(steam_dir) = steam_dir else {
         ui.toasts.add_toast(toast("No Steam installation found"));
-        return;
+        return None;
     };
     let files = steam::shortcut_files(&steam_dir);
     if files.is_empty() {
         ui.toasts.add_toast(toast(
             "No Steam account on this machine has a shortcuts file",
         ));
-        return;
+        return None;
     }
+    Some(files)
+}
 
-    if !begin(ui, &format!("Adding {name} to Steam")) {
+/// Ask before giving every installed title a Steam shortcut. One already in
+/// Steam is updated in place, not added twice.
+fn confirm_add_all_to_steam(ui: &Ui, titles: Vec<(String, String)>) {
+    if ui.busy.borrow().is_some() || *ui.closing.borrow() {
         report_busy(ui);
         return;
     }
-    let (cache, product, market, fallback_icon) = {
+    if titles.is_empty() || steam_shortcut_files(ui).is_none() {
+        return;
+    }
+    let count = titles.len();
+    let heading = if count == 1 {
+        "Add 1 game to Steam?".to_string()
+    } else {
+        format!("Add {count} games to Steam?")
+    };
+    let dialog = adw::AlertDialog::new(
+        Some(&heading),
+        Some(
+            "Every installed game gets a Steam shortcut that starts it through Ferestre, with \
+             its artwork. Games already in Steam are updated, not added twice.",
+        ),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("add", "Add All");
+    dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("add"));
+    dialog.set_close_response("cancel");
+    let titles = std::cell::Cell::new(Some(titles));
+    dialog.connect_response(
+        None,
+        glib::clone!(
+            #[strong]
+            ui,
+            move |_, response| {
+                if response == "add" {
+                    if let Some(titles) = titles.take() {
+                        add_to_steam_titles(&ui, titles);
+                    }
+                }
+            }
+        ),
+    );
+    dialog.present(Some(&ui.window));
+}
+
+/// Give each title a Steam shortcut, in every Steam account's shortcuts file,
+/// reading and writing each file once.
+fn add_to_steam_titles(ui: &Ui, titles: Vec<(String, String)>) {
+    let Some(files) = steam_shortcut_files(ui) else {
+        return;
+    };
+    let busy = match titles.as_slice() {
+        [(_, name)] => format!("Adding {name} to Steam"),
+        _ => format!("Adding {} games to Steam", titles.len()),
+    };
+    if !begin(ui, &busy) {
+        report_busy(ui);
+        return;
+    }
+    // Closing waits: a shortcuts file left half way is a Steam library
+    // missing games the person was told were being added.
+    *ui.wait_on_close.borrow_mut() = true;
+    show_activity(ui);
+    let (cache, market, known) = {
         let model = ui.model.borrow();
-        let key = product_id.to_ascii_uppercase();
-        (
-            model.catalog_cache(),
-            model.catalog.get(&key).cloned(),
-            model.market(),
-            model.icons.get(&key).cloned(),
-        )
+        let known: Vec<_> = titles
+            .iter()
+            .map(|(product_id, _)| {
+                let key = product_id.to_ascii_uppercase();
+                (
+                    model.catalog.get(&key).cloned(),
+                    model.icons.get(&key).cloned(),
+                )
+            })
+            .collect();
+        (model.catalog_cache(), model.market(), known)
     };
     let program = steam::shortcut_program(
         std::env::var_os("APPIMAGE").as_deref(),
@@ -3392,94 +3498,160 @@ fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {
         &cli_binary(),
     );
     let start_dir = program.parent().unwrap_or(Path::new("/")).to_path_buf();
-    let shortcut = steam::Shortcut::new(name, &program, &start_dir, format!("run {product_id}"));
-    let product_id = product_id.to_string();
-    let name = name.to_string();
+    let single = (titles.len() == 1).then(|| titles[0].1.clone());
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = gio::spawn_blocking(move || -> anyhow::Result<_> {
             let mut failures = Vec::new();
-            let artwork = if let Some(cache) = cache {
+            let mut products: Vec<_> = titles
+                .iter()
+                .zip(&known)
+                .map(|((product_id, _), (product, _))| {
+                    product
+                        .clone()
+                        .or_else(|| cache.as_ref().and_then(|c| c.get(product_id)))
+                })
+                .collect();
+            if let Some(cache) = &cache {
                 // Older metadata caches have only the small list icon. Refresh
-                // this one title on demand to learn its larger library assets.
-                let mut product = product.or_else(|| cache.get(&product_id));
-                if product.as_ref().is_none_or(|p| p.artwork.is_empty()) {
+                // the titles missing larger library assets, in one request.
+                let stale: Vec<String> = titles
+                    .iter()
+                    .zip(&products)
+                    .filter(|(_, product)| product.as_ref().is_none_or(|p| p.artwork.is_empty()))
+                    .map(|((product_id, _), _)| product_id.clone())
+                    .collect();
+                if !stale.is_empty() {
                     let (found, errors) =
-                        catalog::revalidate(&cache, &[product_id], &market.0, &market.1, true);
+                        catalog::revalidate(cache, &stale, &market.0, &market.1, true);
                     failures.extend(errors);
-                    if let Some(fresh) = found.into_iter().next() {
-                        product = Some(fresh);
+                    for fresh in found {
+                        if let Some(slot) = titles
+                            .iter()
+                            .position(|(id, _)| id.eq_ignore_ascii_case(&fresh.product_id))
+                        {
+                            products[slot] = Some(fresh);
+                        }
                     }
                 }
-                if let Some(product) = product {
-                    let (files, errors) =
-                        steam::prepare_artwork(&cache, &product, fallback_icon.as_deref());
-                    failures.extend(errors);
-                    files
-                } else {
-                    steam::ArtworkFiles {
-                        icon: fallback_icon,
-                        ..Default::default()
-                    }
-                }
-            } else {
-                steam::ArtworkFiles {
-                    icon: fallback_icon,
-                    ..Default::default()
-                }
-            };
+            }
+            let prepared: Vec<_> = titles
+                .iter()
+                .zip(products)
+                .zip(&known)
+                .map(|(((product_id, name), product), (_, fallback_icon))| {
+                    // A row still showing its product id is named after the
+                    // catalogue's answer, when the worker got one.
+                    let name = product
+                        .as_ref()
+                        .filter(|_| name.eq_ignore_ascii_case(product_id))
+                        .map(|p| p.name.trim())
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or(name.as_str())
+                        .to_string();
+                    let artwork = match (&cache, product) {
+                        (Some(cache), Some(product)) => {
+                            let (files, errors) =
+                                steam::prepare_artwork(cache, &product, fallback_icon.as_deref());
+                            failures.extend(errors);
+                            files
+                        }
+                        _ => steam::ArtworkFiles {
+                            icon: fallback_icon.clone(),
+                            ..Default::default()
+                        },
+                    };
+                    let shortcut = steam::Shortcut::new(
+                        &name,
+                        &program,
+                        &start_dir,
+                        format!("run {product_id}"),
+                    );
+                    (shortcut, artwork)
+                })
+                .collect();
             anyhow::ensure!(
                 !steam::is_running(),
                 "Close Steam first; it started while artwork was being fetched"
             );
-            let mut added = 0;
-            let mut updated = 0;
+            // Per title: whether any account got a new shortcut, and whether
+            // any account has it at all now.
+            let mut added = vec![false; prepared.len()];
+            let mut done = vec![false; prepared.len()];
+            let mut accounts_failed = Vec::new();
             for file in &files {
                 let result = steam::load(file).and_then(|mut document| {
-                    let mut shortcut = shortcut.clone();
-                    let app_id = steam::effective_app_id(&document, &shortcut);
-                    let previous_icon = steam::existing_shortcut(&document, &shortcut)
-                        .and_then(|entry| entry.get("icon"))
-                        .and_then(steam::Value::as_str)
-                        .filter(|path| {
-                            !path.is_empty()
-                                && Path::new(path).is_file()
-                                && *path != program.to_string_lossy()
-                        })
-                        .map(str::to_string);
-                    let (icon, errors) = steam::install_artwork(file, app_id, &artwork);
-                    failures.extend(errors);
-                    shortcut.icon = previous_icon
-                        .or_else(|| icon.map(|p| p.to_string_lossy().into_owned()))
-                        .unwrap_or_default();
-                    let replaced = steam::upsert(&mut document, &shortcut)?;
+                    let mut outcomes = Vec::new();
+                    for (shortcut, artwork) in &prepared {
+                        let mut shortcut = steam::distinct(&document, shortcut);
+                        let app_id = steam::effective_app_id(&document, &shortcut);
+                        let previous_icon = steam::existing_shortcut(&document, &shortcut)
+                            .and_then(|entry| entry.get("icon"))
+                            .and_then(steam::Value::as_str)
+                            .filter(|path| {
+                                !path.is_empty()
+                                    && Path::new(path).is_file()
+                                    && *path != program.to_string_lossy()
+                            })
+                            .map(str::to_string);
+                        let (icon, errors) = steam::install_artwork(file, app_id, artwork);
+                        failures.extend(errors);
+                        shortcut.icon = previous_icon
+                            .or_else(|| icon.map(|p| p.to_string_lossy().into_owned()))
+                            .unwrap_or_default();
+                        outcomes.push(steam::upsert(&mut document, &shortcut)?);
+                    }
                     steam::save(file, &document)?;
-                    Ok(replaced)
+                    Ok(outcomes)
                 });
                 match result {
-                    Ok(true) => updated += 1,
-                    Ok(false) => added += 1,
-                    Err(error) => failures.push(format!("{}: {error}", file.display())),
+                    Ok(outcomes) => {
+                        for (slot, replaced) in outcomes.into_iter().enumerate() {
+                            done[slot] = true;
+                            added[slot] |= !replaced;
+                        }
+                    }
+                    Err(error) => accounts_failed.push(format!("{}: {error}", file.display())),
                 }
             }
-            Ok((added, updated, failures))
+            let added_count = added.iter().filter(|a| **a).count();
+            let updated_count = done.iter().filter(|d| **d).count() - added_count;
+            Ok((added_count, updated_count, failures, accounts_failed))
         })
         .await;
         finish(&ui);
         match result {
-            Ok(Ok((added, updated, failures))) if added + updated > 0 => {
-                let action = if added == 0 { "Updated" } else { "Added" };
-                let detail = if failures.is_empty() {
-                    "Restart Steam to see it."
-                } else {
-                    "Some artwork was unavailable. Restart Steam to see it."
+            Ok(Ok((added, updated, failures, accounts_failed))) if added + updated > 0 => {
+                let what = match &single {
+                    Some(name) => {
+                        let action = if added == 0 { "Updated" } else { "Added" };
+                        format!("{action} \"{name}\" in Steam.")
+                    }
+                    None => steam_summary(added, updated),
                 };
-                ui.toasts
-                    .add_toast(toast(format!("{action} \"{name}\" in Steam. {detail}")));
+                let them = if single.is_some() { "it" } else { "them" };
+                let detail = if failures.is_empty() {
+                    format!("Restart Steam to see {them}.")
+                } else {
+                    format!("Some artwork was unavailable. Restart Steam to see {them}.")
+                };
+                ui.toasts.add_toast(toast(format!("{what} {detail}")));
+                // Said apart from artwork: one Steam account got none of them.
+                if !accounts_failed.is_empty() {
+                    ui.toasts.add_toast(toast(format!(
+                        "Could not update {} of the Steam accounts on this machine: {}",
+                        accounts_failed.len(),
+                        accounts_failed.join("; ")
+                    )));
+                }
             }
-            Ok(Ok((_, _, errors))) => ui.toasts.add_toast(toast(format!(
+            Ok(Ok((_, _, failures, accounts_failed))) => ui.toasts.add_toast(toast(format!(
                 "Could not add to Steam: {}",
-                errors.join("; ")
+                accounts_failed
+                    .into_iter()
+                    .chain(failures)
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ))),
             Ok(Err(error)) => ui.toasts.add_toast(toast(error.to_string())),
             Err(_) => ui
@@ -3487,6 +3659,16 @@ fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {
                 .add_toast(toast("Could not finish adding to Steam")),
         }
     });
+}
+
+/// "Added 3 games and updated 2 in Steam."
+fn steam_summary(added: usize, updated: usize) -> String {
+    let games = |n: usize| format!("{n} {}", if n == 1 { "game" } else { "games" });
+    match (added, updated) {
+        (0, updated) => format!("Updated {} in Steam.", games(updated)),
+        (added, 0) => format!("Added {} to Steam.", games(added)),
+        (added, updated) => format!("Added {} and updated {updated} in Steam.", games(added)),
+    }
 }
 
 fn account_pressed(ui: &Ui) {
