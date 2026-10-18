@@ -63,6 +63,10 @@ struct Ui {
     fetching_names: Rc<Cell<bool>>,
     catalog_generation: Rc<Cell<u64>>,
     fetching_entitlements: Rc<RefCell<bool>>,
+    /// A forced ownership check that could not start because another task held
+    /// the window. Owed until it runs: the next finish or timer tick starts it,
+    /// so a Refresh pressed during a background check is not lost for a day.
+    entitlements_owed: Rc<Cell<bool>>,
     /// The bar along the bottom, and the download it is describing.
     download: DownloadBar,
     /// Titles this window started that have not exited, by product id, each
@@ -267,6 +271,7 @@ fn build_ui(app: &adw::Application) {
         fetching_names: Rc::new(Cell::new(false)),
         catalog_generation: Rc::new(Cell::new(0)),
         fetching_entitlements: Rc::new(RefCell::new(false)),
+        entitlements_owed: Rc::new(Cell::new(false)),
         download: download.clone(),
     };
 
@@ -374,8 +379,10 @@ fn build_ui(app: &adw::Application) {
     window.present();
     refresh_entitlements(&ui, false);
     fetch_gamepass(&ui, false);
-    // Tier upgrades happen outside this window. Recheck without taking the
-    // download's busy flag or touching its process.
+    // Tier upgrades happen outside this window. The listing is reused for a
+    // day (LIBRARY_MAX_AGE), so this picks one up once the saved snapshot
+    // expires, or sooner when Refresh was pressed while something else was
+    // running. It never takes the download's busy flag or touches its process.
     glib::timeout_add_seconds_local(
         60,
         glib::clone!(
@@ -795,9 +802,23 @@ fn render_gamepass(ui: &Ui, page: &gtk::Box) {
     );
 }
 
+/// The saved measurement for a title, if it still matches the install the
+/// model knows about now: same directory, same record, same root and manifest.
+fn current_disk_usage(model: &Model, key: &str) -> Option<u64> {
+    let cache_dir = model.cache_dir()?;
+    let record = model.records.get(key);
+    let dir = record.map(|r| r.dir.clone()).or_else(|| {
+        model
+            .recipe_for(key)
+            .and_then(|recipe| model.game_dir(recipe))
+    })?;
+    ferestre_core::install::cached_disk_usage(cache_dir, key, &dir, record).map(|(bytes, _)| bytes)
+}
+
 /// Reuse persistent disk measurements before drawing. Only missing/stale or
-/// changed installs need a walk, and that runs off the GTK thread. Results
-/// from a previous install generation cannot repopulate the model.
+/// changed installs need a walk, and that runs off the GTK thread. A walk that
+/// a reload overtook repopulates the model only for installs whose saved
+/// fingerprint still matches what the reloaded model points at.
 fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
     let (generation, cache_dir, wanted) = {
         let mut model = ui.model.borrow_mut();
@@ -807,7 +828,7 @@ fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
             .filter(|row| row.installed)
             .filter_map(|row| {
                 let key = row.product_id.to_ascii_uppercase();
-                if model.disk_usage.contains_key(&key) || model.sizes_pending.contains(&key) {
+                if model.disk_usage.contains_key(&key) {
                     return None;
                 }
                 let dir = model.records.get(&key).map(|r| r.dir.clone()).or_else(|| {
@@ -829,6 +850,11 @@ fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
                         }
                     }
                 }
+                // A scan from before a reload is still walking this title.
+                // Show the saved total meanwhile, and let that scan answer.
+                if model.sizes_pending.contains(&key) {
+                    return None;
+                }
                 model.sizes_pending.insert(key.clone());
                 Some((key, dir, record))
             })
@@ -838,6 +864,9 @@ fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
     if wanted.is_empty() {
         return;
     }
+    // Pending now outlives a reload, so a walk that panicked must not leave its
+    // titles marked as being scanned for the rest of the session.
+    let keys: Vec<String> = wanted.iter().map(|(key, _, _)| key.clone()).collect();
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let scanned = gio::spawn_blocking(move || {
@@ -860,11 +889,21 @@ fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
         .await;
         if let Ok(scanned) = scanned {
             let mut model = ui.model.borrow_mut();
-            if model.size_generation != generation {
-                return;
-            }
+            let current = model.size_generation == generation;
             for (key, bytes) in scanned {
                 model.sizes_pending.remove(&key);
+                let bytes = if current {
+                    bytes
+                } else {
+                    // The window reloaded while this walked. The result still
+                    // counts if the install it measured is the one there now,
+                    // which is what the saved fingerprint checks; otherwise the
+                    // render below starts a scan of what is there now.
+                    match current_disk_usage(&model, &key) {
+                        Some(bytes) => Some(bytes),
+                        None => continue,
+                    }
+                };
                 // Keep an expired measurement if the new walk failed.
                 if bytes.is_some() || !model.disk_usage.contains_key(&key) {
                     model.disk_usage.insert(key, bytes);
@@ -872,6 +911,11 @@ fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
             }
             drop(model);
             render(&ui);
+        } else {
+            let mut model = ui.model.borrow_mut();
+            for key in &keys {
+                model.sizes_pending.remove(key);
+            }
         }
     });
 }
@@ -1571,6 +1615,13 @@ fn sign_out(ui: &Ui) {
         report_busy(ui);
         return;
     }
+    // Before the client runs, not after: a window closed while it signs out
+    // never reaches the code below, and the next one would open showing the
+    // old account and its library from these files. If sign-out then fails,
+    // the next account refresh writes them again.
+    if let Some(paths) = ui.model.borrow().paths.as_ref() {
+        state::forget_saved_account(paths.state_dir());
+    }
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = gio::spawn_blocking(move || {
@@ -1584,21 +1635,7 @@ fn sign_out(ui: &Ui) {
         finish(&ui);
         match result {
             Ok(Ok(status)) if status.success() => {
-                {
-                    // The listing goes with the tokens. Leaving it on screen
-                    // would show a library belonging to nobody, with buttons
-                    // that all fail at the licence step.
-                    let mut model = ui.model.borrow_mut();
-                    model.account = None;
-                    model.avatar = None;
-                    model.ownership = Ownership::Unknown;
-                    model.subscriptions.clear();
-                    model.entitlements_checked = false;
-                    if let Some(paths) = model.paths.as_ref() {
-                        let _ = std::fs::remove_file(library::cache_path(paths.state_dir()));
-                        let _ = std::fs::remove_file(account::cache_path(paths.state_dir()));
-                    }
-                }
+                ui.model.borrow_mut().forget_account();
                 render(&ui);
                 ui.toasts.add_toast(adw::Toast::new("Signed out"));
             }
@@ -2474,6 +2511,8 @@ fn finish(ui: &Ui) {
     glib::idle_add_local_once(move || {
         if *ui.closing.borrow() && ui.busy.borrow().is_none() {
             ui.window.close();
+        } else if ui.entitlements_owed.get() {
+            refresh_entitlements(&ui, true);
         }
     });
 }
@@ -2619,43 +2658,78 @@ fn refresh_account(ui: &Ui) {
         return;
     }
 
+    /// What the client said. Only `SignedOut` is allowed to clear the saved
+    /// account; a client that could not answer says nothing about it.
+    enum Answer {
+        SignedIn(account::Account, Option<PathBuf>),
+        SignedOut,
+        Unknown,
+    }
+
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = gio::spawn_blocking(move || {
-            let output = account::command(&client).output().ok()?;
+            let Ok(output) = account::command(&client).output() else {
+                return Answer::Unknown;
+            };
             if !output.status.success() {
-                return None;
+                return if model::client_reports_signed_out(&String::from_utf8_lossy(&output.stderr))
+                {
+                    Answer::SignedOut
+                } else {
+                    Answer::Unknown
+                };
             }
-            let account = account::parse(&String::from_utf8_lossy(&output.stdout)).ok()?;
+            let Ok(account) = account::parse(&String::from_utf8_lossy(&output.stdout)) else {
+                return Answer::Unknown;
+            };
             // Best effort: an account with no picture is still an account.
             let avatar = account::avatar(&cache_dir, &account, AVATAR_PX).ok();
-            Some((account, avatar))
+            Answer::SignedIn(account, avatar)
         })
-        .await;
+        .await
+        .unwrap_or(Answer::Unknown);
         finish(&ui);
-        if let Ok(Some((account, avatar))) = result {
-            {
-                let mut model = ui.model.borrow_mut();
-                let changed = model
-                    .account
-                    .as_ref()
-                    .map_or(true, |previous| !account::same_identity(previous, &account));
-                if changed {
-                    model.ownership = Ownership::Unknown;
-                    model.subscriptions.clear();
-                    model.entitlements_checked = false;
-                    if let Some(paths) = model.paths.as_ref() {
-                        let _ = std::fs::remove_file(library::cache_path(paths.state_dir()));
+        match result {
+            Answer::SignedIn(account, avatar) => {
+                {
+                    let mut model = ui.model.borrow_mut();
+                    let changed = model
+                        .account
+                        .as_ref()
+                        .map_or(true, |previous| !account::same_identity(previous, &account));
+                    if changed {
+                        model.ownership = Ownership::Unknown;
+                        model.subscriptions.clear();
+                        model.entitlements_checked = false;
+                        if let Some(paths) = model.paths.as_ref() {
+                            let _ = std::fs::remove_file(library::cache_path(paths.state_dir()));
+                        }
                     }
+                    if let Some(paths) = model.paths.as_ref() {
+                        let _ = account::save_cache(paths.state_dir(), &account);
+                    }
+                    model.account = Some(account);
+                    model.avatar = avatar;
                 }
-                if let Some(paths) = model.paths.as_ref() {
-                    let _ = account::save_cache(paths.state_dir(), &account);
-                }
-                model.account = Some(account);
-                model.avatar = avatar;
+                render(&ui);
+                refresh_entitlements(&ui, false);
             }
-            render(&ui);
-            refresh_entitlements(&ui, false);
+            // Signed out somewhere else -- `xodus-cli logout` in a terminal,
+            // or a window closed mid sign-out -- while this window still
+            // remembered the account from account.json.
+            Answer::SignedOut => {
+                let had_account = {
+                    let mut model = ui.model.borrow_mut();
+                    let had_account = model.account.is_some() || model.ownership.is_known();
+                    model.forget_account();
+                    had_account
+                };
+                if had_account {
+                    render(&ui);
+                }
+            }
+            Answer::Unknown => {}
         }
         refresh_updates(&ui, false);
     });
@@ -2742,6 +2816,8 @@ fn refresh_updates(ui: &Ui, force: bool) {
 /// Read account access independently of downloads and catalogue artwork.
 /// A failed request retains the last successful snapshot.
 fn refresh_entitlements(ui: &Ui, force: bool) {
+    // A Refresh that had to wait is still a Refresh.
+    let force = force || ui.entitlements_owed.get();
     if !force {
         let model = ui.model.borrow();
         if model.entitlements_checked
@@ -2755,11 +2831,20 @@ fn refresh_entitlements(ui: &Ui, force: bool) {
             return;
         }
     }
-    if (ui.busy.borrow().is_some() && ui.download.current.borrow().is_none())
-        || *ui.fetching_entitlements.borrow()
-    {
+    let blocked = ui.busy.borrow().is_some() && ui.download.current.borrow().is_none();
+    if blocked || *ui.fetching_entitlements.borrow() {
+        // A check already in flight answers a forced one too. A busy window
+        // does not, so keep the request and say when it will run, once.
+        if force && blocked && !ui.entitlements_owed.replace(true) {
+            if let Some(what) = ui.busy.borrow().as_deref() {
+                ui.toasts.add_toast(adw::Toast::new(&format!(
+                    "{what} is running. Your library will be checked when it finishes."
+                )));
+            }
+        }
         return;
     }
+    ui.entitlements_owed.set(false);
     let (client, state_dir, account) = {
         let model = ui.model.borrow();
         (
@@ -3123,6 +3208,25 @@ mod catalog_regressions {
             show_unsupported: false,
             problem: None,
         }
+    }
+
+    /// `xodus-cli logout` in a terminal leaves account.json behind. When the
+    /// client then says nobody is signed in, the window drops the account and
+    /// the library it was listing, not just the name on the button.
+    #[test]
+    fn a_signed_out_client_forgets_the_account_and_its_library() {
+        let mut model = fixture();
+        model.account = Some(account::parse(r#"{"gamertag":"TestPlayer","xuid":"25"}"#).unwrap());
+        model.avatar = Some(PathBuf::from("/cache/gamerpic-64.img"));
+        model.set_ownership(snapshot(true));
+        assert!(!model.subscriptions.is_empty());
+
+        model.forget_account();
+        assert!(model.account.is_none());
+        assert!(model.avatar.is_none());
+        assert_eq!(model.ownership, Ownership::Unknown);
+        assert!(model.subscriptions.is_empty());
+        assert!(!model.entitlements_checked);
     }
 
     fn snapshot(ultimate: bool) -> Vec<ferestre_core::library::Entry> {

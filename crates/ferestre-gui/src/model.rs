@@ -1074,6 +1074,21 @@ pub fn cli_binary(exe_dir: Option<&Path>, is_file: &dyn Fn(&Path) -> bool) -> Pa
     PathBuf::from("ferestre")
 }
 
+/// What the client says when its token store holds no sign-in at all. Ferestre's
+/// own client patch (0003, `xsts_for`) prints it, with exit status 1, for both
+/// the device and the user token.
+const SIGNED_OUT_MARKER: &str = "run `xodus-cli login` first";
+
+/// Whether a failed `xodus-cli account --json` means nobody is signed in.
+///
+/// Anything else that fails -- no network, a service that is down, a token the
+/// service refused -- is not evidence either way, and the saved account stays.
+/// Only the empty token store is: it is the one failure that says something
+/// about who is signed in rather than about whether the service answered.
+pub fn client_reports_signed_out(stderr: &str) -> bool {
+    stderr.contains(SIGNED_OUT_MARKER)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2493,5 +2508,23 @@ mod tests {
         );
         assert_eq!(cli_binary(Some(dir), &|_| false), PathBuf::from("ferestre"));
         assert_eq!(cli_binary(None, &|_| true), PathBuf::from("ferestre"));
+    }
+
+    /// A client with nothing in its token store says so on stderr. A client
+    /// that could not reach the service, or panicked on a refused token, says
+    /// something else, and that must not sign the window out.
+    #[test]
+    fn only_an_empty_token_store_reads_as_signed_out() {
+        assert!(client_reports_signed_out(
+            "no usable device token; run `xodus-cli login` first\n"
+        ));
+        assert!(client_reports_signed_out(
+            "no usable user token; run `xodus-cli login` first"
+        ));
+        assert!(!client_reports_signed_out(""));
+        assert!(!client_reports_signed_out(
+            "thread 'main' panicked: Failed to authenticate Xbox user: MSA user token exchange failed: error sending request"
+        ));
+        assert!(!client_reports_signed_out("profile settings: HTTP 503"));
     }
 }

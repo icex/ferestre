@@ -1504,7 +1504,18 @@ home = Path(os.environ['HOME'])
 with (home / 'client-calls').open('a') as log:
     log.write(sys.argv[1] + '\\n')
 if sys.argv[1] == 'account':
+    # The real client's two failures: a token store with nothing in it, and a
+    # service it could not reach (it panics, exit 101).
+    if (home / 'client-signed-out').exists():
+        sys.stderr.write('no usable device token; run `xodus-cli login` first\\n')
+        sys.exit(1)
+    if (home / 'client-unreachable').exists():
+        sys.stderr.write("thread 'main' panicked: Failed to authenticate Xbox user\\n")
+        sys.exit(101)
     print((home / 'client-account.json').read_text())
+elif sys.argv[1] == 'library' and (home / 'client-signed-out').exists():
+    sys.stderr.write('no usable device token; run `xodus-cli login` first\\n')
+    sys.exit(1)
 elif sys.argv[1] == 'library':
     (home / 'refresh-started').touch()
     (home / 'refresh-child-pid').write_text(str(os.getpid()))
@@ -1636,6 +1647,40 @@ elif sys.argv[1] == 'update':
         check(True, "switching accounts invalidates fresh cached ownership")
         click_named(frame, "Close")
         check(gui.wait(timeout=5) == 0, "the account-change window closes normally")
+        # A client that cannot reach the service says nothing about who is
+        # signed in: the saved account and its library stay.
+        open(os.path.join(home, "client-unreachable"), "w").close()
+        account_calls = open(os.path.join(home, "client-calls")).read().splitlines().count("account")
+        gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        app = find_app(gui.pid, time.monotonic() + TIMEOUT)
+        frame = wait_for(app, lambda root: next(iter(find_all(root, role="frame")), None),
+                         "unreachable client window", time.monotonic() + TIMEOUT)
+        wait_for(frame, lambda root: open(os.path.join(home, "client-calls")).read().splitlines().count("account") > account_calls,
+                 "the account check against an unreachable client", time.monotonic() + TIMEOUT)
+        time.sleep(1)
+        check(any("Other Fixture Player" in t for t in texts(frame)),
+              "an unreachable client keeps the saved account on screen", frame)
+        check(os.path.exists(os.path.join(state, "account.json")) and os.path.exists(os.path.join(state, "library.json")),
+              "an unreachable client keeps the saved account and library")
+        click_named(frame, "Close")
+        check(gui.wait(timeout=5) == 0, "the unreachable-client window closes normally")
+        os.unlink(os.path.join(home, "client-unreachable"))
+        # Signed out outside the window (`xodus-cli logout` in a terminal): the
+        # next window drops the saved account and the library listed for it.
+        open(os.path.join(home, "client-signed-out"), "w").close()
+        gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        app = find_app(gui.pid, time.monotonic() + TIMEOUT)
+        frame = wait_for(app, lambda root: next(iter(find_all(root, role="frame")), None),
+                         "signed-out client window", time.monotonic() + TIMEOUT)
+        wait_for(frame, lambda root: not os.path.exists(os.path.join(state, "account.json")),
+                 "the saved account to be forgotten", time.monotonic() + TIMEOUT)
+        wait_for(frame, lambda root: not any("Other Fixture Player" in t for t in texts(root)),
+                 "the old account to leave the window", time.monotonic() + TIMEOUT)
+        check(not os.path.exists(os.path.join(state, "library.json")),
+              "a signed-out client also drops the saved library")
+        click_named(frame, "Close")
+        check(gui.wait(timeout=5) == 0, "the signed-out window closes normally")
+        os.unlink(os.path.join(home, "client-signed-out"))
         proxy.shutdown()
         if b"panicked" in stderr_before_restart:
             failures.append("the first window panicked")
