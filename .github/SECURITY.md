@@ -86,9 +86,9 @@ keys, or let one process read what it should not:
   title or another local process get at either.
 - Patches that weaken a boundary Wine or Proton was relying on.
 - Scripts that fetch and install a binary. `scripts/fix-xcurl.sh` downloads a
-  curl build over HTTPS and installs it into a game directory; it verifies the
-  exports the title imports, not a pinned checksum. If you can turn that into
-  code execution, that is a report.
+  pinned curl build over HTTPS, checks the archive against its pinned sha256,
+  and installs it into a game directory after verifying the exports the title
+  imports. If you can turn that into code execution, that is a report.
 - Anything in the tooling that writes a token, key or identifier to a file, a
   log, or the terminal where it can be pasted by accident.
 
