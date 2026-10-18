@@ -9,7 +9,8 @@ appearing looks like to the loader.
 
     start(home, log, install_move=(src, dst)) -> (address, processes)
 
-starts a dbus-daemon of its own and this service on it. Point
+starts a dbus-daemon of its own and this service on it; start_bus(home)
+starts the bus alone, for a system without PackageKit. Point
 DBUS_SYSTEM_BUS_ADDRESS at the address and GLib uses it as the system bus.
 """
 import argparse
@@ -69,9 +70,9 @@ BUS_CONFIG = """<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Config
 """
 
 
-def start(home, log, install_move=None, refuse=False):
+def start_bus(home):
     """A private bus with no service directory, so nothing on it is ever
-    activated, and the fake PackageKit owning its name on it."""
+    activated. Returns its address and the daemon."""
     home = Path(home)
     config = home / "system-bus.conf"
     # In the temporary directory: a socket under a deep HOME can pass the 108
@@ -84,6 +85,12 @@ def start(home, log, install_move=None, refuse=False):
     if not address:
         daemon.terminate()
         raise RuntimeError("the private system bus did not start")
+    return address, daemon
+
+
+def start(home, log, install_move=None, refuse=False):
+    """A private bus, and the fake PackageKit owning its name on it."""
+    address, daemon = start_bus(home)
     command = [sys.executable, __file__, "--address", address, "--log", str(log)]
     if install_move:
         command += ["--install-move", str(install_move[0]), str(install_move[1])]
