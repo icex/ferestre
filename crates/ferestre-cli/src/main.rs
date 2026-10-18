@@ -4034,6 +4034,66 @@ fn failures(checks: &[Check]) -> usize {
         .count()
 }
 
+/// Whether the client checks package header signatures, and what happens
+/// on the next install if it cannot yet. A warning at worst, unless installs
+/// are set to be refused and nothing will fetch the key.
+fn package_signature_check(client: &Path) -> Check {
+    use ferestre_core::xvd_key::{self, State, AUTO_FETCH_ENV, REQUIRE_SIGNED_ENV};
+    const SECTION: &str = "client";
+    const FETCH: &str = "fetch it now with: xodus-cli xvd-key fetch (an anonymous download of Microsoft Gaming Services from the Store, about 200 MB, of which only the key is kept)";
+    match xvd_key::status(client) {
+        Ok(Some(status)) => match status.state {
+            State::Present => {
+                Check::ok(SECTION, "package signatures are checked").with_detail(format!(
+                    "Microsoft's game package key, SHA-256 {}",
+                    status.fingerprint.unwrap_or_default()
+                ))
+            }
+            State::Absent | State::Invalid => {
+                let what = if status.state == State::Absent {
+                    "package signatures are not checked yet: no key"
+                } else {
+                    "package signatures are not checked: the stored key is unusable"
+                };
+                let paused = status.auto_fetch_paused_until.clone();
+                let mut check = if status.required && !status.fetches_on_install() {
+                    let why = match &paused {
+                        Some(until) if status.auto_fetch => format!(
+                            "{REQUIRE_SIGNED_ENV}=1 and an automatic fetch failed, so installs do not fetch the key again before {until}: every install until then will be refused"
+                        ),
+                        _ => format!(
+                            "{REQUIRE_SIGNED_ENV}=1 and {AUTO_FETCH_ENV}=0: every install will be refused"
+                        ),
+                    };
+                    Check::fail(SECTION, what).with_hint(format!("{why}; {FETCH}"))
+                } else if status.fetches_on_install() {
+                    Check::warn(SECTION, what)
+                        .with_hint(format!("the next install fetches it; or {FETCH}"))
+                } else if let (true, Some(until)) = (status.auto_fetch, &paused) {
+                    Check::warn(SECTION, what).with_hint(format!(
+                        "an automatic fetch failed, so installs go on without checking and do not fetch the key again before {until}; {FETCH}"
+                    ))
+                } else {
+                    Check::warn(SECTION, what).with_hint(format!(
+                        "{AUTO_FETCH_ENV}=0, so installs go on without checking; {FETCH}"
+                    ))
+                };
+                if let Some(detail) = status.detail.or(status
+                    .last_failed_fetch
+                    .map(|t| format!("the last automatic fetch failed at {t}")))
+                {
+                    check = check.with_detail(detail);
+                }
+                check
+            }
+        },
+        Ok(None) => Check::warn(SECTION, "this client cannot check package signatures")
+            .with_hint("update the client (ferestre-client) to one with xvd-key"),
+        Err(error) => Check::warn(SECTION, "could not ask the client about package signatures")
+            .with_detail(format!("{error:#}")),
+    }
+}
+
 /// Everything a launch needs, in the order it would be needed. Same checks the
 /// placeholder script made, so an answer people have seen stays the answer.
 fn doctor_checks(paths: &Paths) -> Vec<Check> {
@@ -4083,6 +4143,9 @@ fn doctor_checks(paths: &Paths) -> Vec<Check> {
         None => checks.push(Check::fail("client", "no xodus-cli").with_hint(
             "build it (cargo build --release in the xodus-cli checkout), or set XODUS_CLI_DIR",
         )),
+    }
+    if let Some(path) = paths.xodus_cli().filter(|p| p.is_file()) {
+        checks.push(package_signature_check(&path));
     }
     match paths.xodus_service().filter(|p| p.is_file()) {
         Some(_) => checks.push(Check::ok("client", "xodus-service")),
@@ -7286,6 +7349,66 @@ summary = "Runs."
             update_state(&json!({ "update_available": false })),
             "up to date"
         );
+    }
+
+    /// Doctor asks the client whether it checks package signatures, and says
+    /// what the next install will do when it cannot yet.
+    #[test]
+    fn doctor_reports_package_signature_checks() {
+        const PIN: &str = "183f0ae05431e4ad91554e88946967c872997227dbe6c85116f5fd2fd2d1229e";
+        let home = Home::new("doctor-xvd-key");
+        let client = home.root().join("client/xodus-cli");
+        let signatures = |_: &Home| package_signature_check(&client);
+
+        home.client(&format!(
+            r#"[ "$1 $2 $3" = "xvd-key status --json" ] && echo '{{"status":"present","fingerprint":"{PIN}"}}'"#
+        ));
+        let check = signatures(&home);
+        assert_eq!(check.status, CheckStatus::Ok, "{check:?}");
+        assert!(check.detail.unwrap().contains(PIN));
+
+        home.client(r#"echo '{"status":"absent","required":false,"auto_fetch":true}'"#);
+        let check = signatures(&home);
+        assert_eq!(check.status, CheckStatus::Warn, "{check:?}");
+        assert!(check.hint.unwrap().contains("next install fetches it"));
+
+        // Refused installs and nothing to fetch the key: every install fails.
+        home.client(r#"echo '{"status":"absent","required":true,"auto_fetch":false}'"#);
+        let check = signatures(&home);
+        assert_eq!(check.status, CheckStatus::Fail, "{check:?}");
+
+        // A failed automatic fetch pauses fetching for a day: no promise that
+        // the next install fetches it.
+        const UNTIL: &str = "2026-10-19T10:00:00+00:00";
+        home.client(&format!(
+            r#"echo '{{"status":"absent","required":false,"auto_fetch":true,"last_failed_fetch":"2026-10-18T10:00:00+00:00","auto_fetch_paused_until":"{UNTIL}"}}'"#
+        ));
+        let check = signatures(&home);
+        assert_eq!(check.status, CheckStatus::Warn, "{check:?}");
+        let hint = check.hint.unwrap();
+        assert!(!hint.contains("next install fetches it"), "{hint}");
+        assert!(
+            hint.contains(UNTIL) && hint.contains("xvd-key fetch"),
+            "{hint}"
+        );
+        // And with signatures required, every install until then is refused.
+        home.client(&format!(
+            r#"echo '{{"status":"absent","required":true,"auto_fetch":true,"auto_fetch_paused_until":"{UNTIL}"}}'"#
+        ));
+        let check = signatures(&home);
+        assert_eq!(check.status, CheckStatus::Fail, "{check:?}");
+        assert!(check.hint.unwrap().contains(UNTIL));
+
+        home.client(r#"echo '{"status":"invalid","detail":"not the pinned key"}'"#);
+        let check = signatures(&home);
+        assert_eq!(check.status, CheckStatus::Warn, "{check:?}");
+        assert_eq!(check.detail.as_deref(), Some("not the pinned key"));
+
+        // A client from before xvd-key: clap's usage error.
+        home.client("exit 2");
+        let check = signatures(&home);
+        assert_eq!(check.status, CheckStatus::Warn, "{check:?}");
+        assert!(check.name.contains("cannot check"), "{check:?}");
     }
 
     /// Doctor sees a runtime `install-runtime` downloaded, and a recipe of the

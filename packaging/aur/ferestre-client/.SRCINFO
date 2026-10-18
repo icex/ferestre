@@ -51,6 +51,7 @@ pkgbase = ferestre-client
 	source = https://raw.githubusercontent.com/icex/ferestre/764e0dcd5498fda9fbfb5830acc0ff8a4aa4cf58/patches/xodus-cli/0024-harden-token-audiences.patch
 	source = https://raw.githubusercontent.com/icex/ferestre/764e0dcd5498fda9fbfb5830acc0ff8a4aa4cf58/patches/xodus-cli/0025-hold-the-package-header-to-the-package-service-hash.patch
 	source = https://raw.githubusercontent.com/icex/ferestre/764e0dcd5498fda9fbfb5830acc0ff8a4aa4cf58/patches/xodus-cli/0026-presence.patch
+	source = https://raw.githubusercontent.com/icex/ferestre/764e0dcd5498fda9fbfb5830acc0ff8a4aa4cf58/patches/xodus-cli/0027-verify-package-header-signatures.patch
 	sha256sums = SKIP
 	sha256sums = 20d613add707a69f488b50041e53c60f8a0096132c05338b66d594fa8963c918
 	sha256sums = c15806efefdfe7613755ada8ee0fe28784ad955ea7df26825ddeabc7be731256
@@ -77,5 +78,6 @@ pkgbase = ferestre-client
 	sha256sums = 09fa469ecd38e15883c22c260e7355f597e534b66e1601bd57242bcbcbaeb97e
 	sha256sums = 5d3ad5a6a9ecc898626f3a9f06f47567569377c3491de36f5cd9fe7e779713a5
 	sha256sums = 03ad5fcad598b1f4e2bf410979b3a7955899d2fa0d070436db8990dac7bfe39d
+	sha256sums = 72b5c006fc3c666a52514fdc5d774c7b8f9090f59564da59142a25488b189df3
 
 pkgname = ferestre-client

@@ -228,6 +228,8 @@ directory. Close Steam before adding or updating a shortcut.
   controllers and sign-in, per distribution.
 - [docs/PRESENCE.md](docs/PRESENCE.md) — what friends see while you play, and
   how to turn it off.
+- [docs/PACKAGE-SIGNATURES.md](docs/PACKAGE-SIGNATURES.md) — how downloads are
+  held to Microsoft's signature, and where the key comes from.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — the plan for turning this into a launcher.
 - [notes/](notes/) — the debugging write-ups. Worth reading if you want to know
   *why* something is the way it is; several were genuinely hard to find.

@@ -37,6 +37,7 @@ pub mod signing;
 pub mod steam;
 pub mod updates;
 pub mod winrt;
+pub mod xvd_key;
 
 pub use recipe::{Recipe, Status, TitleState};
 

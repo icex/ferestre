@@ -301,7 +301,10 @@ jobs:
           python3 -m py_compile tests/license_token_fixture.py
 
       # Offline, loopback only: the service, the download integrity checks
-      # (msixvc's hash tree and retries, the CLI's path and commit rules),
+      # (msixvc's hash tree, header signatures with throwaway test keys, and
+      # retries; the CLI's path and commit rules, and the package key's
+      # sourcing against recorded-shape fixtures -- its live tests are
+      # ignored),
       # the presence runner (a local server and a fake token provider; it
       # never signs in), the profile store and the file-backed key chain.
       - name: Apply the client series and test it offline
