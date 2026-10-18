@@ -870,6 +870,52 @@ pub fn tail_lines(path: &Path, count: usize) -> Vec<String> {
     lines[lines.len().saturating_sub(count)..].to_vec()
 }
 
+/// Follow a launch's output file while the launch runs, calling `each` with
+/// every complete line as it is written. Polls rather than watching: the file
+/// is the launch's own, written in small bursts. Once `finished` is set it
+/// reads what is left, including a last line without a newline, and returns.
+pub fn follow_lines(
+    path: &Path,
+    finished: &std::sync::atomic::AtomicBool,
+    mut each: impl FnMut(&str),
+) {
+    use std::io::Read;
+    use std::sync::atomic::Ordering;
+    const POLL: std::time::Duration = std::time::Duration::from_millis(200);
+    // Lines longer than this are not events; they are cut, not kept whole.
+    const LONGEST: usize = 64 * 1024;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return;
+    };
+    let mut pending = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        // Read before reading the flag again, so nothing written before the
+        // launch exited is missed.
+        let done = finished.load(Ordering::Acquire);
+        loop {
+            match file.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => pending.extend_from_slice(&chunk[..n]),
+            }
+            while let Some(end) = pending.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = pending.drain(..=end).collect();
+                each(String::from_utf8_lossy(&line[..end]).trim_end());
+            }
+            if pending.len() > LONGEST {
+                pending.clear();
+            }
+        }
+        if done {
+            if !pending.is_empty() {
+                each(String::from_utf8_lossy(&pending).trim_end());
+            }
+            return;
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
 /// Whether `dir` holds a finished install. The package header and manifest
 /// land early in a download, so their being there is not enough while the
 /// temporary container is still beside them.
@@ -1484,6 +1530,38 @@ mod tests {
         // A new launch starts the file afresh.
         let (_, _) = launch_output(&scratch.0, "9ZZA/../x").unwrap();
         assert!(tail_lines(&path, 3).is_empty());
+    }
+
+    /// Presence events reach the window through the same file, as the launch
+    /// writes them.
+    #[test]
+    fn a_launchs_output_is_followed_line_by_line_until_it_ends() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+        let scratch = Scratch::new("follow");
+        let (path, mut file) = launch_output(&scratch.0, "9ZZB").unwrap();
+        let finished = Arc::new(AtomicBool::new(false));
+        let (sender, lines) = mpsc::channel();
+        let follower = {
+            let finished = Arc::clone(&finished);
+            std::thread::spawn(move || {
+                follow_lines(&path, &finished, |line| {
+                    sender.send(line.to_string()).unwrap()
+                })
+            })
+        };
+        file.write_all(b"first\nsec").unwrap();
+        let wait = std::time::Duration::from_secs(5);
+        assert_eq!(lines.recv_timeout(wait).unwrap(), "first");
+        file.write_all(b"ond\r\n\xff\n").unwrap();
+        assert_eq!(lines.recv_timeout(wait).unwrap(), "second");
+        assert_eq!(lines.recv_timeout(wait).unwrap(), "\u{fffd}");
+        // The last line need not end in a newline.
+        file.write_all(b"last").unwrap();
+        finished.store(true, Ordering::Release);
+        follower.join().unwrap();
+        assert_eq!(lines.try_iter().collect::<Vec<_>>(), ["last"]);
     }
 
     #[test]

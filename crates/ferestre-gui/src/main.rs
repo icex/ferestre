@@ -16,6 +16,7 @@ mod deadline;
 mod editor;
 mod model;
 mod packagekit;
+mod presence_ui;
 mod progress;
 mod state;
 mod stop;
@@ -62,6 +63,29 @@ row.library-row label.title {
 .role-badge.player {
   color: @success_color;
   background-color: alpha(@success_color, 0.12);
+}
+.presence-dot {
+  min-width: 6px;
+  min-height: 6px;
+  border-radius: 999px;
+  border: 2px solid @sidebar_bg_color;
+  background-color: alpha(@window_fg_color, 0.4);
+}
+.presence-dot.online {
+  background-color: @success_color;
+}
+.presence-dot.away {
+  background-color: @warning_color;
+}
+.presence-dot.ingame {
+  background-color: @accent_color;
+}
+.presence-dot.failed {
+  background-color: @error_color;
+}
+.presence-dot.pending {
+  background-color: @sidebar_bg_color;
+  box-shadow: inset 0 0 0 2px alpha(@window_fg_color, 0.4);
 }
 ";
 
@@ -170,6 +194,9 @@ struct Ui {
     /// Cancels the PackageKit install in progress, from the activity panel.
     package_cancel: Rc<RefCell<Option<packagekit::Cancel>>>,
     cancel_package: gtk::Button,
+    /// Online status: the Player's switch, what Xbox shows, and the runners
+    /// this window's launches report.
+    presence: Rc<RefCell<presence_ui::State>>,
 }
 
 fn main() -> glib::ExitCode {
@@ -415,6 +442,7 @@ fn build_ui(app: &adw::Application) {
         install_owed: Rc::new(Cell::new(None)),
         package_cancel: Rc::new(RefCell::new(None)),
         cancel_package: cancel_package.clone(),
+        presence: Rc::new(RefCell::new(Default::default())),
     };
 
     window.connect_close_request(glib::clone!(
@@ -571,6 +599,10 @@ fn build_ui(app: &adw::Application) {
                 }
                 refresh_entitlements(&ui, false);
                 refresh_updates(&ui, false);
+                // Xbox is asked every five minutes, not every minute.
+                if let Some(probe) = presence_ui::due(&ui) {
+                    presence_ui::refresh(&ui, probe);
+                }
                 glib::ControlFlow::Continue
             }
         ),
@@ -1817,6 +1849,16 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
 
 fn render_account_button(ui: &Ui) {
     let model = ui.model.borrow();
+    let badge = if model.account.is_some() {
+        ui.presence.borrow().badge()
+    } else {
+        ferestre_core::presence::Badge::Hidden
+    };
+    let status = badge.label();
+    let dot = presence_ui::dot(&badge);
+    // The avatar is the Store account's. With a separate Player the dot goes
+    // on the Player's line instead, so it is never on the wrong face.
+    let split = model.roles.as_ref().is_some_and(|r| r.split());
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     let avatar = adw::Avatar::new(28, model.account.as_ref().map(|a| a.label()), true);
     if let Some(path) = &model.avatar {
@@ -1824,7 +1866,15 @@ fn render_account_button(ui: &Ui) {
             avatar.set_custom_image(Some(&texture));
         }
     }
-    content.append(&avatar);
+    match &dot {
+        Some(dot) if !split => {
+            let overlay = gtk::Overlay::new();
+            overlay.set_child(Some(&avatar));
+            overlay.add_overlay(dot);
+            content.append(&overlay);
+        }
+        _ => content.append(&avatar),
+    }
 
     let (primary, secondary) = if let Some(roles) = &model.roles {
         let player = model
@@ -1868,6 +1918,11 @@ fn render_account_button(ui: &Ui) {
             .into(),
         )
     };
+    // Added after what is there, which stays as it was: "Player: <name>".
+    let secondary = match &status {
+        Some(status) => format!("{secondary} · {status}"),
+        None => secondary,
+    };
     let labels = gtk::Box::new(gtk::Orientation::Vertical, 0);
     labels.append(
         &gtk::Label::builder()
@@ -1876,22 +1931,33 @@ fn render_account_button(ui: &Ui) {
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build(),
     );
-    labels.append(
-        &gtk::Label::builder()
-            .label(&secondary)
-            .xalign(0.0)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["caption", "dim-label"])
-            .build(),
-    );
+    let secondary = gtk::Label::builder()
+        .label(&secondary)
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .css_classes(["caption", "dim-label"])
+        .build();
+    match dot {
+        Some(dot) if split => {
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            dot.set_valign(gtk::Align::Center);
+            line.append(&dot);
+            line.append(&secondary);
+            labels.append(&line);
+        }
+        _ => labels.append(&secondary),
+    }
     content.append(&labels);
 
     ui.account_button.set_child(Some(&content));
-    ui.account_button
-        .set_tooltip_text(Some(match &model.account {
-            Some(_) => "This account, and what to do with it",
-            None => "Sign in through the Xodus client",
-        }));
+    let about = match &model.account {
+        Some(_) => "This account, and what to do with it",
+        None => "Sign in through the Xodus client",
+    };
+    ui.account_button.set_tooltip_text(Some(&match &status {
+        Some(status) => format!("{about}\nStatus: {status}"),
+        None => about.to_string(),
+    }));
 }
 
 /// A title's page on the web Store, by product id.
@@ -1933,6 +1999,8 @@ fn account_menu(ui: &Ui) {
         }
         button
     };
+
+    presence_ui::menu_section(ui, &items, &popover);
 
     let accounts = entry(
         "Accounts",
@@ -2066,6 +2134,13 @@ fn sign_out(ui: &Ui) {
         return;
     }
     let roles = ui.model.borrow().roles.clone();
+    // The account being signed out, whose game runners must say goodbye to
+    // Xbox while it still has a token: the Store account, which is the Player
+    // too unless they are split.
+    let leaving = roles
+        .as_ref()
+        .map(|r| r.store.clone())
+        .or_else(|| presence_ui::player(ui));
     // The saved account is removed just below, before the client runs, and
     // the client is its own process, which a closed window does not stop.
     note_close(
@@ -2084,6 +2159,9 @@ fn sign_out(ui: &Ui) {
     }
     let ui = ui.clone();
     glib::spawn_future_local(async move {
+        if let Some(leaving) = &leaving {
+            presence_ui::stop_for(&ui, leaving).await;
+        }
         let result = gio::spawn_blocking(move || {
             deadline::status(
                 &mut scope_store(account::logout_command(&client), roles.as_ref()),
@@ -2301,6 +2379,35 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
             ui.running_channels.borrow_mut().remove(&key);
         }
     }
+    presence_ui::launch_started(ui, &key, pgid);
+    // Set once the launch has exited: the follower reads what is left, then
+    // stops.
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(path) = output.clone() {
+        // The launch's runner reports on its stderr, which goes to the
+        // launch's output file; follow it while the launch runs.
+        let (sender, mut events) = futures_channel::mpsc::unbounded();
+        let following = std::sync::Arc::clone(&finished);
+        std::thread::spawn(move || {
+            state::follow_lines(&path, &following, |line| {
+                if let Some(event) = ferestre_core::presence::parse_relay(line) {
+                    let _ = sender.unbounded_send(event);
+                }
+            });
+        });
+        glib::spawn_future_local(glib::clone!(
+            #[strong]
+            ui,
+            #[strong]
+            key,
+            async move {
+                use futures_util::StreamExt;
+                while let Some(event) = events.next().await {
+                    presence_ui::launch_event(&ui, &key, pgid, event);
+                }
+            }
+        ));
+    }
     render(ui);
     ui.toasts.add_toast(toast(format!("Starting {name}")));
 
@@ -2312,6 +2419,7 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
         let mut child = child;
         let status = gio::spawn_blocking(move || {
             let status = child.wait();
+            finished.store(true, std::sync::atomic::Ordering::Release);
             let reason = output
                 .map(|path| state::tail_lines(&path, 64))
                 .and_then(|lines| model::launch_failure(&lines));
@@ -2332,6 +2440,7 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
             ui.running.borrow_mut().remove(&key);
             ui.running_servers.borrow_mut().remove(&key);
             ui.running_channels.borrow_mut().remove(&key);
+            presence_ui::launch_ended(&ui, &key);
         }
         render(&ui);
         match status {
@@ -3780,6 +3889,7 @@ fn refresh_account(ui: &Ui) {
         render(&ui);
         refresh_entitlements(&ui, false);
         refresh_updates(&ui, false);
+        presence_ui::refresh(&ui, true);
     });
 }
 
