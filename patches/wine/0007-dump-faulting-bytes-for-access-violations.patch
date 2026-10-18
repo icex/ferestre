@@ -1,7 +1,7 @@
 diff --git a/dlls/ntdll/exception.c b/dlls/ntdll/exception.c
 --- a/dlls/ntdll/exception.c
 +++ b/dlls/ntdll/exception.c
-@@ -191,6 +191,60 @@
+@@ -191,6 +191,64 @@
  }
  
  
@@ -17,14 +17,18 @@ diff --git a/dlls/ntdll/exception.c b/dlls/ntdll/exception.c
 + * violation in ntdll that only happens because +seh logging is on. So the
 + * bytes are read with NtReadVirtualMemory, which catches a fault on the Unix
 + * side without dispatching it, and only from pages NtQueryVirtualMemory says
-+ * are committed, readable and not guard pages, whose first touch is not free.
++ * are committed, readable (execute-only counts) and not guard pages, whose
++ * first touch is not free.
 + * An address in the low 64K, where nothing is ever mapped -- the usual jump
 + * through a null vtable -- is not read at all, which also keeps pc - 32 from
 + * wrapping around to the top of the address space.
 + */
 +static void format_code_bytes( const void *pc, char *text )
 +{
-+    const ULONG readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
++    /* PAGE_EXECUTE included: Wine maps execute-only pages readable, and the
++     * code a fault happened in is the page that matters most here. Should a
++     * page really refuse reads, NtReadVirtualMemory fails and it shows as ??. */
++    const ULONG readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE |
 +                           PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
 +    const ULONG_PTR start = (ULONG_PTR)pc - 32;
 +    BYTE code[48];
@@ -62,7 +66,7 @@ diff --git a/dlls/ntdll/exception.c b/dlls/ntdll/exception.c
  /*******************************************************************
   *		dispatch_exception
   */
-@@ -214,25 +268,21 @@
+@@ -214,25 +272,21 @@
  
          /* An illegal instruction is nearly always a deliberate trap -- ud2 from
           * a failed check, or an instruction the CPU does not have -- and which

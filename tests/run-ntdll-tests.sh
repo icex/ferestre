@@ -85,6 +85,14 @@ else
     results+=("FAIL seh-dump log shows the readable bytes of the ud2 page"); FAILED=1
     grep -a -- '--- Code' "$WORK/seh-dump.log" | head -5
 fi
+# Execute-only code is readable under Wine, and it is the code a fault is in:
+# 32 nops, then the ud2 and ret, then the rest of the zeroed page.
+if grep -aq -- '--- Code .*: \(90 \)\{32\}0f 0b c3 00 ' "$WORK/seh-dump.log"; then
+    results+=("ok   seh-dump log shows the bytes of an execute-only page")
+else
+    results+=("FAIL seh-dump log shows the bytes of an execute-only page"); FAILED=1
+    grep -a -- '--- Code' "$WORK/seh-dump.log" | head -5
+fi
 
 # The main image mapped from a memfd, as the client hands a decrypted title
 # over: the file on disk is a decoy of the same size, and the image Wine runs
