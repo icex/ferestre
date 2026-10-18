@@ -882,41 +882,15 @@ fn player_prefixes(base: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// Recipes from each directory, later ones winning, as
-/// `Recipe::load_layered` reads them -- except that a file that cannot be
-/// read is skipped and named, rather than costing every other recipe. One
-/// typo used to empty the whole library.
+/// Recipes from each directory, later ones winning, as the launcher layers
+/// them -- a file that cannot be read is skipped and named, rather than
+/// costing every other recipe. One typo used to empty the whole library.
 fn load_recipes(dirs: &[PathBuf]) -> (Vec<Recipe>, Vec<String>) {
-    let mut by_product: BTreeMap<String, Recipe> = BTreeMap::new();
-    let mut skipped = Vec::new();
-    for dir in dirs.iter().filter(|dir| dir.is_dir()) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(error) => {
-                skipped.push(format!("{}: {error}", dir.display()));
-                continue;
-            }
-        };
-        let mut found: Vec<Recipe> = Vec::new();
-        let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-        files.sort();
-        for path in files {
-            if path.extension().and_then(|e| e.to_str()) != Some("toml")
-                || path.file_stem().and_then(|s| s.to_str()) == Some("capabilities")
-            {
-                continue;
-            }
-            match Recipe::load(&path) {
-                Ok(recipe) => found.push(recipe),
-                Err(error) => skipped.push(format!("{error:#}")),
-            }
-        }
-        found.sort_by(|a, b| a.title.product_id.cmp(&b.title.product_id));
-        for recipe in found {
-            by_product.insert(recipe.title.product_id.to_ascii_uppercase(), recipe);
-        }
-    }
-    (by_product.into_values().collect(), skipped)
+    let (recipes, problems) = Recipe::load_layered_report(dirs);
+    (
+        recipes,
+        problems.iter().map(|problem| problem.to_string()).collect(),
+    )
 }
 
 /// Icons already on disk from a previous run. Nothing is fetched here: a window
@@ -1265,8 +1239,9 @@ mod tests {
         let good = |id: &str, name: &str| {
             format!(
                 "schema = 1\n[title]\nproduct-id = \"{id}\"\nname = \"{name}\"\n\
-                 slug = \"s{id}\"\n[launch]\nexecutable = \"Game.exe\"\n\
-                 [status]\nstate = \"untested\"\nsummary = \"s\"\n"
+                 slug = \"s{}\"\n[launch]\nexecutable = \"Game.exe\"\n\
+                 [status]\nstate = \"untested\"\nsummary = \"s\"\n",
+                id.to_ascii_lowercase()
             )
         };
         write(&packaged.join("a.toml"), &good("9ZZA", "Packaged A"));
