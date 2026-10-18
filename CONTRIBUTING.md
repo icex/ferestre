@@ -55,6 +55,7 @@ when the work was already finished.
 tests/run-tests.sh          # the GDK runtime suite
 tests/run-gameinput-tests.sh
 tests/run-appmodel-tests.sh
+tests/run-concrt-tests.sh   # concrt140: concurrent_vector and concurrent_queue
 ```
 
 These build against the current sources and run under the locally built runtime.
