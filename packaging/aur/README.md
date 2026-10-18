@@ -36,8 +36,9 @@ weight:
    instead of only in a document. Aggregation would be legal in one package —
    this is about it staying obvious.
 2. **Build cost.** The client links `webkit2gtk-4.1` (its Microsoft sign-in
-   window is a `wry`/`tao` webview). The launcher links nothing. Nobody should
-   rebuild webkit-linked Rust to pick up a launcher fix.
+   window is a `wry`/`tao` webview). The launcher's window links GTK4 and
+   libadwaita but not WebKit. Nobody should rebuild webkit-linked Rust to pick
+   up a launcher fix.
 3. **Provenance.** It is someone else's project, carried as a fork that
    [cannot be upstreamed](../../NOTICE). It moves on its own schedule.
 

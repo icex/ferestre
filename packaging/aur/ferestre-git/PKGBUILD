@@ -2,7 +2,8 @@
 
 # The front end.
 #
-# This package builds and installs the Rust launcher plus its launch scripts.
+# This package builds and installs the Rust launcher, its window and its launch
+# scripts.
 # It remains a -git package; tagged releases are distributed as AppImages and
 # portable archives while the non-git AUR package is prepared.
 #
@@ -36,6 +37,10 @@ depends=(
   # as a side effect of ferestre-runtime-bin needing python for the proton script.
   'python'
   'util-linux'             # private executable views use unshare/mount/umount
+  # ferestre-gui, the window the desktop entry opens. The workspace build links
+  # it against both (gtk4 0.9 with v4_10, libadwaita 0.7 with v1_5), so they
+  # are needed to build the package as well as to run it.
+  'gtk4' 'libadwaita'
 )
 makedepends=('git' 'cargo')
 optdepends=(
@@ -106,11 +111,14 @@ package() {
   # The launcher reads this beside the packaged resources.
   printf '%s\n' "$pkgver" > "$pkgdir/usr/lib/ferestre/VERSION"
 
-  install -Dm755 target/release/ferestre "$pkgdir/usr/bin/ferestre"
+  install -Dm755 target/release/ferestre     "$pkgdir/usr/bin/ferestre"
+  # The desktop entry below runs ferestre-gui and names it in TryExec, so
+  # without this binary desktops hide the entry and there is no window at all.
+  install -Dm755 target/release/ferestre-gui "$pkgdir/usr/bin/ferestre-gui"
 
   # Desktop integration is shared with the AppImage, which owns these files.
-  # It is not load-bearing for a command-line tool, so a rename over there
-  # should not break the package -- but it should be visible.
+  # A rename over there should not break the package, since the window is
+  # still on PATH -- but it should be visible.
   local id=io.github.icex.ferestre
   if [[ -f packaging/appimage/$id.desktop ]]; then
     install -Dm644 "packaging/appimage/$id.desktop" \
