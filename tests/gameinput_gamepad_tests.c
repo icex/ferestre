@@ -36,6 +36,76 @@ static void WINAPI callback(GameInputCallbackToken token, void *context, IGameIn
     count++;
 }
 
+/* What the last device callback said. After registration these arrive from
+ * GameInput's own thread, so the test waits on the event. */
+static struct
+{
+    LONG count;
+    IGameInputDevice_v2 *device;
+    GameInputDeviceStatus current, previous;
+    HANDLE event;
+} hotplug;
+
+static void WINAPI hotplug_callback(GameInputCallbackToken token, void *context, IGameInputDevice_v2 *device,
+                                    uint64_t timestamp, GameInputDeviceStatus current, GameInputDeviceStatus previous)
+{
+    hotplug.device = device;
+    hotplug.current = current;
+    hotplug.previous = previous;
+    InterlockedIncrement(&hotplug.count);
+    SetEvent(hotplug.event);
+}
+
+static BOOL wait_hotplug(LONG target)
+{
+    DWORD start = GetTickCount();
+
+    while (hotplug.count < target && GetTickCount() - start < 3000)
+        WaitForSingleObject(hotplug.event, 50);
+    return hotplug.count >= target;
+}
+
+/* A pad switched on after a title registered for device callbacks has to be
+ * reported to it, and so does one that drops out. Slot 3 is connected and
+ * slot 1 is free when this runs. */
+static void test_hotplug(IGameInput_v2 *input, void (WINAPI *set_state)(DWORD, const XINPUT_STATE *, BOOL))
+{
+    XINPUT_STATE idle = {1};
+    GameInputCallbackToken token = 0;
+    IGameInputDevice_v2 *pad = NULL;
+    LONG initial, seen;
+    HRESULT hr;
+
+    hotplug.event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    set_state(1, &idle, FALSE);
+    Sleep(300); /* slot 0 was just unplugged: let GameInput notice before registering */
+    hr = IGameInput_v2_RegisterDeviceCallback(input, NULL, GameInputKindGamepad, GameInputDeviceConnected,
+                                             GameInputBlockingEnumeration, NULL, hotplug_callback, &token);
+    initial = hotplug.count;
+    OK(hr == S_OK && initial == 1, "registration reports the one pad already connected");
+
+    set_state(1, &idle, TRUE);
+    OK(wait_hotplug(initial + 1) && (hotplug.current & GameInputDeviceConnected) &&
+       hotplug.previous == GameInputDeviceNoStatus, "a pad switched on after registration is reported connected");
+    pad = hotplug.count > initial ? hotplug.device : NULL;
+    OK(pad && pad != devices[0] && pad != devices[1] &&
+       (IGameInputDevice_v2_GetDeviceStatus(pad) & GameInputDeviceConnected), "the new pad is its own, connected device");
+
+    set_state(1, &idle, FALSE);
+    OK(wait_hotplug(initial + 2) && hotplug.device == pad && !(hotplug.current & GameInputDeviceConnected) &&
+       (hotplug.previous & GameInputDeviceConnected), "a pad that drops out is reported disconnected");
+    Sleep(300);
+    OK(hotplug.count == initial + 2, "each change is reported once (%ld reports)", hotplug.count - initial);
+
+    OK(IGameInput_v2_UnregisterCallback(input, token), "UnregisterCallback");
+    seen = hotplug.count;
+    set_state(1, &idle, TRUE);
+    Sleep(400);
+    OK(hotplug.count == seen, "an unregistered callback hears of no further pads");
+    set_state(1, &idle, FALSE);
+    CloseHandle(hotplug.event);
+}
+
 /* Run this thread's messages for a while. */
 static void pump(DWORD ms)
 {
@@ -321,6 +391,7 @@ int main(void)
     OK(hr == GAMEINPUT_E_READING_NOT_FOUND && !next, "disconnected pad supplies no reading");
     IGameInput_v2_UnregisterCallback(input, token);
 
+    test_hotplug(input, set_state);
     test_mouse_registration(input);
 
 done:
