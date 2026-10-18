@@ -84,6 +84,14 @@ WINE=$WORK/wine/bin/wine
 
 export WINEPREFIX="$WORK/prefix"
 export WINEDEBUG=-all,fixme-all
+# Nothing inherited from the calling shell may change what is tested or reach
+# the real service: a manifest would make the bare run a packaged one, and a
+# terminal opened from a launched title carries the service socket and the
+# profile variables. The service directory is an empty one of our own.
+unset WINE_PACKAGE_MANIFEST WINEDLLOVERRIDES XODUS_STORE_PROFILE XODUS_PLAYER_PROFILE \
+    XODUS_ACCOUNT_PROFILE FERESTRE_ACCOUNT_ROLES SteamGameId SteamDeck
+mkdir -p "$WORK/rt"
+export XODUS_RUNTIME_DIR="$WORK/rt"
 DOS_MANIFEST="Z:$(echo "$WORK/pkg/AppxManifest.xml" | sed 's#/#\\#g')"
 
 run() { ( cd "$WORK" && timeout 120 "$WINE" "$@" ) 2>/dev/null | grep -avE '^ntsync|radv is not|^wine:|wineserver'; }
