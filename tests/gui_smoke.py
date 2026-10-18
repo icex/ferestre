@@ -793,6 +793,9 @@ print(":: done", flush=True)
         f.write("#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n")
     os.chmod(image, 0o755)
     env["APPIMAGE"] = image
+    # The AppImage runtime sets both; APPIMAGE only counts for the CLI inside
+    # APPDIR, so an AppImage launcher's own APPIMAGE is not mistaken for ours.
+    env["APPDIR"] = home
     shortcuts = os.path.join(home, "steam", "userdata", "1", "config", "shortcuts.vdf")
     os.makedirs(os.path.dirname(shortcuts))
 

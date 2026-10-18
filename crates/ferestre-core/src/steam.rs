@@ -232,10 +232,25 @@ pub struct Shortcut {
 
 /// A saved shortcut must survive unmounting an AppImage. The CLI inside the
 /// mount is suitable for immediate child processes, but not a Steam target.
-pub fn shortcut_program(appimage: Option<&std::ffi::OsStr>, cli: &Path) -> PathBuf {
+///
+/// `APPIMAGE` alone does not mean this is that AppImage: the type-2 runtime
+/// exports it, and `APPDIR`, to every descendant, so a native install started
+/// from a launcher or a terminal that is itself an AppImage inherits someone
+/// else's. Writing that as the shortcut would start the other program. So the
+/// AppImage is the target only when the CLI being registered lives inside its
+/// mount and the image is still there to start; otherwise it is the CLI.
+pub fn shortcut_program(
+    appimage: Option<&std::ffi::OsStr>,
+    appdir: Option<&std::ffi::OsStr>,
+    cli: &Path,
+) -> PathBuf {
+    let inside_mount = appdir
+        .filter(|dir| !dir.is_empty())
+        .is_some_and(|dir| cli.starts_with(dir));
     appimage
-        .filter(|path| !path.is_empty())
+        .filter(|path| inside_mount && !path.is_empty())
         .map(PathBuf::from)
+        .filter(|path| path.is_file())
         .unwrap_or_else(|| cli.to_path_buf())
 }
 
@@ -246,19 +261,64 @@ mod shortcut_program_tests {
 
     #[test]
     fn persisted_target_uses_appimage_and_native_installs_use_the_cli() {
+        let home = tempfile::tempdir().unwrap();
+        let games = home.path().join("My Games");
+        std::fs::create_dir(&games).unwrap();
+        let image = games.join("Ferestre.AppImage");
+        std::fs::write(&image, b"").unwrap();
+        let appdir = OsStr::new("/tmp/.mount_ferestre");
         let cli = Path::new("/tmp/.mount_ferestre/usr/bin/ferestre");
-        let image = OsStr::new("/opt/My Games/Ferestre.AppImage");
-        let program = shortcut_program(Some(image), cli);
+
+        let program = shortcut_program(Some(image.as_os_str()), Some(appdir), cli);
         let shortcut = Shortcut::new(
             "Game",
             &program,
             program.parent().unwrap(),
             "run 9P5786PJB9RP",
         );
-        assert_eq!(shortcut.exe, "\"/opt/My Games/Ferestre.AppImage\"");
-        assert_eq!(shortcut.start_dir, "\"/opt/My Games\"");
-        assert_eq!(shortcut_program(None, cli), cli);
-        assert_eq!(shortcut_program(Some(OsStr::new("")), cli), cli);
+        assert_eq!(shortcut.exe, format!("\"{}\"", image.display()));
+        assert_eq!(shortcut.start_dir, format!("\"{}\"", games.display()));
+        assert_eq!(shortcut_program(None, Some(appdir), cli), cli);
+        assert_eq!(
+            shortcut_program(Some(OsStr::new("")), Some(appdir), cli),
+            cli
+        );
+    }
+
+    #[test]
+    fn an_inherited_appimage_is_not_ours() {
+        // A native install started from another AppImage: both variables are
+        // set, and both describe the other program.
+        let home = tempfile::tempdir().unwrap();
+        let other = home.path().join("Other.AppImage");
+        std::fs::write(&other, b"").unwrap();
+        let cli = Path::new("/usr/bin/ferestre");
+        let their_mount = OsStr::new("/tmp/.mount_OtherXY");
+        assert_eq!(
+            shortcut_program(Some(other.as_os_str()), Some(their_mount), cli),
+            cli
+        );
+        assert_eq!(shortcut_program(Some(other.as_os_str()), None, cli), cli);
+        assert_eq!(
+            shortcut_program(Some(other.as_os_str()), Some(OsStr::new("")), cli),
+            cli
+        );
+        // A sibling whose name merely starts the same is not inside the mount.
+        let sibling = Path::new("/tmp/.mount_OtherXYZ/usr/bin/ferestre");
+        assert_eq!(
+            shortcut_program(Some(other.as_os_str()), Some(their_mount), sibling),
+            sibling
+        );
+    }
+
+    #[test]
+    fn an_image_that_is_gone_is_not_a_target() {
+        let cli = Path::new("/tmp/.mount_ferestre/usr/bin/ferestre");
+        let gone = OsStr::new("/nonexistent/Ferestre.AppImage");
+        assert_eq!(
+            shortcut_program(Some(gone), Some(OsStr::new("/tmp/.mount_ferestre")), cli),
+            cli
+        );
     }
 }
 

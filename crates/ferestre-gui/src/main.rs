@@ -2330,7 +2330,11 @@ fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {
             model.icons.get(&key).cloned(),
         )
     };
-    let program = steam::shortcut_program(std::env::var_os("APPIMAGE").as_deref(), &cli_binary());
+    let program = steam::shortcut_program(
+        std::env::var_os("APPIMAGE").as_deref(),
+        std::env::var_os("APPDIR").as_deref(),
+        &cli_binary(),
+    );
     let start_dir = program.parent().unwrap_or(Path::new("/")).to_path_buf();
     let shortcut = steam::Shortcut::new(name, &program, &start_dir, format!("run {product_id}"));
     let product_id = product_id.to_string();
