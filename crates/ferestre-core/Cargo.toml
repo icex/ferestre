@@ -24,3 +24,5 @@ tempfile = "3"
 # Signs test artefacts with a key pair generated in the test, to check the
 # release signature verification against.
 ed25519-dalek = "2"
+# Tests sign with a throwaway key pair they generate, in the real format.
+minisign = "0.7"

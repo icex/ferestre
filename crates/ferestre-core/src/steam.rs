@@ -38,6 +38,11 @@ pub enum Value {
     Map(Vec<(String, Value)>),
     Str(String),
     Int(i32),
+    /// A string value that is not UTF-8 -- a path from an older tool on a
+    /// Latin-1 filesystem, say. Kept byte for byte, because decoding it for
+    /// display and writing the decoded text back changed someone else's
+    /// shortcut to point at a path that does not exist.
+    Bytes(Vec<u8>),
 }
 
 impl Value {
@@ -80,7 +85,7 @@ impl<'a> Reader<'a> {
         Ok(b)
     }
 
-    fn cstring(&mut self) -> Result<String> {
+    fn raw_cstring(&mut self) -> Result<&'a [u8]> {
         let start = self.at;
         let end = self.bytes[start..]
             .iter()
@@ -88,10 +93,29 @@ impl<'a> Reader<'a> {
             .ok_or_else(|| anyhow!("unterminated string at byte {start}"))?
             + start;
         self.at = end + 1;
-        // Steam writes UTF-8 but a shortcut name can come from a filesystem
-        // that is not. Lossy, because refusing to show someone their library
-        // over one bad byte in one name is the wrong trade.
-        Ok(String::from_utf8_lossy(&self.bytes[start..end]).into_owned())
+        Ok(&self.bytes[start..end])
+    }
+
+    /// A key. Steam's own field names and entry numbers are ASCII, so one
+    /// that is not even UTF-8 is a file we do not understand well enough to
+    /// rewrite.
+    fn key(&mut self) -> Result<String> {
+        let start = self.at;
+        let raw = self.raw_cstring()?;
+        String::from_utf8(raw.to_vec()).map_err(|_| {
+            anyhow!("a key that is not UTF-8 at byte {start}: not a file we can rewrite")
+        })
+    }
+
+    /// A string value. Steam writes UTF-8, but a shortcut's path or name can
+    /// come from a filesystem that is not; those are kept as bytes so they
+    /// are written back unchanged.
+    fn string_value(&mut self) -> Result<Value> {
+        let raw = self.raw_cstring()?;
+        Ok(match std::str::from_utf8(raw) {
+            Ok(text) => Value::Str(text.to_owned()),
+            Err(_) => Value::Bytes(raw.to_vec()),
+        })
     }
 
     fn int32(&mut self) -> Result<i32> {
@@ -111,10 +135,10 @@ impl<'a> Reader<'a> {
             if kind == END_MAP {
                 return Ok(Value::Map(entries));
             }
-            let key = self.cstring()?;
+            let key = self.key()?;
             let value = match kind {
                 TYPE_MAP => self.map()?,
-                TYPE_STRING => Value::Str(self.cstring()?),
+                TYPE_STRING => self.string_value()?,
                 TYPE_INT32 => Value::Int(self.int32()?),
                 other => bail!("unknown value type {other:#04x} for key {key:?}"),
             };
@@ -168,6 +192,13 @@ fn write_value(out: &mut Vec<u8>, key: &str, value: &Value) {
             out.extend_from_slice(key.as_bytes());
             out.push(0);
             out.extend_from_slice(s.as_bytes());
+            out.push(0);
+        }
+        Value::Bytes(bytes) => {
+            out.push(TYPE_STRING);
+            out.extend_from_slice(key.as_bytes());
+            out.push(0);
+            out.extend_from_slice(bytes);
             out.push(0);
         }
         Value::Int(i) => {
@@ -371,18 +402,51 @@ impl Shortcut {
 }
 
 /// Match the launch identity first, so renamed titles and old mount-local
-/// targets are updated too. Fall back to the display name for older entries.
+/// targets are updated too. Fall back to the display name for older entries,
+/// but only for an entry Ferestre wrote: someone's own shortcut of the same
+/// name, made by hand or by Lutris or Heroic, is theirs and is left alone.
 pub fn existing_shortcut<'a>(document: &'a Value, shortcut: &Shortcut) -> Option<&'a Value> {
     let entries = document.get("shortcuts")?.as_map()?;
+    matching_entry(entries, shortcut).map(|at| &entries[at].1)
+}
+
+/// The position of the entry `shortcut` should replace, if any. The one rule
+/// for [`existing_shortcut`], [`effective_app_id`] and [`upsert`], so the id
+/// whose artwork is written is always the entry that gets updated.
+fn matching_entry(entries: &[(String, Value)], shortcut: &Shortcut) -> Option<usize> {
     entries
         .iter()
-        .find(|(_, entry)| same_launch(entry, shortcut))
+        .position(|(_, entry)| same_launch(entry, shortcut))
         .or_else(|| {
-            entries.iter().find(|(_, entry)| {
-                entry.get("AppName").and_then(Value::as_str) == Some(shortcut.app_name.as_str())
+            entries.iter().position(|(_, entry)| {
+                is_ferestre_entry(entry)
+                    && entry.get("AppName").and_then(Value::as_str)
+                        == Some(shortcut.app_name.as_str())
             })
         })
-        .map(|(_, entry)| entry)
+}
+
+/// Whether an entry was written by Ferestre: it starts the launcher (`Exe` is
+/// `ferestre` or a Ferestre AppImage), or it runs a product the way the
+/// launcher's shortcuts do (`run <product id>`).
+fn is_ferestre_entry(entry: &Value) -> bool {
+    let exe = entry.get("Exe").and_then(Value::as_str).unwrap_or_default();
+    let program = Path::new(exe.trim().trim_matches('"'))
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let launcher =
+        program == "ferestre" || (program.ends_with(".appimage") && program.contains("ferestre"));
+    let runs_a_product = entry
+        .get("LaunchOptions")
+        .and_then(Value::as_str)
+        .is_some_and(|options| {
+            let words: Vec<&str> = options.split_whitespace().collect();
+            matches!(words.as_slice(), ["run", id]
+                if id.len() == 12 && id.bytes().all(|b| b.is_ascii_alphanumeric()))
+        });
+    launcher || runs_a_product
 }
 
 fn same_launch(entry: &Value, shortcut: &Shortcut) -> bool {
@@ -413,8 +477,9 @@ pub fn effective_app_id(document: &Value, shortcut: &Shortcut) -> u32 {
 /// Add or replace a shortcut in a parsed `shortcuts.vdf`, keeping everything
 /// else exactly as it was.
 ///
-/// Matching uses the launch options or title, preserving the existing app id
-/// and personal settings. Returns whether an existing entry was updated.
+/// Matching uses the launch options, or the title of an entry Ferestre wrote,
+/// preserving the existing app id and personal settings. Returns whether an
+/// existing entry was updated.
 pub fn upsert(document: &mut Value, shortcut: &Shortcut) -> Result<bool> {
     let shortcuts = document
         .as_map()
@@ -431,14 +496,7 @@ pub fn upsert(document: &mut Value, shortcut: &Shortcut) -> Result<bool> {
         bail!("\"shortcuts\" is not a map");
     };
 
-    let existing = entries
-        .iter()
-        .position(|(_, entry)| same_launch(entry, shortcut))
-        .or_else(|| {
-            entries.iter().position(|(_, entry)| {
-                entry.get("AppName").and_then(Value::as_str) == Some(shortcut.app_name.as_str())
-            })
-        });
+    let existing = matching_entry(entries, shortcut);
 
     match existing {
         Some(at) => {
@@ -656,11 +714,14 @@ pub fn load(path: &Path) -> Result<Value> {
     }
 }
 
-/// Write a shortcuts file, keeping a copy of what was there.
+/// Write a shortcuts file, keeping copies of what was there.
 ///
 /// The backup is the point. This is Steam's file and it holds shortcuts the
 /// launcher knows nothing about; if the write is wrong, "restore the .bak" has
-/// to be an answer that exists.
+/// to be an answer that exists. So `.vdf.bak` is the file as it was before
+/// Ferestre first wrote it and is never replaced -- refreshing it on every save
+/// meant a second save threw away the only copy of a mistake's victim -- and
+/// `.vdf.prev` is the file as it was before this save.
 pub fn save(path: &Path, document: &Value) -> Result<()> {
     let bytes = serialise(document)?;
 
@@ -679,16 +740,21 @@ pub fn save(path: &Path, document: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path).map_or(0o666, |m| m.permissions().mode() & 0o777);
     // Only back up a file that still parses. A backup is worth having because
     // it can be restored; replacing a good one with something unreadable would
     // take away the answer it exists to provide.
-    if path.is_file() && std::fs::read(path).is_ok_and(|old| parse(&old).is_ok()) {
-        let _ = std::fs::copy(path, path.with_extension("vdf.bak"));
+    if let Some(old) = std::fs::read(path).ok().filter(|old| parse(old).is_ok()) {
+        let first = path.with_extension("vdf.bak");
+        if !first.exists() {
+            crate::cache::write_mode(&first, &old, mode)?;
+        }
+        crate::cache::write_mode(&path.with_extension("vdf.prev"), &old, mode)?;
     }
-    let temporary = path.with_extension("vdf.new");
-    std::fs::write(&temporary, &bytes)?;
-    std::fs::rename(&temporary, path)?;
-    Ok(())
+    // Written beside the file, flushed, then renamed over it: a crash leaves
+    // either the old file or the new one, never half of one.
+    crate::cache::write_mode(path, &bytes, mode)
 }
 
 /// Whether Steam is running, because it rewrites `shortcuts.vdf` from memory
@@ -1072,6 +1138,174 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A person's own shortcut that happens to share the title's name --
+    /// made by hand, or by Lutris or Heroic -- is not Ferestre's to replace,
+    /// and its art slots are not Ferestre's to fill.
+    #[test]
+    fn someone_elses_shortcut_with_the_same_name_is_left_alone() {
+        let mut document = parse(&sample()).expect("parses");
+        let before = document.clone();
+        let shortcut = Shortcut::new(
+            "Someone Elses Game",
+            Path::new("/usr/bin/ferestre"),
+            Path::new("/usr/bin"),
+            "run 9ZZTESTGAME1",
+        );
+        assert!(existing_shortcut(&document, &shortcut).is_none());
+        assert_eq!(effective_app_id(&document, &shortcut), shortcut.app_id());
+        assert!(
+            !upsert(&mut document, &shortcut).expect("adds"),
+            "added, not replaced"
+        );
+        let shortcuts = document.get("shortcuts").unwrap();
+        assert_eq!(shortcuts.as_map().unwrap().len(), 2);
+        assert_eq!(
+            shortcuts.get("0"),
+            before.get("shortcuts").unwrap().get("0"),
+            "their entry is exactly as it was"
+        );
+    }
+
+    /// The name fallback exists for Ferestre's own older entries, whose launch
+    /// options no longer match, and it still finds them.
+    #[test]
+    fn an_older_ferestre_entry_is_still_found_by_name() {
+        for (exe, options) in [
+            ("\"/home/a/Apps/Ferestre-0.1.2-x86_64.AppImage\"", ""),
+            ("\"/usr/bin/ferestre\"", "--verbose run 9ZZTESTGAME1"),
+            ("\"/somewhere/renamed\"", "run 9ZZTESTGAME2"),
+        ] {
+            let mut document = empty_document();
+            let Value::Map(root) = &mut document else {
+                unreachable!()
+            };
+            root[0].1 = Value::Map(vec![(
+                "0".into(),
+                Value::Map(vec![
+                    ("appid".into(), Value::Int(-123)),
+                    ("AppName".into(), Value::Str("Test Title".into())),
+                    ("Exe".into(), Value::Str(exe.into())),
+                    ("LaunchOptions".into(), Value::Str(options.into())),
+                ]),
+            )]);
+            let shortcut = Shortcut::new(
+                "Test Title",
+                Path::new("/usr/bin/ferestre"),
+                Path::new("/usr/bin"),
+                "run 9ZZTESTGAME1",
+            );
+            assert_eq!(
+                effective_app_id(&document, &shortcut),
+                -123i32 as u32,
+                "{exe}"
+            );
+            assert!(upsert(&mut document, &shortcut).expect("updates"), "{exe}");
+            assert_eq!(
+                document.get("shortcuts").unwrap().as_map().unwrap().len(),
+                1
+            );
+        }
+    }
+
+    /// A shortcut whose path is not UTF-8 used to be written back with
+    /// replacement characters, pointing it at a path that does not exist.
+    #[test]
+    fn a_path_that_is_not_utf8_is_written_back_unchanged() {
+        let mut bytes = Vec::new();
+        bytes.push(TYPE_MAP);
+        bytes.extend_from_slice(b"shortcuts\0");
+        bytes.push(TYPE_MAP);
+        bytes.extend_from_slice(b"0\0");
+        bytes.push(TYPE_STRING);
+        bytes.extend_from_slice(b"AppName\0Caf\xe9 Game\0");
+        bytes.push(TYPE_STRING);
+        bytes.extend_from_slice(b"Exe\0\"/games/caf\xe9/run\"\0");
+        bytes.push(END_MAP);
+        bytes.push(END_MAP);
+        bytes.push(END_MAP);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shortcuts.vdf");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut document = load(&path).expect("parses");
+        assert_eq!(
+            serialise(&document).unwrap(),
+            bytes,
+            "a byte-for-byte round trip"
+        );
+        let theirs = document.get("shortcuts").unwrap().get("0").unwrap();
+        assert_eq!(
+            theirs.get("Exe"),
+            Some(&Value::Bytes(b"\"/games/caf\xe9/run\"".to_vec()))
+        );
+        assert_eq!(theirs.get("Exe").unwrap().as_str(), None);
+
+        let shortcut = Shortcut::new(
+            "Test Title",
+            Path::new("/usr/bin/ferestre"),
+            Path::new("/usr/bin"),
+            "run 9ZZTESTGAME1",
+        );
+        upsert(&mut document, &shortcut).unwrap();
+        save(&path, &document).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        let original: &[u8] = b"\"/games/caf\xe9/run\"";
+        assert!(
+            written.windows(original.len()).any(|w| w == original),
+            "the other shortcut's path keeps its original bytes"
+        );
+        assert!(!written.windows(3).any(|w| w == "\u{fffd}".as_bytes()));
+
+        // A key that is not UTF-8 is refused rather than guessed at.
+        let mut bad_key = bytes.clone();
+        let at = bad_key.windows(7).position(|w| w == b"AppName").unwrap();
+        bad_key[at] = 0xff;
+        assert!(parse(&bad_key).is_err());
+    }
+
+    /// `.vdf.bak` is the file before Ferestre ever wrote it and stays that
+    /// way; `.vdf.prev` is the file before the latest save.
+    #[test]
+    fn the_first_backup_survives_later_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shortcuts.vdf");
+        std::fs::write(&path, sample()).unwrap();
+        let mut document = load(&path).unwrap();
+        let mut states = vec![sample()];
+        for (n, id) in ["9ZZTESTGAME1", "9ZZTESTGAME2", "9ZZTESTGAME3"]
+            .into_iter()
+            .enumerate()
+        {
+            let shortcut = Shortcut::new(
+                format!("Title {n}"),
+                Path::new("/usr/bin/ferestre"),
+                Path::new("/usr/bin"),
+                format!("run {id}"),
+            );
+            upsert(&mut document, &shortcut).unwrap();
+            save(&path, &document).unwrap();
+            states.push(std::fs::read(&path).unwrap());
+        }
+        assert_eq!(
+            std::fs::read(path.with_extension("vdf.bak")).unwrap(),
+            sample()
+        );
+        assert_eq!(
+            std::fs::read(path.with_extension("vdf.prev")).unwrap(),
+            states[states.len() - 2]
+        );
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["shortcuts.vdf", "shortcuts.vdf.bak", "shortcuts.vdf.prev"]
+        );
     }
 
     #[test]

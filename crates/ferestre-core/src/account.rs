@@ -131,20 +131,76 @@ pub fn supported_avatar_size(px: u32) -> u32 {
         .unwrap_or(AVATAR_SIZES[AVATAR_SIZES.len() - 1])
 }
 
-/// Fetch the avatar at the size it will be drawn, and say where it went.
-pub fn avatar(cache_dir: &Path, account: &Account, px: u32) -> Result<PathBuf> {
-    let url = account
-        .gamerpic
-        .as_deref()
-        .ok_or_else(|| anyhow!("no gamerpic for this account"))?;
-    let px = supported_avatar_size(px);
-    let dest = avatar_path(cache_dir, px);
+/// Which picture the cached avatar at this size is: a hash of the URL it was
+/// fetched from, beside it. The URL changes when the picture does and differs
+/// between accounts, and its hash says neither who nor what.
+fn avatar_source_path(cache_dir: &Path, px: u32) -> PathBuf {
+    cache_dir.join(format!("gamerpic-{px}.source"))
+}
+
+fn avatar_source(url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(url.as_bytes()))
+}
+
+fn sized_gamerpic(account: &Account, px: u32) -> Option<String> {
+    let url = account.gamerpic.as_deref()?;
     // The host resizes, so a 64px avatar is a 1.7 KB download instead of the
     // 1.6 MB the unsized URL returns. The size goes on with `with_params`, not
     // by appending: this URL already carries `format`, and a duplicate of it is
     // answered with 400 too.
-    crate::http::download(&crate::http::sized_image(url, px), &dest)?;
+    Some(crate::http::sized_image(url, px))
+}
+
+/// The avatar already on disk for this account, if it is this account's.
+///
+/// The file is named for its size only, so without the recorded source it
+/// would show whichever account last fetched one -- the previous person's
+/// picture, on a shared machine -- and never notice a new gamerpic.
+pub fn cached_avatar(cache_dir: &Path, account: &Account, px: u32) -> Option<PathBuf> {
+    let px = supported_avatar_size(px);
+    let url = sized_gamerpic(account, px)?;
+    let dest = avatar_path(cache_dir, px);
+    let recorded = std::fs::read_to_string(avatar_source_path(cache_dir, px)).ok()?;
+    (recorded.trim() == avatar_source(&url) && dest.is_file()).then_some(dest)
+}
+
+/// Fetch the avatar at the size it will be drawn, and say where it went.
+///
+/// A cached picture is reused only when it was fetched from this account's
+/// current gamerpic URL; otherwise it is replaced.
+pub fn avatar(cache_dir: &Path, account: &Account, px: u32) -> Result<PathBuf> {
+    let px = supported_avatar_size(px);
+    let url = sized_gamerpic(account, px).ok_or_else(|| anyhow!("no gamerpic for this account"))?;
+    let dest = avatar_path(cache_dir, px);
+    if let Some(cached) = cached_avatar(cache_dir, account, px) {
+        // Still checked: a cached file that is not a picture is fetched again.
+        crate::http::download(&url, &cached)?;
+        return Ok(cached);
+    }
+    // Forget the old source first, so a failure part way never leaves a new
+    // picture labelled as the old one or the other way round.
+    let source = avatar_source_path(cache_dir, px);
+    let _ = std::fs::remove_file(&source);
+    let _ = std::fs::remove_file(&dest);
+    crate::http::download(&url, &dest)?;
+    crate::cache::write(&source, avatar_source(&url).as_bytes())?;
     Ok(dest)
+}
+
+/// Remove every cached avatar, for a sign-out: the next account to sign in
+/// must not be shown this one's picture, even briefly.
+pub fn forget_avatars(cache_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("gamerpic-") && (name.ends_with(".img") || name.ends_with(".source")) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -215,6 +271,74 @@ mod tests {
                 "asked for {px}"
             );
         }
+    }
+
+    /// One account signs out and another signs in on the same machine. The
+    /// first one's picture must not be reused for the second, and a new
+    /// gamerpic must replace the old one.
+    #[test]
+    fn a_cached_avatar_belongs_to_the_account_it_was_fetched_for() {
+        use std::io::{Read, Write};
+        const PNG: &[u8] = include_bytes!("../tests/fixtures/steam-art.png");
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let mut paths = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = server.accept().unwrap();
+                let mut request = [0; 4096];
+                let n = stream.read(&mut request).unwrap();
+                let line = String::from_utf8_lossy(&request[..n]).to_string();
+                paths.push(line.split_whitespace().nth(1).unwrap().to_string());
+                let body: Vec<u8> = PNG
+                    .iter()
+                    .copied()
+                    .chain(paths.len().to_le_bytes())
+                    .collect();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(&body).unwrap();
+            }
+            paths
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let account = |pic: &str| Account {
+            gamertag: pic.into(),
+            xuid: String::new(),
+            gamerpic: Some(format!("{base}/image?url={pic}")),
+            tier: None,
+        };
+        let first = account("first");
+        let second = account("second");
+
+        let path = avatar(dir.path(), &first, 64).unwrap();
+        let first_picture = std::fs::read(&path).unwrap();
+        assert_eq!(cached_avatar(dir.path(), &first, 64), Some(path.clone()));
+        assert_eq!(
+            cached_avatar(dir.path(), &second, 64),
+            None,
+            "the first account's picture is not the second's"
+        );
+        // Cached for the same account: no request.
+        assert_eq!(avatar(dir.path(), &first, 64).unwrap(), path);
+
+        let path = avatar(dir.path(), &second, 64).unwrap();
+        assert_ne!(std::fs::read(&path).unwrap(), first_picture);
+        assert_eq!(cached_avatar(dir.path(), &second, 64), Some(path));
+        assert_eq!(cached_avatar(dir.path(), &first, 64), None);
+        let paths = worker.join().unwrap();
+        assert!(
+            paths[0].contains("first") && paths[1].contains("second"),
+            "{paths:?}"
+        );
+
+        forget_avatars(dir.path());
+        assert_eq!(cached_avatar(dir.path(), &second, 64), None);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
