@@ -63,15 +63,29 @@ export PROTON_DIR=$XODUS_PROTON_DIR
 # the 16-hex-digit prefix of your Windows save folders to enable it.
 [ -n "${XGR_XUID:-}" ] && export XGR_XUID
 
+# `ferestre run` stops the service it started when the last title using it
+# exits, and counts the titles by a shared lock next to the socket. Hold the
+# same lock while this title runs, so a service reused here is not stopped
+# under it. Only this shell holds it: the service and the title get the
+# descriptor closed, or a service started here would count as a title forever.
+SERVICE_DIR=${XODUS_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}}
+lock_fd=
+if mkdir -p "$SERVICE_DIR" && exec {lock_fd}>>"$SERVICE_DIR/users.lock"; then
+    if ! flock -s "$lock_fd"; then
+        echo "warning: could not lock $SERVICE_DIR/users.lock; a ferestre launch finishing may stop the service under this title" >&2
+    fi
+fi
+close_lock() { if [ -n "$lock_fd" ]; then "$@" {lock_fd}>&-; else "$@"; fi; }
+
 # The service backs xgameruntime's Xbox-side calls; start it if it isn't up.
 if ! pgrep -x xodus-service >/dev/null; then
     rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/xodus.sock"
-    nohup "$XODUS_CLI_DIR/xodus-service" >"${TMPDIR:-/tmp}/xodus-service.log" 2>&1 &
+    close_lock nohup "$XODUS_CLI_DIR/xodus-service" >"${TMPDIR:-/tmp}/xodus-service.log" 2>&1 &
     sleep 2
 fi
 
 echo "launching $EXE from $GAME_DIR (prefix $PREFIX)..."
-"$XODUS_CLI_DIR/xodus-cli" run -e "$EXE" "$GAME_DIR" "$SHIM"
+close_lock "$XODUS_CLI_DIR/xodus-cli" run -e "$EXE" "$GAME_DIR" "$SHIM"
 rc=$?
 echo "=== exited rc=$rc $(date) ==="
 exit $rc
