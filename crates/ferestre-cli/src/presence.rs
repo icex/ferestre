@@ -457,6 +457,53 @@ mod tests {
         assert_eq!(fixture.count("gone"), runs + 1);
     }
 
+    /// A runner that never finishes its goodbye does not keep the launch
+    /// open: it gets `GOODBYE`, and is then killed.
+    #[test]
+    fn a_runner_that_ignores_its_stdin_closing_is_not_waited_for_forever() {
+        use std::os::unix::fs::PermissionsExt;
+        let _turn = SIGNALS.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new("stubborn", "0");
+        let pid = fixture.root.path().join("runner.pid");
+        // `exec`, so the process killed is the one holding the pipes.
+        std::fs::write(
+            fixture.root.path().join("xodus-cli"),
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{log}'\necho $$ > '{pid}'\n\
+                 echo '{{\"schema\":1,\"event\":\"online\",\"title\":\"Fixture\",\"heartbeat_after\":60}}'\n\
+                 exec sleep 60\n",
+                log = fixture.log.display(),
+                pid = pid.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            fixture.root.path().join("xodus-cli"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let launch = Presence::start(Some(fixture.setup()));
+        wait_until("the runner", || {
+            pid.exists() && fixture.count("presence run") == 1
+        });
+        let runner: i32 = std::fs::read_to_string(&pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let started = std::time::Instant::now();
+        drop(launch);
+        let elapsed = started.elapsed();
+        // Safety: signal 0 only asks whether the runner is still there.
+        let gone = unsafe { libc::kill(runner, 0) } != 0;
+        if !gone {
+            unsafe { libc::kill(runner, libc::SIGKILL) };
+        }
+        assert!(gone, "the runner was left running");
+        assert!(elapsed >= GOODBYE, "{elapsed:?}");
+        assert!(elapsed < GOODBYE + Duration::from_secs(3), "{elapsed:?}");
+    }
+
     #[test]
     fn off_and_on_again_while_the_runner_says_goodbye_ends_up_on() {
         let _turn = SIGNALS.lock().unwrap_or_else(|e| e.into_inner());

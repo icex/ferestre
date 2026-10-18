@@ -6703,6 +6703,42 @@ summary = "Runs."
         assert_eq!(std::fs::read(&log_path).unwrap(), input);
     }
 
+    /// Wine leaves processes behind that hold the title's output pipes:
+    /// wineserver, winedevice, a game's own helpers. The launch copies what
+    /// they write for a moment, and then finishes without them.
+    #[test]
+    fn a_process_left_holding_the_titles_output_does_not_hold_the_launch() {
+        let scratch = Scratch::new("tee-holder");
+        let log = scratch.root.join("launch.log");
+        let holder = scratch.root.join("holder.pid");
+        let mut title = Command::new("/bin/sh");
+        title.arg("-c").arg(format!(
+            "setsid sleep 60 & echo $! > '{}'; echo title output; exit 0",
+            holder.display()
+        ));
+        let forwarding = Forwarding {
+            shared: Shared::new(),
+            installed: false,
+        };
+        let started = std::time::Instant::now();
+        let status = run_teed(title, &log, &forwarding).unwrap();
+        let elapsed = started.elapsed();
+        let pid = std::fs::read_to_string(&holder)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok());
+        let alive = pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == 0);
+        if let Some(pid) = pid {
+            // Safety: the sleep this test started.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(alive, "the stand-in left nothing holding the pipes");
+        assert_eq!(code(status), code(ExitCode::SUCCESS));
+        assert!(elapsed < std::time::Duration::from_secs(6), "{elapsed:?}");
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("title output\n"), "{text}");
+        assert!(text.contains("=== exited rc=0 ==="), "{text}");
+    }
+
     struct FakeWine {
         scratch: Scratch,
         running: Arc<std::sync::atomic::AtomicBool>,
