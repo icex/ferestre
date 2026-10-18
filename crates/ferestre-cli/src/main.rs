@@ -990,6 +990,9 @@ fn register_winrt_classes(
         return;
     }
 
+    // Asked before `wine reg` runs, because afterwards there is always one.
+    let wine_prefix = prefix.join("pfx");
+    let session_before = wineserver_running(&wine_prefix);
     for class in missing {
         let status = Command::new(runtime.path.join("files/bin/wine"))
             .args([
@@ -1002,7 +1005,7 @@ fn register_winrt_classes(
                 &class.dll_path(),
                 "/f",
             ])
-            .env("WINEPREFIX", prefix.join("pfx"))
+            .env("WINEPREFIX", &wine_prefix)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1019,11 +1022,81 @@ fn register_winrt_classes(
     // the input bus -- with this process's environment, not the title's. A
     // title launched while it lingers joins it, and its input settings (the
     // shim's PROTON_DISABLE_HIDRAW, a recipe's override) never reach the bus
-    // that enumerates controllers. Let it end first.
-    let _ = Command::new(runtime.path.join("files/bin/wineserver"))
-        .arg("-w")
-        .env("WINEPREFIX", prefix.join("pfx"))
-        .status();
+    // that enumerates controllers. Let it end first -- but only a session
+    // started here, and not forever: `wineserver -w` waits for every process
+    // in the session, and a session that was already there may be this very
+    // title, still running, or one whose Quit never returned.
+    const STILL_RUNNING: &str =
+        "-- input settings may not apply: a Wine session for this prefix is still running";
+    if session_before == Some(true) {
+        eprintln!("{STILL_RUNNING}");
+        return;
+    }
+    let mut wait = Command::new(runtime.path.join("files/bin/wineserver"));
+    wait.arg("-w")
+        .env("WINEPREFIX", &wine_prefix)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Ok(mut wait) = wait.spawn() {
+        if !wait_at_most(&mut wait, std::time::Duration::from_secs(15)) {
+            eprintln!("{STILL_RUNNING}");
+        }
+    }
+}
+
+/// Whether a wineserver runs for this prefix. Wine keys its server directory
+/// by the prefix's device and inode, and the server holds a write lock on the
+/// `lock` file in it for as long as it runs. Testing that lock is passive;
+/// connecting to the server's socket would register a client with it. `None`
+/// when it cannot be told.
+fn wineserver_running(prefix: &Path) -> Option<bool> {
+    // Safety: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    wineserver_running_in(Path::new(&format!("/tmp/.wine-{uid}")), prefix)
+}
+
+fn wineserver_running_in(base: &Path, prefix: &Path) -> Option<bool> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(prefix).ok()?;
+    let lock = base
+        .join(format!("server-{:x}-{:x}", metadata.dev(), metadata.ino()))
+        .join("lock");
+    let file = match std::fs::File::open(&lock) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+    };
+    // Safety: a zeroed flock is a valid argument, and F_GETLK only fills it in.
+    let mut probe: libc::flock = unsafe { std::mem::zeroed() };
+    probe.l_type = libc::F_WRLCK as _;
+    probe.l_whence = libc::SEEK_SET as _;
+    probe.l_start = 0;
+    probe.l_len = 1;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut probe) } != 0 {
+        return None;
+    }
+    Some(libc::c_int::from(probe.l_type) != libc::F_UNLCK)
+}
+
+/// Wait for a child, giving up on it after `limit`. True if it finished in
+/// time; one that did not is killed and reaped, so nothing is left waiting
+/// behind the launch.
+fn wait_at_most(child: &mut std::process::Child, limit: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100))
+            }
+            _ => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
 }
 
 /// Describe an installed title from its own package, if it is installed and the
