@@ -34,8 +34,8 @@ on:
       - 'tests/test_download_cancel.py'
       - 'tests/test_media_dependencies.py'
       - 'tests/test_client_dependencies.py'
-      - 'tools/xsts_probe.py'
-      - 'tools/test_xsts_probe.py'
+      - 'tools/**'
+      - 'tests/endpoint_suite.py'
       - 'titles/**'
       # The `patches` job below is the only thing that checks these, and a
       # patch-only commit is exactly the kind that breaks them.
@@ -47,7 +47,11 @@ on:
       - 'scripts/**'
       - 'packaging/**'
       - 'tests/test_real_path_image_view.py'
+      - 'tests/test_caller_ids_image_view.py'
       - 'tests/test_proton_wine_shim.py'
+      - 'tests/test_fix_xcurl.py'
+      - 'tests/test_launch_gdk.py'
+      - 'tests/test_install_xodus_proton.py'
       - 'tests/test_build_appimage.py'
       - 'tests/test_release_signing.py'
       - 'tests/test_workflows.py'
@@ -64,8 +68,8 @@ on:
       - 'tests/test_download_cancel.py'
       - 'tests/test_media_dependencies.py'
       - 'tests/test_client_dependencies.py'
-      - 'tools/xsts_probe.py'
-      - 'tools/test_xsts_probe.py'
+      - 'tools/**'
+      - 'tests/endpoint_suite.py'
       - 'titles/**'
       # The `patches` job below is the only thing that checks these, and a
       # patch-only commit is exactly the kind that breaks them.
@@ -77,7 +81,11 @@ on:
       - 'scripts/**'
       - 'packaging/**'
       - 'tests/test_real_path_image_view.py'
+      - 'tests/test_caller_ids_image_view.py'
       - 'tests/test_proton_wine_shim.py'
+      - 'tests/test_fix_xcurl.py'
+      - 'tests/test_launch_gdk.py'
+      - 'tests/test_install_xodus_proton.py'
       - 'tests/test_build_appimage.py'
       - 'tests/test_release_signing.py'
       - 'tests/test_workflows.py'
@@ -141,7 +149,13 @@ jobs:
       - name: Launch helper tests
         env:
           FERESTRE_REQUIRE_USERNS: '1'
-        run: python3 -m unittest discover -s tests -p 'test_*image_view.py' && python3 tests/test_proton_wine_shim.py
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -p 'test_*image_view.py'
+          python3 tests/test_proton_wine_shim.py
+          python3 tests/test_fix_xcurl.py
+          python3 tests/test_launch_gdk.py
+          python3 tests/test_install_xodus_proton.py
 
       # Syntax for every shell script, under the shell its #! names: the shim
       # and xodus-env.sh run under /bin/sh, which is dash here, so a bashism
@@ -171,8 +185,8 @@ jobs:
           python3 tests/test_release_signing.py
           python3 tests/test_build_appimage.py
 
-      - name: Authentication probe tests (offline)
-        run: python3 -m unittest discover -s tools -p test_xsts_probe.py
+      - name: Developer tool tests (offline)
+        run: python3 -m unittest discover -s tools -p 'test_*.py'
 
   # The cheap half of testing the runtime. Building it needs a 26 GB tree and an
   # hour, so `tests/run-*.sh` cannot run per push -- but checking that the

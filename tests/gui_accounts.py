@@ -6,7 +6,6 @@ import json
 import os
 from pathlib import Path
 import shutil
-import subprocess
 import tempfile
 import time
 
@@ -83,7 +82,11 @@ def main():
     binary=Path(args.binary).resolve()
     home=Path(tempfile.mkdtemp(prefix="fa-"))
     gui=None
+    # Each window's stderr in a file, checked for panics at the end.
+    windows=s.Windows(str(home))
+    passed=False
     try:
+        s.check_panic_detection(str(home))
         write(home/"profiles.json",json.dumps({"schema":1,"capabilities":["store-player-accounts"],"default_profile":OWNER,
             "profiles":[{"id":OWNER,"label":"Owner Fixture","signed_in":True,"legacy_saves":True,"save_namespace":"a"*64}]}))
         write(home/"client/xodus-cli",CLIENT,True)
@@ -125,7 +128,7 @@ summary="Synthetic account fixture"
         # Its own application id, so a Ferestre already open on this desktop
         # is not the instance that receives the activation.
         env["FERESTRE_APPLICATION_ID"]="io.github.icex.ferestre.AccountTest"
-        gui=subprocess.Popen([home/"bin/ferestre-gui"],env=env,stderr=subprocess.PIPE)
+        gui=windows.start([home/"bin/ferestre-gui"],env,"first",stdout=None)
         s.Atspi.init()
         app=s.find_app(gui.pid,time.monotonic()+20)
         frame=s.wait_for(app,lambda root:next(iter(s.find_all(root,role="frame",name="Ferestre")),None),"main window",time.monotonic()+20)
@@ -224,7 +227,7 @@ summary="Synthetic account fixture"
         settings.unlink()
         # Stand in for an account-menu sign-out, which also deletes the unscoped account cache.
         (state/"account.json").unlink(missing_ok=True)
-        gui=subprocess.Popen([home/"bin/ferestre-gui"],env=env,stderr=subprocess.PIPE)
+        gui=windows.start([home/"bin/ferestre-gui"],env,"signed-out restart",stdout=None)
         app=s.find_app(gui.pid,time.monotonic()+20)
         frame=s.wait_for(app,lambda root:next(iter(s.find_all(root,role="frame",name="Ferestre")),None),"signed-out restart",time.monotonic()+20)
         button=s.wait_for(frame,lambda root:next(iter(s.find_all(root,role="button",name_contains="Not signed in")),None),"signed-out account button",time.monotonic()+20)
@@ -238,10 +241,11 @@ summary="Synthetic account fixture"
         s.wait_for(app,lambda root:not s.find_all(root,role="frame",name="Accounts"),"Accounts dialog closes",time.monotonic()+10)
         s.click_named(frame,"Close")
         s.check(gui.wait(timeout=10)==0,"signed-out restart closes")
-        print("all account GUI checks passed")
+        passed=True
     finally:
         if gui is not None and gui.poll() is None:
             gui.terminate();gui.wait(timeout=10)
+        panics=windows.problems()
         service_log=home/"services.jsonl"
         if service_log.exists():
             for line in service_log.read_text().splitlines():
@@ -250,6 +254,10 @@ summary="Synthetic account fixture"
         if args.keep:
             print("kept",home)
         else:shutil.rmtree(home)
+    if panics:
+        raise s.Failure("; ".join(panics))
+    if passed:
+        print("all account GUI checks passed")
 
 
 if __name__=="__main__":

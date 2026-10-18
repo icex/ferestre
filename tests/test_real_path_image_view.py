@@ -34,7 +34,14 @@ class ImageViewTests(unittest.TestCase):
         p = subprocess.run(["unshare", "--user", "--map-root-user", "--mount", "true"],
                            capture_output=True)
         if p.returncode:
-            self.skipTest("host does not allow unprivileged mount namespaces")
+            why = "host does not allow unprivileged mount namespaces"
+            # These are the only tests of the private mounts, so where they
+            # are meant to run (CI sets this) a skip would hide a regression
+            # behind a green run.
+            if os.environ.get("FERESTRE_REQUIRE_USERNS") == "1":
+                self.fail(f"{why}, and FERESTRE_REQUIRE_USERNS=1 requires them: "
+                          f"{p.stderr.decode(errors='replace').strip()}")
+            self.skipTest(why)
 
     def launch(self, code):
         env = dict(os.environ, WINE_DLL_FILE_MAP=self.mapping, FERESTRE_IMAGE_VIEW="real-path")

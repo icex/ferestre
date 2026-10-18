@@ -39,8 +39,19 @@ def receive_exact(connection, size):
 
 
 class ProbeWireTests(unittest.TestCase):
-    def invoke(self, arguments, config=None, reply=REPLY, magic=0x58445358):
+    def invoke(self, arguments, config=None, reply=REPLY, magic=0x58445358, where=None):
+        """Run the probe against a fake service. `where(folder)` gives the
+        socket's path and the environment that should lead the probe to it;
+        by default the socket is in the session's runtime directory."""
         with tempfile.TemporaryDirectory() as folder:
+            if where is None:
+                listen_at, environment = Path(folder, "xodus.sock"), {"XDG_RUNTIME_DIR": folder}
+            else:
+                listen_at, environment, extra = where(folder)
+                arguments = [*arguments, *extra]
+            # Whatever service the developer's own shell points at stays out of it.
+            env = {key: value for key, value in os.environ.items() if key != "XODUS_RUNTIME_DIR"}
+            env.update(environment)
             game = Path(folder, "game")
             game.mkdir()
             if config is not None:
@@ -49,7 +60,7 @@ class ProbeWireTests(unittest.TestCase):
             captured = []
             errors = []
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
-                listener.bind(str(Path(folder, "xodus.sock")))
+                listener.bind(str(listen_at))
                 listener.listen(1)
                 listener.settimeout(3)
 
@@ -66,7 +77,7 @@ class ProbeWireTests(unittest.TestCase):
                 thread.start()
                 result = subprocess.run(
                     [sys.executable, str(TOOL), *arguments],
-                    env={**os.environ, "XDG_RUNTIME_DIR": folder},
+                    env=env,
                     capture_output=True, text=True, timeout=5,
                 )
                 thread.join(4)
@@ -100,6 +111,38 @@ class ProbeWireTests(unittest.TestCase):
         for secret in ["PRIVATE_HASH", "PRIVATE_TOKEN", "PRIVATE_SIGNATURE", "PRIVATE_XUID", "PRIVATE_GAMERTAG"]:
             self.assertNotIn(secret, result.stdout + result.stderr)
 
+    def test_xodus_runtime_dir_wins_over_the_session_directory(self):
+        def scoped(folder):
+            service = Path(folder, "ferestre-services", "0" * 32)
+            service.mkdir(parents=True)
+            session = Path(folder, "session")
+            session.mkdir()
+            return service / "xodus.sock", {"XODUS_RUNTIME_DIR": str(service), "XDG_RUNTIME_DIR": str(session)}, []
+
+        result, _ = self.invoke([], where=scoped)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_socket_option_names_the_service_directly(self):
+        def named(folder):
+            return Path(folder, "other.sock"), {"XDG_RUNTIME_DIR": str(Path(folder, "nowhere"))}, ["--socket", str(Path(folder, "other.sock"))]
+
+        result, _ = self.invoke([], where=named)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_missing_socket_points_at_the_services_that_are_running(self):
+        with tempfile.TemporaryDirectory() as folder:
+            service = Path(folder, "ferestre-services", "a" * 32)
+            service.mkdir(parents=True)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(str(service / "xodus.sock"))
+                env = {key: value for key, value in os.environ.items() if key != "XODUS_RUNTIME_DIR"}
+                env["XDG_RUNTIME_DIR"] = folder
+                result = subprocess.run([sys.executable, str(TOOL)], env=env,
+                                        capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"No service socket at {folder}/xodus.sock", result.stderr)
+        self.assertIn(str(service / "xodus.sock"), result.stderr)
+
     def test_invalid_header_and_xml_are_reported_without_tracebacks_or_payloads(self):
         for reply, magic in [(REPLY, 0), (b"<PRIVATE_TOKEN", 0x58445358)]:
             with self.subTest(magic=magic):
@@ -119,6 +162,16 @@ class ProbeUnitTests(unittest.TestCase):
     def test_uid_fallback_uses_current_user(self):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(os, "getuid", return_value=4321):
             self.assertEqual(self.probe.socket_path(), "/run/user/4321/xodus.sock")
+
+    def test_socket_resolution_matches_the_launcher(self):
+        cases = [
+            ({"XODUS_RUNTIME_DIR": "/scoped", "XDG_RUNTIME_DIR": "/session"}, None, "/scoped/xodus.sock"),
+            ({"XODUS_RUNTIME_DIR": "", "XDG_RUNTIME_DIR": "/session"}, None, "/session/xodus.sock"),
+            ({"XODUS_RUNTIME_DIR": "/scoped"}, "/given.sock", "/given.sock"),
+        ]
+        for environment, override, expected in cases:
+            with self.subTest(environment=environment, override=override), mock.patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(self.probe.socket_path(override), expected)
 
     def test_invalid_title_ids_are_rejected(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -69,6 +69,17 @@ say "compiling the D3D12 allocator lifetime test (not run: it needs a GPU)"
     "$REPO_DIR/tests/d3d12_allocator_lifetime.c" 2>&1 | grep -v 'note:' || true
 [ -f "$WORK/d3d12_allocator_lifetime.exe" ] || fail "the D3D12 allocator lifetime test did not build"
 
+# Also compiled and not run, for the same reason: the SRW lock soak takes
+# minutes, and the WebSocket harness drives a title's own libHttpClient
+# against tests/ws_server.py. The harness includes the widl header generated
+# from the patched xgameruntime IDL, so an IDL change that breaks it shows here.
+say "compiling the SRW lock stress test (not run: it is a long soak)"
+"$INCUBE" x86_64-w64-mingw32-gcc -O1 -o "$WORK/srwlock_stress.exe" "$REPO_DIR/tests/srwlock_stress.c" \
+    || fail "the SRW lock stress test did not build"
+say "compiling the WebSocket lifecycle harness (not run: it needs a title's libHttpClient)"
+"$INCUBE" x86_64-w64-mingw32-gcc -O1 -o "$WORK/websocket_harness.exe" "$REPO_DIR/tests/websocket_harness.c" \
+    -D__WINESRC__ -I"$OBJ/dlls/xgameruntime" -I"$WINE_SRC/dlls/xgameruntime" || fail "the WebSocket harness did not build"
+
 # Fixtures: a MicrosoftGame.config in the cwd, and a scratch save root.
 cp "$REPO_DIR/tests/fixtures/MicrosoftGame.config" "$WORK/"
 cp "$DLL" "$WORK/xgameruntime.dll"
@@ -111,6 +122,14 @@ cp "$OBJ/dlls/concrt140/x86_64-windows/concrt140.dll" "$CONCRT" || fail "missing
 WINE=$WORK/wine/bin/wine
 
 say "running tests"
+# Nothing inherited from the calling shell may lead the tests to the real
+# service or account. A terminal opened from a launched title carries
+# XODUS_RUNTIME_DIR and the profile variables, and the DLL asks the socket in
+# XODUS_RUNTIME_DIR before the one in XDG_RUNTIME_DIR, so the fixture's
+# directory is set as both below.
+unset XODUS_RUNTIME_DIR XODUS_STORE_PROFILE XODUS_PLAYER_PROFILE XODUS_ACCOUNT_PROFILE \
+    FERESTRE_ACCOUNT_ROLES WINE_PACKAGE_MANIFEST WINEDLLOVERRIDES XGR_XUID XGR_STORE_CATALOG \
+    SteamGameId SteamDeck
 export WINEPREFIX="$WORK/prefix"
 export WINEDEBUG=-all,fixme-all
 export XGR_WGS_ROOT="Z:$(echo "$WORK/wgs" | sed 's#/#\\#g')"
@@ -120,6 +139,7 @@ export XGR_EXPECTED_FAMILY=$EXPECTED_FAMILY
 say "starting the synthetic license service"
 SERVICE_TEST_BIN=${SERVICE_TEST_BIN:-$("$REPO_DIR/tests/build-license-service-fixture.sh")} || fail "service fixture build failed"
 export XDG_RUNTIME_DIR="$WORK/rt"
+export XODUS_RUNTIME_DIR="$XDG_RUNTIME_DIR"
 python3 "$REPO_DIR/tests/license_token_fixture.py" "$XDG_RUNTIME_DIR" "$SERVICE_TEST_BIN" "$WORK/license-transcript.json" &
 FIXTURE_PID=$!
 for _ in $(seq 1 100); do [ -f "$XDG_RUNTIME_DIR/ready" ] && break; sleep 0.1; done

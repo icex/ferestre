@@ -44,5 +44,8 @@ jobs:
       - name: Recipes validate
         run: python3 titles/validate.py
 
+      - name: Validator tests
+        run: python3 titles/test_validate.py
+
       - name: docs/COMPATIBILITY.md matches titles/*.toml
         run: python3 .github/scripts/gen-compatibility.py --check

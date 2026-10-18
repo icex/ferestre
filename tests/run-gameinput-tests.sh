@@ -65,6 +65,14 @@ export WINEARCH
 export WINEPREFIX="$WORK/prefix"
 export WINEDEBUG=-all,fixme-all
 unset WINE_GAMEINPUT WINE_GAMEINPUT_DEVQUERY SteamGameId SteamDeck
+# Nothing inherited from the calling shell may change what is tested or reach
+# the real service: overrides would swap the DLLs under test, and a terminal
+# opened from a launched title carries the service socket and the profile
+# variables. The service directory is an empty one of our own.
+unset WINEDLLOVERRIDES WINE_PACKAGE_MANIFEST XODUS_STORE_PROFILE XODUS_PLAYER_PROFILE \
+    XODUS_ACCOUNT_PROFILE FERESTRE_ACCOUNT_ROLES
+mkdir -p "$WORK/rt"
+export XODUS_RUNTIME_DIR="$WORK/rt"
 
 run() { ( cd "$WORK" && timeout 120 "$WINE" "$@" ) 2>/dev/null | grep -avE '^ntsync|radv is not|^wine:|wineserver'; }
 

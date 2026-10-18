@@ -538,6 +538,119 @@ def check(condition, message, root=None):
     print(f"  ok: {message}")
 
 
+# How Rust reports a panic, on any thread. The line around it has changed
+# between releases -- current ones put the thread id after the name, as in
+# "thread 'main' (2848203) panicked at src/main.rs:1:62:" -- so only the part
+# every release writes is matched. A child's message can mention a panic too --
+# the unreachable-client stub prints the real client's "panicked:" line, and
+# the window may pass that on -- but only a panic hook writes "panicked at".
+PANIC = re.compile(r"\bpanicked at ")
+# GTK's theme parser complains about the system theme on every start and it
+# says nothing about this launcher.
+STDERR_NOISE = ("Theme parser error", "prefer-dark-theme", "radv is not a conformant")
+
+
+class Windows:
+    """Every window a run starts, each with its stderr in a file of its own.
+
+    A worker thread that panics prints its message and leaves the window
+    running, and the window still closes with status 0, so stderr is the only
+    place it shows. Reading it for some windows and not others is how a panic
+    in an error path passes unnoticed; a file per window is also never a pipe
+    that fills up while nobody reads it.
+    """
+
+    def __init__(self, home):
+        self.home = home
+        self.logs = []
+
+    def start(self, command, env, what, stdout=subprocess.DEVNULL):
+        path = os.path.join(self.home, f"gui-stderr-{len(self.logs) + 1}.log")
+        with open(path, "wb") as stderr:
+            process = subprocess.Popen(command, env=env, stdout=stdout, stderr=stderr)
+        self.logs.append((what, path))
+        return process
+
+    def problems(self, quiet=False):
+        """Print what each window said on stderr, and return a failure for
+        every window that panicked."""
+        failures = []
+        for what, path in self.logs:
+            try:
+                with open(path, "rb") as f:
+                    text = f.read().decode(errors="replace")
+            except FileNotFoundError:
+                continue
+            interesting = [line for line in text.splitlines()
+                           if line.strip() and not any(n in line for n in STDERR_NOISE)]
+            if interesting and not quiet:
+                print(f"\nstderr of the {what} window:", file=sys.stderr)
+                print("\n".join(interesting), file=sys.stderr)
+            if any(PANIC.search(line) for line in interesting):
+                failures.append(f"the {what} window panicked; see its stderr above")
+        return failures
+
+
+def check_panic_detection(home):
+    """Make sure a panic in a window would be reported, before trusting a
+    clean run to mean there was none.
+
+    The pattern above silently matched nothing once, when Rust added the
+    thread id to its panic line, and every run still said "all good". So this
+    checks it against the lines each Rust release writes, against the stub's
+    line that must not count, and, when a compiler is at hand, against what a
+    real panicking program prints today.
+    """
+    scratch = os.path.join(home, "panic-check")
+    os.makedirs(scratch, exist_ok=True)
+    samples = {
+        "current": "thread 'main' (2848203) panicked at src/main.rs:1:62:\n",
+        "unnamed": "thread '<unnamed>' (2848204) panicked at src/app.rs:9:5:\n",
+        "older": "thread 'main' panicked at src/main.rs:1:62:\n",
+        "oldest": "thread 'main' panicked at 'boom', src/main.rs:1:62\n",
+    }
+    for what, line in samples.items():
+        windows = Windows(scratch)
+        path = os.path.join(scratch, f"{what}.log")
+        with open(path, "w") as f:
+            f.write(line)
+        windows.logs.append((f"panic-check {what}", path))
+        if not windows.problems(quiet=True):
+            raise Failure(f"a {what} Rust panic line is not reported as a panic: {line!r}")
+    stub = Windows(scratch)
+    path = os.path.join(scratch, "stub.log")
+    with open(path, "w") as f:
+        f.write("thread 'main' panicked: Failed to authenticate Xbox user\n")
+    stub.logs.append(("panic-check stub", path))
+    if stub.problems(quiet=True):
+        raise Failure("the unreachable-client stub's message is reported as a window panic")
+
+    rustc = shutil.which("rustc")
+    if rustc is None:
+        print("  ok: panic lines are recognised (no rustc for a live check)")
+        return
+    source = os.path.join(scratch, "panics.rs")
+    program = os.path.join(scratch, "panics")
+    with open(source, "w") as f:
+        f.write('fn main() { let _ = std::thread::spawn(|| panic!("worker")).join(); }\n')
+    subprocess.run([rustc, "-o", program, source], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    live = Windows(scratch)
+    live.start([program], dict(os.environ), "panic-check program").wait(timeout=30)
+    if not live.problems(quiet=True):
+        raise Failure("a real worker-thread panic from this rustc is not reported as a panic")
+    print("  ok: a real Rust panic in a window is reported")
+
+
+def cli_calls(home, command):
+    """How many times the stub CLI has been asked to run `command`."""
+    try:
+        with open(os.path.join(home, "cli-calls")) as f:
+            return sum(1 for line in f if line.split()[:1] == [command])
+    except FileNotFoundError:
+        return 0
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default="target/debug/ferestre-gui")
@@ -573,6 +686,8 @@ def main():
     # or write into one. It also means the run starts from the state a new user
     # has, which is the state most worth testing.
     home = tempfile.mkdtemp(prefix="ferestre-gui-smoke-")
+    windows = Windows(home)
+    check_panic_detection(home)
     recipes_dir = os.path.join(home, "titles")
     shutil.copytree(os.path.join(os.getcwd(), "titles"), recipes_dir)
     # A fixed fixture keeps this warning check independent of live compatibility.
@@ -819,6 +934,10 @@ last-verified = 2026-10-10
 import json, os, select, sys, time
 from pathlib import Path
 home = Path(os.environ["HOME"])
+# Every call, so a check can count what the window started rather than look
+# for a marker only one path through this stub writes.
+with (home / "cli-calls").open("a") as calls:
+    calls.write(" ".join(sys.argv[1:]) + "\\n")
 if sys.argv[1:2] == ["uninstall"]:
     (home / "removal-started").touch()
     while not (home / "release-removal").exists():
@@ -874,7 +993,7 @@ print(":: done", flush=True)
     shortcuts = os.path.join(home, "steam", "userdata", "1", "config", "shortcuts.vdf")
     os.makedirs(os.path.dirname(shortcuts))
 
-    gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    gui = windows.start([binary_copy], env, "first")
     deadline = time.monotonic() + TIMEOUT
     failures = []
     try:
@@ -1078,6 +1197,7 @@ print(":: done", flush=True)
             "prefilled with somewhere to put it",
             frame,
         )
+        installs = cli_calls(home, "install")
         click_named(frame, "Cancel")
         wait_for(
             frame,
@@ -1085,8 +1205,9 @@ print(":: done", flush=True)
             "the confirmation to close",
             time.monotonic() + TIMEOUT,
         )
+        time.sleep(1)
         check(
-            not any("Installing" in t for t in texts(frame)),
+            cli_calls(home, "install") == installs and not any("Installing" in t for t in texts(frame)),
             "and saying no starts nothing",
             frame,
         )
@@ -1480,10 +1601,16 @@ print(":: done", flush=True)
         )
         check("Please wait" in tooltip.get_name(), "the spinner tooltip identifies the operation and game", frame)
         select_in_list(frame, "Library")
+        installs = cli_calls(home, "install")
         click(row_button(frame, "Smoke Test Racer", "Install"))
         wait_for(frame, lambda root: any("Removing Minecraft for Windows. Please wait" in t for t in texts(root)),
                  "a specific busy message", time.monotonic() + TIMEOUT)
-        check(not os.path.exists(os.path.join(home, "download-started")), "busy click did not start another operation")
+        # Long enough for a wrongly started install to reach the stub, or its
+        # confirmation to draw.
+        time.sleep(1)
+        check(cli_calls(home, "install") == installs, "busy click did not start another operation")
+        check(not any("Install Smoke Test Racer?" in t for t in texts(frame)),
+              "and did not ask to start one either", frame)
         click_named(frame, "Close")
         wait_for(frame, lambda root: bool(find_all(root, role="button", name="Finish and Close")),
                  "the close confirmation during removal", time.monotonic() + TIMEOUT)
@@ -1509,7 +1636,6 @@ print(":: done", flush=True)
         open(os.path.join(home, "release-removal"), "w").close()
         check(gui.wait(timeout=TIMEOUT) == 0, "the app closes after removal finishes")
         check(os.path.exists(os.path.join(home, "removal-finished")), "removal completed before exit")
-        stderr_before_restart = gui.stderr.read()
         # Simulate the mount-local CLI disappearing once the GUI exits.
         os.rename(stub, stub + ".unmounted")
         launched = subprocess.run([image, *shlex.split(saved_options)], env=env,
@@ -1521,7 +1647,7 @@ print(":: done", flush=True)
 
         print("download cancellation waits for cleanup")
         open(os.path.join(home, "hold-download"), "w").close()
-        gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        gui = windows.start([binary_copy], env, "download cancellation")
         app = find_app(gui.pid, time.monotonic() + TIMEOUT)
         frame = wait_for(app, lambda root: next(iter(find_all(root, role="frame")), None),
                          "the restarted window", time.monotonic() + TIMEOUT)
@@ -1632,7 +1758,7 @@ elif sys.argv[1] == 'update':
         cached_library = open(os.path.join(state, "library.json"), "rb").read()
         with open(os.path.join(home, "client-library.json"), "wb") as f:
             f.write(cached_library)
-        gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        gui = windows.start([binary_copy], env, "cached restart")
         app = find_app(gui.pid, time.monotonic() + TIMEOUT)
         frame = wait_for(app, lambda root: next(iter(find_all(root, role="frame")), None),
                          "cached restart window", time.monotonic() + TIMEOUT)
@@ -1673,7 +1799,7 @@ elif sys.argv[1] == 'update':
         for path in glob.glob(os.path.join(catalog, "*.json")):
             os.utime(path, (time.time() - 172800, time.time() - 172800))
         CountingProxy.requests.clear()
-        gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        gui = windows.start([binary_copy], env, "stale catalogue")
         app = find_app(gui.pid, time.monotonic() + TIMEOUT)
         frame = wait_for(app, lambda root: next(iter(find_all(root, role="frame")), None),
                          "stale catalogue window", time.monotonic() + TIMEOUT)
@@ -1716,7 +1842,7 @@ elif sys.argv[1] == 'update':
             json.dump({"gamertag": "Other Fixture Player", "xuid": "other-fixture-player"}, f)
         with open(os.path.join(home, "client-library.json"), "w") as f:
             json.dump({"items": [{"productId": "9ZZSMOKEGAME", "productType": "Game", "status": "Active"}]}, f)
-        gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        gui = windows.start([binary_copy], env, "account change")
         app = find_app(gui.pid, time.monotonic() + TIMEOUT)
         frame = wait_for(app, lambda root: next(iter(find_all(root, role="frame")), None),
                          "account change window", time.monotonic() + TIMEOUT)
@@ -1731,7 +1857,7 @@ elif sys.argv[1] == 'update':
         # signed in: the saved account and its library stay.
         open(os.path.join(home, "client-unreachable"), "w").close()
         account_calls = open(os.path.join(home, "client-calls")).read().splitlines().count("account")
-        gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        gui = windows.start([binary_copy], env, "unreachable client")
         app = find_app(gui.pid, time.monotonic() + TIMEOUT)
         frame = wait_for(app, lambda root: next(iter(find_all(root, role="frame")), None),
                          "unreachable client window", time.monotonic() + TIMEOUT)
@@ -1748,7 +1874,7 @@ elif sys.argv[1] == 'update':
         # Signed out outside the window (`xodus-cli logout` in a terminal): the
         # next window drops the saved account and the library listed for it.
         open(os.path.join(home, "client-signed-out"), "w").close()
-        gui = subprocess.Popen([binary_copy], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        gui = windows.start([binary_copy], env, "signed-out client")
         app = find_app(gui.pid, time.monotonic() + TIMEOUT)
         frame = wait_for(app, lambda root: next(iter(find_all(root, role="frame")), None),
                          "signed-out client window", time.monotonic() + TIMEOUT)
@@ -1762,8 +1888,6 @@ elif sys.argv[1] == 'update':
         check(gui.wait(timeout=5) == 0, "the signed-out window closes normally")
         os.unlink(os.path.join(home, "client-signed-out"))
         proxy.shutdown()
-        if b"panicked" in stderr_before_restart:
-            failures.append("the first window panicked")
 
     except Failure as e:
         if "frame" in locals():
@@ -1783,20 +1907,7 @@ elif sys.argv[1] == 'update':
             gui.wait(timeout=5)
         except subprocess.TimeoutExpired:
             gui.kill()
-        stderr = (gui.stderr.read() or b"").decode(errors="replace")
-        # GTK's theme parser complains about the system theme on every start and
-        # it says nothing about this launcher.
-        noise = ("Theme parser error", "prefer-dark-theme", "radv is not a conformant")
-        interesting = [
-            line
-            for line in stderr.splitlines()
-            if line.strip() and not any(n in line for n in noise)
-        ]
-        if interesting:
-            print("\nstderr:", file=sys.stderr)
-            print("\n".join(interesting), file=sys.stderr)
-        if any("panicked" in line for line in interesting):
-            failures.append("the window panicked; see stderr above")
+        failures.extend(windows.problems())
         if args.keep:
             print(f"\nkept {home}")
         else:

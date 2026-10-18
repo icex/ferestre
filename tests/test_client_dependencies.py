@@ -12,19 +12,40 @@ WEBKIT = "libwebkit2gtk-4.1.so.0"
 FIXTURE = "libferestre_client_fixture.so.1"
 
 
+def system_libc():
+    """Where this system's C library is, as the loader finds it."""
+    probe = subprocess.run(["ldd", "/bin/sh"], capture_output=True, text=True,
+                           env=dict(os.environ, LC_ALL="C"), check=True)
+    for line in probe.stdout.splitlines():
+        name, _, rest = line.strip().partition(" => ")
+        if name == "libc.so.6":
+            return Path(rest.split()[0]).resolve()
+    raise RuntimeError("could not find libc.so.6")
+
+
 def build_client(home, soname):
     """An ELF named xodus-cli that needs `soname`, with the library built
-    beside it in lib/ and not on any search path."""
+    beside it in lib/ and not on any search path.
+
+    The client is linked with -z nodefaultlib and a run path holding only a
+    link to libc, so the loader never looks in the system's own directories
+    or its cache for it. Its libraries are found exactly where this test puts
+    them, whatever the machine running it has installed: borrowing WebKit's
+    soname then does not mean finding the real WebKit."""
     lib = home / "lib"
     client = home / "client"
+    libc = home / "libc"
     lib.mkdir()
     client.mkdir()
+    libc.mkdir()
+    (libc / "libc.so.6").symlink_to(system_libc())
     (home / "dependency.c").write_text("int ferestre_client_fixture(void) { return 0; }\n")
     (home / "main.c").write_text("extern int ferestre_client_fixture(void);\n"
                                  "int main(void) { return ferestre_client_fixture(); }\n")
     subprocess.run(["cc", "-shared", "-fPIC", f"-Wl,-soname,{soname}",
                     "-o", lib / soname, home / "dependency.c"], check=True)
-    subprocess.run(["cc", "-o", client / "xodus-cli", home / "main.c", lib / soname], check=True)
+    subprocess.run(["cc", "-o", client / "xodus-cli", home / "main.c", lib / soname,
+                    "-Wl,-z,nodefaultlib", f"-Wl,-rpath,{libc}"], check=True)
     return client / "xodus-cli", lib
 
 
@@ -59,13 +80,12 @@ class ClientDependencies(unittest.TestCase):
 
     def test_missing_webkit_names_the_package_for_the_distribution(self):
         client, lib = build_client(self.home, WEBKIT)
-        # The fixture borrows WebKit's soname. Where the real library is
-        # installed the loader finds that one, and nothing is missing.
+        (lib / WEBKIT).rename(self.home / WEBKIT)
+        # The fixture borrows WebKit's soname, and the real library may well be
+        # installed; the client must still not find it.
         ldd = subprocess.run(["ldd", client], capture_output=True, text=True,
                              env=dict(self.env, LC_ALL="C"))
-        if f"{WEBKIT} => not found" not in ldd.stdout:
-            self.skipTest(f"this system has {WEBKIT}, so the fixture cannot lack it")
-        (lib / WEBKIT).rename(self.home / WEBKIT)
+        self.assertIn(f"{WEBKIT} => not found", ldd.stdout)
 
         # Linux Mint names Ubuntu and Debian as its parents.
         self.os_release('NAME="Linux Mint"\nID=linuxmint\nID_LIKE="ubuntu debian"\n')
