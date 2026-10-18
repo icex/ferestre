@@ -46,6 +46,7 @@ pkgbase = ferestre-client
 	source = https://raw.githubusercontent.com/icex/ferestre/81f460b6a713bdc08f21f179e3c05ebc7aa14b33/patches/xodus-cli/0019-serve-read-only-store-catalog.patch
 	source = https://raw.githubusercontent.com/icex/ferestre/81f460b6a713bdc08f21f179e3c05ebc7aa14b33/patches/xodus-cli/0020-separate-store-and-player-accounts.patch
 	source = https://raw.githubusercontent.com/icex/ferestre/81f460b6a713bdc08f21f179e3c05ebc7aa14b33/patches/xodus-cli/0021-scope-service-tokens-to-the-bound-title.patch
+	source = https://raw.githubusercontent.com/icex/ferestre/81f460b6a713bdc08f21f179e3c05ebc7aa14b33/patches/xodus-cli/0022-check-what-the-download-writes-and-stop-when-it-fails.patch
 	sha256sums = SKIP
 	sha256sums = 20d613add707a69f488b50041e53c60f8a0096132c05338b66d594fa8963c918
 	sha256sums = c15806efefdfe7613755ada8ee0fe28784ad955ea7df26825ddeabc7be731256
@@ -67,5 +68,6 @@ pkgbase = ferestre-client
 	sha256sums = 041bb4b80da350c7cfe427d3ba4188dab1c1b4219512dff92bb3e7e056b19c39
 	sha256sums = 0b76dd562210434726fad24bd52aba16b7d9f4f6caeebab7ffec59e09d479434
 	sha256sums = 529cb5505ba5a026ea0ee467e6bdbff0b196b4dfab6958735d967d91dec4c976
+	sha256sums = 14d0cf59cdaa76a05ab9118304b6aedf354c50a9f11d75153bf2845ea7d0e6bf
 
 pkgname = ferestre-client
