@@ -13,6 +13,7 @@
 #   <each of the above>.minisig         minisign signatures, so a download can
 #                                       be checked against a key that is not
 #                                       published in the same place as the file.
+#                                       Tag releases only: see below.
 #
 # The runtime has its own build train and tag. The GUI downloads its published
 # release on first start, so updating the launcher never requires rebuilding
@@ -24,7 +25,9 @@
 #
 # A workflow_dispatch run builds and uploads the same artefacts without
 # publishing anything, which is how to find out whether a release would build
-# before committing to a tag.
+# before committing to a tag. Those artefacts are UNSIGNED: nothing is signed
+# outside a tag, the run says so in its summary, and the launcher refuses an
+# unsigned runtime.
 #
 # Two jobs, because building runs a great deal of code nobody here wrote: the
 # build scripts and proc-macros of every crate in two dependency trees, and the
@@ -34,11 +37,16 @@
 # artefacts it is handed -- it is the one job that holds a token able to write
 # releases, and the only one that sees the signing key.
 #
-# Signing uses minisign. The repository secret MINISIGN_SECRET_KEY holds the
-# whole secret key file, and MINISIGN_PASSWORD its password (unset for a key
-# made with -W). The launcher verifies what it downloads against the public
-# key built into ferestre-core; packaging/sign-release.sh refuses to sign with
-# a key the launcher being published would not accept.
+# Signing uses minisign, and happens only on a tag. The secrets live in the
+# GitHub Environment named `release`, not in the repository: MINISIGN_SECRET_KEY
+# holds the whole secret key file, and MINISIGN_PASSWORD its password (unset for
+# a key made with -W). `publish` is the only job that names that environment,
+# so the environment's protection rules (tags only, a required reviewer) gate
+# the one job that can read the key. Each signature's trusted comment is
+# `file:<name> version:<version>`. The launcher verifies what it downloads
+# against the public key built into ferestre-core; packaging/sign-release.sh
+# refuses to sign with a key the launcher being published would not accept.
+# docs/RELEASING.md covers making, storing and rotating the key.
 name: Release
 
 on:
@@ -249,6 +257,17 @@ jobs:
           sha256sum ./*.AppImage ./*.tar.zst > SHA256SUMS
           cat SHA256SUMS
 
+      # Said out loud, because an artefact from a manual run looks exactly
+      # like a release's except for the missing .minisig files.
+      - name: Unsigned build
+        if: github.ref_type != 'tag'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          msg="ferestre $VERSION was built by a manual run and is UNSIGNED. Only a v* tag signs and publishes."
+          echo "::notice::$msg"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ferestre-${{ steps.version.outputs.version }}
@@ -263,11 +282,16 @@ jobs:
           if-no-files-found: error
 
   # Only a tag publishes. A manual run has produced the same artefacts and
-  # attached them to the run, which is the point of being able to try.
+  # attached them to the run, unsigned, which is the point of being able to
+  # try.
   publish:
     needs: build
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
+    # The signing secrets are environment secrets of `release`. Restrict that
+    # environment to v* and runtime-* tags and give it a required reviewer
+    # (docs/RELEASING.md), and nothing else can reach the key.
+    environment: release
     # The only job that can write a release, so the only one with the token
     # that can. It runs no build and no third-party action beyond fetching
     # the artefacts and this repository's own signing script.
@@ -297,19 +321,28 @@ jobs:
       # Checks SHA256SUMS first, then signs every artefact and the sums. The
       # launcher binary in the tarball has to trust the signing key, or the
       # runtime it downloads would be refused on every machine.
+      #
+      # The version in the trusted comment is the tag's, and the artefacts
+      # must carry the same one.
       - name: Sign
+        if: github.ref_type == 'tag'
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
+          tag_version=${GITHUB_REF_NAME#v}
+          if [ "$tag_version" != "$VERSION" ]; then
+              echo "::error::built as $VERSION, but the tag $GITHUB_REF_NAME says $tag_version"
+              exit 1
+          fi
           launcher="$RUNNER_TEMP/launcher"
           mkdir -p "$launcher"
           tar -xaf "out/ferestre-$VERSION-x86_64.tar.zst" -C "$launcher" \
               "ferestre-$VERSION/usr/bin/ferestre"
           FERESTRE_EXPECT_PUBKEY_IN="$launcher/ferestre-$VERSION/usr/bin/ferestre" \
-              packaging/sign-release.sh out "$GITHUB_REF_NAME"
+              packaging/sign-release.sh out "$tag_version"
           ls -l out
 
       - name: Publish

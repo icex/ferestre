@@ -1,7 +1,7 @@
 #!/bin/bash
 # Sign a release's artefacts with minisign, beside the artefacts themselves.
 #
-#   packaging/sign-release.sh DIR LABEL
+#   packaging/sign-release.sh DIR VERSION
 #
 # Every regular file in DIR gets a DIR/<file>.minisig. DIR must hold a
 # SHA256SUMS that covers everything else in it, and it is checked first: the
@@ -11,13 +11,19 @@
 #
 # The secret key comes from the environment, never from a file in the tree:
 #
-#   MINISIGN_SECRET_KEY   the whole secret key file (both lines), from a CI secret
+#   MINISIGN_SECRET_KEY   the whole secret key file (both lines), from the
+#                         `release` environment's secret of that name
 #   MINISIGN_PASSWORD     its password; leave unset for a key made with -W
 #
-# Each signature's trusted comment is `file:<name> release:<LABEL>`. The
-# trusted comment is covered by the signature, so a verifier that checks the
-# file: field cannot be handed a validly signed but different artefact under
-# this one's name.
+# Each signature's trusted comment is exactly `file:<name> version:<VERSION>`,
+# where VERSION is the release's version as its tag states it, without the
+# tag's prefix (0.1.13 for v0.1.13, 11.0.20260907 for runtime-11.0.20260907).
+# The trusted comment is covered by the signature, so a verifier that checks
+# the file: field cannot be handed a validly signed but different artefact
+# under this one's name, and a reader can see which release a file came from.
+#
+# Only the tag-triggered publish jobs run this; a manual workflow run is never
+# signed. See docs/RELEASING.md for the key itself.
 #
 # Optionally, FERESTRE_EXPECT_PUBKEY_IN names a file -- the launcher binary
 # being published -- that must contain this key's public half in minisign's
@@ -29,17 +35,18 @@ set -euo pipefail
 
 die() { printf '!! %s\n' "$1" >&2; shift; for l in "$@"; do printf '   %s\n' "$l" >&2; done; exit 1; }
 
-[ $# -eq 2 ] || die "usage: $0 DIR LABEL"
+[ $# -eq 2 ] || die "usage: $0 DIR VERSION"
 DIR=$1
-LABEL=$2
+VERSION=$2
 [ -d "$DIR" ] || die "not a directory: $DIR"
-case "$LABEL" in
-    *[!A-Za-z0-9._+-]*|"") die "not a usable release label: $LABEL" ;;
+# A version, not a tag: v0.1.13 here would mean the caller passed the tag.
+case "$VERSION" in
+    *[!A-Za-z0-9._+-]*|""|v[0-9]*|runtime-*) die "not a usable release version: $VERSION" ;;
 esac
 command -v minisign >/dev/null 2>&1 || die "minisign is not installed"
 [ -n "${MINISIGN_SECRET_KEY:-}" ] || die \
     "MINISIGN_SECRET_KEY is empty" \
-    "set it from the repository secret of the same name"
+    "set it from the secret of the same name in the release environment (docs/RELEASING.md)"
 [ -f "$DIR/SHA256SUMS" ] || die "no SHA256SUMS in $DIR"
 
 # Everything except the signatures must be listed in SHA256SUMS, and every
@@ -87,7 +94,7 @@ for f in "$DIR"/*; do
     case "$name" in *.minisig) continue ;; esac
     rm -f "$f.minisig"
     with_password minisign -S -s "$work/secret.key" -m "$f" -x "$f.minisig" \
-        -t "file:$name release:$LABEL" >/dev/null \
+        -t "file:$name version:$VERSION" >/dev/null \
         || die "could not sign $name"
     # Checked with the public half, the way a downloader will check it.
     minisign -Vq -p "$work/public.key" -m "$f" -x "$f.minisig" \

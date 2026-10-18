@@ -28,9 +28,15 @@
 # read-only token that is not written to any checkout; `publish` runs only on a
 # tag, after `build` succeeded, and only checks, signs and uploads the tarball
 # it is handed. It is the one job that can write a release and the only one
-# that sees the minisign key (the MINISIGN_SECRET_KEY and MINISIGN_PASSWORD
-# secrets, as in release.yml). The launcher refuses a runtime whose signature
-# does not verify against the public key built into ferestre-core.
+# that sees the minisign key: the MINISIGN_SECRET_KEY and MINISIGN_PASSWORD
+# secrets of the `release` GitHub Environment, as in release.yml. Each
+# signature's trusted comment is `file:<name> version:<version>`. The launcher
+# refuses a runtime whose signature does not verify against the public key
+# built into ferestre-core.
+#
+# A workflow_dispatch run builds the same tarball and attaches it to the run
+# UNSIGNED, and says so; the launcher will not install it. See
+# docs/RELEASING.md.
 #
 # Cutting a runtime release:
 #
@@ -241,6 +247,15 @@ jobs:
           cat SHA256SUMS
           ls -lh
 
+      - name: Unsigned build
+        if: github.ref_type != 'tag'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          msg="runtime $VERSION was built by a manual run and is UNSIGNED; ferestre install-runtime refuses it. Only a runtime-* tag signs and publishes."
+          echo "::notice::$msg"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ferestre-runtime-${{ steps.version.outputs.version }}
@@ -254,6 +269,8 @@ jobs:
     needs: build
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
+    # Where the signing secrets live; see release.yml and docs/RELEASING.md.
+    environment: release
     permissions:
       contents: write
     steps:
@@ -281,13 +298,20 @@ jobs:
       # every launcher would refuse this runtime; a placeholder there stops
       # the release here.
       - name: Sign
+        if: github.ref_type == 'tag'
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
           FERESTRE_EXPECT_PUBKEY_IN: crates/ferestre-core/src/signing.rs
+          VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
-          packaging/sign-release.sh out "$GITHUB_REF_NAME"
+          tag_version=${GITHUB_REF_NAME#runtime-}
+          if [ "$tag_version" != "$VERSION" ]; then
+              echo "::error::built as $VERSION, but the tag $GITHUB_REF_NAME says $tag_version"
+              exit 1
+          fi
+          packaging/sign-release.sh out "$tag_version"
           ls -lh out
 
       - name: Publish

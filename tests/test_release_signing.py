@@ -62,14 +62,14 @@ class SignReleaseTests(unittest.TestCase):
                                 check=True, capture_output=True, text=True)
         (self.out / 'SHA256SUMS').write_text(result.stdout)
 
-    def sign(self, secret, password=None, label='v1.2.3', **extra):
+    def sign(self, secret, password=None, version='1.2.3', **extra):
         env = {k: v for k, v in os.environ.items()
                if k not in ('MINISIGN_SECRET_KEY', 'MINISIGN_PASSWORD',
                             'FERESTRE_EXPECT_PUBKEY_IN')}
         env.update(MINISIGN_SECRET_KEY=secret, TMPDIR=str(self.root), **extra)
         if password is not None:
             env['MINISIGN_PASSWORD'] = password
-        return subprocess.run([str(SCRIPT), str(self.out), label], env=env,
+        return subprocess.run([str(SCRIPT), str(self.out), version], env=env,
                               capture_output=True, text=True)
 
     def verify(self, pub, name):
@@ -84,7 +84,7 @@ class SignReleaseTests(unittest.TestCase):
                      'SHA256SUMS'):
             check = self.verify(pub, name)
             self.assertEqual(check.returncode, 0, check.stderr)
-            self.assertIn(f'file:{name} release:v1.2.3', check.stdout)
+            self.assertIn(f'Trusted comment: file:{name} version:1.2.3\n', check.stdout)
         # Nothing but the artefacts and their signatures is left for upload.
         self.assertEqual(sorted(p.name for p in self.out.iterdir()), sorted([
             'SHA256SUMS', 'SHA256SUMS.minisig',
@@ -138,6 +138,14 @@ class SignReleaseTests(unittest.TestCase):
         launcher.write_bytes(b'\x7fELF... ' + pubkey.encode() + b' ...')
         result = self.sign(secret, FERESTRE_EXPECT_PUBKEY_IN=str(launcher))
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_tag_is_not_taken_for_the_version(self):
+        secret, _, _ = keypair(self.root, None)
+        for tag in ('v1.2.3', 'runtime-11.0.20260907', ''):
+            result = self.sign(secret, version=tag)
+            self.assertNotEqual(result.returncode, 0, tag)
+            self.assertIn('not a usable release version', result.stderr)
+        self.assertEqual(list(self.out.glob('*.minisig')), [])
 
     def test_signing_needs_a_key(self):
         result = self.sign('')

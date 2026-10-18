@@ -42,7 +42,8 @@ Releases are driven by tags, never by a push to a branch: `v*` builds the
 launcher, `runtime-*` builds the patched Proton. Both workflows check that the
 tag is reachable from `main` and refuse otherwise, because a tag can be created
 on any branch and a release cut from `dev` would publish work that was never
-merged.
+merged. Only a tag signs; [docs/RELEASING.md](docs/RELEASING.md) covers the
+signing key, the `release` environment that holds it, and rotating it.
 
 The per-push checks (`Rust`, `Compatibility matrix`) run on **both** branches.
 That is deliberate and load-bearing: a filter naming `main` alone would mean an

@@ -83,6 +83,15 @@ class WorkflowTests(unittest.TestCase):
                 if 'secrets.MINISIGN' in yaml.safe_dump(job):
                     self.assertTrue(can_write(job, workflow), f'{path.name}/{name}')
                     self.assertEqual(job.get('needs'), 'build', f'{path.name}/{name}')
+                    # Environment secrets, so the environment's tag rule and
+                    # required reviewer gate every job that can read them.
+                    self.assertEqual(job.get('environment'), 'release', f'{path.name}/{name}')
+                    self.assertEqual(job.get('if'), "github.ref_type == 'tag'",
+                                     f'{path.name}/{name}')
+                    for step in job.get('steps', []):
+                        if 'secrets.MINISIGN' in yaml.safe_dump(step):
+                            self.assertEqual(step.get('if'), "github.ref_type == 'tag'",
+                                             f'{path.name}/{name}/{step.get("name")}')
 
     def test_releases_are_signed_before_they_are_published(self):
         for wf in ('release.yml', 'runtime.yml'):
@@ -98,6 +107,20 @@ class WorkflowTests(unittest.TestCase):
             self.assertLess(sign, publish, wf)
             self.assertIn('out/*', texts[publish], wf)
             self.assertFalse(can_write(workflow['jobs']['build'], workflow), wf)
+
+    def test_signatures_carry_the_tags_version_and_manual_runs_say_they_are_unsigned(self):
+        for wf, prefix in (('release.yml', 'v'), ('runtime.yml', 'runtime-')):
+            workflow = load(REPO / '.github/workflows' / wf)
+            sign = next(t for t in runs(workflow['jobs']['publish'])
+                        if 'packaging/sign-release.sh out' in t)
+            self.assertIn(f'tag_version=${{GITHUB_REF_NAME#{prefix}}}', sign, wf)
+            self.assertIn('packaging/sign-release.sh out "$tag_version"', sign, wf)
+            unsigned = [s for s in workflow['jobs']['build']['steps']
+                        if s.get('name') == 'Unsigned build']
+            self.assertEqual(len(unsigned), 1, wf)
+            self.assertEqual(unsigned[0].get('if'), "github.ref_type != 'tag'", wf)
+            self.assertIn('UNSIGNED', unsigned[0]['run'], wf)
+            self.assertIn('GITHUB_STEP_SUMMARY', unsigned[0]['run'], wf)
 
     def test_the_msrv_job_builds_with_the_declared_rust_version(self):
         declared = re.search(r'^rust-version = "([0-9.]+)"$',

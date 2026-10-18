@@ -439,7 +439,7 @@ mod tests {
         assert!(verify_file_with_key(&key.public(), &signature, "", &path).is_err());
     }
 
-    /// Release CI writes `file:<name> release:<tag>`; minisign's default is
+    /// Release CI writes `file:<name> version:<version>`; minisign's default is
     /// tab-separated. Both name the file.
     #[test]
     fn the_file_field_is_found_however_the_comment_separates_it() {
@@ -448,7 +448,7 @@ mod tests {
         let name = "ferestre-runtime-11.0.1.tar.xz";
         let path = written(dir.path(), name, b"data");
         for comment in [
-            format!("file:{name} release:runtime-11.0.1"),
+            format!("file:{name} version:11.0.1"),
             format!("timestamp:1\tfile:{name}\thashed"),
         ] {
             let signature = key.sign_with_comment(&comment, b"data");
