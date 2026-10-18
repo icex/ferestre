@@ -108,6 +108,7 @@ _patches=(
   "0021-scope-service-tokens-to-the-bound-title.patch"
   "0022-check-what-the-download-writes-and-stop-when-it-fails.patch"
   "0023-keep-accounts-consistent-and-the-service-up.patch"
+  "0024-harden-token-audiences.patch"
 )
 source=("xodus::git+https://github.com/xodus-gaming/xodus.git#commit=$_commit")
 for _patch in "${_patches[@]}"; do
@@ -138,6 +139,7 @@ sha256sums=(
   '529cb5505ba5a026ea0ee467e6bdbff0b196b4dfab6958735d967d91dec4c976'
   '14d0cf59cdaa76a05ab9118304b6aedf354c50a9f11d75153bf2845ea7d0e6bf'
   'bd45c8ac307f73837ce67461a25692c519f031d0bb18148305fe1b77c7734bdc'
+  '142c9b29aefaa985b2c82cbc7c716c9b7cd3eca3979e151e66dd67ee4be72c63'
 )
 
 prepare() {

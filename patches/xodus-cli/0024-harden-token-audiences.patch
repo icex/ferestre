@@ -1,0 +1,265 @@
+From: Ferestre contributors
+Subject: Harden token audiences in a bound service
+
+The licensing audience a bound title may not take when the Player is the
+Store account is now also any of the fixed licensing hosts:
+licensing.xboxlive.com, licensing.mp.microsoft.com,
+collections.mp.microsoft.com and inventory.xboxlive.com, compared by host
+whatever the scheme, case, port, user info, path or trailing dot. Before,
+only the audience the fetched endpoint list maps the licence service to was
+refused, so a list that mapped it somewhere else, or could not be fetched,
+left the gate open.
+
+When the default endpoint list cannot be fetched, a bound service refuses a
+title's XSTS request instead of using https://<host>/ of the request's URL
+as the audience. The title can retry once the list is back. The service's
+own licence path, which names a fixed URL, and an unbound service are
+unchanged.
+
+diff --git a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/src/connection/xml.rs
+index 645764c..2860c2e 100644
+--- a/crates/xodus-service/src/connection/xml.rs
++++ b/crates/xodus-service/src/connection/xml.rs
+@@ -380,13 +380,40 @@ fn bound(context: &SimpleContext) -> bool {
+     context.entitlement.is_some() || context.title.is_some()
+ }
+ 
++/// The hosts licence tokens are minted for. The gate below goes by these as
++/// well as by what the endpoint list maps the licence service to: that list is
++/// fetched over the network, and the gate must hold when it maps the licence
++/// service somewhere new, or could not be fetched at all.
++const LICENSING_AUDIENCES: [&str; 4] = [
++    "licensing.xboxlive.com",
++    "licensing.mp.microsoft.com",
++    "collections.mp.microsoft.com",
++    "inventory.xboxlive.com",
++];
++
++/// The host a relying party names: no scheme, user info, port, path or
++/// trailing dot, in lower case. `http://` and `https://` spellings of one host
++/// are the same audience here.
++fn audience_host(relying_party: &str) -> String {
++    let rp = relying_party.trim().to_ascii_lowercase();
++    let rest = rp.split_once("://").map_or(rp.as_str(), |(_, rest)| rest);
++    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
++    let host = authority
++        .rsplit_once('@')
++        .map_or(authority, |(_, host)| host);
++    let host = host.split(':').next().unwrap_or_default();
++    host.trim_end_matches('.').to_string()
++}
++
+ /// Keep the licensing audience to the licence path in a bound service.
+ ///
+ /// The licence path holds a request to the bound product and its add-ons, but
+ /// a title asking for the licensing audience itself could sign a licence
+ /// request of its own choosing: the signature covers the method, path and
+-/// body, not the host, so any URL resolving to that audience will do. Where
+-/// that token would be the Store account's -- one account in both roles -- it
++/// body, not the host, so any URL resolving to that audience will do. That
++/// audience is the one the endpoint list maps the licence service to, and any
++/// of the fixed `LICENSING_AUDIENCES`. Where that token would be the Store
++/// account's -- one account in both roles -- it
+ /// is refused. A Player who is another account gets their own licensing
+ /// authorization, as on any other machine.
+ fn licensing_audience_gate(
+@@ -404,10 +431,9 @@ fn licensing_audience_gate(
+             .unwrap_or(&rp);
+         rp.trim_end_matches('/').to_string()
+     };
+-    if !bound(context)
+-        || audience(relying_party) != audience(&endpoints.relying_party(super::license::URL))
+-        || !context.player_is_store_account()
+-    {
++    let licensing = LICENSING_AUDIENCES.contains(&audience_host(relying_party).as_str())
++        || audience(relying_party) == audience(&endpoints.relying_party(super::license::URL));
++    if !bound(context) || !licensing || !context.player_is_store_account() {
+         return Ok(());
+     }
+     Err(format!(
+@@ -415,6 +441,38 @@ fn licensing_audience_gate(
+     ))
+ }
+ 
++/// The endpoint lists a request's audience is resolved against, starting
++/// with the default one.
++///
++/// Without that list the audience would be `https://<host>/` of whatever URL
++/// the request names, outside every mapping the list carries. A bound service
++/// resolves a title's audience from the list only, so it refuses the title's
++/// request until the list can be fetched. The licence path names its own URL,
++/// and an unbound service is unchanged.
++fn endpoint_config(
++    context: &SimpleContext,
++    caller: Caller,
++    default: Option<xodus::models::xbox::TitleMgtResponse>,
++) -> Result<EndpointConfig, String> {
++    let default = match default {
++        Some(default) => default,
++        None if caller == Caller::Title && bound(context) => {
++            return Err(
++                "refused an XSTS request: the endpoint list could not be fetched, and a bound service takes the audience only from it; retry later"
++                    .to_string(),
++            );
++        }
++        None => xodus::models::xbox::TitleMgtResponse {
++            end_points: vec![],
++            signature_policies: vec![],
++        },
++    };
++    Ok(EndpointConfig {
++        default,
++        title: None,
++    })
++}
++
+ #[cfg(test)]
+ pub(super) async fn xsts_token(
+     context: &mut SimpleContext,
+@@ -524,15 +582,10 @@ async fn xsts_token_with(
+             .ok_or("invalid title signing key")?,
+         None => SIGNER.clone(),
+     };
+-    let mut endpoints = EndpointConfig {
+-        default: endpoints_for(&context.client).await.unwrap_or(
+-            xodus::models::xbox::TitleMgtResponse {
+-                end_points: vec![],
+-                signature_policies: vec![],
+-            },
+-        ),
+-        title: None,
+-    };
++    let default = endpoints_for(&context.client).await;
++    let mut endpoints = endpoint_config(context, caller, default).inspect_err(|refusal| {
++        tracing::warn!("{refusal}");
++    })?;
+     if let (Some((id, _)), Some(identity)) = (&title, &identity) {
+         match title_endpoints_for(&context.client, *id, identity).await {
+             Ok(list) => endpoints.title = Some(list),
+diff --git a/crates/xodus-service/src/connection/xml_tests.rs b/crates/xodus-service/src/connection/xml_tests.rs
+index 2d238a6..b8a3cc3 100644
+--- a/crates/xodus-service/src/connection/xml_tests.rs
++++ b/crates/xodus-service/src/connection/xml_tests.rs
+@@ -570,6 +570,122 @@ fn a_bound_title_cannot_take_the_store_accounts_licensing_audience() {
+     assert!(gate(&split, licence).is_ok());
+ }
+ 
++#[test]
++fn the_licensing_hosts_stay_the_licence_paths_whatever_the_endpoint_list_says() {
++    // A list that maps the licence service to an audience of its own, and the
++    // licensing hosts to nothing in particular: the fixed hosts still hold.
++    let moved = EndpointConfig {
++        default: serde_json::from_value(serde_json::json!({
++            "EndPoints": [
++                {"Protocol": "https", "Host": "licensing.mp.microsoft.com", "HostType": "fqdn",
++                 "RelyingParty": "http://licensing.example.test", "SignaturePolicyIndex": 0}
++            ],
++            "SignaturePolicies": [{
++                "Version": 1, "MaxBodyBytes": 8192,
++                "SupportedAlgorithms": ["ES256"], "SupportedSignatureTypes": ["XBL"]
++            }]
++        }))
++        .unwrap(),
++        title: None,
++    };
++    // And no list at all, as when discovery failed in the licence path.
++    let missing = EndpointConfig {
++        default: xodus::models::xbox::TitleMgtResponse {
++            end_points: vec![],
++            signature_policies: vec![],
++        },
++        title: None,
++    };
++    let mut shared = crate::simple_context::tests::context("same-account", "same-account");
++    shared.entitlement = Some(crate::entitlement::Entitlement::fixture("9P5786PJB9RP"));
++    for endpoints in [&moved, &missing, &licensing_endpoints()] {
++        for audience in [
++            "http://licensing.xboxlive.com",
++            "https://licensing.xboxlive.com/",
++            "HTTP://Licensing.XboxLive.com",
++            "licensing.xboxlive.com",
++            "http://licensing.xboxlive.com./",
++            "http://licensing.xboxlive.com:443/any/path",
++            "https://user@licensing.mp.microsoft.com",
++            "https://licensing.mp.microsoft.com/",
++            "http://collections.mp.microsoft.com",
++            "https://inventory.xboxlive.com/",
++        ] {
++            let message = licensing_audience_gate(&shared, audience, endpoints).unwrap_err();
++            assert!(
++                message.starts_with("refused an XSTS request for the licensing audience"),
++                "{audience}: {message}"
++            );
++        }
++        for audience in [
++            "http://xboxlive.com",
++            "http://mp.microsoft.com/",
++            "https://licensing.xboxlive.com.example.test/",
++            "https://notlicensing.xboxlive.com/",
++            "https://userpresence.xboxlive.com/",
++        ] {
++            assert!(
++                licensing_audience_gate(&shared, audience, endpoints).is_ok(),
++                "{audience}"
++            );
++        }
++    }
++    // The audience the list does map the licence service to is refused too.
++    assert!(licensing_audience_gate(&shared, "http://licensing.example.test/", &moved).is_err());
++
++    // Unbound, or with a Player who is another account, nothing changes.
++    let unbound = crate::simple_context::tests::context("same-account", "same-account");
++    let mut split = crate::simple_context::tests::context("owner-account", "player-account");
++    split.entitlement = Some(crate::entitlement::Entitlement::fixture("9P5786PJB9RP"));
++    for context in [&unbound, &split] {
++        for audience in [
++            "http://licensing.xboxlive.com",
++            "https://inventory.xboxlive.com/",
++        ] {
++            assert!(
++                licensing_audience_gate(context, audience, &moved).is_ok(),
++                "{audience}"
++            );
++        }
++    }
++}
++
++#[test]
++fn a_bound_service_without_the_endpoint_list_refuses_a_titles_request() {
++    let list = || licensing_endpoints().default;
++    let url = "https://title.example.test/v1/thing";
++
++    // Unbound, the audience falls back to the request's host, as before.
++    let unbound = crate::simple_context::tests::context("owner-list", "player-list");
++    for caller in [Caller::Title, Caller::Licensing] {
++        let endpoints = endpoint_config(&unbound, caller, None).unwrap();
++        assert_eq!(endpoints.relying_party(url), "https://title.example.test/");
++    }
++
++    let mut product = crate::simple_context::tests::context("owner-list", "player-list");
++    product.entitlement = Some(crate::entitlement::Entitlement::fixture("9P5786PJB9RP"));
++    let mut titled = crate::simple_context::tests::context("owner-list", "player-list");
++    titled.title = Some(crate::title::TitleIdentity::fixture(
++        1805509784,
++        "own-client",
++    ));
++    for bound in [&product, &titled] {
++        // No list: the title's request is refused, not given a made-up audience.
++        let message = endpoint_config(bound, Caller::Title, None)
++            .err()
++            .expect("a bound service without the list refuses");
++        assert!(message.starts_with("refused an XSTS request"), "{message}");
++        // The licence path names its own fixed URL and still goes ahead.
++        assert!(endpoint_config(bound, Caller::Licensing, None).is_ok());
++        // With the list, the audience comes from it.
++        let endpoints = endpoint_config(bound, Caller::Title, Some(list())).unwrap();
++        assert_eq!(
++            endpoints.relying_party("https://userpresence.xboxlive.com/users/me"),
++            "http://xboxlive.com"
++        );
++    }
++}
++
+ #[tokio::test]
+ async fn a_bound_service_issues_no_msa_tickets_and_an_unbound_one_does() {
+     for client in ["own-client", "another-client", ""] {
