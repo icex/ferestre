@@ -408,6 +408,79 @@ def row_button(root, title, label):
     return None
 
 
+MENU_PREFIX = "More actions for "
+
+
+def row_menus(root):
+    """Every row's "More actions" button, by the title it names."""
+    return {
+        (node.get_name() or "")[len(MENU_PREFIX):]: node
+        for node in find_all(root, name_contains=MENU_PREFIX)
+        if (node.get_name() or "").startswith(MENU_PREFIX)
+    }
+
+
+def menu_items(app, menu):
+    """Open a row's menu and return {item name: button}; close_menu() shuts it.
+
+    The secondary actions live in a popover, and a popover's contents are in
+    the accessible tree only while it is open -- the reason there is no Edit
+    button to count until this has run.
+    """
+    targets = [menu] + [
+        node for node, _ in walk(menu) if node is not menu and node.get_role_name() == "toggle button"
+    ]
+    for target in targets:
+        click(target)
+        try:
+            items = wait_for(
+                app,
+                lambda root: {
+                    node.get_name(): node
+                    for node in find_all(root, role="button")
+                    if node.get_name() in MENU_ITEMS
+                }
+                or None,
+                "the row's menu to open",
+                time.monotonic() + 5,
+            )
+            return items
+        except Failure:
+            continue
+    raise Failure("the row's menu would not open")
+
+
+def close_menu(app):
+    """Escape closes the open popover; its items then leave the tree."""
+    for node in find_all(app, role="button"):
+        if node.get_name() in MENU_ITEMS:
+            break
+    else:
+        return
+    Atspi.generate_keyboard_event(0xFF1B, None, Atspi.KeySynthType.SYM)
+    wait_for(
+        app,
+        lambda root: not any(n.get_name() in MENU_ITEMS for n in find_all(root, role="button")) or None,
+        "the row's menu to close",
+        time.monotonic() + 5,
+    )
+
+
+MENU_ITEMS = {"Open Store page", "Choose runtime", "Add to Steam", "Edit launch settings", "Remove from disk"}
+
+
+def row_action(app, frame, item, title=None):
+    """Click `item` in the menu of `title`'s row, or of the first row that has it."""
+    menus = row_menus(frame)
+    for name, menu in ([(title, menus[title])] if title else menus.items()):
+        items = menu_items(app, menu)
+        if item in items:
+            click(items[item])
+            return name
+        close_menu(app)
+    raise Failure(f"no row offers {item!r}")
+
+
 def check_game_row_layout(root, title, size, action):
     button = row_button(root, title, action)
     check(button is not None, f"{title} keeps its {action} action", root)
@@ -1215,24 +1288,33 @@ print(":: done", flush=True)
             "the library to come back",
             time.monotonic() + TIMEOUT,
         )
-        edit = find_all(frame, role="button", name_contains="Edit how this title launches")
         # One per recipe, counted from titles/ rather than written down here.
         # This used to assert a literal 3 and went stale the moment a fourth
         # recipe landed -- it then failed on every commit that added a title,
         # which is exactly the commit whose author has least reason to suspect
         # the GUI suite.
+        offered = {}
+        for name, menu in row_menus(frame).items():
+            offered[name] = set(menu_items(app, menu))
+            close_menu(app)
+        edit = [name for name, items in offered.items() if "Edit launch settings" in items]
+        steam = [name for name, items in offered.items() if "Add to Steam" in items]
         check(
             len(edit) == recipe_count,
-            f"every recipe offers an edit ({len(edit)} buttons for {recipe_count} recipes)",
+            f"every recipe offers an edit ({len(edit)} menus for {recipe_count} recipes)",
             frame,
         )
-        steam = find_all(frame, role="button", name_contains="Add to Steam")
         check(
             len(steam) == recipe_count,
             f"and an Add to Steam ({len(steam)} for {recipe_count} recipes)",
             frame,
         )
-        click(steam[0])
+        check(
+            all("Open Store page" in items for items in offered.values()),
+            "every row's menu links its Store page",
+            frame,
+        )
+        row_action(app, frame, "Add to Steam", steam[0])
         wait_for(frame, lambda root: os.path.isfile(shortcuts),
                  "the saved Steam shortcut", time.monotonic() + TIMEOUT)
         with open(shortcuts, "rb") as f:
@@ -1264,7 +1346,7 @@ print(":: done", flush=True)
             f.write(legacy)
         os.unlink(icon_path)
         previous_mtime = os.stat(shortcuts).st_mtime_ns
-        click(find_all(frame, role="button", name_contains="Add to Steam")[0])
+        row_action(app, frame, "Add to Steam")
         wait_for(frame, lambda root: os.stat(shortcuts).st_mtime_ns != previous_mtime,
                  "the existing Steam shortcut to update", time.monotonic() + TIMEOUT)
         shortcut_bytes = open(shortcuts, "rb").read()
@@ -1318,7 +1400,7 @@ print(":: done", flush=True)
             not glob.glob(os.path.join(user_titles, "*.toml")),
             "nothing has been written yet",
         )
-        click(find_all(frame, role="button", name_contains="Edit how this title launches")[0])
+        row_action(app, frame, "Edit launch settings")
         wait_for(
             frame,
             lambda root: any("Executable" in t for t in texts(root)),
@@ -1381,11 +1463,9 @@ print(":: done", flush=True)
               "Installed never confuses purchase-list absence with missing access", frame)
         wait_for(frame, lambda root: not any("Checking for game updates" in t for t in texts(root)),
                  "the automatic update check to finish", time.monotonic() + TIMEOUT)
-        remove = wait_for(
-            frame, lambda root: next(iter(find_all(root, role="button", name="Remove this title from disk")), None),
-            "the installed game's Remove button", time.monotonic() + TIMEOUT,
-        )
-        click(remove)
+        wait_for(frame, lambda root: row_menus(root) or None,
+                 "the installed game's row menu", time.monotonic() + TIMEOUT)
+        row_action(app, frame, "Remove from disk")
         wait_for(frame, lambda root: any("Remove Minecraft for Windows?" in t for t in texts(root)),
                  "the removal confirmation", time.monotonic() + TIMEOUT)
         click_named(frame, "Remove")

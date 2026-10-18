@@ -1382,6 +1382,10 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
         .tooltip_text("More actions")
         .popover(&popover)
         .build();
+    more.update_property(&[gtk::accessible::Property::Label(&format!(
+        "More actions for {}",
+        row.name
+    ))]);
     let item = |icon: &str, label: &str, run: Box<dyn Fn()>| {
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         content.append(&gtk::Image::from_icon_name(icon));
@@ -1390,6 +1394,7 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             .child(&content)
             .css_classes(["flat"])
             .build();
+        button.update_property(&[gtk::accessible::Property::Label(label)]);
         let popover = popover.clone();
         button.connect_clicked(move |_| {
             popover.popdown();
