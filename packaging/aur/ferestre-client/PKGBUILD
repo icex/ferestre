@@ -106,6 +106,7 @@ _patches=(
   "0019-serve-read-only-store-catalog.patch"
   "0020-separate-store-and-player-accounts.patch"
   "0021-scope-service-tokens-to-the-bound-title.patch"
+  "0023-keep-accounts-consistent-and-the-service-up.patch"
 )
 source=("xodus::git+https://github.com/xodus-gaming/xodus.git#commit=$_commit")
 for _patch in "${_patches[@]}"; do
@@ -134,6 +135,7 @@ sha256sums=(
   '041bb4b80da350c7cfe427d3ba4188dab1c1b4219512dff92bb3e7e056b19c39'
   '0b76dd562210434726fad24bd52aba16b7d9f4f6caeebab7ffec59e09d479434'
   '529cb5505ba5a026ea0ee467e6bdbff0b196b4dfab6958735d967d91dec4c976'
+  '212503caa5e860cacd2a459f6359610ff759bd800308b7c460f997d3fbcaf82c'
 )
 
 prepare() {

@@ -1,0 +1,1511 @@
+From: Ferestre contributors
+Subject: Keep accounts consistent and the service up
+
+The first account added on a fresh install becomes the default, under the
+same lock migration uses, so a launch or `account` that is not told which
+account to use no longer falls back to the empty legacy keychain and fails
+as signed out. Selection, in the client and in the service, uses the legacy
+unscoped sign-in only while no profile exists at all: a lone profile without
+a default (as an earlier Add account left it) is adopted, and several with
+none chosen are an error that says so. Migration with no legacy sign-in also
+adopts a lone profile.
+
+Add account removes the new sign-in's credentials on every failure,
+including a panic, until its profile is saved. The Xbox identity step
+reports errors instead of panicking: `xsts_for` uses the reporting XSTS
+call, and a token without a user claim is an error rather than a panic when
+building its Authorization header.
+
+Signing out a profile also removes the legacy, pre-profile entries when they
+belong to the same Microsoft account, so a migrated account's refresh
+credential does not stay in the keyring and cannot be revived by a later
+migration. Device registration is untouched.
+
+Neither HTTP client is built with connection_verbose any more: at trace
+level it logged the decrypted traffic, Authorization headers and token
+bodies included. The service shares one client across connections. A failed
+accept() is logged and retried after a pause instead of ending the service.
+
+Catalog queries upper-case Store IDs, so a title that passes them in lower
+case matches the catalog's answer. An XSTS request may carry
+<ForceRefresh>true</ForceRefresh>, the title's ForceRefresh option, and then
+skips the cached token; it re-mints at most once per 30 s per token key.
+Older runtimes do not send it and older services ignore it.
+
+The sign-in window accepts bridge messages only from login.live.com and
+login.microsoftonline.com pages, navigates only to https Microsoft account
+domains (and the challenge provider their pages embed), and passes the
+page-supplied context to its script as a JSON value. The plain-file
+credential store (key-chain-file) refuses to work without HOME instead of
+using the shared temporary directory, and keeps its file 0600 in a
+directory only the user can write. xbl-check shortens a response line on a
+character boundary.
+
+diff --git a/crates/xodus-cli/src/commands/account.rs b/crates/xodus-cli/src/commands/account.rs
+index ae73ba9..20bfca1 100644
+--- a/crates/xodus-cli/src/commands/account.rs
++++ b/crates/xodus-cli/src/commands/account.rs
+@@ -11,7 +11,7 @@
+ 
+ use std::process::ExitCode;
+ 
+-use super::collections::{send, xsts_for};
++use super::collections::{auth_header, send, xsts_for};
+ 
+ const XBOXLIVE_RELYING_PARTY: &str = "http://xboxlive.com";
+ const PROFILE_SETTINGS: &str = "https://profile.xboxlive.com/users/me/profile/settings\
+@@ -48,7 +48,7 @@ pub async fn describe(
+         "gamertag": xsts.gamertag().unwrap_or_default(),
+         "xuid": xsts.xuid().unwrap_or_default(),
+     });
+-    let auth = xodus::api::xbox::get_xsts_auth_header(xsts);
++    let auth = auth_header(xsts)?;
+ 
+     let headers = ["x-xbl-contract-version:3".to_string()];
+     match send(client, PROFILE_SETTINGS, None, &auth, &headers).await {
+diff --git a/crates/xodus-cli/src/commands/collections.rs b/crates/xodus-cli/src/commands/collections.rs
+index ff8a2af..4160caa 100644
+--- a/crates/xodus-cli/src/commands/collections.rs
++++ b/crates/xodus-cli/src/commands/collections.rs
+@@ -43,7 +43,19 @@ pub(crate) async fn xsts_for(
+     let Ok(Token::Legacy(user_token)) = tokens.get_user_sts_token() else {
+         return Err("no usable user token; run `xodus-cli login` first".into());
+     };
+-    Ok(xodus::api::xbox::run(client, dev_token, user_token, relying_party).await)
++    // The reporting variant: an account with no Xbox profile, one that needs
++    // consent or a dropped connection is an error for the caller to report,
++    // not a panic that skips its cleanup.
++    xodus::api::xbox::try_run_with_signer(client, dev_token, user_token, relying_party, None).await
++}
++
++/// The `XBL3.0` authorization header for a token, or an error when the token
++/// carries no user claim to build it from.
++pub(crate) fn auth_header(xsts: XstsResponse) -> Result<String, String> {
++    if xsts.user_hash().is_none() {
++        return Err("the Xbox token carries no user claim".into());
++    }
++    Ok(xodus::api::xbox::get_xsts_auth_header(xsts))
+ }
+ 
+ /// Mint an XSTS token carrying a title claim for `title_id`.
+@@ -148,7 +160,13 @@ pub async fn probe(
+     let uhs = xsts.user_hash().unwrap_or_default().to_string();
+     let puid = tokens.get_user().map(|u| u.puid).unwrap_or_default();
+     let raw_token = xsts.token.clone();
+-    let auth = xodus::api::xbox::get_xsts_auth_header(xsts);
++    let auth = match auth_header(xsts) {
++        Ok(auth) => auth,
++        Err(message) => {
++            eprintln!("{message}");
++            return ExitCode::FAILURE;
++        }
++    };
+     let fill = |text: &str| {
+         text.replace("{XUID}", &xuid)
+             .replace("{UHS}", &uhs)
+@@ -373,3 +391,35 @@ pub async fn query(
+     }
+     ExitCode::SUCCESS
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn token(claims: serde_json::Value) -> XstsResponse {
++        serde_json::from_value(serde_json::json!({
++            "NotAfter": "2030-01-01T00:00:00Z",
++            "Token": "synthetic-token",
++            "DisplayClaims": claims
++        }))
++        .unwrap()
++    }
++
++    #[test]
++    fn a_token_without_a_user_claim_is_an_error_not_a_panic() {
++        assert!(auth_header(token(serde_json::json!({}))).is_err());
++        assert_eq!(
++            auth_header(token(serde_json::json!({"xui": [{"uhs": "fixture-hash"}]}))).unwrap(),
++            "XBL3.0 x=fixture-hash;synthetic-token"
++        );
++    }
++
++    #[tokio::test]
++    async fn no_stored_sign_in_is_reported_without_a_network_call() {
++        let tokens = TokenManager::with_memory();
++        let error = xsts_for(&reqwest::Client::new(), &tokens, "http://xboxlive.com")
++            .await
++            .unwrap_err();
++        assert!(error.contains("device token"), "{error}");
++    }
++}
+diff --git a/crates/xodus-cli/src/commands/profiles.rs b/crates/xodus-cli/src/commands/profiles.rs
+index c74daad..ec96815 100644
+--- a/crates/xodus-cli/src/commands/profiles.rs
++++ b/crates/xodus-cli/src/commands/profiles.rs
+@@ -4,19 +4,29 @@ use xodus::profiles::{self, Profile};
+ use xodus::tokens::{TokenManager, store::TokenStoreError};
+ 
+ pub fn manager(root: &Path, id: Option<&str>) -> Result<TokenManager, TokenStoreError> {
+-    let id = match id {
+-        Some(id) => Some(id.to_owned()),
+-        None => profiles::default_id(root)?,
+-    };
+-    match id {
+-        Some(id) => {
+-            profiles::load(root, &id)?;
+-            TokenManager::for_profile(&id)
+-        }
++    match profiles::select(root, id)? {
++        Some(id) => TokenManager::for_profile(&id),
+         None => Ok(TokenManager::with_keychain_and_memory()),
+     }
+ }
+ 
++/// Removes a new sign-in's credentials unless the profile that owns them was
++/// saved. Dropped on every early return and on a panic, so a failed Xbox
++/// identity step cannot leave a refresh token under a profile ID that no
++/// account list shows and so nothing can sign out.
++struct Uncommitted<'a> {
++    tokens: &'a TokenManager,
++    committed: bool,
++}
++
++impl Drop for Uncommitted<'_> {
++    fn drop(&mut self) {
++        if !self.committed {
++            let _ = self.tokens.remove_user();
++        }
++    }
++}
++
+ pub fn list(root: &Path, json: bool) -> ExitCode {
+     let result = (|| -> Result<serde_json::Value, TokenStoreError> {
+         let mut result = Vec::new();
+@@ -86,72 +96,162 @@ pub async fn add(client: &reqwest::Client, root: &Path) -> ExitCode {
+         }
+     };
+     xodus::tokens::device::ensure_device_credentials(client, &tokens).await;
++    let mut pending = Uncommitted {
++        tokens: &tokens,
++        committed: false,
++    };
+     if super::login::run(client, &tokens).await != ExitCode::SUCCESS {
+-        let _ = tokens.remove_user();
+         return ExitCode::FAILURE;
+     }
+     // Publish the profile only after both sign-in and Xbox identity succeeded.
+     // A cancelled/failed login never replaces either selected account.
+     let account = match super::account::describe(client, &tokens).await {
+         Ok(value) if value["gamertag"].as_str().is_some_and(|s| !s.is_empty()) => value,
+-        _ => {
+-            let _ = tokens.remove_user();
++        Ok(_) => {
+             eprintln!("New account did not supply an Xbox identity");
+             return ExitCode::FAILURE;
+         }
++        Err(e) => {
++            eprintln!("New account did not supply an Xbox identity: {e}");
++            return ExitCode::FAILURE;
++        }
+     };
++    let label = account["gamertag"].as_str().unwrap_or_default().to_owned();
+     let user = match tokens.get_user() {
+         Ok(user) => user,
+         Err(e) => {
+-            let _ = tokens.remove_user();
+             eprintln!("New account identity: {e}");
+             return ExitCode::FAILURE;
+         }
+     };
+-    let save_namespace = profiles::save_namespace(&user.puid);
+-    // Unreadable is not empty: treating it as empty would give an account
+-    // that already has a profile a second one, with saves split between them.
+-    let known = match profiles::list(root) {
+-        Ok(known) => known,
++    match commit(root, &tokens, &id, &user.puid, &label) {
++        Ok(profile) => {
++            // The new sign-in is either kept under its own profile or was
++            // copied into the one that already had this account.
++            pending.committed = profile.id == id;
++            println!("{}", serde_json::json!({"profile":profile}));
++            ExitCode::SUCCESS
++        }
+         Err(e) => {
+-            let _ = tokens.remove_user();
+-            eprintln!("Cannot read account profiles: {e}");
+-            return ExitCode::FAILURE;
++            eprintln!("{e}");
++            ExitCode::FAILURE
+         }
+-    };
+-    if let Some(mut existing) = known
++    }
++}
++
++/// Save the profile for a verified sign-in held under `id`, or refresh the
++/// profile that already has this account, and make it the default when there
++/// is none. The caller removes the sign-in under `id` unless the returned
++/// profile is `id` itself.
++fn commit(
++    root: &Path,
++    tokens: &TokenManager,
++    id: &str,
++    puid: &str,
++    label: &str,
++) -> Result<Profile, String> {
++    let save_namespace = profiles::save_namespace(puid);
++    // Unreadable is not empty: treating it as empty would give an account
++    // that already has a profile a second one, with saves split between them.
++    let known = profiles::list(root).map_err(|e| format!("Cannot read account profiles: {e}"))?;
++    let profile = match known
+         .into_iter()
+         .find(|p| p.save_namespace == save_namespace)
+     {
+-        if let Err(e) = tokens.migrate_user_to(&existing.id) {
+-            let _ = tokens.remove_user();
+-            eprintln!("Cannot refresh account profile: {e}");
+-            return ExitCode::FAILURE;
+-        }
+-        let _ = tokens.remove_user();
+-        existing.label = account["gamertag"].as_str().unwrap().into();
+-        if let Err(e) = profiles::save(root, &existing) {
+-            eprintln!("Cannot save account profile: {e}");
+-            return ExitCode::FAILURE;
++        Some(mut existing) => {
++            tokens
++                .migrate_user_to(&existing.id)
++                .map_err(|e| format!("Cannot refresh account profile: {e}"))?;
++            existing.label = label.into();
++            existing
+         }
+-        println!("{}", serde_json::json!({"profile":existing}));
+-        return ExitCode::SUCCESS;
+-    }
+-    let profile = Profile {
+-        id,
+-        label: account["gamertag"].as_str().unwrap().into(),
+-        legacy_saves: false,
+-        save_namespace,
++        None => Profile {
++            id: id.into(),
++            label: label.into(),
++            legacy_saves: false,
++            save_namespace,
++        },
+     };
+-    match profiles::save(root, &profile) {
+-        Ok(()) => {
+-            println!("{}", serde_json::json!({"profile":profile}));
+-            ExitCode::SUCCESS
+-        }
+-        Err(e) => {
+-            let _ = tokens.remove_user();
+-            eprintln!("Cannot save account profile: {e}");
+-            ExitCode::FAILURE
+-        }
++    profiles::save(root, &profile).map_err(|e| format!("Cannot save account profile: {e}"))?;
++    // Without a default, a launch that is not told which account to use would
++    // fall back to the empty legacy keychain and fail as signed out. The
++    // profile is saved by now, so failing here would only lose the sign-in;
++    // selection adopts a lone profile on its own later.
++    if let Err(e) = profiles::adopt_default(root, &profile.id) {
++        eprintln!("Cannot make the account the default: {e}");
++    }
++    Ok(profile)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use xodus::models::secrets::{Token, User};
++
++    fn signed_in(tokens: &TokenManager, puid: &str) {
++        tokens
++            .save_user(&User {
++                puid: puid.into(),
++                username: "offline fixture".into(),
++            })
++            .unwrap();
++        tokens
++            .save_user_token(
++                xodus::tokens::PASSPORT_STS.into(),
++                Token::Compact("offline fixture".into()),
++            )
++            .unwrap();
++    }
++
++    #[test]
++    fn a_failed_sign_in_leaves_no_credentials_behind() {
++        let tokens = TokenManager::with_memory()
++            .scoped("0123456789abcdef0123456789abcdef")
++            .unwrap();
++        signed_in(&tokens, "orphan-fixture");
++        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            let _pending = Uncommitted {
++                tokens: &tokens,
++                committed: false,
++            };
++            panic!("simulated Xbox identity failure");
++        }));
++        assert!(result.is_err());
++        assert!(tokens.get_user().is_err());
++        assert!(tokens.get_user_sts_token().is_err());
++
++        signed_in(&tokens, "kept-fixture");
++        drop(Uncommitted {
++            tokens: &tokens,
++            committed: true,
++        });
++        assert_eq!(tokens.get_user().unwrap().puid, "kept-fixture");
++    }
++
++    #[test]
++    fn the_first_account_added_is_the_default_and_a_repeat_sign_in_reuses_it() {
++        let root = std::env::temp_dir().join(format!("xodus-add-{}", uuid::Uuid::new_v4()));
++        let backend = TokenManager::with_memory();
++        let first = "0123456789abcdef0123456789abcdef";
++        let tokens = backend.scoped(first).unwrap();
++        signed_in(&tokens, "player-fixture");
++        let profile = commit(&root, &tokens, first, "player-fixture", "Fixture").unwrap();
++        assert_eq!(profile.id, first);
++        assert_eq!(profiles::default_id(&root).unwrap().as_deref(), Some(first));
++        assert_eq!(manager_id(&root), Some(first.to_owned()));
++
++        // Signing in to the same account again refreshes the profile it has.
++        let again = "fedcba9876543210fedcba9876543210";
++        let retry = backend.scoped(again).unwrap();
++        signed_in(&retry, "player-fixture");
++        let profile = commit(&root, &retry, again, "player-fixture", "Renamed").unwrap();
++        assert_eq!(profile.id, first);
++        assert_eq!(profile.label, "Renamed");
++        assert_eq!(profiles::list(&root).unwrap().len(), 1);
++        std::fs::remove_dir_all(root).unwrap();
++    }
++
++    fn manager_id(root: &Path) -> Option<String> {
++        profiles::select(root, None).unwrap()
+     }
+ }
+diff --git a/crates/xodus-cli/src/commands/xblcheck.rs b/crates/xodus-cli/src/commands/xblcheck.rs
+index 4c0e12c..6bdc233 100644
+--- a/crates/xodus-cli/src/commands/xblcheck.rs
++++ b/crates/xodus-cli/src/commands/xblcheck.rs
+@@ -191,7 +191,13 @@ pub async fn run(
+         }
+     };
+     let xuid = plain.xuid().unwrap_or_default().to_string();
+-    let plain_auth = xodus::api::xbox::get_xsts_auth_header(plain);
++    let plain_auth = match super::collections::auth_header(plain) {
++        Ok(auth) => auth,
++        Err(message) => {
++            eprintln!("!! {message}");
++            return ExitCode::FAILURE;
++        }
++    };
+ 
+     let mut failed = 0;
+     for probe in UNCLAIMED {
+@@ -218,8 +224,8 @@ pub async fn run(
+     // The claim itself. A failure here is the interesting one, and it is the
+     // failure a title reports as "failed to create party".
+     let claimed = title_claim_xsts(client, tokens, &identity).await;
+-    let claimed_auth = match claimed {
+-        Ok(xsts) => xodus::api::xbox::get_xsts_auth_header(xsts),
++    let claimed_auth = match claimed.and_then(super::collections::auth_header) {
++        Ok(auth) => auth,
+         Err(message) => {
+             eprintln!(
+                 "!! could not mint a token claiming title {}: {message}",
+@@ -270,10 +276,11 @@ pub async fn run(
+ 
+ fn first_line(body: &str) -> String {
+     let line = body.lines().next().unwrap_or_default().trim();
+-    if line.len() > 120 {
+-        format!("{}...", &line[..120])
+-    } else {
+-        line.to_string()
++    // At most 120 characters, cut on a character: a byte offset can land
++    // inside a non-ASCII character of a localised error body and panic.
++    match line.char_indices().nth(120) {
++        Some((end, _)) => format!("{}...", &line[..end]),
++        None => line.to_string(),
+     }
+ }
+ 
+@@ -281,6 +288,16 @@ fn first_line(body: &str) -> String {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn a_long_non_ascii_response_line_is_shortened_without_splitting_a_character() {
++        // Byte 120 falls inside the 60th "é": slicing there panicked.
++        let body = format!("a{}\nsecond line", "é".repeat(200));
++        let line = first_line(&body);
++        assert_eq!(line, format!("a{}...", "é".repeat(119)));
++        assert_eq!(first_line(&"a".repeat(120)), "a".repeat(120));
++        assert_eq!(first_line("  short  \nrest"), "short");
++    }
++
+     #[test]
+     fn a_game_config_yields_the_pair_xbox_mints_a_claim_from() {
+         let dir = tempfile::tempdir().expect("tempdir");
+diff --git a/crates/xodus-cli/src/main.rs b/crates/xodus-cli/src/main.rs
+index a6ade67..613d053 100644
+--- a/crates/xodus-cli/src/main.rs
++++ b/crates/xodus-cli/src/main.rs
+@@ -237,9 +237,11 @@ async fn main() -> ExitCode {
+     {
+         registry.init();
+     }
++    // No connection_verbose: it logs the decrypted traffic, Authorization
++    // headers and token bodies included, at trace level, and XODUS_LOG=trace
++    // is what an issue report asks for.
+     let client = reqwest::ClientBuilder::new()
+         .user_agent(format!("xodus-cli/{}", env!("CARGO_PKG_VERSION")))
+-        .connection_verbose(true)
+         .build()
+         .unwrap();
+     let args = CliArgs::parse();
+diff --git a/crates/xodus-cli/src/webview.rs b/crates/xodus-cli/src/webview.rs
+index e581d24..ef91aa9 100644
+--- a/crates/xodus-cli/src/webview.rs
++++ b/crates/xodus-cli/src/webview.rs
+@@ -155,6 +155,84 @@ pub fn finalize_request(url: String) -> WebviewRequest {
+     WebviewRequest::new("Xodus login", url, HeaderMap::new())
+ }
+ 
++/// Origins whose pages may talk to the sign-in host. The IPC bridge hands
++/// over the account's tokens, so a page from anywhere else -- an ad, a help
++/// link, a redirect the sign-in flow did not intend -- must not reach it.
++const IPC_ORIGINS: [&str; 2] = ["login.live.com", "login.microsoftonline.com"];
++
++/// Domains the sign-in window may navigate to: Microsoft account pages, their
++/// CDNs, and the challenge provider the sign-in pages embed. Nothing else, and
++/// nothing but https, so the window cannot be turned into a general browser
++/// that still holds the bridge.
++const NAVIGATION_DOMAINS: [&str; 8] = [
++    "live.com",
++    "microsoftonline.com",
++    "microsoft.com",
++    "msauth.net",
++    "msftauth.net",
++    "live.net",
++    "xboxlive.com",
++    "arkoselabs.com",
++];
++
++fn https_host(url: &str) -> Option<String> {
++    let uri: wry::http::Uri = url.parse().ok()?;
++    if uri.scheme_str() != Some("https") {
++        return None;
++    }
++    let authority = uri.authority()?;
++    if authority.as_str().contains('@') || authority.port().is_some_and(|p| p.as_u16() != 443) {
++        return None;
++    }
++    Some(authority.host().to_ascii_lowercase())
++}
++
++/// Whether a bridge message came from a Microsoft sign-in page.
++fn trusted_ipc_origin(url: &str) -> bool {
++    https_host(url).is_some_and(|host| IPC_ORIGINS.contains(&host.as_str()))
++}
++
++/// Whether the sign-in window may load `url`.
++fn allowed_navigation(url: &str) -> bool {
++    if matches!(url, "about:blank" | "about:srcdoc") {
++        return true;
++    }
++    https_host(url).is_some_and(|host| {
++        NAVIGATION_DOMAINS.iter().any(|domain| {
++            host == *domain
++                || host
++                    .strip_suffix(domain)
++                    .is_some_and(|rest| rest.ends_with('.'))
++        })
++    })
++}
++
++/// The script that answers the bridge's getContext call. `context` comes from
++/// the page, so it is embedded as a JSON value, never spliced into the source.
++fn host_context_script(context: &str) -> String {
++    let message = serde_json::json!({
++        "type": "callback",
++        "value": {
++            "name": "CloudExperienceHost.getContext",
++            "args": [
++                "CloudExperienceHost",
++                "TokenBroker",
++                "TokenBroker",
++                r#"{"PrivatePropertyBag":1,"PasswordlessConnect":1,"PreferAssociate":1,"ChromelessUI":0}"#
++            ],
++            "context": context,
++        }
++    });
++    // The JSON text of the message is itself passed as a string, as the bridge
++    // expects. U+2028 and U+2029 are valid in JSON but end a line in older
++    // JavaScript, so they are escaped too.
++    let argument = serde_json::to_string(&message.to_string())
++        .unwrap_or_default()
++        .replace('\u{2028}', "\\u2028")
++        .replace('\u{2029}', "\\u2029");
++    format!(r#"window["CloudExperienceHost.Bridge.dispatchMessage"]({argument})"#)
++}
++
+ pub fn run_sessions<T>(handler: T) -> HandlerResult<Option<T::Output>>
+ where
+     T: SessionHandler,
+@@ -187,13 +265,9 @@ where
+                 session_id,
+                 request,
+             }) => {
+-                if let Err(err) = create_session(
+-                    target,
+-                    proxy.clone(),
+-                    &mut state,
+-                    session_id,
+-                    request,
+-                ) {
++                if let Err(err) =
++                    create_session(target, proxy.clone(), &mut state, session_id, request)
++                {
+                     state.error = Some(err.to_string());
+                 }
+             }
+@@ -201,23 +275,21 @@ where
+                 if state.active_session == Some(session_id)
+                     && let Some(webview) = state.active_webview.as_ref()
+                 {
+-                    let _ = webview.evaluate_script("window.ipc.postMessage(JSON.stringify(ServerData))");
++                    let _ = webview
++                        .evaluate_script("window.ipc.postMessage(JSON.stringify(ServerData))");
+                 }
+             }
+             Event::UserEvent(CustomEvent::HostGetContext(session_id, ctx)) => {
+                 if state.active_session == Some(session_id)
+                     && let Some(webview) = state.active_webview.as_ref()
+                 {
+-                    let _ = webview.evaluate_script(&format!(r#"window["CloudExperienceHost.Bridge.dispatchMessage"](JSON.stringify({{"type": "callback", "value": {{ "name": "CloudExperienceHost.getContext", "args": ["CloudExperienceHost", "TokenBroker", "TokenBroker", "{{\"PrivatePropertyBag\":1,\"PasswordlessConnect\":1,\"PreferAssociate\":1,\"ChromelessUI\":0}}"], "context": "{ctx}"}}}}))"#));
++                    let _ = webview.evaluate_script(&host_context_script(&ctx));
+                 }
+             }
+             Event::UserEvent(CustomEvent::IpcCallback(session_id, data)) => {
+-                apply_handler_result(
+-                    &proxy,
+-                    target,
+-                    &mut state,
+-                    move |handler, runtime| handler.on_token(session_id, data, runtime),
+-                );
++                apply_handler_result(&proxy, target, &mut state, move |handler, runtime| {
++                    handler.on_token(session_id, data, runtime)
++                });
+             }
+             Event::WindowEvent {
+                 event: WindowEvent::CloseRequested,
+@@ -345,7 +417,18 @@ fn create_session<T: SessionHandler>(
+             .with_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64; MSAppHost/3.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36 Edge/18.26100")
+             .with_headers(request.headers)
+             .with_initialization_script("window.external = {notify: window.ipc.postMessage }")
++            .with_navigation_handler(|url| {
++                let allowed = allowed_navigation(&url);
++                if !allowed {
++                    eprintln!("Sign-in window: blocked navigation away from Microsoft sign-in");
++                }
++                allowed
++            })
+             .with_ipc_handler(move |request| {
++                if !trusted_ipc_origin(&request.uri().to_string()) {
++                    eprintln!("Ignoring a sign-in bridge message from outside Microsoft sign-in");
++                    return;
++                }
+                 let body = request.body();
+                 let payload = serde_json::from_str::<DAProperty>(body);
+                 if let Ok(data) = payload {
+@@ -376,7 +459,9 @@ fn create_session<T: SessionHandler>(
+                 }
+             })
+             .with_on_page_load_handler(move |event, url| {
+-                if matches!(event, PageLoadEvent::Finished) && url.starts_with("https://login.live.com/ppsecure/post.srf")
++                if matches!(event, PageLoadEvent::Finished)
++                    && https_host(&url).as_deref() == Some("login.live.com")
++                    && url.starts_with("https://login.live.com/ppsecure/post.srf")
+                 {
+                     proxy.send_event(CustomEvent::Finish(session_id)).ok();
+                 }
+@@ -402,3 +487,71 @@ fn remove_session<T: SessionHandler>(state: &mut RuntimeState<T>, session_id: Se
+         state.active_webview = None;
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn only_microsoft_sign_in_pages_reach_the_bridge() {
++        assert!(trusted_ipc_origin(
++            "https://login.live.com/ppsecure/post.srf?x=1"
++        ));
++        assert!(trusted_ipc_origin(
++            "https://LOGIN.microsoftonline.com/common"
++        ));
++        for url in [
++            "http://login.live.com/",
++            "https://login.live.com.example.test/",
++            "https://login.live.com@example.test/",
++            "https://evil-login.live.com/",
++            "https://account.live.com/",
++            "https://login.live.com:8443/",
++            "file:///login.live.com",
++            "",
++        ] {
++            assert!(!trusted_ipc_origin(url), "{url}");
++        }
++    }
++
++    #[test]
++    fn navigation_stays_on_microsoft_sign_in_domains() {
++        for url in [
++            "https://login.live.com/oauth20_authorize.srf",
++            "https://account.live.com/proofs/Add",
++            "https://logincdn.msauth.net/shared/1.0/content/js/x.js",
++            "https://client-api.arkoselabs.com/fc/gt2/",
++            "about:blank",
++        ] {
++            assert!(allowed_navigation(url), "{url}");
++        }
++        for url in [
++            "http://login.live.com/",
++            "https://example.test/",
++            "https://notlive.com/",
++            "https://live.com.example.test/",
++            "javascript:alert(1)",
++            "data:text/html,x",
++        ] {
++            assert!(!allowed_navigation(url), "{url}");
++        }
++    }
++
++    #[test]
++    fn a_page_supplied_context_cannot_escape_its_string() {
++        let hostile = "x\"}}));alert(1);//\u{2028}";
++        let script = host_context_script(hostile);
++        let prefix = r#"window["CloudExperienceHost.Bridge.dispatchMessage"]("#;
++        let argument = script
++            .strip_prefix(prefix)
++            .and_then(|s| s.strip_suffix(')'))
++            .unwrap();
++        // The argument is one JSON string literal, which decodes to the
++        // message, whose context is the page's value unchanged.
++        let text: String = serde_json::from_str(argument).unwrap();
++        let message: serde_json::Value = serde_json::from_str(&text).unwrap();
++        assert_eq!(message["value"]["context"], hostile);
++        assert_eq!(message["value"]["name"], "CloudExperienceHost.getContext");
++        assert!(!script.contains('\u{2028}'));
++    }
++}
+diff --git a/crates/xodus-service/src/connection/catalog.rs b/crates/xodus-service/src/connection/catalog.rs
+index 046fa4e..d99c5d6 100644
+--- a/crates/xodus-service/src/connection/catalog.rs
++++ b/crates/xodus-service/src/connection/catalog.rs
+@@ -56,7 +56,9 @@ fn parse_request(bytes: &[u8]) -> Result<Request, Error> {
+     }
+     let mode = r.integer()?;
+     let kinds = r.integer()?;
+-    let parent = r.text()?;
++    // Store IDs are case-insensitive and the catalog answers in upper case,
++    // so compare and ask in upper case whatever case the title passed.
++    let parent = r.text()?.to_ascii_uppercase();
+     let market = r.text()?;
+     let language = r.text()?;
+     if mode > 1
+@@ -79,7 +81,7 @@ fn parse_request(bytes: &[u8]) -> Result<Request, Error> {
+     }
+     let mut ids = Vec::new();
+     for _ in 0..count {
+-        let id = r.text()?;
++        let id = r.text()?.to_ascii_uppercase();
+         if !valid_id(&id) {
+             return Err("invalid catalog ID");
+         }
+@@ -464,7 +466,10 @@ async fn fetch(req: &Request) -> Result<Vec<u8>, Error> {
+             .as_array()
+             .ok_or("missing catalog products")?;
+         for p in products {
+-            if !ids.contains(&string(p, "ProductId")) {
++            if !ids
++                .iter()
++                .any(|id| id.eq_ignore_ascii_case(string(p, "ProductId")))
++            {
+                 return Err("unexpected catalog product");
+             }
+             if product(&mut out, p, req)? {
+@@ -543,6 +548,27 @@ mod tests {
+         req.ids = vec!["9TESTADDON000011".into()];
+         assert!(!product(&mut Vec::new(), &p, &req).unwrap());
+     }
++    #[test]
++    fn lowercase_store_ids_match_the_catalog_answer() {
++        let mut b = vec![];
++        integer(&mut b, 1);
++        integer(&mut b, 0);
++        integer(&mut b, 31);
++        for s in ["9testparent0", "US", "en-US"] {
++            text(&mut b, s).unwrap();
++        }
++        integer(&mut b, 1);
++        text(&mut b, "9testaddon000010").unwrap();
++        integer(&mut b, 0);
++        let req = parse_request(&b).unwrap();
++        assert_eq!(req.parent, "9TESTPARENT0");
++        assert_eq!(req.ids, ["9TESTADDON000010"]);
++        // The catalog echoes the canonical upper-case ID; the SKU asked for in
++        // lower case still selects its SKU.
++        let p = serde_json::json!({"ProductId":"9TESTADDON00","ProductKind":"Durable","LocalizedProperties":[{"ProductTitle":"t","ProductDescription":"d","Language":"en-US"}],"DisplaySkuAvailabilities":[{"Sku":{"SkuId":"0010","Properties":{}},"Availabilities":[{"AvailabilityId":"a","Actions":["Purchase"],"OrderManagementData":{"Price":{"MSRP":1.0,"ListPrice":1.0,"CurrencyCode":"USD"}}}]}]});
++        assert!(product(&mut Vec::new(), &p, &req).unwrap());
++    }
++
+     #[test]
+     fn request_is_versioned_and_rejects_paths_and_trailing_data() {
+         let mut b = vec![];
+diff --git a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/src/connection/xml.rs
+index 9fe5c82..645764c 100644
+--- a/crates/xodus-service/src/connection/xml.rs
++++ b/crates/xodus-service/src/connection/xml.rs
+@@ -9,7 +9,7 @@ use xodus::models::live::ExchangeUserTokenOutcome;
+ use xodus::models::secrets::Token;
+ use xodus::models::soap;
+ use xodus::models::xgameruntime::xuser::{
+-    MSATokenRequest, MSATokenResponse, XSTSTokenRequest, XSTSTokenResponse,
++    MSATokenRequest, MSATokenResponse, XSTSRefreshHint, XSTSTokenRequest, XSTSTokenResponse,
+ };
+ use xodus::proto::xodus::XodusMessageType;
+ 
+@@ -415,6 +415,7 @@ fn licensing_audience_gate(
+     ))
+ }
+ 
++#[cfg(test)]
+ pub(super) async fn xsts_token(
+     context: &mut SimpleContext,
+     req: XSTSTokenRequest,
+@@ -426,6 +427,52 @@ pub(super) async fn xsts_token_for(
+     context: &mut SimpleContext,
+     req: XSTSTokenRequest,
+     caller: Caller,
++) -> Result<XSTSTokenResponse, Box<dyn std::error::Error + Send + Sync>> {
++    xsts_token_with(context, req, caller, false).await
++}
++
++/// The runtime's `ForceRefresh` flag, read from the same request. A title sets
++/// it after a service rejected the token it was given, and only a new token
++/// helps then.
++fn force_refresh_requested(xml: &str) -> bool {
++    quick_xml::de::from_str::<XSTSRefreshHint>(xml)
++        .map(|hint| hint.force_refresh)
++        .unwrap_or(false)
++}
++
++/// When each cache key was last re-minted on a title's request. A title that
++/// asks for a refresh on every call would otherwise run the whole sign-in
++/// chain per request; within this window it gets the token just minted.
++static FORCED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, i64>>> =
++    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
++const FORCED_REFRESH_INTERVAL: i64 = 30;
++
++/// The cached token for `key`, unless it is about to expire or the title asked
++/// for a new one and none was minted on request in the last
++/// `FORCED_REFRESH_INTERVAL` seconds.
++fn cached_token_for(key: &str, now: i64, force_refresh: bool) -> Option<CachedToken> {
++    if force_refresh {
++        let mut forced = FORCED.lock().ok()?;
++        if forced
++            .get(key)
++            .is_none_or(|at| now - *at >= FORCED_REFRESH_INTERVAL)
++        {
++            forced.insert(key.to_owned(), now);
++            return None;
++        }
++    }
++    XSTS_CACHE
++        .lock()
++        .ok()
++        .and_then(|c| c.get(key).cloned())
++        .filter(|c| c.expiry > now + 60)
++}
++
++async fn xsts_token_with(
++    context: &mut SimpleContext,
++    req: XSTSTokenRequest,
++    caller: Caller,
++    force_refresh: bool,
+ ) -> Result<XSTSTokenResponse, Box<dyn std::error::Error + Send + Sync>> {
+     tracing::debug!("XSTS token request for {}", req.url);
+ 
+@@ -505,12 +552,7 @@ pub(super) async fn xsts_token_for(
+     }
+     let cache_key = token_cache_key(&session, title.as_ref(), &relying_party, &issuer);
+     let now = chrono::Utc::now().timestamp();
+-    if let Some(hit) = XSTS_CACHE
+-        .lock()
+-        .ok()
+-        .and_then(|c| c.get(&cache_key).cloned())
+-        .filter(|c| c.expiry > now + 60)
+-    {
++    if let Some(hit) = cached_token_for(&cache_key, now, force_refresh) {
+         let signature = sign_for_with(&req, &hit.token, &endpoints, &hit.signer);
+         let payload = XSTSTokenResponse {
+             token: hit.token,
+@@ -744,8 +786,10 @@ pub async fn parse_message(
+             }
+         }
+         XodusMessageType::XstsTokenRequest => {
+-            let req = quick_xml::de::from_str::<XSTSTokenRequest>(std::str::from_utf8(&buffer)?)?;
+-            let payload = xsts_token(context, req).await?;
++            let xml = std::str::from_utf8(&buffer)?;
++            let req = quick_xml::de::from_str::<XSTSTokenRequest>(xml)?;
++            let payload =
++                xsts_token_with(context, req, Caller::Title, force_refresh_requested(xml)).await?;
+             Ok(quick_xml::se::to_string(&payload)?.into_bytes())
+         }
+         XodusMessageType::LicenseTokenRequest => {
+@@ -773,13 +817,77 @@ pub async fn parse_message(
+ #[path = "xml_tests.rs"]
+ mod tests;
+ 
++#[cfg(test)]
++mod refresh_tests {
++    use super::*;
++
++    #[test]
++    fn the_force_refresh_flag_is_optional_on_the_wire() {
++        let request = |extra: &str| {
++            format!(
++                "<XSTSTokenRequest><Url>https://xboxlive.com</Url><RelyingParty></RelyingParty><Method>GET</Method>{extra}<BodyBase64></BodyBase64></XSTSTokenRequest>"
++            )
++        };
++        assert!(!force_refresh_requested(&request("")));
++        assert!(force_refresh_requested(&request(
++            "<ForceRefresh>true</ForceRefresh>"
++        )));
++        assert!(force_refresh_requested(&request(
++            "<ForceRefresh>1</ForceRefresh>"
++        )));
++        assert!(!force_refresh_requested(&request(
++            "<ForceRefresh>false</ForceRefresh>"
++        )));
++        // The request itself still parses with the flag present.
++        let parsed = quick_xml::de::from_str::<XSTSTokenRequest>(&request(
++            "<ForceRefresh>true</ForceRefresh>",
++        ))
++        .unwrap();
++        assert_eq!(parsed.url, "https://xboxlive.com");
++    }
++
++    #[test]
++    fn a_forced_refresh_skips_the_cache_once_per_interval() {
++        let key = format!("refresh-test-{:?}", std::time::Instant::now());
++        let now = 1_900_000_000;
++        XSTS_CACHE.lock().unwrap().insert(
++            key.clone(),
++            CachedToken {
++                signer: SIGNER.clone(),
++                token: "cached-fixture".into(),
++                xuid: String::new(),
++                gamertag: String::new(),
++                expiry: now + 3600,
++            },
++        );
++        assert!(cached_token_for(&key, now, false).is_some());
++        assert!(
++            cached_token_for(&key, now, true).is_none(),
++            "first forced refresh re-mints"
++        );
++        assert!(
++            cached_token_for(&key, now + 5, true).is_some(),
++            "a second one within the interval gets the token just minted"
++        );
++        assert!(cached_token_for(&key, now + FORCED_REFRESH_INTERVAL, true).is_none());
++        assert!(cached_token_for(&key, now, false).is_some());
++    }
++}
++
+ #[cfg(test)]
+ mod framing_tests {
+     use super::*;
+-    async fn decode(kind: u16, marker: u16, length: Option<u32>, payload: &[u8]) -> std::io::Result<(XodusMessageType, Vec<u8>)> {
++    async fn decode(
++        kind: u16,
++        marker: u16,
++        length: Option<u32>,
++        payload: &[u8],
++    ) -> std::io::Result<(XodusMessageType, Vec<u8>)> {
+         let mut wire = kind.to_le_bytes().to_vec();
+         wire.extend(marker.to_le_bytes());
+-        if let Some(length) = length { wire.extend(length.to_le_bytes()); }
++        if let Some(length) = length {
++            wire.extend(length.to_le_bytes());
++        }
+         wire.extend(payload);
+         read_request(&mut wire.as_slice()).await
+     }
+diff --git a/crates/xodus-service/src/main.rs b/crates/xodus-service/src/main.rs
+index 6d76caf..552d984 100644
+--- a/crates/xodus-service/src/main.rs
++++ b/crates/xodus-service/src/main.rs
+@@ -18,6 +18,18 @@ mod utils;
+ const XML_MAGIC: u32 = 0x58445358;
+ const PROTO_MAGIC: u32 = 0x58445350;
+ 
++/// How long to wait after a failed accept before the next one. Out of file
++/// descriptors or memory, accepting again at once would only fail again in a
++/// tight loop; the pause lets connections close. Anything else is one bad
++/// connection and costs a token pause.
++fn accept_backoff(error: &std::io::Error) -> std::time::Duration {
++    // EMFILE, ENFILE, ENOBUFS and ENOMEM on Linux.
++    match error.raw_os_error() {
++        Some(24 | 23 | 105 | 12) => std::time::Duration::from_millis(500),
++        _ => std::time::Duration::from_millis(10),
++    }
++}
++
+ #[tokio::main]
+ async fn main() {
+     if std::env::args().any(|arg| arg == "--capabilities") {
+@@ -56,14 +68,19 @@ async fn main() {
+ 
+     xodus::secrets::init_secrets().expect("Failed to init keychain");
+     let root = xodus::profiles::root().expect("Account profile directory unavailable");
+-    let default = xodus::profiles::default_id(&root).expect("Invalid default account profile");
+     let select = |role: &str| {
+-        let id = std::env::var(role).ok().or_else(|| default.clone());
+-        match id {
+-            Some(id) => {
+-                xodus::profiles::load(&root, &id).expect("Selected account profile is unavailable");
+-                TokenManager::for_profile(&id).expect("Invalid account profile")
++        let requested = std::env::var(role).ok().filter(|id| !id.is_empty());
++        // The legacy, unscoped sign-in only while no profile exists at all;
++        // once one does, an unnamed role is the default or an error.
++        let id = match xodus::profiles::select(&root, requested.as_deref()) {
++            Ok(id) => id,
++            Err(e) => {
++                eprintln!("{role}: {e}");
++                std::process::exit(1);
+             }
++        };
++        match id {
++            Some(id) => TokenManager::for_profile(&id).expect("Invalid account profile"),
+             None => TokenManager::with_keychain_and_memory(),
+         }
+         .pin_user()
+@@ -105,8 +122,19 @@ async fn main() {
+             let accept = tokio::select! {
+                 r = listener.accept() => r,
+                 _ = cancellation.cancelled() => break,
+-            }
+-            .expect("Failed to accept");
++            };
++            // A failed accept is one connection lost, never the service: every
++            // running title depends on it for sign-in and licences.
++            let accept = match accept {
++                Ok(accept) => accept,
++                Err(e) => {
++                    tracing::warn!("accept failed: {e}");
++                    tokio::select! {
++                        _ = tokio::time::sleep(accept_backoff(&e)) => continue,
++                        _ = cancellation.cancelled() => break,
++                    }
++                }
++            };
+ 
+             let token = cancellation.clone();
+             let device_token = device_token.clone();
+@@ -131,3 +159,17 @@ async fn main() {
+ 
+     _ = tokio::fs::remove_file(socket_path).await;
+ }
++
++#[cfg(test)]
++mod tests {
++    #[test]
++    fn a_failed_accept_backs_off_instead_of_ending_the_service() {
++        let too_many_files = std::io::Error::from_raw_os_error(24);
++        assert_eq!(
++            super::accept_backoff(&too_many_files),
++            std::time::Duration::from_millis(500)
++        );
++        let aborted = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
++        assert!(super::accept_backoff(&aborted) < std::time::Duration::from_millis(100));
++    }
++}
+diff --git a/crates/xodus-service/src/simple_context.rs b/crates/xodus-service/src/simple_context.rs
+index fb2d176..f6d2d2c 100644
+--- a/crates/xodus-service/src/simple_context.rs
++++ b/crates/xodus-service/src/simple_context.rs
+@@ -5,6 +5,17 @@ use std::sync::Arc;
+ use xodus::models::secrets::LegacyToken;
+ use xodus::tokens::TokenManager;
+ 
++/// One HTTP client for every connection, so they share its connection pool.
++/// Never built with connection_verbose: that logs the decrypted traffic, with
++/// XBL3.0 Authorization headers, Signature headers and SOAP token bodies, to
++/// the service log whenever trace logging is on.
++static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
++    reqwest::ClientBuilder::new()
++        .user_agent(format!("xodus-service/{}", env!("CARGO_PKG_VERSION")))
++        .build()
++        .expect("HTTP client")
++});
++
+ pub struct SimpleContext {
+     pub entitlement: Option<Arc<crate::entitlement::Entitlement>>,
+     /// The title this service was started for, when the launcher said.
+@@ -94,14 +105,8 @@ impl SimpleContext {
+         store_tokens: Arc<TokenManager>,
+         tokens: Arc<TokenManager>,
+     ) -> Self {
+-        let client = reqwest::ClientBuilder::new()
+-            .user_agent(format!("xodus-service/{}", env!("CARGO_PKG_VERSION")))
+-            .connection_verbose(true)
+-            .build()
+-            .unwrap();
+-
+         Self {
+-            client,
++            client: CLIENT.clone(),
+             entitlement: None,
+             title: None,
+             device_token: Some(device_token),
+diff --git a/crates/xodus/src/models/xgameruntime/xuser.rs b/crates/xodus/src/models/xgameruntime/xuser.rs
+index 07515ff..a99312b 100644
+--- a/crates/xodus/src/models/xgameruntime/xuser.rs
++++ b/crates/xodus/src/models/xgameruntime/xuser.rs
+@@ -46,6 +46,18 @@ pub struct XSTSTokenRequest {
+     pub title_client_id: String,
+ }
+ 
++/// The optional `<ForceRefresh>true</ForceRefresh>` element of an
++/// `XSTSTokenRequest`: the title's `XUserGetTokenAndSignatureOptions::
++/// ForceRefresh`, sent after a service rejected the token it was given. Read
++/// on its own so that the request type, and every older runtime that never
++/// sends it, stay as they are; an older service ignores the element.
++#[derive(Deserialize, Default)]
++#[serde(rename_all = "PascalCase")]
++pub struct XSTSRefreshHint {
++    #[serde(default)]
++    pub force_refresh: bool,
++}
++
+ impl XSTSTokenRequest {
+     /// The title this request is on behalf of, when it named one.
+     pub fn title(&self) -> Option<(i64, &str)> {
+diff --git a/crates/xodus/src/profiles.rs b/crates/xodus/src/profiles.rs
+index d507937..9b85d10 100644
+--- a/crates/xodus/src/profiles.rs
++++ b/crates/xodus/src/profiles.rs
+@@ -126,9 +126,9 @@ fn atomic(root: &Path, dest: &Path, bytes: &[u8]) -> Result<(), TokenStoreError>
+     result
+ }
+ 
+-/// Copy both legacy entries before publishing the default. An interrupted copy
+-/// is retryable, and the original entries remain available to older launchers.
+-pub fn migrate(root: &Path, legacy: &TokenManager) -> Result<Option<Profile>, TokenStoreError> {
++/// Serialises everything that publishes `default`: migration, a new sign-in
++/// and adopting the only profile there is.
++fn lock(root: &Path) -> Result<std::fs::File, TokenStoreError> {
+     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+     std::fs::DirBuilder::new()
+         .recursive(true)
+@@ -142,17 +142,80 @@ pub fn migrate(root: &Path, legacy: &TokenManager) -> Result<Option<Profile>, To
+         .mode(0o600)
+         .open(root.join(".migration-lock"))?;
+     lock.lock()?;
++    Ok(lock)
++}
++
++/// Make `id` the default account unless one is already set, and return the
++/// default that holds afterwards. A first sign-in on a fresh install is the
++/// only account there is, and until it is the default every command that is
++/// not told which account to use would fall back to the empty legacy keychain.
++pub fn adopt_default(root: &Path, id: &str) -> Result<String, TokenStoreError> {
++    let _lock = lock(root)?;
++    if let Some(current) = default_id(root)? {
++        return Ok(current);
++    }
++    load(root, id)?;
++    atomic(root, &root.join("default"), id.as_bytes())?;
++    Ok(id.to_owned())
++}
++
++/// With no default and no legacy sign-in, a lone profile is the default by
++/// any reading; several are a choice only the user can make. The caller holds
++/// the lock.
++fn adopt_sole_profile(root: &Path) -> Result<Option<Profile>, TokenStoreError> {
++    let mut profiles = list(root)?;
++    if profiles.len() != 1 {
++        return Ok(None);
++    }
++    let profile = profiles.remove(0);
++    atomic(root, &root.join("default"), profile.id.as_bytes())?;
++    Ok(Some(profile))
++}
++
++/// Which account a command runs as when it was not told: the default, else
++/// the only profile there is, else (with no profiles at all) the legacy
++/// unscoped sign-in, returned as `None`. Once any profile exists the legacy
++/// keychain is never used by accident: with several profiles and no default
++/// this is an error that says so, not a silent switch to another identity.
++pub fn select(root: &Path, requested: Option<&str>) -> Result<Option<String>, TokenStoreError> {
++    if let Some(id) = requested {
++        load(root, id)?;
++        return Ok(Some(id.to_owned()));
++    }
++    if let Some(id) = default_id(root)? {
++        return Ok(Some(id));
++    }
++    if list(root)?.is_empty() {
++        return Ok(None);
++    }
++    let _lock = lock(root)?;
++    if let Some(id) = default_id(root)? {
++        return Ok(Some(id));
++    }
++    match adopt_sole_profile(root)? {
++        Some(profile) => Ok(Some(profile.id)),
++        None => Err(std::io::Error::other(
++            "several accounts are signed in and none is the default; choose one in Accounts",
++        )
++        .into()),
++    }
++}
++
++/// Copy both legacy entries before publishing the default. An interrupted copy
++/// is retryable, and the original entries remain available to older launchers.
++pub fn migrate(root: &Path, legacy: &TokenManager) -> Result<Option<Profile>, TokenStoreError> {
++    let _lock = lock(root)?;
+     if let Some(id) = default_id(root)? {
+         return Ok(Some(load(root, &id)?));
+     }
+     let user = match legacy.get_user() {
+         Ok(user) => user,
+-        Err(TokenStoreError::NotFound) => return Ok(None),
++        Err(TokenStoreError::NotFound) => return adopt_sole_profile(root),
+         Err(error) => return Err(error),
+     };
+     match legacy.get_user_sts_token() {
+         Ok(_) => {}
+-        Err(TokenStoreError::NotFound) => return Ok(None),
++        Err(TokenStoreError::NotFound) => return adopt_sole_profile(root),
+         Err(error) => return Err(error),
+     }
+     // If the credentials/profile were already copied before a crash, commit
+@@ -215,4 +278,69 @@ mod tests {
+         );
+         std::fs::remove_dir_all(root).unwrap();
+     }
++
++    fn fixture(root: &Path, id: &str, label: &str) -> Profile {
++        let profile = Profile {
++            id: id.into(),
++            label: label.into(),
++            legacy_saves: false,
++            save_namespace: save_namespace(label),
++        };
++        save(root, &profile).unwrap();
++        profile
++    }
++
++    const FIRST: &str = "0123456789abcdef0123456789abcdef";
++    const SECOND: &str = "fedcba9876543210fedcba9876543210";
++
++    #[test]
++    fn the_first_account_on_a_fresh_install_becomes_the_default() {
++        let root = std::env::temp_dir().join(format!("xodus-profiles-{}", uuid::Uuid::new_v4()));
++        assert!(adopt_default(&root, "../elsewhere").is_err());
++        assert!(
++            adopt_default(&root, FIRST).is_err(),
++            "only a saved profile can be the default"
++        );
++        fixture(&root, FIRST, "First fixture");
++        assert_eq!(adopt_default(&root, FIRST).unwrap(), FIRST);
++        assert_eq!(default_id(&root).unwrap().as_deref(), Some(FIRST));
++        // A second sign-in never takes the default from the first.
++        fixture(&root, SECOND, "Second fixture");
++        assert_eq!(adopt_default(&root, SECOND).unwrap(), FIRST);
++        assert_eq!(default_id(&root).unwrap().as_deref(), Some(FIRST));
++        std::fs::remove_dir_all(root).unwrap();
++    }
++
++    #[test]
++    fn selection_never_falls_back_to_the_legacy_sign_in_once_profiles_exist() {
++        let root = std::env::temp_dir().join(format!("xodus-profiles-{}", uuid::Uuid::new_v4()));
++        // No profiles at all: the legacy, unscoped sign-in.
++        assert_eq!(select(&root, None).unwrap(), None);
++        // One profile and no default, as a 0.1.13 Add account left it.
++        fixture(&root, FIRST, "First fixture");
++        assert_eq!(select(&root, None).unwrap().as_deref(), Some(FIRST));
++        assert_eq!(default_id(&root).unwrap().as_deref(), Some(FIRST));
++        // Several and no default is the user's choice, and an error until made.
++        std::fs::remove_file(root.join("default")).unwrap();
++        fixture(&root, SECOND, "Second fixture");
++        assert!(select(&root, None).is_err());
++        assert_eq!(
++            select(&root, Some(SECOND)).unwrap().as_deref(),
++            Some(SECOND)
++        );
++        assert!(select(&root, Some("../elsewhere")).is_err());
++        assert!(select(&root, Some("00000000000000000000000000000009")).is_err());
++        std::fs::remove_dir_all(root).unwrap();
++    }
++
++    #[test]
++    fn migration_without_a_legacy_sign_in_adopts_a_lone_profile() {
++        let root = std::env::temp_dir().join(format!("xodus-profiles-{}", uuid::Uuid::new_v4()));
++        let legacy = TokenManager::with_memory();
++        assert_eq!(migrate(&root, &legacy).unwrap(), None);
++        let profile = fixture(&root, FIRST, "First fixture");
++        assert_eq!(migrate(&root, &legacy).unwrap(), Some(profile));
++        assert_eq!(default_id(&root).unwrap().as_deref(), Some(FIRST));
++        std::fs::remove_dir_all(root).unwrap();
++    }
+ }
+diff --git a/crates/xodus/src/secrets.rs b/crates/xodus/src/secrets.rs
+index dba6b2f..72be346 100644
+--- a/crates/xodus/src/secrets.rs
++++ b/crates/xodus/src/secrets.rs
+@@ -3,10 +3,10 @@ pub static SERVICE_NAME: &str = "Xodus Service";
+ pub fn init_secrets() -> Result<(), keyring_core::Error> {
+     #[cfg(feature = "key-chain-file")]
+     {
++        let path = secrets_backing_file()
++            .map_err(|e| keyring_core::Error::NoStorageAccess(Box::new(e)))?;
+         let store = keyring_core::sample::Store::new_with_backing(
+-            secrets_backing_file()
+-                .to_str()
+-                .expect("Invalid secrets backing path"),
++            path.to_str().expect("Invalid secrets backing path"),
+         )?;
+         keyring_core::set_default_store(store);
+     }
+@@ -43,11 +43,139 @@ pub fn destroy_secrets() {
+     keyring_core::unset_default_store();
+ }
+ 
++/// The plain-file credential store: `.xodus-keyring.ron` in the home
++/// directory, never anywhere shared. It holds refresh tokens in the clear, so
++/// with no home directory this fails rather than fall back to the temporary
++/// directory, where another user could read it or plant one first.
+ #[cfg(feature = "key-chain-file")]
+-fn secrets_backing_file() -> std::path::PathBuf {
+-    std::env::var_os("HOME")
+-        .or_else(|| std::env::var_os("USERPROFILE"))
++fn secrets_backing_file() -> std::io::Result<std::path::PathBuf> {
++    let home = home_dir(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))?;
++    private_file(&home, ".xodus-keyring.ron")
++}
++
++#[cfg(any(test, feature = "key-chain-file"))]
++fn home_dir(
++    home: Option<std::ffi::OsString>,
++    profile: Option<std::ffi::OsString>,
++) -> std::io::Result<std::path::PathBuf> {
++    home.filter(|p| !p.is_empty())
++        .or_else(|| profile.filter(|p| !cfg!(unix) && !p.is_empty()))
+         .map(std::path::PathBuf::from)
+-        .unwrap_or_else(std::env::temp_dir)
+-        .join(".xodus-keyring.ron")
++        .ok_or_else(|| {
++            std::io::Error::other("HOME is not set; refusing to keep credentials elsewhere")
++        })
++}
++
++/// Create `name` in `dir` readable by the owner only, or tighten an existing
++/// one to that, and refuse a directory someone else owns or can write to: the
++/// store library rewrites the file in place, so the file's own mode is what
++/// protects it.
++#[cfg(any(test, feature = "key-chain-file"))]
++fn private_file(dir: &std::path::Path, name: &str) -> std::io::Result<std::path::PathBuf> {
++    let path = dir.join(name);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
++        let refuse = |why: &str| {
++            Err(std::io::Error::new(
++                std::io::ErrorKind::PermissionDenied,
++                format!("{}: {why}", path.display()),
++            ))
++        };
++        let parent = std::fs::metadata(dir)?;
++        if !parent.is_dir() {
++            return refuse("its directory is not a directory");
++        }
++        if parent.mode() & 0o022 != 0 {
++            return refuse("its directory is writable by other users");
++        }
++        // Checked before opening: in a directory only this user can write,
++        // nobody can swap a link in between.
++        match std::fs::symlink_metadata(&path) {
++            Ok(meta) if !meta.file_type().is_file() => return refuse("not a regular file"),
++            Ok(_) => {}
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
++            Err(e) => return Err(e),
++        }
++        let file = std::fs::OpenOptions::new()
++            .read(true)
++            .write(true)
++            .create(true)
++            .truncate(false)
++            .mode(0o600)
++            .open(&path)?;
++        let meta = file.metadata()?;
++        // The file is ours if we just created it; the directory must be too.
++        if meta.uid() != parent.uid() {
++            return refuse("owned by another user");
++        }
++        if meta.mode() & 0o077 != 0 {
++            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
++        }
++    }
++    Ok(path)
++}
++
++#[cfg(all(test, unix))]
++mod tests {
++    use super::{home_dir, private_file};
++    use std::os::unix::fs::PermissionsExt;
++
++    #[test]
++    fn no_home_is_an_error_not_the_temporary_directory() {
++        assert!(home_dir(None, None).is_err());
++        assert!(home_dir(Some("".into()), None).is_err());
++        assert!(home_dir(None, Some("/profile".into())).is_err());
++        assert_eq!(
++            home_dir(Some("/home/fixture".into()), None).unwrap(),
++            std::path::Path::new("/home/fixture")
++        );
++    }
++
++    struct Dir(std::path::PathBuf);
++    impl Dir {
++        fn new() -> Self {
++            let path = std::env::temp_dir().join(format!("xodus-secrets-{}", uuid::Uuid::new_v4()));
++            std::fs::create_dir(&path).unwrap();
++            Dir(path)
++        }
++        fn path(&self) -> &std::path::Path {
++            &self.0
++        }
++    }
++    impl Drop for Dir {
++        fn drop(&mut self) {
++            let _ = std::fs::remove_dir_all(&self.0);
++        }
++    }
++
++    fn mode(path: &std::path::Path) -> u32 {
++        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
++    }
++
++    #[test]
++    fn the_credential_file_is_private_and_never_in_a_shared_directory() {
++        let dir = Dir::new();
++        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
++        let path = private_file(dir.path(), ".xodus-keyring.ron").unwrap();
++        assert_eq!(mode(&path), 0o600);
++
++        // An existing, readable file is tightened, and its content kept.
++        std::fs::write(&path, b"kept").unwrap();
++        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
++        private_file(dir.path(), ".xodus-keyring.ron").unwrap();
++        assert_eq!(mode(&path), 0o600);
++        assert_eq!(std::fs::read(&path).unwrap(), b"kept");
++
++        // A link planted in its place is refused, not followed.
++        let target = dir.path().join("elsewhere");
++        std::fs::write(&target, b"").unwrap();
++        std::os::unix::fs::symlink(&target, dir.path().join("linked")).unwrap();
++        assert!(private_file(dir.path(), "linked").is_err());
++
++        // So is a directory other users can write to, such as /tmp.
++        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
++        assert!(private_file(dir.path(), "shared").is_err());
++        assert!(!dir.path().join("shared").exists());
++    }
+ }
+diff --git a/crates/xodus/src/tokens/manager.rs b/crates/xodus/src/tokens/manager.rs
+index 98502ac..5f9fb05 100644
+--- a/crates/xodus/src/tokens/manager.rs
++++ b/crates/xodus/src/tokens/manager.rs
+@@ -67,6 +67,43 @@ mod profile_tests {
+         assert!(player.scoped("../owner").is_err());
+     }
+ 
++    #[test]
++    fn signing_out_a_migrated_account_removes_its_legacy_original_only() {
++        let legacy = TokenManager::with_memory();
++        legacy.save_user(&user("migrated-fixture")).unwrap();
++        legacy
++            .save_user_token(
++                PASSPORT_STS.into(),
++                Token::Compact("migrated-fixture".into()),
++            )
++            .unwrap();
++        legacy
++            .save_device_token(PASSPORT_STS.into(), Token::Compact("device-fixture".into()))
++            .unwrap();
++        legacy.migrate_user_to(OWNER).unwrap();
++        let other = legacy.scoped(PLAYER).unwrap();
++        other.save_user(&user("other-fixture")).unwrap();
++        other
++            .save_user_token(PASSPORT_STS.into(), Token::Compact("other-fixture".into()))
++            .unwrap();
++
++        // A different account's logout leaves the legacy sign-in alone.
++        other.remove_persistent().unwrap();
++        assert_eq!(legacy.get_user().unwrap().puid, "migrated-fixture");
++
++        legacy.scoped(OWNER).unwrap().remove_persistent().unwrap();
++        assert!(legacy.scoped(OWNER).unwrap().get_user().is_err());
++        assert!(matches!(legacy.get_user(), Err(TokenStoreError::NotFound)));
++        assert!(matches!(
++            legacy.get_user_sts_token(),
++            Err(TokenStoreError::NotFound)
++        ));
++        // The device registration is shared and survives every user logout.
++        assert!(legacy.get_device_sts_token().is_ok());
++        // Signing out an account that is already signed out is not an error.
++        legacy.scoped(OWNER).unwrap().remove_persistent().unwrap();
++    }
++
+     #[test]
+     fn a_live_service_cannot_follow_replacement_credentials_in_its_profile() {
+         let backend = TokenManager::with_memory();
+@@ -253,7 +290,26 @@ impl TokenManager {
+ 
+     pub fn remove_persistent(&self) -> Result<(), TokenStoreError> {
+         if self.profile.is_some() {
+-            return self.remove_user();
++            // Migration copied the pre-profile sign-in and left the original
++            // for older launchers. Signing that account out has to remove the
++            // original too, or the refresh credential stays in the keyring and
++            // a later migration would bring the signed-out account back. Only
++            // the same Microsoft account's entries go; a different legacy
++            // sign-in is not this logout's business.
++            let puid = self.get_user().ok().map(|user| user.puid);
++            self.remove_user()?;
++            if let Some(puid) = puid.filter(|p| !p.is_empty()) {
++                let legacy = Self {
++                    persistent: self.persistent.clone(),
++                    ephemeral: Arc::new(MemoryBackend::default()),
++                    profile: None,
++                    expected_user: None,
++                };
++                if legacy.get_user().is_ok_and(|user| user.puid == puid) {
++                    legacy.remove_user()?;
++                }
++            }
++            return Ok(());
+         }
+         self.persistent.remove(keys::DEVICE_TOKENS)?;
+         self.persistent.remove(keys::USER_TOKENS)?;
