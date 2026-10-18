@@ -126,7 +126,9 @@ first install fetches Microsoft Gaming Services anonymously from the Store
 (about 200 MB, a few seconds on a fast connection), keeps the 539-byte key
 if its fingerprint is the pinned one, and deletes the rest. It needs
 `displaycatalog.mp.microsoft.com`, `fe3.delivery.mp.microsoft.com`,
-`www.microsoft.com` and `*.dl.delivery.mp.microsoft.com` to be reachable,
+`www.microsoft.com` and the download host the delivery service names, which
+must be under `*.delivery.mp.microsoft.com` (so far
+`tlu.dl.delivery.mp.microsoft.com`), to be reachable,
 once. `ferestre doctor` reports **package signatures are checked** when the
 key is in place, and `xodus-cli xvd-key fetch` fetches it by hand. See
 [PACKAGE-SIGNATURES.md](PACKAGE-SIGNATURES.md) for what is checked and the

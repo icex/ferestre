@@ -4055,13 +4055,24 @@ fn package_signature_check(client: &Path) -> Check {
                 } else {
                     "package signatures are not checked: the stored key is unusable"
                 };
-                let mut check = if status.required && !status.auto_fetch {
-                    Check::fail(SECTION, what).with_hint(format!(
-                        "{REQUIRE_SIGNED_ENV}=1 and {AUTO_FETCH_ENV}=0: every install will be refused; {FETCH}"
-                    ))
-                } else if status.auto_fetch {
+                let paused = status.auto_fetch_paused_until.clone();
+                let mut check = if status.required && !status.fetches_on_install() {
+                    let why = match &paused {
+                        Some(until) if status.auto_fetch => format!(
+                            "{REQUIRE_SIGNED_ENV}=1 and an automatic fetch failed, so installs do not fetch the key again before {until}: every install until then will be refused"
+                        ),
+                        _ => format!(
+                            "{REQUIRE_SIGNED_ENV}=1 and {AUTO_FETCH_ENV}=0: every install will be refused"
+                        ),
+                    };
+                    Check::fail(SECTION, what).with_hint(format!("{why}; {FETCH}"))
+                } else if status.fetches_on_install() {
                     Check::warn(SECTION, what)
                         .with_hint(format!("the next install fetches it; or {FETCH}"))
+                } else if let (true, Some(until)) = (status.auto_fetch, &paused) {
+                    Check::warn(SECTION, what).with_hint(format!(
+                        "an automatic fetch failed, so installs go on without checking and do not fetch the key again before {until}; {FETCH}"
+                    ))
                 } else {
                     Check::warn(SECTION, what).with_hint(format!(
                         "{AUTO_FETCH_ENV}=0, so installs go on without checking; {FETCH}"
@@ -7329,6 +7340,28 @@ summary = "Runs."
         home.client(r#"echo '{"status":"absent","required":true,"auto_fetch":false}'"#);
         let check = signatures(&home);
         assert_eq!(check.status, CheckStatus::Fail, "{check:?}");
+
+        // A failed automatic fetch pauses fetching for a day: no promise that
+        // the next install fetches it.
+        const UNTIL: &str = "2026-10-19T10:00:00+00:00";
+        home.client(&format!(
+            r#"echo '{{"status":"absent","required":false,"auto_fetch":true,"last_failed_fetch":"2026-10-18T10:00:00+00:00","auto_fetch_paused_until":"{UNTIL}"}}'"#
+        ));
+        let check = signatures(&home);
+        assert_eq!(check.status, CheckStatus::Warn, "{check:?}");
+        let hint = check.hint.unwrap();
+        assert!(!hint.contains("next install fetches it"), "{hint}");
+        assert!(
+            hint.contains(UNTIL) && hint.contains("xvd-key fetch"),
+            "{hint}"
+        );
+        // And with signatures required, every install until then is refused.
+        home.client(&format!(
+            r#"echo '{{"status":"absent","required":true,"auto_fetch":true,"auto_fetch_paused_until":"{UNTIL}"}}'"#
+        ));
+        let check = signatures(&home);
+        assert_eq!(check.status, CheckStatus::Fail, "{check:?}");
+        assert!(check.hint.unwrap().contains(UNTIL));
 
         home.client(r#"echo '{"status":"invalid","detail":"not the pinned key"}'"#);
         let check = signatures(&home);

@@ -48,6 +48,16 @@ pub struct Status {
     pub auto_fetch: bool,
     /// When an automatic fetch last failed, as the client wrote it.
     pub last_failed_fetch: Option<String>,
+    /// Until when the client skips the automatic fetch because one failed
+    /// recently; `None` when it is not paused (or the client does not say).
+    pub auto_fetch_paused_until: Option<String>,
+}
+
+impl Status {
+    /// Whether an install would try to fetch the key now.
+    pub fn fetches_on_install(&self) -> bool {
+        self.auto_fetch && self.auto_fetch_paused_until.is_none()
+    }
 }
 
 #[derive(Deserialize)]
@@ -60,6 +70,7 @@ struct Raw {
     #[serde(default = "yes")]
     auto_fetch: bool,
     last_failed_fetch: Option<String>,
+    auto_fetch_paused_until: Option<String>,
 }
 
 fn yes() -> bool {
@@ -97,6 +108,10 @@ pub fn parse_status(stdout: &[u8]) -> Result<Status> {
         required: raw.required,
         auto_fetch: raw.auto_fetch,
         last_failed_fetch: raw.last_failed_fetch.map(|t| clean(&t)),
+        auto_fetch_paused_until: raw
+            .auto_fetch_paused_until
+            .map(|t| clean(&t))
+            .filter(|t| !t.is_empty()),
     })
 }
 
@@ -169,6 +184,17 @@ mod tests {
         .unwrap();
         assert_eq!(absent.state, State::Absent);
         assert!(absent.required && !absent.auto_fetch);
+        assert!(!absent.fetches_on_install());
+
+        let paused = parse_status(
+            br#"{"status":"absent","auto_fetch":true,"auto_fetch_paused_until":"2026-10-19T10:00:00+00:00"}"#,
+        )
+        .unwrap();
+        assert!(paused.auto_fetch && !paused.fetches_on_install());
+        assert_eq!(
+            paused.auto_fetch_paused_until.as_deref(),
+            Some("2026-10-19T10:00:00+00:00")
+        );
         assert_eq!(
             absent.last_failed_fetch.as_deref(),
             Some("2026-10-18T10:00:00+00:00")

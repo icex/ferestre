@@ -22,16 +22,21 @@ Store's delivery service, without signing in:
 2. The delivery service (`fe3.delivery.mp.microsoft.com`) lists the package
    and its SHA-256, and gives a download URL. Every request carries an empty,
    anonymous ticket; no account, token or device identity is sent.
-3. The package (about 200 MB) is downloaded from a
-   `*.dl.delivery.mp.microsoft.com` host into a temporary file, and checked
-   against the size and SHA-256 the delivery service gave.
+3. The package (about 200 MB) is downloaded from the URL the delivery service
+   gave, which must be on a `*.delivery.mp.microsoft.com` host (so far
+   `tlu.dl.delivery.mp.microsoft.com`, over http; redirects only among such
+   hosts), into an unnamed temporary file, and checked against the size and
+   SHA-256 the delivery service gave.
 4. The client reads the binaries of the x64 package inside it without
    unpacking the rest, and keeps only an RSA-4096 public key whose SHA-256 is
    the one compiled into the client:
    `183F0AE05431E4AD91554E88946967C872997227DBE6C85116F5FD2FD2D1229E`.
    Any other key, or a package that was changed on its way, yields nothing.
 5. The key (539 bytes) is stored readable only by you, and the download is
-   deleted. On a fast connection the whole thing takes a few seconds.
+   deleted. The temporary files have no name on disk, so the system frees
+   them however the client ends, even when an install is stopped or killed
+   while the key is being fetched. On a fast connection the whole thing takes
+   a few seconds.
 
 The delivery service's TLS certificate chains to Microsoft Root Certificate
 Authority 2011, which Linux certificate stores do not include. The client
@@ -50,13 +55,20 @@ changed, belongs to someone else or is readable by others is not used.
 - An install (`ferestre install`, or the client's `streaming`) uses the stored
   key. If there is none, it tries once to fetch it, for at most three minutes,
   and says so on stderr. An automatic attempt that failed is not repeated for
-  a day.
+  a day; `xodus-cli xvd-key status --json` gives the time in
+  `auto_fetch_paused_until`, and `ferestre doctor` says so.
+- An install from a package file on disk (`streaming file://…`) never fetches
+  the key, so it stays offline. If a key is stored, the file's header must
+  carry a retail signature that verifies, or the install is refused; nothing
+  says which package the file should be, so only the signature and the
+  integrity flag are checked.
 - `xodus-cli xvd-key fetch` fetches it now; `xodus-cli xvd-key status` and
   `xodus-cli xvd-key forget` report and remove it. All three take `--json`,
   and none of them needs an account.
 
 The key is kept in `~/.local/share/xodus/xvd-key/` (`$XDG_DATA_HOME/xodus/xvd-key`),
-and the download goes to `~/.cache/xodus/xvd-key-fetch/` while it is read.
+and the download goes to unnamed files in `~/.cache/xodus/xvd-key-fetch/`
+while it is read.
 `XODUS_XVD_KEY_DIR` puts both somewhere else.
 
 ## What is checked

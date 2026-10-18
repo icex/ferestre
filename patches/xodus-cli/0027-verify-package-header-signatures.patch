@@ -18,14 +18,16 @@ user's machine at run time (`xvd_key`): DisplayCatalog gives Microsoft Gaming
 Services' (9MWPM2CQNLHN) Windows Update category, the Store's delivery service
 (FE3: GetCookie, SyncUpdates, GetExtendedUpdateInfo2) lists its bundle and
 file URL anonymously -- the ticket is an empty MSA ticket, nothing signs in --
-and the bundle (about 200 MB) is streamed to a temporary file in the cache
-directory, checked against its size and the SHA-256 FE3 gives, and read
+and the bundle (about 200 MB) is streamed to an unnamed temporary file
+(O_TMPFILE, or unlinked at once) in the cache directory, so the kernel frees
+it however the process ends, a SIGTERM or SIGKILL included; checked against its size and the SHA-256 FE3 gives, and read
 without unpacking: a minimal zip64 reader opens the x64 package where it lies
 in the bundle and streams its binaries (xsapi.dll and drivers/xvdd.sys first)
 through a scanner that keeps only an RSA-4096 public blob with the pinned
 SHA-256. The blob is stored 0600 in a 0700 directory
 ($XDG_DATA_HOME/xodus/xvd-key, or XODUS_XVD_KEY_DIR), hashed again on every
-load, and the bundle is deleted. FE3's certificate chains to Microsoft Root
+load, and the bundle is freed. A deflated nested package is inflated into an
+unnamed temporary file the same way. FE3's certificate chains to Microsoft Root
 Certificate Authority 2011, which Linux stores lack and this client does not
 carry: it is fetched from the CA Issuers address in FE3's intermediate
 (www.microsoft.com/pki/certs, plain http), used only if its SHA-256 is the
@@ -53,7 +55,10 @@ signed and are not relied on.
 
 `xodus-cli streaming` uses the stored key. Without one it tries once to fetch
 it, bounded at 180 s; a failed automatic attempt is not repeated for a day,
-and XODUS_XVD_KEY_AUTOFETCH=0 turns automatic fetching off. With no key the
+and XODUS_XVD_KEY_AUTOFETCH=0 turns automatic fetching off; `xvd-key status
+--json` reports the pause as auto_fetch_paused_until. An install from a
+package file on disk (file://) never fetches the key, so it stays offline;
+with a stored key its header must still carry a verifying retail signature. With no key the
 install goes on with a warning on stderr, as before, unless
 XODUS_REQUIRE_SIGNED_PACKAGE=1, which refuses it. With a key, a header that
 fails stops the install with an error saying it was refused, not a dropped
@@ -61,7 +66,7 @@ connection, and nothing is installed.
 
 This is a reimplementation from the format; no XvdTool code is used. The
 tests use two throwaway RSA-4096 keys generated for them
-(crates/msixvc/src/testdata/TEST-ONLY-*.pem), synthetic signed headers,
+(crates/msixvc/src/testdata/TEST-ONLY-*.pkcs8), synthetic signed headers,
 zip fixtures written by the tests and hand-made FE3 answers with made-up
 identifiers. Two ignored tests talk to Microsoft, anonymously: one locates the
 bundle through FE3, the other checks the real key against real headers
@@ -1141,7 +1146,7 @@ index 89edd99..87e3acd 100644
              Err(err) => {
                  eprintln!("{err}");
 diff --git a/crates/xodus-cli/src/commands/streaming.rs b/crates/xodus-cli/src/commands/streaming.rs
-index 07a9ad6..d649eb1 100644
+index 07a9ad6..582633f 100644
 --- a/crates/xodus-cli/src/commands/streaming.rs
 +++ b/crates/xodus-cli/src/commands/streaming.rs
 @@ -9,8 +9,12 @@ use fs2::available_space;
@@ -1196,8 +1201,8 @@ index 07a9ad6..d649eb1 100644
 +/// The key to check the package header's signature with, fetched once if it
 +/// is not stored yet; see `crate::xvd_key::for_install`. `Err` when there is
 +/// none and `XODUS_REQUIRE_SIGNED_PACKAGE=1`.
-+async fn signing_key() -> Result<Option<XvdSigningKey>, ExitCode> {
-+    crate::xvd_key::for_install().await.map_err(|err| {
++async fn signing_key(fetch: crate::xvd_key::Fetch) -> Result<Option<XvdSigningKey>, ExitCode> {
++    crate::xvd_key::for_install(fetch).await.map_err(|err| {
 +        eprintln!("{err}");
 +        ExitCode::FAILURE
 +    })
@@ -1206,13 +1211,14 @@ index 07a9ad6..d649eb1 100644
  enum ProgressEvent {
      Started { id: usize, name: String, total: u64 },
      Advanced { id: usize, delta: u64 },
-@@ -59,6 +96,16 @@ pub async fn run(
+@@ -59,6 +96,17 @@ pub async fn run(
                  return ExitCode::FAILURE;
              }
          };
-+        // A file on disk: its signature is checked if there is a key, but
-+        // nothing says which package it should be.
-+        let key = match signing_key().await {
++        // A file on disk: its signature is checked if a key is stored (never
++        // fetched for it, so this stays offline), but nothing says which
++        // package it should be.
++        let key = match signing_key(crate::xvd_key::Fetch::Never).await {
 +            Ok(key) => key,
 +            Err(code) => return code,
 +        };
@@ -1223,7 +1229,7 @@ index 07a9ad6..d649eb1 100644
          run_cli_reader(
              client,
              tokens,
-@@ -69,22 +116,33 @@ pub async fn run(
+@@ -69,22 +117,33 @@ pub async fn run(
              f,
              l,
              &source,
@@ -1240,7 +1246,7 @@ index 07a9ad6..d649eb1 100644
 +        // from it and it gave one, and the package it named. A URL given
 +        // directly has nothing to go by but the header's signature.
 +        let (vurl, trust) = if source.starts_with("http://") || source.starts_with("https://") {
-+            let key = match signing_key().await {
++            let key = match signing_key(crate::xvd_key::Fetch::Allowed).await {
 +                Ok(key) => key,
 +                Err(code) => return code,
 +            };
@@ -1263,12 +1269,12 @@ index 07a9ad6..d649eb1 100644
          } else {
              let content_id = if Uuid::try_parse(&source).is_err() {
                  let content_id_task = get_content_id(client, source, market.clone()).await;
-@@ -137,11 +195,29 @@ pub async fn run(
+@@ -137,11 +196,29 @@ pub async fn run(
                      return ExitCode::FAILURE;
                  }
              };
 -            if anchor.is_none() {
-+            let key = match signing_key().await {
++            let key = match signing_key(crate::xvd_key::Fetch::Allowed).await {
 +                Ok(key) => key,
 +                Err(code) => return code,
 +            };
@@ -1296,7 +1302,7 @@ index 07a9ad6..d649eb1 100644
                  Err(err) => {
                      eprintln!("{err}");
                      return ExitCode::FAILURE;
-@@ -188,7 +264,7 @@ pub async fn run(
+@@ -188,7 +265,7 @@ pub async fn run(
              http_file,
              l,
              url,
@@ -1305,7 +1311,7 @@ index 07a9ad6..d649eb1 100644
              tx,
              rx,
          )
-@@ -270,7 +346,7 @@ async fn run_cli_reader<Reader>(
+@@ -270,7 +347,7 @@ async fn run_cli_reader<Reader>(
      reader: Reader,
      l: u64,
      url: &str,
@@ -1314,7 +1320,7 @@ index 07a9ad6..d649eb1 100644
      tx: Sender<ProgressEvent>,
      mut rx: Receiver<ProgressEvent>,
  ) -> Result<(), String>
-@@ -336,7 +412,7 @@ where
+@@ -336,7 +413,7 @@ where
          reader,
          l,
          url,
@@ -1323,7 +1329,7 @@ index 07a9ad6..d649eb1 100644
          &tx,
      )
      .await;
-@@ -416,28 +492,37 @@ fn needs_download(
+@@ -416,28 +493,37 @@ fn needs_download(
  
  /// Parse a package being downloaded, checked before anything in it is believed.
  ///
@@ -1377,7 +1383,7 @@ index 07a9ad6..d649eb1 100644
      })
  }
  
-@@ -507,7 +592,7 @@ async fn run_reader<Reader>(
+@@ -507,7 +593,7 @@ async fn run_reader<Reader>(
      reader: Reader,
      l: u64,
      url: &str,
@@ -1386,7 +1392,7 @@ index 07a9ad6..d649eb1 100644
      tx: &Sender<ProgressEvent>,
  ) -> Result<(), String>
  where
-@@ -523,7 +608,7 @@ where
+@@ -523,7 +609,7 @@ where
      let mut remote_file = streaming::PrefixCacheFile::new(reader, l, cache_path.clone())
          .await
          .map_err(stopped("open the download cache"))?;
@@ -1395,7 +1401,7 @@ index 07a9ad6..d649eb1 100644
      let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
  
      let files = remote_xvd
-@@ -898,7 +983,11 @@ mod tests {
+@@ -898,7 +984,11 @@ mod tests {
          let p = msixvc::xvd::testing::package();
          let top: [u8; 32] = p.bytes[0x240..0x260].try_into().unwrap();
          let read = |bytes: Vec<u8>, anchor: Option<[u8; 32]>| async move {
@@ -1408,7 +1414,7 @@ index 07a9ad6..d649eb1 100644
          };
  
          // Match.
-@@ -926,6 +1015,82 @@ mod tests {
+@@ -926,6 +1016,82 @@ mod tests {
          assert!(err.starts_with("refusing this download"), "{err}");
      }
  
@@ -1493,10 +1499,10 @@ index 07a9ad6..d649eb1 100644
      async fn fixture(dir: &Path) -> (std::path::PathBuf, XvdFile, Job, Vec<u8>) {
 diff --git a/crates/xodus-cli/src/commands/xvd_key.rs b/crates/xodus-cli/src/commands/xvd_key.rs
 new file mode 100644
-index 0000000..f4927a1
+index 0000000..1870c4d
 --- /dev/null
 +++ b/crates/xodus-cli/src/commands/xvd_key.rs
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,178 @@
 +//! `xodus-cli xvd-key status|fetch|forget`: the key that package header
 +//! signatures are checked with. See `crate::xvd_key`.
 +//!
@@ -1509,9 +1515,13 @@ index 0000000..f4927a1
 +use serde_json::json;
 +
 +use crate::xvd_key::{
-+    self, AUTO_FETCH_ENV, FETCH_TIMEOUT, REQUIRE_SIGNED_ENV, Status, forget_in, key_dir,
-+    last_failure, status_of,
++    self, AUTO_FETCH_ENV, FETCH_TIMEOUT, REQUIRE_SIGNED_ENV, Status, auto_fetch_paused_until,
++    forget_in, key_dir, last_failure, status_of,
 +};
++
++fn rfc3339(t: std::time::SystemTime) -> String {
++    chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
++}
 +
 +fn settings() -> serde_json::Value {
 +    json!({
@@ -1530,8 +1540,9 @@ index 0000000..f4927a1
 +
 +fn status_json() -> Result<serde_json::Value, String> {
 +    let dir = key_dir()?;
-+    let last_failed =
-+        last_failure(&dir).map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
++    let last_failed = last_failure(&dir).map(rfc3339);
++    // When set, an install does not fetch the key before this time.
++    let paused_until = auto_fetch_paused_until(&dir).map(rfc3339);
 +    let mut value = match status_of(&dir, &GAME_PACKAGE_KEY_SHA256) {
 +        Status::Present { fingerprint } => json!({
 +            "status": "present",
@@ -1543,7 +1554,11 @@ index 0000000..f4927a1
 +    value = merge(value, settings());
 +    value = merge(
 +        value,
-+        json!({ "dir": dir.display().to_string(), "last_failed_fetch": last_failed }),
++        json!({
++            "dir": dir.display().to_string(),
++            "last_failed_fetch": last_failed,
++            "auto_fetch_paused_until": paused_until,
++        }),
 +    );
 +    Ok(value)
 +}
@@ -1570,15 +1585,21 @@ index 0000000..f4927a1
 +                "Package signing key present ({}); package headers are checked.",
 +                value["fingerprint"].as_str().unwrap_or_default()
 +            ),
-+            Some("absent") => println!(
-+                "No package signing key. It is fetched from Microsoft Gaming Services on the next \
-+                 install, or now with `xodus-cli xvd-key fetch`.{}",
-+                if xvd_key::auto_fetch_enabled() {
-+                    ""
++            Some("absent") => {
++                let when = if !xvd_key::auto_fetch_enabled() {
++                    "with `xodus-cli xvd-key fetch` (automatic fetching is off)".to_string()
++                } else if let Some(until) = value["auto_fetch_paused_until"].as_str() {
++                    format!(
++                        "by the first install after {until} (an automatic fetch failed), or now \
++                         with `xodus-cli xvd-key fetch`"
++                    )
 +                } else {
-+                    " (Automatic fetching is off.)"
-+                }
-+            ),
++                    "on the next install, or now with `xodus-cli xvd-key fetch`".to_string()
++                };
++                println!(
++                    "No package signing key. It is fetched from Microsoft Gaming Services {when}."
++                )
++            }
 +            _ => println!(
 +                "The stored package signing key is unusable: {}",
 +                value["detail"].as_str().unwrap_or_default()
@@ -2456,10 +2477,10 @@ index 0000000..7b3393b
 +}
 diff --git a/crates/xodus-cli/src/xvd_key/mod.rs b/crates/xodus-cli/src/xvd_key/mod.rs
 new file mode 100644
-index 0000000..ec23c3f
+index 0000000..4764631
 --- /dev/null
 +++ b/crates/xodus-cli/src/xvd_key/mod.rs
-@@ -0,0 +1,525 @@
+@@ -0,0 +1,574 @@
 +//! The key that signs retail PC game package headers, found on this machine.
 +//!
 +//! This client does not carry that key. It is a public key, but Microsoft's,
@@ -2471,9 +2492,11 @@ index 0000000..ec23c3f
 +//! package is deleted as soon as it has been read.
 +//!
 +//! Where: `XODUS_XVD_KEY_DIR`, else `$XDG_DATA_HOME/xodus/xvd-key`, else
-+//! `~/.local/share/xodus/xvd-key`. The download goes to a temporary file in
++//! `~/.local/share/xodus/xvd-key`. The download goes to an unnamed temporary
++//! file (`O_TMPFILE`, or unlinked as soon as it is made) in
 +//! `XODUS_XVD_KEY_DIR/.fetch`, else `$XDG_CACHE_HOME/xodus/xvd-key-fetch`, else
-+//! `~/.cache/xodus/xvd-key-fetch`.
++//! `~/.cache/xodus/xvd-key-fetch`, so the kernel frees it however the process
++//! ends, a signal included.
 +
 +pub mod fe3;
 +pub mod scan;
@@ -2668,6 +2691,18 @@ index 0000000..ec23c3f
 +        .ok()
 +}
 +
++/// Until when automatic fetching is paused because an automatic fetch failed
++/// less than `RETRY_AFTER` ago; `None` when it is not paused.
++pub fn auto_fetch_paused_until(dir: &Path) -> Option<SystemTime> {
++    let failed = last_failure(dir)?;
++    let until = failed.checked_add(RETRY_AFTER)?;
++    // A failure stamped in the future (clock moved back) still pauses, but
++    // never for longer than `RETRY_AFTER` from now.
++    let now = SystemTime::now();
++    let until = until.min(now.checked_add(RETRY_AFTER)?);
++    (until > now).then_some(until)
++}
++
 +fn record_failure(dir: &Path) {
 +    if private_dir(dir).is_ok() {
 +        let _ = std::fs::write(dir.join(FAILED_FILE), b"");
@@ -2692,7 +2727,7 @@ index 0000000..ec23c3f
 +    location: &fe3::BundleLocation,
 +    scratch: &Path,
 +    timeout: Duration,
-+) -> Result<tempfile::NamedTempFile, String> {
++) -> Result<std::fs::File, String> {
 +    if location.size == 0 || location.size > MAX_BUNDLE {
 +        return Err(format!(
 +            "the package is said to be {} bytes, outside what is expected",
@@ -2714,10 +2749,9 @@ index 0000000..ec23c3f
 +    if !fe3::download_url_allowed(response.url()) {
 +        return Err("the Gaming Services download ended on another host".into());
 +    }
-+    let mut file = tempfile::Builder::new()
-+        .prefix(".bundle-")
-+        .tempfile_in(scratch)
-+        .map_err(|e| format!("{}: {e}", scratch.display()))?;
++    // Unnamed: nothing is left behind if the process is killed.
++    let mut file =
++        tempfile::tempfile_in(scratch).map_err(|e| format!("{}: {e}", scratch.display()))?;
 +    let mut hasher = Sha256::new();
 +    let mut written = 0u64;
 +    while let Some(chunk) = response
@@ -2761,12 +2795,15 @@ index 0000000..ec23c3f
 +    let started = Instant::now();
 +    let location = fe3::locate_bundle(timeout).await?;
 +    let bundle = download(&location, &scratch, timeout).await?;
-+    let path = bundle.path().to_path_buf();
 +    let scratch_for_scan = scratch.clone();
-+    let found = tokio::task::spawn_blocking(move || {
++    let name = location.moniker.clone();
++    // The bundle is unnamed; it is freed when the scan drops it.
++    let (found, stats) = tokio::task::spawn_blocking(move || {
++        let mut bundle = bundle;
 +        let mut stats = scan::ScanStats::default();
 +        scan::scan_bundle(
-+            &path,
++            &mut bundle,
++            &name,
 +            &scratch_for_scan,
 +            &GAME_PACKAGE_KEY_SHA256,
 +            &mut stats,
@@ -2775,10 +2812,7 @@ index 0000000..ec23c3f
 +    })
 +    .await
 +    .map_err(|e| e.to_string())?
-+    .map_err(|e| format!("could not read the Gaming Services package: {e}"));
-+    // Deleted whatever was found.
-+    drop(bundle);
-+    let (found, stats) = found?;
++    .map_err(|e| format!("could not read the Gaming Services package: {e}"))?;
 +    let found = found.ok_or_else(|| {
 +        format!(
 +            "{} holds no key with the pinned fingerprint ({} candidate keys in {} files); \
@@ -2813,14 +2847,25 @@ index 0000000..ec23c3f
 +    !env_is(AUTO_FETCH_ENV, "0")
 +}
 +
++/// Whether `for_key` may fetch the key when none is stored.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Fetch {
++    /// A download from the package service: one bounded automatic attempt.
++    Allowed,
++    /// A package file on disk: only the stored key is used, so an install
++    /// from a local file never reaches the network for it.
++    Never,
++}
++
 +/// The key for checking a package about to be installed.
 +///
-+/// The stored key if there is one. Otherwise one attempt to fetch it, bounded
-+/// by `AUTO_FETCH_TIMEOUT`, unless `XODUS_XVD_KEY_AUTOFETCH=0` or an
-+/// automatic attempt failed in the last day. Without a key the install goes
-+/// on, with a warning on stderr, unless `XODUS_REQUIRE_SIGNED_PACKAGE=1`, in
-+/// which case this is an error.
-+pub async fn for_install() -> Result<Option<XvdSigningKey>, String> {
++/// The stored key if there is one. Otherwise, with `Fetch::Allowed`, one
++/// attempt to fetch it, bounded by `AUTO_FETCH_TIMEOUT`, unless
++/// `XODUS_XVD_KEY_AUTOFETCH=0` or an automatic attempt failed in the last day
++/// (`auto_fetch_paused_until`). Without a key the install goes on, with a
++/// warning on stderr, unless `XODUS_REQUIRE_SIGNED_PACKAGE=1`, in which case
++/// this is an error.
++pub async fn for_install(fetch_policy: Fetch) -> Result<Option<XvdSigningKey>, String> {
 +    let dir = key_dir();
 +    let mut why = String::new();
 +    if let Ok(dir) = &dir {
@@ -2832,12 +2877,11 @@ index 0000000..ec23c3f
 +                why = format!("the stored key is unusable ({e})");
 +            }
 +        }
-+        let recent_failure = last_failure(dir)
-+            .and_then(|t| t.elapsed().ok())
-+            .is_some_and(|age| age < RETRY_AFTER);
-+        if !auto_fetch_enabled() {
++        if fetch_policy == Fetch::Never {
++            why.push_str(" (a package file on disk does not fetch it)");
++        } else if !auto_fetch_enabled() {
 +            why.push_str(&format!(" and {AUTO_FETCH_ENV}=0"));
-+        } else if recent_failure {
++        } else if auto_fetch_paused_until(dir).is_some() {
 +            why.push_str(" and fetching it failed less than a day ago");
 +        } else {
 +            eprintln!(
@@ -2926,6 +2970,32 @@ index 0000000..ec23c3f
 +        assert_eq!(status_of(&dir, &pin), Status::Absent);
 +    }
 +
++    #[test]
++    fn a_failed_automatic_fetch_pauses_automatic_fetching_for_a_day() {
++        let root = tempfile::tempdir().unwrap();
++        let dir = root.path().join("xvd-key");
++        assert_eq!(auto_fetch_paused_until(&dir), None);
++        record_failure(&dir);
++        let until = auto_fetch_paused_until(&dir).expect("paused after a failure");
++        let left = until.duration_since(SystemTime::now()).unwrap();
++        assert!(left > RETRY_AFTER - Duration::from_secs(60) && left <= RETRY_AFTER);
++
++        // A failure older than a day no longer pauses.
++        let old = SystemTime::now() - RETRY_AFTER - Duration::from_secs(1);
++        std::fs::File::options()
++            .write(true)
++            .open(dir.join(FAILED_FILE))
++            .unwrap()
++            .set_modified(old)
++            .unwrap();
++        assert_eq!(auto_fetch_paused_until(&dir), None);
++
++        // Forgetting the key clears the pause.
++        record_failure(&dir);
++        forget_in(&dir).unwrap();
++        assert_eq!(auto_fetch_paused_until(&dir), None);
++    }
++
 +    #[cfg(unix)]
 +    #[test]
 +    fn a_key_file_others_can_read_or_a_link_is_refused() {
@@ -2987,10 +3057,10 @@ index 0000000..ec23c3f
 +}
 diff --git a/crates/xodus-cli/src/xvd_key/scan.rs b/crates/xodus-cli/src/xvd_key/scan.rs
 new file mode 100644
-index 0000000..07f5dd3
+index 0000000..5218c0d
 --- /dev/null
 +++ b/crates/xodus-cli/src/xvd_key/scan.rs
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,369 @@
 +//! Finding the pinned key among the bytes of a Microsoft Gaming Services
 +//! package.
 +//!
@@ -3144,47 +3214,44 @@ index 0000000..07f5dd3
 +    Ok(None)
 +}
 +
-+/// Look for the pinned key in an Appx bundle on disk.
++/// Look for the pinned key in an Appx bundle in `file`, called `name`.
 +///
 +/// Each package in the bundle is read where it lies when it is stored, as
-+/// bundles store them. One that is deflated is inflated into a temporary
-+/// file in `scratch`, at most `MAX_NESTED_PACKAGE` bytes, and removed after.
-+/// A package given directly, rather than a bundle, is read the same way.
++/// bundles store them. One that is deflated is inflated into an unnamed
++/// temporary file in `scratch` (freed by the kernel however the process
++/// ends), at most `MAX_NESTED_PACKAGE` bytes. A package given directly,
++/// rather than a bundle, is read the same way.
 +pub fn scan_bundle(
-+    path: &Path,
++    file: &mut File,
++    name: &str,
 +    scratch: &Path,
 +    pin: &[u8; 32],
 +    stats: &mut ScanStats,
 +) -> io::Result<Option<Found>> {
-+    let mut file = File::open(path)?;
 +    let len = file.seek(SeekFrom::End(0))?;
-+    let entries = Archive::open(&mut file, 0, len)?.entries;
++    let entries = Archive::open(&mut *file, 0, len)?.entries;
 +    let packages = by_priority(&entries, package_priority);
 +    if packages.is_empty() {
-+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
 +        return Ok(
-+            scan_package(&mut file, 0, len, pin, stats)?.map(|(blob, member)| Found {
++            scan_package(file, 0, len, pin, stats)?.map(|(blob, member)| Found {
 +                blob,
-+                package: name.unwrap_or_default(),
++                package: name.to_string(),
 +                member,
 +            }),
 +        );
 +    }
 +    for package in packages {
 +        let found = if package.method == STORED {
-+            let (start, len) = Archive::open(&mut file, 0, len)?.data_range(&package)?;
-+            scan_package(&mut file, start, len, pin, stats)?
++            let (start, len) = Archive::open(&mut *file, 0, len)?.data_range(&package)?;
++            scan_package(file, start, len, pin, stats)?
 +        } else {
-+            let mut inflated = tempfile::Builder::new()
-+                .prefix(".package-")
-+                .tempfile_in(scratch)?;
++            let mut inner = tempfile::tempfile_in(scratch)?;
 +            {
-+                let mut archive = Archive::open(&mut file, 0, len)?;
++                let mut archive = Archive::open(&mut *file, 0, len)?;
 +                let mut reader = archive.reader(&package, MAX_NESTED_PACKAGE)?;
-+                io::copy(&mut reader, inflated.as_file_mut())?;
++                io::copy(&mut reader, &mut inner)?;
 +            }
-+            inflated.as_file_mut().flush()?;
-+            let mut inner = inflated.reopen()?;
++            inner.flush()?;
 +            let inner_len = inner.seek(SeekFrom::End(0))?;
 +            scan_package(&mut inner, 0, inner_len, pin, stats)?
 +        };
@@ -3315,7 +3382,8 @@ index 0000000..07f5dd3
 +            let path = dir.path().join("bundle.appxbundle");
 +            std::fs::write(&path, bundle(stored, member, zip64)).unwrap();
 +            let mut stats = ScanStats::default();
-+            let found = scan_bundle(&path, dir.path(), &pin, &mut stats)
++            let mut file = File::open(&path).unwrap();
++            let found = scan_bundle(&mut file, "bundle", dir.path(), &pin, &mut stats)
 +                .unwrap()
 +                .unwrap_or_else(|| panic!("{member}: not found"));
 +            assert_eq!(found.blob, blob());
@@ -3336,14 +3404,30 @@ index 0000000..07f5dd3
 +        let mut stats = ScanStats::default();
 +        let wrong_pin = [7u8; 32];
 +        assert_eq!(
-+            scan_bundle(&path, dir.path(), &wrong_pin, &mut stats).unwrap(),
++            scan_bundle(
++                &mut File::open(&path).unwrap(),
++                "bundle",
++                dir.path(),
++                &wrong_pin,
++                &mut stats
++            )
++            .unwrap(),
 +            None
 +        );
 +        // The ARM package is never opened; both x64 binaries holding a key are.
 +        assert_eq!(stats.candidates, 2);
 +        // Not a zip at all.
 +        std::fs::write(&path, b"not a bundle").unwrap();
-+        assert!(scan_bundle(&path, dir.path(), &wrong_pin, &mut stats).is_err());
++        assert!(
++            scan_bundle(
++                &mut File::open(&path).unwrap(),
++                "bundle",
++                dir.path(),
++                &wrong_pin,
++                &mut stats
++            )
++            .is_err()
++        );
 +    }
 +}
 diff --git a/crates/xodus-cli/src/xvd_key/testdata/displaycatalog.json b/crates/xodus-cli/src/xvd_key/testdata/displaycatalog.json
