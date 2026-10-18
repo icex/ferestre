@@ -143,6 +143,30 @@ ruleset controls who can start a release at all.
 To see whether a release would build without publishing anything, start the
 workflow by hand with *Run workflow*. The result is unsigned.
 
+### Build caches
+
+A cold runtime build takes a little over two hours. To avoid paying that on
+every release, the runtime workflow keeps Proton's compiler cache (ccache)
+between runs:
+
+- A push to `main` that changes `patches/wine`, `patches/xgameruntime`,
+  `patches/vkd3d-proton`, `patches/proton`, `scripts/write-capabilities.sh` or
+  the workflow itself (which holds the Proton pin) builds the runtime on
+  `main`, unsigned. That build saves the cache, and a newer push cancels an
+  older one still running.
+- A `runtime-*` tag restores the cache `main` saved and saves nothing. GitHub
+  lets a tag read the caches of the default branch but not another tag's, so
+  merging the runtime changes to `main` before tagging is what makes the
+  release fast. Tagging straight after the merge still works; the tag just
+  finds the cache from the previous `main` build.
+- Only the newest runtime cache is kept: the `prune-ccache` job deletes older
+  ones. Its token can delete caches and nothing else.
+
+The Rust jobs work the same way. They restore their caches everywhere, but
+only save them on `main`, because a cache saved for a pull request, another
+branch or a tag can only be read there, and every copy counts against the
+repository's 10 GB.
+
 ## Verifying a download by hand
 
 With the `RW...` public key from `signing.rs`:

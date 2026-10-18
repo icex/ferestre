@@ -6,12 +6,16 @@
 # 2h09m wall clock and 300 MB compressed. That is why it is a separate train
 # from the launcher rather than a step in it.
 #
-# Every run here is a cold build. --enable-ccache is passed, but nothing carries
-# the cache between runs, so it only helps within one. Caching it would need
-# actions/cache over a multi-gigabyte directory against a 10 GB per-repository
-# limit, to speed up a build that happens only when Wine or the GDK runtime
-# changes -- not obviously worth it, and worth reconsidering if that stops being
-# rare.
+# The compiler cache is kept between runs. Proton's build already runs its
+# compilers through ccache inside its container (--enable-ccache mounts
+# $CCACHE_DIR); the job restores that directory before configuring and, on
+# main only, saves it afterwards. GitHub scopes a cache to the ref that saved
+# it, and a tag may read the caches main saved but no other tag's, so main is
+# where it has to be saved: a push to main that changes what goes into the
+# runtime builds it too, unsigned, which keeps the cache warm and finds a
+# broken runtime build before a tag does. A tag restores and saves nothing.
+# Only one copy is kept (the prune job deletes older ones) because the whole
+# repository shares 10 GB.
 #
 # The three sources are all public, and all pinned by commit rather than by
 # branch. A runtime nobody can reproduce is a binary blob with a changelog:
@@ -53,6 +57,16 @@ on:
   push:
     tags:
       - 'runtime-*'
+    # What goes into the runtime: the patch series, the capability script,
+    # and this file, which holds the Proton pin.
+    branches: [main]
+    paths:
+      - 'patches/wine/**'
+      - 'patches/xgameruntime/**'
+      - 'patches/vkd3d-proton/**'
+      - 'patches/proton/**'
+      - 'scripts/write-capabilities.sh'
+      - '.github/workflows/runtime.yml'
   workflow_dispatch:
     inputs:
       proton_ref:
@@ -64,12 +78,23 @@ on:
 permissions:
   contents: read
 
+# A newer push to main makes an older main build pointless; a tag build is a
+# release and always runs to the end.
+concurrency:
+  group: runtime-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
     # An hour and a quarter cold, and a runner that dies at the default six
     # hours mid-link wastes the whole build rather than reporting anything.
     timeout-minutes: 330
+    env:
+      # Proton's Makefile mounts this into its container and passes every
+      # CCACHE_* variable through.
+      CCACHE_DIR: /home/runner/.ccache
+      CCACHE_MAXSIZE: 4G
     outputs:
       version: ${{ steps.version.outputs.version }}
       proton: ${{ steps.commits.outputs.proton }}
@@ -187,6 +212,28 @@ jobs:
               git -C vkd3d-proton apply "$p"
           done
 
+      # Keyed on what the objects are compiled from. An exact match is only
+      # likely for a rebuild; the fallbacks are what make the usual case, a
+      # patch series that moved since the last build, mostly hits.
+      - name: Restore the compiler cache
+        id: ccache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: runtime-ccache-v1-${{ steps.commits.outputs.proton }}-${{ hashFiles('ferestre/patches/wine/**', 'ferestre/patches/xgameruntime/**', 'ferestre/patches/vkd3d-proton/**') }}
+          restore-keys: |
+            runtime-ccache-v1-${{ steps.commits.outputs.proton }}-
+            runtime-ccache-v1-
+
+      # Only to read the statistics; the compilers run inside Proton's
+      # container, with its own ccache.
+      - name: Compiler cache statistics, before
+        run: |
+          mkdir -p "$CCACHE_DIR"
+          du -sh "$CCACHE_DIR"
+          sudo apt-get install -y -qq ccache >/dev/null || echo "::notice::no host ccache; no statistics"
+          ccache --zero-stats || true
+
       - name: Configure
         run: |
           set -euo pipefail
@@ -200,6 +247,21 @@ jobs:
           cd proton/build
           make -j"$(nproc)" dist
           df -h /
+
+      - name: Compiler cache statistics, after
+        if: always()
+        run: |
+          ccache --show-stats || true
+          du -sh "$CCACHE_DIR" || true
+
+      # Also after a failed build: the objects that did compile are still
+      # good, and the next attempt starts from them.
+      - name: Save the compiler cache
+        if: always() && github.ref == 'refs/heads/main' && steps.ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
 
       # The `proton` script Valve ships closes inherited descriptors before
       # exec, and the client hands Wine a memfd holding the decrypted
@@ -266,7 +328,7 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          msg="runtime $VERSION was built by a manual run and is UNSIGNED; ferestre install-runtime refuses it. Only a runtime-* tag signs and publishes."
+          msg="runtime $VERSION was built by a manual run or a push to main and is UNSIGNED; ferestre install-runtime refuses it. Only a runtime-* tag signs and publishes."
           echo "::notice::$msg"
           echo "$msg" >> "$GITHUB_STEP_SUMMARY"
 
@@ -278,6 +340,29 @@ jobs:
           # A 300 MB artefact on every manual run adds up; a tag's copy lives
           # on the release instead.
           retention-days: 14
+
+  # One compiler cache is enough, and two would crowd out everything else
+  # in the repository's 10 GB: drop every runtime cache but the newest. Its
+  # token can delete caches and nothing else, and it runs no build.
+  prune-ccache:
+    needs: build
+    if: always() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Keep only the newest compiler cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh cache list --key runtime-ccache- --sort created_at --order desc \
+              --limit 100 --json id,key --jq '.[1:][] | .id' |
+          while read -r id; do
+              echo ":: deleting compiler cache $id"
+              gh cache delete "$id"
+          done
 
   publish:
     needs: build
