@@ -1,5 +1,5 @@
 diff --git a/dlls/gameinput/gameinput.c b/dlls/gameinput/gameinput.c
-index 36b0eb9..f91a6ff 100644
+index 36b0eb9..cdcac5f 100644
 --- a/dlls/gameinput/gameinput.c
 +++ b/dlls/gameinput/gameinput.c
 @@ -27,6 +27,7 @@
@@ -10,12 +10,14 @@ index 36b0eb9..f91a6ff 100644
  #include "ddk/hidsdi.h"
  
  #include "initguid.h"
-@@ -51,6 +52,17 @@ static CRITICAL_SECTION_DEBUG game_input_cs_debug =
+@@ -51,6 +52,19 @@ static CRITICAL_SECTION_DEBUG game_input_cs_debug =
  static CRITICAL_SECTION game_input_cs = { &game_input_cs_debug, -1, 0, 0, 0, 0 };
  static struct game_input *game_input;
  
-+/* Held while the pad notification thread delivers device callbacks, so that
-+ * unregistering one can wait for a delivery in progress to finish. */
++/* Held while device callbacks are delivered -- by the pad notification thread,
++ * and by a registration reporting what is already connected -- so that
++ * unregistering one can wait for a delivery in progress to finish, and the two
++ * deliveries to one callback cannot overtake each other. */
 +static CRITICAL_SECTION device_callback_cs;
 +static CRITICAL_SECTION_DEBUG device_callback_cs_debug =
 +{
@@ -28,7 +30,7 @@ index 36b0eb9..f91a6ff 100644
  struct device
  {
      IGameInputDevice_v0 IGameInputDevice_v0_iface;
-@@ -442,6 +454,10 @@ static ULONG WINAPI game_input_v0_Release( IGameInput_v0 *iface )
+@@ -442,6 +456,10 @@ static ULONG WINAPI game_input_v0_Release( IGameInput_v0 *iface )
              free( callback );
          }
  
@@ -39,7 +41,7 @@ index 36b0eb9..f91a6ff 100644
          while ((ptr = list_head( &impl->callbacks_v2 )))
          {
              struct device_callback_v2 *callback = LIST_ENTRY(ptr, struct device_callback_v2, entry);
-@@ -737,7 +753,7 @@ static HRESULT create_dispatcher( IGameInputDispatcher **out )
+@@ -737,7 +755,7 @@ static HRESULT create_dispatcher( IGameInputDispatcher **out )
   * that initialises its input through GameInput waits for a keyboard and mouse
   * to be enumerated before it leaves its loading screen (Minecraft sits at 41%
   * forever otherwise). Present one of each as always-connected devices of the
@@ -48,7 +50,7 @@ index 36b0eb9..f91a6ff 100644
  struct virtual_device
  {
      IGameInputDevice_v2 IGameInputDevice_v2_iface;
-@@ -746,6 +762,8 @@ struct virtual_device
+@@ -746,6 +764,8 @@ struct virtual_device
      GameInputDeviceInfo_v2 info;
      GameInputKeyboardInfo_v2 keyboard;
      GameInputMouseInfo_v2 mouse;
@@ -57,7 +59,7 @@ index 36b0eb9..f91a6ff 100644
  };
  
  static struct virtual_device *impl_from_IGameInputDevice_v2( IGameInputDevice_v2 *iface )
-@@ -798,7 +816,12 @@ static HRESULT WINAPI virtual_device_GetHapticInfo( IGameInputDevice_v2 *iface,
+@@ -798,7 +818,12 @@ static HRESULT WINAPI virtual_device_GetHapticInfo( IGameInputDevice_v2 *iface,
  
  static GameInputDeviceStatus WINAPI virtual_device_GetDeviceStatus( IGameInputDevice_v2 *iface )
  {
@@ -70,7 +72,7 @@ index 36b0eb9..f91a6ff 100644
      return GameInputDeviceConnected | GameInputDeviceInputEnabled;
  }
  
-@@ -822,6 +845,16 @@ static void WINAPI virtual_device_SetForceFeedbackMotorGain( IGameInputDevice_v2
+@@ -822,6 +847,16 @@ static void WINAPI virtual_device_SetForceFeedbackMotorGain( IGameInputDevice_v2
  
  static void WINAPI virtual_device_SetRumbleState( IGameInputDevice_v2 *iface, const GameInputRumbleParams *params )
  {
@@ -87,7 +89,7 @@ index 36b0eb9..f91a6ff 100644
  }
  
  static HRESULT WINAPI virtual_device_DirectInputEscape( IGameInputDevice_v2 *iface, uint32_t command, const void *input,
-@@ -849,7 +882,24 @@ static const IGameInputDevice_v2Vtbl virtual_device_vtbl =
+@@ -849,7 +884,24 @@ static const IGameInputDevice_v2Vtbl virtual_device_vtbl =
  
  static struct virtual_device virtual_keyboard = { {&virtual_device_vtbl}, 1, GameInputKindKeyboard };
  static struct virtual_device virtual_mouse    = { {&virtual_device_vtbl}, 1, GameInputKindMouse };
@@ -113,7 +115,7 @@ index 36b0eb9..f91a6ff 100644
  
  static void virtual_device_init( struct virtual_device *device, const char *name, BYTE id_byte, uint16_t usage_id )
  {
-@@ -874,7 +924,7 @@ static void virtual_device_init( struct virtual_device *device, const char *name
+@@ -874,7 +926,7 @@ static void virtual_device_init( struct virtual_device *device, const char *name
          device->keyboard.maxSimultaneousKeys = 6;
          info->keyboardInfo = &device->keyboard;
      }
@@ -122,7 +124,7 @@ index 36b0eb9..f91a6ff 100644
      {
          device->mouse.supportedButtons = GameInputMouseLeftButton | GameInputMouseRightButton | GameInputMouseMiddleButton |
                                           GameInputMouseButton4 | GameInputMouseButton5;
-@@ -888,19 +938,68 @@ static void virtual_device_init( struct virtual_device *device, const char *name
+@@ -888,19 +940,68 @@ static void virtual_device_init( struct virtual_device *device, const char *name
  static void virtual_devices_init( void )
  {
      static BOOL done;
@@ -193,7 +195,7 @@ index 36b0eb9..f91a6ff 100644
  };
  
  static struct virtual_reading *impl_from_IGameInputReading_v2( IGameInputReading_v2 *iface )
-@@ -932,8 +1031,10 @@ static ULONG WINAPI virtual_reading_AddRef( IGameInputReading_v2 *iface )
+@@ -932,8 +1033,10 @@ static ULONG WINAPI virtual_reading_AddRef( IGameInputReading_v2 *iface )
  
  static ULONG WINAPI virtual_reading_Release( IGameInputReading_v2 *iface )
  {
@@ -206,7 +208,7 @@ index 36b0eb9..f91a6ff 100644
  }
  
  static GameInputKind WINAPI virtual_reading_GetInputKind( IGameInputReading_v2 *iface )
-@@ -943,7 +1044,8 @@ static GameInputKind WINAPI virtual_reading_GetInputKind( IGameInputReading_v2 *
+@@ -943,7 +1046,8 @@ static GameInputKind WINAPI virtual_reading_GetInputKind( IGameInputReading_v2 *
  
  static uint64_t WINAPI virtual_reading_GetTimestamp( IGameInputReading_v2 *iface )
  {
@@ -216,7 +218,7 @@ index 36b0eb9..f91a6ff 100644
  }
  
  static void WINAPI virtual_reading_GetDevice( IGameInputReading_v2 *iface, IGameInputDevice_v2 **device )
-@@ -1233,7 +1335,41 @@ static bool WINAPI virtual_reading_GetMouseState( IGameInputReading_v2 *iface, G
+@@ -1233,7 +1337,41 @@ static bool WINAPI virtual_reading_GetMouseState( IGameInputReading_v2 *iface, G
  static bool WINAPI virtual_reading_GetSensorsState( IGameInputReading_v2 *iface, GameInputSensorsState *state ) { return FALSE; }
  static bool WINAPI virtual_reading_GetArcadeStickState( IGameInputReading_v2 *iface, GameInputArcadeStickState *state ) { return FALSE; }
  static bool WINAPI virtual_reading_GetFlightStickState( IGameInputReading_v2 *iface, GameInputFlightStickState *state ) { return FALSE; }
@@ -259,7 +261,7 @@ index 36b0eb9..f91a6ff 100644
  static bool WINAPI virtual_reading_GetRacingWheelState( IGameInputReading_v2 *iface, GameInputRacingWheelState *state ) { return FALSE; }
  static bool WINAPI virtual_reading_GetUiNavigationState( IGameInputReading_v2 *iface, GameInputUiNavigationState *state ) { return FALSE; }
  
-@@ -1281,12 +1417,282 @@ static struct virtual_reading *virtual_reading_for( GameInputKind kind, IGameInp
+@@ -1281,12 +1419,282 @@ static struct virtual_reading *virtual_reading_for( GameInputKind kind, IGameInp
      return NULL;
  }
  
@@ -546,7 +548,7 @@ index 36b0eb9..f91a6ff 100644
  
  static struct game_input *impl_from_v2_IGameInput( IGameInput_v2 *iface )
  {
-@@ -1333,8 +1739,7 @@ static ULONG WINAPI game_input_v2_Release( IGameInput_v2 *iface )
+@@ -1333,8 +1741,7 @@ static ULONG WINAPI game_input_v2_Release( IGameInput_v2 *iface )
  
  static uint64_t WINAPI game_input_v2_GetCurrentTimestamp( IGameInput_v2 *iface )
  {
@@ -556,7 +558,7 @@ index 36b0eb9..f91a6ff 100644
  }
  
  static HRESULT WINAPI game_input_v2_GetCurrentReading( IGameInput_v2 *iface, GameInputKind kind,
-@@ -1345,6 +1750,12 @@ static HRESULT WINAPI game_input_v2_GetCurrentReading( IGameInput_v2 *iface, Gam
+@@ -1345,6 +1752,12 @@ static HRESULT WINAPI game_input_v2_GetCurrentReading( IGameInput_v2 *iface, Gam
      TRACE( "impl %p, kind %#x, device %p, reading %p.\n", impl_from_v2_IGameInput( iface ), kind, device, reading );
  
      if (!reading) return E_POINTER;
@@ -569,7 +571,7 @@ index 36b0eb9..f91a6ff 100644
      if (!(r = virtual_reading_for( kind, device )))
      {
          *reading = NULL;
-@@ -1360,11 +1771,9 @@ static HRESULT WINAPI game_input_v2_GetNextReading( IGameInput_v2 *iface, IGameI
+@@ -1360,11 +1773,9 @@ static HRESULT WINAPI game_input_v2_GetNextReading( IGameInput_v2 *iface, IGameI
  {
      TRACE( "impl %p, reference %p, kind %#x, device %p, reading %p.\n", impl_from_v2_IGameInput( iface ), reference, kind, device, reading );
  
@@ -582,7 +584,7 @@ index 36b0eb9..f91a6ff 100644
  }
  
  static HRESULT WINAPI game_input_v2_GetPreviousReading( IGameInput_v2 *iface, IGameInputReading_v2 *reference,
-@@ -1390,8 +1799,9 @@ static HRESULT WINAPI game_input_v2_RegisterDeviceCallback( IGameInput_v2 *iface
+@@ -1390,8 +1801,9 @@ static HRESULT WINAPI game_input_v2_RegisterDeviceCallback( IGameInput_v2 *iface
                                                              GameInputDeviceCallback_v2 callback, GameInputCallbackToken *token )
  {
      struct game_input *impl = impl_from_v2_IGameInput( iface );
@@ -593,8 +595,18 @@ index 36b0eb9..f91a6ff 100644
  
      TRACE( "impl %p, device %p, kind %#x, filter %#x, enum_kind %#x, context %p, callback %p, token %p.\n",
             impl, device, kind, filter, enum_kind, context, callback, token );
-@@ -1406,24 +1816,34 @@ static HRESULT WINAPI game_input_v2_RegisterDeviceCallback( IGameInput_v2 *iface
+@@ -1404,26 +1816,45 @@ static HRESULT WINAPI game_input_v2_RegisterDeviceCallback( IGameInput_v2 *iface
+     entry->context = context;
+     entry->callback = callback;
  
++    /* Held until the devices already connected have been reported, so the
++     * pad notification thread cannot report a change to this callback first:
++     * a pad that drops out while the keyboard and mouse are being reported
++     * would otherwise be reported gone and then, from the stale list taken
++     * here, connected -- and a title that keeps its pad list from these calls
++     * would hold on to a pad that is not there. Same lock order as that
++     * thread, and recursive, so a callback may still register or unregister. */
++    EnterCriticalSection( &device_callback_cs );
      EnterCriticalSection( &game_input_cs );
      list_add_tail( &impl->callbacks_v2, &entry->entry );
 -    LeaveCriticalSection( &game_input_cs );
@@ -606,7 +618,7 @@ index 36b0eb9..f91a6ff 100644
 -     * ask for AsyncEnumeration accept the same events. */
 +    /* Report what is already connected. Pads are taken from what the
 +     * notification thread last reported, so that whatever changes from here
-+     * on is reported by that thread, once. */
++     * on is reported by that thread, once, and after these. */
      if (enum_kind != GameInputNoEnumeration && (filter & GameInputDeviceConnected))
      {
          for (i = 0; i < ARRAY_SIZE(virtual_devices); i++)
@@ -631,14 +643,15 @@ index 36b0eb9..f91a6ff 100644
 +    LeaveCriticalSection( &game_input_cs );
 +    *token = (UINT_PTR)entry;
 +
-+    /* Delivered synchronously, outside the lock, which is what
++    /* Delivered synchronously, outside game_input_cs, which is what
 +     * BlockingEnumeration means; titles that ask for AsyncEnumeration accept
 +     * the same events. */
 +    deliver_device_notifications( initial, count );
++    LeaveCriticalSection( &device_callback_cs );
      return S_OK;
  }
  
-@@ -1464,6 +1884,12 @@ static bool WINAPI game_input_v2_UnregisterCallback( IGameInput_v2 *iface, GameI
+@@ -1464,6 +1895,12 @@ static bool WINAPI game_input_v2_UnregisterCallback( IGameInput_v2 *iface, GameI
          break;
      }
      LeaveCriticalSection( &game_input_cs );

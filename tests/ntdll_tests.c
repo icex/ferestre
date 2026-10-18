@@ -15,7 +15,8 @@
  *   ntdll_tests seh-dump           - run with WINEDEBUG=+seh: faults whose
  *                                    surrounding bytes are unreadable must
  *                                    reach the title's vectored handler once,
- *                                    not again from inside ntdll's dump.
+ *                                    not again from inside ntdll's dump; the
+ *                                    bytes of an execute-only page are shown.
  *   ntdll_tests alloc              - FileAllocationInformation beyond end of
  *                                    file does not leave space reserved after
  *                                    the handle is closed; below end of file it
@@ -165,7 +166,7 @@ static void test_seh_dump(void)
 {
     void (*volatile null_vtable_call)(void) = (void (*)(void))(ULONG_PTR)0x18;
     void (*code_fn)(void);
-    BYTE *region, *code;
+    BYTE *region, *code, *xcode;
     void *veh;
 
     veh = AddVectoredExceptionHandler(1, count_faults);
@@ -193,6 +194,29 @@ static void test_seh_dump(void)
         code_fn();
         OK(ill == 1, "ud2 seen once by the handler (%ld)", ill);
         OK(stray_av == 0, "no fault from reading the reserved page before it (%ld)", stray_av);
+    }
+
+    /* ud2 32 bytes into an execute-only page. Wine maps such pages readable,
+     * so the dump shows the code around the fault rather than "??": this is
+     * the page a crash dump is most often about. */
+    xcode = VirtualAlloc(NULL, 0x1000, MEM_COMMIT, PAGE_READWRITE);
+    OK(xcode != NULL, "allocated the execute-only page");
+    if (xcode)
+    {
+        static const BYTE ud2_ret[] = { 0x0f, 0x0b, 0xc3 };
+        DWORD old;
+
+        memset(xcode, 0x90, 32);
+        memcpy(xcode + 32, ud2_ret, sizeof(ud2_ret));
+        OK(VirtualProtect(xcode, 0x1000, PAGE_EXECUTE, &old), "page made execute-only");
+        FlushInstructionCache(GetCurrentProcess(), xcode, 32 + sizeof(ud2_ret));
+        ud2_addr = xcode + 32;
+        ill = stray_av = 0;
+        code_fn = (void (*)(void))(xcode + 32);
+        code_fn();
+        OK(ill == 1, "ud2 on the execute-only page seen once by the handler (%ld)", ill);
+        OK(stray_av == 0, "no fault from dumping the execute-only page (%ld)", stray_av);
+        VirtualFree(xcode, 0, MEM_RELEASE);
     }
     RemoveVectoredExceptionHandler(veh);
     if (region) VirtualFree(region, 0, MEM_RELEASE);

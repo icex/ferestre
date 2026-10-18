@@ -1,8 +1,8 @@
 diff --git a/dlls/gameinput/gameinput.c b/dlls/gameinput/gameinput.c
-index f91a6ff..dbe148f 100644
+index cdcac5f..19e7320 100644
 --- a/dlls/gameinput/gameinput.c
 +++ b/dlls/gameinput/gameinput.c
-@@ -764,6 +764,16 @@ struct virtual_device
+@@ -766,6 +766,16 @@ struct virtual_device
      GameInputMouseInfo_v2 mouse;
      GameInputGamepadInfo_v2 gamepad;
      DWORD xinput_index;
@@ -19,7 +19,7 @@ index f91a6ff..dbe148f 100644
  };
  
  static struct virtual_device *impl_from_IGameInputDevice_v2( IGameInputDevice_v2 *iface )
-@@ -782,6 +792,12 @@ static HRESULT WINAPI virtual_device_QueryInterface( IGameInputDevice_v2 *iface,
+@@ -784,6 +794,12 @@ static HRESULT WINAPI virtual_device_QueryInterface( IGameInputDevice_v2 *iface,
          IGameInputDevice_v2_AddRef( iface );
          return S_OK;
      }
@@ -32,7 +32,7 @@ index f91a6ff..dbe148f 100644
  
      FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
      *out = NULL;
-@@ -880,6 +896,173 @@ static const IGameInputDevice_v2Vtbl virtual_device_vtbl =
+@@ -882,6 +898,173 @@ static const IGameInputDevice_v2Vtbl virtual_device_vtbl =
      virtual_device_DirectInputEscape,
  };
  
@@ -206,7 +206,7 @@ index f91a6ff..dbe148f 100644
  static struct virtual_device virtual_keyboard = { {&virtual_device_vtbl}, 1, GameInputKindKeyboard };
  static struct virtual_device virtual_mouse    = { {&virtual_device_vtbl}, 1, GameInputKindMouse };
  /* Read pads through Wine's XInput rather than enumerating a second copy of each
-@@ -933,6 +1116,44 @@ static void virtual_device_init( struct virtual_device *device, const char *name
+@@ -935,6 +1118,44 @@ static void virtual_device_init( struct virtual_device *device, const char *name
          device->mouse.hasWheelY = TRUE;
          info->mouseInfo = &device->mouse;
      }
@@ -251,7 +251,7 @@ index f91a6ff..dbe148f 100644
  }
  
  static void virtual_devices_init( void )
-@@ -969,6 +1190,7 @@ static void virtual_devices_init( void )
+@@ -971,6 +1192,7 @@ static void virtual_devices_init( void )
          device->gamepad.rightThumbstickButtonLabel = GameInputLabelXboxRightStickButton;
          device->info.supportedRumbleMotors = GameInputRumbleLowFrequency | GameInputRumbleHighFrequency;
      }
@@ -259,7 +259,7 @@ index f91a6ff..dbe148f 100644
      done = TRUE;
  }
  
-@@ -1748,6 +1970,7 @@ static HRESULT WINAPI game_input_v2_GetCurrentReading( IGameInput_v2 *iface, Gam
+@@ -1750,6 +1972,7 @@ static HRESULT WINAPI game_input_v2_GetCurrentReading( IGameInput_v2 *iface, Gam
      struct virtual_reading *r;
  
      TRACE( "impl %p, kind %#x, device %p, reading %p.\n", impl_from_v2_IGameInput( iface ), kind, device, reading );
@@ -267,7 +267,7 @@ index f91a6ff..dbe148f 100644
  
      if (!reading) return E_POINTER;
      *reading = NULL;
-@@ -1770,6 +1993,7 @@ static HRESULT WINAPI game_input_v2_GetNextReading( IGameInput_v2 *iface, IGameI
+@@ -1772,6 +1995,7 @@ static HRESULT WINAPI game_input_v2_GetNextReading( IGameInput_v2 *iface, IGameI
                                                      GameInputKind kind, IGameInputDevice_v2 *device, IGameInputReading_v2 **reading )
  {
      TRACE( "impl %p, reference %p, kind %#x, device %p, reading %p.\n", impl_from_v2_IGameInput( iface ), reference, kind, device, reading );
@@ -275,7 +275,7 @@ index f91a6ff..dbe148f 100644
  
      if (!reading) return E_POINTER;
      *reading = NULL;
-@@ -1805,6 +2029,7 @@ static HRESULT WINAPI game_input_v2_RegisterDeviceCallback( IGameInput_v2 *iface
+@@ -1807,6 +2031,7 @@ static HRESULT WINAPI game_input_v2_RegisterDeviceCallback( IGameInput_v2 *iface
  
      TRACE( "impl %p, device %p, kind %#x, filter %#x, enum_kind %#x, context %p, callback %p, token %p.\n",
             impl, device, kind, filter, enum_kind, context, callback, token );

@@ -1,0 +1,688 @@
+From: Ferestre contributors
+Subject: Keep token requests off title queues, answer roles freshly after a quiet spell, and verify server certificates
+
+A token request's DoWork no longer makes the service round trip itself. In
+strict manual mode (XGR_STRICT_MANUAL_QUEUES, Halo Infinite) DoWork runs on
+the title's own Work port, so with the service stalled the title's dispatch
+thread was held for the whole exchange, up to 65 s, and its own work queued
+behind it. DoWork now hands the exchange to the pool, or a thread of its own,
+through xgr_async_run_detached, which keeps it counted as the queue's work:
+terminating the queue still waits for it, and the terminated callback cannot
+overtake its completion.
+
+The role poller stops 30 s after the last question, so the first
+XUserGetState, XUserIsStoreUser or XStoreIsLicenseValid after a quiet spell
+used to answer from the end of the last window: a licence still valid after a
+Store sign-out, a player still signed in after signing out. Such a question
+now wakes the poller and waits for its answer, for at most 1 s; a service that
+does not answer in time gets the last state, as during any outage.
+Registration and XUserAddAsync are unchanged.
+
+XNetworkingVerifyServerCertificate accepted every certificate. It now takes
+the server certificate from the WinHTTP request handle and verifies its chain
+against the request's host under the SSL policy, as WinHTTP does while
+connecting, honouring the SECURITY_FLAG_IGNORE_* exceptions the request
+carries. A handle that is not a WinHTTP request, or a request with no server
+certificate, keeps the old answer and is logged once. winhttp and crypt32 are
+looked up at run time, not imported.
+
+diff --git a/private.h b/private.h
+index 1ca3f68..6ea3eab 100644
+--- a/private.h
++++ b/private.h
+@@ -112,6 +112,10 @@ HRESULT WINAPI QueryApiImpl( const GUID *classId, REFIID interfaceId, void **out
+ void xgr_async_complete( XAsyncBlock *async, HRESULT hr, void *payload );
+ /* Same, also recording the buffer size XAsyncGetResultSize should report. */
+ void xgr_async_complete_ex( XAsyncBlock *async, HRESULT hr, void *payload, SIZE_T result_size );
++/* From a provider's DoWork: run `callback` off the thread that dispatched it,
++ * counted as the block's queue's work, and let it complete the operation. On
++ * failure nothing runs and the caller does the work itself. */
++HRESULT xgr_async_run_detached( XAsyncBlock *async, PTP_SIMPLE_CALLBACK callback, void *context );
+ 
+ /* Inline MicrosoftGame.config text from InitializeApiImplEx2, or NULL. */
+ extern char *xgr_game_config;
+@@ -173,7 +177,9 @@ BOOLEAN xgr_role_watch_unregister(enum xgr_role_watch_kind, void *, XTaskQueueRe
+ void xgr_role_watch_close(enum xgr_role_watch_kind, void *);
+ /* The Store account's entitlement to the running game as last answered by the
+  * service, kept off the title's threads (xuser.c). FALSE while nothing
+- * definitive is known. Store requests that ask the service themselves feed
+- * their answer back with the unix call's status. */
+-BOOL xgr_role_entitlement( UINT32 *active );
++ * definitive is known. With `fresh`, a question after a quiet spell waits a
++ * bounded time for a current answer (see role_state_get). Store requests that
++ * ask the service themselves feed their answer back with the unix call's
++ * status. */
++BOOL xgr_role_entitlement( UINT32 *active, BOOL fresh );
+ void xgr_role_entitlement_store( LONG status /* NTSTATUS */, UINT32 active );
+diff --git a/xnetworking.c b/xnetworking.c
+index 75a07bc..31028f8 100644
+--- a/xnetworking.c
++++ b/xnetworking.c
+@@ -21,8 +21,10 @@
+ 
+ #include "private.h"
+ 
+-/* for the WINHTTP_FLAG_SECURE_PROTOCOL_* mask the GDK reports below */
++/* for the WINHTTP_FLAG_SECURE_PROTOCOL_* mask the GDK reports below, and the
++ * request handles XNetworkingVerifyServerCertificate is given */
+ #include <winhttp.h>
++#include <wincrypt.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+ 
+@@ -130,9 +132,8 @@ static BOOLEAN WINAPI x_networking_XNetworkingUnregisterPreferredLocalUdpMultipl
+  * itself from the observer map of an already-freed WebSocket. Joining from the
+  * history or by IP never opens that socket, which is why only the menu froze.
+  *
+- * There is nothing to pin: XNetworkingVerifyServerCertificate below accepts the
+- * connection, so report no thumbprints and let the caller do the ordinary TLS
+- * validation it would otherwise do.
++ * There is nothing to pin: report no thumbprints, and let
++ * XNetworkingVerifyServerCertificate below do the ordinary TLS validation.
+  *
+  * The protocol flags are not a formality either. The GDK documents them as a
+  * WINHTTP_FLAG_SECURE_PROTOCOL_* mask to be handed straight to
+@@ -215,11 +216,193 @@ static HRESULT WINAPI x_networking_XNetworkingQuerySecurityInformationForUrlUtf1
+                                         securityInformationBuffer, securityInformation );
+ }
+ 
++/* XNetworkingVerifyServerCertificate.
++ *
++ * A title (libHttpClient's WinHTTP provider, in practice) calls this from its
++ * WINHTTP_CALLBACK_STATUS_SENDING_REQUEST callback with the request handle, and
++ * fails the request unless it succeeds. It used to succeed unconditionally,
++ * which made it no check at all. So the server's certificate is taken from the
++ * request and its chain verified against the request's host, under the SSL
++ * policy, the way WinHTTP verifies it while connecting -- including the
++ * SECURITY_FLAG_IGNORE_* exceptions the request carries, so a request WinHTTP
++ * was told to accept is accepted here too.
++ *
++ * Neither library is imported: the handle can only be a WinHTTP request if the
++ * title has winhttp.dll loaded, and crypt32.dll is loaded by it. A handle that
++ * is not a WinHTTP request, or a request with no server certificate (plain
++ * HTTP), cannot be checked here; that keeps the old answer, logged once.
++ *
++ * Thumbprint pinning is not checked. QuerySecurityInformationForUrl above
++ * reports none, so a title only has some to pass if it built its own. */
++static INIT_ONCE crypt32_once = INIT_ONCE_STATIC_INIT;
++static __typeof__(CertGetCertificateChain) *pCertGetCertificateChain;
++static __typeof__(CertVerifyCertificateChainPolicy) *pCertVerifyCertificateChainPolicy;
++static __typeof__(CertFreeCertificateChain) *pCertFreeCertificateChain;
++static __typeof__(CertFreeCertificateContext) *pCertFreeCertificateContext;
++
++static BOOL WINAPI load_crypt32( INIT_ONCE *once, void *param, void **context )
++{
++    HMODULE crypt32 = LoadLibraryW( L"crypt32.dll" );
++
++    if (!crypt32) return TRUE;
++    pCertGetCertificateChain = (void *)GetProcAddress( crypt32, "CertGetCertificateChain" );
++    pCertVerifyCertificateChainPolicy = (void *)GetProcAddress( crypt32, "CertVerifyCertificateChainPolicy" );
++    pCertFreeCertificateChain = (void *)GetProcAddress( crypt32, "CertFreeCertificateChain" );
++    pCertFreeCertificateContext = (void *)GetProcAddress( crypt32, "CertFreeCertificateContext" );
++    return TRUE;
++}
++
++static void cannot_verify( void *request, const char *why, DWORD error )
++{
++    static LONG logged;
++
++    if (!InterlockedExchange( &logged, 1 ))
++        WARN( "cannot verify the server certificate of %p (%s, error %lu); accepting it, as before.\n",
++              request, why, error );
++    else TRACE( "cannot verify the server certificate of %p (%s, error %lu).\n", request, why, error );
++}
++
++/* The host the request was made to, from its URL. */
++static BOOL request_host( __typeof__(WinHttpQueryOption) *query, __typeof__(WinHttpCrackUrl) *crack,
++                          HINTERNET request, WCHAR *host, DWORD host_len )
++{
++    URL_COMPONENTS parts = { sizeof(parts) };
++    DWORD size = 0;
++    WCHAR *url;
++    BOOL ret = FALSE;
++
++    query( request, WINHTTP_OPTION_URL, NULL, &size );
++    if (!size || !(url = calloc( 1, size + sizeof(WCHAR) ))) return FALSE;
++    parts.dwHostNameLength = ~0u;
++    if (query( request, WINHTTP_OPTION_URL, url, &size ) && crack( url, 0, 0, &parts ) &&
++        parts.lpszHostName && parts.dwHostNameLength && parts.dwHostNameLength < host_len)
++    {
++        memcpy( host, parts.lpszHostName, parts.dwHostNameLength * sizeof(WCHAR) );
++        host[parts.dwHostNameLength] = 0;
++        ret = TRUE;
++    }
++    free( url );
++    return ret;
++}
++
++/* WinHTTP's own verdict, as dlls/winhttp/net.c reaches it: chain errors the
++ * request does not ignore first, then the SSL policy for the host. */
++static DWORD verify_chain( const CERT_CONTEXT *cert, WCHAR *host, DWORD security_flags )
++{
++    static const DWORD supported = CERT_TRUST_IS_NOT_TIME_VALID | CERT_TRUST_IS_UNTRUSTED_ROOT |
++                                   CERT_TRUST_IS_NOT_VALID_FOR_USAGE;
++    char oid_server_auth[] = szOID_PKIX_KP_SERVER_AUTH;
++    char *server_auth[] = { oid_server_auth };
++    CERT_CHAIN_PARA chain_para = { sizeof(chain_para) };
++    SSL_EXTRA_CERT_CHAIN_POLICY_PARA ssl = { {sizeof(ssl)} };
++    CERT_CHAIN_POLICY_PARA policy = { sizeof(policy) };
++    CERT_CHAIN_POLICY_STATUS status = { sizeof(status) };
++    const CERT_CHAIN_CONTEXT *chain;
++    CERT_CHAIN_CONTEXT copy;
++    DWORD errors, err = ERROR_SUCCESS;
++
++    chain_para.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
++    chain_para.RequestedUsage.Usage.cUsageIdentifier = 1;
++    chain_para.RequestedUsage.Usage.rgpszUsageIdentifier = server_auth;
++    if (!pCertGetCertificateChain( NULL, cert, NULL, cert->hCertStore, &chain_para, 0, NULL, &chain ))
++        return ERROR_WINHTTP_SECURE_CHANNEL_ERROR;
++
++    if ((errors = chain->TrustStatus.dwErrorStatus))
++    {
++        if (errors & CERT_TRUST_IS_NOT_TIME_VALID)
++        {
++            if (!(security_flags & SECURITY_FLAG_IGNORE_CERT_DATE_INVALID)) err = ERROR_WINHTTP_SECURE_CERT_DATE_INVALID;
++        }
++        else if (errors & (CERT_TRUST_IS_UNTRUSTED_ROOT | CERT_TRUST_IS_PARTIAL_CHAIN))
++        {
++            if (!(security_flags & SECURITY_FLAG_IGNORE_UNKNOWN_CA)) err = ERROR_WINHTTP_SECURE_INVALID_CA;
++        }
++        else if (errors & CERT_TRUST_IS_REVOKED) err = ERROR_WINHTTP_SECURE_CERT_REVOKED;
++        else if (errors & CERT_TRUST_IS_NOT_VALID_FOR_USAGE)
++        {
++            if (!(security_flags & SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE)) err = ERROR_WINHTTP_SECURE_CERT_WRONG_USAGE;
++        }
++        else if (errors & ~(supported | CERT_TRUST_IS_OFFLINE_REVOCATION | CERT_TRUST_REVOCATION_STATUS_UNKNOWN))
++            err = ERROR_WINHTTP_SECURE_INVALID_CERT;
++    }
++    if (!err)
++    {
++        /* An error already ignored above must not stop the policy from
++         * making its other checks. */
++        copy = *chain;
++        copy.TrustStatus.dwErrorStatus = 0;
++        ssl.dwAuthType = AUTHTYPE_SERVER;
++        ssl.pwszServerName = host;
++        ssl.fdwChecks = security_flags;
++        policy.pvExtraPolicyPara = &ssl;
++        if (!pCertVerifyCertificateChainPolicy( CERT_CHAIN_POLICY_SSL, &copy, &policy, &status ))
++            err = ERROR_WINHTTP_SECURE_CHANNEL_ERROR;
++        else if (status.dwError == CERT_E_CN_NO_MATCH) err = ERROR_WINHTTP_SECURE_CERT_CN_INVALID;
++        else if (status.dwError) err = ERROR_WINHTTP_SECURE_INVALID_CERT;
++    }
++    pCertFreeCertificateChain( chain );
++    return err;
++}
++
+ static HRESULT WINAPI x_networking_XNetworkingVerifyServerCertificate( IXNetworkingImpl2 *iface, void *requestHandle, const XNetworkingSecurityInformation *securityInformation )
+ {
++    static const DWORD ignorable = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
++                                   SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
++    __typeof__(WinHttpQueryOption) *query;
++    __typeof__(WinHttpCrackUrl) *crack;
++    const CERT_CONTEXT *cert = NULL;
++    DWORD size, flags = 0, err;
++    WCHAR host[256] = {0};
++    HMODULE winhttp;
++    HRESULT hr;
++
+     TRACE( "iface %p, requestHandle %p, securityInformation %p.\n", iface, requestHandle, securityInformation );
+-    /* no Xbox Live cert pinning offline; accept the connection */
+-    return S_OK;
++
++    if (securityInformation && securityInformation->thumbprintCount)
++        FIXME( "%Iu certificate thumbprints not checked.\n", securityInformation->thumbprintCount );
++
++    InitOnceExecuteOnce( &crypt32_once, load_crypt32, NULL, NULL );
++    if (!pCertGetCertificateChain || !pCertVerifyCertificateChainPolicy || !pCertFreeCertificateChain ||
++        !pCertFreeCertificateContext)
++    {
++        cannot_verify( requestHandle, "no crypt32", 0 );
++        return S_OK;
++    }
++    /* Held for the call, so the title cannot unload it from under us. */
++    if (!requestHandle || !GetModuleHandleExW( 0, L"winhttp.dll", &winhttp ))
++    {
++        cannot_verify( requestHandle, "not a WinHTTP request", 0 );
++        return S_OK;
++    }
++    query = (void *)GetProcAddress( winhttp, "WinHttpQueryOption" );
++    crack = (void *)GetProcAddress( winhttp, "WinHttpCrackUrl" );
++    size = sizeof(cert);
++    if (!query || !crack || !query( requestHandle, WINHTTP_OPTION_SERVER_CERT_CONTEXT, &cert, &size ) || !cert)
++    {
++        cannot_verify( requestHandle, "no server certificate", GetLastError() );
++        FreeLibrary( winhttp );
++        return S_OK;
++    }
++    size = sizeof(flags);
++    if (!query( requestHandle, WINHTTP_OPTION_SECURITY_FLAGS, &flags, &size )) flags = 0;
++    flags &= ignorable;
++
++    if (!request_host( query, crack, requestHandle, host, ARRAY_SIZE(host) ))
++    {
++        /* The certificate is from a connection WinHTTP made to some host; with
++         * no way to name it, the name check has nothing to compare against. */
++        WARN( "no host for request %p; verifying the chain without its name.\n", requestHandle );
++        err = verify_chain( cert, NULL, flags | SECURITY_FLAG_IGNORE_CERT_CN_INVALID );
++    }
++    else err = verify_chain( cert, host, flags );
++
++    pCertFreeCertificateContext( cert );
++    FreeLibrary( winhttp );
++
++    hr = err ? HRESULT_FROM_WIN32( err ) : S_OK;
++    if (FAILED(hr)) WARN( "server certificate of %p for %s refused: %#lx.\n", requestHandle, debugstr_w( host ), hr );
++    else TRACE( "server certificate of %p for %s verified (ignoring %#lx).\n", requestHandle, debugstr_w( host ), flags );
++    return hr;
+ }
+ 
+ /* Report a plain, unmetered wired connection. Titles gate HTTP startup on this:
+diff --git a/xstore.c b/xstore.c
+index b4a2189..cfd6d88 100644
+--- a/xstore.c
++++ b/xstore.c
+@@ -731,7 +731,7 @@ static BOOLEAN WINAPI x_store_XStoreIsLicenseValid( IXStoreImpl6 *iface, const X
+     TRACE( "iface %p, storeLicenseHandle %p.\n", iface, storeLicenseHandle );
+     if (lic && lic->verified)
+     {
+-        if (xgr_role_entitlement(&active)) lic->valid = !!active;
++        if (xgr_role_entitlement(&active, TRUE)) lic->valid = !!active;
+         return lic->valid;
+     }
+     return lic && lic->valid;
+@@ -1174,7 +1174,7 @@ static HRESULT WINAPI x_store_XStoreRegisterGameLicenseChanged( IXStoreImpl6 *if
+         if (!storeContextHandle || !xgr_config_element("StoreId",store_id,sizeof(store_id))) return E_INVALIDARG;
+         /* No request here: the watch takes the first answer as its baseline. */
+         return xgr_role_watch_register(XGR_ROLE_WATCH_GAME,storeContextHandle,queue,context,NULL,callback,
+-            xgr_role_entitlement(&active) ? (int)!!active : -1,token);
++            xgr_role_entitlement(&active, FALSE) ? (int)!!active : -1,token);
+     }
+     /* Legacy mode has no live Store state. */
+     if (token) token->token = 1;
+diff --git a/xthreading.c b/xthreading.c
+index 5a52da0..5a91d8e 100644
+--- a/xthreading.c
++++ b/xthreading.c
+@@ -1043,6 +1043,61 @@ static void queue_finish( struct x_task_queue *queue )
+     }
+ }
+ 
++/* Provider work that must not run where DoWork was dispatched.
++ *
++ * In strict manual mode an operation's DoWork runs on the title's own Work
++ * port, so a provider whose work blocks -- a service round trip with a long
++ * deadline -- blocks the title's dispatch thread and everything queued behind
++ * it. Such a provider hands the blocking part here from DoWork and returns
++ * E_PENDING; the work runs on the pool, or a thread of its own when the pool
++ * refuses, and completes the operation itself.
++ *
++ * It is still the queue's work, exactly as provider work is in the other
++ * modes: the block's queue counts it until it returns, so terminating the
++ * queue waits for it, and the terminated callback cannot overtake its
++ * completion. */
++struct x_detached_work
++{
++    struct x_task_queue *queue;
++    PTP_SIMPLE_CALLBACK callback;
++    void *context;
++};
++
++static void CALLBACK detached_work_callback( TP_CALLBACK_INSTANCE *instance, void *arg )
++{
++    struct x_detached_work *work = arg;
++    struct x_task_queue *queue = work->queue;
++
++    work->callback( instance, work->context );
++    free( work );
++    if (queue) queue_finish( queue );
++}
++
++HRESULT xgr_async_run_detached( XAsyncBlock *async, PTP_SIMPLE_CALLBACK callback, void *context )
++{
++    struct x_detached_work *work;
++    struct x_async_op *op;
++    HRESULT hr;
++
++    if (!async || !callback) return E_INVALIDARG;
++    if (!(work = calloc( 1, sizeof(*work) ))) return E_OUTOFMEMORY;
++    work->callback = callback;
++    work->context = context;
++    if ((op = acquire_async_op( async )))
++    {
++        work->queue = (struct x_task_queue *)op->route.queue;
++        release_async_op( op );
++    }
++    if (work->queue) queue_hold( work->queue );
++
++    if (TrySubmitThreadpoolCallback( detached_work_callback, work, NULL )) return S_OK;
++    if (SUCCEEDED(hr = run_off_pool( detached_work_callback, work ))) return S_OK;
++
++    if (work->queue) queue_finish( work->queue );
++    free( work );
++    return hr;
++}
++
+ /* Block until everything the queue owes has returned.
+  *
+  * Work still running can complete an operation on this queue while we wait,
+diff --git a/xuser.c b/xuser.c
+index 1ac5187..658edbc 100644
+--- a/xuser.c
++++ b/xuser.c
+@@ -297,10 +297,26 @@ static BOOL get_live_identity( UINT64 *xuid, char *gamertag, SIZE_T gamertag_siz
+  * to read as a sign-out or a lost licence, and a licence handle never recovered
+  * from it. An answer in a protocol version this side cannot read is
+  * definitive, and fails closed. A source is polled while something watches it
+- * or a title asked about it in the last half minute. */
++ * or a title asked about it in the last half minute.
++ *
++ * Outside that window nothing polls, so what is kept can be as old as the
++ * last question. A title checking its licence once a minute with nothing
++ * registered would then be told about a Store sign-out a whole question late,
++ * and a sign-in likewise. So the first question after a quiet spell -- when
++ * nothing has asked the service for ROLE_FRESH_MS -- wakes the poller and
++ * waits for its answer, for at most ROLE_STALE_WAIT_MS; a service that does
++ * not answer in time gets the last state, as during any outage. Freshness
++ * bound, then: while polled, about ROLE_POLL_MS plus one exchange; after a
++ * quiet spell, current unless the service took longer than the wait. */
+ enum role_source { ROLE_SOURCE_ACCOUNTS, ROLE_SOURCE_ENTITLEMENT, ROLE_SOURCE_COUNT };
+-#define ROLE_POLL_MS   1000
+-#define ROLE_DEMAND_MS 30000
++#define ROLE_POLL_MS       1000
++#define ROLE_DEMAND_MS     30000
++#define ROLE_FRESH_MS      3000
++#define ROLE_STALE_WAIT_MS 1000
++
++/* What a caller of role_state_get wants. */
++#define ROLE_GET_SEED  0x1  /* ask synchronously if there has never been an answer */
++#define ROLE_GET_FRESH 0x2  /* after a quiet spell, wait (bounded) for a current answer */
+ 
+ static struct role_source_state
+ {
+@@ -308,10 +324,13 @@ static struct role_source_state
+     struct account_roles_params roles;  /* ROLE_SOURCE_ACCOUNTS */
+     UINT32 active;                      /* ROLE_SOURCE_ENTITLEMENT */
+     ULONGLONG wanted_until;
++    ULONGLONG checked_at;               /* when the last exchange ended, whatever it said */
++    LONG generation;                    /* counts those exchanges */
+     LONG watchers;
+     HANDLE wake;
+ } role_state[ROLE_SOURCE_COUNT];
+ static SRWLOCK role_state_lock = SRWLOCK_INIT;
++static CONDITION_VARIABLE role_state_checked = CONDITION_VARIABLE_INIT;
+ 
+ static void role_watches_update( enum role_source source );
+ 
+@@ -336,6 +355,17 @@ static BOOL role_state_store( enum role_source source, NTSTATUS status,
+     return TRUE;
+ }
+ 
++/* An exchange with the service has ended, answered or not: whoever waits for a
++ * current answer can stop waiting. */
++static void role_state_note_checked( enum role_source source )
++{
++    AcquireSRWLockExclusive( &role_state_lock );
++    role_state[source].checked_at = GetTickCount64();
++    role_state[source].generation++;
++    ReleaseSRWLockExclusive( &role_state_lock );
++    WakeAllConditionVariable( &role_state_checked );
++}
++
+ static NTSTATUS role_state_fetch( enum role_source source )
+ {
+     struct store_entitlement_params entitlement = {{0}};
+@@ -347,6 +377,7 @@ static NTSTATUS role_state_fetch( enum role_source source )
+         return STATUS_NOT_FOUND;
+     else status = XGR_UNIX_CALL( store_entitlement, &entitlement );
+     role_state_store( source, status, &roles, entitlement.active );
++    role_state_note_checked( source );
+     return status;
+ }
+ 
+@@ -384,16 +415,21 @@ static DWORD WINAPI role_poller( void *arg )
+ }
+ 
+ /* Note that a title cares about a source -- `watchers` adds or drops a
+- * standing interest -- and make sure something is polling it. */
+-static void role_source_want( enum role_source source, LONG watchers )
++ * standing interest -- and make sure something is polling it. Returns TRUE
++ * when what is kept may be stale: nothing was polling it, and nothing has
++ * asked the service for a while. `generation` then says which exchange a
++ * fresher answer has to come after. */
++static BOOL role_source_want( enum role_source source, LONG watchers, LONG *generation )
+ {
+     struct role_source_state *state = &role_state[source];
+     ULONGLONG now = GetTickCount64();
+-    BOOL idle, start = FALSE;
++    BOOL idle, stale, start = FALSE;
+     HANDLE thread;
+ 
+     AcquireSRWLockExclusive( &role_state_lock );
+     idle = state->watchers <= 0 && now >= state->wanted_until;
++    stale = idle && now - state->checked_at >= ROLE_FRESH_MS;
++    if (generation) *generation = state->generation;
+     state->watchers += watchers;
+     if (watchers >= 0) state->wanted_until = now + ROLE_DEMAND_MS;
+     if (!state->started && (state->wake = CreateEventW( NULL, FALSE, FALSE, NULL )))
+@@ -408,34 +444,53 @@ static void role_source_want( enum role_source source, LONG watchers )
+         else ERR( "could not start the role poller: %lu.\n", GetLastError() );
+     }
+     else if (idle && watchers >= 0 && state->wake) SetEvent( state->wake );
++    return stale && watchers >= 0 && state->wake;
+ }
+ 
+-/* The last definitive answer, if there has been one. With `seed`, a source
+- * that has never answered is asked once, synchronously and bounded, so the
+- * first question of a process does not have to wait for a poll. */
+-static BOOL role_state_get( enum role_source source, BOOL seed, struct account_roles_params *roles, UINT32 *active )
++/* The last definitive answer, if there has been one. With ROLE_GET_SEED, a
++ * source that has never answered is asked once, synchronously and bounded, so
++ * the first question of a process does not have to wait for a poll. With
++ * ROLE_GET_FRESH, the first question after a quiet spell waits a bounded time
++ * for the poller's next answer rather than reporting one from before it. */
++static BOOL role_state_get( enum role_source source, DWORD flags, struct account_roles_params *roles, UINT32 *active )
+ {
+-    BOOL ask;
++    struct role_source_state *state = &role_state[source];
++    ULONGLONG deadline, now;
++    LONG generation;
++    BOOL ask, stale;
+ 
+-    role_source_want( source, 0 );
+-    if (role_state_peek( source, roles, active )) return TRUE;
+-    if (!seed) return FALSE;
++    stale = role_source_want( source, 0, &generation );
++    if (role_state_peek( source, roles, active ))
++    {
++        if (!stale || !(flags & ROLE_GET_FRESH)) return TRUE;
++        AcquireSRWLockExclusive( &role_state_lock );
++        deadline = GetTickCount64() + ROLE_STALE_WAIT_MS;
++        while (state->generation == generation && (now = GetTickCount64()) < deadline)
++            SleepConditionVariableSRW( &role_state_checked, &role_state_lock, deadline - now, 0 );
++        if (state->generation == generation)
++            TRACE( "role source %u did not answer within %u ms; reporting the last state.\n",
++                   source, ROLE_STALE_WAIT_MS );
++        ReleaseSRWLockExclusive( &role_state_lock );
++        return role_state_peek( source, roles, active );
++    }
++    if (!(flags & ROLE_GET_SEED)) return FALSE;
+     AcquireSRWLockExclusive( &role_state_lock );
+-    ask = !role_state[source].seeded;
+-    role_state[source].seeded = TRUE;
++    ask = !state->seeded;
++    state->seeded = TRUE;
+     ReleaseSRWLockExclusive( &role_state_lock );
+     if (ask) role_state_fetch( source );
+     return role_state_peek( source, roles, active );
+ }
+ 
+-BOOL xgr_role_entitlement( UINT32 *active )
++BOOL xgr_role_entitlement( UINT32 *active, BOOL fresh )
+ {
+-    return role_state_get( ROLE_SOURCE_ENTITLEMENT, FALSE, NULL, active );
++    return role_state_get( ROLE_SOURCE_ENTITLEMENT, fresh ? ROLE_GET_FRESH : 0, NULL, active );
+ }
+ 
+ void xgr_role_entitlement_store( NTSTATUS status, UINT32 active )
+ {
+     role_state_store( ROLE_SOURCE_ENTITLEMENT, status, NULL, active );
++    role_state_note_checked( ROLE_SOURCE_ENTITLEMENT );
+ }
+ 
+ static HRESULT WINAPI x_user_XUserDuplicateHandle( IXUserImpl6 *iface, XUserHandle handle, XUserHandle *duplicatedHandle )
+@@ -483,7 +538,7 @@ static HRESULT WINAPI x_user_XUserAddAsync( IXUserImpl6 *iface, XUserAddOptions
+          * signed in at all (bounded by the unix call's own deadline); a
+          * failed exchange falls back to the last answer there was. */
+         role_state_fetch( ROLE_SOURCE_ACCOUNTS );
+-        if (!role_state_get( ROLE_SOURCE_ACCOUNTS, FALSE, &roles, NULL ) || !roles.player_signed_in)
++        if (!role_state_get( ROLE_SOURCE_ACCOUNTS, 0, &roles, NULL ) || !roles.player_signed_in)
+             return HRESULT_FROM_WIN32(ERROR_NO_SUCH_LOGON_SESSION);
+     }
+     /* The identity is wanted next; get it going while the title carries on. */
+@@ -572,7 +627,8 @@ static HRESULT WINAPI x_user_XUserGetState( IXUserImpl6 *iface, XUserHandle user
+     if (!is_local_user( user ) || !state) return E_INVALIDARG;
+     /* The handle was issued signed in; only a definitive answer changes that. */
+     *state = XUserState_SignedIn;
+-    if (account_roles_enabled() && role_state_get( ROLE_SOURCE_ACCOUNTS, TRUE, &roles, NULL ) &&
++    if (account_roles_enabled() &&
++        role_state_get( ROLE_SOURCE_ACCOUNTS, ROLE_GET_SEED | ROLE_GET_FRESH, &roles, NULL ) &&
+         !roles.player_signed_in)
+         *state = XUserState_SignedOut;
+     return S_OK;
+@@ -641,10 +697,19 @@ static HRESULT WINAPI x_user_XUserResolvePrivilegeWithUiResult( IXUserImpl6 *ifa
+  * (Minecraft spun on its PlayFab sign-in tens of thousands of times).
+  *
+  * The request is an XAsyncBegin operation. The *Async call copies what it
+- * needs and returns; the round trip to the service is the operation's DoWork,
+- * scheduled on the caller's queue like any other async work, never done on the
+- * calling thread. The provider owns the result until the caller takes it, and
+- * Cleanup releases it. It used to be handed to the block and never freed -- a
++ * needs and returns, and the operation's DoWork is scheduled on the caller's
++ * queue like any other async work. DoWork itself only hands the round trip to
++ * a thread of ours and returns: the exchange can take up to 65 s with its
++ * retries, and in strict manual mode (XGR_STRICT_MANUAL_QUEUES, Halo Infinite)
++ * DoWork runs on the title's own Work port, so doing it there held the
++ * title's dispatch thread -- and everything queued behind it -- for that long
++ * when the service stalled. That thread completes the operation, and nothing
++ * else does, so the request stays alive until it has; it is still the queue's
++ * work, so terminating the queue waits for it as before. Cancel is not
++ * honoured, as before: the exchange is bounded and finishes on its own.
++ *
++ * The provider owns the result until the caller takes it, and Cleanup
++ * releases it. It used to be handed to the block and never freed -- a
+  * few KB, bearer token included, left behind for every Xbox Live call a title
+  * made. As with every provider-driven operation, taking the result consumes
+  * it. The narrow and UTF-16 entry points lay the result out differently, so
+@@ -653,6 +718,7 @@ static HRESULT WINAPI x_user_XUserResolvePrivilegeWithUiResult( IXUserImpl6 *ifa
+ struct token_request
+ {
+     struct xsts_token_params params;
++    XAsyncBlock *async;                /* set when DoWork hands the request off */
+     char *url, *method;
+     void *body;
+     BOOL wide;
+@@ -714,32 +780,51 @@ static void token_fill_result( const struct token_request *req, void *buffer )
+     }
+ }
+ 
++/* The round trip itself, off the title's threads. */
++static void token_request_run( struct token_request *req )
++{
++    HRESULT hr = S_OK;
++
++    if (XGR_UNIX_CALL( xsts_token, &req->params )) hr = E_GAMEUSER_NO_AUTH_USER;
++    else
++    {
++        req->token_len = strlen( req->params.token );
++        req->signature_len = strlen( req->params.signature );
++        if (req->wide &&
++            (!(req->token_count = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, req->params.token, -1, NULL, 0 )) ||
++             (req->signature_len &&
++              !(req->signature_count = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, req->params.signature, -1, NULL, 0 )))))
++            hr = HRESULT_FROM_WIN32( GetLastError() );
++        else
++            TRACE( "issued a token for %s %s%s.\n", debugstr_a( req->method ), debugstr_a( req->url ),
++                   req->signature_len ? " (signed)" : "" );
++    }
++    /* Completion may release the request on another thread: the last use. */
++    IXThreadingImpl_XAsyncComplete( x_threading_impl, req->async, hr, SUCCEEDED(hr) ? token_result_size( req ) : 0 );
++}
++
++static void CALLBACK token_request_detached( TP_CALLBACK_INSTANCE *instance, void *context )
++{
++    token_request_run( context );
++}
++
+ static HRESULT CALLBACK token_provider( XAsyncOp op, const XAsyncProviderData *data )
+ {
+     struct token_request *req = data->context;
+-    HRESULT hr = S_OK;
++    HRESULT hr;
+ 
+     switch (op)
+     {
+     case XAsyncOp_Begin:
+         return IXThreadingImpl_XAsyncSchedule( x_threading_impl, data->async, 0 );
+     case XAsyncOp_DoWork:
+-        if (XGR_UNIX_CALL( xsts_token, &req->params )) hr = E_GAMEUSER_NO_AUTH_USER;
+-        else
++        req->async = data->async;
++        pin_module();
++        if (FAILED(hr = xgr_async_run_detached( data->async, token_request_detached, req )))
+         {
+-            req->token_len = strlen( req->params.token );
+-            req->signature_len = strlen( req->params.signature );
+-            if (req->wide &&
+-                (!(req->token_count = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, req->params.token, -1, NULL, 0 )) ||
+-                 (req->signature_len &&
+-                  !(req->signature_count = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, req->params.signature, -1, NULL, 0 )))))
+-                hr = HRESULT_FROM_WIN32( GetLastError() );
+-            else
+-                TRACE( "issued a token for %s %s%s.\n", debugstr_a( req->method ), debugstr_a( req->url ),
+-                       req->signature_len ? " (signed)" : "" );
++            WARN( "no thread for the token request (%#lx); asking on this one.\n", hr );
++            token_request_run( req );
+         }
+-        /* Completion may release the context on another thread. */
+-        IXThreadingImpl_XAsyncComplete( x_threading_impl, data->async, hr, SUCCEEDED(hr) ? token_result_size( req ) : 0 );
+         return E_PENDING;
+     case XAsyncOp_GetResult:
+         token_fill_result( req, data->buffer );
+@@ -1044,7 +1129,7 @@ HRESULT xgr_role_watch_register( enum xgr_role_watch_kind kind, void *owner, XTa
+     watch->next = role_watches; role_watches = watch;
+     token->token = watch->token;
+     ReleaseSRWLockExclusive(&role_watches_lock);
+-    role_source_want(role_watch_source(kind),1);
++    role_source_want(role_watch_source(kind),1,NULL);
+     return S_OK;
+ }
+ 
+@@ -1059,7 +1144,7 @@ BOOLEAN xgr_role_watch_unregister( enum xgr_role_watch_kind kind, void *owner,
+         { watch = *link; *link = watch->next; break; }
+     ReleaseSRWLockExclusive(&role_watches_lock);
+     if (!watch) return TRUE;
+-    role_source_want(role_watch_source(kind),-1);
++    role_source_want(role_watch_source(kind),-1,NULL);
+     EnterCriticalSection(&watch->lock);
+     watch->stopped = TRUE;
+     while (wait && watch->callback_thread && watch->callback_thread != GetCurrentThreadId())
+@@ -1093,7 +1178,7 @@ static HRESULT WINAPI x_user_XUserRegisterForChangeEvent( IXUserImpl6 *iface, XT
+     TRACE( "iface %p, queue %p, context %p, callback %p, token %p.\n", iface, queue, context, callback, token );
+     if (account_roles_enabled())
+         return xgr_role_watch_register(XGR_ROLE_WATCH_USER,NULL,queue,context,callback,NULL,
+-            role_state_get(ROLE_SOURCE_ACCOUNTS,TRUE,&roles,NULL) ? (int)roles.player_signed_in : -1,token);
++            role_state_get(ROLE_SOURCE_ACCOUNTS,ROLE_GET_SEED,&roles,NULL) ? (int)roles.player_signed_in : -1,token);
+     /* The legacy local user never changes. */
+     if (token) token->token = 1;
+     return S_OK;
+@@ -1154,7 +1239,8 @@ static BOOLEAN WINAPI x_user_XUserIsStoreUser( IXUserImpl6 *iface, XUserHandle u
+ 
+     TRACE( "iface %p, user %p.\n", iface, user );
+     if (account_roles_enabled())
+-        return is_local_user(user) && role_state_get(ROLE_SOURCE_ACCOUNTS,TRUE,&roles,NULL) && roles.same_store_user;
++        return is_local_user(user) &&
++            role_state_get(ROLE_SOURCE_ACCOUNTS,ROLE_GET_SEED|ROLE_GET_FRESH,&roles,NULL) && roles.same_store_user;
+     return is_local_user( user );  /* the local user owns the title from the store */
+ }
+ 

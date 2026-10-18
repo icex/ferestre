@@ -373,6 +373,53 @@ static void test_transport_errors_keep_state(void)
     IXStoreImpl6_XStoreCloseContextHandle(store,context);
 }
 
+/* Nothing polls a source that nobody watched or asked about for half a minute,
+ * so what is kept can be as old as the last question. The first question after
+ * such a quiet spell used to report that old state -- a licence still valid
+ * after the Store account signed out, a player still signed in after signing
+ * out -- and only the question after it saw the change. Both directions, both
+ * sources, one quiet spell: the player signs out and the licence comes back. */
+#define QUIET_SPELL_MS 33000
+static void test_fresh_after_quiet_spell(void)
+{
+    XUserState state=XUserState_SignedIn;
+    ULONGLONG start,took;
+    BOOLEAN answer;
+
+    control(1,1,1,1,0);
+    CHECK(eventually(probe_store_user,10000),"the Store user is known before the quiet spell");
+    CHECK((g_license=acquire_licence())!=NULL,"package licence for the quiet spell");
+    if(!g_license) return;
+    control(1,1,1,0,0);
+    CHECK(eventually(probe_licence_invalid,5000),"the licence follows a lost entitlement before the quiet spell");
+    CHECK(IXUserImpl6_XUserGetState(users,g_user,&state)==S_OK && state==XUserState_SignedIn,"the player is signed in before the quiet spell");
+
+    Sleep(QUIET_SPELL_MS);
+    control(1,0,1,1,0);
+    Sleep(200);
+
+    start=GetTickCount64();
+    state=XUserState_SignedIn;
+    CHECK(IXUserImpl6_XUserGetState(users,g_user,&state)==S_OK && state==XUserState_SignedOut,
+        "the first XUserGetState after a quiet spell reports the sign-out");
+    took=GetTickCount64()-start;
+    CHECKF(took<2000,"and waits a bounded time for it (%llu ms)",took);
+    start=GetTickCount64();
+    answer=IXStoreImpl6_XStoreIsLicenseValid(store,g_license);
+    took=GetTickCount64()-start;
+    CHECKF(answer,"the first XStoreIsLicenseValid after a quiet spell reports the entitlement back (%llu ms)",took);
+    CHECKF(took<2000,"and waits a bounded time for it (%llu ms)",took);
+    start=GetTickCount64();
+    answer=IXUserImpl6_XUserIsStoreUser(users,g_user);
+    took=GetTickCount64()-start;
+    CHECKF(!answer && took<2000,"XUserIsStoreUser agrees with the sign-out (%llu ms)",took);
+
+    control(1,1,1,1,0);
+    CHECK(eventually(probe_store_user,5000),"the player is back after the quiet spell");
+    IXStoreImpl6_XStoreCloseLicenseHandle(store,g_license);
+    g_license=NULL;
+}
+
 /* A child started while a request is open must not inherit the connection:
  * the service would keep it open until the child exits. XUserAddAsync asks
  * the service on the calling thread (bounded to 5 s), so a second thread
@@ -409,6 +456,112 @@ static void test_sockets_close_on_exec(void)
     Sleep(1000);
     held=fixture_seconds("hold-max");
     CHECKF(held>0 && held<9,"the service connection closes when the runtime gives up, not when a child exits (%.1f s)",held);
+}
+
+/* Run by the harness with XGR_STRICT_MANUAL_QUEUES=1, which a process reads
+ * once (Halo Infinite runs this way). There an operation's DoWork runs on the
+ * title's own Work port, and the token request used to make its service round
+ * trip right there: with the service stalled, the title's dispatch thread was
+ * held for the whole exchange, up to 65 s, and its own work queued behind it. */
+static volatile LONG token_completions,queue_terminated,completion_before_terminated;
+static void CALLBACK token_completed(XAsyncBlock *async) { InterlockedIncrement(&token_completions); }
+static void CALLBACK title_queue_terminated(void *context)
+{
+    InterlockedExchange(&completion_before_terminated,token_completions);
+    InterlockedExchange(&queue_terminated,1);
+}
+
+static int strict_token_probe(void)
+{
+    XUserGetTokenAndSignatureData *data=NULL;
+    XTaskQueueHandle queue=NULL,pooled=NULL;
+    BYTE *buffer=malloc(8192);
+    XAsyncBlock async={0};
+    ULONGLONG start,took,slowest=0,one,until;
+    HRESULT hr;
+
+    control_ex(1,1,0,1,0,"\"xsts\":\"stall\"");
+    CHECK(IXUserImpl6_XUserAddAsync(users,XUserAddOptions_AddDefaultUserSilently,&async)==S_OK &&
+        IXUserImpl6_XUserAddResult(users,&async,&g_user)==S_OK,"strict mode: a user to ask for");
+    CHECK(IXThreadingImpl_XTaskQueueCreate(threading,XTaskQueueDispatchMode_Manual,XTaskQueueDispatchMode_Manual,&queue)==S_OK,
+        "strict mode: manual title queue");
+    if(!queue) return 1;
+
+    memset(&async,0,sizeof(async));
+    async.queue=queue;
+    async.callback=token_completed;
+    hr=IXUserImpl6_XUserGetTokenAndSignatureAsync(users,g_user,0,"GET","https://fixture.invalid/",0,NULL,0,NULL,&async);
+    CHECK(hr==S_OK,"strict mode: token request accepted");
+    /* The title pumps its Work port; DoWork runs inside this. */
+    start=GetTickCount64();
+    while(GetTickCount64()-start<300)
+    {
+        one=GetTickCount64();
+        IXThreadingImpl_XTaskQueueDispatch(threading,queue,XTaskQueuePort_Work,0);
+        one=GetTickCount64()-one;
+        if(one>slowest) slowest=one;
+        Sleep(5);
+    }
+    CHECKF(slowest<250,"strict mode: dispatching the token request's work does not wait for the service (%llu ms)",slowest);
+    CHECK(IXThreadingImpl_XAsyncGetStatus(threading,&async,FALSE)==E_PENDING,"strict mode: the request is still waiting on the service");
+    InterlockedExchange(&probe_ran,0);
+    start=GetTickCount64();
+    IXThreadingImpl_XTaskQueueSubmitCallback(threading,queue,XTaskQueuePort_Work,NULL,probe_callback);
+    while(!probe_ran && GetTickCount64()-start<10000)
+    {
+        IXThreadingImpl_XTaskQueueDispatch(threading,queue,XTaskQueuePort_Work,0);
+        Sleep(5);
+    }
+    took=GetTickCount64()-start;
+    CHECKF(probe_ran && took<500,"strict mode: title work is not held behind a stalled token request (%llu ms)",took);
+    until=GetTickCount64()+30000;
+    while(!token_completions && GetTickCount64()<until)
+    {
+        IXThreadingImpl_XTaskQueueDispatch(threading,queue,XTaskQueuePort_Work,0);
+        IXThreadingImpl_XTaskQueueDispatch(threading,queue,XTaskQueuePort_Completion,0);
+        Sleep(5);
+    }
+    CHECK(token_completions==1 && IXThreadingImpl_XAsyncGetStatus(threading,&async,FALSE)==E_GAMEUSER_NO_AUTH_USER,
+        "strict mode: the stalled request completes on the title's Completion port");
+
+    control(1,1,0,1,0);
+    InterlockedExchange(&token_completions,0);
+    memset(&async,0,sizeof(async));
+    async.queue=queue;
+    async.callback=token_completed;
+    hr=IXUserImpl6_XUserGetTokenAndSignatureAsync(users,g_user,0,"GET","https://fixture.invalid/",0,NULL,0,NULL,&async);
+    until=GetTickCount64()+20000;
+    while(hr==S_OK && !token_completions && GetTickCount64()<until)
+    {
+        IXThreadingImpl_XTaskQueueDispatch(threading,queue,XTaskQueuePort_Work,0);
+        IXThreadingImpl_XTaskQueueDispatch(threading,queue,XTaskQueuePort_Completion,0);
+        Sleep(5);
+    }
+    hr=IXUserImpl6_XUserGetTokenAndSignatureResult(users,&async,8192,buffer,&data,NULL);
+    CHECK(hr==S_OK && data && strstr(data->token,";cached;"),"strict mode: an answered request hands over its token");
+    IXThreadingImpl_XTaskQueueCloseHandle(threading,queue);
+
+    /* Still the queue's work: terminating the queue while the service is
+     * stalled must not report it terminated before the request completes. */
+    control_ex(1,1,0,1,0,"\"xsts\":\"stall\"");
+    CHECK(IXThreadingImpl_XTaskQueueCreate(threading,XTaskQueueDispatchMode_Manual,XTaskQueueDispatchMode_ThreadPool,&pooled)==S_OK,
+        "strict mode: manual work, pooled completions");
+    InterlockedExchange(&token_completions,0);
+    memset(&async,0,sizeof(async));
+    async.queue=pooled;
+    async.callback=token_completed;
+    hr=IXUserImpl6_XUserGetTokenAndSignatureAsync(users,g_user,0,"GET","https://fixture.invalid/",0,NULL,0,NULL,&async);
+    start=GetTickCount64();
+    while(GetTickCount64()-start<300) { IXThreadingImpl_XTaskQueueDispatch(threading,pooled,XTaskQueuePort_Work,0); Sleep(5); }
+    hr=IXThreadingImpl_XTaskQueueTerminate(threading,pooled,FALSE,NULL,title_queue_terminated);
+    until=GetTickCount64()+30000;
+    while(!queue_terminated && GetTickCount64()<until) Sleep(10);
+    CHECK(queue_terminated && completion_before_terminated==1,
+        "strict mode: termination waits for the token request to complete");
+    control(1,1,0,1,0);
+    free(buffer);
+    printf("%s (%u checks, %u failures)\n",failures?"FAILED":"PASSED",checks,failures);
+    return failures?1:0;
 }
 
 /* Run under WINEDEBUG=+gdkc by the harness, which then checks the log. */
@@ -451,6 +604,7 @@ int main(int argc,char **argv)
         FAILED(query(&CLSID_XPackageImpl,&IID_IXPackageImpl3,(void **)&package))) return 12;
     if(argc>2 && !strcmp(argv[1],"--sleep")) { Sleep(atoi(argv[2])*1000); return 0; }
     if(argc>1 && !strcmp(argv[1],"--log-probe")) return log_probe();
+    if(argc>1 && !strcmp(argv[1],"--strict-token")) return strict_token_probe();
     SetEnvironmentVariableA("XGR_ACCOUNT_ROLES_V1","1");
     test_identity_off_the_callers_thread();
     control(1,1,0,1,0);
@@ -527,6 +681,7 @@ int main(int argc,char **argv)
     test_token_requests();
     test_roles_off_the_title_queue();
     test_transport_errors_keep_state();
+    test_fresh_after_quiet_spell();
     test_sockets_close_on_exec();
     control(1,1,1,1,1);
     CHECK(eventually(probe_not_store_user,5000),"unsupported role responses fail closed");
