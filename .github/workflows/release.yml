@@ -7,9 +7,12 @@
 #                                       recipes exactly the way the AUR package
 #                                       lays them out -- usr/bin beside
 #                                       usr/lib/ferestre. Extract anywhere.
-#   Ferestre-<version>-x86_64.AppImage  one file, for people who do not want to
+#   ferestre-<version>-x86_64.AppImage  one file, for people who do not want to
 #                                       extract anything.
 #   SHA256SUMS                          for both, so a download can be checked.
+#   <each of the above>.minisig         minisign signatures, so a download can
+#                                       be checked against a key that is not
+#                                       published in the same place as the file.
 #
 # The runtime has its own build train and tag. The GUI downloads its published
 # release on first start, so updating the launcher never requires rebuilding
@@ -22,6 +25,20 @@
 # A workflow_dispatch run builds and uploads the same artefacts without
 # publishing anything, which is how to find out whether a release would build
 # before committing to a tag.
+#
+# Two jobs, because building runs a great deal of code nobody here wrote: the
+# build scripts and proc-macros of every crate in two dependency trees, and the
+# actions that set the toolchain up. `build` does all of that with a read-only
+# token that is not even written to the checkout. `publish` runs only on a tag,
+# after `build` has succeeded, and does nothing but check, sign and upload the
+# artefacts it is handed -- it is the one job that holds a token able to write
+# releases, and the only one that sees the signing key.
+#
+# Signing uses minisign. The repository secret MINISIGN_SECRET_KEY holds the
+# whole secret key file, and MINISIGN_PASSWORD its password (unset for a key
+# made with -W). The launcher verifies what it downloads against the public
+# key built into ferestre-core; packaging/sign-release.sh refuses to sign with
+# a key the launcher being published would not accept.
 name: Release
 
 on:
@@ -42,17 +59,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  launcher:
+  build:
     runs-on: ubuntu-latest
-    # A release that publishes has to be able to write one.
-    permissions:
-      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # The AppImage stamps the build it came from, and a shallow clone
           # cannot describe itself.
           fetch-depth: 0
+          # Nothing in this job pushes, so nothing in it needs the token, and
+          # every build script it runs could read it from .git/config.
+          persist-credentials: false
 
       # A tag can be created on any branch, and a release cut from dev would
       # publish work that never reached main. Now that there are two branches
@@ -80,8 +99,12 @@ jobs:
             libgtk-3-dev libwebkit2gtk-4.1-dev \
             fuse3 libfuse3-3 zstd protobuf-compiler
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # Third-party actions are pinned to a commit: a tag or a branch can be
+      # moved to code nobody reviewed.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # A tag is the version, without its leading v. Otherwise the workspace
       # says what it is, and a manual run may override that.
@@ -104,13 +127,30 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo ":: building $version"
 
+      # The publish job uses these as the release text, and finding out they
+      # are missing after an hour of building helps nobody.
+      - name: Release notes
+        if: github.ref_type == 'tag'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -f "docs/RELEASE-$VERSION.md" || {
+              echo "::error::docs/RELEASE-$VERSION.md does not exist"
+              exit 1
+          }
+          mkdir -p notes
+          cp "docs/RELEASE-$VERSION.md" notes/
+
       # A release is not the place to discover a broken test. The same suite
       # rust.yml runs per push, run again against the exact tree being shipped.
+      # --locked throughout: the release is built from the dependency versions
+      # in Cargo.lock, which were reviewed, not whatever crates.io serves today.
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Build
-        run: cargo build --release --workspace
+        run: cargo build --locked --release --workspace
 
       # A release that opens but cannot sign in is not a usable AppImage. Build
       # the GPL client separately and ship it beside the MIT launcher; the two
@@ -127,7 +167,7 @@ jobs:
               case "$(basename "$patch")" in 0001-*) continue ;; esac
               git -C third_party/xodus-cli apply "$GITHUB_WORKSPACE/$patch"
           done
-          cargo build --release --manifest-path third_party/xodus-cli/Cargo.toml \
+          cargo build --locked --release --manifest-path third_party/xodus-cli/Cargo.toml \
               -p xodus-cli -p xodus-service
 
       # The layout an installed copy has: usr/bin/ferestre with
@@ -209,23 +249,78 @@ jobs:
           sha256sum ./*.AppImage ./*.tar.zst > SHA256SUMS
           cat SHA256SUMS
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ferestre-${{ steps.version.outputs.version }}
           path: out/*
           if-no-files-found: error
 
-      # Only a tag publishes. A manual run has produced the same artefacts and
-      # attached them to the run, which is the point of being able to try.
-      - name: Publish
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: github.ref_type == 'tag'
+        with:
+          name: release-notes
+          path: notes/*
+          if-no-files-found: error
+
+  # Only a tag publishes. A manual run has produced the same artefacts and
+  # attached them to the run, which is the point of being able to try.
+  publish:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    # The only job that can write a release, so the only one with the token
+    # that can. It runs no build and no third-party action beyond fetching
+    # the artefacts and this repository's own signing script.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          sparse-checkout: packaging
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ferestre-${{ needs.build.outputs.version }}
+          path: out
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-notes
+          path: notes
+
+      - name: minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign zstd
+
+      # Checks SHA256SUMS first, then signs every artefact and the sums. The
+      # launcher binary in the tarball has to trust the signing key, or the
+      # runtime it downloads would be refused on every machine.
+      - name: Sign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          launcher="$RUNNER_TEMP/launcher"
+          mkdir -p "$launcher"
+          tar -xaf "out/ferestre-$VERSION-x86_64.tar.zst" -C "$launcher" \
+              "ferestre-$VERSION/usr/bin/ferestre"
+          FERESTRE_EXPECT_PUBKEY_IN="$launcher/ferestre-$VERSION/usr/bin/ferestre" \
+              packaging/sign-release.sh out "$GITHUB_REF_NAME"
+          ls -l out
+
+      - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
           # Publish the complete checked-in changes and qualification limits.
           # Keeping a second abbreviated changelog here used to omit fixes.
           gh release create "$GITHUB_REF_NAME" out/* \
             --title "ferestre $VERSION" \
-            --notes-file "docs/RELEASE-$VERSION.md"
+            --notes-file "notes/RELEASE-$VERSION.md"

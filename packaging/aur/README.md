@@ -150,6 +150,13 @@ PKGBUILD assumes a shape. The contract:
 - `package()` refuses to build if `proton` lacks the `close_fds=False` patch or
   if `xgameruntime.dll` is missing. Both have been shipped broken before by
   hand; both look like the title crashing rather than like a packaging mistake.
+- **Signatures.** The workflow's publish job puts a minisign signature beside
+  every file it uploads (`<file>.minisig`, including `SHA256SUMS.minisig`),
+  made with the key in the `MINISIGN_SECRET_KEY` secret. `ferestre
+  install-runtime` checks them against the public key built into the launcher.
+  This package does not: the `sha256sums` entry recorded when `pkgver` is
+  bumped already pins the one file that was checked, and makepkg has no
+  minisign support to add to that.
 
 The runtime workflow produces the release `.tar.xz` shape used by both the
 launcher installer and this package. The local `scripts/package-runtime.sh`
