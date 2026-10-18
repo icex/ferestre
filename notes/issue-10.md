@@ -1,9 +1,12 @@
-# Issue 10: video dependencies, GameInput and AppImage shortcuts
+# Issue 10: video dependencies, controllers and Steam shortcuts
 
 The report uses Fedora 44, runtime `11.0.20261010.2`, and a Bluetooth
-DualShock 4, including Steam Input's virtual Xbox pad. That exact combination
-has not been reproduced here. The changes address three independently
-observable deficiencies; they do not certify every controller/backend.
+DualShock 4, both directly and through Steam Input's virtual Xbox pad. There
+is no physical DualShock 4 or Fedora install here. The pad was emulated
+through `/dev/uhid`, over USB and over Bluetooth (report `0x11` with its CRC,
+the calibration and firmware feature reports), and Steam was the real client
+on CachyOS. With that setup the reporter's log was reproduced, and every
+fix below was checked against it by automated runs in a 1280x720 window.
 
 ## Media
 
@@ -12,52 +15,92 @@ cannot satisfy them. `ferestre doctor`, the CLI launch path and a GUI launch
 warning now name unresolved dependencies and explain the Fedora RPM Fusion
 `compat-ffmpeg4` workaround. See `docs/DEPENDENCIES.md`.
 
+The check searches libraries in Proton's order: Steam's
+`ubuntu12_64/video` and `ubuntu12_32/video` (Steam ships the FFmpeg 4 sonames
+there, with H.264 and AAC), then the runtime's lib dirs, then the
+`LD_LIBRARY_PATH` that launch would actually pass on. The default launch
+drops the inherited one; `--steam` and recipes keep theirs. A machine with
+Steam installed no longer gets a warning it does not need.
+
 Bundling the build tree's FFmpeg is insufficient: its configure disables all
 codecs, including H.264 and AAC. A future self-contained runtime needs a
-decoder-enabled build and its dependency closure. This change documents and
-diagnoses the compatibility-library requirement rather than shipping that
-incomplete build.
+decoder-enabled build and its dependency closure.
 
 Validation: an actual ELF plugin with an unavailable shared library produces
-the actionable warning. Moving that library onto Proton's search path clears
-the warning. The installed game's actual 1080p splash movie decoded through
-Wine Media Foundation into 30 frames, with 29 changing frame checksums.
-That playback check used the local host's available compatibility libraries.
+the actionable warning, and moving that library onto Proton's search path
+clears it. The installed game's 1080p splash movie decoded through Wine Media
+Foundation into 30 frames, 29 with changing checksums.
 
 ## Controller
 
-The previous v2 implementation enumerated keyboard and mouse only and returned
-no gamepad state. Wine patch 0016 bridges already-connected Wine XInput pads to
-GameInput v2: enumeration, stable per-slot device identity, immutable readings,
-button/trigger/stick conversion, next-reading polling, status and two-motor
-rumble. It uses Wine's existing HID/SDL backend, including virtual Xbox pads,
-instead of exposing duplicate devices through DevQuery.
+Four separate faults kept a pad from a GDK title. Each was reproduced
+before it was fixed.
 
-Validation: the actual DLL passes the existing gated/keyboard/mouse suite and
-a test-only native XInput backend covering two connected slots, input updates,
-immutable retained readings, disconnects and rumble. The released DLL fails the
-new enumeration test. A temporary Linux uinput Xbox pad also delivered its A
-button, full-left stick and full trigger through Wine XInput into GameInput.
-The temporary device was removed after that test.
+1. **GameInput had no gamepads.** The v2 implementation enumerated keyboard
+   and mouse only. Wine patch 0016 bridges Wine's XInput slots to GameInput
+   v2: enumeration, stable per-slot identity, immutable readings, next-reading
+   polling, status and two-motor rumble. A reading for "any pad" comes from
+   the pad whose input changed last, and its timestamp is when the packet
+   changed, not when it was polled. Both views of a pad report 045e:028e.
+   Patch 0017 answers `QueryInterface(IID_IGameInputDevice_v0)` on those pads.
+   Minecraft Dungeons II makes that query and logs `E_NOINTERFACE` without it,
+   but its input comes through XInput either way. `IGameInput_v0` itself still
+   enumerates no virtual devices.
 
-The candidate launched Minecraft Dungeons II to its title screen. The local
-user reported the controller worked in that window, and clarified it had
-already worked on this machine before the change. This is regression evidence,
-not confirmation of the Fedora reporter's path.
+2. **A DualShock 4 or DualSense never became an XInput pad.** Wine's winebus
+   prefers hidraw for Sony pads and then drops the SDL copy, and only the SDL
+   copy becomes an XInput gamepad. The Proton shim therefore sets
+   `PROTON_DISABLE_HIDRAW` for the five Sony IDs, unless the user, a recipe
+   or Proton's `user_settings.py` already chose either `PROTON_DISABLE_HIDRAW`
+   or `PROTON_ENABLE_HIDRAW`. Winebus loads the host's `libSDL2-2.0.so.0` for
+   this. The AUR runtime now depends on `sdl2-compat`, `ferestre doctor`
+   checks for it, and the shim warns when it is missing.
+   - Emulated USB DS4: Minecraft Dungeons II went from no pad to the main menu
+     driven by the pad.
+   - Emulated Bluetooth DS4: before the fix, the log matched the report
+     (`failed to create device for L"SDL"`) and 0 gamepad reports arrived;
+     after it, 48 arrived.
 
-Limitations: gamepads must be connected when the game registers its callback.
-This does not add background hotplug notifications, reading callbacks or
-GameInput v0 gamepad support. Raw Bluetooth DS4 mapping and Steam Input still
-depend on the underlying Wine input backend; they need reporter verification.
+3. **Steam Input's virtual pad stayed silent.** Steam applies a shortcut's
+   controller layout only to processes carrying `SteamGameId`/`SteamAppId`.
+   The launch stripped them with the rest of Steam's environment. They are now
+   kept by default (`STEAM_IDENTITY`). `--steam` is only needed for the overlay
+   and Remote Play. Steam's `SDL_GAMECONTROLLER_IGNORE_DEVICES` still reaches
+   Wine, which skips the physical pads Steam wraps, so there is no double
+   input. Through real Steam, the virtual pad went from 0 to 10-14 input events
+   per run, and only the 28DE XInput device was present.
+
+4. **Steam thought the game never exited.** The Xbox service started by a
+   launch kept the AppImage mount and Steam's reaper alive. The service now
+   runs from a copy in the cache, with its own process group. It is shared by
+   concurrent launches through a lock in its runtime directory, and the last
+   launch to finish stops it, including when the launcher is signalled.
+   `launch-gdk.sh` takes the same lock. After the fix, Steam saw the game exit
+   within a second.
+
+After registering WinRT input classes, the launch waits for the Wine session
+that `wine reg` started to end. Otherwise the title joins that session, whose
+input bus was started without the shim's hidraw setting. The wait is bounded,
+so a session that is already running cannot hang the launch.
+
+Validation: the GameInput suite (gated, enabled and gamepad) passes against
+the built DLL. The gamepad cases cover two connected slots, input updates,
+immutable readings, disconnects, rumble, any-pad selection, idle timestamps
+and vendor IDs. The DLL compiles with `-Werror` in the SDK container.
+
+Not verified here: Fedora itself, a physical DualShock 4 or DualSense, and
+hotplug after a title has registered its device callback.
 
 ## Steam shortcut
 
 Saved Steam targets use the persistent `APPIMAGE` path, while immediate child
-processes continue using the CLI inside the mount. Native installations keep
-their CLI target. The GUI test clicks Add to Steam in an isolated Steam tree,
-checks quoted Exe/StartDir and title options, closes the GUI, removes the
-mount-local CLI and launches the saved target. Unrelated Steam entries remain
-covered by the existing round-trip/upsert tests.
+processes keep using the CLI inside the mount. `APPIMAGE` is used only when the
+CLI really runs from that AppImage's `APPDIR`, so an AppImage launcher that
+started a native install does not become its shortcut target. Native
+installations keep their CLI target. The GUI test clicks Add to Steam in an
+isolated Steam tree, checks quoted Exe/StartDir and title options, closes the
+GUI, removes the mount-local CLI and launches the saved target. Unrelated Steam
+entries remain covered by the existing round-trip/upsert tests.
 
 ## Related requested GUI changes
 
@@ -85,13 +128,19 @@ changes invalidate the corresponding data; explicit refresh bypasses freshness.
 No Microsoft change notification is available here: changes made elsewhere are
 detected by the periodic ownership check or an explicit refresh.
 
+When the client reports that nobody is signed in, for example after
+`xodus-cli logout` or a revoked token, the cached account and its library
+are forgotten instead of shown. Sign-out removes them before the client runs.
+A Refresh pressed while another task runs is kept and runs when that task
+ends. A reload during a disk-usage scan keeps the scan instead of starting
+another walk of the same folders.
+
 Final local checks: 307 Rust tests, workspace formatting and Clippy with warnings
 as errors; complete isolated GTK smoke including all three size-label sections,
 cache reuse across restart, account-change invalidation, immediate close during
 a held list refresh, download cleanup and removal completion; CLI media and
 cancellation integration tests; all four patch series; GameInput compilation
 with `-Werror`; launch-helper/authentication probe tests and recipe validation.
-The Fedora/Bluetooth/Steam Input combination remains unverified.
 
 Catalogue revalidation follow-up: a local HTTP fixture checks cold load, a warm
 load with no request, changed stale metadata replacing the cached row, forced

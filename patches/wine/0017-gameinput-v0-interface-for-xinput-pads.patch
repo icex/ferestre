@@ -1,0 +1,285 @@
+diff --git a/dlls/gameinput/gameinput.c b/dlls/gameinput/gameinput.c
+index a2e83a9..8502ab1 100644
+--- a/dlls/gameinput/gameinput.c
++++ b/dlls/gameinput/gameinput.c
+@@ -749,6 +749,16 @@ struct virtual_device
+     GameInputMouseInfo_v2 mouse;
+     GameInputGamepadInfo_v2 gamepad;
+     DWORD xinput_index;
++    /* Answers QueryInterface(IID_IGameInputDevice_v0) on the devices the v2
++     * callback hands out. Minecraft Dungeons II makes that query on its pads
++     * and logs E_NOINTERFACE without it; its input still comes through XInput,
++     * so this is for completeness rather than what makes the pad work.
++     * IGameInput_v0 itself still enumerates and reads no virtual devices. */
++    IGameInputDevice_v0 IGameInputDevice_v0_iface;
++    GameInputDeviceInfo_v0 info_v0;
++    GameInputKeyboardInfo_v0 keyboard_v0;
++    GameInputMouseInfo_v0 mouse_v0;
++    GameInputString name_v0;
+ };
+ 
+ static struct virtual_device *impl_from_IGameInputDevice_v2( IGameInputDevice_v2 *iface )
+@@ -767,6 +777,12 @@ static HRESULT WINAPI virtual_device_QueryInterface( IGameInputDevice_v2 *iface,
+         IGameInputDevice_v2_AddRef( iface );
+         return S_OK;
+     }
++    if (IsEqualGUID( iid, &IID_IGameInputDevice_v0 ))
++    {
++        *out = &impl_from_IGameInputDevice_v2( iface )->IGameInputDevice_v0_iface;
++        IGameInputDevice_v2_AddRef( iface );
++        return S_OK;
++    }
+ 
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL;
+@@ -865,6 +881,173 @@ static const IGameInputDevice_v2Vtbl virtual_device_vtbl =
+     virtual_device_DirectInputEscape,
+ };
+ 
++static struct virtual_device *virtual_device_from_v0( IGameInputDevice_v0 *iface )
++{
++    return CONTAINING_RECORD( iface, struct virtual_device, IGameInputDevice_v0_iface );
++}
++
++/* IUnknown stays the v2 pointer, so either interface compares as one object. */
++static HRESULT WINAPI virtual_device_v0_QueryInterface( IGameInputDevice_v0 *iface, REFIID iid, void **out )
++{
++    return virtual_device_QueryInterface( &virtual_device_from_v0( iface )->IGameInputDevice_v2_iface, iid, out );
++}
++
++static ULONG WINAPI virtual_device_v0_AddRef( IGameInputDevice_v0 *iface )
++{
++    return virtual_device_AddRef( &virtual_device_from_v0( iface )->IGameInputDevice_v2_iface );
++}
++
++static ULONG WINAPI virtual_device_v0_Release( IGameInputDevice_v0 *iface )
++{
++    return virtual_device_Release( &virtual_device_from_v0( iface )->IGameInputDevice_v2_iface );
++}
++
++static const GameInputDeviceInfo_v0 *WINAPI virtual_device_v0_GetDeviceInfo( IGameInputDevice_v0 *iface )
++{
++    TRACE( "iface %p.\n", iface );
++    return &virtual_device_from_v0( iface )->info_v0;
++}
++
++static GameInputDeviceStatus WINAPI virtual_device_v0_GetDeviceStatus( IGameInputDevice_v0 *iface )
++{
++    return virtual_device_GetDeviceStatus( &virtual_device_from_v0( iface )->IGameInputDevice_v2_iface );
++}
++
++static void WINAPI virtual_device_v0_GetBatteryState( IGameInputDevice_v0 *iface, GameInputBatteryState *state )
++{
++    TRACE( "iface %p, state %p.\n", iface, state );
++    if (!state) return;
++    memset( state, 0, sizeof(*state) );
++    state->status = GameInputBatteryUnknown;
++}
++
++static HRESULT WINAPI virtual_device_v0_CreateForceFeedbackEffect( IGameInputDevice_v0 *iface, uint32_t motor,
++                                                                   const GameInputForceFeedbackParams *params,
++                                                                   IGameInputForceFeedbackEffect_v0 **effect )
++{
++    TRACE( "iface %p, motor %u, params %p, effect %p.\n", iface, motor, params, effect );
++    if (effect) *effect = NULL;
++    return E_NOTIMPL;
++}
++
++static bool WINAPI virtual_device_v0_IsForceFeedbackMotorPoweredOn( IGameInputDevice_v0 *iface, uint32_t motor )
++{
++    return FALSE;
++}
++
++static void WINAPI virtual_device_v0_SetForceFeedbackMotorGain( IGameInputDevice_v0 *iface, uint32_t motor, float gain )
++{
++}
++
++static HRESULT WINAPI virtual_device_v0_SetHapticMotorState( IGameInputDevice_v0 *iface, uint32_t motor,
++                                                             const GameInputHapticFeedbackParams *params )
++{
++    return E_NOTIMPL;
++}
++
++static void WINAPI virtual_device_v0_SetRumbleState( IGameInputDevice_v0 *iface, const GameInputRumbleParams *params )
++{
++    virtual_device_SetRumbleState( &virtual_device_from_v0( iface )->IGameInputDevice_v2_iface, params );
++}
++
++static void WINAPI virtual_device_v0_SetInputSynchronizationState( IGameInputDevice_v0 *iface, bool enabled )
++{
++}
++
++static void WINAPI virtual_device_v0_SendInputSynchronizationHint( IGameInputDevice_v0 *iface )
++{
++}
++
++static void WINAPI virtual_device_v0_PowerOff( IGameInputDevice_v0 *iface )
++{
++}
++
++static HRESULT WINAPI virtual_device_v0_CreateRawDeviceReport( IGameInputDevice_v0 *iface, uint32_t id,
++                                                               GameInputRawDeviceReportKind kind,
++                                                               IGameInputRawDeviceReport_v0 **report )
++{
++    if (report) *report = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI virtual_device_v0_GetRawDeviceFeature( IGameInputDevice_v0 *iface, uint32_t id,
++                                                             IGameInputRawDeviceReport_v0 **report )
++{
++    if (report) *report = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI virtual_device_v0_SetRawDeviceFeature( IGameInputDevice_v0 *iface, IGameInputRawDeviceReport_v0 *report )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI virtual_device_v0_SendRawDeviceOutput( IGameInputDevice_v0 *iface, IGameInputRawDeviceReport_v0 *report )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI virtual_device_v0_SendRawDeviceOutputWithResponse( IGameInputDevice_v0 *iface,
++                                                                         IGameInputRawDeviceReport_v0 *request,
++                                                                         IGameInputRawDeviceReport_v0 **reply )
++{
++    if (reply) *reply = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI virtual_device_v0_ExecuteRawDeviceIoControl( IGameInputDevice_v0 *iface, uint32_t code, size_t in_size,
++                                                                   const void *input, size_t out_size, void *output, size_t *size )
++{
++    if (size) *size = 0;
++    return E_NOTIMPL;
++}
++
++static bool WINAPI virtual_device_v0_AcquireExclusiveRawDeviceAccess( IGameInputDevice_v0 *iface, uint64_t timeout_ms )
++{
++    return FALSE;
++}
++
++static void WINAPI virtual_device_v0_ReleaseExclusiveRawDeviceAccess( IGameInputDevice_v0 *iface )
++{
++}
++
++static const IGameInputDevice_v0Vtbl virtual_device_v0_vtbl =
++{
++    virtual_device_v0_QueryInterface,
++    virtual_device_v0_AddRef,
++    virtual_device_v0_Release,
++    virtual_device_v0_GetDeviceInfo,
++    virtual_device_v0_GetDeviceStatus,
++    virtual_device_v0_GetBatteryState,
++    virtual_device_v0_CreateForceFeedbackEffect,
++    virtual_device_v0_IsForceFeedbackMotorPoweredOn,
++    virtual_device_v0_SetForceFeedbackMotorGain,
++    virtual_device_v0_SetHapticMotorState,
++    virtual_device_v0_SetRumbleState,
++    virtual_device_v0_SetInputSynchronizationState,
++    virtual_device_v0_SendInputSynchronizationHint,
++    virtual_device_v0_PowerOff,
++    virtual_device_v0_CreateRawDeviceReport,
++    virtual_device_v0_GetRawDeviceFeature,
++    virtual_device_v0_SetRawDeviceFeature,
++    virtual_device_v0_SendRawDeviceOutput,
++    virtual_device_v0_SendRawDeviceOutputWithResponse,
++    virtual_device_v0_ExecuteRawDeviceIoControl,
++    virtual_device_v0_AcquireExclusiveRawDeviceAccess,
++    virtual_device_v0_ReleaseExclusiveRawDeviceAccess,
++};
++
++/* A title holding a pad by its v0 interface may pass that pointer back to the
++ * v2 calls, which identify devices by their v2 pointer. */
++static IGameInputDevice_v2 *virtual_device_v2( IGameInputDevice_v2 *device )
++{
++    IGameInputDevice_v0 *v0 = (IGameInputDevice_v0 *)device;
++
++    if (device && v0->lpVtbl == &virtual_device_v0_vtbl)
++        return &virtual_device_from_v0( v0 )->IGameInputDevice_v2_iface;
++    return device;
++}
++
+ static struct virtual_device virtual_keyboard = { {&virtual_device_vtbl}, 1, GameInputKindKeyboard };
+ static struct virtual_device virtual_mouse    = { {&virtual_device_vtbl}, 1, GameInputKindMouse };
+ /* Read pads through Wine's XInput rather than enumerating a second copy of each
+@@ -918,6 +1101,44 @@ static void virtual_device_init( struct virtual_device *device, const char *name
+         device->mouse.hasWheelY = TRUE;
+         info->mouseInfo = &device->mouse;
+     }
++
++    device->IGameInputDevice_v0_iface.lpVtbl = &virtual_device_v0_vtbl;
++    device->name_v0.data = name;
++    device->name_v0.sizeInBytes = strlen( name );
++    device->name_v0.codePointCount = strlen( name );
++    memset( &device->info_v0, 0, sizeof(device->info_v0) );
++    device->info_v0.infoSize = sizeof(device->info_v0);
++    device->info_v0.usage = info->usage;
++    device->info_v0.deviceId = info->deviceId;
++    device->info_v0.deviceRootId = info->deviceRootId;
++    device->info_v0.displayName = &device->name_v0;
++    if (device->kind == GameInputKindKeyboard)
++    {
++        device->keyboard_v0.kind = device->keyboard.kind;
++        device->keyboard_v0.keyCount = device->keyboard.keyCount;
++        device->keyboard_v0.functionKeyCount = device->keyboard.functionKeyCount;
++        device->keyboard_v0.maxSimultaneousKeys = device->keyboard.maxSimultaneousKeys;
++        device->info_v0.keyboardInfo = &device->keyboard_v0;
++    }
++    else if (device->kind == GameInputKindMouse)
++    {
++        device->mouse_v0.supportedButtons = device->mouse.supportedButtons;
++        device->mouse_v0.sampleRate = device->mouse.sampleRate;
++        device->mouse_v0.hasWheelX = device->mouse.hasWheelX;
++        device->mouse_v0.hasWheelY = device->mouse.hasWheelY;
++        device->info_v0.mouseInfo = &device->mouse_v0;
++    }
++}
++
++/* The v2 fields a caller may change after virtual_device_init, mirrored. */
++static void virtual_device_sync_v0( struct virtual_device *device )
++{
++    device->info_v0.deviceFamily = device->info.deviceFamily;
++    device->info_v0.supportedInput = device->info.supportedInput;
++    device->info_v0.supportedRumbleMotors = device->info.supportedRumbleMotors;
++    device->info_v0.gamepadInfo = device->info.gamepadInfo;
++    device->info_v0.vendorId = device->info.vendorId;
++    device->info_v0.productId = device->info.productId;
+ }
+ 
+ static void virtual_devices_init( void )
+@@ -954,6 +1175,7 @@ static void virtual_devices_init( void )
+         device->gamepad.rightThumbstickButtonLabel = GameInputLabelXboxRightStickButton;
+         device->info.supportedRumbleMotors = GameInputRumbleLowFrequency | GameInputRumbleHighFrequency;
+     }
++    for (i = 0; i < ARRAY_SIZE(virtual_devices); i++) virtual_device_sync_v0( virtual_devices[i] );
+     done = TRUE;
+ }
+ 
+@@ -1474,6 +1696,7 @@ static HRESULT WINAPI game_input_v2_GetCurrentReading( IGameInput_v2 *iface, Gam
+     struct virtual_reading *r;
+ 
+     TRACE( "impl %p, kind %#x, device %p, reading %p.\n", impl_from_v2_IGameInput( iface ), kind, device, reading );
++    device = virtual_device_v2( device );
+ 
+     if (!reading) return E_POINTER;
+     *reading = NULL;
+@@ -1496,6 +1719,7 @@ static HRESULT WINAPI game_input_v2_GetNextReading( IGameInput_v2 *iface, IGameI
+                                                     GameInputKind kind, IGameInputDevice_v2 *device, IGameInputReading_v2 **reading )
+ {
+     TRACE( "impl %p, reference %p, kind %#x, device %p, reading %p.\n", impl_from_v2_IGameInput( iface ), reference, kind, device, reading );
++    device = virtual_device_v2( device );
+ 
+     if (!reading) return E_POINTER;
+     *reading = NULL;
+@@ -1530,6 +1754,7 @@ static HRESULT WINAPI game_input_v2_RegisterDeviceCallback( IGameInput_v2 *iface
+ 
+     TRACE( "impl %p, device %p, kind %#x, filter %#x, enum_kind %#x, context %p, callback %p, token %p.\n",
+            impl, device, kind, filter, enum_kind, context, callback, token );
++    device = virtual_device_v2( device );
+ 
+     if (!callback || !token) return E_INVALIDARG;
+     if (!(entry = calloc( 1, sizeof(*entry) ))) return E_OUTOFMEMORY;

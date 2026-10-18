@@ -11,6 +11,24 @@ static unsigned int failures, count;
 static IGameInputDevice_v2 *devices[4];
 #define OK(c, s) do { printf("%s - %s\n", (c) ? "ok  " : "FAIL", s); if (!(c)) failures++; } while (0)
 
+/* The pad a reading came from, without keeping a reference to it. */
+static IGameInputDevice_v2 *reading_device(IGameInputReading_v2 *reading)
+{
+    IGameInputDevice_v2 *device = NULL;
+
+    IGameInputReading_v2_GetDevice(reading, &device);
+    if (device) IGameInputDevice_v2_Release(device);
+    return device;
+}
+
+static GameInputGamepadButtons reading_buttons(IGameInputReading_v2 *reading)
+{
+    GameInputGamepadState pad = {0};
+
+    IGameInputReading_v2_GetGamepadState(reading, &pad);
+    return pad.buttons;
+}
+
 static void WINAPI callback(GameInputCallbackToken token, void *context, IGameInputDevice_v2 *device,
                            uint64_t timestamp, GameInputDeviceStatus current, GameInputDeviceStatus previous)
 {
@@ -26,15 +44,20 @@ int main(void)
     HMODULE fixture = LoadLibraryA("xinput1_3.dll"), module = LoadLibraryA("gameinput.dll");
     IGameInput_v0 *v0 = NULL;
     IGameInput_v2 *input = NULL;
-    IGameInputReading_v2 *reading = NULL, *next = NULL;
+    IGameInputReading_v2 *reading = NULL, *next = NULL, *first = NULL, *second = NULL, *any = NULL;
     IGameInputDevice_v2 *found = NULL;
+    IGameInputDevice_v0 *device_v0 = NULL;
+    IUnknown *unknown = NULL;
     const GameInputDeviceInfo_v2 *info;
+    const GameInputDeviceInfo_v0 *info_v0;
     GameInputGamepadState pad, original;
     GameInputCallbackToken token;
     GameInputRumbleParams rumble = {1.0f, 0.5f, 0, 0};
     XINPUT_VIBRATION vibration;
     XINPUT_STATE state = {7, {XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_DPAD_LEFT,
                              255, 128, -32768, 32767, 0, -16384}};
+    XINPUT_STATE other;
+    uint64_t stamp;
     HRESULT hr;
 
     create = (void *)GetProcAddress(module, "GameInputCreate");
@@ -56,6 +79,19 @@ int main(void)
     if (count != 2) goto done;
     IGameInputDevice_v2_GetDeviceInfo(devices[0], &info);
     OK(info->supportedInput == GameInputKindGamepad && info->gamepadInfo, "gamepad metadata present");
+    OK(info->vendorId == 0x045e && info->productId == 0x028e, "v2 info names the Xbox 360 pad XInput presents");
+    hr = IGameInputDevice_v2_QueryInterface(devices[0], &IID_IGameInputDevice_v0, (void **)&device_v0);
+    OK(hr == S_OK && device_v0, "pad from the v2 callback answers IGameInputDevice_v0");
+    if (device_v0)
+    {
+        info_v0 = IGameInputDevice_v0_GetDeviceInfo(device_v0);
+        OK(info_v0 && info_v0->vendorId == info->vendorId && info_v0->productId == info->productId,
+           "v0 and v2 views of one pad report the same vendor and product");
+        IGameInputDevice_v0_QueryInterface(device_v0, &IID_IUnknown, (void **)&unknown);
+        OK(unknown == (IUnknown *)devices[0], "v0 view shares the pad's IUnknown identity");
+        if (unknown) unknown->lpVtbl->Release(unknown);
+        IGameInputDevice_v0_Release(device_v0);
+    }
     IGameInput_v2_FindDeviceFromId(input, &info->deviceId, &found);
     OK(found == devices[0], "FindDeviceFromId preserves gamepad identity");
     if (found) IGameInputDevice_v2_Release(found);
@@ -86,6 +122,73 @@ int main(void)
     IGameInputDevice_v2_SetRumbleState(devices[0], &rumble);
     get_vibration(0, &vibration);
     OK(vibration.wLeftMotorSpeed == 65535 && vibration.wRightMotorSpeed == 32767, "rumble reaches XInput");
+
+    /* An idle pad's timestamp is when its packet arrived, not when it was polled. */
+    hr = IGameInput_v2_GetCurrentReading(input, GameInputKindGamepad, devices[0], &first);
+    Sleep(20);
+    if (hr == S_OK) hr = IGameInput_v2_GetCurrentReading(input, GameInputKindGamepad, devices[0], &second);
+    OK(hr == S_OK && first && second, "idle pad supplies repeated readings");
+    if (first && second)
+    {
+        stamp = IGameInputReading_v2_GetTimestamp(first);
+        OK(IGameInputReading_v2_GetTimestamp(second) == stamp, "idle pad's timestamp does not advance between polls");
+        OK(stamp <= IGameInput_v2_GetCurrentTimestamp(input), "pad timestamps share GetCurrentTimestamp's clock");
+        IGameInputReading_v2_Release(second);
+        second = NULL;
+        state.dwPacketNumber++;
+        set_state(0, &state, TRUE);
+        IGameInput_v2_GetCurrentReading(input, GameInputKindGamepad, devices[0], &second);
+        OK(second && IGameInputReading_v2_GetTimestamp(second) > stamp, "a new packet gets a newer timestamp");
+    }
+    if (first) IGameInputReading_v2_Release(first);
+    if (second) IGameInputReading_v2_Release(second);
+    first = second = NULL;
+
+    /* With no device, readings come from whichever pad was used last, as in
+     * GameInput's single input stream: not always from the lowest slot. */
+    hr = IGameInput_v2_GetCurrentReading(input, GameInputKindGamepad, NULL, &first);
+    OK(hr == S_OK && first && reading_device(first) == devices[0], "any-pad reading starts at the pad in use");
+    other = state;
+    other.dwPacketNumber = 100;
+    other.Gamepad.wButtons = XINPUT_GAMEPAD_X;
+    set_state(3, &other, TRUE);
+    hr = IGameInput_v2_GetCurrentReading(input, GameInputKindGamepad, NULL, &any);
+    OK(hr == S_OK && any && reading_device(any) == devices[1] && reading_buttons(any) == GameInputGamepadX,
+       "any-pad reading follows input on the pad in slot 3 after slot 0");
+    if (any) IGameInputReading_v2_Release(any);
+    any = NULL;
+    if (first)
+    {
+        hr = IGameInput_v2_GetNextReading(input, first, GameInputKindGamepad, NULL, &second);
+        OK(hr == S_OK && second && reading_device(second) == devices[1] && reading_buttons(second) == GameInputGamepadX,
+           "next any-pad reading after slot 0's is the newer input from slot 3");
+    }
+    if (second)
+    {
+        hr = IGameInput_v2_GetNextReading(input, second, GameInputKindGamepad, NULL, &any);
+        OK(hr == GAMEINPUT_E_READING_NOT_FOUND && !any, "no newer input on any pad ends the drain loop");
+        if (any) IGameInputReading_v2_Release(any);
+        any = NULL;
+        hr = IGameInput_v2_GetNextReading(input, second, GameInputKindGamepad, devices[0], &any);
+        OK(hr == GAMEINPUT_E_READING_NOT_FOUND && !any, "a named pad with no input since the reference has no next reading");
+        if (any) IGameInputReading_v2_Release(any);
+        any = NULL;
+        state.dwPacketNumber++;
+        state.Gamepad.wButtons = XINPUT_GAMEPAD_Y;
+        set_state(0, &state, TRUE);
+        hr = IGameInput_v2_GetNextReading(input, second, GameInputKindGamepad, NULL, &any);
+        OK(hr == S_OK && any && reading_device(any) == devices[0] && reading_buttons(any) == GameInputGamepadY,
+           "slot 0 used again supplies the next any-pad reading");
+        if (any) IGameInputReading_v2_Release(any);
+        any = NULL;
+    }
+    hr = IGameInput_v2_GetCurrentReading(input, GameInputKindGamepad, NULL, &any);
+    OK(hr == S_OK && any && reading_device(any) == devices[0], "any-pad reading returns to slot 0 once it is used again");
+    if (any) IGameInputReading_v2_Release(any);
+    if (first) IGameInputReading_v2_Release(first);
+    if (second) IGameInputReading_v2_Release(second);
+    any = first = second = NULL;
+
     set_state(0, &state, FALSE);
     OK(IGameInputDevice_v2_GetDeviceStatus(devices[0]) == GameInputDeviceNoStatus, "disconnected pad reports disconnected");
     next = NULL;

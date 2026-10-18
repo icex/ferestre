@@ -129,6 +129,21 @@ impl Model {
         self.entitlements_checked = true;
     }
 
+    /// Nobody is signed in any more. The listing goes with the account:
+    /// leaving it on screen, or on disk for the next window, would show a
+    /// library belonging to nobody, with buttons that all fail at the licence
+    /// step.
+    pub fn forget_account(&mut self) {
+        self.account = None;
+        self.avatar = None;
+        self.ownership = Ownership::Unknown;
+        self.subscriptions.clear();
+        self.entitlements_checked = false;
+        if let Some(paths) = self.paths.as_ref() {
+            forget_saved_account(paths.state_dir());
+        }
+    }
+
     pub fn load() -> Self {
         let mut problem = None;
         let paths = match Paths::from_env() {
@@ -293,10 +308,15 @@ impl Model {
     ///
     /// Re-reading a recipe file is not a reason to make someone sign in again,
     /// or to re-download a hundred icons.
+    ///
+    /// Scans already walking a game folder stay pending: starting another walk
+    /// of the same hundred gigabytes on every Refresh would only race the first.
+    /// The new generation tells their results to re-check the install first.
     pub fn reload(&mut self) {
         let fresh = Model::load();
         *self = Model {
             size_generation: self.size_generation.wrapping_add(1),
+            sizes_pending: std::mem::take(&mut self.sizes_pending),
             ownership: std::mem::take(&mut self.ownership),
             catalog: std::mem::take(&mut self.catalog),
             icons: std::mem::take(&mut self.icons),
@@ -423,6 +443,14 @@ impl Model {
     }
 }
 
+/// Remove the saved account and the library listed for it, so a window opened
+/// later does not show either. Best effort: a file that is already gone is the
+/// point.
+pub fn forget_saved_account(state_dir: &Path) {
+    let _ = std::fs::remove_file(library::cache_path(state_dir));
+    let _ = std::fs::remove_file(ferestre_core::account::cache_path(state_dir));
+}
+
 /// Icons already on disk from a previous run. Nothing is fetched here: a window
 /// that waits on a hundred HTTP requests before it appears is not a window.
 fn existing_icons(cache: &Cache, catalog: &BTreeMap<String, Product>) -> BTreeMap<String, PathBuf> {
@@ -469,4 +497,26 @@ fn adopt_existing(
         }
     }
     records
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forgetting_the_saved_account_removes_its_library_too() {
+        let dir = std::env::temp_dir().join(format!("ferestre-gui-forget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let account = ferestre_core::account::cache_path(&dir);
+        let listing = library::cache_path(&dir);
+        std::fs::write(&account, "{}").unwrap();
+        std::fs::write(&listing, "[]").unwrap();
+
+        forget_saved_account(&dir);
+        assert!(!account.exists());
+        assert!(!listing.exists());
+        // Already gone is fine: that is what it is for.
+        forget_saved_account(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
