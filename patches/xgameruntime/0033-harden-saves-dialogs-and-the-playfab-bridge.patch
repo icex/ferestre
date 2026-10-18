@@ -18,9 +18,15 @@ is used, otherwise the one whose index was written last, ties going to the
 lowest name, with a warning; never whichever the listing returned first.
 
 XGameSaveSubmitUpdateAsync and XGameSaveDeleteContainerAsync do their disk
-work on a background writer, in submission order, instead of on the caller's
-thread. Container and update handles are reference counted so a title may
-close them while the work is pending.
+work on a background writer instead of on the caller's thread. Jobs are only
+taken off the queue under the save lock, and every call that takes the lock
+first writes what is queued, so all changes still land in the order they
+were made, synchronous ones included. Called from inside an enumeration
+callback, where the thread already holds the lock, the job is written
+inline as before, so a title can wait on it there. Jobs still queued when
+the process exits are written from DLL_PROCESS_DETACH if the lock is free.
+Container and update handles are reference counted so a title may close them
+while the work is pending.
 
 The PFX bridge clears a reused XAsyncBlock before starting the SDK operation,
 returns the folder path itself as the async payload, and only treats a
@@ -31,6 +37,19 @@ ForceUseInprocGameSaves override is recorded in a marker first, and a run
 that finds the marker restores the prior setting if the override is still in
 place.
 
+diff --git a/main.c b/main.c
+index 10c03ed..61eef9d 100644
+--- a/main.c
++++ b/main.c
+@@ -106,6 +106,8 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, void *reserved )
+             TlsSetValue( tlsIndex, FALSE );
+             break;
+         case DLL_PROCESS_DETACH:
++            /* process exit only (reserved is set): the save writer is gone */
++            if (reserved) xgr_save_process_exit();
+             if (fault_trace_handler) RemoveVectoredExceptionHandler(fault_trace_handler);
+             TlsFree( tlsIndex );
+             break;
 diff --git a/pfxgamesave.c b/pfxgamesave.c
 index d0adbaa..d409a2a 100644
 --- a/pfxgamesave.c
@@ -244,8 +263,23 @@ index d0adbaa..d409a2a 100644
      return hr;
  }
  
+diff --git a/private.h b/private.h
+index f6a06c5..b54fd04 100644
+--- a/private.h
++++ b/private.h
+@@ -151,6 +151,10 @@ void xgr_title_identity( char *title_id, SIZE_T title_id_len, char *client_id, S
+ /* Wrap a UTF-8 filesystem path in an XPackageMountHandle (from xpackage.c). */
+ void *xgr_make_mount( const char *path );
+ 
++/* Write the game saves still queued for the background writer (xgamesave.c);
++ * called once at process exit. */
++void xgr_save_process_exit( void );
++
+ static inline BOOL xgr_async_completed( const XAsyncBlock *async, HRESULT *hr, void **payload )
+ {
+     if (!async || async->internal[0] != XGR_ASYNC_MAGIC) return FALSE;
 diff --git a/xgamesave.c b/xgamesave.c
-index ce74d5c..a65c839 100644
+index ce74d5c..e486736 100644
 --- a/xgamesave.c
 +++ b/xgamesave.c
 @@ -112,6 +112,7 @@ struct x_string_entry
@@ -521,7 +555,7 @@ index ce74d5c..a65c839 100644
      free( req );
  }
  
-@@ -1602,6 +1701,155 @@ static HRESULT queue_op( struct XGameSaveUpdate *update, const char *blob_name,
+@@ -1602,6 +1701,250 @@ static HRESULT queue_op( struct XGameSaveUpdate *update, const char *blob_name,
      return S_OK;
  }
  
@@ -572,12 +606,14 @@ index ce74d5c..a65c839 100644
 + * index, each flushed to disk. So they are done here, off the caller's
 + * thread, and the block completes when the data is on disk.
 + *
-+ * One worker at a time takes them in the order they were submitted. Two
-+ * updates to the same container, submitted back to back, must reach the disk
-+ * in that order: running them side by side on the pool could leave the older
-+ * one on top. Each holds what it needs alive -- the update and through it its
-+ * container and provider -- so a title may close its handles as soon as the
-+ * call returns. */
++ * Every change still lands in the order it was made. A job is only taken off
++ * the queue by someone holding gs_cs, so whoever holds the saves sees every
++ * job that has not started yet, and each call that takes them first writes
++ * what is queued (lock_saves). A synchronous update made after an async one
++ * therefore lands on top of it, as it did when both were written inline, and
++ * a read sees what was submitted before it. Each job holds what it needs
++ * alive -- the update and through it its container and provider -- so a
++ * title may close its handles as soon as the call returns. */
 +struct save_job
 +{
 +    struct list entry;
@@ -585,6 +621,7 @@ index ce74d5c..a65c839 100644
 +    struct XGameSaveUpdate *update;         /* a submit... */
 +    struct XGameSaveProvider *provider;     /* ...or a delete */
 +    char *name;
++    HRESULT hr;
 +};
 +
 +static struct list save_jobs = LIST_INIT( save_jobs );
@@ -606,34 +643,87 @@ index ce74d5c..a65c839 100644
 +    free( job );
 +}
 +
++/* The oldest job not yet started. Called with gs_cs held. */
++static struct save_job *next_save_job( void )
++{
++    struct save_job *job = NULL;
++
++    EnterCriticalSection( &jobs_cs );
++    if (!list_empty( &save_jobs ))
++    {
++        job = LIST_ENTRY( list_head( &save_jobs ), struct save_job, entry );
++        list_remove( &job->entry );
++    }
++    LeaveCriticalSection( &jobs_cs );
++    return job;
++}
++
++/* Called with gs_cs held. */
++static void run_save_job( struct save_job *job )
++{
++    if (job->update) job->hr = submit_update( job->update );
++    else job->hr = delete_container( job->provider, job->name );
++    TRACE( "%s for block %p finished, hr %#lx.\n", job->update ? "update" : "delete", job->async, job->hr );
++}
++
++static void complete_save_job( struct save_job *job )
++{
++    XAsyncBlock *async = job->async;
++    HRESULT hr = job->hr;
++
++    free_save_job( job );
++    xgr_async_complete( async, hr, NULL );
++}
++
++/* Take the saves, first writing whatever was queued before this call. The
++ * jobs written here are completed by unlock_saves, once the saves are
++ * released, so a completion callback does not run under gs_cs. */
++static void lock_saves( struct list *done )
++{
++    struct save_job *job;
++
++    list_init( done );
++    EnterCriticalSection( &gs_cs );
++    while ((job = next_save_job()))
++    {
++        run_save_job( job );
++        list_add_tail( done, &job->entry );
++    }
++}
++
++static void unlock_saves( struct list *done )
++{
++    struct save_job *job, *next;
++
++    LeaveCriticalSection( &gs_cs );
++    LIST_FOR_EACH_ENTRY_SAFE( job, next, done, struct save_job, entry )
++    {
++        list_remove( &job->entry );
++        complete_save_job( job );
++    }
++}
++
 +static void run_save_jobs( void )
 +{
 +    struct save_job *job;
-+    XAsyncBlock *async;
-+    HRESULT hr;
 +
 +    for (;;)
 +    {
++        EnterCriticalSection( &gs_cs );
 +        EnterCriticalSection( &jobs_cs );
 +        if (list_empty( &save_jobs ))
 +        {
 +            save_worker_running = FALSE;
 +            LeaveCriticalSection( &jobs_cs );
++            LeaveCriticalSection( &gs_cs );
 +            return;
 +        }
 +        job = LIST_ENTRY( list_head( &save_jobs ), struct save_job, entry );
 +        list_remove( &job->entry );
 +        LeaveCriticalSection( &jobs_cs );
-+
-+        EnterCriticalSection( &gs_cs );
-+        if (job->update) hr = submit_update( job->update );
-+        else hr = delete_container( job->provider, job->name );
++        run_save_job( job );
 +        LeaveCriticalSection( &gs_cs );
-+        TRACE( "%s for block %p finished, hr %#lx.\n", job->update ? "update" : "delete", job->async, hr );
-+
-+        async = job->async;
-+        free_save_job( job );
-+        xgr_async_complete( async, hr, NULL );
++        complete_save_job( job );
 +    }
 +}
 +
@@ -649,13 +739,29 @@ index ce74d5c..a65c839 100644
 +}
 +
 +/* Takes ownership of the job. The block reads as pending from here until the
-+ * worker completes it. */
++ * job is written and completed. */
 +static void queue_save_job( struct save_job *job )
 +{
++    struct list done;
 +    HANDLE thread;
 +    BOOL start;
 +
 +    memset( job->async->internal, 0, sizeof(job->async->internal) );
++
++    /* Called from one of the enumeration callbacks, this thread already
++     * holds the saves, and the writer cannot take them before the callback
++     * returns. A title that waits on the block right there would wait for
++     * good, so the job is written here, after anything queued before it, as
++     * it was before the writer existed. */
++    if (gs_cs.OwningThread == ULongToHandle( GetCurrentThreadId() ))
++    {
++        lock_saves( &done );
++        run_save_job( job );
++        list_add_tail( &done, &job->entry );
++        unlock_saves( &done );
++        return;
++    }
++
 +    EnterCriticalSection( &jobs_cs );
 +    list_add_tail( &save_jobs, &job->entry );
 +    start = !save_worker_running;
@@ -674,10 +780,68 @@ index ce74d5c..a65c839 100644
 +    run_save_jobs();
 +}
 +
++/* At process exit, write what is still queued. A title that submits its last
++ * save and quits without waiting would otherwise lose it: the threads that
++ * would have written it are gone by now. Only when the saves are free -- a
++ * writer stopped halfway through a job left them held, and its half-changed
++ * state with them, and that job is lost either way. The blocks are not
++ * completed; nobody is left to look at them. */
++void xgr_save_process_exit( void )
++{
++    struct save_job *job;
++
++    if (!TryEnterCriticalSection( &gs_cs )) return;
++    while (TryEnterCriticalSection( &jobs_cs ))
++    {
++        job = list_empty( &save_jobs ) ? NULL : LIST_ENTRY( list_head( &save_jobs ), struct save_job, entry );
++        if (job) list_remove( &job->entry );
++        LeaveCriticalSection( &jobs_cs );
++        if (!job) break;
++        TRACE( "writing a save left queued at exit.\n" );
++        run_save_job( job );
++    }
++    LeaveCriticalSection( &gs_cs );
++}
++
  /* ---- interface ---------------------------------------------------------- */
  
  struct x_game_save
-@@ -1770,13 +2018,29 @@ static HRESULT WINAPI x_game_save_XGameSaveDeleteContainer( IXGameSaveImpl4 *ifa
+@@ -1707,14 +2050,15 @@ static void WINAPI x_game_save_XGameSaveCloseProvider( IXGameSaveImpl4 *iface, X
+ 
+ static HRESULT WINAPI x_game_save_XGameSaveGetRemainingQuota( IXGameSaveImpl4 *iface, XGameSaveProviderHandle provider, INT64 *remainingQuota )
+ {
++    struct list done;
+     HRESULT hr;
+ 
+     TRACE( "iface %p, provider %p, remainingQuota %p.\n", iface, provider, remainingQuota );
+ 
+     if (!provider || !remainingQuota) return E_INVALIDARG;
+-    EnterCriticalSection( &gs_cs );
++    lock_saves( &done );
+     if ((hr = provider_reload( provider )) == S_OK) *remainingQuota = provider_remaining( provider );
+-    LeaveCriticalSection( &gs_cs );
++    unlock_saves( &done );
+     return hr;
+ }
+ 
+@@ -1756,27 +2100,44 @@ static HRESULT WINAPI x_game_save_XGameSaveGetRemainingQuotaResult( IXGameSaveIm
+ 
+ static HRESULT WINAPI x_game_save_XGameSaveDeleteContainer( IXGameSaveImpl4 *iface, XGameSaveProviderHandle provider, const char *containerName )
+ {
++    struct list done;
+     HRESULT hr;
+ 
+     TRACE( "iface %p, provider %p, containerName %s.\n", iface, provider, debugstr_a( containerName ) );
+ 
+     if (!provider) return E_INVALIDARG;
+     if (!valid_container_name( containerName )) return E_GS_INVALID_CONTAINER_NAME;
+-    EnterCriticalSection( &gs_cs );
++    lock_saves( &done );
+     hr = delete_container( provider, containerName );
+-    LeaveCriticalSection( &gs_cs );
++    unlock_saves( &done );
+     return hr;
+ }
  
  static HRESULT WINAPI x_game_save_XGameSaveDeleteContainerAsync( IXGameSaveImpl4 *iface, XGameSaveProviderHandle provider, const char *containerName, XAsyncBlock *async )
  {
@@ -710,7 +874,53 @@ index ce74d5c..a65c839 100644
      return S_OK;
  }
  
-@@ -1879,6 +2143,7 @@ static HRESULT WINAPI x_game_save_XGameSaveCreateContainer( IXGameSaveImpl4 *ifa
+@@ -1792,6 +2153,7 @@ static HRESULT WINAPI x_game_save_XGameSaveDeleteContainerResult( IXGameSaveImpl
+ 
+ static HRESULT WINAPI x_game_save_XGameSaveGetContainerInfo( IXGameSaveImpl4 *iface, XGameSaveProviderHandle provider, const char *containerName, void *context, XGameSaveContainerInfoCallback *callback )
+ {
++    struct list done;
+     struct wgs_container *c;
+     WCHAR *name;
+     HRESULT hr;
+@@ -1801,16 +2163,17 @@ static HRESULT WINAPI x_game_save_XGameSaveGetContainerInfo( IXGameSaveImpl4 *if
+     if (!provider || !callback) return E_INVALIDARG;
+     if (!valid_container_name( containerName )) return E_GS_INVALID_CONTAINER_NAME;
+     if (!(name = utf8_to_wide( containerName ))) return E_OUTOFMEMORY;
+-    EnterCriticalSection( &gs_cs );
++    lock_saves( &done );
+     if ((hr = provider_reload( provider )) == S_OK && (c = provider_find( provider, name )))
+         report_container( provider, c, context, callback );
+-    LeaveCriticalSection( &gs_cs );
++    unlock_saves( &done );
+     free( name );
+     return hr;
+ }
+ 
+ static HRESULT enumerate_containers( struct XGameSaveProvider *provider, const char *prefix, void *context, XGameSaveContainerInfoCallback *callback )
+ {
++    struct list done;
+     struct wgs_container *c;
+     WCHAR *prefix_w = NULL, **names;
+     SIZE_T prefix_len = 0;
+@@ -1823,7 +2186,7 @@ static HRESULT enumerate_containers( struct XGameSaveProvider *provider, const c
+         if (!(prefix_w = utf8_to_wide( prefix ))) return E_OUTOFMEMORY;
+         prefix_len = wcslen( prefix_w );
+     }
+-    EnterCriticalSection( &gs_cs );
++    lock_saves( &done );
+     if ((hr = provider_reload( provider )) == S_OK)
+     {
+         /* the callback may call back in and reload the list, so walk a
+@@ -1845,7 +2208,7 @@ static HRESULT enumerate_containers( struct XGameSaveProvider *provider, const c
+             free( names );
+         }
+     }
+-    LeaveCriticalSection( &gs_cs );
++    unlock_saves( &done );
+     free( prefix_w );
+     return hr;
+ }
+@@ -1879,6 +2242,7 @@ static HRESULT WINAPI x_game_save_XGameSaveCreateContainer( IXGameSaveImpl4 *ifa
          return E_OUTOFMEMORY;
      }
      list_init( &container->strings );
@@ -718,7 +928,7 @@ index ce74d5c..a65c839 100644
      container->provider = provider;
      provider_addref( provider );
      /* nothing reaches the disk until an update is submitted */
-@@ -1888,21 +2153,9 @@ static HRESULT WINAPI x_game_save_XGameSaveCreateContainer( IXGameSaveImpl4 *ifa
+@@ -1888,25 +2252,14 @@ static HRESULT WINAPI x_game_save_XGameSaveCreateContainer( IXGameSaveImpl4 *ifa
  
  static void WINAPI x_game_save_XGameSaveCloseContainer( IXGameSaveImpl4 *iface, XGameSaveContainerHandle context )
  {
@@ -741,7 +951,54 @@ index ce74d5c..a65c839 100644
  }
  
  static HRESULT enumerate_blobs( struct XGameSaveContainer *container, const char *prefix, void *context, XGameSaveBlobInfoCallback *callback )
-@@ -1993,6 +2246,7 @@ static HRESULT WINAPI x_game_save_XGameSaveReadBlobDataAsync( IXGameSaveImpl4 *i
+ {
++    struct list done;
+     struct XGameSaveProvider *p;
+     struct wgs_container *c;
+     struct wgs_blob *b;
+@@ -1922,7 +2275,7 @@ static HRESULT enumerate_blobs( struct XGameSaveContainer *container, const char
+         if (!(prefix_w = utf8_to_wide( prefix ))) return E_OUTOFMEMORY;
+         prefix_len = wcslen( prefix_w );
+     }
+-    EnterCriticalSection( &gs_cs );
++    lock_saves( &done );
+     if ((hr = provider_reload( p )) == S_OK && (c = provider_find( p, container->name )))
+     {
+         if (!(dir = container_dir( p, c ))) hr = E_OUTOFMEMORY;
+@@ -1949,7 +2302,7 @@ static HRESULT enumerate_blobs( struct XGameSaveContainer *container, const char
+             free( dir );
+         }
+     }
+-    LeaveCriticalSection( &gs_cs );
++    unlock_saves( &done );
+     free( prefix_w );
+     return hr;
+ }
+@@ -1970,19 +2323,21 @@ static HRESULT WINAPI x_game_save_XGameSaveEnumerateBlobInfoByName( IXGameSaveIm
+ 
+ static HRESULT WINAPI x_game_save_XGameSaveReadBlobData( IXGameSaveImpl4 *iface, XGameSaveContainerHandle container, const char **blobNames, UINT32 *countOfBlobs, SIZE_T blobsSize, XGameSaveBlob *blobData )
+ {
++    struct list done;
+     HRESULT hr;
+ 
+     TRACE( "iface %p, container %p, blobNames %p, countOfBlobs %p, blobsSize %Iu, blobData %p.\n", iface, container, blobNames, countOfBlobs, blobsSize, blobData );
+ 
+     if (!container || !countOfBlobs) return E_INVALIDARG;
+-    EnterCriticalSection( &gs_cs );
++    lock_saves( &done );
+     hr = read_blobs( container, blobNames, countOfBlobs, blobsSize, blobData, NULL );
+-    LeaveCriticalSection( &gs_cs );
++    unlock_saves( &done );
+     return hr;
+ }
+ 
+ static HRESULT WINAPI x_game_save_XGameSaveReadBlobDataAsync( IXGameSaveImpl4 *iface, XGameSaveContainerHandle container, const char **blobNames, UINT32 countOfBlobs, XAsyncBlock *async )
+ {
++    struct list done;
+     struct read_request *req;
+     SIZE_T required = 0;
+     UINT32 n = countOfBlobs, i;
+@@ -1993,12 +2348,13 @@ static HRESULT WINAPI x_game_save_XGameSaveReadBlobDataAsync( IXGameSaveImpl4 *i
      if (!container || !async) return E_INVALIDARG;
      if (!(req = calloc( 1, sizeof(*req) ))) return E_OUTOFMEMORY;
      req->container = container;
@@ -749,7 +1006,46 @@ index ce74d5c..a65c839 100644
      if (blobNames)
      {
          req->count = n;
-@@ -2064,25 +2318,18 @@ static HRESULT WINAPI x_game_save_XGameSaveCreateUpdate( IXGameSaveImpl4 *iface,
+         if (!(req->names = calloc( n + 1, sizeof(*req->names) )))
+         {
+-            free( req );
++            free_read_request( req );
+             return E_OUTOFMEMORY;
+         }
+         for (i = 0; i < n; i++)
+@@ -2012,9 +2368,9 @@ static HRESULT WINAPI x_game_save_XGameSaveReadBlobDataAsync( IXGameSaveImpl4 *i
+     }
+ 
+     /* validate now and report the buffer size; the copy happens in *Result */
+-    EnterCriticalSection( &gs_cs );
++    lock_saves( &done );
+     hr = read_blobs( container, (const char **)req->names, &n, 0, NULL, &required );
+-    LeaveCriticalSection( &gs_cs );
++    unlock_saves( &done );
+     if (FAILED( hr ))
+     {
+         free_read_request( req );
+@@ -2026,6 +2382,7 @@ static HRESULT WINAPI x_game_save_XGameSaveReadBlobDataAsync( IXGameSaveImpl4 *i
+ 
+ static HRESULT WINAPI x_game_save_XGameSaveReadBlobDataResult( IXGameSaveImpl4 *iface, XAsyncBlock *async, SIZE_T blobsSize, XGameSaveBlob *blobData, UINT32 *countOfBlobs )
+ {
++    struct list done;
+     struct read_request *req;
+     UINT32 n;
+     HRESULT hr;
+@@ -2037,9 +2394,9 @@ static HRESULT WINAPI x_game_save_XGameSaveReadBlobDataResult( IXGameSaveImpl4 *
+     if (!req) return E_INVALIDARG;
+ 
+     n = req->count;
+-    EnterCriticalSection( &gs_cs );
++    lock_saves( &done );
+     hr = read_blobs( req->container, (const char **)req->names, &n, blobsSize, blobData, NULL );
+-    LeaveCriticalSection( &gs_cs );
++    unlock_saves( &done );
+     if (countOfBlobs) *countOfBlobs = n;
+     if (hr != E_GS_PROVIDED_BUFFER_TOO_SMALL)
+     {
+@@ -2064,25 +2421,18 @@ static HRESULT WINAPI x_game_save_XGameSaveCreateUpdate( IXGameSaveImpl4 *iface,
          return E_OUTOFMEMORY;
      }
      list_init( &update->ops );
@@ -778,7 +1074,23 @@ index ce74d5c..a65c839 100644
  }
  
  static HRESULT WINAPI x_game_save_XGameSaveSubmitBlobWrite( IXGameSaveImpl4 *iface, XGameSaveUpdateHandle updateContext, const char *blobName, UINT8 *data, SIZE_T byteCount )
-@@ -2116,13 +2363,21 @@ static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdate( IXGameSaveImpl4 *iface,
+@@ -2103,26 +2453,35 @@ static HRESULT WINAPI x_game_save_XGameSaveSubmitBlobDelete( IXGameSaveImpl4 *if
+ 
+ static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdate( IXGameSaveImpl4 *iface, XGameSaveUpdateHandle updateContext )
+ {
++    struct list done;
+     HRESULT hr;
+ 
+     TRACE( "iface %p, updateContext %p.\n", iface, updateContext );
+ 
+     if (!updateContext) return E_INVALIDARG;
+-    EnterCriticalSection( &gs_cs );
++    lock_saves( &done );
+     hr = submit_update( updateContext );
+-    LeaveCriticalSection( &gs_cs );
++    unlock_saves( &done );
+     return hr;
+ }
  
  static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdateAsync( IXGameSaveImpl4 *iface, XGameSaveUpdateHandle updateContext, XAsyncBlock *async )
  {
@@ -803,6 +1115,26 @@ index ce74d5c..a65c839 100644
      return S_OK;
  }
  
+@@ -2181,6 +2540,7 @@ static HRESULT WINAPI x_game_save_XGameSaveFilesGetFolderWithUiResult( IXGameSav
+ 
+ static HRESULT WINAPI x_game_save_XGameSaveFilesGetRemainingQuota( IXGameSaveImpl4 *iface, XUserHandle userContext, const char *configurationId, INT64 *remainingQuota )
+ {
++    struct list done;
+     struct XGameSaveProvider *provider;
+     HRESULT hr;
+ 
+@@ -2188,9 +2548,9 @@ static HRESULT WINAPI x_game_save_XGameSaveFilesGetRemainingQuota( IXGameSaveImp
+ 
+     if (!remainingQuota) return E_INVALIDARG;
+     if (FAILED( hr = create_provider( userContext, configurationId, &provider ) )) return hr;
+-    EnterCriticalSection( &gs_cs );
++    lock_saves( &done );
+     *remainingQuota = provider_remaining( provider );
+-    LeaveCriticalSection( &gs_cs );
++    unlock_saves( &done );
+     provider_release( provider );
+     return S_OK;
+ }
 diff --git a/xgameui.c b/xgameui.c
 index 893a013..f5928de 100644
 --- a/xgameui.c

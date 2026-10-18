@@ -1673,6 +1673,10 @@ static void test_package_identity_race(void);
 static void test_gamesave_unreadable_manifest(void);
 static void test_gamesave_user_folder_choice(void);
 static void test_gamesave_async_writes(void);
+static void test_gamesave_sync_after_async(void);
+static void test_gamesave_async_from_callback(void);
+static void test_gamesave_queued_at_exit(void);
+static int exit_after_async_save_child( const char *container_name );
 static void test_pfx_backend_recovery(void);
 static void test_pfx_reused_block(void);
 
@@ -1699,7 +1703,7 @@ int main(int argc, char **argv)
     g_query = query;
     /* a test's helper process starts from a clean slate and says nothing */
     if (argc < 2 || (strcmp( argv[1], "--identity-race" ) && strcmp( argv[1], "--read-owner" ) &&
-                     strcmp( argv[1], "--pfx-recovery-child" )))
+                     strcmp( argv[1], "--pfx-recovery-child" ) && strcmp( argv[1], "--exit-after-async-save" )))
         test_runtime_discovery( mod );
     init( 10002, 7822 );
 
@@ -1717,6 +1721,7 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "--identity-race")) return identity_race_child();
     if (argc > 2 && !strcmp(argv[1], "--read-owner")) return read_owner_child( argv[2] );
     if (argc > 1 && !strcmp(argv[1], "--pfx-recovery-child")) return pfx_recovery_child();
+    if (argc > 2 && !strcmp(argv[1], "--exit-after-async-save")) return exit_after_async_save_child( argv[2] );
     if (argc > 1 && !strcmp(argv[1], "--store-lifetime"))
     {
         test_store_product_lifetime();
@@ -1752,6 +1757,9 @@ int main(int argc, char **argv)
     test_gamesave_unreadable_manifest();
     test_gamesave_user_folder_choice();
     test_gamesave_async_writes();
+    test_gamesave_sync_after_async();
+    test_gamesave_async_from_callback();
+    test_gamesave_queued_at_exit();
 
     printf( "\n1..%d\n", g_run );
     printf( "%s: %d checks, %d failed\n", g_failed ? "FAILED" : "PASSED", g_run, g_failed );
@@ -2337,4 +2345,246 @@ static void test_pfx_reused_block(void)
 
     IXGameSaveImpl4_PFXGameSaveFreeConfig( modern, config );
     IXGameSaveImpl4_Release( modern );
+}
+
+/* ---- XGameSave: queued writes keep their order -------------------------- */
+
+struct sync_inside_hold
+{
+    XGameSaveProviderHandle provider;
+    XGameSaveUpdateHandle update;
+    HANDLE inside, go, done;
+    HRESULT hr;
+};
+
+/* Holds the saves like hold_save_lock, then, still inside the callback, makes
+ * a synchronous update: the thread already owns the saves, so nothing about
+ * lock order decides whether it lands before or after a queued one. */
+static BOOLEAN __stdcall sync_submit_while_holding( const XGameSaveContainerInfo *info, void *context )
+{
+    struct sync_inside_hold *hold = context;
+
+    if (!hold->update) return FALSE;
+    SetEvent( hold->inside );
+    WaitForSingleObject( hold->go, 10000 );
+    hold->hr = IXGameSaveImpl3_XGameSaveSubmitUpdate( gs, hold->update );
+    hold->update = NULL;
+    SetEvent( hold->done );
+    return FALSE;
+}
+
+static DWORD WINAPI sync_submit_thread( void *context )
+{
+    struct sync_inside_hold *hold = context;
+
+    IXGameSaveImpl3_XGameSaveEnumerateContainerInfo( gs, hold->provider, hold, sync_submit_while_holding );
+    return 0;
+}
+
+static void test_gamesave_sync_after_async(void)
+{
+    static const char scid[] = "00000000-0000-0000-0000-0000000000f6";
+    XGameSaveProviderHandle provider = NULL;
+    XGameSaveContainerHandle container = NULL;
+    XGameSaveUpdateHandle early = NULL, late = NULL;
+    struct sync_inside_hold hold;
+    XAsyncBlock async;
+    HANDLE thread;
+    char value[64];
+    HRESULT hr;
+
+    printf( "# XGameSave synchronous update after a queued one\n" );
+    hr = IXGameSaveImpl3_XGameSaveInitializeProvider( gs, user, scid, FALSE, &provider );
+    CHECK( SUCCEEDED( hr ) && provider, "provider opens (0x%08lx)", hr );
+    if (!provider) return;
+    hr = write_one_blob( provider, "order_container", "order", "initial" );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveCreateContainer( gs, provider, "order_container", &container );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveCreateUpdate( gs, container, NULL, &early );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveSubmitBlobWrite( gs, early, "order", (UINT8 *)"async", 6 );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveCreateUpdate( gs, container, NULL, &late );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveSubmitBlobWrite( gs, late, "order", (UINT8 *)"sync", 5 );
+    CHECK( SUCCEEDED( hr ), "an async and a later synchronous update are prepared (0x%08lx)", hr );
+    if (FAILED( hr )) goto done;
+
+    memset( &hold, 0, sizeof(hold) );
+    hold.provider = provider;
+    hold.update = late;
+    hold.hr = E_FAIL;
+    hold.inside = CreateEventA( NULL, TRUE, FALSE, NULL );
+    hold.go = CreateEventA( NULL, TRUE, FALSE, NULL );
+    hold.done = CreateEventA( NULL, TRUE, FALSE, NULL );
+    thread = CreateThread( NULL, 0, sync_submit_thread, &hold, 0, NULL );
+    CHECK( WaitForSingleObject( hold.inside, 5000 ) == WAIT_OBJECT_0, "another thread holds the saves" );
+
+    /* the async update is made first, the synchronous one after it */
+    memset( &async, 0, sizeof(async) );
+    hr = IXGameSaveImpl3_XGameSaveSubmitUpdateAsync( gs, early, &async );
+    CHECK( SUCCEEDED( hr ), "the async update is queued (0x%08lx)", hr );
+    SetEvent( hold.go );
+    CHECK( WaitForSingleObject( hold.done, 10000 ) == WAIT_OBJECT_0 && hold.hr == S_OK,
+           "the synchronous update is made after it (0x%08lx)", hold.hr );
+    WaitForSingleObject( thread, 15000 );
+    CloseHandle( thread );
+    CloseHandle( hold.inside );
+    CloseHandle( hold.go );
+    CloseHandle( hold.done );
+
+    hr = IXThreadingImpl_XAsyncGetStatus( threading, &async, TRUE );
+    CHECK( hr == S_OK, "the async update completes (0x%08lx)", hr );
+    hr = read_one_blob( provider, "order_container", "order", value, sizeof(value) );
+    CHECK( SUCCEEDED( hr ) && !strcmp( value, "sync" ), "the later synchronous update is what is on disk ('%s')", value );
+
+done:
+    if (early) IXGameSaveImpl3_XGameSaveCloseUpdate( gs, early );
+    if (late) IXGameSaveImpl3_XGameSaveCloseUpdate( gs, late );
+    if (container) IXGameSaveImpl3_XGameSaveCloseContainer( gs, container );
+    IXGameSaveImpl3_XGameSaveCloseProvider( gs, provider );
+}
+
+/* ---- XGameSave: an async call from inside an enumeration ---------------- */
+
+struct reentrant_call
+{
+    XGameSaveProviderHandle provider;
+    XGameSaveContainerHandle container;
+    XAsyncBlock async;
+    HRESULT started, status;
+    BOOL called;
+};
+
+/* Poll for up to three seconds rather than wait: if the call cannot finish
+ * while the callback runs, a wait would never return. */
+static HRESULT poll_status( XAsyncBlock *async )
+{
+    HRESULT hr;
+    DWORD start = GetTickCount();
+
+    while ((hr = IXThreadingImpl_XAsyncGetStatus( threading, async, FALSE )) == E_PENDING &&
+           GetTickCount() - start < 3000)
+        Sleep( 10 );
+    return hr;
+}
+
+static BOOLEAN __stdcall delete_from_enumeration( const XGameSaveContainerInfo *info, void *context )
+{
+    struct reentrant_call *call = context;
+
+    if (call->called || strcmp( info->name, "reentrant_delete" )) return TRUE;
+    call->called = TRUE;
+    memset( &call->async, 0, sizeof(call->async) );
+    call->started = IXGameSaveImpl3_XGameSaveDeleteContainerAsync( gs, call->provider, info->name, &call->async );
+    call->status = poll_status( &call->async );
+    return FALSE;
+}
+
+static BOOLEAN __stdcall submit_from_enumeration( const XGameSaveBlobInfo *info, void *context )
+{
+    struct reentrant_call *call = context;
+    XGameSaveUpdateHandle update = NULL;
+
+    if (call->called) return FALSE;
+    call->called = TRUE;
+    call->started = IXGameSaveImpl3_XGameSaveCreateUpdate( gs, call->container, NULL, &update );
+    if (SUCCEEDED( call->started ))
+        call->started = IXGameSaveImpl3_XGameSaveSubmitBlobWrite( gs, update, "inner", (UINT8 *)"written", 8 );
+    memset( &call->async, 0, sizeof(call->async) );
+    if (SUCCEEDED( call->started )) call->started = IXGameSaveImpl3_XGameSaveSubmitUpdateAsync( gs, update, &call->async );
+    if (update) IXGameSaveImpl3_XGameSaveCloseUpdate( gs, update );
+    call->status = SUCCEEDED( call->started ) ? poll_status( &call->async ) : call->started;
+    return FALSE;
+}
+
+static BOOLEAN __stdcall find_reentrant_delete( const XGameSaveContainerInfo *info, void *context )
+{
+    if (!strcmp( info->name, "reentrant_delete" )) *(BOOL *)context = TRUE;
+    return TRUE;
+}
+
+static void test_gamesave_async_from_callback(void)
+{
+    static const char scid[] = "00000000-0000-0000-0000-0000000000f7";
+    XGameSaveProviderHandle provider = NULL;
+    struct reentrant_call call;
+    char value[64];
+    BOOL found = FALSE;
+    HRESULT hr;
+
+    printf( "# XGameSave async calls from inside an enumeration callback\n" );
+    hr = IXGameSaveImpl3_XGameSaveInitializeProvider( gs, user, scid, FALSE, &provider );
+    CHECK( SUCCEEDED( hr ) && provider, "provider opens (0x%08lx)", hr );
+    if (!provider) return;
+    hr = write_one_blob( provider, "reentrant_delete", "blob", "doomed" );
+    if (SUCCEEDED( hr )) hr = write_one_blob( provider, "reentrant_submit", "outer", "present" );
+    CHECK( SUCCEEDED( hr ), "two containers exist (0x%08lx)", hr );
+
+    memset( &call, 0, sizeof(call) );
+    call.provider = provider;
+    IXGameSaveImpl3_XGameSaveEnumerateContainerInfo( gs, provider, &call, delete_from_enumeration );
+    CHECK( call.called && SUCCEEDED( call.started ), "DeleteContainerAsync starts inside the callback (0x%08lx)", call.started );
+    CHECK( call.status == S_OK, "and completes while the callback still runs (0x%08lx)", call.status );
+    if (call.status == E_PENDING) IXThreadingImpl_XAsyncGetStatus( threading, &call.async, TRUE );
+    IXGameSaveImpl3_XGameSaveEnumerateContainerInfo( gs, provider, &found, find_reentrant_delete );
+    CHECK( !found, "the container is gone" );
+
+    memset( &call, 0, sizeof(call) );
+    call.provider = provider;
+    hr = IXGameSaveImpl3_XGameSaveCreateContainer( gs, provider, "reentrant_submit", &call.container );
+    if (SUCCEEDED( hr )) IXGameSaveImpl3_XGameSaveEnumerateBlobInfo( gs, call.container, &call, submit_from_enumeration );
+    CHECK( call.called && SUCCEEDED( call.started ), "SubmitUpdateAsync starts inside a blob callback (0x%08lx)", call.started );
+    CHECK( call.status == S_OK, "and completes while the callback still runs (0x%08lx)", call.status );
+    if (call.status == E_PENDING) IXThreadingImpl_XAsyncGetStatus( threading, &call.async, TRUE );
+    if (call.container) IXGameSaveImpl3_XGameSaveCloseContainer( gs, call.container );
+    hr = read_one_blob( provider, "reentrant_submit", "inner", value, sizeof(value) );
+    CHECK( SUCCEEDED( hr ) && !strcmp( value, "written" ), "the update is on disk ('%s')", value );
+    IXGameSaveImpl3_XGameSaveCloseProvider( gs, provider );
+}
+
+/* ---- XGameSave: a queued save when the title quits ---------------------- */
+
+static const char exit_save_scid[] = "00000000-0000-0000-0000-0000000000f8";
+
+/* Child: submit a save asynchronously and quit at once, without waiting. */
+static int exit_after_async_save_child( const char *container_name )
+{
+    XGameSaveProviderHandle provider = NULL;
+    XGameSaveContainerHandle container = NULL;
+    XGameSaveUpdateHandle update = NULL;
+    static XAsyncBlock async;
+    XUserHandle owner;
+
+    if (!(owner = add_quiet_user())) return 100;
+    if (FAILED( IXGameSaveImpl3_XGameSaveInitializeProvider( gs, owner, exit_save_scid, FALSE, &provider ) )) return 101;
+    if (FAILED( IXGameSaveImpl3_XGameSaveCreateContainer( gs, provider, container_name, &container ) )) return 102;
+    if (FAILED( IXGameSaveImpl3_XGameSaveCreateUpdate( gs, container, NULL, &update ) )) return 103;
+    if (FAILED( IXGameSaveImpl3_XGameSaveSubmitBlobWrite( gs, update, "last", (UINT8 *)"kept", 5 ) )) return 104;
+    if (FAILED( IXGameSaveImpl3_XGameSaveSubmitUpdateAsync( gs, update, &async ) )) return 105;
+    ExitProcess( 0 );
+}
+
+static void test_gamesave_queued_at_exit(void)
+{
+    XGameSaveProviderHandle provider = NULL;
+    char args[64], name[32], value[64];
+    int i, kept = 0;
+    DWORD code;
+    HRESULT hr;
+
+    printf( "# XGameSave async save made just before the title quits\n" );
+    for (i = 0; i < 4; i++)
+    {
+        snprintf( name, sizeof(name), "exit_save_%d", i );
+        snprintf( args, sizeof(args), "--exit-after-async-save %s", name );
+        code = run_child( args, NULL );
+        CHECK( code == 0, "child %d submits and quits (%lu)", i, code );
+    }
+    hr = IXGameSaveImpl3_XGameSaveInitializeProvider( gs, user, exit_save_scid, FALSE, &provider );
+    CHECK( SUCCEEDED( hr ) && provider, "provider opens (0x%08lx)", hr );
+    if (!provider) return;
+    for (i = 0; i < 4; i++)
+    {
+        snprintf( name, sizeof(name), "exit_save_%d", i );
+        if (SUCCEEDED( read_one_blob( provider, name, "last", value, sizeof(value) ) ) && !strcmp( value, "kept" )) kept++;
+    }
+    CHECK( kept == 4, "every save submitted before quitting is on disk (%d of 4)", kept );
+    IXGameSaveImpl3_XGameSaveCloseProvider( gs, provider );
 }
