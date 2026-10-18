@@ -6,10 +6,13 @@ for Bedrock on Android, for Microsoft Store titles on Linux.
 
 ## Current qualification
 
-Release 0.1.13 pairs with runtime 11.0.20261018.1. It adds separate Store and
-Player accounts (#9), controllers in GDK titles -- PlayStation pads through
-SDL, Steam Input layouts from Steam shortcuts, GameInput gamepads (#10) -- and
-an offer to install WebKitGTK when the client's sign-in cannot start (#8). See
+Release 0.1.13 pairs with runtime 11.0.20261018.2, the first signed runtime.
+It adds separate Store and Player accounts (#9), controllers in GDK titles --
+PlayStation pads through SDL, Steam Input layouts from Steam shortcuts,
+GameInput gamepads (#10) -- an offer to install WebKitGTK when the client's
+sign-in cannot start (#8), online status for games started through Ferestre,
+signed releases, package headers checked against Microsoft's signature, Add
+All to Steam, and the fixes from a review of the whole codebase. See
 [release qualification](RELEASE-0.1.13.md).
 
 Release 0.1.8 keeps runtime 11.0.20261010.2. A recipe that names no install
@@ -259,6 +262,9 @@ honestly marked as unproven rather than planned.
       round-trips the whole document and keeps every field it did not write.
       Steam rewrites that file from memory on exit, so the launcher has to
       refuse while Steam is running rather than write an edit that vanishes.
+      **Add All to Steam** in the Installed list does every installed title
+      in one pass, reading and writing each shortcuts file once; two titles
+      sharing a name get a shortcut each.
 
 - [x] **A sidebar, and a layout that survives a hundred titles.** One flat
       preferences page was right for three recipes and is wrong for a library.
@@ -330,6 +336,20 @@ honestly marked as unproven rather than planned.
 
 - [x] **Sign-in without WebKitGTK.** The window notices that the client cannot
       load WebKitGTK and installs it through PackageKit, or shows the command.
+
+- [x] **Online status.** While a game started through Ferestre runs, friends
+      see the Player playing it, reported with the game's own identity. On by
+      default, switched per Player in the account menu; the dot by the name
+      says Online or Offline as Xbox reports it. Nothing is reported while no
+      game runs. See [PRESENCE.md](PRESENCE.md).
+
+- [x] **Signed releases and checked downloads.** Releases are signed with
+      minisign in a publish job that alone sees the key, and the launcher
+      installs only runtimes signed with it. Game package headers are checked
+      against Microsoft's signature with a key the client fetches from
+      Microsoft on first use and pins by fingerprint; nothing ships the key.
+      See [RELEASING.md](RELEASING.md) and
+      [PACKAGE-SIGNATURES.md](PACKAGE-SIGNATURES.md).
 
 - [ ] **Appx and Msix packages.** This runtime opens MSIXVC, the container Xbox
       GDK titles ship in. The rest of a Store library is `Appx`, `AppxBundle`,
