@@ -61,6 +61,9 @@ cp "$WORK/PlayFabCore.dll" "$WORK/PlayFabGameSave.dll"
 
 say "compiling the concurrent queue iterator test"
 "$INCUBE" x86_64-w64-mingw32-gcc -O1 -o "$WORK/concrt_queue_iterator.exe" "$REPO_DIR/tests/concrt_queue_iterator.c" || fail "iterator test did not build"
+say "compiling the concurrent vector segment test"
+"$INCUBE" x86_64-w64-mingw32-gcc -O1 -Wall -Werror -o "$WORK/concrt_vector_segments.exe" \
+    "$REPO_DIR/tests/concrt_vector_segments.c" || fail "vector segment test did not build"
 
 # Compiled, never run here: it needs a Vulkan GPU. Building it on every run is
 # what keeps a test nobody runs routinely from quietly stopping compiling.
@@ -161,6 +164,13 @@ fi
 if [ "$rc" = 0 ]; then
     ( cd "$WORK" && timeout 30 "$WINE" "$WORK/concrt_queue_iterator.exe" ) 2>/dev/null | \
         grep -avE '^ntsync|radv is not|^wine:|wineserver' | tee "$WORK/iterator-out.txt"
+    rc=${PIPESTATUS[0]}
+fi
+# The same builtin concrt140 against Microsoft's segment layout; see
+# tests/run-concrt-tests.sh to compare it with a native DLL.
+if [ "$rc" = 0 ]; then
+    ( cd "$WORK" && timeout 120 "$WINE" "$WORK/concrt_vector_segments.exe" ) 2>/dev/null | \
+        grep -avE '^ntsync|radv is not|^wine:|wineserver' | tail -5 | tee "$WORK/vector-out.txt"
     rc=${PIPESTATUS[0]}
 fi
 if [ "$rc" = 0 ]; then
