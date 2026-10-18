@@ -2,6 +2,7 @@
 """Exercise the shipped CLI's cancellation protocol with an offline downloader."""
 import os
 from pathlib import Path
+import signal
 import subprocess
 import tempfile
 import time
@@ -27,10 +28,14 @@ def stop(*_):
     (dest / "cleaned").write_text("done")
     sys.exit(0)
 signal.signal(signal.SIGTERM, stop)
+parent = os.getppid()
 (dest / "partial").write_text("downloaded bytes")
 (dest / "ready").write_text(str(os.getpid()))
-while True:
+# Outliving the launcher would leave this spinning after a failed run, so a
+# downloader whose parent is gone has nobody left to clean up for.
+while os.getppid() == parent:
     time.sleep(0.05)
+sys.exit(3)
 ''')
                     stub.chmod(0o755)
                     dest = home / "game"
@@ -47,6 +52,7 @@ while True:
                     process = subprocess.Popen([str(binary), "install", "9ZZCANCEL001", str(dest)],
                                                env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                                stderr=subprocess.PIPE)
+                    downloader_fd = None
                     try:
                         deadline = time.monotonic() + 10
                         while not (dest / "ready").exists() and time.monotonic() < deadline:
@@ -55,6 +61,9 @@ while True:
                             time.sleep(0.02)
                         self.assertTrue((dest / "ready").exists())
                         downloader = int((dest / "ready").read_text())
+                        # A handle on this process rather than its number, so
+                        # the cleanup below can never signal a recycled PID.
+                        downloader_fd = os.pidfd_open(downloader)
                         if not disappear:
                             process.stdin.write(b"x")
                             process.stdin.flush()
@@ -75,6 +84,15 @@ while True:
                         if process.poll() is None:
                             process.kill()
                             process.wait()
+                        # The downloader runs in its own process group, so
+                        # killing the launcher leaves it behind; a failed run
+                        # must not leave it running.
+                        if downloader_fd is not None:
+                            try:
+                                signal.pidfd_send_signal(downloader_fd, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            os.close(downloader_fd)
 
 
 if __name__ == "__main__":
