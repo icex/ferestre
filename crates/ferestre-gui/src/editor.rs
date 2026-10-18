@@ -257,6 +257,10 @@ pub fn present(
                 toasts.add_toast(crate::toast(&complaint));
                 return;
             }
+            // Somebody has looked at it now: an edited recipe is theirs, and
+            // keeps winning over one shipped later, as a generated one would
+            // not.
+            edited.generated = false;
             match edited.save_to(&titles_dir) {
                 Ok(path) => {
                     on_saved(path);

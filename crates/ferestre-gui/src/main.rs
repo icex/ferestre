@@ -843,7 +843,7 @@ fn draw_list(
         model
             .paths
             .as_ref()
-            .and_then(|paths| ferestre_core::runtime::selected(paths.config_dir(), id))
+            .and_then(|paths| ferestre_core::runtime::requested(paths, id).ok().flatten())
     };
     let installed_version = |r: &Recipe| model.installed_version(r);
     let installed_product = |id: &str| model.product_is_installed(id);
@@ -2835,6 +2835,7 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
     let resolve: Resolve = {
         let ui = ui.clone();
         let product_id = product_id.to_string();
+        let folder = folder.clone();
         Rc::new(move |text: &str| {
             let model = ui.model.borrow();
             model::install_destination(text, home.as_deref(), &folder, &|dir| {
@@ -2873,7 +2874,25 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
         }
         let what = if updating { "Updating" } else { "Installing" };
         match resolve(&where_to.text()) {
-            Ok(dir) => spawn_install(&ui, &product_id, &name, Some(&dir), what),
+            Ok(dir) => {
+                // `ferestre install` takes the folder as the library, as the
+                // field does, and finds the title's folder in it by the same
+                // rule. Only a folder that is already this title's -- its
+                // install, or its stopped download -- goes as it is, since
+                // its name need not be the one a fresh install would get.
+                let own = matches!(
+                    ui.model.borrow().inspect_folder(&product_id, &dir),
+                    model::Folder::This | model::Folder::Download
+                );
+                let library = model::library_of(&dir, &folder);
+                let argument = if own { Some(dir.as_path()) } else { library };
+                match argument {
+                    Some(argument) => spawn_install(&ui, &product_id, &name, Some(argument), what),
+                    None => ui
+                        .toasts
+                        .add_toast(toast("Cannot work out where to put it")),
+                }
+            }
             Err(why) => ui.toasts.add_toast(toast(why)),
         }
     });

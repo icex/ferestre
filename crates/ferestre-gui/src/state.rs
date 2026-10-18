@@ -487,7 +487,9 @@ impl Model {
     pub fn launch_runtime(&self, recipe: &Recipe) -> Result<&InstalledRuntime, String> {
         let paths = self.paths.as_ref().ok_or("nowhere to look for a runtime")?;
         let inferred = ferestre_core::autofix::infer(recipe, self.game_dir(recipe).as_deref());
-        let selected = runtime::selected(paths.config_dir(), &recipe.title.product_id);
+        // The title's own choice, else XODUS_PROTON_DIR, as `ferestre run`.
+        let selected =
+            runtime::requested(paths, &recipe.title.product_id).map_err(|e| format!("{e:#}"))?;
         crate::model::launch_runtime(
             &inferred.recipe,
             &self.runtimes,
@@ -726,21 +728,14 @@ pub fn forget_saved_account(state_dir: &Path) {
 /// Remove the saved picture of the account that signed out, so the next one
 /// to sign in -- or nobody -- is not shown with it.
 pub fn forget_saved_avatar(account_cache_dir: &Path) {
-    let _ = std::fs::remove_file(ferestre_core::account::avatar_path(
-        account_cache_dir,
-        AVATAR_PX,
-    ));
+    ferestre_core::account::forget_avatars(account_cache_dir);
 }
 
 /// The saved picture, for a saved account only: a picture with nobody signed
 /// in is the last person's.
 fn saved_avatar(account: Option<&Account>, account_cache_dir: Option<&Path>) -> Option<PathBuf> {
-    account?;
-    Some(ferestre_core::account::avatar_path(
-        account_cache_dir?,
-        AVATAR_PX,
-    ))
-    .filter(|p| p.is_file())
+    // Only the picture fetched for this account, not whatever is cached.
+    ferestre_core::account::cached_avatar(account_cache_dir?, account?, AVATAR_PX)
 }
 
 /// Move an unreadable `account-roles.json` aside, so the window can start
@@ -813,14 +808,11 @@ pub fn tail_lines(path: &Path, count: usize) -> Vec<String> {
     lines[lines.len().saturating_sub(count)..].to_vec()
 }
 
-/// The temporary container a download writes into, renamed when it ends.
-const DOWNLOADING: &str = ".xodus-streaming-tmp.msixvc";
-
 /// Whether `dir` holds a finished install. The package header and manifest
 /// land early in a download, so their being there is not enough while the
 /// temporary container is still beside them.
 pub fn install_complete(dir: &Path) -> bool {
-    install::looks_installed(dir) && !dir.join(DOWNLOADING).exists()
+    install::looks_installed(dir) && !install::is_partial(dir)
 }
 
 fn has_entries(dir: &Path) -> bool {
@@ -1057,7 +1049,7 @@ mod tests {
         let dir = scratch.0.join("games/test");
         installed(&dir, "9ZZTESTGAME1");
         assert!(install_complete(&dir));
-        write(&dir.join(DOWNLOADING), "");
+        write(&dir.join(install::PARTIAL_CONTAINER), "");
         assert!(!install_complete(&dir));
         assert!(
             installed_products(&scratch.0.join("games")).is_empty(),
@@ -1068,7 +1060,7 @@ mod tests {
         model.recipes = vec![recipe("9ZZTESTGAME1", None)];
         assert!(!model.is_installed(&model.recipes[0]));
         assert!(model.incomplete("9ZZTESTGAME1"));
-        std::fs::remove_file(dir.join(DOWNLOADING)).unwrap();
+        std::fs::remove_file(dir.join(install::PARTIAL_CONTAINER)).unwrap();
         assert!(model.is_installed(&model.recipes[0]));
         assert!(!model.incomplete("9ZZTESTGAME1"));
         // A folder nothing arrived in is neither.
@@ -1103,7 +1095,7 @@ mod tests {
         assert_eq!(model.removal_dir("9ZZNOTHING01"), None);
 
         let guess = scratch.0.join("games/9zzpartial01");
-        write(&guess.join(DOWNLOADING), "x");
+        write(&guess.join(install::PARTIAL_CONTAINER), "x");
         assert_eq!(model.removal_dir("9ZZPARTIAL01"), Some(guess));
 
         model.recipes = vec![recipe("9ZZRECIPE001", Some("described"))];
@@ -1175,7 +1167,7 @@ mod tests {
             model.inspect_folder("9ZZA", &root.join("theirs")),
             Folder::Other
         );
-        write(&root.join("partial").join(DOWNLOADING), "x");
+        write(&root.join("partial").join(install::PARTIAL_CONTAINER), "x");
         assert_eq!(
             model.inspect_folder("9ZZA", &root.join("partial")),
             Folder::Download
@@ -1270,23 +1262,24 @@ mod tests {
         assert!(set_aside_roles(&scratch.0).is_err(), "nothing left to move");
     }
 
-    /// The picture is cached by size alone, so with nobody signed in a saved
-    /// one is the previous account's.
+    /// A saved picture is shown only for the account it was fetched for: with
+    /// nobody signed in, or with a picture nothing ties to this account, it is
+    /// the previous account's. Which picture belongs to which account is the
+    /// core's test; this is that the window asks it.
     #[test]
     fn the_saved_picture_goes_with_the_account() {
         let scratch = Scratch::new("avatar");
         let picture = ferestre_core::account::avatar_path(&scratch.0, AVATAR_PX);
         write(&picture, "png");
-        let someone =
-            ferestre_core::account::parse(r#"{"gamertag":"Someone","xuid":"25"}"#).unwrap();
+        let someone = ferestre_core::account::parse(
+            r#"{"gamertag":"Someone","xuid":"25",
+                "gamerpic":"https://images-eds-ssl.xboxlive.com/image?url=ZZZZtest"}"#,
+        )
+        .unwrap();
         assert_eq!(saved_avatar(None, Some(&scratch.0)), None);
-        assert_eq!(
-            saved_avatar(Some(&someone), Some(&scratch.0)),
-            Some(picture.clone())
-        );
+        assert_eq!(saved_avatar(Some(&someone), Some(&scratch.0)), None);
         forget_saved_avatar(&scratch.0);
         assert!(!picture.exists());
-        assert_eq!(saved_avatar(Some(&someone), Some(&scratch.0)), None);
     }
 
     /// The launcher's diagnostics go to a file of the window's, not a pipe:

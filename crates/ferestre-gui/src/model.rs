@@ -343,26 +343,18 @@ pub fn launch_runtime<'a>(
         return Err("install the patched runtime first".into());
     }
     if let Some(path) = requested {
-        let chosen = runtimes.iter().find(|rt| rt.path == path).ok_or_else(|| {
-            format!(
+        if !runtimes.iter().any(|rt| rt.path == path) {
+            return Err(format!(
                 "the runtime chosen for this title is no longer installed ({}); choose another \
                  with Choose runtime",
                 path.display()
-            )
-        })?;
-        return Ok((chosen, runtime::assess(recipe, chosen, registry)));
-    }
-    let assessed = runtimes
-        .iter()
-        .map(|rt| (rt, runtime::assess(recipe, rt, registry)));
-    let mut newest = None;
-    for (rt, assessment) in assessed {
-        if assessment.is_satisfied() {
-            return Ok((rt, assessment));
+            ));
         }
-        newest.get_or_insert((rt, assessment));
     }
-    Ok(newest.expect("runtimes is not empty"))
+    // The launcher's own choice, so the row and `ferestre run` agree.
+    runtime::choose(recipe, runtimes, requested, registry)
+        .map(|choice| (choice.runtime, choice.assessment))
+        .map_err(|e| e.to_string())
 }
 
 /// The first line of an explanation `assess` wrote for a terminal, cut down to
@@ -1382,6 +1374,18 @@ pub fn install_destination(
             destination.display()
         )),
     }
+}
+
+/// The library a destination from [`install_destination`] was made in: the
+/// destination without the title's own `folder_name` on the end. `None` when
+/// it does not end in that folder.
+pub fn library_of<'a>(destination: &'a Path, folder_name: &Path) -> Option<&'a Path> {
+    if !destination.ends_with(folder_name) {
+        return None;
+    }
+    destination
+        .ancestors()
+        .nth(folder_name.components().count())
 }
 
 /// How long to leave a background check that failed before trying it again
@@ -3233,6 +3237,27 @@ mod tests {
         assert_eq!(
             install_destination("/mnt/z", None, fh6, &inspect),
             Ok(PathBuf::from("/mnt/z/forza-horizon-6"))
+        );
+    }
+
+    /// What `ferestre install` is given for a fresh install: the library the
+    /// title's folder was made in, so it finds the same folder itself.
+    #[test]
+    fn the_library_is_the_destination_without_the_titles_folder() {
+        assert_eq!(
+            library_of(
+                Path::new("/mnt/games/bedrock/game"),
+                Path::new("bedrock/game")
+            ),
+            Some(Path::new("/mnt/games"))
+        );
+        assert_eq!(
+            library_of(Path::new("/mnt/games/fh6"), Path::new("fh6")),
+            Some(Path::new("/mnt/games"))
+        );
+        assert_eq!(
+            library_of(Path::new("/mnt/games/other"), Path::new("fh6")),
+            None
         );
     }
 

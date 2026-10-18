@@ -155,8 +155,22 @@ fn owner(status: &str) -> Option<u32> {
         .ok()
 }
 
+/// Whether the process at `dir` shares the window's user and mount
+/// namespaces. A title launched through the real-path image view runs Wine in
+/// a namespace of its own, with a private Wine server folder: a `taskkill`
+/// started out here cannot reach its server, and would start a second server
+/// and Wine session on the live prefix instead. Such a title is ended, not
+/// asked.
+fn shares_namespaces(proc_root: &Path, dir: &Path) -> bool {
+    ["ns/user", "ns/mnt"].iter().all(|ns| {
+        std::fs::read_link(proc_root.join("self").join(ns)).ok()
+            == std::fs::read_link(dir.join(ns)).ok()
+    })
+}
+
 /// Every Windows process of `uid` running in `prefix`, read from `proc_root`
-/// (`/proc`, or a fixture in a test).
+/// (`/proc`, or a fixture in a test), that a `taskkill` from the window can
+/// reach.
 pub fn processes_in(proc_root: &Path, uid: u32, prefix: &Path) -> Vec<WineProcess> {
     let Ok(entries) = std::fs::read_dir(proc_root) else {
         return Vec::new();
@@ -173,7 +187,7 @@ pub fn processes_in(proc_root: &Path, uid: u32, prefix: &Path) -> Vec<WineProces
             let in_prefix = env
                 .iter()
                 .any(|(key, value)| key == "WINEPREFIX" && same_dir(Path::new(value), prefix));
-            if !in_prefix {
+            if !in_prefix || !shares_namespaces(proc_root, &dir) {
                 return None;
             }
             let image = image_name(&std::fs::read(dir.join("cmdline")).ok()?)?;
@@ -388,6 +402,35 @@ mod tests {
         let env: Vec<_> = command.get_envs().collect();
         assert!(env.contains(&(OsStr::new("WINEPREFIX"), Some(OsStr::new(&ours)))));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A title in the real-path view's namespace is not asked from outside
+    /// it: there is nothing to ask, so Stop ends it.
+    #[test]
+    fn a_title_in_another_namespace_is_not_asked() {
+        let root =
+            std::env::temp_dir().join(format!("ferestre-gui-proc-ns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let prefix = root.join("games/halo-proton/pfx");
+        std::fs::create_dir_all(&prefix).unwrap();
+        std::fs::create_dir_all(root.join("self/ns")).unwrap();
+        std::os::unix::fs::symlink("user:[4026531837]", root.join("self/ns/user")).unwrap();
+        std::os::unix::fs::symlink("mnt:[4026531841]", root.join("self/ns/mnt")).unwrap();
+        let env = format!("WINEPREFIX={}\0", prefix.display()).into_bytes();
+        for (pid, user) in [(300, "user:[4026533000]"), (400, "user:[4026531837]")] {
+            fake_process(&root, pid, 1000, b"C:\\Game\\HaloInfinite.exe\0", &env);
+            let ns = root.join(pid.to_string()).join("ns");
+            std::fs::create_dir_all(&ns).unwrap();
+            std::os::unix::fs::symlink(user, ns.join("user")).unwrap();
+            std::os::unix::fs::symlink("mnt:[4026531841]", ns.join("mnt")).unwrap();
+        }
+        let found = processes_in(&root, 1000, &prefix);
+        assert_eq!(
+            found.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            [400],
+            "only the process a taskkill from here can reach"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
