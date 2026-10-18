@@ -19,8 +19,9 @@ downloads them.
   is running.
 - On by default after sign-in. **Show me online** in the account menu turns
   it off per Player account.
-- A dot next to your name at the bottom left shows what Xbox reports for you:
-  Playing, Online, Away, Offline, Off or Unknown.
+- A dot next to your name at the bottom left shows what Xbox reports for you,
+  Online or Offline; its tooltip names the game. With no game running it
+  says Offline, since Ferestre does not show you online on its own.
 
 Verified live with three real accounts and Stardew Valley: the status
 appeared while the game ran and was removed after it quit. See
