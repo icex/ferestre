@@ -24,6 +24,8 @@ shares its input queue.
 import os, re, subprocess, sys, time
 from pathlib import Path
 
+from private_out import private_dir
+
 HOME = Path.home()
 REPO = Path(__file__).resolve().parent.parent
 GAMES = Path(os.environ.get("XODUS_GAMES_DIR", HOME / "xbox-games"))
@@ -33,15 +35,16 @@ TOOL = Path(os.environ.get("XODUS_PROTON_DIR",
                            HOME / ".local/share/Steam/compatibilitytools.d/xodus")) / "files"
 WINE = TOOL / "bin" / "wine"
 def _find_bot():
-    """The input bot only needs user32, so it can live anywhere; prefer a copy
-    beside the outputs and fall back to one staged in the game directory."""
-    for cand in (os.environ.get("XODUS_BOT_EXE"), OUT / "bot.exe", GAME_DIR / "_bot.exe"):
+    """The input bot only needs user32, so it can live anywhere: the one
+    XODUS_BOT_EXE names, else one staged in the game directory. Never one
+    found among the outputs, which hold screenshots and logs, not programs."""
+    for cand in (os.environ.get("XODUS_BOT_EXE"), GAME_DIR / "_bot.exe"):
         if cand and Path(cand).exists():
             return Path(cand)
-    return OUT / "bot.exe"
+    sys.exit("!! no input bot: build tools/wine_input_bot.c and point XODUS_BOT_EXE at it")
 LOG = GAMES / "bedrock-launch.log"
-OUT = Path(os.environ.get("XODUS_AUTOJOIN_OUT", "/tmp/xodus-autojoin"))
-OUT.mkdir(parents=True, exist_ok=True)
+# Private to this user: the bot reads its click scripts from here.
+OUT = private_dir(os.environ.get("XODUS_AUTOJOIN_OUT"), "ferestre-autojoin")
 BOT = None
 
 NOISE = re.compile(r"^(ntsync|radv|wineserver|wine: created)")
@@ -170,7 +173,9 @@ def collect(tag):
                 subprocess.run([str(ws), str(pid)], stdout=f, stderr=subprocess.STDOUT,
                                timeout=300)
     if LOG.exists():
-        subprocess.run(f"tail -c 4000000 '{LOG}' > '{stamp / 'tail.log'}'", shell=True)
+        with open(LOG, "rb") as log, open(stamp / "tail.log", "wb") as tail:
+            log.seek(max(0, LOG.stat().st_size - 4000000))
+            tail.write(log.read())
     shot(f"{tag}/frozen")
     print(f"collected into {stamp}")
 

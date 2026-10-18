@@ -5,20 +5,35 @@ Proves the sign-in path works with the user's own credentials before any Wine
 plumbing exists. Deliberately never prints token material -- only whether one
 came back, how long it is, and when it expires.
 """
-import os, socket, struct, sys, datetime
+import argparse, os, socket, struct, sys, datetime
+from xml.sax.saxutils import escape
 
 XML_MAGIC = 0x58445358
 MSA_TOKEN_REQUEST = 3
 
-sock_path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000"), "xodus.sock")
 
-# Minecraft's MSA app id and full-trust flag, straight from its MicrosoftGame.Config.
-client_id = sys.argv[1] if len(sys.argv) > 1 else "0000000040159362"
+def socket_path(override=None):
+    """The service socket, found the way the launcher and the DLL find it:
+    XODUS_RUNTIME_DIR first, then the session's runtime directory."""
+    if override:
+        return override
+    runtime_dir = (os.environ.get("XODUS_RUNTIME_DIR") or os.environ.get("XDG_RUNTIME_DIR")
+                   or f"/run/user/{os.getuid()}")
+    return os.path.join(runtime_dir, "xodus.sock")
+
+
+parser = argparse.ArgumentParser(description=__doc__)
+# Minecraft's MSA app id, straight from its MicrosoftGame.Config.
+parser.add_argument("client_id", nargs="?", default="0000000040159362", help="MSA app id to ask for")
+parser.add_argument("--socket", help="service socket to ask (default: $XODUS_RUNTIME_DIR, else $XDG_RUNTIME_DIR, /xodus.sock)")
+args = parser.parse_args()
+sock_path = socket_path(args.socket)
+client_id = args.client_id
 full_trust = "true"
 
 payload = (
     "<MSATokenRequest>"
-    f"<ClientId>{client_id}</ClientId>"
+    f"<ClientId>{escape(client_id)}</ClientId>"
     "<AllowUi>false</AllowUi>"
     f"<MSAFullTrust>{full_trust}</MSAFullTrust>"
     "</MSATokenRequest>"

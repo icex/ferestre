@@ -21,11 +21,127 @@
  *   XCurl.dll.microsoft  Microsoft's original, kept aside
  *
  * XCURL_TRACE_LOG names the log file; tracing is off when it is unset.
+ *
+ * Built with -DXCURL_REDACT_TEST and a native compiler, only the redaction
+ * remains, with a main() that feeds it from stdin: that is how
+ * tools/test_tool_hygiene.py checks that no credential reaches the log.
  */
+#ifdef XCURL_REDACT_TEST
+#include <stdio.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#define __cdecl
+#else
 #include <windows.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#endif
+
+/* What a log line may say about a request without handing out its
+ * credentials.
+ *
+ * Headers: any header whose name mentions a credential is reduced to its
+ * length. Matching words inside the name rather than whole names is what
+ * catches the ones nobody listed: PlayFab's X-Authorization and X-EntityToken,
+ * a proxy's Proxy-Authorization, a title's own X-SecretKey.
+ *
+ * URLs: query strings carry credentials too (an Azure SAS signature, an
+ * access_token parameter), so every value in one is reduced to its length,
+ * keeping the parameter names for the reader. That applies to the request
+ * line and to a Location header as much as to the URLs logged per request. */
+static char ascii_lower( char c )
+{
+    return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+}
+
+static int name_contains( const char *name, size_t len, const char *word )
+{
+    size_t k = strlen( word ), i, j;
+
+    for (i = 0; i + k <= len; i++)
+    {
+        for (j = 0; j < k && ascii_lower( name[i + j] ) == word[j]; j++) ;
+        if (j == k) return 1;
+    }
+    return 0;
+}
+
+/* The length of "Name:" when the line is a header whose value is a secret. */
+static int header_is_secret( const char *line, size_t len )
+{
+    static const char *secret[] = {
+        "auth", "token", "secret", "sign", "cookie", "key", "ticket",
+        "session", "pass", "credential",
+    };
+    const char *colon = memchr( line, ':', len );
+    size_t name_len, i;
+
+    if (!colon) return 0;
+    name_len = colon - line;
+    /* A request or status line is not a header, even with a colon in it. */
+    for (i = 0; i < name_len; i++) if (line[i] == ' ' || line[i] == '\t') return 0;
+    for (i = 0; i < sizeof(secret)/sizeof(secret[0]); i++)
+        if (name_contains( line, name_len, secret[i] )) return (int)(name_len + 1);
+    return 0;
+}
+
+static int ends_query_value( char c )
+{
+    return c == '&' || c == '#' || c == ' ' || c == '\t';
+}
+
+/* Copy `in` to `out`, replacing every query value (and every fragment) with
+ * its length in angle brackets. */
+static void redact_query( const char *in, size_t len, char *out, size_t out_len )
+{
+    size_t i = 0, o = 0;
+
+    if (!out_len) return;
+    while (i < len && o + 1 < out_len)
+    {
+        if (in[i] != '?' && in[i] != '#')
+        {
+            out[o++] = in[i++];
+            continue;
+        }
+        out[o++] = in[i++];
+        /* name=value pairs up to the next space; a bare word counts as a value */
+        while (i < len && in[i] != ' ' && in[i] != '\t' && o + 1 < out_len)
+        {
+            size_t start = i, value, n;
+            char count[24];
+
+            while (i < len && !ends_query_value( in[i] ) && in[i] != '=') i++;
+            if (i < len && in[i] == '=')
+            {
+                n = i + 1 - start;
+                if (o + n >= out_len) n = out_len - o - 1;
+                memcpy( out + o, in + start, n );
+                o += n;
+                i++;
+                value = i;
+            }
+            else value = start;
+            while (i < len && !ends_query_value( in[i] )) i++;
+            snprintf( count, sizeof(count), "<%u>", (unsigned)(i - value) );
+            n = strlen( count );
+            if (o + n >= out_len) n = out_len - o - 1;
+            memcpy( out + o, count, n );
+            o += n;
+            if (i < len && (in[i] == '&' || in[i] == '#') && o + 1 < out_len) out[o++] = in[i++];
+        }
+    }
+    out[o] = 0;
+}
+
+static void redact_url( const char *url, char *out, size_t out_len )
+{
+    redact_query( url, url ? strlen( url ) : 0, out, out_len );
+}
+
+#ifndef XCURL_REDACT_TEST
 
 #define CURLOPT_URL             10002
 #define CURLOPT_CUSTOMREQUEST   10036
@@ -64,7 +180,7 @@ static void note_handle( void *h, const char *method, const char *url )
     {
         handles[i].h = h;
         if (method) { strncpy( handles[i].method, method, sizeof(handles[i].method) - 1 ); handles[i].method[sizeof(handles[i].method)-1] = 0; }
-        if (url) { strncpy( handles[i].url, url, sizeof(handles[i].url) - 1 ); handles[i].url[sizeof(handles[i].url)-1] = 0; }
+        if (url) redact_url( url, handles[i].url, sizeof(handles[i].url) );
     }
     LeaveCriticalSection( &log_cs );
 }
@@ -109,27 +225,26 @@ static void trace( const char *fmt, ... )
     LeaveCriticalSection( &log_cs );
 }
 
+#else
+
+static void trace( const char *fmt, ... )
+{
+    va_list ap;
+
+    va_start( ap, fmt );
+    vprintf( fmt, ap );
+    va_end( ap );
+    putchar( '\n' );
+}
+
+#endif
+
 /* Header traffic, with anything bearing a credential reduced to its length.
  *
  * libcurl hands the whole header block to this callback in one piece, not a
  * line at a time, so the redaction has to walk the block line by line. Getting
  * that wrong writes live Xbox tokens to a file, which is exactly what an
  * earlier version of this did. */
-static int header_is_secret( const char *line, size_t len )
-{
-    static const char *secret[] = {
-        "authorization:", "signature:", "cookie:", "set-cookie:",
-        "apikey:", "x-xbl-signature:", "proof-key:", "www-authenticate:"
-    };
-    size_t i;
-
-    for (i = 0; i < sizeof(secret)/sizeof(secret[0]); i++)
-    {
-        size_t k = strlen( secret[i] );
-        if (len >= k && !_strnicmp( line, secret[i], k )) return (int)k;
-    }
-    return 0;
-}
 
 static int __cdecl debug_cb( void *handle, int type, char *data, size_t size, void *user )
 {
@@ -157,13 +272,20 @@ static int __cdecl debug_cb( void *handle, int type, char *data, size_t size, vo
                 trace( "  %s %.*s <redacted, %u bytes>", type == 2 ? ">" : "<",
                        k, line, (unsigned)(n - k) );
             else
-                trace( "  %s %s", type == 2 ? ">" : "<", line );
+            {
+                char shown[600];
+
+                redact_query( line, n, shown, sizeof(shown) );
+                trace( "  %s %s", type == 2 ? ">" : "<", shown );
+            }
         }
         if (!nl) break;
         p = nl + 1;
     }
     return 0;
 }
+
+#ifndef XCURL_REDACT_TEST
 
 /* Percent-encode the characters libcurl refuses in a URL.
  *
@@ -237,7 +359,12 @@ __declspec(dllexport) int curl_easy_setopt( void *h, int opt, ... )
         const char *clean = url_fixup( (const char *)val, fixed, sizeof(fixed) );
 
         if (clean != (const char *)val)
-            trace( "  ! url re-encoded: %s", (const char *)val );
+        {
+            char shown[512];
+
+            redact_url( (const char *)val, shown, sizeof(shown) );
+            trace( "  ! url re-encoded: %s", shown );
+        }
         val = (void *)clean;
         if (tracing) note_handle( h, NULL, clean );
     }
@@ -384,3 +511,26 @@ BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, void *reserved )
     }
     return real != NULL;
 }
+
+#else
+
+/* The redaction on its own: stdin is a header block as libcurl hands it to
+ * the debug callback, and each argument is a URL to log. */
+int main( int argc, char **argv )
+{
+    static char block[65536];
+    size_t size = fread( block, 1, sizeof(block), stdin );
+    int i;
+
+    debug_cb( NULL, 2, block, size, NULL );
+    for (i = 1; i < argc; i++)
+    {
+        char shown[512];
+
+        redact_url( argv[i], shown, sizeof(shown) );
+        trace( "--> GET %s", shown );
+    }
+    return 0;
+}
+
+#endif
