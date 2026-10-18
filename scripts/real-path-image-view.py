@@ -54,6 +54,30 @@ def stop_descendants():
         raise OSError("launch descendants did not exit")
 
 
+def as_caller(uid, gid):
+    """Return a preexec hook that gives the launch the caller's own ids back.
+
+    Mounting needs root in this namespace, but Wine keys its server directory
+    on getuid(): as uid 0 it would use /tmp/.wine-0, which another user can own
+    or create first, and a second wineserver for the prefix would run beside
+    the one the rest of the launch uses under /tmp/.wine-<uid>. A nested user
+    namespace maps the caller's ids onto this one's root. It shares the mount
+    namespace, so the private views stay in place, and the launch ends up with
+    no capabilities over them.
+    """
+    def enter():
+        if hasattr(os, "unshare"):
+            os.unshare(os.CLONE_NEWUSER)
+        else:
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.unshare(0x10000000):  # CLONE_NEWUSER
+                raise OSError(ctypes.get_errno(), "could not create the launch's user namespace")
+        Path("/proc/self/setgroups").write_text("deny")
+        Path("/proc/self/uid_map").write_text(f"{uid} 0 1")
+        Path("/proc/self/gid_map").write_text(f"{gid} 0 1")
+    return enter
+
+
 def image_entries(mapping, root):
     if not mapping:
         raise ValueError("the client supplied no decrypted image descriptors")
@@ -80,7 +104,8 @@ def main():
     inside = args[:1] == ["--inside"]
     if inside:
         parent_mount = args[1]
-        args = args[2:]
+        uid, gid = int(args[2]), int(args[3])
+        args = args[4:]
         if os.readlink("/proc/self/ns/mnt") == parent_mount:
             raise ValueError("refusing to mount images outside a private namespace")
     if args[:1] == ["--"]:
@@ -92,7 +117,8 @@ def main():
         os.execvp("unshare", [
             "unshare", "--user", "--map-root-user", "--mount",
             "--propagation", "private", sys.executable, str(Path(__file__).resolve()),
-            "--inside", os.readlink("/proc/self/ns/mnt"), "--", *args,
+            "--inside", os.readlink("/proc/self/ns/mnt"), str(os.getuid()), str(os.getgid()),
+            "--", *args,
         ])
 
     targets = []
@@ -128,7 +154,7 @@ def main():
             env = dict(os.environ)
             env.pop("WINE_DLL_FILE_MAP", None)
             env.pop("FERESTRE_IMAGE_VIEW", None)
-            result = subprocess.call(args, env=env, close_fds=True)
+            result = subprocess.call(args, env=env, close_fds=True, preexec_fn=as_caller(uid, gid))
             if result == 0:
                 # The bootstrapper may exit after handing off to another game
                 # image (Halo's campaign does this). Keep both the namespace
@@ -154,6 +180,6 @@ if __name__ == "__main__":
         sys.exit(main())
     except KeyboardInterrupt:
         sys.exit(130)
-    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
         print(f"ferestre: could not prepare the private image view: {error}", file=sys.stderr)
         sys.exit(1)
