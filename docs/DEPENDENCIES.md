@@ -28,8 +28,11 @@ A Steam install already provides them. Steam ships these four sonames in
 `ubuntu12_64/video` and `ubuntu12_32/video`, and Proton puts those directories
 first on its library path when Ferestre hands it the Steam install. `ferestre
 doctor` checks the same directories, in the same order, so it reports nothing
-missing when Steam is found. A shell `LD_LIBRARY_PATH` does not count: the
-launch removes it before starting Proton.
+missing when Steam is found. A shell `LD_LIBRARY_PATH` does not count for
+`ferestre doctor`, because a default launch removes it before starting Proton.
+`ferestre run --steam` keeps it, and a recipe can set its own in `launch.env`;
+Proton searches either one after Steam's and the runtime's directories, and the
+check `ferestre run` makes before a launch searches it there too.
 
 Without a Steam install (or with one that lacks these files), install a
 compatibility package. On Fedora, enable [RPM Fusion](https://rpmfusion.org/Configuration), then run:

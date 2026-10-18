@@ -47,6 +47,10 @@ struct Ui {
     /// duplicate sign-in or a duplicate library fetch.
     busy: Rc<RefCell<Option<String>>>,
     wait_on_close: Rc<RefCell<bool>>,
+    /// What the activity panel says about closing the window during a task
+    /// that does not hold it open. Each task knows what a close costs it; one
+    /// that says nothing gets a sentence that promises nothing.
+    close_note: Rc<Cell<Option<&'static str>>>,
     activity: gtk::Box,
     activity_title: gtk::Label,
     activity_detail: gtk::Label,
@@ -258,6 +262,7 @@ fn build_ui(app: &adw::Application) {
         spinner,
         busy: Rc::new(RefCell::new(None)),
         wait_on_close: Rc::new(RefCell::new(false)),
+        close_note: Rc::new(Cell::new(None)),
         activity,
         activity_title,
         activity_detail,
@@ -1615,6 +1620,12 @@ fn sign_out(ui: &Ui) {
         report_busy(ui);
         return;
     }
+    // The saved account is removed just below, before the client runs, and
+    // the client is its own process, which a closed window does not stop.
+    note_close(
+        ui,
+        "You can close the window. You will still be signed out.",
+    );
     // Before the client runs, not after: a window closed while it signs out
     // never reaches the code below, and the next one would open showing the
     // old account and its library from these files. If sign-out then fails,
@@ -1696,7 +1707,7 @@ fn warn_about_media(ui: &Ui, product_id: &str) {
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let checked = gio::spawn_blocking(move || {
-            ferestre_core::media::missing_libav_dependencies(&runtime, steam.as_deref())
+            ferestre_core::media::missing_libav_dependencies(&runtime, steam.as_deref(), None)
         })
         .await;
         if let Ok(Ok(missing)) = checked {
@@ -2494,15 +2505,28 @@ fn begin(ui: &Ui, what: &str) -> bool {
         return false;
     }
     *ui.wait_on_close.borrow_mut() = false;
+    ui.close_note.set(None);
     *ui.busy.borrow_mut() = Some(what.to_string());
     ui.spinner.start();
     show_activity(ui);
     true
 }
 
+/// Say what closing the window during the task just begun means for it.
+fn note_close(ui: &Ui, note: &'static str) {
+    ui.close_note.set(Some(note));
+    show_activity(ui);
+}
+
+/// The note every refresh shares: closing drops the refresh, not the lists
+/// already saved from the last one.
+const REFRESH_CLOSE_NOTE: &str =
+    "You can close the window while this refresh runs. Cached lists are kept.";
+
 fn finish(ui: &Ui) {
     *ui.busy.borrow_mut() = None;
     *ui.wait_on_close.borrow_mut() = false;
+    ui.close_note.set(None);
     *ui.download_control.borrow_mut() = None;
     ui.spinner.stop();
     show_activity(ui);
@@ -2541,7 +2565,9 @@ fn show_activity(ui: &Ui) {
     } else if closing {
         "Finishing this operation. Ferestre will close when it is safe."
     } else if !*ui.wait_on_close.borrow() && ui.download_control.borrow().is_none() {
-        "You can close the window while this refresh runs. Cached lists are kept."
+        ui.close_note
+            .get()
+            .unwrap_or("You can close the window while this runs.")
     } else {
         "Please wait for this to finish before starting another operation."
     };
@@ -2657,6 +2683,7 @@ fn refresh_account(ui: &Ui) {
     if !begin(ui, "Refreshing account") {
         return;
     }
+    note_close(ui, REFRESH_CLOSE_NOTE);
 
     /// What the client said. Only `SignedOut` is allowed to clear the saved
     /// account; a client that could not answer says nothing about it.
@@ -2765,6 +2792,7 @@ fn refresh_updates(ui: &Ui, force: bool) {
         }
         return;
     }
+    note_close(ui, REFRESH_CLOSE_NOTE);
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let checked = gio::spawn_blocking(move || {
@@ -2908,6 +2936,7 @@ fn refresh_library(ui: &Ui) {
         report_busy(ui);
         return;
     }
+    note_close(ui, REFRESH_CLOSE_NOTE);
     let (market, language) = ui.model.borrow().market();
     let recipe_ids: Vec<String> = ui
         .model

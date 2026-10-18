@@ -645,9 +645,11 @@ fn cmd_run(
         return Ok(ExitCode::from(exit_code_from(None, Some(signal))));
     }
 
-    if let Ok(missing) =
-        ferestre_core::media::missing_libav_dependencies(&dirs.proton_dir, Some(&dirs.steam_dir))
-    {
+    if let Ok(missing) = ferestre_core::media::missing_libav_dependencies(
+        &dirs.proton_dir,
+        Some(&dirs.steam_dir),
+        ferestre_core::media::launch_library_path(&plan).as_deref(),
+    ) {
         if !missing.is_empty() {
             eprintln!(
                 "-- videos may be black or silent: missing {}. {}",
@@ -2584,8 +2586,11 @@ fn doctor_checks(paths: &Paths) -> Vec<Check> {
         Ok(rt) => {
             checks.push(Check::ok("runtime", "patched Proton").with_detail(rt.label()));
             checks.push(
-                match ferestre_core::media::missing_libav_dependencies(&rt.path, paths.steam_dir())
-                {
+                match ferestre_core::media::missing_libav_dependencies(
+                    &rt.path,
+                    paths.steam_dir(),
+                    None,
+                ) {
                     Ok(missing) if missing.is_empty() => {
                         Check::ok("media", "GStreamer libav dependencies available")
                     }

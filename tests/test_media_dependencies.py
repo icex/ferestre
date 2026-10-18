@@ -48,8 +48,8 @@ class MediaDependencies(unittest.TestCase):
             self.assertIn(dependency.name, missing["detail"])
             self.assertIn("compat-ffmpeg4", missing["hint"])
 
-            # The launch drops an inherited LD_LIBRARY_PATH before Proton runs,
-            # so a library found only through it does not count.
+            # A default launch drops an inherited LD_LIBRARY_PATH before Proton runs,
+            # so doctor does not count a library found only through it.
             inherited = dict(env, LD_LIBRARY_PATH=str(home))
             result = subprocess.run([binary, "doctor", "--json"], env=inherited, capture_output=True, text=True)
             checks = json.loads(result.stdout)["checks"]
