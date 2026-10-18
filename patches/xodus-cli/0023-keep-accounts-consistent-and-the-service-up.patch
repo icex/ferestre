@@ -38,8 +38,9 @@ domains (and the challenge provider their pages embed), and passes the
 page-supplied context to its script as a JSON value. The plain-file
 credential store (key-chain-file) refuses to work without HOME instead of
 using the shared temporary directory, and keeps its file 0600 in a
-directory only the user can write. xbl-check shortens a response line on a
-character boundary.
+directory only the user can write, created holding an empty store so the
+store can read it. xbl-check shortens a response line on a character
+boundary.
 
 diff --git a/crates/xodus-cli/src/commands/account.rs b/crates/xodus-cli/src/commands/account.rs
 index ae73ba9..20bfca1 100644
@@ -1271,7 +1272,7 @@ index d507937..9b85d10 100644
 +    }
  }
 diff --git a/crates/xodus/src/secrets.rs b/crates/xodus/src/secrets.rs
-index dba6b2f..72be346 100644
+index dba6b2f..7d98726 100644
 --- a/crates/xodus/src/secrets.rs
 +++ b/crates/xodus/src/secrets.rs
 @@ -3,10 +3,10 @@ pub static SERVICE_NAME: &str = "Xodus Service";
@@ -1288,7 +1289,7 @@ index dba6b2f..72be346 100644
          )?;
          keyring_core::set_default_store(store);
      }
-@@ -43,11 +43,139 @@ pub fn destroy_secrets() {
+@@ -43,11 +43,170 @@ pub fn destroy_secrets() {
      keyring_core::unset_default_store();
  }
  
@@ -1320,8 +1321,8 @@ index dba6b2f..72be346 100644
 +        })
 +}
 +
-+/// Create `name` in `dir` readable by the owner only, or tighten an existing
-+/// one to that, and refuse a directory someone else owns or can write to: the
++/// Create `name` in `dir` readable by the owner only, holding an empty store,
++/// or tighten an existing one to that, and refuse a directory someone else owns or can write to: the
 +/// store library rewrites the file in place, so the file's own mode is what
 +/// protects it.
 +#[cfg(any(test, feature = "key-chain-file"))]
@@ -1365,6 +1366,12 @@ index dba6b2f..72be346 100644
 +        }
 +        if meta.mode() & 0o077 != 0 {
 +            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
++        }
++        // The store reads any file that exists and an empty one is not valid
++        // to it, so a new file starts as the empty map it would write itself.
++        if meta.len() == 0 {
++            use std::io::Write;
++            (&file).write_all(b"{}")?;
 +        }
 +    }
 +    Ok(path)
@@ -1431,6 +1438,31 @@ index dba6b2f..72be346 100644
 +        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
 +        assert!(private_file(dir.path(), "shared").is_err());
 +        assert!(!dir.path().join("shared").exists());
++    }
++
++    #[test]
++    fn the_store_opens_the_credential_file_it_was_given() {
++        let dir = Dir::new();
++        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
++        let path = private_file(dir.path(), ".xodus-keyring.ron").unwrap();
++        let path = path.to_str().unwrap();
++
++        // A fresh file must already be something the store can read, and so
++        // must the empty one an earlier build of this code left behind.
++        let store = keyring_core::sample::Store::new_with_backing(path).unwrap();
++        drop(store);
++        std::fs::write(path, b"").unwrap();
++        private_file(dir.path(), ".xodus-keyring.ron").unwrap();
++        let store = keyring_core::sample::Store::new_with_backing(path).unwrap();
++        store.save().unwrap();
++        drop(store);
++
++        // Opening it again keeps what the store saved.
++        let saved = std::fs::read(path).unwrap();
++        private_file(dir.path(), ".xodus-keyring.ron").unwrap();
++        assert_eq!(std::fs::read(path).unwrap(), saved);
++        assert_eq!(mode(std::path::Path::new(path)), 0o600);
++        keyring_core::sample::Store::new_with_backing(path).unwrap();
 +    }
  }
 diff --git a/crates/xodus/src/tokens/manager.rs b/crates/xodus/src/tokens/manager.rs
@@ -1509,3 +1541,41 @@ index 98502ac..5f9fb05 100644
          }
          self.persistent.remove(keys::DEVICE_TOKENS)?;
          self.persistent.remove(keys::USER_TOKENS)?;
+diff --git a/crates/xodus/tests/key_chain_file.rs b/crates/xodus/tests/key_chain_file.rs
+new file mode 100644
+index 0000000..68684ed
+--- /dev/null
++++ b/crates/xodus/tests/key_chain_file.rs
+@@ -0,0 +1,32 @@
++//! The plain-file credential store, end to end. It changes HOME, so it lives
++//! in its own test binary where nothing else runs beside it.
++#![cfg(all(unix, feature = "key-chain-file"))]
++
++use std::os::unix::fs::PermissionsExt;
++
++#[test]
++fn a_fresh_home_gets_a_private_store_that_keeps_what_is_saved() {
++    let home = std::env::temp_dir().join(format!("xodus-home-{}", std::process::id()));
++    std::fs::create_dir(&home).unwrap();
++    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
++    // Nothing else runs in this binary, so no other thread reads the
++    // environment while it changes.
++    unsafe { std::env::set_var("HOME", &home) };
++    let file = home.join(".xodus-keyring.ron");
++
++    let result = (|| {
++        xodus::secrets::init_secrets()?;
++        xodus::secrets::get_entry("fixture")?.set_password("secret")?;
++        xodus::secrets::destroy_secrets();
++        // A second run reads back what the first one saved.
++        xodus::secrets::init_secrets()?;
++        let kept = xodus::secrets::get_entry("fixture")?.get_password()?;
++        xodus::secrets::destroy_secrets();
++        Ok::<_, keyring_core::Error>(kept)
++    })();
++    let mode = std::fs::metadata(&file).map(|m| m.permissions().mode() & 0o777);
++    let _ = std::fs::remove_dir_all(&home);
++
++    assert_eq!(result.unwrap(), "secret");
++    assert_eq!(mode.unwrap(), 0o600);
++}
