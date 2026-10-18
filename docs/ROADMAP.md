@@ -163,9 +163,12 @@ Three decisions worth stating up front:
 - **Steam integration is a toggle, not a policy.** By default the launcher runs
   an isolated runtime and strips Steam's injected environment, because the
   overlay, Fossilize capture and `STEAM_COMPAT_*` collide with a Proton instance
-  we start ourselves. But people add these titles as non-Steam shortcuts for the
-  overlay, controller config and Remote Play, so keeping that environment must
-  be an option per title rather than something the launcher decides.
+  we start ourselves. The default keeps the shortcut's game identity
+  (`SteamAppId`, `SteamGameId`, `SteamClientLaunch`), so its Steam Input
+  controller layout applies without opting in. The overlay and Remote Play
+  ride on what is stripped -- `LD_PRELOAD` and Steam's Vulkan layers -- so
+  keeping that environment (`run --steam`) must be an option per title rather
+  than something the launcher decides.
 - **The client is carried, not assumed.** Because launching requires the
   decrypt path, "install Xodus separately" is not a real option for an end user.
 
