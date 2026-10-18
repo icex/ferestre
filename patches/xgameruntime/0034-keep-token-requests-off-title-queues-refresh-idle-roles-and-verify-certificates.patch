@@ -22,9 +22,16 @@ XNetworkingVerifyServerCertificate accepted every certificate. It now takes
 the server certificate from the WinHTTP request handle and verifies its chain
 against the request's host under the SSL policy, as WinHTTP does while
 connecting, honouring the SECURITY_FLAG_IGNORE_* exceptions the request
-carries. A handle that is not a WinHTTP request, or a request with no server
-certificate, keeps the old answer and is logged once. winhttp and crypt32 are
-looked up at run time, not imported.
+carries. Each exception covers its own chain error and no other: an ignored
+expiry does not let an unknown CA or a wrong usage through, as it would where
+the errors are weighed in turn, and only the ignored errors are hidden from
+the SSL policy, which still checks the host name. Revocation has no exception.
+It is looked up in what the machine already knows (a cached status, the URL
+cache, a local distribution point) and never fetched, since the call is made
+on the title's thread while its request is being sent. A handle that is not a
+WinHTTP request, or a request with no server certificate, keeps the old answer
+and is logged once. winhttp and crypt32 are looked up at run time, not
+imported.
 
 diff --git a/private.h b/private.h
 index 1ca3f68..6ea3eab 100644
@@ -55,7 +62,7 @@ index 1ca3f68..6ea3eab 100644
 +BOOL xgr_role_entitlement( UINT32 *active, BOOL fresh );
  void xgr_role_entitlement_store( LONG status /* NTSTATUS */, UINT32 active );
 diff --git a/xnetworking.c b/xnetworking.c
-index 75a07bc..31028f8 100644
+index 75a07bc..578c811 100644
 --- a/xnetworking.c
 +++ b/xnetworking.c
 @@ -21,8 +21,10 @@
@@ -82,7 +89,7 @@ index 75a07bc..31028f8 100644
   *
   * The protocol flags are not a formality either. The GDK documents them as a
   * WINHTTP_FLAG_SECURE_PROTOCOL_* mask to be handed straight to
-@@ -215,11 +216,193 @@ static HRESULT WINAPI x_networking_XNetworkingQuerySecurityInformationForUrlUtf1
+@@ -215,11 +216,218 @@ static HRESULT WINAPI x_networking_XNetworkingQuerySecurityInformationForUrlUtf1
                                          securityInformationBuffer, securityInformation );
  }
  
@@ -155,12 +162,39 @@ index 75a07bc..31028f8 100644
 +    return ret;
 +}
 +
-+/* WinHTTP's own verdict, as dlls/winhttp/net.c reaches it: chain errors the
-+ * request does not ignore first, then the SSL policy for the host. */
++/* The chain errors a request can carry, and the exception that lets it through.
++ * Each is weighed on its own: an ignored error must not hide one that is not,
++ * as it did when they were checked in turn (and as dlls/winhttp/net.c still
++ * does), so an expired certificate the request accepted from an unknown CA it
++ * did not accept was let through. Revocation has no exception. */
++static const struct
++{
++    DWORD trust_errors;
++    DWORD ignore;
++    DWORD error;
++}
++chain_errors[] =
++{
++    { CERT_TRUST_IS_NOT_TIME_VALID, SECURITY_FLAG_IGNORE_CERT_DATE_INVALID, ERROR_WINHTTP_SECURE_CERT_DATE_INVALID },
++    { CERT_TRUST_IS_UNTRUSTED_ROOT | CERT_TRUST_IS_PARTIAL_CHAIN, SECURITY_FLAG_IGNORE_UNKNOWN_CA,
++      ERROR_WINHTTP_SECURE_INVALID_CA },
++    { CERT_TRUST_IS_REVOKED, 0, ERROR_WINHTTP_SECURE_CERT_REVOKED },
++    { CERT_TRUST_IS_NOT_VALID_FOR_USAGE, SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE, ERROR_WINHTTP_SECURE_CERT_WRONG_USAGE },
++};
++
++/* Revocation is looked up in the caches only (below), so not knowing is the
++ * usual answer, not a reason to refuse. */
++static const DWORD revocation_unknown = CERT_TRUST_IS_OFFLINE_REVOCATION | CERT_TRUST_REVOCATION_STATUS_UNKNOWN;
++
++/* WinHTTP's verdict: chain errors the request does not ignore first, then the
++ * SSL policy for the host.
++ *
++ * Revocation is checked from what the system already knows -- a status cached
++ * by an earlier online check, a CRL in the URL cache, or a local distribution
++ * point -- and never fetched: this runs on the title's thread, in the middle of
++ * sending its request. */
 +static DWORD verify_chain( const CERT_CONTEXT *cert, WCHAR *host, DWORD security_flags )
 +{
-+    static const DWORD supported = CERT_TRUST_IS_NOT_TIME_VALID | CERT_TRUST_IS_UNTRUSTED_ROOT |
-+                                   CERT_TRUST_IS_NOT_VALID_FOR_USAGE;
 +    char oid_server_auth[] = szOID_PKIX_KP_SERVER_AUTH;
 +    char *server_auth[] = { oid_server_auth };
 +    CERT_CHAIN_PARA chain_para = { sizeof(chain_para) };
@@ -169,38 +203,36 @@ index 75a07bc..31028f8 100644
 +    CERT_CHAIN_POLICY_STATUS status = { sizeof(status) };
 +    const CERT_CHAIN_CONTEXT *chain;
 +    CERT_CHAIN_CONTEXT copy;
-+    DWORD errors, err = ERROR_SUCCESS;
++    DWORD errors, known = revocation_unknown, ignored, err = ERROR_SUCCESS;
++    unsigned int i;
 +
 +    chain_para.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
 +    chain_para.RequestedUsage.Usage.cUsageIdentifier = 1;
 +    chain_para.RequestedUsage.Usage.rgpszUsageIdentifier = server_auth;
-+    if (!pCertGetCertificateChain( NULL, cert, NULL, cert->hCertStore, &chain_para, 0, NULL, &chain ))
++    if (!pCertGetCertificateChain( NULL, cert, NULL, cert->hCertStore, &chain_para,
++                                   CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT |
++                                   CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY, NULL, &chain ))
 +        return ERROR_WINHTTP_SECURE_CHANNEL_ERROR;
 +
-+    if ((errors = chain->TrustStatus.dwErrorStatus))
++    errors = chain->TrustStatus.dwErrorStatus;
++    ignored = errors & revocation_unknown;
++    for (i = 0; i < ARRAY_SIZE(chain_errors); i++)
 +    {
-+        if (errors & CERT_TRUST_IS_NOT_TIME_VALID)
-+        {
-+            if (!(security_flags & SECURITY_FLAG_IGNORE_CERT_DATE_INVALID)) err = ERROR_WINHTTP_SECURE_CERT_DATE_INVALID;
-+        }
-+        else if (errors & (CERT_TRUST_IS_UNTRUSTED_ROOT | CERT_TRUST_IS_PARTIAL_CHAIN))
-+        {
-+            if (!(security_flags & SECURITY_FLAG_IGNORE_UNKNOWN_CA)) err = ERROR_WINHTTP_SECURE_INVALID_CA;
-+        }
-+        else if (errors & CERT_TRUST_IS_REVOKED) err = ERROR_WINHTTP_SECURE_CERT_REVOKED;
-+        else if (errors & CERT_TRUST_IS_NOT_VALID_FOR_USAGE)
-+        {
-+            if (!(security_flags & SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE)) err = ERROR_WINHTTP_SECURE_CERT_WRONG_USAGE;
-+        }
-+        else if (errors & ~(supported | CERT_TRUST_IS_OFFLINE_REVOCATION | CERT_TRUST_REVOCATION_STATUS_UNKNOWN))
-+            err = ERROR_WINHTTP_SECURE_INVALID_CERT;
++        known |= chain_errors[i].trust_errors;
++        if (!(errors & chain_errors[i].trust_errors)) continue;
++        if (chain_errors[i].ignore && (security_flags & chain_errors[i].ignore))
++            ignored |= errors & chain_errors[i].trust_errors;
++        else if (!err) err = chain_errors[i].error;
 +    }
++    if (!err && (errors & ~known)) err = ERROR_WINHTTP_SECURE_INVALID_CERT;
++    if (err) TRACE( "chain errors %#lx, ignoring %#lx: %lu.\n", errors, ignored, err );
++
 +    if (!err)
 +    {
-+        /* An error already ignored above must not stop the policy from
-+         * making its other checks. */
++        /* Only what was ignored above is hidden from the policy, so it still
++         * makes its other checks, the host name among them. */
 +        copy = *chain;
-+        copy.TrustStatus.dwErrorStatus = 0;
++        copy.TrustStatus.dwErrorStatus &= ~ignored;
 +        ssl.dwAuthType = AUTHTYPE_SERVER;
 +        ssl.pwszServerName = host;
 +        ssl.fdwChecks = security_flags;

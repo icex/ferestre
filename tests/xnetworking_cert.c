@@ -3,11 +3,13 @@
  * leaves the machine.
  *
  *   xnetworking_cert.exe <https port> <http port> <test CA, DER, Windows path>
+ *                        <expired port> <revoked port>
  *
  * The call is made where libHttpClient makes it, from the request's
  * WINHTTP_CALLBACK_STATUS_SENDING_REQUEST callback. It used to accept every
  * certificate; now it must verify the chain against the request's host, and
- * honour the exceptions the request itself carries. */
+ * honour the exceptions the request itself carries -- each on its own, so that
+ * one the request carries cannot let through an error it does not. */
 #define COBJMACROS
 #include <windows.h>
 #include <winhttp.h>
@@ -16,6 +18,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "xnetworking.h"
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
 
 static IXNetworkingImpl2 *net;
 static unsigned int failures, checks;
@@ -89,6 +95,55 @@ static BOOL trust_test_ca(const char *path)
     return ok;
 }
 
+/* What may be ignored about the untrusted CA's certificates, one count at a time:
+ * all of it is accepted, and leaving out any one exception refuses it for that. */
+static void check_untrusted_ca(unsigned int expired_port, unsigned int revoked_port)
+{
+    static const DWORD ignore_all = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                                    SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE | SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
+    static const struct
+    {
+        DWORD keep;
+        DWORD error;
+        const char *what;
+    }
+    counts[] =
+    {
+        { SECURITY_FLAG_IGNORE_UNKNOWN_CA, ERROR_WINHTTP_SECURE_INVALID_CA, "an untrusted CA" },
+        { SECURITY_FLAG_IGNORE_CERT_DATE_INVALID, ERROR_WINHTTP_SECURE_CERT_DATE_INVALID, "an expired certificate" },
+        { SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE, ERROR_WINHTTP_SECURE_CERT_WRONG_USAGE, "a client-only certificate" },
+        { SECURITY_FLAG_IGNORE_CERT_CN_INVALID, ERROR_WINHTTP_SECURE_CERT_CN_INVALID, "a certificate for another host" },
+    };
+    BOOL received;
+    HRESULT hr;
+    unsigned int i;
+
+    /* Expired, for client authentication only, from a CA nobody trusts, and
+     * asked for under a name it does not carry. WinHTTP is told to accept all
+     * of that to connect; the verdict is asked with the exceptions under test. */
+    hr = request(L"127.0.0.1", expired_port, TRUE, ignore_all, ignore_all, &received);
+    CHECK(hr == S_OK && received, "a certificate wrong only in ways the request ignores is accepted (%#lx)", hr);
+    for (i = 0; i < ARRAY_SIZE(counts); i++)
+    {
+        hr = request(L"127.0.0.1", expired_port, TRUE, ignore_all, ignore_all & ~counts[i].keep, &received);
+        CHECK(hr == HRESULT_FROM_WIN32(counts[i].error),
+              "%s is refused although the request ignores everything else (%#lx)", counts[i].what, hr);
+    }
+    /* The case that slipped through when the errors were weighed in turn. */
+    hr = request(L"localhost", expired_port, TRUE, ignore_all,
+                 SECURITY_FLAG_IGNORE_CERT_DATE_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE, &received);
+    CHECK(hr == HRESULT_FROM_WIN32(ERROR_WINHTTP_SECURE_INVALID_CA),
+          "an ignored expiry does not let an untrusted CA through (%#lx)", hr);
+
+    /* No exception covers revocation, whatever else the request ignores. */
+    hr = request(L"localhost", revoked_port, TRUE, ignore_all, SECURITY_FLAG_IGNORE_UNKNOWN_CA, &received);
+    CHECK(hr == HRESULT_FROM_WIN32(ERROR_WINHTTP_SECURE_CERT_REVOKED),
+          "a revoked certificate is refused though its untrusted CA is ignored (%#lx)", hr);
+    hr = request(L"localhost", revoked_port, TRUE, ignore_all, ignore_all, &received);
+    CHECK(hr == HRESULT_FROM_WIN32(ERROR_WINHTTP_SECURE_CERT_REVOKED),
+          "a revoked certificate is refused though every exception is set (%#lx)", hr);
+}
+
 int main(int argc, char **argv)
 {
     static const DWORD ignore_ca = SECURITY_FLAG_IGNORE_UNKNOWN_CA;
@@ -98,7 +153,11 @@ int main(int argc, char **argv)
     BOOL received;
     HRESULT hr;
 
-    if (argc < 4) { printf("usage: xnetworking_cert <https port> <http port> <ca.der>\n"); return 2; }
+    if (argc < 6)
+    {
+        printf("usage: xnetworking_cert <https port> <http port> <ca.der> <expired port> <revoked port>\n");
+        return 2;
+    }
     https_port = atoi(argv[1]);
     http_port = atoi(argv[2]);
     if (!(runtime = LoadLibraryA("xgameruntime.dll"))) return 11;
@@ -122,6 +181,8 @@ int main(int argc, char **argv)
     hr = request(L"localhost", https_port, TRUE, ignore_ca, 0, &received);
     CHECK(hr == HRESULT_FROM_WIN32(ERROR_WINHTTP_SECURE_INVALID_CA),
           "an untrusted chain is refused (%#lx)", hr);
+
+    check_untrusted_ca(atoi(argv[4]), atoi(argv[5]));
 
     if (!trust_test_ca(argv[3]))
     {
