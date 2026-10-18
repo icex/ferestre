@@ -140,15 +140,35 @@ async fn run(
         .map(String::from)
         .ok_or("PackageKit returned no transaction")?;
 
+    // The daemon's unique name, so only signals PackageKit itself sends are
+    // heard. Any client on the system bus may emit a signal with this path
+    // on it; a forged Package or Finished must not choose what is installed.
+    let owner = bus
+        .call_future(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "GetNameOwner",
+            Some(&(NAME,).to_variant()),
+            Some(glib::VariantTy::new("(s)").expect("a valid type string")),
+            gio::DBusCallFlags::NONE,
+            -1,
+        )
+        .await
+        .map_err(|e| format!("PackageKit: {e}"))?
+        .child_value(0)
+        .str()
+        .map(String::from)
+        .ok_or("PackageKit has no owner on the bus")?;
+
     let (sender, finished) = oneshot::channel();
     let progress = Rc::new(RefCell::new(Progress {
         done: Some(sender),
         ..Default::default()
     }));
-    // Before the method is called, so no signal can arrive unheard. By path
-    // alone: it names this transaction and nothing else.
+    // Before the method is called, so no signal can arrive unheard.
     let signals = bus.signal_subscribe(
-        None,
+        Some(&owner),
         Some(TRANSACTION),
         None,
         Some(&path),
@@ -157,7 +177,12 @@ async fn run(
         glib::clone!(
             #[strong]
             progress,
-            move |_, _, _, _, signal, parameters| {
+            #[strong]
+            owner,
+            move |_, sender, _, _, signal, parameters| {
+                if sender != owner {
+                    return;
+                }
                 let mut progress = progress.borrow_mut();
                 match signal {
                     // Package(u info, s package_id, s summary)
@@ -183,7 +208,7 @@ async fn run(
         ),
     );
     // A daemon that exits or crashes mid-transaction sends nothing more.
-    let owner = bus.signal_subscribe(
+    let vanished = bus.signal_subscribe(
         Some("org.freedesktop.DBus"),
         Some("org.freedesktop.DBus"),
         Some("NameOwnerChanged"),
@@ -193,10 +218,12 @@ async fn run(
         glib::clone!(
             #[strong]
             progress,
+            #[strong]
+            owner,
             move |_, _, _, _, _, parameters| {
                 if parameters
                     .get::<(String, String, String)>()
-                    .is_some_and(|(_, _, new)| new.is_empty())
+                    .is_some_and(|(_, old, new)| old == owner && new != owner)
                 {
                     progress.borrow_mut().end();
                 }
@@ -206,8 +233,9 @@ async fn run(
 
     let called = async {
         let call = |method: &str, args: glib::Variant| {
+            // To the same daemon the signals are taken from.
             bus.call_future(
-                Some(NAME),
+                Some(&owner),
                 &path,
                 TRANSACTION,
                 method,
@@ -233,7 +261,7 @@ async fn run(
     }
     .await;
     bus.signal_unsubscribe(signals);
-    bus.signal_unsubscribe(owner);
+    bus.signal_unsubscribe(vanished);
     called?;
 
     let progress = progress.take();
