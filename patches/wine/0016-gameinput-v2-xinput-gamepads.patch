@@ -1,5 +1,5 @@
 diff --git a/dlls/gameinput/gameinput.c b/dlls/gameinput/gameinput.c
-index d342bc9..860f349 100644
+index d342bc9..a2e83a9 100644
 --- a/dlls/gameinput/gameinput.c
 +++ b/dlls/gameinput/gameinput.c
 @@ -27,6 +27,7 @@
@@ -58,13 +58,17 @@ index d342bc9..860f349 100644
  }
  
  static HRESULT WINAPI virtual_device_DirectInputEscape( IGameInputDevice_v2 *iface, uint32_t command, const void *input,
-@@ -849,7 +867,20 @@ static const IGameInputDevice_v2Vtbl virtual_device_vtbl =
+@@ -849,7 +867,24 @@ static const IGameInputDevice_v2Vtbl virtual_device_vtbl =
  
  static struct virtual_device virtual_keyboard = { {&virtual_device_vtbl}, 1, GameInputKindKeyboard };
  static struct virtual_device virtual_mouse    = { {&virtual_device_vtbl}, 1, GameInputKindMouse };
 -static struct virtual_device *virtual_devices[] = { &virtual_keyboard, &virtual_mouse };
-+/* Use Wine's XInput backend: it already maps HID/SDL pads, including Steam
-+ * Input's virtual Xbox pad. Do not enumerate a second copy through DevQuery. */
++/* Read pads through Wine's XInput rather than enumerating a second copy of each
++ * through DevQuery. XInput only sees the pads winebus exposes through SDL or
++ * evdev, Steam Input's virtual Xbox pad among them. A pad winebus hands to
++ * hidraw instead (Sony's, unless told otherwise) reaches no XInput slot and is
++ * not seen here either. PROTON_DISABLE_HIDRAW for its IDs moves it to SDL;
++ * Ferestre's launcher sets that for Sony pads by default. */
 +static struct virtual_device virtual_gamepads[XUSER_MAX_COUNT] =
 +{
 +    { {&virtual_device_vtbl}, 1, GameInputKindGamepad },
@@ -80,7 +84,7 @@ index d342bc9..860f349 100644
  
  static void virtual_device_init( struct virtual_device *device, const char *name, BYTE id_byte, uint16_t usage_id )
  {
-@@ -874,7 +905,7 @@ static void virtual_device_init( struct virtual_device *device, const char *name
+@@ -874,7 +909,7 @@ static void virtual_device_init( struct virtual_device *device, const char *name
          device->keyboard.maxSimultaneousKeys = 6;
          info->keyboardInfo = &device->keyboard;
      }
@@ -89,7 +93,7 @@ index d342bc9..860f349 100644
      {
          device->mouse.supportedButtons = GameInputMouseLeftButton | GameInputMouseRightButton | GameInputMouseMiddleButton |
                                           GameInputMouseButton4 | GameInputMouseButton5;
-@@ -888,9 +919,34 @@ static void virtual_device_init( struct virtual_device *device, const char *name
+@@ -888,19 +923,68 @@ static void virtual_device_init( struct virtual_device *device, const char *name
  static void virtual_devices_init( void )
  {
      static BOOL done;
@@ -104,6 +108,9 @@ index d342bc9..860f349 100644
 +        virtual_device_init( device, "XInput Gamepad", 0x50 + i, HID_USAGE_GENERIC_GAMEPAD );
 +        device->xinput_index = i;
 +        device->info.deviceFamily = GameInputFamilyXbox360;
++        /* What Wine's XInput presents every pad as: an Xbox 360 controller. */
++        device->info.vendorId = 0x045e;
++        device->info.productId = 0x028e;
 +        device->info.gamepadInfo = &device->gamepad;
 +        device->gamepad.menuButtonLabel = GameInputLabelXboxMenu;
 +        device->gamepad.viewButtonLabel = GameInputLabelXboxView;
@@ -124,16 +131,40 @@ index d342bc9..860f349 100644
      done = TRUE;
  }
  
-@@ -901,6 +957,8 @@ struct virtual_reading
+-/* A reading for a virtual device: the device is present, nothing is pressed and
+- * nothing has moved. One static reading per device; its timestamp is "now". */
++/* GameInput timestamps are microseconds from an arbitrary, monotonic base. The
++ * performance counter is that base on Windows, and it is finer than the tick
++ * count, which cannot tell apart two pad packets less than a millisecond apart.
++ * Every timestamp here comes from this, so a reading's age can be taken against
++ * GetCurrentTimestamp. */
++static uint64_t gameinput_timestamp( void )
++{
++    LARGE_INTEGER counter, frequency;
++
++    QueryPerformanceFrequency( &frequency );
++    QueryPerformanceCounter( &counter );
++    return counter.QuadPart / frequency.QuadPart * 1000000
++           + counter.QuadPart % frequency.QuadPart * 1000000 / frequency.QuadPart;
++}
++
++/* A reading for a virtual device. The keyboard and mouse have one static
++ * reading each, which reads the live state whenever it is asked and is always
++ * timestamped "now". A gamepad reading is a snapshot of one XInput packet,
++ * timestamped when that packet was first seen (see gamepad_poll) and ordered
++ * against every other pad's packets by its sequence number. */
+ struct virtual_reading
+ {
      IGameInputReading_v2 IGameInputReading_v2_iface;
      LONG refcount;
      struct virtual_device *device;
 +    XINPUT_STATE xinput;
 +    uint64_t timestamp;
++    uint64_t sequence;
  };
  
  static struct virtual_reading *impl_from_IGameInputReading_v2( IGameInputReading_v2 *iface )
-@@ -932,8 +990,10 @@ static ULONG WINAPI virtual_reading_AddRef( IGameInputReading_v2 *iface )
+@@ -932,8 +1016,10 @@ static ULONG WINAPI virtual_reading_AddRef( IGameInputReading_v2 *iface )
  
  static ULONG WINAPI virtual_reading_Release( IGameInputReading_v2 *iface )
  {
@@ -146,17 +177,17 @@ index d342bc9..860f349 100644
  }
  
  static GameInputKind WINAPI virtual_reading_GetInputKind( IGameInputReading_v2 *iface )
-@@ -943,7 +1003,8 @@ static GameInputKind WINAPI virtual_reading_GetInputKind( IGameInputReading_v2 *
+@@ -943,7 +1029,8 @@ static GameInputKind WINAPI virtual_reading_GetInputKind( IGameInputReading_v2 *
  
  static uint64_t WINAPI virtual_reading_GetTimestamp( IGameInputReading_v2 *iface )
  {
 -    return GetTickCount64() * 1000;
 +    struct virtual_reading *reading = impl_from_IGameInputReading_v2( iface );
-+    return reading->device->kind == GameInputKindGamepad ? reading->timestamp : GetTickCount64() * 1000;
++    return reading->device->kind == GameInputKindGamepad ? reading->timestamp : gameinput_timestamp();
  }
  
  static void WINAPI virtual_reading_GetDevice( IGameInputReading_v2 *iface, IGameInputDevice_v2 **device )
-@@ -1151,7 +1212,41 @@ static bool WINAPI virtual_reading_GetMouseState( IGameInputReading_v2 *iface, G
+@@ -1151,7 +1238,41 @@ static bool WINAPI virtual_reading_GetMouseState( IGameInputReading_v2 *iface, G
  static bool WINAPI virtual_reading_GetSensorsState( IGameInputReading_v2 *iface, GameInputSensorsState *state ) { return FALSE; }
  static bool WINAPI virtual_reading_GetArcadeStickState( IGameInputReading_v2 *iface, GameInputArcadeStickState *state ) { return FALSE; }
  static bool WINAPI virtual_reading_GetFlightStickState( IGameInputReading_v2 *iface, GameInputFlightStickState *state ) { return FALSE; }
@@ -199,42 +230,103 @@ index d342bc9..860f349 100644
  static bool WINAPI virtual_reading_GetRacingWheelState( IGameInputReading_v2 *iface, GameInputRacingWheelState *state ) { return FALSE; }
  static bool WINAPI virtual_reading_GetUiNavigationState( IGameInputReading_v2 *iface, GameInputUiNavigationState *state ) { return FALSE; }
  
-@@ -1199,12 +1294,44 @@ static struct virtual_reading *virtual_reading_for( GameInputKind kind, IGameInp
+@@ -1199,12 +1320,105 @@ static struct virtual_reading *virtual_reading_for( GameInputKind kind, IGameInp
      return NULL;
  }
  
++/* What each XInput slot last reported. XInput numbers its packets but does not
++ * time them, so a packet is stamped when it is first polled and keeps that
++ * stamp for as long as the pad stays idle: polling an untouched pad twice gives
++ * the same timestamp, which is how titles tell new input from a repeat (and
++ * which device was used last, for button prompts). The sequence number orders
++ * those changes across every slot, which is what a reading for "any pad" is
++ * chosen by. A pad's first sighting is not input, so it gets sequence 0 and an
++ * idle pad never outranks one that has actually been used. Guarded by
++ * game_input_cs. */
++struct gamepad_slot
++{
++    BOOL seen;
++    DWORD packet;
++    uint64_t timestamp;
++    uint64_t sequence;
++};
++static struct gamepad_slot gamepad_slots[XUSER_MAX_COUNT];
++static uint64_t gamepad_sequence;
++
++/* Poll one slot. FALSE if no pad is connected there; otherwise its state, and
++ * when and in what order that state first appeared. */
++static BOOL gamepad_poll( unsigned int index, XINPUT_STATE *state, struct gamepad_slot *out )
++{
++    struct gamepad_slot *slot = &gamepad_slots[index];
++    BOOL connected;
++
++    /* Read and recorded under one lock, so two threads polling the same pad
++     * cannot record an older packet over a newer one. */
++    EnterCriticalSection( &game_input_cs );
++    if ((connected = !XInputGetState( index, state )))
++    {
++        if (!slot->seen || slot->packet != state->dwPacketNumber)
++        {
++            slot->sequence = slot->seen ? ++gamepad_sequence : 0;
++            slot->seen = TRUE;
++            slot->packet = state->dwPacketNumber;
++            slot->timestamp = gameinput_timestamp();
++        }
++        *out = *slot;
++    }
++    else slot->seen = FALSE;
++    LeaveCriticalSection( &game_input_cs );
++    return connected;
++}
++
 +/* Gamepad readings own a snapshot, so a later poll cannot change a reading
-+ * the title retained. The existing keyboard/mouse objects remain static. */
++ * the title retained. The existing keyboard/mouse objects remain static.
++ *
++ * With a device, the reading is that pad's. Without one it may come from any
++ * pad, as from GameInput's single input stream: the current reading is the
++ * pad whose input changed last, and the next reading after a reference is the
++ * pad whose input changed soonest after the reference was taken. Either way a
++ * next reading exists only if something changed after the reference, which is
++ * what ends a title's drain loop. */
 +static HRESULT gamepad_reading( GameInputKind kind, IGameInputDevice_v2 *device,
 +                                IGameInputReading_v2 *reference, IGameInputReading_v2 **out )
 +{
-+    struct virtual_reading *reading, *previous;
-+    XINPUT_STATE state;
-+    unsigned int i;
++    struct virtual_reading *reading;
++    struct gamepad_slot slot, best_slot = {0};
++    XINPUT_STATE state, best_state = {0};
++    BOOL after = FALSE, found = FALSE;
++    uint64_t since = 0;
++    unsigned int i, best = 0;
 +
 +    if (!(kind & GameInputKindGamepad)) return GAMEINPUT_E_READING_NOT_FOUND;
-+    if (!device && reference && reference->lpVtbl == &virtual_reading_vtbl)
-+        device = &impl_from_IGameInputReading_v2( reference )->device->IGameInputDevice_v2_iface;
++    if (reference && reference->lpVtbl == &virtual_reading_vtbl)
++    {
++        after = TRUE;
++        since = impl_from_IGameInputReading_v2( reference )->sequence;
++    }
 +    for (i = 0; i < ARRAY_SIZE(virtual_gamepads); i++)
 +    {
 +        if (device && device != &virtual_gamepads[i].IGameInputDevice_v2_iface) continue;
-+        if (XInputGetState( i, &state )) continue;
-+        if (reference && reference->lpVtbl == &virtual_reading_vtbl)
-+        {
-+            previous = impl_from_IGameInputReading_v2( reference );
-+            if (previous->device == &virtual_gamepads[i] && previous->xinput.dwPacketNumber == state.dwPacketNumber)
-+                continue;
-+        }
-+        if (!(reading = calloc( 1, sizeof(*reading) ))) return E_OUTOFMEMORY;
-+        reading->IGameInputReading_v2_iface.lpVtbl = &virtual_reading_vtbl;
-+        reading->refcount = 1;
-+        reading->device = &virtual_gamepads[i];
-+        reading->xinput = state;
-+        reading->timestamp = GetTickCount64() * 1000;
-+        *out = &reading->IGameInputReading_v2_iface;
-+        return S_OK;
++        if (!gamepad_poll( i, &state, &slot )) continue;
++        if (after && slot.sequence <= since) continue;
++        /* Strict comparisons, so pads that are equally idle go to the lowest slot. */
++        if (found && (after ? slot.sequence >= best_slot.sequence : slot.sequence <= best_slot.sequence)) continue;
++        found = TRUE;
++        best = i;
++        best_state = state;
++        best_slot = slot;
 +    }
-+    return GAMEINPUT_E_READING_NOT_FOUND;
++    if (!found) return GAMEINPUT_E_READING_NOT_FOUND;
++
++    if (!(reading = calloc( 1, sizeof(*reading) ))) return E_OUTOFMEMORY;
++    reading->IGameInputReading_v2_iface.lpVtbl = &virtual_reading_vtbl;
++    reading->refcount = 1;
++    reading->device = &virtual_gamepads[best];
++    reading->xinput = best_state;
++    reading->timestamp = best_slot.timestamp;
++    reading->sequence = best_slot.sequence;
++    *out = &reading->IGameInputReading_v2_iface;
++    return S_OK;
 +}
 +
  /* IGameInput_v2 -- the interface Minecraft (and other recent GDK titles) query
@@ -248,7 +340,17 @@ index d342bc9..860f349 100644
  
  static struct game_input *impl_from_v2_IGameInput( IGameInput_v2 *iface )
  {
-@@ -1263,6 +1390,12 @@ static HRESULT WINAPI game_input_v2_GetCurrentReading( IGameInput_v2 *iface, Gam
+@@ -1251,8 +1465,7 @@ static ULONG WINAPI game_input_v2_Release( IGameInput_v2 *iface )
+ 
+ static uint64_t WINAPI game_input_v2_GetCurrentTimestamp( IGameInput_v2 *iface )
+ {
+-    /* GameInput timestamps are microseconds from an arbitrary, monotonic base. */
+-    return GetTickCount64() * 1000;
++    return gameinput_timestamp();
+ }
+ 
+ static HRESULT WINAPI game_input_v2_GetCurrentReading( IGameInput_v2 *iface, GameInputKind kind,
+@@ -1263,6 +1476,12 @@ static HRESULT WINAPI game_input_v2_GetCurrentReading( IGameInput_v2 *iface, Gam
      TRACE( "impl %p, kind %#x, device %p, reading %p.\n", impl_from_v2_IGameInput( iface ), kind, device, reading );
  
      if (!reading) return E_POINTER;
@@ -261,7 +363,7 @@ index d342bc9..860f349 100644
      if (!(r = virtual_reading_for( kind, device )))
      {
          *reading = NULL;
-@@ -1278,11 +1411,9 @@ static HRESULT WINAPI game_input_v2_GetNextReading( IGameInput_v2 *iface, IGameI
+@@ -1278,11 +1497,9 @@ static HRESULT WINAPI game_input_v2_GetNextReading( IGameInput_v2 *iface, IGameI
  {
      TRACE( "impl %p, reference %p, kind %#x, device %p, reading %p.\n", impl_from_v2_IGameInput( iface ), reference, kind, device, reading );
  
@@ -274,14 +376,18 @@ index d342bc9..860f349 100644
  }
  
  static HRESULT WINAPI game_input_v2_GetPreviousReading( IGameInput_v2 *iface, IGameInputReading_v2 *reference,
-@@ -1336,6 +1467,7 @@ static HRESULT WINAPI game_input_v2_RegisterDeviceCallback( IGameInput_v2 *iface
+@@ -1336,9 +1553,10 @@ static HRESULT WINAPI game_input_v2_RegisterDeviceCallback( IGameInput_v2 *iface
          {
              struct virtual_device *vd = virtual_devices[i];
              if (!(vd->kind & kind)) continue;
 +            if (!(virtual_device_GetDeviceStatus( &vd->IGameInputDevice_v2_iface ) & GameInputDeviceConnected)) continue;
              if (device && device != &vd->IGameInputDevice_v2_iface) continue;
              TRACE( "reporting %s connected\n", vd->info.displayName );
-             callback( *token, context, &vd->IGameInputDevice_v2_iface, GetTickCount64() * 1000,
+-            callback( *token, context, &vd->IGameInputDevice_v2_iface, GetTickCount64() * 1000,
++            callback( *token, context, &vd->IGameInputDevice_v2_iface, gameinput_timestamp(),
+                       GameInputDeviceConnected, GameInputDeviceNoStatus );
+         }
+     }
 diff --git a/dlls/gameinput/Makefile.in b/dlls/gameinput/Makefile.in
 index 629352a..f95809d 100644
 --- a/dlls/gameinput/Makefile.in

@@ -1,14 +1,16 @@
 diff --git a/dlls/gameinput/gameinput.c b/dlls/gameinput/gameinput.c
-index 860f349..e375e69 100644
+index a2e83a9..8502ab1 100644
 --- a/dlls/gameinput/gameinput.c
 +++ b/dlls/gameinput/gameinput.c
-@@ -749,6 +749,14 @@ struct virtual_device
+@@ -749,6 +749,16 @@ struct virtual_device
      GameInputMouseInfo_v2 mouse;
      GameInputGamepadInfo_v2 gamepad;
      DWORD xinput_index;
-+    /* The same device as titles built against the v0 header see it. Minecraft
-+     * Dungeons II takes connected pads from the v2 device callback and then
-+     * queries IGameInputDevice_v0; refusing that drops the pad. */
++    /* Answers QueryInterface(IID_IGameInputDevice_v0) on the devices the v2
++     * callback hands out. Minecraft Dungeons II makes that query on its pads
++     * and logs E_NOINTERFACE without it; its input still comes through XInput,
++     * so this is for completeness rather than what makes the pad work.
++     * IGameInput_v0 itself still enumerates and reads no virtual devices. */
 +    IGameInputDevice_v0 IGameInputDevice_v0_iface;
 +    GameInputDeviceInfo_v0 info_v0;
 +    GameInputKeyboardInfo_v0 keyboard_v0;
@@ -17,7 +19,7 @@ index 860f349..e375e69 100644
  };
  
  static struct virtual_device *impl_from_IGameInputDevice_v2( IGameInputDevice_v2 *iface )
-@@ -767,6 +775,12 @@ static HRESULT WINAPI virtual_device_QueryInterface( IGameInputDevice_v2 *iface,
+@@ -767,6 +777,12 @@ static HRESULT WINAPI virtual_device_QueryInterface( IGameInputDevice_v2 *iface,
          IGameInputDevice_v2_AddRef( iface );
          return S_OK;
      }
@@ -30,7 +32,7 @@ index 860f349..e375e69 100644
  
      FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
      *out = NULL;
-@@ -865,6 +879,173 @@ static const IGameInputDevice_v2Vtbl virtual_device_vtbl =
+@@ -865,6 +881,173 @@ static const IGameInputDevice_v2Vtbl virtual_device_vtbl =
      virtual_device_DirectInputEscape,
  };
  
@@ -203,8 +205,8 @@ index 860f349..e375e69 100644
 +
  static struct virtual_device virtual_keyboard = { {&virtual_device_vtbl}, 1, GameInputKindKeyboard };
  static struct virtual_device virtual_mouse    = { {&virtual_device_vtbl}, 1, GameInputKindMouse };
- /* Use Wine's XInput backend: it already maps HID/SDL pads, including Steam
-@@ -914,6 +1095,48 @@ static void virtual_device_init( struct virtual_device *device, const char *name
+ /* Read pads through Wine's XInput rather than enumerating a second copy of each
+@@ -918,6 +1101,44 @@ static void virtual_device_init( struct virtual_device *device, const char *name
          device->mouse.hasWheelY = TRUE;
          info->mouseInfo = &device->mouse;
      }
@@ -244,16 +246,12 @@ index 860f349..e375e69 100644
 +    device->info_v0.supportedInput = device->info.supportedInput;
 +    device->info_v0.supportedRumbleMotors = device->info.supportedRumbleMotors;
 +    device->info_v0.gamepadInfo = device->info.gamepadInfo;
-+    if (device->kind == GameInputKindGamepad)
-+    {
-+        /* What Wine's XInput presents: an Xbox 360 controller. */
-+        device->info_v0.vendorId = 0x045e;
-+        device->info_v0.productId = 0x028e;
-+    }
++    device->info_v0.vendorId = device->info.vendorId;
++    device->info_v0.productId = device->info.productId;
  }
  
  static void virtual_devices_init( void )
-@@ -947,6 +1170,7 @@ static void virtual_devices_init( void )
+@@ -954,6 +1175,7 @@ static void virtual_devices_init( void )
          device->gamepad.rightThumbstickButtonLabel = GameInputLabelXboxRightStickButton;
          device->info.supportedRumbleMotors = GameInputRumbleLowFrequency | GameInputRumbleHighFrequency;
      }
@@ -261,7 +259,7 @@ index 860f349..e375e69 100644
      done = TRUE;
  }
  
-@@ -1388,6 +1612,7 @@ static HRESULT WINAPI game_input_v2_GetCurrentReading( IGameInput_v2 *iface, Gam
+@@ -1474,6 +1696,7 @@ static HRESULT WINAPI game_input_v2_GetCurrentReading( IGameInput_v2 *iface, Gam
      struct virtual_reading *r;
  
      TRACE( "impl %p, kind %#x, device %p, reading %p.\n", impl_from_v2_IGameInput( iface ), kind, device, reading );
@@ -269,7 +267,7 @@ index 860f349..e375e69 100644
  
      if (!reading) return E_POINTER;
      *reading = NULL;
-@@ -1410,6 +1635,7 @@ static HRESULT WINAPI game_input_v2_GetNextReading( IGameInput_v2 *iface, IGameI
+@@ -1496,6 +1719,7 @@ static HRESULT WINAPI game_input_v2_GetNextReading( IGameInput_v2 *iface, IGameI
                                                      GameInputKind kind, IGameInputDevice_v2 *device, IGameInputReading_v2 **reading )
  {
      TRACE( "impl %p, reference %p, kind %#x, device %p, reading %p.\n", impl_from_v2_IGameInput( iface ), reference, kind, device, reading );
@@ -277,7 +275,7 @@ index 860f349..e375e69 100644
  
      if (!reading) return E_POINTER;
      *reading = NULL;
-@@ -1444,6 +1670,7 @@ static HRESULT WINAPI game_input_v2_RegisterDeviceCallback( IGameInput_v2 *iface
+@@ -1530,6 +1754,7 @@ static HRESULT WINAPI game_input_v2_RegisterDeviceCallback( IGameInput_v2 *iface
  
      TRACE( "impl %p, device %p, kind %#x, filter %#x, enum_kind %#x, context %p, callback %p, token %p.\n",
             impl, device, kind, filter, enum_kind, context, callback, token );
