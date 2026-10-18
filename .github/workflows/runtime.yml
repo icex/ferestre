@@ -210,6 +210,22 @@ jobs:
           cat SHA256SUMS
           ls -lh
 
+      # `ferestre install-runtime` refuses an archive without a valid
+      # <archive>.minisig from the release key. A tag must be signed; a manual
+      # run without the secret builds unsigned and says so.
+      - name: Sign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_L1b }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          REQUIRE_SIGNATURE: ${{ github.ref_type == 'tag' && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          if [ -n "${MINISIGN_SECRET_KEY:-}" ]; then
+              sudo apt-get update -qq
+              sudo apt-get install -y --no-install-recommends minisign
+          fi
+          ferestre/scripts/sign-release.sh out/*.tar.xz out/SHA256SUMS
+
       - uses: actions/upload-artifact@v4
         with:
           name: ferestre-runtime-${{ steps.version.outputs.version }}

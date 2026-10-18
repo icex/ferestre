@@ -10,6 +10,8 @@
 #   Ferestre-<version>-x86_64.AppImage  one file, for people who do not want to
 #                                       extract anything.
 #   SHA256SUMS                          for both, so a download can be checked.
+#   <each of the above>.minisig         minisign signatures from the release
+#                                       key (scripts/sign-release.sh).
 #
 # The runtime has its own build train and tag. The GUI downloads its published
 # release on first start, so updating the launcher never requires rebuilding
@@ -208,6 +210,21 @@ jobs:
         run: |
           sha256sum ./*.AppImage ./*.tar.zst > SHA256SUMS
           cat SHA256SUMS
+
+      # Signed with the same release key the launcher checks the runtime
+      # against. A tag must be signed; a manual run without the secret builds
+      # unsigned and says so.
+      - name: Sign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_L1b }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          REQUIRE_SIGNATURE: ${{ github.ref_type == 'tag' && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          if [ -n "${MINISIGN_SECRET_KEY:-}" ]; then
+              sudo apt-get install -y --no-install-recommends minisign
+          fi
+          scripts/sign-release.sh out/*.AppImage out/*.tar.zst out/SHA256SUMS
 
       - uses: actions/upload-artifact@v4
         with:

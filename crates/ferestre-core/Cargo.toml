@@ -15,6 +15,10 @@ anyhow.workspace = true
 sha2 = "0.10"
 ureq.workspace = true
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Verifies the runtime release before it is unpacked. No dependencies of its own.
+minisign-verify = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
+# Tests sign with a throwaway key pair they generate, in the real format.
+minisign = "0.7"
