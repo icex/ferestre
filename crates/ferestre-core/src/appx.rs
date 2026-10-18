@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 
 /// An upper bound for the one XML file this module reads.
@@ -48,16 +48,27 @@ pub fn inspect_archive(path: &Path) -> Result<Package> {
     let mut manifest = archive
         .by_name(MANIFEST)
         .map_err(|_| anyhow!("{MANIFEST} is missing from {}", path.display()))?;
-    if manifest.size() > MAX_MANIFEST_BYTES {
-        bail!(
+    let too_big = || {
+        anyhow!(
             "{MANIFEST} exceeds the {} MiB inspection limit",
             MAX_MANIFEST_BYTES / 1024 / 1024
-        );
+        )
+    };
+    if manifest.size() > MAX_MANIFEST_BYTES {
+        return Err(too_big());
     }
-    let mut text = String::with_capacity(manifest.size() as usize);
-    manifest
-        .read_to_string(&mut text)
-        .context("AppxManifest.xml is not UTF-8 XML")?;
+    // The size above is what the archive claims, and a crafted one can claim
+    // a few bytes for a member that inflates to gigabytes. The cap is applied
+    // to what actually comes out: one byte past it is enough to know.
+    let mut bytes = Vec::with_capacity(manifest.size() as usize);
+    (&mut manifest)
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("AppxManifest.xml could not be read")?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(too_big());
+    }
+    let text = String::from_utf8(bytes).context("AppxManifest.xml is not UTF-8 XML")?;
     Ok(parse_manifest(&text))
 }
 
@@ -98,4 +109,54 @@ fn attribute(element: &str, name: &str) -> Option<String> {
     let close = value.find(quote)?;
     let value = value[..close].trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A deflated manifest of `real` bytes whose headers claim it is `claimed`
+    /// bytes long, as a hostile package would.
+    fn lying_archive(real: usize, claimed: u32) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().expect("temporary archive");
+        let mut zip = zip::ZipWriter::new(File::create(file.path()).expect("create"));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file(MANIFEST, options).expect("manifest entry");
+        let mut body = b"<Package><Identity Name=\"X\" Version=\"1.0.0.0\"/>".to_vec();
+        body.resize(real, b' ');
+        zip.write_all(&body).expect("manifest data");
+        zip.finish().expect("finish archive");
+
+        let mut bytes = std::fs::read(file.path()).unwrap();
+        let patch = |bytes: &mut Vec<u8>, signature: [u8; 4], offset: usize| {
+            let at = bytes
+                .windows(4)
+                .position(|w| w == signature)
+                .expect("header present");
+            bytes[at + offset..at + offset + 4].copy_from_slice(&claimed.to_le_bytes());
+        };
+        // Uncompressed size in the local header and in the central directory.
+        patch(&mut bytes, [0x50, 0x4b, 0x03, 0x04], 22);
+        patch(&mut bytes, [0x50, 0x4b, 0x01, 0x02], 24);
+        std::fs::write(file.path(), bytes).unwrap();
+        file
+    }
+
+    #[test]
+    fn the_cap_holds_against_a_manifest_that_lies_about_its_size() {
+        let archive = lying_archive(MAX_MANIFEST_BYTES as usize + 4096, 64);
+        let err = inspect_archive(archive.path())
+            .expect_err("an oversized manifest is refused")
+            .to_string();
+        assert!(err.contains("inspection limit"), "{err}");
+    }
+
+    #[test]
+    fn an_honest_manifest_under_the_cap_is_read() {
+        let archive = lying_archive(4096, 4096);
+        let package = inspect_archive(archive.path()).expect("inspect");
+        assert_eq!(package.identity.as_deref(), Some("X"));
+    }
 }
