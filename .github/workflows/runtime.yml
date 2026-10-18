@@ -13,7 +13,8 @@
 # it, and a tag may read the caches main saved but no other tag's, so main is
 # where it has to be saved: a push to main that changes what goes into the
 # runtime builds it too, unsigned, which keeps the cache warm and finds a
-# broken runtime build before a tag does. A tag restores and saves nothing.
+# broken runtime build before a tag does. A tag restores and saves nothing, and
+# so does a manual run, which may build a Proton ref nobody reviewed.
 # Only one copy is kept (the prune job deletes older ones) because the whole
 # repository shares 10 GB.
 #
@@ -256,8 +257,14 @@ jobs:
 
       # Also after a failed build: the objects that did compile are still
       # good, and the next attempt starts from them.
+      #
+      # Only from a push to main, which always builds the pinned Proton. A
+      # manual run may build any Proton ref somebody typed, and that tree's
+      # build scripts can write anything into the cache directory; a release
+      # restores this cache before it is signed, so only reviewed sources may
+      # ever fill it. Manual runs restore it and save nothing.
       - name: Save the compiler cache
-        if: always() && github.ref == 'refs/heads/main' && steps.ccache.outputs.cache-hit != 'true'
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.ccache.outputs.cache-hit != 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ env.CCACHE_DIR }}
@@ -346,7 +353,7 @@ jobs:
   # token can delete caches and nothing else, and it runs no build.
   prune-ccache:
     needs: build
-    if: always() && github.ref == 'refs/heads/main'
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       actions: write

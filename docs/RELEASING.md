@@ -154,6 +154,11 @@ between runs:
   the workflow itself (which holds the Proton pin) builds the runtime on
   `main`, unsigned. That build saves the cache, and a newer push cancels an
   older one still running.
+- Only that automatic `main` build saves the cache. It always builds the
+  pinned Proton commit, from reviewed patches. A manual run may build any
+  Proton ref, whose build scripts could write anything into the cache, so it
+  restores the cache and saves nothing. What a signed release restores was
+  therefore compiled only from sources that were merged to `main`.
 - A `runtime-*` tag restores the cache `main` saved and saves nothing. GitHub
   lets a tag read the caches of the default branch but not another tag's, so
   merging the runtime changes to `main` before tagging is what makes the
