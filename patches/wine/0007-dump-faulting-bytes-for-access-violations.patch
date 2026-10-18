@@ -1,7 +1,68 @@
 diff --git a/dlls/ntdll/exception.c b/dlls/ntdll/exception.c
 --- a/dlls/ntdll/exception.c
 +++ b/dlls/ntdll/exception.c
-@@ -214,10 +214,17 @@
+@@ -191,6 +191,60 @@
+ }
+ 
+ 
++/*******************************************************************
++ *		format_code_bytes
++ *
++ * Write the 48 bytes around @pc -- 32 before it, 16 from it -- into @text
++ * as hex, with "??" for any that cannot be read.
++ *
++ * Nothing here may fault. This runs in dispatch_exception before the
++ * vectored handlers, so a fault taken while reading would be dispatched as
++ * an exception of its own, and the title's handlers would see an access
++ * violation in ntdll that only happens because +seh logging is on. So the
++ * bytes are read with NtReadVirtualMemory, which catches a fault on the Unix
++ * side without dispatching it, and only from pages NtQueryVirtualMemory says
++ * are committed, readable and not guard pages, whose first touch is not free.
++ * An address in the low 64K, where nothing is ever mapped -- the usual jump
++ * through a null vtable -- is not read at all, which also keeps pc - 32 from
++ * wrapping around to the top of the address space.
++ */
++static void format_code_bytes( const void *pc, char *text )
++{
++    const ULONG readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
++                           PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
++    const ULONG_PTR start = (ULONG_PTR)pc - 32;
++    BYTE code[48];
++    SIZE_T i = 0, j;
++
++    if ((ULONG_PTR)pc < 0x10000)
++    {
++        strcpy( text, "<unreadable>" );
++        return;
++    }
++    while (i < sizeof(code))
++    {
++        MEMORY_BASIC_INFORMATION mbi;
++        ULONG_PTR addr = start + i;
++        SIZE_T chunk = 0x1000 - (addr & 0xfff), got = 0;
++
++        if (chunk > sizeof(code) - i) chunk = sizeof(code) - i;
++        if (!NtQueryVirtualMemory( NtCurrentProcess(), (const void *)addr, MemoryBasicInformation,
++                                   &mbi, sizeof(mbi), NULL ) &&
++            mbi.State == MEM_COMMIT && (mbi.Protect & readable) && !(mbi.Protect & PAGE_GUARD))
++        {
++            if (NtReadVirtualMemory( NtCurrentProcess(), (const void *)addr, code + i, chunk, &got ))
++                got = 0;
++        }
++        for (j = 0; j < chunk; j++)
++        {
++            if (j < got) sprintf( text + (i + j) * 3, "%02x ", code[i + j] );
++            else strcpy( text + (i + j) * 3, "?? " );
++        }
++        i += chunk;
++    }
++}
++
++
+ /*******************************************************************
+  *		dispatch_exception
+  */
+@@ -214,25 +268,21 @@
  
          /* An illegal instruction is nearly always a deliberate trap -- ud2 from
           * a failed check, or an instruction the CPU does not have -- and which
@@ -22,4 +83,21 @@ diff --git a/dlls/ntdll/exception.c b/dlls/ntdll/exception.c
 +             rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) && rec->ExceptionAddress)
          {
              char bytes[48 * 3 + 1];
-             unsigned int i;
+-            unsigned int i;
+-
+-            bytes[0] = 0;
+-            __TRY
+-            {
+-                const BYTE *code = (const BYTE *)rec->ExceptionAddress - 32;
+-                for (i = 0; i < 48; i++) sprintf( bytes + i * 3, "%02x ", code[i] );
+-            }
+-            __EXCEPT_ALL
+-            {
+-                strcpy( bytes, "<unreadable>" );
+-            }
+-            __ENDTRY
++
++            format_code_bytes( rec->ExceptionAddress, bytes );
+             WINE_BACKTRACE_LOG( "--- Code %p-32..+16: %s\n", rec->ExceptionAddress, bytes );
+         }
+     }
