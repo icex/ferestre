@@ -584,7 +584,8 @@ pub fn parse(json: &str) -> Result<Vec<Product>> {
 /// store app and does not know a bundle has children, which reads as "the
 /// catalog does not give a size" for something the catalog answers fine.
 /// Version 4 adds `wu_category_id`, the routing key for Appx/Msix delivery.
-const CACHE_SCHEMA: u32 = 4;
+/// Version 5 adds `product_kind`; without it an add-on reads as a game.
+const CACHE_SCHEMA: u32 = 5;
 
 #[derive(Serialize, Deserialize)]
 struct CacheEntry {
@@ -657,9 +658,6 @@ impl Cache {
                 entry.schema == CACHE_SCHEMA
                     && entry.market.eq_ignore_ascii_case(market)
                     && entry.language.eq_ignore_ascii_case(language)
-                    // Written before the product kind was recorded: fetched
-                    // again so an add-on is not taken for a game.
-                    && entry.product.product_kind.is_some()
             })
     }
 
