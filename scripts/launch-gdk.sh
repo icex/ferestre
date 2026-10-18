@@ -78,18 +78,49 @@ fi
 close_lock() { if [ -n "$lock_fd" ]; then "$@" {lock_fd}>&-; else "$@"; fi; }
 
 # The service backs xgameruntime's Xbox-side calls; start it if it isn't up.
-# Background the command itself, not `close_lock`: a backgrounded function
-# runs in a forked subshell that would keep the descriptor open for as long as
-# the service lives.
-if ! pgrep -x xodus-service >/dev/null; then
-    rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/xodus.sock"
-    if [ -n "$lock_fd" ]; then
-        nohup "$XODUS_CLI_DIR/xodus-service" {lock_fd}>&- >"${TMPDIR:-/tmp}/xodus-service.log" 2>&1 &
-    else
-        nohup "$XODUS_CLI_DIR/xodus-service" >"${TMPDIR:-/tmp}/xodus-service.log" 2>&1 &
-    fi
-    sleep 2
+# "Up" means something accepts connections on the socket this title will use.
+# Any process merely named xodus-service proves nothing: `ferestre run` keeps
+# its own under a per-title directory, and another user's is no use here.
+SOCK=$SERVICE_DIR/xodus.sock
+service_up() {
+    python3 -I -c 'import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(1)
+try:
+    s.connect(sys.argv[1])
+except OSError:
+    sys.exit(1)' "$SOCK" 2>/dev/null
+}
+# `ferestre run` takes the same lock around its own check and start, so the
+# two never both start a service on one socket.
+start_fd=
+exec {start_fd}>>"$SERVICE_DIR/start.lock" && flock -x "$start_fd" || start_fd=
+if ! service_up; then
+    # A service that was killed leaves its socket behind and a new one cannot
+    # bind over it. Only ever remove a socket, never some other file.
+    [ -S "$SOCK" ] && rm -f "$SOCK"
+    # The subshell closes the lock descriptors and then becomes the service,
+    # so nothing else lives on holding them. The log can name accounts and
+    # titles: it goes next to the socket, readable by this user only.
+    (
+        if [ -n "$lock_fd" ]; then exec {lock_fd}>&-; fi
+        if [ -n "$start_fd" ]; then exec {start_fd}>&-; fi
+        umask 077
+        export XODUS_RUNTIME_DIR=$SERVICE_DIR
+        log=$SERVICE_DIR/xodus-service.log
+        # One written by an older version of this script may be world-readable.
+        : >"$log" && chmod 600 "$log"
+        exec nohup "$XODUS_CLI_DIR/xodus-service" >"$log" 2>&1
+    ) &
+    service_pid=$!
+    for _ in $(seq 100); do
+        service_up && break
+        kill -0 "$service_pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    service_up || echo "warning: xodus-service is not listening on $SOCK; see $SERVICE_DIR/xodus-service.log" >&2
 fi
+if [ -n "$start_fd" ]; then exec {start_fd}>&-; fi
 
 echo "launching $EXE from $GAME_DIR (prefix $PREFIX)..."
 close_lock "$XODUS_CLI_DIR/xodus-cli" run -e "$EXE" "$GAME_DIR" "$SHIM"
