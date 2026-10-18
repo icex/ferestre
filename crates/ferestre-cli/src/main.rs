@@ -643,14 +643,12 @@ fn cmd_run(
             .content_ids
             .first()
             .context("The installed title has no Store content ID")?;
-        // Upper case like every Store id the runtime sends; the service
-        // compares the bound product exactly.
-        plan.env_set.insert(
-            "XODUS_STORE_PRODUCT".into(),
-            recipe.title.product_id.to_ascii_uppercase(),
-        );
-        plan.env_set
-            .insert("XODUS_STORE_CONTENT".into(), content.clone());
+        bind_service_title(
+            &mut plan,
+            &recipe.title.product_id,
+            content,
+            &launch::game_dir(recipe, &dirs, &options),
+        )?;
     }
     let service_socket = plan_service_socket(&mut plan, &dirs, runtime, roles.as_ref())?;
 
@@ -1755,11 +1753,15 @@ fn plan_service_socket(
             Ok(id) => id,
             Err(_) => accounts::service_fingerprint(&dirs.xodus_service())?,
         };
+        // A service started for one title identity is never reused for
+        // another: the binding names the product, content and title.
         let binding = format!(
-            "{}:{}:{}",
+            "{}:{}:{}:{}:{}",
             id.trim(),
             plan.get("XODUS_STORE_PRODUCT").unwrap_or_default(),
-            plan.get("XODUS_STORE_CONTENT").unwrap_or_default()
+            plan.get("XODUS_STORE_CONTENT").unwrap_or_default(),
+            plan.get("XODUS_TITLE_ID").unwrap_or_default(),
+            plan.get("XODUS_TITLE_CLIENT_ID").unwrap_or_default()
         );
         let root = std::env::var_os("XODUS_RUNTIME_DIR")
             .filter(|v| !v.is_empty())
@@ -2188,6 +2190,67 @@ fn service_command(
     Ok(service)
 }
 
+/// What a launch tells the service it starts, each set or removed so nothing
+/// leaks in from the launcher's own environment.
+///
+/// - `XODUS_STORE_PROFILE` / `XODUS_PLAYER_PROFILE`: the account pair.
+/// - `XODUS_STORE_PRODUCT` / `XODUS_STORE_CONTENT`: the Store product and
+///   content the service licenses, and the only product it signs licence
+///   tokens for, with the add-ons and editions the Store catalog ties to it.
+/// - `XODUS_TITLE_ID` / `XODUS_TITLE_CLIENT_ID`: the title's `TitleId`
+///   (decimal) and `MSAAppId` out of its `MicrosoftGame.config`. The service
+///   mints XSTS tokens claiming this title or none, and signs licence requests
+///   as it whatever a request says. Empty means the config names no title, so
+///   no request may claim one. Left unset only by older launchers, whose
+///   services then take the title on a request's word as before; a launch with
+///   account roles needs a service that understands them
+///   (`accounts::SERVICE_TITLE_SCOPE`).
+const SERVICE_BINDING: [&str; 6] = [
+    "XODUS_STORE_PROFILE",
+    "XODUS_PLAYER_PROFILE",
+    "XODUS_STORE_PRODUCT",
+    "XODUS_STORE_CONTENT",
+    "XODUS_TITLE_ID",
+    "XODUS_TITLE_CLIENT_ID",
+];
+
+/// Bind the launch's service to one title: its Store product and content,
+/// and the identity the runtime will read out of the same install's config.
+fn bind_service_title(
+    plan: &mut launch::Plan,
+    product_id: &str,
+    content: &str,
+    game_dir: &Path,
+) -> Result<()> {
+    // Upper case like every Store id the runtime sends; the service
+    // compares the bound product exactly.
+    plan.env_set.insert(
+        "XODUS_STORE_PRODUCT".into(),
+        product_id.to_ascii_uppercase(),
+    );
+    plan.env_set
+        .insert("XODUS_STORE_CONTENT".into(), content.to_string());
+    // A package without a readable config has no title for a request to
+    // claim, so it is bound to none rather than left to choose.
+    let identity = install::title_identity(game_dir).unwrap_or_default();
+    // The service refuses to start on anything else; say why here instead.
+    if !identity
+        .client_id
+        .bytes()
+        .all(|c| c.is_ascii_alphanumeric() || b"-{}".contains(&c))
+    {
+        bail!(
+            "{}'s MicrosoftGame.config has an MSAAppId the Xbox service cannot be bound to",
+            game_dir.display()
+        );
+    }
+    plan.env_set
+        .insert("XODUS_TITLE_ID".into(), identity.title_id);
+    plan.env_set
+        .insert("XODUS_TITLE_CLIENT_ID".into(), identity.client_id);
+    Ok(())
+}
+
 /// Write the pid file whole or not at all: a launch finishing reads it.
 fn record_service_pid(directory: &Path, pid: u32) {
     let temporary = directory.join(format!(".{SERVICE_PID}.{}", std::process::id()));
@@ -2265,13 +2328,9 @@ fn start_service(
     )?;
     let spawn = |executable: &Path| {
         let mut service = service_command(executable, directory, &out)?;
-        // The pair this launch was resolved for, and nothing inherited.
-        for key in [
-            "XODUS_STORE_PROFILE",
-            "XODUS_PLAYER_PROFILE",
-            "XODUS_STORE_PRODUCT",
-            "XODUS_STORE_CONTENT",
-        ] {
+        // The pair and the title this launch was resolved for, and nothing
+        // inherited.
+        for key in SERVICE_BINDING {
             match plan.get(key) {
                 Some(value) => service.env(key, value),
                 None => service.env_remove(key),
@@ -3655,6 +3714,62 @@ mod tests {
             socket.as_os_str().len() < 108,
             "service namespace must fit a Linux Unix socket path"
         );
+    }
+
+    /// The service learns its title from the launch, out of the install's own
+    /// config, and every variable the binding sets reaches the service.
+    #[test]
+    fn a_bound_service_is_told_the_title_the_runtime_will_name() {
+        let scratch = Scratch::new("service-title");
+        let plan = |config: Option<&str>| {
+            let game = scratch.root.join("game");
+            let _ = std::fs::remove_dir_all(&game);
+            std::fs::create_dir_all(&game).unwrap();
+            if let Some(config) = config {
+                std::fs::write(game.join("MicrosoftGame.config"), config).unwrap();
+            }
+            let mut plan = launch::Plan {
+                program: PathBuf::from("/opt/xodus/xodus-cli"),
+                args: vec![],
+                env_set: Default::default(),
+                env_unset: vec![],
+                cwd: None,
+            };
+            bind_service_title(
+                &mut plan,
+                "9p5786pjb9rp",
+                "00000000-0000-0000-0000-000000000001",
+                &game,
+            )
+            .map(|()| plan)
+        };
+        let bound = plan(Some(
+            "<Game><TitleId>6B9DE498</TitleId><MSAAppId>00000000-0000-0000-0000-00004C26E6C9</MSAAppId></Game>",
+        ))
+        .unwrap();
+        assert_eq!(bound.get("XODUS_STORE_PRODUCT"), Some("9P5786PJB9RP"));
+        assert_eq!(
+            bound.get("XODUS_STORE_CONTENT"),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+        assert_eq!(bound.get("XODUS_TITLE_ID"), Some("1805509784"));
+        assert_eq!(
+            bound.get("XODUS_TITLE_CLIENT_ID"),
+            Some("00000000-0000-0000-0000-00004C26E6C9")
+        );
+        for key in bound.env_set.keys() {
+            assert!(
+                SERVICE_BINDING.contains(&key.as_str()),
+                "{key} never reaches the service"
+            );
+        }
+        // No config, or one naming no title: bound to no title, not unbound.
+        for config in [None, Some("<Game><MSAAppId>client</MSAAppId></Game>")] {
+            let none = plan(config).unwrap();
+            assert_eq!(none.get("XODUS_TITLE_ID"), Some(""));
+            assert_eq!(none.get("XODUS_TITLE_CLIENT_ID"), Some(""));
+        }
+        assert!(plan(Some("<TitleId>1</TitleId><MSAAppId>a b;c</MSAAppId>")).is_err());
     }
 
     #[test]

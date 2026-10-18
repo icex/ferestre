@@ -57,7 +57,7 @@ SERVICE = r'''#!/usr/bin/env python3
 import json,os,socket,sys
 from pathlib import Path
 if '--capabilities' in sys.argv:
- print(json.dumps({'schema':1,'capabilities':['store-player-accounts']}));sys.exit(0)
+ print(json.dumps({'schema':1,'capabilities':['store-player-accounts','title-scoped-tokens']}));sys.exit(0)
 root=Path(os.environ['HOME']);path=Path(os.environ['XODUS_RUNTIME_DIR'])/'xodus.sock'
 with (root/'services.jsonl').open('a') as log:
  log.write(json.dumps({'pid':os.getpid(),'store':os.environ['XODUS_STORE_PROFILE'],'player':os.environ['XODUS_PLAYER_PROFILE'],'socket':str(path)})+'\n')

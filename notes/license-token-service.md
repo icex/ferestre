@@ -22,6 +22,34 @@ never logs response contents or signed credentials. The production endpoint is
 fixed; there is no environment override. The game's service remains responsible
 for checking Microsoft's JWT signature and the account's entitlements.
 
+## Title-bound services
+
+A service started for one title (account sharing) signs only that title's
+requests. The parent product must be the bound product. Each product ID must be
+the bound product or one whose own market-neutral DisplayCatalog entry names
+the bound product as `addOnParent`, `Parent` or `Extends`. That covers add-ons,
+consumables, DLC and editions. Bundles and storefronts that the game's entry
+lists are not admitted, since either can grant other titles, and neither is a
+product naming the game only under `SellableBy`. Dungeons
+II's real licence request asks for its Soul and Hero packs, each naming the
+game as `addOnParent`. Answers are kept
+for the life of the service. A product the catalog does not list, or a catalog
+that cannot be reached, refuses the request with a log line naming the products;
+the licensing endpoint needs the network too, so nothing that would have worked
+offline is lost. The request is signed under the identity the launcher read from
+the install's `MicrosoftGame.config` (`XODUS_TITLE_ID`, `XODUS_TITLE_CLIENT_ID`),
+not the `TitleId` and `TitleClientId` it carried. Unbound services are unchanged.
+
+A licence request is the only way to the licensing audience in a bound service
+whose Player is also its Store account. A title's own XSTS request that resolves
+to the relying party the licence path uses (`http://licensing.xboxlive.com` in
+the default endpoint list, shared with `collections.mp.microsoft.com` and
+`inventory.xboxlive.com`) is refused: the request signature covers the method,
+path and body but not the host, so such a token could carry a licence request
+of the title's choosing. A Player who is another account gets their own
+licensing authorization, which is no one else's to protect. For the same
+reason a bound service answers no MSA token requests at all.
+
 ## IPC and compatibility
 
 Licence IPC requires matching **client patch 0017 and runtime patches 0018–0019**.

@@ -568,6 +568,59 @@ fn store_id(install_dir: &Path) -> Option<String> {
     (!value.is_empty()).then(|| value.to_ascii_uppercase())
 }
 
+/// The identity a title signs in to Xbox under, as the runtime reads it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TitleIdentity {
+    /// `TitleId` in decimal, the way the runtime sends it; empty when the
+    /// config names no title.
+    pub title_id: String,
+    /// `MSAAppId`; empty when the config has none, or names no title.
+    pub client_id: String,
+}
+
+/// The title identity in an install's `MicrosoftGame.config`, read the way
+/// the runtime reads it: the text of the first `<TitleId>` element as
+/// hexadecimal, and of the first `<MSAAppId>`, each under 64 bytes.
+///
+/// The runtime sends this pair on every token request, and a title is free to
+/// put anything there instead. Read here, before the title runs, it is what the
+/// launcher binds the service to, so the service can tell the title's own
+/// identity from one it claims. `None` when the install has no readable
+/// config.
+pub fn title_identity(install_dir: &Path) -> Option<TitleIdentity> {
+    let text = std::fs::read_to_string(game_config(install_dir)?).ok()?;
+    let element = |name: &str| {
+        let open = format!("<{name}>");
+        let start = text.find(&open)? + open.len();
+        let value = &text[start..];
+        let value = &value[..value.find('<').unwrap_or(value.len())];
+        (value.len() < 64).then_some(value)
+    };
+    // strtoul: leading space, an optional 0x, then as many hex digits as
+    // there are. A value that is zero or does not fit a title ID is no title.
+    let title = element("TitleId").and_then(|hex| {
+        let hex = hex.trim_start();
+        let hex = hex
+            .strip_prefix("0x")
+            .or_else(|| hex.strip_prefix("0X"))
+            .unwrap_or(hex);
+        let digits = hex.len()
+            - hex
+                .trim_start_matches(|c: char| c.is_ascii_hexdigit())
+                .len();
+        u64::from_str_radix(&hex[..digits], 16)
+            .ok()
+            .filter(|id| *id > 0 && *id <= u64::from(u32::MAX))
+    });
+    Some(match title {
+        Some(id) => TitleIdentity {
+            title_id: id.to_string(),
+            client_id: element("MSAAppId").unwrap_or("").trim().to_string(),
+        },
+        None => TitleIdentity::default(),
+    })
+}
+
 /// Build a record for a title already on disk that nothing recorded.
 ///
 /// Exact, not assumed: everything comes from the install itself. Returns `None`
@@ -1112,5 +1165,50 @@ mod tests {
         forget(&dir, "9ZZTESTGAME1").expect("forgetting twice is not an error");
 
         std::fs::remove_dir_all(&dir).expect("cleans up");
+    }
+
+    /// The service is bound to what the runtime will send, so this has to
+    /// read the config the way the runtime does, quirks included.
+    #[test]
+    fn the_title_identity_is_read_the_way_the_runtime_reads_it() {
+        let dir = std::env::temp_dir().join(format!("ferestre-title-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(title_identity(&dir), None);
+        let identity = |config: &str| {
+            std::fs::write(dir.join("MicrosoftGame.Config"), config).unwrap();
+            title_identity(&dir).unwrap()
+        };
+        let expect = |title_id: &str, client_id: &str| TitleIdentity {
+            title_id: title_id.into(),
+            client_id: client_id.into(),
+        };
+        assert_eq!(
+            identity(
+                "<Game><TitleId>6B9DE498</TitleId><MSAAppId>00000000-0000-0000-0000-00004C26E6C9</MSAAppId></Game>"
+            ),
+            expect("1805509784", "00000000-0000-0000-0000-00004C26E6C9")
+        );
+        // A Windows title authenticates by TitleId alone.
+        assert_eq!(
+            identity("<Game><TitleId> 0x4d5f3c6a</TitleId></Game>"),
+            expect("1298087018", "")
+        );
+        // Trailing text after the digits is ignored, as strtoul ignores it.
+        assert_eq!(
+            identity("<TitleId>7900C3C7 </TitleId>"),
+            expect("2030093255", "")
+        );
+        for config in [
+            "<Game><MSAAppId>client</MSAAppId></Game>",
+            "<Game><TitleId></TitleId><MSAAppId>client</MSAAppId></Game>",
+            "<TitleId>0</TitleId>",
+            "<TitleId>not hex</TitleId>",
+            "<TitleId>100000000</TitleId>",
+            &format!("<TitleId>{}</TitleId>", "1".repeat(64)),
+        ] {
+            assert_eq!(identity(config), TitleIdentity::default(), "{config}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1,0 +1,1299 @@
+From: Ferestre contributors
+Subject: Scope service tokens to the bound title
+
+A launcher that binds the service to a Store product now also passes the
+title's identity from its MicrosoftGame.config: XODUS_TITLE_ID (decimal, empty
+when the config names no title) and XODUS_TITLE_CLIENT_ID (MSAAppId). A bound
+service mints XSTS tokens only under that title identity, or with no title
+claim at all (the runtime's own sign-in lookup asks that way, and such a token
+carries the user and device only), with the relying party taken from the
+endpoint list. It signs licence-token requests as that title whatever TitleId
+and TitleClientId they carry.
+
+Licence tokens are issued for the bound product and for products whose own
+Store catalog entry names it as their game: add-ons and consumables
+(addOnParent) and editions (Parent, Extends), looked up once per
+product in the market-neutral display catalog. Bundles and storefronts the
+game merely lists are not admitted, since they can grant other titles, and
+neither is a product that names the game only as where it is sold
+(SellableBy). A product the catalog does not confirm is refused and the
+reason logged. A bound service refuses a relying party chosen by the
+request, and one with a title binding but no product refuses licence
+requests.
+
+The licensing audience stays with the licence path: where the Player is the
+Store account, a title's own XSTS request that resolves to the audience the
+licence service uses is refused. A bound service also answers no MSA token
+requests, which the runtime never makes. The service lists
+title-scoped-tokens among its capabilities so a launcher can tell it apart
+from one that ignores the title variables. Unbound services behave as
+before, and a service bound without the title variables keeps the title a
+request names.
+
+diff --git a/crates/xodus-service/src/connection/catalog.rs b/crates/xodus-service/src/connection/catalog.rs
+index ed0ee77..046fa4e 100644
+--- a/crates/xodus-service/src/connection/catalog.rs
++++ b/crates/xodus-service/src/connection/catalog.rs
+@@ -390,13 +390,57 @@ fn product(out: &mut Vec<u8>, p: &Value, req: &Request) -> Result<bool, Error> {
+     Ok(true)
+ }
+ 
+-async fn fetch(req: &Request) -> Result<Vec<u8>, Error> {
+-    let client = reqwest::Client::builder()
++fn catalog_client() -> Result<reqwest::Client, Error> {
++    reqwest::Client::builder()
+         .redirect(reqwest::redirect::Policy::none())
+         .timeout(Duration::from_secs(20))
+         .connect_timeout(Duration::from_secs(8))
+         .build()
+-        .map_err(|_| "cannot build catalog client")?;
++        .map_err(|_| "cannot build catalog client")
++}
++
++/// The catalog entries of up to 256 products, for their relationships.
++///
++/// Relationships do not depend on the market, so this asks the neutral one
++/// rather than guessing the account's. A product the catalog does not know is
++/// simply absent from the answer; anything it returns that was not asked for
++/// fails the whole lookup.
++pub(super) async fn relationships(ids: Vec<String>) -> Result<Vec<Value>, Error> {
++    if ids.len() > 256 || !ids.iter().all(|id| valid_id(id) && id.len() == 12) {
++        return Err("invalid catalog IDs");
++    }
++    let client = catalog_client()?;
++    let mut entries = Vec::new();
++    for chunk in ids.chunks(20) {
++        let value = json(
++            client
++                .get(format!(
++                    "https://displaycatalog.mp.microsoft.com/v7.0/products?bigIds={}&market=neutral&languages=en-US",
++                    chunk.join(",")
++                ))
++                .send()
++                .await
++                .map_err(|_| "product catalog transport failed")?,
++        )
++        .await?;
++        let products = value["Products"]
++            .as_array()
++            .ok_or("missing catalog products")?;
++        for product in products {
++            if !chunk
++                .iter()
++                .any(|id| id.eq_ignore_ascii_case(string(product, "ProductId")))
++            {
++                return Err("unexpected catalog product");
++            }
++            entries.push(product.clone());
++        }
++    }
++    Ok(entries)
++}
++
++async fn fetch(req: &Request) -> Result<Vec<u8>, Error> {
++    let client = catalog_client()?;
+     let ids = if req.associated {
+         associated_ids(&client, req).await?
+     } else {
+diff --git a/crates/xodus-service/src/connection/license.rs b/crates/xodus-service/src/connection/license.rs
+index cfbacf0..2f31cdd 100644
+--- a/crates/xodus-service/src/connection/license.rs
++++ b/crates/xodus-service/src/connection/license.rs
+@@ -7,7 +7,7 @@ use std::time::Duration;
+ use xodus::models::licensing::LicenseTokenResponse;
+ use xodus::models::xgameruntime::xuser::{LicenseTokenIpcRequest, XSTSTokenRequest};
+ 
+-const URL: &str = "https://licensing.mp.microsoft.com/v8.0/licenseToken";
++pub(super) const URL: &str = "https://licensing.mp.microsoft.com/v8.0/licenseToken";
+ const MAX_RESPONSE: usize = 65536;
+ const MAX_TOKEN: usize = 60000; // fits the IPC frame and the DLL result buffer
+ const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+@@ -114,8 +114,13 @@ async fn post(
+     parse_response(&bytes)
+ }
+ 
++fn parse(xml: &[u8]) -> Result<LicenseTokenIpcRequest, Error> {
++    quick_xml::de::from_str(std::str::from_utf8(xml).map_err(|_| "invalid IPC request")?)
++        .map_err(|_| "invalid IPC request")
++}
++
+ async fn fetch_with<F, Fut>(
+-    xml: &[u8],
++    req: LicenseTokenIpcRequest,
+     url: &str,
+     client: &reqwest::Client,
+     authorize: F,
+@@ -126,9 +131,6 @@ where
+             Output = Result<xodus::models::xgameruntime::xuser::XSTSTokenResponse, Error>,
+         >,
+ {
+-    let req: LicenseTokenIpcRequest =
+-        quick_xml::de::from_str(std::str::from_utf8(xml).map_err(|_| "invalid IPC request")?)
+-            .map_err(|_| "invalid IPC request")?;
+     let bytes = body(&req)?;
+     let auth = authorize(XSTSTokenRequest {
+         url: url.into(),
+@@ -142,21 +144,69 @@ where
+     post(client, url, bytes, &auth.token, &auth.signature).await
+ }
+ 
+-pub(super) async fn fetch(context: &mut SimpleContext, xml: &[u8]) -> Result<String, Error> {
+-    // A service bound to one title signs licence requests for that title
+-    // only: the Store account's token is not the running game's to spend on
+-    // another product it happens to own.
+-    if let Some(bound) = &context.entitlement {
+-        let req: LicenseTokenIpcRequest =
+-            quick_xml::de::from_str(std::str::from_utf8(xml).map_err(|_| "invalid IPC request")?)
+-                .map_err(|_| "invalid IPC request")?;
+-        if !req.parent_product_id.eq_ignore_ascii_case(bound.product()) {
+-            return Err("licence token request is for another title");
++/// Hold a licence request to the title the service is bound to.
++///
++/// A service bound to one title signs licence requests for that title only:
++/// the Store account's token is not the running game's to spend on another
++/// product it happens to own. The parent must be the bound product, every
++/// product ID must be one the Store catalog ties to it (see
++/// `Entitlement::admit_products`), and the request is signed under the bound
++/// title's identity whatever TitleId and TitleClientId it carried. An unbound
++/// service changes nothing.
++async fn scope<L, Fut>(
++    context: &SimpleContext,
++    req: &mut LicenseTokenIpcRequest,
++    lookup: L,
++) -> Result<(), Error>
++where
++    L: FnOnce(Vec<String>) -> Fut,
++    Fut: std::future::Future<Output = Result<Vec<serde_json::Value>, Error>>,
++{
++    let Some(bound) = &context.entitlement else {
++        // A service bound to a title is bound to its product too; one
++        // without the product could not hold the request to it.
++        if context.title.is_some() {
++            tracing::warn!(
++                "refused a licence token: this service has a title binding but no product"
++            );
++            return Err("licence token request without a bound product");
+         }
++        return Ok(());
++    };
++    if !req.parent_product_id.eq_ignore_ascii_case(bound.product()) {
++        tracing::warn!(
++            "refused a licence token with parent {:?}; this service is bound to {}",
++            req.parent_product_id,
++            bound.product()
++        );
++        return Err("licence token request is for another title");
++    }
++    if let Err(refusal) = bound.admit_products(&req.product_ids.ids, lookup).await {
++        tracing::warn!("{refusal}");
++        return Err("licence token request names products outside the bound title");
+     }
++    if let Some(title) = &context.title {
++        if req.title_id != title.title_id() || req.title_client_id != title.client_id() {
++            tracing::info!(
++                "licence token request claimed title {:?} (client {:?}); signing it as the bound title {:?} (client {:?})",
++                req.title_id,
++                req.title_client_id,
++                title.title_id(),
++                title.client_id()
++            );
++        }
++        req.title_id = title.title_id();
++        req.title_client_id = title.client_id().into();
++    }
++    Ok(())
++}
++
++pub(super) async fn fetch(context: &mut SimpleContext, xml: &[u8]) -> Result<String, Error> {
++    let mut req = parse(xml)?;
++    scope(context, &mut req, super::catalog::relationships).await?;
+     let mut store = context.store_context();
+-    fetch_with(xml, URL, &client(HTTP_TIMEOUT)?, |req| async move {
+-        super::xml::xsts_token(&mut store, req)
++    fetch_with(req, URL, &client(HTTP_TIMEOUT)?, |req| async move {
++        super::xml::xsts_token_for(&mut store, req, super::xml::Caller::Licensing)
+             .await
+             .map_err(|_| "licensing authorization failed")
+     })
+diff --git a/crates/xodus-service/src/connection/license/tests.rs b/crates/xodus-service/src/connection/license/tests.rs
+index 3f1d0be..dd44548 100644
+--- a/crates/xodus-service/src/connection/license/tests.rs
++++ b/crates/xodus-service/src/connection/license/tests.rs
+@@ -261,7 +261,8 @@ async fn offline_service_fixture() {
+                     }
+                     _ => {}
+                 }
+-                let outcome = fetch_with(&bytes, &url, &client, |request| async move {
++                let req = parse(&bytes).unwrap();
++                let outcome = fetch_with(req, &url, &client, |request| async move {
+                     assert_eq!(request.method, "POST");
+                     assert_eq!(request.title_id, "1298034544");
+                     assert_eq!(
+@@ -330,3 +331,189 @@ async fn a_title_bound_service_signs_licence_requests_for_that_title_only() {
+         Err("licence token request is for another title")
+     );
+ }
++
++fn catalog_entry(id: &str, related: &[(&str, &str)]) -> serde_json::Value {
++    let related: Vec<_> = related
++        .iter()
++        .map(|(id, kind)| serde_json::json!({"RelatedProductId": id, "RelationshipType": kind}))
++        .collect();
++    serde_json::json!({"ProductId": id, "MarketProperties": [{"RelatedProducts": related}]})
++}
++
++/// The bound game, which names a bundle containing it and the storefront
++/// that sells it; an add-on and an edition that name the game; and an
++/// unrelated product only recommended alongside it.
++fn catalog() -> Vec<serde_json::Value> {
++    vec![
++        catalog_entry(
++            "9TESTSTORE0I",
++            &[("9TESTBUNDLE0", "Bundle"), ("9TESTLAUNCH0", "SellableBy")],
++        ),
++        catalog_entry(
++            "9TESTADDON00",
++            &[
++                ("9TESTSTORE0I", "addOnParent"),
++                ("9TESTSTORE0I", "SellableBy"),
++            ],
++        ),
++        catalog_entry("9TESTDELUXE0", &[("9TESTSTORE0I", "Parent")]),
++        catalog_entry("9TESTBUNDLE0", &[]),
++        catalog_entry("9TESTLAUNCH0", &[]),
++        catalog_entry("9OTHERGAME00", &[("9TESTSTORE0I", "Recommendation")]),
++        catalog_entry("9SOLDBYGAME0", &[("9TESTSTORE0I", "SellableBy")]),
++    ]
++}
++
++fn bound_request(products: &[&str], title: &str, client: &str) -> LicenseTokenIpcRequest {
++    let products: String = products
++        .iter()
++        .map(|id| format!("<ProductId>{id}</ProductId>"))
++        .collect();
++    parse(format!(
++        "<LicenseTokenRequest><ParentProductId>9TESTSTORE0I</ParentProductId><ProductIds>{products}</ProductIds><CustomBase64>{}</CustomBase64><TitleId>{title}</TitleId><TitleClientId>{client}</TitleClientId></LicenseTokenRequest>",
++        STANDARD.encode("fixture")
++    ).as_bytes())
++    .unwrap()
++}
++
++fn bound_context() -> SimpleContext {
++    let mut context = crate::simple_context::tests::context("owner-scope", "player-scope");
++    context.entitlement = Some(crate::entitlement::Entitlement::fixture("9TESTSTORE0I"));
++    context.title = Some(crate::title::TitleIdentity::fixture(
++        1805509784,
++        "00000000-0000-0000-0000-00004C26E6C9",
++    ));
++    context
++}
++
++/// A catalog lookup that serves `catalog()` and counts how often it was asked.
++fn lookup(
++    calls: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
++) -> impl FnOnce(Vec<String>) -> std::future::Ready<Result<Vec<serde_json::Value>, Error>> {
++    let calls = calls.clone();
++    move |ids: Vec<String>| {
++        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++        assert_eq!(
++            ids[0], "9TESTSTORE0I",
++            "the bound product is always looked up"
++        );
++        std::future::ready(Ok(catalog()
++            .into_iter()
++            .filter(|entry| {
++                ids.iter()
++                    .any(|id| id == entry["ProductId"].as_str().unwrap())
++            })
++            .collect()))
++    }
++}
++
++#[tokio::test]
++async fn a_bound_service_refuses_licence_tokens_for_products_outside_the_title() {
++    let context = bound_context();
++    let calls = Default::default();
++    for products in [
++        &["9TESTSTORE0I", "9OTHERGAME00"][..],
++        &["9TESTADDON00", "9NOTINCATALG"],
++        &["9TESTSTORE0I", "../../escape"],
++        &["9TESTSTORE0I", "9TESTADDON00X"],
++        // Listed by the game, not naming it: a bundle and a storefront can
++        // grant other titles.
++        &["9TESTSTORE0I", "9TESTBUNDLE0"],
++        &["9TESTSTORE0I", "9TESTLAUNCH0"],
++        // Sold through the game, but not one of its add-ons or editions.
++        &["9TESTSTORE0I", "9SOLDBYGAME0"],
++    ] {
++        let mut req = bound_request(products, "1805509784", "");
++        assert_eq!(
++            scope(&context, &mut req, lookup(&calls)).await,
++            Err("licence token request names products outside the bound title"),
++            "{products:?}"
++        );
++    }
++    // A catalog that cannot be reached confirms nothing.
++    let mut req = bound_request(&["9TESTSTORE0I", "9TESTBUNDLE0"], "1805509784", "");
++    let unreachable = |_| std::future::ready(Err("product catalog transport failed"));
++    assert!(scope(&context, &mut req, unreachable).await.is_err());
++}
++
++#[tokio::test]
++async fn a_bound_service_licenses_its_own_product_and_confirmed_add_ons_as_itself() {
++    let context = bound_context();
++    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
++    // The game alone needs no catalog at all.
++    let mut req = bound_request(&["9teststore0i"], "1805509784", "");
++    scope(&context, &mut req, lookup(&calls)).await.unwrap();
++    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
++
++    // The title claims another title's identity; the signed request does not.
++    let mut req = bound_request(
++        &["9TESTSTORE0I", "9TESTADDON00", "9TESTDELUXE00010"],
++        "1298034544",
++        "00000000-0000-0000-0000-000000000000",
++    );
++    scope(&context, &mut req, lookup(&calls)).await.unwrap();
++    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
++    let signed = std::sync::Arc::new(std::sync::Mutex::new(None));
++    let seen = signed.clone();
++    let result = fetch_with(
++        req,
++        URL,
++        &client(HTTP_TIMEOUT).unwrap(),
++        |request| async move {
++            *seen.lock().unwrap() = Some((
++                request.title_id,
++                request.title_client_id,
++                STANDARD.decode(request.body_base64).unwrap(),
++            ));
++            Err("stop before the network")
++        },
++    )
++    .await;
++    assert_eq!(result, Err("stop before the network"));
++    let (title, client, body) = signed.lock().unwrap().take().unwrap();
++    assert_eq!(title, "1805509784");
++    assert_eq!(client, "00000000-0000-0000-0000-00004C26E6C9");
++    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
++    assert_eq!(body["parentProductId"], "9TESTSTORE0I");
++    assert_eq!(
++        body["relatedProductIds"],
++        "[\"9TESTSTORE0I\",\"9TESTADDON00\",\"9TESTDELUXE00010\"]"
++    );
++
++    // Confirmed products are remembered for the life of the service.
++    let mut req = bound_request(&["9TESTADDON00"], "1805509784", "");
++    scope(&context, &mut req, lookup(&calls)).await.unwrap();
++    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
++}
++
++#[tokio::test]
++async fn an_unbound_service_signs_licence_requests_as_before() {
++    let context = crate::simple_context::tests::context("owner-unbound", "player-unbound");
++    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
++    let mut req = bound_request(&["9OTHERGAME00"], "1298034544", "client");
++    scope(&context, &mut req, lookup(&calls)).await.unwrap();
++    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
++    assert_eq!(req.title_id, "1298034544");
++    assert_eq!(req.title_client_id, "client");
++    assert_eq!(req.product_ids.ids, ["9OTHERGAME00"]);
++
++    // A service bound to a product by an older launcher, which passed no
++    // title identity, still scopes the products but keeps the request's title.
++    let mut context = context;
++    context.entitlement = Some(crate::entitlement::Entitlement::fixture("9TESTSTORE0I"));
++    let mut req = bound_request(&["9TESTADDON00"], "1298034544", "client");
++    scope(&context, &mut req, lookup(&calls)).await.unwrap();
++    assert_eq!(req.title_id, "1298034544");
++}
++
++#[tokio::test]
++async fn a_title_bound_service_without_a_product_refuses_licence_tokens() {
++    let mut context = bound_context();
++    context.entitlement = None;
++    let calls = Default::default();
++    let mut req = bound_request(&["9TESTSTORE0I"], "1805509784", "");
++    assert_eq!(
++        scope(&context, &mut req, lookup(&calls)).await,
++        Err("licence token request without a bound product")
++    );
++}
+diff --git a/crates/xodus-service/src/connection/router.rs b/crates/xodus-service/src/connection/router.rs
+index a584a8b..73177eb 100644
+--- a/crates/xodus-service/src/connection/router.rs
++++ b/crates/xodus-service/src/connection/router.rs
+@@ -14,12 +14,14 @@ pub async fn route(
+     tokens: Arc<TokenManager>,
+     store_tokens: Arc<TokenManager>,
+     entitlement: Option<Arc<crate::entitlement::Entitlement>>,
++    title: Option<crate::title::TitleIdentity>,
+ ) {
+     let cred = socket.peer_cred().ok().and_then(|cred| cred.pid());
+     tracing::debug!("Connection from pid {cred:?}");
+ 
+     let mut context = SimpleContext::with_roles(device_token, store_tokens, tokens);
+     context.entitlement = entitlement;
++    context.title = title;
+     route_context(socket, token, context).await;
+ }
+ 
+diff --git a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/src/connection/xml.rs
+index 97423a1..9fe5c82 100644
+--- a/crates/xodus-service/src/connection/xml.rs
++++ b/crates/xodus-service/src/connection/xml.rs
+@@ -367,12 +367,88 @@ fn sign_for_with(
+     )
+ }
+ 
++/// Who an XSTS request is for: the title, over the socket, or the service's
++/// own licence path, which has already held its request to the bound title.
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub(super) enum Caller {
++    Title,
++    Licensing,
++}
++
++/// Whether the launcher bound this service to one title.
++fn bound(context: &SimpleContext) -> bool {
++    context.entitlement.is_some() || context.title.is_some()
++}
++
++/// Keep the licensing audience to the licence path in a bound service.
++///
++/// The licence path holds a request to the bound product and its add-ons, but
++/// a title asking for the licensing audience itself could sign a licence
++/// request of its own choosing: the signature covers the method, path and
++/// body, not the host, so any URL resolving to that audience will do. Where
++/// that token would be the Store account's -- one account in both roles -- it
++/// is refused. A Player who is another account gets their own licensing
++/// authorization, as on any other machine.
++fn licensing_audience_gate(
++    context: &SimpleContext,
++    relying_party: &str,
++    endpoints: &EndpointConfig,
++) -> Result<(), String> {
++    // The scheme is not part of who the token is for: `http://` and
++    // `https://` spellings of one host are the same audience here.
++    let audience = |rp: &str| {
++        let rp = rp.trim().to_ascii_lowercase();
++        let rp = rp
++            .strip_prefix("https://")
++            .or_else(|| rp.strip_prefix("http://"))
++            .unwrap_or(&rp);
++        rp.trim_end_matches('/').to_string()
++    };
++    if !bound(context)
++        || audience(relying_party) != audience(&endpoints.relying_party(super::license::URL))
++        || !context.player_is_store_account()
++    {
++        return Ok(());
++    }
++    Err(format!(
++        "refused an XSTS request for the licensing audience {relying_party:?}; the Player is the Store account here, and licence tokens come only from licence requests for the bound title"
++    ))
++}
++
+ pub(super) async fn xsts_token(
+     context: &mut SimpleContext,
+     req: XSTSTokenRequest,
++) -> Result<XSTSTokenResponse, Box<dyn std::error::Error + Send + Sync>> {
++    xsts_token_for(context, req, Caller::Title).await
++}
++
++pub(super) async fn xsts_token_for(
++    context: &mut SimpleContext,
++    req: XSTSTokenRequest,
++    caller: Caller,
+ ) -> Result<XSTSTokenResponse, Box<dyn std::error::Error + Send + Sync>> {
+     tracing::debug!("XSTS token request for {}", req.url);
+ 
++    // A service bound to one title mints tokens claiming that title only. The
++    // claim is what services that scope by title go by, and the request's own
++    // TitleId is whatever the title chose to put there.
++    if let Some(bound) = &context.title
++        && let Err(refusal) = bound.admits(&req)
++    {
++        tracing::warn!("{refusal}");
++        return Err(refusal.into());
++    }
++    // Bound to a product alone, without a title identity: the audience still
++    // comes from the endpoint list, never from the request.
++    if caller == Caller::Title && bound(context) && !req.relying_party.is_empty() {
++        let refusal = format!(
++            "refused an XSTS request naming its own relying party {:?}; a bound service resolves it from the endpoint list",
++            req.relying_party
++        );
++        tracing::warn!("{refusal}");
++        return Err(refusal.into());
++    }
++
+     // Read the persisted credential before any cache lookup: a logout
+     // invalidates access and a different login must never reuse an old identity.
+     let Token::Legacy(current_user) = context.tokens().get_user_sts_token()? else {
+@@ -421,6 +497,12 @@ pub(super) async fn xsts_token(
+     } else {
+         req.relying_party.clone()
+     };
++    if caller == Caller::Title
++        && let Err(refusal) = licensing_audience_gate(context, &relying_party, &endpoints)
++    {
++        tracing::warn!("{refusal}");
++        return Err(refusal.into());
++    }
+     let cache_key = token_cache_key(&session, title.as_ref(), &relying_party, &issuer);
+     let now = chrono::Utc::now().timestamp();
+     if let Some(hit) = XSTS_CACHE
+@@ -567,6 +649,18 @@ pub async fn parse_message(
+             let string_buf = std::str::from_utf8(&buffer)?;
+             tracing::debug!("String buffer: {string_buf:?}");
+             let req = quick_xml::de::from_str::<MSATokenRequest>(string_buf)?;
++            // An MSA ticket is enough to run Xbox sign-in from scratch and mint
++            // XSTS tokens for any title and audience, past every check above;
++            // even one for the bound title's own client ID would be. The
++            // runtime never asks for one, so a bound service hands out none.
++            if bound(context) {
++                let refusal = format!(
++                    "refused an MSA token request for client {:?}; a title-bound service issues no Microsoft account tickets",
++                    req.client_id
++                );
++                tracing::warn!("{refusal}");
++                return Err(refusal.into());
++            }
+             let Token::Legacy(token) = context.tokens().get_user_sts_token()? else {
+                 return Ok(vec![]);
+             };
+diff --git a/crates/xodus-service/src/connection/xml_tests.rs b/crates/xodus-service/src/connection/xml_tests.rs
+index dc14805..2d238a6 100644
+--- a/crates/xodus-service/src/connection/xml_tests.rs
++++ b/crates/xodus-service/src/connection/xml_tests.rs
+@@ -380,3 +380,260 @@ async fn expired_identity_is_replaced_under_the_same_key() {
+         2
+     );
+ }
++
++#[tokio::test]
++async fn a_bound_service_refuses_xsts_for_another_title_and_an_unbound_one_does_not() {
++    let xml = |title: &str, client: &str| {
++        format!(
++            "<XSTSTokenRequest><Url>https://title.example.test/</Url><RelyingParty></RelyingParty><Method>GET</Method><TitleId>{title}</TitleId><TitleClientId>{client}</TitleClientId><BodyBase64></BodyBase64></XSTSTokenRequest>"
++        )
++        .into_bytes()
++    };
++    let refusal = |result: Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>| {
++        result.unwrap_err().to_string()
++    };
++    // The fixture accounts hold no legacy STS credential, so a request that
++    // passes the title check stops at the credential read, before any network.
++    const PAST_THE_GATE: &str = "no signed-in credentials";
++    let mut unbound = crate::simple_context::tests::context("owner-xsts", "player-xsts");
++    for (title, client) in [
++        ("1298034544", "another-client"),
++        ("1805509784", ""),
++        ("", ""),
++    ] {
++        assert_eq!(
++            refusal(
++                parse_message(
++                    &mut unbound,
++                    XodusMessageType::XstsTokenRequest,
++                    xml(title, client)
++                )
++                .await
++            ),
++            PAST_THE_GATE
++        );
++    }
++
++    let mut bound = crate::simple_context::tests::context("owner-xsts", "player-xsts");
++    bound.title = Some(crate::title::TitleIdentity::fixture(
++        1805509784,
++        "own-client",
++    ));
++    // Its own claim, or none: a token with no title claim carries the user
++    // and device only, and cannot pass for another title.
++    for (title, client) in [
++        ("1805509784", "OWN-CLIENT"),
++        ("", ""),
++        ("0", "another-client"),
++    ] {
++        assert_eq!(
++            refusal(
++                parse_message(
++                    &mut bound,
++                    XodusMessageType::XstsTokenRequest,
++                    xml(title, client)
++                )
++                .await
++            ),
++            PAST_THE_GATE
++        );
++    }
++    for (title, client) in [
++        ("1298034544", "own-client"),
++        ("1805509784", "another-client"),
++        ("1805509784", ""),
++    ] {
++        let message = refusal(
++            parse_message(
++                &mut bound,
++                XodusMessageType::XstsTokenRequest,
++                xml(title, client),
++            )
++            .await,
++        );
++        assert!(
++            message.starts_with("refused an XSTS request for title"),
++            "{message}"
++        );
++    }
++    let mut req = request("https://title.example.test/", "GET", b"");
++    req.title_id = "1805509784".into();
++    req.title_client_id = "own-client".into();
++    req.relying_party = "http://xboxlive.com".into();
++    let message = xsts_token(&mut bound, req).await.err().unwrap().to_string();
++    assert!(message.contains("relying party"), "{message}");
++}
++
++#[tokio::test]
++async fn a_bound_service_answers_the_runtimes_sign_in_lookup() {
++    // xuser.c's resolve_live_identity: the canonical Xbox Live audience and
++    // nothing else, to learn the XUID and gamertag. Refusing it would leave
++    // the title with a placeholder identity.
++    let wire = b"<XSTSTokenRequest><Url>https://xboxlive.com</Url><RelyingParty></RelyingParty><Method>GET</Method><TitleId></TitleId><TitleClientId></TitleClientId><BodyBase64></BodyBase64></XSTSTokenRequest>";
++    let mut bound = crate::simple_context::tests::context("owner-lookup", "player-lookup");
++    bound.entitlement = Some(crate::entitlement::Entitlement::fixture("9P5786PJB9RP"));
++    bound.title = Some(crate::title::TitleIdentity::fixture(
++        1805509784,
++        "own-client",
++    ));
++    let message = parse_message(
++        &mut bound,
++        XodusMessageType::XstsTokenRequest,
++        wire.to_vec(),
++    )
++    .await
++    .unwrap_err()
++    .to_string();
++    // Past every title check; the fixture holds no credential to go further.
++    assert_eq!(message, "no signed-in credentials");
++}
++
++/// The licensing hosts as the default endpoint list maps them: the licence
++/// service shares its audience with collections and inventory.
++fn licensing_endpoints() -> EndpointConfig {
++    EndpointConfig {
++        default: serde_json::from_value(serde_json::json!({
++            "EndPoints": [
++                {"Protocol": "https", "Host": "licensing.mp.microsoft.com", "HostType": "fqdn",
++                 "RelyingParty": "http://licensing.xboxlive.com", "SignaturePolicyIndex": 0},
++                {"Protocol": "https", "Host": "collections.mp.microsoft.com", "HostType": "fqdn",
++                 "RelyingParty": "http://licensing.xboxlive.com", "SignaturePolicyIndex": 0},
++                {"Protocol": "https", "Host": "*.mp.microsoft.com", "HostType": "wildcard",
++                 "RelyingParty": "http://mp.microsoft.com/", "SignaturePolicyIndex": 0},
++                {"Protocol": "https", "Host": "*.xboxlive.com", "HostType": "wildcard",
++                 "RelyingParty": "http://xboxlive.com", "SignaturePolicyIndex": 0}
++            ],
++            "SignaturePolicies": [{
++                "Version": 1, "MaxBodyBytes": 8192,
++                "SupportedAlgorithms": ["ES256"], "SupportedSignatureTypes": ["XBL"]
++            }]
++        }))
++        .unwrap(),
++        title: None,
++    }
++}
++
++#[test]
++fn a_bound_title_cannot_take_the_store_accounts_licensing_audience() {
++    let endpoints = licensing_endpoints();
++    let gate = |context: &SimpleContext, url: &str| {
++        licensing_audience_gate(context, &endpoints.relying_party(url), &endpoints)
++    };
++    let licence = super::super::license::URL;
++    // The signature does not cover the host, so a licence path signed for
++    // another host of the same audience would do just as well.
++    let elsewhere = "https://collections.mp.microsoft.com/v8.0/licenseToken";
++
++    let mut shared = crate::simple_context::tests::context("same-account", "same-account");
++    assert!(
++        gate(&shared, licence).is_ok(),
++        "an unbound service is unchanged"
++    );
++    shared.entitlement = Some(crate::entitlement::Entitlement::fixture("9P5786PJB9RP"));
++    for url in [licence, elsewhere] {
++        let message = gate(&shared, url).unwrap_err();
++        assert!(
++            message.starts_with("refused an XSTS request for the licensing audience"),
++            "{message}"
++        );
++    }
++    // A self-chosen spelling of the same audience is the same audience.
++    assert!(
++        licensing_audience_gate(&shared, "HTTP://licensing.xboxlive.com/", &endpoints).is_err()
++    );
++    assert!(
++        licensing_audience_gate(&shared, "https://licensing.xboxlive.com", &endpoints).is_err(),
++        "a scheme swap names the same audience"
++    );
++    shared.entitlement = None;
++    shared.title = Some(crate::title::TitleIdentity::fixture(
++        1805509784,
++        "own-client",
++    ));
++    assert!(gate(&shared, licence).is_err());
++    // Other audiences, the Xbox Live one included, are the title's to ask for.
++    for url in [
++        "https://purchase.mp.microsoft.com/v7.0/users/me/orders",
++        "https://xboxlive.com",
++        "https://userpresence.xboxlive.com/users/me",
++    ] {
++        assert!(gate(&shared, url).is_ok(), "{url}");
++    }
++
++    // A Player who is another account only ever gets their own.
++    let mut split = crate::simple_context::tests::context("owner-account", "player-account");
++    split.entitlement = Some(crate::entitlement::Entitlement::fixture("9P5786PJB9RP"));
++    split.title = Some(crate::title::TitleIdentity::fixture(
++        1805509784,
++        "own-client",
++    ));
++    assert!(gate(&split, licence).is_ok());
++}
++
++#[tokio::test]
++async fn a_bound_service_issues_no_msa_tickets_and_an_unbound_one_does() {
++    for client in ["own-client", "another-client", ""] {
++        let wire = format!(
++            "<MSATokenRequest><ClientId>{client}</ClientId><AllowUi>false</AllowUi><MSAFullTrust>true</MSAFullTrust></MSATokenRequest>"
++        );
++        // The fixture's STS credential is not a legacy one, so an admitted
++        // request ends with an empty answer before any network.
++        let mut unbound = crate::simple_context::tests::context("owner-msa", "player-msa");
++        assert_eq!(
++            parse_message(
++                &mut unbound,
++                XodusMessageType::MsaTokenRequest,
++                wire.clone().into_bytes()
++            )
++            .await
++            .unwrap(),
++            Vec::<u8>::new()
++        );
++        let mut titled = crate::simple_context::tests::context("owner-msa", "player-msa");
++        titled.title = Some(crate::title::TitleIdentity::fixture(
++            1805509784,
++            "own-client",
++        ));
++        let mut product = crate::simple_context::tests::context("owner-msa", "player-msa");
++        product.entitlement = Some(crate::entitlement::Entitlement::fixture("9P5786PJB9RP"));
++        for bound in [&mut titled, &mut product] {
++            let message = parse_message(
++                bound,
++                XodusMessageType::MsaTokenRequest,
++                wire.clone().into_bytes(),
++            )
++            .await
++            .unwrap_err()
++            .to_string();
++            assert!(
++                message.starts_with("refused an MSA token request"),
++                "{message}"
++            );
++        }
++    }
++}
++
++#[tokio::test]
++async fn a_product_bound_service_refuses_a_chosen_relying_party() {
++    let mut product = crate::simple_context::tests::context("owner-xsts", "player-xsts");
++    product.entitlement = Some(crate::entitlement::Entitlement::fixture("9P5786PJB9RP"));
++    let mut req = request("https://title.example.test/", "GET", b"");
++    req.relying_party = "http://licensing.xboxlive.com".into();
++    let message = xsts_token(&mut product, req)
++        .await
++        .err()
++        .unwrap()
++        .to_string();
++    assert!(
++        message.starts_with("refused an XSTS request naming its own relying party"),
++        "{message}"
++    );
++    // The same request without a chosen audience gets past the gate.
++    let req = request("https://title.example.test/", "GET", b"");
++    let message = xsts_token(&mut product, req)
++        .await
++        .err()
++        .unwrap()
++        .to_string();
++    assert_eq!(message, "no signed-in credentials");
++}
+diff --git a/crates/xodus-service/src/entitlement.rs b/crates/xodus-service/src/entitlement.rs
+index 9487753..2598a8d 100644
+--- a/crates/xodus-service/src/entitlement.rs
++++ b/crates/xodus-service/src/entitlement.rs
+@@ -1,4 +1,6 @@
+ //! A title-bound Store licence. No running-title or player ownership inference.
++use serde_json::Value;
++use std::collections::HashMap;
+ use std::sync::Arc;
+ use std::time::{Duration, Instant};
+ use xodus::tokens::TokenManager;
+@@ -7,6 +9,43 @@ pub struct Entitlement {
+     product: String,
+     content: String,
+     cached: tokio::sync::Mutex<Option<Check>>,
++    /// Products the Store catalog was asked about, and whether it ties each
++    /// one to the bound product. Only answers the catalog gave are kept.
++    family: tokio::sync::Mutex<HashMap<String, bool>>,
++}
++
++/// The relationships under which a product's own catalog entry names the game
++/// it belongs to: an add-on or consumable to its game (`addOnParent`) and an
++/// edition to the game it extends (`Parent`, `Extends`). Only the requested
++/// product's entry counts: a game naming a bundle that contains it, or the
++/// storefront that sells it, is not a reason to license that bundle or
++/// storefront under this title, since either can grant other titles. Nor is
++/// `SellableBy` alone, which names where a product is sold, not what it
++/// belongs to; real add-ons carry it beside `addOnParent`. Dungeons II's own
++/// licence request asks for exactly this shape: its Soul and Hero packs, each
++/// naming the game as `addOnParent` (and `SellableBy`).
++const FAMILY: [&str; 3] = ["addOnParent", "Parent", "Extends"];
++
++/// Whether a catalog entry names `other` under one of the family relationships.
++fn related(entry: &Value, other: &str) -> bool {
++    entry["MarketProperties"]
++        .as_array()
++        .into_iter()
++        .flatten()
++        .filter_map(|market| market["RelatedProducts"].as_array())
++        .flatten()
++        .any(|relation| {
++            relation["RelatedProductId"]
++                .as_str()
++                .is_some_and(|id| id.eq_ignore_ascii_case(other))
++                && relation["RelationshipType"]
++                    .as_str()
++                    .is_some_and(|kind| FAMILY.iter().any(|f| f.eq_ignore_ascii_case(kind)))
++        })
++}
++
++fn entry_id(entry: &Value) -> &str {
++    entry["ProductId"].as_str().unwrap_or("")
+ }
+ 
+ /// The last answer, and when the licence was last actually granted.
+@@ -40,6 +79,7 @@ impl Entitlement {
+                     product,
+                     content,
+                     cached: Default::default(),
++                    family: Default::default(),
+                 })))
+             }
+             _ => Err("invalid Store title binding".into()),
+@@ -52,6 +92,7 @@ impl Entitlement {
+             product: product.into(),
+             content: "00000000-0000-0000-0000-000000000001".into(),
+             cached: Default::default(),
++            family: Default::default(),
+         })
+     }
+ 
+@@ -60,6 +101,76 @@ impl Entitlement {
+         &self.product
+     }
+ 
++    /// Refuse licence tokens for products that are not this title's own.
++    ///
++    /// The bound product always passes. Any other ID must be a Store product
++    /// ID (twelve characters, or sixteen with a SKU) whose own catalog entry
++    /// names the bound product under one of the family relationships. That
++    /// covers a game's add-ons, consumables, DLC and editions, and nothing the
++    /// game merely lists, such as bundles. The
++    /// catalog is the only source for those relationships; when it cannot be
++    /// reached, or does not list a product, the request is refused rather
++    /// than signed on the title's word. The licensing request needs the
++    /// network as well, so an unreachable catalog costs nothing that would
++    /// have worked.
++    pub async fn admit_products<L, Fut>(&self, wanted: &[String], lookup: L) -> Result<(), String>
++    where
++        L: FnOnce(Vec<String>) -> Fut,
++        Fut: std::future::Future<Output = Result<Vec<Value>, &'static str>>,
++    {
++        let mut products = Vec::new();
++        for id in wanted {
++            if !matches!(id.len(), 12 | 16) || !id.bytes().all(|c| c.is_ascii_alphanumeric()) {
++                return Err(format!(
++                    "refused a licence token for {id:?}: not a Store product ID"
++                ));
++            }
++            let product = id[..12].to_ascii_uppercase();
++            if !product.eq_ignore_ascii_case(&self.product) && !products.contains(&product) {
++                products.push(product);
++            }
++        }
++        if products.is_empty() {
++            return Ok(());
++        }
++        let mut family = self.family.lock().await;
++        let unknown: Vec<_> = products
++            .iter()
++            .filter(|id| !family.contains_key(*id))
++            .cloned()
++            .collect();
++        if !unknown.is_empty() {
++            let mut ask = vec![self.product.clone()];
++            ask.extend(unknown.iter().cloned());
++            let entries = lookup(ask).await.map_err(|cause| {
++                format!(
++                    "refused a licence token for {unknown:?}: the Store catalog could not confirm them as part of {} ({cause})",
++                    self.product
++                )
++            })?;
++            for id in &unknown {
++                if let Some(entry) = entries
++                    .iter()
++                    .find(|entry| entry_id(entry).eq_ignore_ascii_case(id))
++                {
++                    family.insert(id.clone(), related(entry, &self.product));
++                }
++            }
++        }
++        let refused: Vec<_> = products
++            .iter()
++            .filter(|id| family.get(*id) != Some(&true))
++            .collect();
++        if refused.is_empty() {
++            Ok(())
++        } else {
++            Err(format!(
++                "refused a licence token for {refused:?}: the Store catalog does not list them as add-ons or editions of {}",
++                self.product
++            ))
++        }
++    }
++
+     pub async fn valid(
+         &self,
+         product: &str,
+@@ -142,6 +253,7 @@ mod tests {
+                 valid: true,
+                 granted: Some(Instant::now()),
+             })),
++            family: Default::default(),
+         };
+         assert!(binding.valid("9TESTROLE0ID", &context.client, &owner).await);
+         assert!(!binding.valid("9OTHERROLE00", &context.client, &owner).await);
+@@ -168,6 +280,7 @@ mod tests {
+                     valid: true,
+                     granted: Some(now.checked_sub(granted_ago)?),
+                 })),
++                family: Default::default(),
+             })
+         };
+         if let Some(recent) = binding(Duration::from_secs(120)) {
+diff --git a/crates/xodus-service/src/main.rs b/crates/xodus-service/src/main.rs
+index 312bf54..6d76caf 100644
+--- a/crates/xodus-service/src/main.rs
++++ b/crates/xodus-service/src/main.rs
+@@ -12,6 +12,7 @@ use xodus::tokens::TokenManager;
+ mod connection;
+ mod entitlement;
+ mod simple_context;
++mod title;
+ mod utils;
+ 
+ const XML_MAGIC: u32 = 0x58445358;
+@@ -21,7 +22,7 @@ const PROTO_MAGIC: u32 = 0x58445350;
+ async fn main() {
+     if std::env::args().any(|arg| arg == "--capabilities") {
+         println!(
+-            "{{\"schema\":1,\"protocol\":\"FERESTRE_ACCOUNT_ROLES_SERVICE_V1\",\"capabilities\":[\"store-player-accounts\"]}}"
++            "{{\"schema\":1,\"protocol\":\"FERESTRE_ACCOUNT_ROLES_SERVICE_V1\",\"capabilities\":[\"store-player-accounts\",\"title-scoped-tokens\"]}}"
+         );
+         return;
+     }
+@@ -71,6 +72,13 @@ async fn main() {
+     let tokens = Arc::new(select("XODUS_PLAYER_PROFILE"));
+     let store_tokens = Arc::new(select("XODUS_STORE_PROFILE"));
+     let entitlement = entitlement::Entitlement::from_env().expect("Invalid Store title binding");
++    let title = title::TitleIdentity::from_env().expect("Invalid title identity binding");
++    if entitlement.is_some() && title.is_none() {
++        // An older launcher: the product is bound, the title identity is not.
++        tracing::warn!(
++            "bound to a Store product without XODUS_TITLE_ID; title identities on requests are not pinned"
++        );
++    }
+     xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await;
+     let xodus::models::secrets::Token::Legacy(device_token) =
+         tokens.get_device_sts_token().unwrap()
+@@ -105,6 +113,7 @@ async fn main() {
+             let tokens = tokens.clone();
+             let store_tokens = store_tokens.clone();
+             let entitlement = entitlement.clone();
++            let title = title.clone();
+             tokio::spawn(async move {
+                 connection::router::route(
+                     accept.0,
+@@ -113,6 +122,7 @@ async fn main() {
+                     tokens,
+                     store_tokens,
+                     entitlement,
++                    title,
+                 )
+                 .await
+             });
+diff --git a/crates/xodus-service/src/simple_context.rs b/crates/xodus-service/src/simple_context.rs
+index 5948cfc..fb2d176 100644
+--- a/crates/xodus-service/src/simple_context.rs
++++ b/crates/xodus-service/src/simple_context.rs
+@@ -7,6 +7,8 @@ use xodus::tokens::TokenManager;
+ 
+ pub struct SimpleContext {
+     pub entitlement: Option<Arc<crate::entitlement::Entitlement>>,
++    /// The title this service was started for, when the launcher said.
++    pub title: Option<crate::title::TitleIdentity>,
+     pub client: reqwest::Client,
+     pub device_token: Option<LegacyToken>,
+     tokens: Arc<TokenManager>,
+@@ -48,6 +50,7 @@ pub(crate) mod tests {
+             .unwrap();
+         SimpleContext {
+             entitlement: None,
++            title: None,
+             client: reqwest::Client::new(),
+             device_token: None,
+             tokens: Arc::new(gamer.pin_user().unwrap()),
+@@ -100,6 +103,7 @@ impl SimpleContext {
+         Self {
+             client,
+             entitlement: None,
++            title: None,
+             device_token: Some(device_token),
+             tokens,
+             store_tokens,
+@@ -113,6 +117,7 @@ impl SimpleContext {
+     pub fn store_context(&self) -> Self {
+         Self {
+             entitlement: self.entitlement.clone(),
++            title: self.title.clone(),
+             client: self.client.clone(),
+             device_token: self.device_token.clone(),
+             tokens: self.store_tokens.clone(),
+@@ -120,6 +125,18 @@ impl SimpleContext {
+         }
+     }
+ 
++    /// Whether the Player's tokens are the Store account's: one account in
++    /// both roles, or a Store account that cannot be told apart from it.
++    pub fn player_is_store_account(&self) -> bool {
++        if Arc::ptr_eq(&self.tokens, &self.store_tokens) {
++            return true;
++        }
++        match (self.store_tokens.get_user(), self.tokens.get_user()) {
++            (Ok(store), Ok(player)) => store.puid.is_empty() || store.puid == player.puid,
++            _ => true,
++        }
++    }
++
+     pub fn account_roles(&self) -> [u32; 4] {
+         let store = self
+             .store_tokens
+diff --git a/crates/xodus-service/src/title.rs b/crates/xodus-service/src/title.rs
+new file mode 100644
+index 0000000..3b4a864
+--- /dev/null
++++ b/crates/xodus-service/src/title.rs
+@@ -0,0 +1,192 @@
++//! The identity of the title a service was started for.
++//!
++//! The launcher reads it out of the game's own `MicrosoftGame.config` before
++//! the game runs, the same way the runtime does, and hands it over in
++//! `XODUS_TITLE_ID` (decimal, as the runtime sends it) and
++//! `XODUS_TITLE_CLIENT_ID` (`MSAAppId`). An empty `XODUS_TITLE_ID` means the
++//! config names no title. A title can put any identity on a request it sends,
++//! including an inline config of its own, so a service bound to a title signs
++//! with this one rather than with whatever the request says.
++use xodus::models::xgameruntime::xuser::XSTSTokenRequest;
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct TitleIdentity {
++    id: Option<u32>,
++    client_id: String,
++}
++
++impl TitleIdentity {
++    pub fn from_env() -> Result<Option<Self>, String> {
++        Self::parse(
++            std::env::var("XODUS_TITLE_ID").ok().as_deref(),
++            std::env::var("XODUS_TITLE_CLIENT_ID").ok().as_deref(),
++        )
++    }
++
++    fn parse(id: Option<&str>, client_id: Option<&str>) -> Result<Option<Self>, String> {
++        let (id, client_id) = match (id, client_id) {
++            (None, None) => return Ok(None),
++            (Some(id), client_id) => (id.trim(), client_id.unwrap_or("").trim()),
++            (None, Some(_)) => return Err("a title client ID without a title ID".into()),
++        };
++        let id = match id {
++            "" => None,
++            id if id.len() <= 10 && id.bytes().all(|c| c.is_ascii_digit()) => Some(
++                id.parse::<u32>()
++                    .ok()
++                    .filter(|id| *id > 0)
++                    .ok_or("invalid title ID")?,
++            ),
++            _ => return Err("invalid title ID".into()),
++        };
++        if client_id.len() > 64
++            || !client_id
++                .bytes()
++                .all(|c| c.is_ascii_alphanumeric() || b"-{}".contains(&c))
++            || (id.is_none() && !client_id.is_empty())
++        {
++            return Err("invalid title client ID".into());
++        }
++        Ok(Some(Self {
++            id,
++            client_id: client_id.into(),
++        }))
++    }
++
++    #[cfg(test)]
++    pub(crate) fn fixture(id: u32, client_id: &str) -> Self {
++        Self {
++            id: Some(id),
++            client_id: client_id.into(),
++        }
++    }
++
++    /// The `TitleId` field a request on behalf of this title carries.
++    pub fn title_id(&self) -> String {
++        self.id.map(|id| id.to_string()).unwrap_or_default()
++    }
++
++    /// The `TitleClientId` field a request on behalf of this title carries.
++    pub fn client_id(&self) -> &str {
++        &self.client_id
++    }
++
++    /// Whether a title's XSTS request is one this title may make: its own
++    /// title claim, or no title claim at all. A request naming no title gets a
++    /// token carrying the user and device only, which cannot pass for another
++    /// title; the runtime asks that way to learn who is signed in. The audience
++    /// is left to the title-management endpoint list, as the runtime does; a
++    /// request choosing its own relying party is not the runtime's.
++    pub fn admits(&self, req: &XSTSTokenRequest) -> Result<(), String> {
++        let own = match (req.title(), self.id) {
++            (None, _) => true,
++            (Some((id, client)), Some(bound)) => {
++                id == bound as i64 && client.trim().eq_ignore_ascii_case(&self.client_id)
++            }
++            (Some(_), None) => false,
++        };
++        if !own {
++            return Err(format!(
++                "refused an XSTS request for title {:?} (client {:?}); this service is bound to title {:?} (client {:?})",
++                req.title_id,
++                req.title_client_id,
++                self.title_id(),
++                self.client_id
++            ));
++        }
++        if !req.relying_party.is_empty() {
++            return Err(format!(
++                "refused an XSTS request naming its own relying party {:?}; a title-bound service resolves it from the endpoint list",
++                req.relying_party
++            ));
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn request(title: &str, client: &str, relying_party: &str) -> XSTSTokenRequest {
++        XSTSTokenRequest {
++            url: "https://title.example.test/".into(),
++            relying_party: relying_party.into(),
++            method: "GET".into(),
++            body_base64: String::new(),
++            title_id: title.into(),
++            title_client_id: client.into(),
++        }
++    }
++
++    #[test]
++    fn environment_binding_is_all_or_nothing_and_strict() {
++        assert_eq!(TitleIdentity::parse(None, None), Ok(None));
++        assert_eq!(
++            TitleIdentity::parse(Some("1298034544"), Some("0000000048183522")),
++            Ok(Some(TitleIdentity::fixture(1298034544, "0000000048183522")))
++        );
++        assert_eq!(
++            TitleIdentity::parse(Some("1298034544"), None),
++            Ok(Some(TitleIdentity::fixture(1298034544, "")))
++        );
++        let none = TitleIdentity::parse(Some(""), Some("")).unwrap().unwrap();
++        assert_eq!(none.title_id(), "");
++        for (id, client) in [
++            (None, Some("client")),
++            (Some("0"), None),
++            (Some("4294967296"), None),
++            (Some("6B9DE498"), None),
++            (Some("-1"), None),
++            (Some(""), Some("client")),
++            (Some("1"), Some("a/b")),
++        ] {
++            assert!(
++                TitleIdentity::parse(id, client).is_err(),
++                "{id:?} {client:?}"
++            );
++        }
++    }
++
++    #[test]
++    fn a_bound_title_gets_its_own_claim_and_nothing_else() {
++        let bound = TitleIdentity::fixture(1805509784, "00000000-0000-0000-0000-00004C26E6C9");
++        assert!(
++            bound
++                .admits(&request(
++                    "1805509784",
++                    "00000000-0000-0000-0000-00004c26e6c9",
++                    ""
++                ))
++                .is_ok()
++        );
++        // No title claim: the runtime's own sign-in lookup asks this way, and
++        // the token it gets carries the user and device only.
++        for (title, client) in [("", ""), ("0", ""), ("", "another-client")] {
++            assert!(bound.admits(&request(title, client, "")).is_ok());
++        }
++        for (title, client, relying_party) in [
++            ("1298034544", "00000000-0000-0000-0000-00004C26E6C9", ""),
++            ("1805509784", "00000000-0000-0000-0000-000000000000", ""),
++            ("1805509784", "", ""),
++            ("", "", "http://xboxlive.com"),
++            (
++                "1805509784",
++                "00000000-0000-0000-0000-00004C26E6C9",
++                "http://xboxlive.com",
++            ),
++        ] {
++            assert!(
++                bound
++                    .admits(&request(title, client, relying_party))
++                    .is_err()
++            );
++        }
++        let legacy = TitleIdentity::fixture(1298034544, "");
++        assert!(legacy.admits(&request("1298034544", "", "")).is_ok());
++        assert!(legacy.admits(&request("1298034544", "client", "")).is_err());
++        let none = TitleIdentity::parse(Some(""), None).unwrap().unwrap();
++        assert!(none.admits(&request("", "", "")).is_ok());
++        assert!(none.admits(&request("1298034544", "", "")).is_err());
++    }
++}

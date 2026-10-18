@@ -7,6 +7,10 @@ use std::process::Command;
 
 pub const CAPABILITY: &str = "xgameruntime.store-player-accounts";
 pub const CLIENT_CAPABILITY: &str = "store-player-accounts";
+/// A service that holds its tokens to the title it is bound to. An older one
+/// ignores `XODUS_TITLE_ID` and `XODUS_TITLE_CLIENT_ID` without a word, and
+/// would sign for whatever title a request names.
+pub const SERVICE_TITLE_SCOPE: &str = "title-scoped-tokens";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct Profile {
@@ -194,13 +198,26 @@ pub fn require_service(binary: &Path) -> Result<()> {
         .output()
         .context("Cannot check Xbox account service support")?;
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
-    if !output.status.success()
-        || value["schema"] != 1
-        || !value["capabilities"]
-            .as_array()
-            .is_some_and(|a| a.iter().any(|s| s == CLIENT_CAPABILITY))
-    {
+    if !output.status.success() {
         bail!("Update the Xodus service before launching with separate accounts");
+    }
+    service_capabilities(&value)
+}
+
+fn service_capabilities(value: &serde_json::Value) -> Result<()> {
+    let has = |name: &str| {
+        value["capabilities"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|s| s == name))
+    };
+    if value["schema"] != 1 || !has(CLIENT_CAPABILITY) {
+        bail!("Update the Xodus service before launching with separate accounts");
+    }
+    // A launch with account roles binds the service to its title. One that
+    // would quietly ignore the binding is refused rather than left to sign
+    // for any title the game names.
+    if !has(SERVICE_TITLE_SCOPE) {
+        bail!("Update the Xodus service before launching with separate accounts: this one cannot hold its tokens to the launched title");
     }
     Ok(())
 }
@@ -267,5 +284,24 @@ mod tests {
             .to_string()
             .contains("Player"));
         assert!(parse_profiles(br#"{"schema":0,"profiles":[]}"#).is_err());
+    }
+    #[test]
+    fn a_service_that_ignores_the_title_binding_is_refused() {
+        let probe = |capabilities: &[&str]| {
+            service_capabilities(&serde_json::json!({
+                "schema": 1,
+                "protocol": "FERESTRE_ACCOUNT_ROLES_SERVICE_V1",
+                "capabilities": capabilities,
+            }))
+        };
+        assert!(probe(&[CLIENT_CAPABILITY, SERVICE_TITLE_SCOPE]).is_ok());
+        let older = probe(&[CLIENT_CAPABILITY]).unwrap_err().to_string();
+        assert!(older.contains("launched title"), "{older}");
+        assert!(probe(&[SERVICE_TITLE_SCOPE]).is_err());
+        assert!(service_capabilities(&serde_json::json!({
+            "schema": 2,
+            "capabilities": [CLIENT_CAPABILITY, SERVICE_TITLE_SCOPE],
+        }))
+        .is_err());
     }
 }
