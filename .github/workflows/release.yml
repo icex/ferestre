@@ -112,7 +112,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
           toolchain: stable
+      # Restore only. A cache saved by a tag is visible to that tag alone, so
+      # it would only take space from the caches main saves for every push.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: false
 
       # A tag is the version, without its leading v. Otherwise the workspace
       # says what it is, and a manual run may override that.
