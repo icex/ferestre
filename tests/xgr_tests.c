@@ -228,6 +228,9 @@ static void test_xuser(void)
                 hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Async( u6, user, 0, L"GET",
                         L"https://fixture.invalid/", 0, NULL, 0, NULL, &token_async );
                 CHECK( hr == S_OK, "UTF-16 token request starts" );
+                /* The request runs on the queue, not inside the *Async call. */
+                hr = IXThreadingImpl_XAsyncGetStatus( threading, &token_async, TRUE );
+                CHECK( hr == S_OK, "UTF-16 token request completes (0x%08lx)", hr );
                 hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16ResultSize( u6, &token_async, &size );
                 CHECK( hr == S_OK && size == expected, "UTF-16 result size includes wide strings (%Iu)", size );
                 memset(buffer, 0x5a, 512);
@@ -246,11 +249,19 @@ static void test_xuser(void)
                         !memcmp(wide->signature, L"fixture-signature", sizeof(L"fixture-signature")),
                         "UTF-16 signature is a terminated wide string with a byte count" );
                 CHECK( buffer[expected] == 0x5a, "UTF-16 result leaves the tail untouched" );
-                /* Retrieving the Unicode form must not corrupt the cached UTF-8 payload. */
-                hr = IXUserImpl6_XUserGetTokenAndSignatureResult( u6, &token_async, 512,
+                /* A result is handed over once: the runtime releases the token
+                 * once the title has its copy, rather than leaking it. */
+                hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Result( u6, &token_async, 512,
+                        buffer, &wide, &used );
+                CHECK( hr != S_OK, "a token result is not handed over twice" );
+                memset( &token_async, 0, sizeof(token_async) );
+                hr = IXUserImpl6_XUserGetTokenAndSignatureAsync( u6, user, 0, "GET",
+                        "https://fixture.invalid/", 0, NULL, 0, NULL, &token_async );
+                if (hr == S_OK) hr = IXThreadingImpl_XAsyncGetStatus( threading, &token_async, TRUE );
+                if (hr == S_OK) hr = IXUserImpl6_XUserGetTokenAndSignatureResult( u6, &token_async, 512,
                         buffer, &narrow, &used );
                 CHECK( hr == S_OK && narrow && !strcmp(narrow->token, "fixture-auth") &&
-                        !strcmp(narrow->signature, "fixture-signature"), "UTF-8 payload remains intact" );
+                        !strcmp(narrow->signature, "fixture-signature"), "UTF-8 token and signature are intact" );
                 {
                     BYTE *large = malloc(100000);
                     unsigned int n;
@@ -259,6 +270,7 @@ static void test_xuser(void)
                     hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Async(u6, user, 0, L"POST",
                             L"https://fixture.invalid/large", 0, NULL, 100000, large, &token_async);
                     CHECK(hr == S_OK, "100 KB signing request crosses the extended IPC frame intact");
+                    if (hr == S_OK) hr = IXThreadingImpl_XAsyncGetStatus(threading, &token_async, TRUE);
                     hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Result(u6, &token_async, 512, buffer, &wide, &used);
                     CHECK(hr == S_OK && wide && !wcscmp(wide->signature, L"fixture-signature"),
                           "extended signing request returns the service signature");
@@ -590,14 +602,14 @@ static void test_xgameui(void)
 
     printf( "# XGameUI\n" );
 
-    /* a message dialog dismisses to its default button, without a real UI */
+    /* a message dialog is dismissed, without a real UI, to its cancel button */
     memset( &async, 0, sizeof(async) );
     hr = IXGameUiImpl4_XGameUiShowMessageDialogAsync( gameui, &async, "Title", "Body",
             "OK", NULL, NULL, XGameUiMessageDialogButton_Second, XGameUiMessageDialogButton_First );
     CHECK( SUCCEEDED( hr ), "ShowMessageDialogAsync succeeds (0x%08lx)", hr );
     hr = IXGameUiImpl4_XGameUiShowMessageDialogResult( gameui, &async, &button );
-    CHECK( SUCCEEDED( hr ) && button == XGameUiMessageDialogButton_Second,
-           "message dialog returns the default button (%d)", button );
+    CHECK( SUCCEEDED( hr ) && button == XGameUiMessageDialogButton_First,
+           "message dialog returns the cancel button (%d)", button );
 
     /* an error dialog just dismisses */
     memset( &async, 0, sizeof(async) );
@@ -1353,6 +1365,866 @@ static void test_manual_queues(void)
 }
 
 
+/* ---- Task queue termination, XAsync cancel and operation lifetimes ------- */
+
+static volatile LONG x1_seq, x1_cb_runs, x1_cb_canceled, x1_cb_seq, x1_cb_thread;
+static volatile LONG x1_term_runs, x1_term_seq, x1_term_thread, x1_finished, x1_finished_seen;
+static HANDLE x1_started, x1_release;
+
+static void x1_reset(void)
+{
+    InterlockedExchange( (LONG *)&x1_seq, 0 );
+    InterlockedExchange( (LONG *)&x1_cb_runs, 0 );
+    InterlockedExchange( (LONG *)&x1_cb_canceled, 0 );
+    InterlockedExchange( (LONG *)&x1_cb_seq, 0 );
+    InterlockedExchange( (LONG *)&x1_cb_thread, 0 );
+    InterlockedExchange( (LONG *)&x1_term_runs, 0 );
+    InterlockedExchange( (LONG *)&x1_term_seq, 0 );
+    InterlockedExchange( (LONG *)&x1_term_thread, 0 );
+    InterlockedExchange( (LONG *)&x1_finished, 0 );
+    InterlockedExchange( (LONG *)&x1_finished_seen, -1 );
+}
+
+static BOOL x1_wait_for( volatile LONG *value, LONG want, DWORD ms )
+{
+    DWORD start = GetTickCount();
+    while (InterlockedCompareExchange( (LONG *)value, 0, 0 ) != want)
+    {
+        if (GetTickCount() - start > ms) return FALSE;
+        Sleep( 5 );
+    }
+    return TRUE;
+}
+
+static void CALLBACK x1_record_cb( void *context, BOOLEAN canceled )
+{
+    InterlockedExchange( (LONG *)&x1_cb_canceled, canceled );
+    InterlockedExchange( (LONG *)&x1_cb_thread, GetCurrentThreadId() );
+    InterlockedExchange( (LONG *)&x1_cb_seq, InterlockedIncrement( (LONG *)&x1_seq ) );
+    InterlockedIncrement( (LONG *)&x1_cb_runs );
+}
+
+static void CALLBACK x1_terminated( void *context )
+{
+    InterlockedExchange( (LONG *)&x1_finished_seen, x1_finished );
+    InterlockedExchange( (LONG *)&x1_term_thread, GetCurrentThreadId() );
+    InterlockedExchange( (LONG *)&x1_term_seq, InterlockedIncrement( (LONG *)&x1_seq ) );
+    InterlockedIncrement( (LONG *)&x1_term_runs );
+}
+
+static void CALLBACK x1_slow_cb( void *context, BOOLEAN canceled )
+{
+    SetEvent( x1_started );
+    Sleep( 300 );
+    InterlockedExchange( (LONG *)&x1_finished, 1 );
+}
+
+static void CALLBACK x1_blocking_cb( void *context, BOOLEAN canceled )
+{
+    SetEvent( x1_started );
+    WaitForSingleObject( x1_release, 5000 );
+}
+
+static XTaskQueueHandle x1_self_queue;
+static volatile LONG x1_inner_terminate_hr, x1_done_seq;
+
+static void CALLBACK x1_self_terminate_cb( void *context, BOOLEAN canceled )
+{
+    HRESULT hr = IXThreadingImpl_XTaskQueueTerminate( threading, x1_self_queue, TRUE, NULL, x1_terminated );
+    InterlockedExchange( (LONG *)&x1_inner_terminate_hr, hr );
+    Sleep( 50 );
+    InterlockedExchange( (LONG *)&x1_done_seq, InterlockedIncrement( (LONG *)&x1_seq ) );
+}
+
+static void CALLBACK x1_slow_completion( XAsyncBlock *async )
+{
+    Sleep( 300 );
+    InterlockedExchange( (LONG *)&x1_finished, 1 );
+}
+
+static volatile LONG x1_dowork, x1_cancels, x1_cleanups, x1_completions, x1_completion_status;
+
+static HRESULT CALLBACK x1_pending_provider( XAsyncOp op, const XAsyncProviderData *data )
+{
+    if (op == XAsyncOp_DoWork) InterlockedIncrement( (LONG *)&x1_dowork );
+    if (op == XAsyncOp_Cancel) InterlockedIncrement( (LONG *)&x1_cancels );
+    if (op == XAsyncOp_Cleanup) InterlockedIncrement( (LONG *)&x1_cleanups );
+    return op == XAsyncOp_Begin || op == XAsyncOp_DoWork ? E_PENDING : S_OK;
+}
+
+static HRESULT CALLBACK x1_schedules_in_begin( XAsyncOp op, const XAsyncProviderData *data )
+{
+    if (op == XAsyncOp_Begin) return IXThreadingImpl_XAsyncSchedule( threading, data->async, 0 );
+    if (op == XAsyncOp_DoWork)
+    {
+        InterlockedIncrement( (LONG *)&x1_dowork );
+        IXThreadingImpl_XAsyncComplete( threading, data->async, S_OK, 0 );
+        return S_OK;
+    }
+    return S_OK;
+}
+
+static HRESULT CALLBACK x1_delayed_work_provider( XAsyncOp op, const XAsyncProviderData *data )
+{
+    if (op == XAsyncOp_Begin) return IXThreadingImpl_XAsyncSchedule( threading, data->async, 300 );
+    if (op == XAsyncOp_DoWork)
+    {
+        InterlockedIncrement( (LONG *)&x1_dowork );
+        IXThreadingImpl_XAsyncComplete( threading, data->async, S_OK, 0 );
+    }
+    if (op == XAsyncOp_Cleanup) InterlockedIncrement( (LONG *)&x1_cleanups );
+    return S_OK;
+}
+
+static HRESULT CALLBACK x1_completes_on_cancel( XAsyncOp op, const XAsyncProviderData *data )
+{
+    if (op == XAsyncOp_Cancel)
+    {
+        InterlockedIncrement( (LONG *)&x1_cancels );
+        IXThreadingImpl_XAsyncComplete( threading, data->async, E_ABORT, 0 );
+    }
+    if (op == XAsyncOp_Cleanup) InterlockedIncrement( (LONG *)&x1_cleanups );
+    return op == XAsyncOp_Begin ? E_PENDING : S_OK;
+}
+
+/* Schedules DoWork and then completes with a payload before it runs. */
+static HRESULT CALLBACK x1_completes_before_work( XAsyncOp op, const XAsyncProviderData *data )
+{
+    switch (op)
+    {
+    case XAsyncOp_Begin:
+        IXThreadingImpl_XAsyncSchedule( threading, data->async, 200 );
+        IXThreadingImpl_XAsyncComplete( threading, data->async, S_OK, sizeof(UINT32) );
+        return E_PENDING;
+    case XAsyncOp_DoWork:
+        InterlockedIncrement( (LONG *)&x1_dowork );
+        return E_PENDING;
+    case XAsyncOp_GetResult:
+        *(UINT32 *)data->buffer = 7;
+        return S_OK;
+    default:
+        return S_OK;
+    }
+}
+
+/* Schedules DoWork and then fails, which withdraws the operation at once. */
+static HRESULT CALLBACK x1_fails_after_scheduling( XAsyncOp op, const XAsyncProviderData *data )
+{
+    if (op == XAsyncOp_Begin)
+    {
+        IXThreadingImpl_XAsyncSchedule( threading, data->async, 200 );
+        return E_FAIL;
+    }
+    return S_OK;
+}
+
+static void CALLBACK x1_completion_record( XAsyncBlock *async )
+{
+    InterlockedExchange( (LONG *)&x1_completion_status, IXThreadingImpl_XAsyncGetStatus( threading, async, FALSE ) );
+    InterlockedIncrement( (LONG *)&x1_completions );
+}
+
+static volatile LONG x1_bad_callback;
+static void CALLBACK x1_wrong_callback( XAsyncBlock *async )
+{
+    InterlockedIncrement( (LONG *)&x1_bad_callback );
+}
+
+static HRESULT CALLBACK x1_slow_run( XAsyncBlock *async )
+{
+    Sleep( 300 );
+    InterlockedIncrement( (LONG *)&x1_dowork );
+    return S_OK;
+}
+
+/* Strict manual mode (XGR_STRICT_MANUAL_QUEUES=1, as Halo runs): work on a
+ * Manual port runs inside the title's own XTaskQueueDispatch. A callback a
+ * title thread is inside when another thread terminates the queue is still
+ * the queue's, and the terminated callback -- after which the title frees what
+ * that callback is using -- has to wait for it. */
+static XTaskQueueHandle x1_dispatch_queue;
+
+static DWORD WINAPI x1_dispatch_thread( void *arg )
+{
+    IXThreadingImpl_XTaskQueueDispatch( threading, x1_dispatch_queue, XTaskQueuePort_Work, 0 );
+    return 0;
+}
+
+static void CALLBACK x1_blocking_finish_cb( void *context, BOOLEAN canceled )
+{
+    SetEvent( x1_started );
+    WaitForSingleObject( x1_release, 5000 );
+    InterlockedExchange( (LONG *)&x1_finished, 1 );
+    InterlockedExchange( (LONG *)&x1_cb_seq, InterlockedIncrement( (LONG *)&x1_seq ) );
+}
+
+static DWORD WINAPI x1_terminate_and_wait_thread( void *arg )
+{
+    IXThreadingImpl_XTaskQueueTerminate( threading, arg, TRUE, NULL, x1_terminated );
+    InterlockedExchange( (LONG *)&x1_done_seq, InterlockedIncrement( (LONG *)&x1_seq ) );
+    return 0;
+}
+
+static void test_strict_manual_termination(void)
+{
+    XTaskQueueHandle queue;
+    HANDLE dispatcher, terminator;
+    HRESULT hr;
+    int wait;
+
+    printf( "# Strict manual queues: termination waits for a dispatched callback\n" );
+    if (!x1_started) x1_started = CreateEventW( NULL, FALSE, FALSE, NULL );
+    if (!x1_release) x1_release = CreateEventW( NULL, TRUE, FALSE, NULL );
+
+    for (wait = 0; wait < 2; ++wait)
+    {
+        x1_reset();
+        InterlockedExchange( (LONG *)&x1_done_seq, 0 );
+        ResetEvent( x1_release );
+        hr = IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_Manual,
+                                               XTaskQueueDispatchMode_Manual, &queue );
+        CHECK( hr == S_OK && queue, "create a manual queue (0x%08lx)", hr );
+        if (!queue) return;
+        x1_dispatch_queue = queue;
+        hr = IXThreadingImpl_XTaskQueueSubmitCallback( threading, queue, XTaskQueuePort_Work,
+                                                       NULL, x1_blocking_finish_cb );
+        CHECK( hr == S_OK, "queue manual work (0x%08lx)", hr );
+        dispatcher = CreateThread( NULL, 0, x1_dispatch_thread, NULL, 0, NULL );
+        CHECK( WaitForSingleObject( x1_started, 2000 ) == WAIT_OBJECT_0,
+               "a title thread dispatches the work and is inside it" );
+        if (wait)
+            terminator = CreateThread( NULL, 0, x1_terminate_and_wait_thread, queue, 0, NULL );
+        else
+        {
+            terminator = NULL;
+            hr = IXThreadingImpl_XTaskQueueTerminate( threading, queue, FALSE, NULL, x1_terminated );
+            CHECK( hr == S_OK, "terminate without wait (0x%08lx)", hr );
+        }
+        Sleep( 300 );
+        CHECK( !x1_term_runs && !x1_done_seq,
+               "%s: nothing reports termination while the callback runs (terminated %ld, returned %ld)",
+               wait ? "wait" : "no wait", x1_term_runs, x1_done_seq );
+        SetEvent( x1_release );
+        WaitForSingleObject( dispatcher, 5000 );
+        CloseHandle( dispatcher );
+        if (terminator)
+        {
+            CHECK( WaitForSingleObject( terminator, 5000 ) == WAIT_OBJECT_0,
+                   "terminate with wait returns once the callback has" );
+            CloseHandle( terminator );
+        }
+        x1_wait_for( &x1_term_runs, 1, 3000 );
+        CHECK( x1_term_runs == 1 && x1_finished_seen == 1 && x1_cb_seq < x1_term_seq,
+               "%s: the terminated callback follows the dispatched one (runs %ld, saw finished %ld, %ld < %ld)",
+               wait ? "wait" : "no wait", x1_term_runs, x1_finished_seen, x1_cb_seq, x1_term_seq );
+        if (wait) CHECK( x1_cb_seq < x1_done_seq, "terminate with wait returns after the callback (%ld < %ld)",
+                         x1_cb_seq, x1_done_seq );
+        IXThreadingImpl_XTaskQueueCloseHandle( threading, queue );
+    }
+
+    /* A manual callback that terminates its own queue and asks to wait is not
+     * left waiting for itself. */
+    x1_reset();
+    InterlockedExchange( (LONG *)&x1_done_seq, 0 );
+    InterlockedExchange( (LONG *)&x1_inner_terminate_hr, -1 );
+    hr = IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_Manual,
+                                           XTaskQueueDispatchMode_Manual, &x1_self_queue );
+    CHECK( hr == S_OK && x1_self_queue, "create a manual queue to terminate from inside (0x%08lx)", hr );
+    if (!x1_self_queue) return;
+    IXThreadingImpl_XTaskQueueSubmitCallback( threading, x1_self_queue, XTaskQueuePort_Work, NULL, x1_self_terminate_cb );
+    x1_dispatch_queue = x1_self_queue;
+    dispatcher = CreateThread( NULL, 0, x1_dispatch_thread, NULL, 0, NULL );
+    CHECK( WaitForSingleObject( dispatcher, 5000 ) == WAIT_OBJECT_0,
+           "a manual callback terminating its own queue with wait returns" );
+    CloseHandle( dispatcher );
+    x1_wait_for( &x1_term_runs, 1, 3000 );
+    CHECK( x1_inner_terminate_hr == S_OK && x1_term_runs == 1 && x1_done_seq < x1_term_seq,
+           "its terminated callback follows its return (hr 0x%08lx, runs %ld, %ld < %ld)",
+           x1_inner_terminate_hr, x1_term_runs, x1_done_seq, x1_term_seq );
+    IXThreadingImpl_XTaskQueueCloseHandle( threading, x1_self_queue );
+    x1_self_queue = NULL;
+}
+
+static void test_queue_termination(void)
+{
+    XTaskQueueHandle queue;
+    DWORD main_thread = GetCurrentThreadId(), start;
+    HRESULT hr;
+
+    printf( "# XTaskQueueTerminate waits for what the queue still owes\n" );
+    x1_started = CreateEventW( NULL, FALSE, FALSE, NULL );
+    x1_release = CreateEventW( NULL, TRUE, FALSE, NULL );
+
+    /* A delayed callback is cancelled before the terminated callback, not
+     * fired into the title's freed state when its timer comes round. */
+    x1_reset();
+    hr = IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_ThreadPool,
+                                           XTaskQueueDispatchMode_ThreadPool, &queue );
+    CHECK( hr == S_OK, "create a thread-pool queue (0x%08lx)", hr );
+    hr = IXThreadingImpl_XTaskQueueSubmitDelayedCallback( threading, queue, XTaskQueuePort_Work, 300, NULL, x1_record_cb );
+    CHECK( hr == S_OK, "queue a delayed callback (0x%08lx)", hr );
+    hr = IXThreadingImpl_XTaskQueueTerminate( threading, queue, TRUE, NULL, x1_terminated );
+    CHECK( hr == S_OK && x1_term_runs == 1, "terminate with wait reports termination before returning (%ld)", x1_term_runs );
+    CHECK( x1_cb_runs == 1 && x1_cb_canceled && x1_cb_seq < x1_term_seq,
+           "the delayed callback runs cancelled before the terminated callback (runs %ld, canceled %ld, %ld < %ld)",
+           x1_cb_runs, x1_cb_canceled, x1_cb_seq, x1_term_seq );
+    Sleep( 500 );
+    CHECK( x1_cb_runs == 1, "the delayed callback's timer cannot run it again (%ld)", x1_cb_runs );
+    hr = IXThreadingImpl_XTaskQueueSubmitDelayedCallback( threading, queue, XTaskQueuePort_Work, 1, NULL, x1_record_cb );
+    CHECK( hr == E_ABORT, "a terminated thread-pool queue refuses delayed work (0x%08lx)", hr );
+    IXThreadingImpl_XTaskQueueCloseHandle( threading, queue );
+
+    /* A callback already running finishes before termination completes. */
+    x1_reset();
+    IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_ThreadPool,
+                                      XTaskQueueDispatchMode_ThreadPool, &queue );
+    IXThreadingImpl_XTaskQueueSubmitCallback( threading, queue, XTaskQueuePort_Work, NULL, x1_slow_cb );
+    CHECK( WaitForSingleObject( x1_started, 2000 ) == WAIT_OBJECT_0, "the slow callback starts" );
+    IXThreadingImpl_XTaskQueueTerminate( threading, queue, TRUE, NULL, x1_terminated );
+    CHECK( x1_term_runs == 1 && x1_finished_seen == 1,
+           "the terminated callback waits for a callback that was running (saw finished=%ld)", x1_finished_seen );
+    IXThreadingImpl_XTaskQueueCloseHandle( threading, queue );
+
+    /* Without wait nothing runs on the caller's thread, and the terminated
+     * callback follows the last callback out. */
+    x1_reset();
+    ResetEvent( x1_release );
+    IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_ThreadPool,
+                                      XTaskQueueDispatchMode_ThreadPool, &queue );
+    IXThreadingImpl_XTaskQueueSubmitCallback( threading, queue, XTaskQueuePort_Work, NULL, x1_blocking_cb );
+    CHECK( WaitForSingleObject( x1_started, 2000 ) == WAIT_OBJECT_0, "the blocking callback starts" );
+    IXThreadingImpl_XTaskQueueSubmitCallback( threading, queue, XTaskQueuePort_Work, NULL, x1_record_cb );
+    start = GetTickCount();
+    hr = IXThreadingImpl_XTaskQueueTerminate( threading, queue, FALSE, NULL, x1_terminated );
+    CHECK( hr == S_OK && GetTickCount() - start < 1000, "terminate without wait returns at once (0x%08lx)", hr );
+    CHECK( !x1_term_runs && !x1_cb_runs,
+           "terminate without wait runs nothing inline (terminated %ld, callbacks %ld)", x1_term_runs, x1_cb_runs );
+    SetEvent( x1_release );
+    x1_wait_for( &x1_term_runs, 1, 3000 );
+    CHECK( x1_cb_runs == 1 && x1_cb_canceled && x1_cb_thread != main_thread,
+           "the queued callback runs cancelled off the caller's thread (runs %ld, canceled %ld)", x1_cb_runs, x1_cb_canceled );
+    CHECK( x1_term_runs == 1 && x1_cb_seq < x1_term_seq && x1_term_thread != main_thread,
+           "the terminated callback follows it, off the caller's thread (%ld < %ld)", x1_cb_seq, x1_term_seq );
+    IXThreadingImpl_XTaskQueueCloseHandle( threading, queue );
+
+    /* A callback that terminates its own queue and asks to wait would be
+     * waiting for itself; it gets its terminated callback after it returns. */
+    x1_reset();
+    InterlockedExchange( (LONG *)&x1_done_seq, 0 );
+    InterlockedExchange( (LONG *)&x1_inner_terminate_hr, -1 );
+    IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_ThreadPool,
+                                      XTaskQueueDispatchMode_ThreadPool, &x1_self_queue );
+    IXThreadingImpl_XTaskQueueSubmitCallback( threading, x1_self_queue, XTaskQueuePort_Work, NULL, x1_self_terminate_cb );
+    x1_wait_for( &x1_term_runs, 1, 3000 );
+    CHECK( x1_inner_terminate_hr == S_OK && x1_term_runs == 1,
+           "terminating a queue from its own callback neither deadlocks nor fails (0x%08lx)", x1_inner_terminate_hr );
+    CHECK( x1_done_seq && x1_done_seq < x1_term_seq,
+           "its terminated callback runs after that callback has returned (%ld < %ld)", x1_done_seq, x1_term_seq );
+    IXThreadingImpl_XTaskQueueCloseHandle( threading, x1_self_queue );
+
+    /* A completion already handed to the pool for a block on the queue is
+     * still owed: termination waits for it. */
+    x1_reset();
+    IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_ThreadPool,
+                                      XTaskQueueDispatchMode_ThreadPool, &queue );
+    {
+        static XAsyncBlock block;
+
+        memset( &block, 0, sizeof(block) );
+        block.queue = queue;
+        block.callback = x1_slow_completion;
+        IXThreadingImpl_XAsyncBegin( threading, &block, NULL, x1_pending_provider, "x1-completion", x1_pending_provider );
+        IXThreadingImpl_XAsyncComplete( threading, &block, S_OK, 0 );
+        IXThreadingImpl_XTaskQueueTerminate( threading, queue, TRUE, NULL, x1_terminated );
+        CHECK( x1_term_runs == 1 && x1_finished_seen == 1,
+               "termination waits for a completion callback on its way (saw finished=%ld)", x1_finished_seen );
+    }
+
+    /* Provider work for a terminated queue is refused, and the operation
+     * ends with that refusal rather than running anyway. */
+    {
+        static XAsyncBlock block;
+
+        InterlockedExchange( (LONG *)&x1_dowork, 0 );
+        memset( &block, 0, sizeof(block) );
+        block.queue = queue;
+        IXThreadingImpl_XAsyncBegin( threading, &block, NULL, x1_schedules_in_begin, "x1-refused", x1_schedules_in_begin );
+        Sleep( 100 );
+        hr = IXThreadingImpl_XAsyncGetStatus( threading, &block, FALSE );
+        CHECK( hr == E_ABORT && !x1_dowork, "work scheduled on a terminated queue is refused (0x%08lx, DoWork %ld)",
+               hr, x1_dowork );
+    }
+    IXThreadingImpl_XTaskQueueCloseHandle( threading, queue );
+
+    /* Delayed provider work is cancelled by termination: the operation ends
+     * with E_ABORT before termination completes, and DoWork never runs. */
+    x1_reset();
+    InterlockedExchange( (LONG *)&x1_dowork, 0 );
+    InterlockedExchange( (LONG *)&x1_cleanups, 0 );
+    IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_ThreadPool,
+                                      XTaskQueueDispatchMode_ThreadPool, &queue );
+    {
+        static XAsyncBlock block;
+
+        memset( &block, 0, sizeof(block) );
+        block.queue = queue;
+        IXThreadingImpl_XAsyncBegin( threading, &block, NULL, x1_delayed_work_provider, "x1-delayed-work",
+                                     x1_delayed_work_provider );
+        IXThreadingImpl_XTaskQueueTerminate( threading, queue, TRUE, NULL, x1_terminated );
+        hr = IXThreadingImpl_XAsyncGetStatus( threading, &block, FALSE );
+        CHECK( hr == E_ABORT && x1_cleanups == 1, "termination aborts pending provider work (0x%08lx, cleanups %ld)",
+               hr, x1_cleanups );
+        Sleep( 500 );
+        CHECK( !x1_dowork, "the aborted provider work never runs (%ld)", x1_dowork );
+    }
+    IXThreadingImpl_XTaskQueueCloseHandle( threading, queue );
+
+    CloseHandle( x1_started );
+    CloseHandle( x1_release );
+}
+
+/* A provider that answers Cancel the way libHttpClient's HTTP provider does:
+ * it starts winding its own work down and completes the operation later, from
+ * that work, reading the context its Cleanup frees. */
+static volatile LONG x1_cleaned_at_completion;
+static XAsyncBlock x1_async_cancel_block;
+
+static DWORD WINAPI x1_finish_cancel_later( void *arg )
+{
+    Sleep( 200 );
+    InterlockedExchange( (LONG *)&x1_cleaned_at_completion, x1_cleanups );
+    IXThreadingImpl_XAsyncComplete( threading, &x1_async_cancel_block, E_ABORT, 0 );
+    return 0;
+}
+
+static HRESULT CALLBACK x1_cancels_asynchronously( XAsyncOp op, const XAsyncProviderData *data )
+{
+    if (op == XAsyncOp_Cancel)
+    {
+        HANDLE thread;
+
+        InterlockedIncrement( (LONG *)&x1_cancels );
+        if ((thread = CreateThread( NULL, 0, x1_finish_cancel_later, NULL, 0, NULL ))) CloseHandle( thread );
+    }
+    if (op == XAsyncOp_Cleanup) InterlockedIncrement( (LONG *)&x1_cleanups );
+    return op == XAsyncOp_Begin ? E_PENDING : S_OK;
+}
+
+/* Completes with a payload from inside Cancel, then keeps using its context
+ * until it is let go. */
+static HANDLE x1_in_cancel, x1_cancel_release;
+static volatile LONG x1_cleaned_at_cancel_return;
+
+static HRESULT CALLBACK x1_completes_inside_cancel( XAsyncOp op, const XAsyncProviderData *data )
+{
+    switch (op)
+    {
+    case XAsyncOp_Begin:
+        return E_PENDING;
+    case XAsyncOp_Cancel:
+        InterlockedIncrement( (LONG *)&x1_cancels );
+        IXThreadingImpl_XAsyncComplete( threading, data->async, S_OK, sizeof(UINT32) );
+        SetEvent( x1_in_cancel );
+        WaitForSingleObject( x1_cancel_release, 5000 );
+        InterlockedExchange( (LONG *)&x1_cleaned_at_cancel_return, x1_cleanups );
+        return S_OK;
+    case XAsyncOp_GetResult:
+        *(UINT32 *)data->buffer = 9;
+        return S_OK;
+    case XAsyncOp_Cleanup:
+        InterlockedIncrement( (LONG *)&x1_cleanups );
+        return S_OK;
+    default:
+        return S_OK;
+    }
+}
+
+static DWORD WINAPI x1_cancel_thread( void *arg )
+{
+    IXThreadingImpl_XAsyncCancel( threading, arg );
+    return 0;
+}
+
+static void x1_reset_cancel_counts(void)
+{
+    InterlockedExchange( (LONG *)&x1_cancels, 0 );
+    InterlockedExchange( (LONG *)&x1_cleanups, 0 );
+    InterlockedExchange( (LONG *)&x1_completions, 0 );
+    InterlockedExchange( (LONG *)&x1_completion_status, 0 );
+}
+
+static void test_async_cancel(void)
+{
+    static XAsyncBlock block, run_block;
+    UINT32 value = 0;
+    HANDLE thread;
+    HRESULT hr;
+
+    printf( "# XAsyncCancel\n" );
+
+    /* Cancel reaches the provider, and that is all: the operation stays the
+     * provider's to finish, as in the GDK's AsyncLib. */
+    x1_reset_cancel_counts();
+    memset( &block, 0, sizeof(block) );
+    block.callback = x1_completion_record;
+    IXThreadingImpl_XAsyncBegin( threading, &block, NULL, x1_pending_provider, "x1-cancel", x1_pending_provider );
+    IXThreadingImpl_XAsyncCancel( threading, &block );
+    CHECK( x1_cancels == 1, "the provider is asked to cancel (%ld)", x1_cancels );
+    Sleep( 100 );
+    hr = IXThreadingImpl_XAsyncGetStatus( threading, &block, FALSE );
+    CHECK( hr == E_PENDING && !x1_completions && !x1_cleanups,
+           "cancelling does not complete the operation for the provider (0x%08lx, completions %ld, cleanups %ld)",
+           hr, x1_completions, x1_cleanups );
+    IXThreadingImpl_XAsyncComplete( threading, &block, E_ABORT, 0 );
+    x1_wait_for( &x1_cleanups, 1, 2000 );
+    hr = IXThreadingImpl_XAsyncGetStatus( threading, &block, FALSE );
+    CHECK( hr == E_ABORT && x1_completions == 1 && x1_completion_status == E_ABORT && x1_cleanups == 1,
+           "the provider's own E_ABORT completes it once and cleans it up once (0x%08lx, %ld, %ld)",
+           hr, x1_completions, x1_cleanups );
+    IXThreadingImpl_XAsyncCancel( threading, &block );
+    CHECK( x1_cancels == 1 && x1_completions == 1, "cancelling a finished operation does nothing" );
+
+    /* A provider that finishes cancelling on its own thread is not cleaned up
+     * underneath that thread. */
+    x1_reset_cancel_counts();
+    InterlockedExchange( (LONG *)&x1_cleaned_at_completion, -1 );
+    memset( &x1_async_cancel_block, 0, sizeof(x1_async_cancel_block) );
+    x1_async_cancel_block.callback = x1_completion_record;
+    IXThreadingImpl_XAsyncBegin( threading, &x1_async_cancel_block, NULL, x1_cancels_asynchronously,
+                                 "x1-async-cancel", x1_cancels_asynchronously );
+    IXThreadingImpl_XAsyncCancel( threading, &x1_async_cancel_block );
+    hr = IXThreadingImpl_XAsyncGetStatus( threading, &x1_async_cancel_block, FALSE );
+    CHECK( hr == E_PENDING, "the operation is still running once Cancel returns (0x%08lx)", hr );
+    x1_wait_for( &x1_cleanups, 1, 3000 );
+    CHECK( x1_cleaned_at_completion == 0,
+           "Cleanup does not run before the provider completes its cancelled operation (cleaned=%ld at completion)",
+           x1_cleaned_at_completion );
+    hr = IXThreadingImpl_XAsyncGetStatus( threading, &x1_async_cancel_block, TRUE );
+    CHECK( hr == E_ABORT && x1_completions == 1 && x1_cleanups == 1,
+           "its E_ABORT is the only completion (0x%08lx, %ld, %ld)", hr, x1_completions, x1_cleanups );
+
+    /* A provider that completes the operation itself inside Cancel is not
+     * completed a second time. */
+    x1_reset_cancel_counts();
+    memset( &block, 0, sizeof(block) );
+    block.callback = x1_completion_record;
+    IXThreadingImpl_XAsyncBegin( threading, &block, NULL, x1_completes_on_cancel, "x1-self-cancel", x1_completes_on_cancel );
+    IXThreadingImpl_XAsyncCancel( threading, &block );
+    x1_wait_for( &x1_cleanups, 1, 2000 );
+    Sleep( 50 );
+    hr = IXThreadingImpl_XAsyncGetStatus( threading, &block, TRUE );
+    CHECK( hr == E_ABORT && x1_cancels == 1 && x1_completions == 1 && x1_cleanups == 1,
+           "a provider's own E_ABORT is the only completion (0x%08lx, %ld, %ld)", hr, x1_completions, x1_cleanups );
+
+    /* A result taken while the provider is still inside Cancel: Cleanup waits
+     * for Cancel to return. */
+    x1_reset_cancel_counts();
+    InterlockedExchange( (LONG *)&x1_cleaned_at_cancel_return, -1 );
+    x1_in_cancel = CreateEventW( NULL, FALSE, FALSE, NULL );
+    x1_cancel_release = CreateEventW( NULL, TRUE, FALSE, NULL );
+    memset( &block, 0, sizeof(block) );
+    IXThreadingImpl_XAsyncBegin( threading, &block, NULL, x1_completes_inside_cancel, "x1-result-in-cancel",
+                                 x1_completes_inside_cancel );
+    thread = CreateThread( NULL, 0, x1_cancel_thread, &block, 0, NULL );
+    CHECK( WaitForSingleObject( x1_in_cancel, 2000 ) == WAIT_OBJECT_0, "the provider is inside Cancel" );
+    hr = IXThreadingImpl_XAsyncGetResult( threading, &block, x1_completes_inside_cancel, sizeof(value), &value, NULL );
+    CHECK( hr == S_OK && value == 9, "the result can be taken meanwhile (0x%08lx, %u)", hr, value );
+    CHECK( !x1_cleanups, "but the provider is not cleaned up while its Cancel runs (%ld)", x1_cleanups );
+    SetEvent( x1_cancel_release );
+    WaitForSingleObject( thread, 5000 );
+    CloseHandle( thread );
+    CHECK( x1_cleaned_at_cancel_return == 0 && x1_cleanups == 1,
+           "it is cleaned up once, after Cancel returns (%ld at return, %ld)", x1_cleaned_at_cancel_return, x1_cleanups );
+    CloseHandle( x1_in_cancel );
+    CloseHandle( x1_cancel_release );
+
+    /* XAsyncRun has no provider to cancel: the work function finishes it. */
+    InterlockedExchange( (LONG *)&x1_dowork, 0 );
+    memset( &run_block, 0, sizeof(run_block) );
+    hr = IXThreadingImpl_XAsyncRun( threading, &run_block, x1_slow_run );
+    CHECK( hr == S_OK, "XAsyncRun starts (0x%08lx)", hr );
+    Sleep( 50 );
+    IXThreadingImpl_XAsyncCancel( threading, &run_block );
+    hr = IXThreadingImpl_XAsyncGetStatus( threading, &run_block, FALSE );
+    CHECK( hr == E_PENDING, "a cancelled XAsyncRun keeps running (0x%08lx)", hr );
+    hr = IXThreadingImpl_XAsyncGetStatus( threading, &run_block, TRUE );
+    CHECK( hr == S_OK && x1_dowork == 1, "and reports its work function's result (0x%08lx, %ld)", hr, x1_dowork );
+}
+
+/* Termination with wait on an XSAPI-shaped queue: thread-pool work, Manual
+ * completions, pumped by the thread that terminates it. */
+static HANDLE x1_work_started;
+
+static HRESULT CALLBACK x1_slow_dowork( XAsyncOp op, const XAsyncProviderData *data )
+{
+    if (op == XAsyncOp_Begin) return IXThreadingImpl_XAsyncSchedule( threading, data->async, 0 );
+    if (op == XAsyncOp_DoWork)
+    {
+        SetEvent( x1_work_started );
+        Sleep( 300 );
+        IXThreadingImpl_XAsyncComplete( threading, data->async, S_OK, 0 );
+    }
+    return S_OK;
+}
+
+static DWORD WINAPI x1_terminate_waiting( void *arg )
+{
+    return IXThreadingImpl_XTaskQueueTerminate( threading, arg, TRUE, NULL, x1_terminated );
+}
+
+static void test_terminate_manual_completions(void)
+{
+    static XAsyncBlock block;
+    XTaskQueueHandle queue;
+    HANDLE thread;
+    DWORD wait;
+    HRESULT hr;
+
+    printf( "# XTaskQueueTerminate(wait) delivers completions parked while it waits\n" );
+    x1_reset_cancel_counts();
+    x1_reset();
+    x1_work_started = CreateEventW( NULL, TRUE, FALSE, NULL );
+    hr = IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_ThreadPool,
+                                           XTaskQueueDispatchMode_Manual, &queue );
+    CHECK( hr == S_OK, "create a queue with Manual completions (0x%08lx)", hr );
+    /* The title has shown it pumps the queue, so completions are parked. */
+    IXThreadingImpl_XTaskQueueDispatch( threading, queue, XTaskQueuePort_Completion, 0 );
+    memset( &block, 0, sizeof(block) );
+    block.queue = queue;
+    block.callback = x1_completion_record;
+    IXThreadingImpl_XAsyncBegin( threading, &block, NULL, x1_slow_dowork, "x1-manual-terminate", x1_slow_dowork );
+    CHECK( WaitForSingleObject( x1_work_started, 2000 ) == WAIT_OBJECT_0, "DoWork starts" );
+    thread = CreateThread( NULL, 0, x1_terminate_waiting, queue, 0, NULL );
+    wait = WaitForSingleObject( thread, 5000 );
+    CHECK( wait == WAIT_OBJECT_0, "terminate with wait returns once DoWork has completed (wait %lu)", wait );
+    CHECK( x1_completions == 1 && x1_completion_status == S_OK && x1_term_runs == 1,
+           "the parked completion is delivered before the terminated callback (%ld, 0x%08lx, terminated %ld)",
+           x1_completions, x1_completion_status, x1_term_runs );
+    if (wait == WAIT_OBJECT_0)
+    {
+        CloseHandle( thread );
+        IXThreadingImpl_XTaskQueueCloseHandle( threading, queue );
+    }
+    CloseHandle( x1_work_started );
+}
+
+/* XAsyncRun refused by a terminated queue leaves the block saying so. */
+static XAsyncBlock x1_refused_block;
+
+static DWORD WINAPI x1_wait_on_refused( void *arg )
+{
+    return IXThreadingImpl_XAsyncGetStatus( threading, &x1_refused_block, TRUE );
+}
+
+static void test_refused_run_status(void)
+{
+    XTaskQueueHandle queue;
+    HANDLE thread;
+    DWORD wait, code = 0;
+    HRESULT hr;
+
+    printf( "# A refused XAsyncRun does not leave XAsyncGetStatus(wait) waiting\n" );
+    IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_ThreadPool,
+                                      XTaskQueueDispatchMode_ThreadPool, &queue );
+    IXThreadingImpl_XTaskQueueTerminate( threading, queue, TRUE, NULL, NULL );
+    memset( &x1_refused_block, 0, sizeof(x1_refused_block) );
+    x1_refused_block.queue = queue;
+    x1_refused_block.callback = x1_wrong_callback;
+    InterlockedExchange( (LONG *)&x1_bad_callback, 0 );
+    hr = IXThreadingImpl_XAsyncRun( threading, &x1_refused_block, x1_slow_run );
+    CHECK( hr == E_ABORT, "XAsyncRun on a terminated queue fails (0x%08lx)", hr );
+    thread = CreateThread( NULL, 0, x1_wait_on_refused, NULL, 0, NULL );
+    wait = WaitForSingleObject( thread, 3000 );
+    if (wait == WAIT_OBJECT_0) GetExitCodeThread( thread, &code );
+    CHECK( wait == WAIT_OBJECT_0 && code == (DWORD)E_ABORT,
+           "XAsyncGetStatus(wait) on its block returns the refusal (wait %lu, 0x%08lx)", wait, code );
+    Sleep( 50 );
+    CHECK( !x1_bad_callback, "and no completion callback follows a refused call (%ld)", x1_bad_callback );
+    if (wait == WAIT_OBJECT_0)
+    {
+        CloseHandle( thread );
+        IXThreadingImpl_XTaskQueueCloseHandle( threading, queue );
+    }
+}
+
+static void test_async_work_identity(void)
+{
+    static XAsyncBlock block;
+    UINT32 value = 0;
+    HRESULT hr;
+
+    printf( "# Scheduled provider work belongs to its own operation\n" );
+
+    /* Work scheduled before the operation completed does not run after. */
+    InterlockedExchange( (LONG *)&x1_dowork, 0 );
+    memset( &block, 0, sizeof(block) );
+    IXThreadingImpl_XAsyncBegin( threading, &block, NULL, x1_completes_before_work, "x1-completed",
+                                 x1_completes_before_work );
+    Sleep( 400 );
+    CHECK( !x1_dowork, "DoWork is not delivered to an operation that has completed (%ld)", x1_dowork );
+    hr = IXThreadingImpl_XAsyncGetResult( threading, &block, x1_completes_before_work, sizeof(value), &value, NULL );
+    CHECK( hr == S_OK && value == 7, "its result is intact (0x%08lx, %u)", hr, value );
+
+    /* Nor is it delivered to a later operation reusing the block. */
+    InterlockedExchange( (LONG *)&x1_dowork, 0 );
+    memset( &block, 0, sizeof(block) );
+    IXThreadingImpl_XAsyncBegin( threading, &block, NULL, x1_fails_after_scheduling, "x1-withdrawn",
+                                 x1_fails_after_scheduling );
+    hr = IXThreadingImpl_XAsyncGetResult( threading, &block, x1_fails_after_scheduling, 0, NULL, NULL );
+    CHECK( hr == E_FAIL, "the first operation fails at once (0x%08lx)", hr );
+    IXThreadingImpl_XAsyncBegin( threading, &block, NULL, x1_pending_provider, "x1-reuser", x1_pending_provider );
+    Sleep( 400 );
+    CHECK( !x1_dowork, "a stale DoWork does not reach the next operation on the block (%ld)", x1_dowork );
+    /* Cancel only asks; the provider finishes the operation itself. */
+    IXThreadingImpl_XAsyncCancel( threading, &block );
+    IXThreadingImpl_XAsyncComplete( threading, &block, E_ABORT, 0 );
+}
+
+static void test_async_route_snapshot(void)
+{
+    XAsyncBlock block;
+
+    printf( "# A completion goes where the operation began\n" );
+
+    /* The block is the caller's again once its result is visible, so the
+     * completion cannot be read from it: change it after Begin and the
+     * original routing must still be used. */
+    InterlockedExchange( (LONG *)&x1_completions, 0 );
+    InterlockedExchange( (LONG *)&x1_bad_callback, 0 );
+    memset( &block, 0, sizeof(block) );
+    block.callback = x1_completion_record;
+    IXThreadingImpl_XAsyncBegin( threading, &block, NULL, x1_pending_provider, "x1-route", x1_pending_provider );
+    block.callback = x1_wrong_callback;
+    IXThreadingImpl_XAsyncComplete( threading, &block, S_OK, 0 );
+    x1_wait_for( &x1_completions, 1, 2000 );
+    Sleep( 50 );
+    CHECK( x1_completions == 1 && !x1_bad_callback,
+           "the completion uses the callback captured at Begin (%ld, wrong %ld)", x1_completions, x1_bad_callback );
+}
+
+static volatile LONG x1_inner_ran, x1_outer_saw_inner;
+static HANDLE x1_inner_done;
+static XTaskQueueHandle x1_parallel_queue;
+
+static void CALLBACK x1_inner_cb( void *context, BOOLEAN canceled )
+{
+    InterlockedIncrement( (LONG *)&x1_inner_ran );
+    SetEvent( x1_inner_done );
+}
+
+static void CALLBACK x1_outer_cb( void *context, BOOLEAN canceled )
+{
+    IXThreadingImpl_XTaskQueueSubmitCallback( threading, x1_parallel_queue, XTaskQueuePort_Work, NULL, x1_inner_cb );
+    InterlockedExchange( (LONG *)&x1_outer_saw_inner, WaitForSingleObject( x1_inner_done, 2000 ) == WAIT_OBJECT_0 );
+    InterlockedIncrement( (LONG *)&x1_cb_runs );
+}
+
+static void test_threadpool_dispatch(void)
+{
+    XTaskQueueHandle queue = NULL;
+    HRESULT hr;
+    int i;
+
+    printf( "# ThreadPool queue dispatch\n" );
+
+    /* Serialised by default, as before. */
+    hr = IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_ThreadPool,
+                                           XTaskQueueDispatchMode_ThreadPool, &queue );
+    InterlockedExchange( &serial_inflight, 0 );
+    InterlockedExchange( &serial_max_inflight, 0 );
+    InterlockedExchange( &serial_ran, 0 );
+    for (i = 0; i < 20 && hr == S_OK; i++)
+        hr = IXThreadingImpl_XTaskQueueSubmitCallback( threading, queue, XTaskQueuePort_Work, (void *)(LONG_PTR)i, serial_cb );
+    x1_wait_for( &serial_ran, 20, 5000 );
+    CHECK( serial_ran == 20 && serial_max_inflight == 1,
+           "a ThreadPool queue still runs one callback at a time by default (ran %ld, peak %ld)",
+           serial_ran, serial_max_inflight );
+    IXThreadingImpl_XTaskQueueCloseHandle( threading, queue );
+
+    /* Opted out per title, a callback can wait for another on its queue. */
+    x1_inner_done = CreateEventW( NULL, FALSE, FALSE, NULL );
+    InterlockedExchange( (LONG *)&x1_inner_ran, 0 );
+    InterlockedExchange( (LONG *)&x1_outer_saw_inner, 0 );
+    InterlockedExchange( (LONG *)&x1_cb_runs, 0 );
+    SetEnvironmentVariableA( "XGR_PARALLEL_THREADPOOL_QUEUES", "1" );
+    hr = IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_ThreadPool,
+                                           XTaskQueueDispatchMode_ThreadPool, &x1_parallel_queue );
+    SetEnvironmentVariableA( "XGR_PARALLEL_THREADPOOL_QUEUES", NULL );
+    CHECK( hr == S_OK, "create a parallel ThreadPool queue (0x%08lx)", hr );
+    IXThreadingImpl_XTaskQueueSubmitCallback( threading, x1_parallel_queue, XTaskQueuePort_Work, NULL, x1_outer_cb );
+    x1_wait_for( &x1_cb_runs, 1, 4000 );
+    CHECK( x1_outer_saw_inner, "with XGR_PARALLEL_THREADPOOL_QUEUES=1 a callback can wait for another on its queue" );
+    IXThreadingImpl_XTaskQueueTerminate( threading, x1_parallel_queue, TRUE, NULL, NULL );
+    IXThreadingImpl_XTaskQueueCloseHandle( threading, x1_parallel_queue );
+    CloseHandle( x1_inner_done );
+}
+
+/* Strict manual mode only: completions parked on a Manual queue are what
+ * XAsyncGetStatus(wait) drains while it blocks. */
+#define X1_FLOOD 30005
+static volatile LONG x1_flood_delivered;
+static XAsyncBlock *x1_flood_blocks;
+static XAsyncBlock x1_slow_block;
+
+static void CALLBACK x1_flood_completed( XAsyncBlock *async )
+{
+    InterlockedIncrement( (LONG *)&x1_flood_delivered );
+}
+
+static HRESULT CALLBACK x1_completes_inline( XAsyncOp op, const XAsyncProviderData *data )
+{
+    if (op == XAsyncOp_Begin) IXThreadingImpl_XAsyncComplete( threading, data->async, S_OK, 0 );
+    return S_OK;
+}
+
+static DWORD WINAPI x1_complete_later( void *arg )
+{
+    Sleep( 500 );
+    IXThreadingImpl_XAsyncComplete( threading, &x1_slow_block, S_OK, 0 );
+    return 0;
+}
+
+static void test_async_wait_under_load(void)
+{
+    XTaskQueueHandle queue = NULL;
+    HANDLE thread;
+    HRESULT hr;
+    int i;
+
+    printf( "# XAsyncGetStatus(wait) waits for as long as the operation takes\n" );
+    hr = IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_Manual,
+                                           XTaskQueueDispatchMode_Manual, &queue );
+    CHECK( hr == S_OK, "create a caller-dispatched queue (0x%08lx)", hr );
+    if (hr != S_OK) return;
+    x1_flood_blocks = calloc( X1_FLOOD, sizeof(*x1_flood_blocks) );
+    InterlockedExchange( (LONG *)&x1_flood_delivered, 0 );
+    for (i = 0; i < X1_FLOOD; i++)
+    {
+        x1_flood_blocks[i].queue = queue;
+        x1_flood_blocks[i].callback = x1_flood_completed;
+        IXThreadingImpl_XAsyncBegin( threading, &x1_flood_blocks[i], NULL, x1_completes_inline, "x1-flood",
+                                     x1_completes_inline );
+    }
+
+    /* Every poll that delivered one of those used to count against a budget
+     * of 30000 without sleeping, so this gave up long before half a second. */
+    memset( &x1_slow_block, 0, sizeof(x1_slow_block) );
+    x1_slow_block.queue = queue;
+    IXThreadingImpl_XAsyncBegin( threading, &x1_slow_block, NULL, x1_pending_provider, "x1-slow", x1_pending_provider );
+    thread = CreateThread( NULL, 0, x1_complete_later, NULL, 0, NULL );
+    hr = IXThreadingImpl_XAsyncGetStatus( threading, &x1_slow_block, TRUE );
+    CHECK( hr == S_OK, "a waiting caller gets the result, not E_PENDING, after draining %d completions (0x%08lx)",
+           X1_FLOOD, hr );
+    WaitForSingleObject( thread, 5000 );
+    CloseHandle( thread );
+    while (IXThreadingImpl_XTaskQueueDispatch( threading, queue, XTaskQueuePort_Completion, 0 ));
+    CHECK( x1_flood_delivered == X1_FLOOD, "every parked completion is delivered exactly once (%ld)",
+           x1_flood_delivered );
+    IXThreadingImpl_XTaskQueueCloseHandle( threading, queue );
+    free( x1_flood_blocks );
+}
+
+
 /* ABI fixture results are synthetic; they exercise the facade, not cloud access. */
 static LONG pfx_progress_calls;
 static void WINAPI pfx_test_progress(XUserHandle u, UINT32 state, void *context)
@@ -1665,6 +2537,21 @@ static void test_runtime_discovery( HMODULE mod )
            "available runtime version matches the installed implementation" );
 }
 
+static void test_xgameui_dismisses_to_cancel(void);
+static int identity_race_child(void);
+static int read_owner_child( const char *scid );
+static int pfx_recovery_child(void);
+static void test_package_identity_race(void);
+static void test_gamesave_unreadable_manifest(void);
+static void test_gamesave_user_folder_choice(void);
+static void test_gamesave_async_writes(void);
+static void test_gamesave_sync_after_async(void);
+static void test_gamesave_async_from_callback(void);
+static void test_gamesave_queued_at_exit(void);
+static int exit_after_async_save_child( const char *container_name );
+static void test_pfx_backend_recovery(void);
+static void test_pfx_reused_block(void);
+
 int main(int argc, char **argv)
 {
     HMODULE mod;
@@ -1686,7 +2573,10 @@ int main(int argc, char **argv)
     query = (void *)GetProcAddress( mod, "QueryApiImpl" );
     if (!init || !query) { printf( "Bail out! missing exports\n" ); return 100; }
     g_query = query;
-    test_runtime_discovery( mod );
+    /* a test's helper process starts from a clean slate and says nothing */
+    if (argc < 2 || (strcmp( argv[1], "--identity-race" ) && strcmp( argv[1], "--read-owner" ) &&
+                     strcmp( argv[1], "--pfx-recovery-child" ) && strcmp( argv[1], "--exit-after-async-save" )))
+        test_runtime_discovery( mod );
     init( 10002, 7822 );
 
     if (FAILED( hr = query( &CLSID_XPackageImpl, &IID_IXPackageImpl3, (void **)&pkg ) ) ||
@@ -1700,6 +2590,10 @@ int main(int argc, char **argv)
         return 100;
     }
 
+    if (argc > 1 && !strcmp(argv[1], "--identity-race")) return identity_race_child();
+    if (argc > 2 && !strcmp(argv[1], "--read-owner")) return read_owner_child( argv[2] );
+    if (argc > 1 && !strcmp(argv[1], "--pfx-recovery-child")) return pfx_recovery_child();
+    if (argc > 2 && !strcmp(argv[1], "--exit-after-async-save")) return exit_after_async_save_child( argv[2] );
     if (argc > 1 && !strcmp(argv[1], "--store-lifetime"))
     {
         test_store_product_lifetime();
@@ -1709,13 +2603,17 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "--manual-queues"))
     {
         test_manual_queues();
+        test_strict_manual_termination();
+        test_async_wait_under_load();
         printf( "%s: %d checks, %d failed\n", g_failed ? "FAILED" : "PASSED", g_run, g_failed );
         return g_failed;
     }
     if (argc > 1 && !strcmp(argv[1], "--pfx"))
     {
         test_xuser();
+        test_pfx_backend_recovery();
         test_pfx_backend();
+        test_pfx_reused_block();
         printf("%s: %d checks, %d failed\n", g_failed ? "FAILED" : "PASSED", g_run, g_failed);
         return g_failed;
     }
@@ -1726,10 +2624,848 @@ int main(int argc, char **argv)
     test_xgameui();
     test_storage_and_system();
     test_xthreading();
+    test_queue_termination();
+    test_async_cancel();
+    test_terminate_manual_completions();
+    test_refused_run_status();
+    test_async_work_identity();
+    test_async_route_snapshot();
+    test_threadpool_dispatch();
     test_xgamesave( scid );
     test_gamesave_interface4( scid );
+    test_xgameui_dismisses_to_cancel();
+    test_package_identity_race();
+    test_gamesave_unreadable_manifest();
+    test_gamesave_user_folder_choice();
+    test_gamesave_async_writes();
+    test_gamesave_sync_after_async();
+    test_gamesave_async_from_callback();
+    test_gamesave_queued_at_exit();
 
     printf( "\n1..%d\n", g_run );
     printf( "%s: %d checks, %d failed\n", g_failed ? "FAILED" : "PASSED", g_run, g_failed );
     return g_failed;
+}
+
+/* ---- XGameUI: a dismissed message dialog -------------------------------- */
+
+static void test_xgameui_dismisses_to_cancel(void)
+{
+    XGameUiMessageDialogButton button = 99;
+    XAsyncBlock async;
+    HRESULT hr;
+
+    printf( "# XGameUI message dialog dismissal\n" );
+
+    /* "Delete this save?" with the destructive answer focused: nobody saw it,
+     * so nobody chose to delete anything */
+    memset( &async, 0, sizeof(async) );
+    hr = IXGameUiImpl4_XGameUiShowMessageDialogAsync( gameui, &async, "Corrupted save",
+            "Delete it and start over?", "Delete", "Cancel", NULL,
+            XGameUiMessageDialogButton_First, XGameUiMessageDialogButton_Second );
+    CHECK( SUCCEEDED( hr ), "two-button dialog starts (0x%08lx)", hr );
+    hr = IXGameUiImpl4_XGameUiShowMessageDialogResult( gameui, &async, &button );
+    CHECK( SUCCEEDED( hr ) && button == XGameUiMessageDialogButton_Second,
+           "a dismissed dialog answers with its cancel button, not the focused one (%d)", button );
+
+    /* a cancel button that does not exist cannot be the answer */
+    button = 99;
+    memset( &async, 0, sizeof(async) );
+    hr = IXGameUiImpl4_XGameUiShowMessageDialogAsync( gameui, &async, "Notice", "Body",
+            "Continue", "Quit", NULL, XGameUiMessageDialogButton_First, XGameUiMessageDialogButton_Third );
+    hr = IXGameUiImpl4_XGameUiShowMessageDialogResult( gameui, &async, &button );
+    CHECK( SUCCEEDED( hr ) && button == XGameUiMessageDialogButton_First,
+           "a cancel button without text falls back to one that has it (%d)", button );
+}
+
+/* ---- helpers for tests that need a process of their own ----------------- */
+
+/* Run this executable again with `args`, XGR_XUID set to `xuid` (or unset),
+ * and return its exit code. The package identity and the local XUID are
+ * worked out once per process, so a fresh one is the only clean slate. */
+static DWORD run_child( const char *args, const char *xuid )
+{
+    char exe[MAX_PATH], cmd[MAX_PATH + 256], saved[64];
+    STARTUPINFOA si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+    DWORD code = 255, had;
+
+    if (!GetModuleFileNameA( NULL, exe, sizeof(exe) )) return code;
+    snprintf( cmd, sizeof(cmd), "\"%s\" %s", exe, args );
+    had = GetEnvironmentVariableA( "XGR_XUID", saved, sizeof(saved) );
+    SetEnvironmentVariableA( "XGR_XUID", xuid );
+    fflush( stdout );
+    if (CreateProcessA( exe, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi ))
+    {
+        if (WaitForSingleObject( pi.hProcess, 60000 ) == WAIT_OBJECT_0) GetExitCodeProcess( pi.hProcess, &code );
+        else TerminateProcess( pi.hProcess, 254 );
+        CloseHandle( pi.hThread );
+        CloseHandle( pi.hProcess );
+    }
+    SetEnvironmentVariableA( "XGR_XUID", had && had < sizeof(saved) ? saved : NULL );
+    return code;
+}
+
+static XUserHandle add_quiet_user(void)
+{
+    XAsyncBlock async = { 0 };
+    XUserHandle added = NULL;
+
+    if (FAILED( IXUserImpl_XUserAddAsync( users, XUserAddOptions_AddDefaultUserSilently, &async ) )) return NULL;
+    if (FAILED( IXUserImpl_XUserAddResult( users, &async, &added ) )) return NULL;
+    return added;
+}
+
+/* The save root the harness points XGR_WGS_ROOT at, as a Windows path. */
+static BOOL save_root( char *out, DWORD size )
+{
+    DWORD len = GetEnvironmentVariableA( "XGR_WGS_ROOT", out, size );
+    return len && len < size;
+}
+
+/* The one entry of `dir` matching `pattern`, of the kind asked for. */
+static BOOL find_entry( const char *dir, const char *pattern, BOOL want_dir, char *out, size_t size )
+{
+    WIN32_FIND_DATAA data;
+    char spec[MAX_PATH];
+    HANDLE find;
+    BOOL found = FALSE;
+
+    snprintf( spec, sizeof(spec), "%s\\%s", dir, pattern );
+    if ((find = FindFirstFileA( spec, &data )) == INVALID_HANDLE_VALUE) return FALSE;
+    do
+    {
+        if (!strcmp( data.cFileName, "." ) || !strcmp( data.cFileName, ".." )) continue;
+        if (!!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != !!want_dir) continue;
+        snprintf( out, size, "%s\\%s", dir, data.cFileName );
+        found = TRUE;
+        break;
+    } while (FindNextFileA( find, &data ));
+    FindClose( find );
+    return found;
+}
+
+static HRESULT write_one_blob( XGameSaveProviderHandle provider, const char *container_name,
+                               const char *blob, const char *value )
+{
+    XGameSaveContainerHandle container = NULL;
+    XGameSaveUpdateHandle update = NULL;
+    HRESULT hr;
+
+    if (FAILED( hr = IXGameSaveImpl3_XGameSaveCreateContainer( gs, provider, container_name, &container ) )) return hr;
+    if (SUCCEEDED( hr = IXGameSaveImpl3_XGameSaveCreateUpdate( gs, container, container_name, &update ) ))
+    {
+        hr = IXGameSaveImpl3_XGameSaveSubmitBlobWrite( gs, update, blob, (UINT8 *)value, strlen( value ) + 1 );
+        if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveSubmitUpdate( gs, update );
+        IXGameSaveImpl3_XGameSaveCloseUpdate( gs, update );
+    }
+    IXGameSaveImpl3_XGameSaveCloseContainer( gs, container );
+    return hr;
+}
+
+/* What blob `blob` of `container_name` holds, or "" if it cannot be read. */
+static HRESULT read_one_blob( XGameSaveProviderHandle provider, const char *container_name,
+                              const char *blob, char *out, size_t size )
+{
+    XGameSaveContainerHandle container = NULL;
+    const char *names[1] = { blob };
+    union { XGameSaveBlob blob; char bytes[512]; } buffer;
+    UINT32 count = 1;
+    HRESULT hr;
+
+    out[0] = 0;
+    if (FAILED( hr = IXGameSaveImpl3_XGameSaveCreateContainer( gs, provider, container_name, &container ) )) return hr;
+    hr = IXGameSaveImpl3_XGameSaveReadBlobData( gs, container, names, &count, sizeof(buffer), &buffer.blob );
+    if (SUCCEEDED( hr ) && count == 1 && buffer.blob.info.size && buffer.blob.info.size <= size)
+    {
+        memcpy( out, buffer.blob.data, buffer.blob.info.size );
+        out[buffer.blob.info.size - 1] = 0;
+    }
+    IXGameSaveImpl3_XGameSaveCloseContainer( gs, container );
+    return hr;
+}
+
+/* ---- package identity, resolved once from many threads ------------------ */
+
+static volatile LONG race_go, race_failures;
+static IXPersistentLocalStorageImpl3 *race_pls;
+
+static DWORD WINAPI identity_race_thread( void *arg )
+{
+    SIZE_T size = 0;
+
+    while (!race_go) YieldProcessor();
+    if (FAILED( IXPersistentLocalStorageImpl3_XPersistentLocalStorageGetPathSize( race_pls, &size ) ) || size <= 1)
+        InterlockedIncrement( &race_failures );
+    return 0;
+}
+
+/* Child: sixteen threads ask for the package's storage at the same instant,
+ * the first time anything in the process needs the package identity. */
+static int identity_race_child(void)
+{
+    HANDLE threads[16];
+    unsigned int i, started = 0;
+
+    if (FAILED( g_query( &CLSID_XPersistentLocalStorageImpl, &IID_IXPersistentLocalStorageImpl3, (void **)&race_pls ) ))
+        return 100;
+    for (i = 0; i < ARRAY_SIZE(threads); i++)
+        if ((threads[started] = CreateThread( NULL, 0, identity_race_thread, NULL, 0, NULL ))) started++;
+    Sleep( 100 );
+    race_go = 1;
+    WaitForMultipleObjects( started, threads, TRUE, 30000 );
+    for (i = 0; i < started; i++) CloseHandle( threads[i] );
+    return race_failures;
+}
+
+static void test_package_identity_race(void)
+{
+    DWORD code;
+
+    printf( "# package identity from concurrent first callers\n" );
+    code = run_child( "--identity-race", NULL );
+    CHECK( code == 0, "no first caller finds the package identity missing (%lu failed)", code );
+}
+
+/* ---- XGameSave: an unreadable container manifest ------------------------ */
+
+static void test_gamesave_unreadable_manifest(void)
+{
+    static const char scid[] = "00000000-0000-0000-0000-0000000000e3";
+    XGameSaveProviderHandle provider = NULL;
+    XGameSaveContainerHandle container = NULL;
+    XGameSaveUpdateHandle update = NULL;
+    char root[MAX_PATH], dir[MAX_PATH], folder[MAX_PATH], manifest[MAX_PATH], value[64];
+    HANDLE locked;
+    HRESULT hr;
+
+    printf( "# XGameSave with an unreadable container manifest\n" );
+    hr = IXGameSaveImpl3_XGameSaveInitializeProvider( gs, user, scid, FALSE, &provider );
+    CHECK( SUCCEEDED( hr ) && provider, "provider opens (0x%08lx)", hr );
+    if (!provider) return;
+
+    hr = IXGameSaveImpl3_XGameSaveCreateContainer( gs, provider, "manifest_test", &container );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveCreateUpdate( gs, container, "Manifest", &update );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveSubmitBlobWrite( gs, update, "progress", (UINT8 *)"chapter 9", 10 );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveSubmitBlobWrite( gs, update, "settings", (UINT8 *)"old", 4 );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveSubmitUpdate( gs, update );
+    if (update) IXGameSaveImpl3_XGameSaveCloseUpdate( gs, update );
+    if (container) IXGameSaveImpl3_XGameSaveCloseContainer( gs, container );
+    CHECK( SUCCEEDED( hr ), "a container with two blobs is written (0x%08lx)", hr );
+
+    if (!save_root( root, sizeof(root) ) || !find_entry( root, "*_000000000000000000000000000000E3", TRUE, dir, sizeof(dir) ) ||
+        !find_entry( dir, "*", TRUE, folder, sizeof(folder) ) ||
+        !find_entry( folder, "container.*", FALSE, manifest, sizeof(manifest) ))
+    {
+        CHECK( 0, "found the container manifest on disk" );
+        IXGameSaveImpl3_XGameSaveCloseProvider( gs, provider );
+        return;
+    }
+
+    /* the manifest is there but cannot be opened: another program has it */
+    locked = CreateFileA( manifest, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL );
+    CHECK( locked != INVALID_HANDLE_VALUE, "the manifest is held open without sharing" );
+    hr = write_one_blob( provider, "manifest_test", "settings", "new" );
+    CHECK( FAILED( hr ), "an update to a container whose manifest cannot be read fails (0x%08lx)", hr );
+    CloseHandle( locked );
+
+    hr = read_one_blob( provider, "manifest_test", "progress", value, sizeof(value) );
+    CHECK( SUCCEEDED( hr ) && !strcmp( value, "chapter 9" ),
+           "the container's other blob survives that update (0x%08lx, '%s')", hr, value );
+    hr = write_one_blob( provider, "manifest_test", "settings", "new" );
+    CHECK( SUCCEEDED( hr ), "once readable again, the update goes through (0x%08lx)", hr );
+    hr = read_one_blob( provider, "manifest_test", "progress", value, sizeof(value) );
+    CHECK( SUCCEEDED( hr ) && !strcmp( value, "chapter 9" ), "and keeps the other blob (0x%08lx, '%s')", hr, value );
+
+    IXGameSaveImpl3_XGameSaveDeleteContainer( gs, provider, "manifest_test" );
+    IXGameSaveImpl3_XGameSaveCloseProvider( gs, provider );
+}
+
+/* ---- XGameSave: which <XUID>_<SCID> folder is used ---------------------- */
+
+static void set_index_age( const char *dir, BOOL old )
+{
+    char path[MAX_PATH];
+    SYSTEMTIME st = { 2001, 1, 1, 1 };
+    FILETIME ft;
+    HANDLE file;
+
+    snprintf( path, sizeof(path), "%s\\containers.index", dir );
+    if (old) SystemTimeToFileTime( &st, &ft );
+    else GetSystemTimeAsFileTime( &ft );
+    file = CreateFileA( path, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL );
+    if (file == INVALID_HANDLE_VALUE) return;
+    SetFileTime( file, NULL, NULL, &ft );
+    CloseHandle( file );
+}
+
+/* Write a one-blob profile through `scid`, then move its folder to `name`. */
+static BOOL make_profile( const char *scid, const char *suffix, const char *who, const char *name, BOOL old )
+{
+    XGameSaveProviderHandle provider = NULL;
+    char root[MAX_PATH], from[MAX_PATH], pattern[64], to[MAX_PATH];
+    BOOL ok;
+
+    if (FAILED( IXGameSaveImpl3_XGameSaveInitializeProvider( gs, user, scid, FALSE, &provider ) )) return FALSE;
+    ok = SUCCEEDED( write_one_blob( provider, "profile", "who", who ) );
+    IXGameSaveImpl3_XGameSaveCloseProvider( gs, provider );
+    snprintf( pattern, sizeof(pattern), "*_%s", suffix );
+    if (!ok || !save_root( root, sizeof(root) ) || !find_entry( root, pattern, TRUE, from, sizeof(from) )) return FALSE;
+    snprintf( to, sizeof(to), "%s\\%s", root, name );
+    if (!MoveFileA( from, to )) return FALSE;
+    set_index_age( to, old );
+    return TRUE;
+}
+
+/* Child: whose profile does a provider for `scid` open? */
+static int read_owner_child( const char *scid )
+{
+    XGameSaveProviderHandle provider = NULL;
+    char who[64];
+
+    if (!(user = add_quiet_user())) return 100;
+    if (FAILED( IXGameSaveImpl3_XGameSaveInitializeProvider( gs, user, scid, FALSE, &provider ) )) return 101;
+    read_one_blob( provider, "profile", "who", who, sizeof(who) );
+    IXGameSaveImpl3_XGameSaveCloseProvider( gs, provider );
+    if (!strcmp( who, "configured" )) return 1;
+    if (!strcmp( who, "placeholder" )) return 2;
+    if (!strcmp( who, "older" )) return 3;
+    if (!strcmp( who, "newer" )) return 4;
+    return 5;
+}
+
+static void test_gamesave_user_folder_choice(void)
+{
+    static const char sfx_a[] = "0000000000000000000000000000A001", sfx_b[] = "0000000000000000000000000000B001";
+    char name[64];
+    BOOL ok;
+    DWORD code;
+
+    printf( "# XGameSave folder choice among several users\n" );
+
+    /* the configured user's folder wins, even over a newer placeholder that
+     * the directory listing returns first */
+    snprintf( name, sizeof(name), "0000000000000000_%s", sfx_a );
+    ok = make_profile( "00000000-0000-0000-0000-00000000A0F1", "0000000000000000000000000000A0F1", "placeholder", name, FALSE );
+    snprintf( name, sizeof(name), "00000000000ABCDE_%s", sfx_a );
+    ok = ok && make_profile( "00000000-0000-0000-0000-00000000A0F2", "0000000000000000000000000000A0F2", "configured", name, TRUE );
+    CHECK( ok, "two profiles for one service configuration are set up" );
+    code = run_child( "--read-owner 00000000-0000-0000-0000-00000000a001", "00000000000ABCDE" );
+    CHECK( code == 1, "XGR_XUID picks that user's folder (child %lu)", code );
+
+    /* with no user configured, the profile written last is the one in use */
+    snprintf( name, sizeof(name), "0000000000000001_%s", sfx_b );
+    ok = make_profile( "00000000-0000-0000-0000-00000000B0F1", "0000000000000000000000000000B0F1", "older", name, TRUE );
+    snprintf( name, sizeof(name), "0000000000000002_%s", sfx_b );
+    ok = ok && make_profile( "00000000-0000-0000-0000-00000000B0F2", "0000000000000000000000000000B0F2", "newer", name, FALSE );
+    CHECK( ok, "an older and a newer profile are set up" );
+    code = run_child( "--read-owner 00000000-0000-0000-0000-00000000b001", NULL );
+    CHECK( code == 4, "without XGR_XUID the most recently written profile is used (child %lu)", code );
+    code = run_child( "--read-owner 00000000-0000-0000-0000-00000000b001", NULL );
+    CHECK( code == 4, "and the same one again on the next run (child %lu)", code );
+}
+
+/* ---- XGameSave: asynchronous writes leave the caller's thread ----------- */
+
+static HANDLE hold_inside, hold_release;
+
+static BOOLEAN __stdcall hold_save_lock( const XGameSaveContainerInfo *info, void *context )
+{
+    SetEvent( hold_inside );
+    WaitForSingleObject( hold_release, 10000 );
+    return FALSE;
+}
+
+static DWORD WINAPI hold_saves_thread( void *provider )
+{
+    IXGameSaveImpl3_XGameSaveEnumerateContainerInfo( gs, provider, NULL, hold_save_lock );
+    return 0;
+}
+
+struct async_submit
+{
+    XGameSaveUpdateHandle update;
+    XAsyncBlock *async;
+    HRESULT hr;
+};
+
+static DWORD WINAPI submit_async_thread( void *arg )
+{
+    struct async_submit *submit = arg;
+    submit->hr = IXGameSaveImpl3_XGameSaveSubmitUpdateAsync( gs, submit->update, submit->async );
+    return 0;
+}
+
+static void test_gamesave_async_writes(void)
+{
+    static const char scid[] = "00000000-0000-0000-0000-0000000000f5";
+    XGameSaveProviderHandle provider = NULL;
+    XGameSaveContainerHandle container = NULL;
+    XGameSaveUpdateHandle first = NULL, second = NULL;
+    XAsyncBlock a1, a2, a3;
+    struct async_submit submit;
+    HANDLE holder = NULL, submitter;
+    char value[64];
+    int blob_count = -1;
+    BOOL returned;
+    HRESULT hr;
+
+    printf( "# XGameSave asynchronous writes\n" );
+    hr = IXGameSaveImpl3_XGameSaveInitializeProvider( gs, user, scid, FALSE, &provider );
+    CHECK( SUCCEEDED( hr ) && provider, "provider opens (0x%08lx)", hr );
+    if (!provider) return;
+    hr = write_one_blob( provider, "unit_test_container", "order", "initial" );
+    CHECK( SUCCEEDED( hr ), "a container exists to write to (0x%08lx)", hr );
+
+    /* another thread is in the middle of a save call, holding the saves */
+    hold_inside = CreateEventA( NULL, TRUE, FALSE, NULL );
+    hold_release = CreateEventA( NULL, TRUE, FALSE, NULL );
+    holder = CreateThread( NULL, 0, hold_saves_thread, provider, 0, NULL );
+    CHECK( WaitForSingleObject( hold_inside, 5000 ) == WAIT_OBJECT_0, "another thread holds the saves" );
+
+    hr = IXGameSaveImpl3_XGameSaveCreateContainer( gs, provider, "unit_test_container", &container );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveCreateUpdate( gs, container, NULL, &first );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveSubmitBlobWrite( gs, first, "order", (UINT8 *)"first", 6 );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveCreateUpdate( gs, container, NULL, &second );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveSubmitBlobWrite( gs, second, "order", (UINT8 *)"second", 7 );
+    CHECK( SUCCEEDED( hr ), "two updates are prepared (0x%08lx)", hr );
+
+    memset( &a1, 0, sizeof(a1) );
+    memset( &a2, 0, sizeof(a2) );
+    submit.update = first;
+    submit.async = &a1;
+    submit.hr = E_FAIL;
+    submitter = CreateThread( NULL, 0, submit_async_thread, &submit, 0, NULL );
+    returned = WaitForSingleObject( submitter, 2000 ) == WAIT_OBJECT_0;
+    CHECK( returned && SUCCEEDED( submit.hr ), "SubmitUpdateAsync returns without waiting for the disk (0x%08lx)", submit.hr );
+    if (returned)
+    {
+        CHECK( IXThreadingImpl_XAsyncGetStatus( threading, &a1, FALSE ) == E_PENDING, "the write is still pending" );
+        hr = IXGameSaveImpl3_XGameSaveSubmitUpdateAsync( gs, second, &a2 );
+        CHECK( SUCCEEDED( hr ), "a second update queues behind it (0x%08lx)", hr );
+        /* the title lets go of its handles straight away */
+        IXGameSaveImpl3_XGameSaveCloseUpdate( gs, first );
+        IXGameSaveImpl3_XGameSaveCloseUpdate( gs, second );
+        IXGameSaveImpl3_XGameSaveCloseContainer( gs, container );
+    }
+    SetEvent( hold_release );
+    WaitForSingleObject( holder, 15000 );
+    WaitForSingleObject( submitter, 15000 );
+    CloseHandle( holder );
+    CloseHandle( submitter );
+    CloseHandle( hold_inside );
+    CloseHandle( hold_release );
+    if (!returned)
+    {
+        IXGameSaveImpl3_XGameSaveCloseUpdate( gs, first );
+        IXGameSaveImpl3_XGameSaveCloseUpdate( gs, second );
+        IXGameSaveImpl3_XGameSaveCloseContainer( gs, container );
+    }
+    else
+    {
+        hr = IXThreadingImpl_XAsyncGetStatus( threading, &a1, TRUE );
+        CHECK( hr == S_OK && IXGameSaveImpl3_XGameSaveSubmitUpdateResult( gs, &a1 ) == S_OK,
+               "the first write completes once the saves are free (0x%08lx)", hr );
+        hr = IXThreadingImpl_XAsyncGetStatus( threading, &a2, TRUE );
+        CHECK( hr == S_OK && IXGameSaveImpl3_XGameSaveSubmitUpdateResult( gs, &a2 ) == S_OK,
+               "the second completes too (0x%08lx)", hr );
+    }
+    hr = read_one_blob( provider, "unit_test_container", "order", value, sizeof(value) );
+    CHECK( SUCCEEDED( hr ) && !strcmp( value, "second" ), "the writes reached the disk in order ('%s')", value );
+
+    memset( &a3, 0, sizeof(a3) );
+    hr = IXGameSaveImpl3_XGameSaveDeleteContainerAsync( gs, provider, "unit_test_container", &a3 );
+    CHECK( SUCCEEDED( hr ), "DeleteContainerAsync starts (0x%08lx)", hr );
+    hr = IXThreadingImpl_XAsyncGetStatus( threading, &a3, TRUE );
+    CHECK( hr == S_OK && IXGameSaveImpl3_XGameSaveDeleteContainerResult( gs, &a3 ) == S_OK,
+           "the delete completes (0x%08lx)", hr );
+    IXGameSaveImpl3_XGameSaveEnumerateContainerInfo( gs, provider, &blob_count, find_container );
+    CHECK( blob_count == -1, "and the container is gone" );
+    memset( &a3, 0, sizeof(a3) );
+    hr = IXGameSaveImpl3_XGameSaveDeleteContainerAsync( gs, provider, "bad name!", &a3 );
+    CHECK( SUCCEEDED( hr ) && IXThreadingImpl_XAsyncGetStatus( threading, &a3, TRUE ) == E_GS_INVALID_CONTAINER_NAME,
+           "an invalid name still completes with its error" );
+    IXGameSaveImpl3_XGameSaveCloseProvider( gs, provider );
+}
+
+/* ---- PFX: the cached backend copy and the provider override ------------- */
+
+static BOOL pfx_backend_paths( char *source, char *destination, size_t size, WIN32_FILE_ATTRIBUTE_DATA *attributes )
+{
+    HMODULE save = LoadLibraryA( "PlayFabGameSave.dll" );
+    char local[MAX_PATH], family[128], dir[MAX_PATH];
+    char *p;
+
+    if (!save || !GetModuleFileNameA( save, source, size ) ||
+        !GetFileAttributesExA( source, GetFileExInfoStandard, attributes ) ||
+        !GetEnvironmentVariableA( "LOCALAPPDATA", local, sizeof(local) ) ||
+        !GetEnvironmentVariableA( "XGR_EXPECTED_FAMILY", family, sizeof(family) ))
+        return FALSE;
+    snprintf( dir, sizeof(dir), "%s\\Packages\\%s\\SystemAppData\\PFXGameSave\\backend", local, family );
+    for (p = dir + 3; *p; p++) if (*p == '\\') { *p = 0; CreateDirectoryA( dir, NULL ); *p = '\\'; }
+    CreateDirectoryA( dir, NULL );
+    snprintf( destination, size, "%s\\pgs-%08lx-%08lx-%08lx.dll", dir, attributes->ftLastWriteTime.dwHighDateTime,
+              attributes->ftLastWriteTime.dwLowDateTime, attributes->nFileSizeLow );
+    return TRUE;
+}
+
+/* Child: the backend loads from a cache holding a cut-short copy, and an
+ * override an earlier run left behind is put back. */
+static int pfx_recovery_child(void)
+{
+    static const char marker_key[] = "Software\\Wine\\xgameruntime\\ForceUseInprocGameSaves";
+    struct PFXGameSaveConfigRequest request = { NULL, "4D5E6F70", "https://fixture.invalid", 0, NULL, NULL, NULL };
+    PFXGameSaveConfigHandle config = NULL;
+    IXGameSaveImpl4 *modern = NULL;
+    DWORD one = 1, value = 0, size = sizeof(value);
+    HKEY key, marker;
+    LONG status;
+    HRESULT hr;
+
+    if (!(request.requestingUser = add_quiet_user())) return 100;
+    if (!LoadLibraryA( "PlayFabCore.dll" ) || !LoadLibraryA( "PlayFabGameSave.dll" )) return 101;
+    if (FAILED( g_query( &CLSID_XGameSaveImpl, &IID_IXGameSaveImpl4, (void **)&modern ) )) return 102;
+
+    /* what a run killed inside the private SDK's initialization leaves: the
+     * override in place, and the note that the setting did not exist before */
+    RegCreateKeyExA( HKEY_LOCAL_MACHINE, "Software\\Microsoft\\GamingServices", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL );
+    RegSetValueExA( key, "ForceUseInprocGameSaves", 0, REG_DWORD, (BYTE *)&one, sizeof(one) );
+    if (!RegCreateKeyExA( HKEY_LOCAL_MACHINE, marker_key, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &marker, NULL ))
+        RegCloseKey( marker );
+
+    hr = IXGameSaveImpl4_PFXGameSaveInitializeConfig( modern, &request, &config );
+    CHECK( hr == S_OK && config, "the backend loads despite a cut-short cached copy (0x%08lx)", hr );
+    status = RegQueryValueExA( key, "ForceUseInprocGameSaves", NULL, NULL, (BYTE *)&value, &size );
+    CHECK( status == ERROR_FILE_NOT_FOUND, "an override left by an interrupted run is removed (%ld, %lu)", status, value );
+    status = RegOpenKeyExA( HKEY_LOCAL_MACHINE, marker_key, 0, KEY_READ, &marker );
+    CHECK( status == ERROR_FILE_NOT_FOUND, "and nothing is left marked as pending (%ld)", status );
+    if (!status) RegCloseKey( marker );
+    RegCloseKey( key );
+    if (config) IXGameSaveImpl4_PFXGameSaveFreeConfig( modern, config );
+    IXGameSaveImpl4_Release( modern );
+    return g_failed;
+}
+
+static void test_pfx_backend_recovery(void)
+{
+    char source[MAX_PATH], destination[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA attributes, copy;
+    HANDLE file;
+    DWORD written = 0, code;
+
+    printf( "# PFX backend copy and provider override recovery\n" );
+    if (!pfx_backend_paths( source, destination, sizeof(source), &attributes ))
+    {
+        CHECK( 0, "found the PlayFab save backend and its cache" );
+        return;
+    }
+    /* a copy cut short by a full disk or a killed process */
+    file = CreateFileA( destination, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        WriteFile( file, "MZ", 2, &written, NULL );
+        CloseHandle( file );
+    }
+    CHECK( written == 2, "a truncated backend copy is in the cache" );
+    code = run_child( "--pfx-recovery-child", NULL );
+    CHECK( code == 0, "the backend recovers in a fresh process (%lu failed)", code );
+    CHECK( GetFileAttributesExA( destination, GetFileExInfoStandard, &copy ) &&
+           copy.nFileSizeLow == attributes.nFileSizeLow && copy.nFileSizeHigh == attributes.nFileSizeHigh,
+           "the cached copy is whole again" );
+}
+
+/* ---- PFX: a reused XAsyncBlock ------------------------------------------ */
+
+static void test_pfx_reused_block(void)
+{
+    struct PFXGameSaveConfigRequest request = { user, "4D5E6F70", "https://fixture.invalid", 0, NULL, NULL, NULL };
+    PFXGameSaveConfigHandle config = NULL;
+    IXGameSaveImpl4 *modern = NULL;
+    XUserHandle added = NULL;
+    XAsyncBlock a = { 0 }, b = { 0 };
+    char folder[128], generic[128];
+    SIZE_T used = 0;
+    HRESULT hr;
+
+    printf( "# PFX operations on a reused XAsyncBlock\n" );
+    if (FAILED( g_query( &CLSID_XGameSaveImpl, &IID_IXGameSaveImpl4, (void **)&modern ) ))
+    {
+        CHECK( 0, "PFX interface is available" );
+        return;
+    }
+    hr = IXGameSaveImpl4_PFXGameSaveInitializeConfig( modern, &request, &config );
+    CHECK( hr == S_OK && config, "a configuration initializes (0x%08lx)", hr );
+    if (!config)
+    {
+        IXGameSaveImpl4_Release( modern );
+        return;
+    }
+
+    /* a block that already carries a finished result */
+    hr = IXGameSaveImpl4_PFXGameSaveFilesUploadWithUiAsync( modern, config, 0, &a );
+    CHECK( hr == S_OK && IXThreadingImpl_XAsyncGetStatus( threading, &a, TRUE ) == S_OK, "an upload completes on the block" );
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiAsync( modern, config, &a );
+    CHECK( hr == S_OK, "the same block starts a folder synchronization" );
+    CHECK( IXThreadingImpl_XAsyncGetStatus( threading, &a, FALSE ) == E_PENDING,
+           "the reused block is pending, not complete with the upload's result" );
+    CHECK( IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult( modern, &a, sizeof(folder), folder ) == E_PENDING,
+           "its result is not available yet" );
+    CHECK( IXThreadingImpl_XAsyncGetStatus( threading, &a, TRUE ) == S_OK, "the synchronization completes" );
+    hr = IXThreadingImpl_XAsyncGetResult( threading, &a, NULL, sizeof(generic), generic, &used );
+    CHECK( hr == S_OK && used == sizeof("C:\\pfx-fixture\\account-save") && !strcmp( generic, "C:\\pfx-fixture\\account-save" ),
+           "generic retrieval copies the folder path (0x%08lx)", hr );
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult( modern, &a, sizeof(folder), folder );
+    CHECK( hr == S_OK && !strcmp( folder, "C:\\pfx-fixture\\account-save" ), "the typed result returns the folder" );
+
+    /* a block that another API completed is not a folder result */
+    hr = IXUserImpl_XUserAddAsync( users, XUserAddOptions_AddDefaultUserSilently, &b );
+    CHECK( SUCCEEDED( hr ), "another API completes a block" );
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult( modern, &b, sizeof(folder), folder );
+    CHECK( hr == E_INVALIDARG, "the folder result refuses a block it did not complete (0x%08lx)", hr );
+    if (SUCCEEDED( IXUserImpl_XUserAddResult( users, &b, &added ) ) && added) IXUserImpl_XUserCloseHandle( users, added );
+
+    IXGameSaveImpl4_PFXGameSaveFreeConfig( modern, config );
+    IXGameSaveImpl4_Release( modern );
+}
+
+/* ---- XGameSave: queued writes keep their order -------------------------- */
+
+struct sync_inside_hold
+{
+    XGameSaveProviderHandle provider;
+    XGameSaveUpdateHandle update;
+    HANDLE inside, go, done;
+    HRESULT hr;
+};
+
+/* Holds the saves like hold_save_lock, then, still inside the callback, makes
+ * a synchronous update: the thread already owns the saves, so nothing about
+ * lock order decides whether it lands before or after a queued one. */
+static BOOLEAN __stdcall sync_submit_while_holding( const XGameSaveContainerInfo *info, void *context )
+{
+    struct sync_inside_hold *hold = context;
+
+    if (!hold->update) return FALSE;
+    SetEvent( hold->inside );
+    WaitForSingleObject( hold->go, 10000 );
+    hold->hr = IXGameSaveImpl3_XGameSaveSubmitUpdate( gs, hold->update );
+    hold->update = NULL;
+    SetEvent( hold->done );
+    return FALSE;
+}
+
+static DWORD WINAPI sync_submit_thread( void *context )
+{
+    struct sync_inside_hold *hold = context;
+
+    IXGameSaveImpl3_XGameSaveEnumerateContainerInfo( gs, hold->provider, hold, sync_submit_while_holding );
+    return 0;
+}
+
+static void test_gamesave_sync_after_async(void)
+{
+    static const char scid[] = "00000000-0000-0000-0000-0000000000f6";
+    XGameSaveProviderHandle provider = NULL;
+    XGameSaveContainerHandle container = NULL;
+    XGameSaveUpdateHandle early = NULL, late = NULL;
+    struct sync_inside_hold hold;
+    XAsyncBlock async;
+    HANDLE thread;
+    char value[64];
+    HRESULT hr;
+
+    printf( "# XGameSave synchronous update after a queued one\n" );
+    hr = IXGameSaveImpl3_XGameSaveInitializeProvider( gs, user, scid, FALSE, &provider );
+    CHECK( SUCCEEDED( hr ) && provider, "provider opens (0x%08lx)", hr );
+    if (!provider) return;
+    hr = write_one_blob( provider, "order_container", "order", "initial" );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveCreateContainer( gs, provider, "order_container", &container );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveCreateUpdate( gs, container, NULL, &early );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveSubmitBlobWrite( gs, early, "order", (UINT8 *)"async", 6 );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveCreateUpdate( gs, container, NULL, &late );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveSubmitBlobWrite( gs, late, "order", (UINT8 *)"sync", 5 );
+    CHECK( SUCCEEDED( hr ), "an async and a later synchronous update are prepared (0x%08lx)", hr );
+    if (FAILED( hr )) goto done;
+
+    memset( &hold, 0, sizeof(hold) );
+    hold.provider = provider;
+    hold.update = late;
+    hold.hr = E_FAIL;
+    hold.inside = CreateEventA( NULL, TRUE, FALSE, NULL );
+    hold.go = CreateEventA( NULL, TRUE, FALSE, NULL );
+    hold.done = CreateEventA( NULL, TRUE, FALSE, NULL );
+    thread = CreateThread( NULL, 0, sync_submit_thread, &hold, 0, NULL );
+    CHECK( WaitForSingleObject( hold.inside, 5000 ) == WAIT_OBJECT_0, "another thread holds the saves" );
+
+    /* the async update is made first, the synchronous one after it */
+    memset( &async, 0, sizeof(async) );
+    hr = IXGameSaveImpl3_XGameSaveSubmitUpdateAsync( gs, early, &async );
+    CHECK( SUCCEEDED( hr ), "the async update is queued (0x%08lx)", hr );
+    SetEvent( hold.go );
+    CHECK( WaitForSingleObject( hold.done, 10000 ) == WAIT_OBJECT_0 && hold.hr == S_OK,
+           "the synchronous update is made after it (0x%08lx)", hold.hr );
+    WaitForSingleObject( thread, 15000 );
+    CloseHandle( thread );
+    CloseHandle( hold.inside );
+    CloseHandle( hold.go );
+    CloseHandle( hold.done );
+
+    hr = IXThreadingImpl_XAsyncGetStatus( threading, &async, TRUE );
+    CHECK( hr == S_OK, "the async update completes (0x%08lx)", hr );
+    hr = read_one_blob( provider, "order_container", "order", value, sizeof(value) );
+    CHECK( SUCCEEDED( hr ) && !strcmp( value, "sync" ), "the later synchronous update is what is on disk ('%s')", value );
+
+done:
+    if (early) IXGameSaveImpl3_XGameSaveCloseUpdate( gs, early );
+    if (late) IXGameSaveImpl3_XGameSaveCloseUpdate( gs, late );
+    if (container) IXGameSaveImpl3_XGameSaveCloseContainer( gs, container );
+    IXGameSaveImpl3_XGameSaveCloseProvider( gs, provider );
+}
+
+/* ---- XGameSave: an async call from inside an enumeration ---------------- */
+
+struct reentrant_call
+{
+    XGameSaveProviderHandle provider;
+    XGameSaveContainerHandle container;
+    XAsyncBlock async;
+    HRESULT started, status;
+    BOOL called;
+};
+
+/* Poll for up to three seconds rather than wait: if the call cannot finish
+ * while the callback runs, a wait would never return. */
+static HRESULT poll_status( XAsyncBlock *async )
+{
+    HRESULT hr;
+    DWORD start = GetTickCount();
+
+    while ((hr = IXThreadingImpl_XAsyncGetStatus( threading, async, FALSE )) == E_PENDING &&
+           GetTickCount() - start < 3000)
+        Sleep( 10 );
+    return hr;
+}
+
+static BOOLEAN __stdcall delete_from_enumeration( const XGameSaveContainerInfo *info, void *context )
+{
+    struct reentrant_call *call = context;
+
+    if (call->called || strcmp( info->name, "reentrant_delete" )) return TRUE;
+    call->called = TRUE;
+    memset( &call->async, 0, sizeof(call->async) );
+    call->started = IXGameSaveImpl3_XGameSaveDeleteContainerAsync( gs, call->provider, info->name, &call->async );
+    call->status = poll_status( &call->async );
+    return FALSE;
+}
+
+static BOOLEAN __stdcall submit_from_enumeration( const XGameSaveBlobInfo *info, void *context )
+{
+    struct reentrant_call *call = context;
+    XGameSaveUpdateHandle update = NULL;
+
+    if (call->called) return FALSE;
+    call->called = TRUE;
+    call->started = IXGameSaveImpl3_XGameSaveCreateUpdate( gs, call->container, NULL, &update );
+    if (SUCCEEDED( call->started ))
+        call->started = IXGameSaveImpl3_XGameSaveSubmitBlobWrite( gs, update, "inner", (UINT8 *)"written", 8 );
+    memset( &call->async, 0, sizeof(call->async) );
+    if (SUCCEEDED( call->started )) call->started = IXGameSaveImpl3_XGameSaveSubmitUpdateAsync( gs, update, &call->async );
+    if (update) IXGameSaveImpl3_XGameSaveCloseUpdate( gs, update );
+    call->status = SUCCEEDED( call->started ) ? poll_status( &call->async ) : call->started;
+    return FALSE;
+}
+
+static BOOLEAN __stdcall find_reentrant_delete( const XGameSaveContainerInfo *info, void *context )
+{
+    if (!strcmp( info->name, "reentrant_delete" )) *(BOOL *)context = TRUE;
+    return TRUE;
+}
+
+static void test_gamesave_async_from_callback(void)
+{
+    static const char scid[] = "00000000-0000-0000-0000-0000000000f7";
+    XGameSaveProviderHandle provider = NULL;
+    struct reentrant_call call;
+    char value[64];
+    BOOL found = FALSE;
+    HRESULT hr;
+
+    printf( "# XGameSave async calls from inside an enumeration callback\n" );
+    hr = IXGameSaveImpl3_XGameSaveInitializeProvider( gs, user, scid, FALSE, &provider );
+    CHECK( SUCCEEDED( hr ) && provider, "provider opens (0x%08lx)", hr );
+    if (!provider) return;
+    hr = write_one_blob( provider, "reentrant_delete", "blob", "doomed" );
+    if (SUCCEEDED( hr )) hr = write_one_blob( provider, "reentrant_submit", "outer", "present" );
+    CHECK( SUCCEEDED( hr ), "two containers exist (0x%08lx)", hr );
+
+    memset( &call, 0, sizeof(call) );
+    call.provider = provider;
+    IXGameSaveImpl3_XGameSaveEnumerateContainerInfo( gs, provider, &call, delete_from_enumeration );
+    CHECK( call.called && SUCCEEDED( call.started ), "DeleteContainerAsync starts inside the callback (0x%08lx)", call.started );
+    CHECK( call.status == S_OK, "and completes while the callback still runs (0x%08lx)", call.status );
+    if (call.status == E_PENDING) IXThreadingImpl_XAsyncGetStatus( threading, &call.async, TRUE );
+    IXGameSaveImpl3_XGameSaveEnumerateContainerInfo( gs, provider, &found, find_reentrant_delete );
+    CHECK( !found, "the container is gone" );
+
+    memset( &call, 0, sizeof(call) );
+    call.provider = provider;
+    hr = IXGameSaveImpl3_XGameSaveCreateContainer( gs, provider, "reentrant_submit", &call.container );
+    if (SUCCEEDED( hr )) IXGameSaveImpl3_XGameSaveEnumerateBlobInfo( gs, call.container, &call, submit_from_enumeration );
+    CHECK( call.called && SUCCEEDED( call.started ), "SubmitUpdateAsync starts inside a blob callback (0x%08lx)", call.started );
+    CHECK( call.status == S_OK, "and completes while the callback still runs (0x%08lx)", call.status );
+    if (call.status == E_PENDING) IXThreadingImpl_XAsyncGetStatus( threading, &call.async, TRUE );
+    if (call.container) IXGameSaveImpl3_XGameSaveCloseContainer( gs, call.container );
+    hr = read_one_blob( provider, "reentrant_submit", "inner", value, sizeof(value) );
+    CHECK( SUCCEEDED( hr ) && !strcmp( value, "written" ), "the update is on disk ('%s')", value );
+    IXGameSaveImpl3_XGameSaveCloseProvider( gs, provider );
+}
+
+/* ---- XGameSave: a queued save when the title quits ---------------------- */
+
+static const char exit_save_scid[] = "00000000-0000-0000-0000-0000000000f8";
+
+/* Child: submit a save asynchronously and quit at once, without waiting. */
+static int exit_after_async_save_child( const char *container_name )
+{
+    XGameSaveProviderHandle provider = NULL;
+    XGameSaveContainerHandle container = NULL;
+    XGameSaveUpdateHandle update = NULL;
+    static XAsyncBlock async;
+    XUserHandle owner;
+
+    if (!(owner = add_quiet_user())) return 100;
+    if (FAILED( IXGameSaveImpl3_XGameSaveInitializeProvider( gs, owner, exit_save_scid, FALSE, &provider ) )) return 101;
+    if (FAILED( IXGameSaveImpl3_XGameSaveCreateContainer( gs, provider, container_name, &container ) )) return 102;
+    if (FAILED( IXGameSaveImpl3_XGameSaveCreateUpdate( gs, container, NULL, &update ) )) return 103;
+    if (FAILED( IXGameSaveImpl3_XGameSaveSubmitBlobWrite( gs, update, "last", (UINT8 *)"kept", 5 ) )) return 104;
+    if (FAILED( IXGameSaveImpl3_XGameSaveSubmitUpdateAsync( gs, update, &async ) )) return 105;
+    ExitProcess( 0 );
+}
+
+static void test_gamesave_queued_at_exit(void)
+{
+    XGameSaveProviderHandle provider = NULL;
+    char args[64], name[32], value[64];
+    int i, kept = 0;
+    DWORD code;
+    HRESULT hr;
+
+    printf( "# XGameSave async save made just before the title quits\n" );
+    for (i = 0; i < 4; i++)
+    {
+        snprintf( name, sizeof(name), "exit_save_%d", i );
+        snprintf( args, sizeof(args), "--exit-after-async-save %s", name );
+        code = run_child( args, NULL );
+        CHECK( code == 0, "child %d submits and quits (%lu)", i, code );
+    }
+    hr = IXGameSaveImpl3_XGameSaveInitializeProvider( gs, user, exit_save_scid, FALSE, &provider );
+    CHECK( SUCCEEDED( hr ) && provider, "provider opens (0x%08lx)", hr );
+    if (!provider) return;
+    for (i = 0; i < 4; i++)
+    {
+        snprintf( name, sizeof(name), "exit_save_%d", i );
+        if (SUCCEEDED( read_one_blob( provider, name, "last", value, sizeof(value) ) ) && !strcmp( value, "kept" )) kept++;
+    }
+    CHECK( kept == 4, "every save submitted before quitting is on disk (%d of 4)", kept );
+    IXGameSaveImpl3_XGameSaveCloseProvider( gs, provider );
 }

@@ -222,7 +222,10 @@ directory. Close Steam before adding or updating a shortcut.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — the plan for turning this into a launcher.
 - [notes/](notes/) — the debugging write-ups. Worth reading if you want to know
   *why* something is the way it is; several were genuinely hard to find.
-- [CONTRIBUTING.md](CONTRIBUTING.md) — adding a title, running the tests.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — building (Rust 1.88 or newer), adding a
+  title, running the tests.
+- [docs/RELEASING.md](docs/RELEASING.md) — cutting a release, and the minisign
+  key that signs it.
 
 ## Licence
 

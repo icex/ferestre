@@ -4,26 +4,223 @@
 The normal Xodus client supplies WINE_DLL_FILE_MAP. Its plaintext stays in
 memory: this helper copies it to tmpfs and binds it over the encrypted files
 only in the launch's user/mount namespace. The package on disk is untouched.
+
+The window's Stop asks a title to close before it ends it, with Wine's own
+`taskkill` (no /F), which posts WM_CLOSE. From outside the view that request
+would not reach the title's private Wine server, so the window sends it here
+instead, on the stop channel the launch inherits (FERESTRE_STOP_FD), and this
+helper runs the same `taskkill` inside its namespace; see serve_stop and
+crates/ferestre-gui/src/stop.rs.
 """
 
 import os
 import ctypes
+import fcntl
 from pathlib import Path
 import shutil
 import signal
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+
+# How long the launch waits for a Wine session on its prefix that started
+# outside the view; see wait_for_outside_server.
+SERVER_WAIT = 10
+
+# The variable naming this launch's end of the window's stop channel.
+CHANNEL_FD = "FERESTRE_STOP_FD"
+# How long the close request's `taskkill` may take, as in the window.
+ASK_LIMIT = 10
+
+# Wine's own processes, and Proton's launcher, which own no window a person
+# would close. The window keeps the same list (crates/ferestre-gui/src/stop.rs).
+SYSTEM_IMAGES = (
+    "conhost.exe",
+    "explorer.exe",
+    "plugplay.exe",
+    "rpcss.exe",
+    "rundll32.exe",
+    "services.exe",
+    "start.exe",
+    "steam.exe",
+    "svchost.exe",
+    "tabtip.exe",
+    "taskkill.exe",
+    "wineboot.exe",
+    "winedevice.exe",
+    "winemenubuilder.exe",
+)
+
+# What Wine's loader hands one process of its own: its server connection and
+# its preloader's reservation, meaningless in any other process. None of them
+# goes with the close request, and nor does the stop channel.
+LOADER_PRIVATE = (
+    "WINESERVERSOCKET",
+    "WINEPRELOADRESERVE",
+    "WINELOADERNOEXEC",
+    "FERESTRE_STOP_FD",
+)
+
+
+def children_of(pid):
+    """Every child of every thread of `pid`: the stop channel's thread
+    starts children of its own."""
+    children = []
+    try:
+        tasks = os.listdir(f"/proc/{pid}/task")
+    except (FileNotFoundError, ProcessLookupError):
+        return []
+    for task in tasks:
+        try:
+            children += [int(n) for n in Path(f"/proc/{pid}/task/{task}/children").read_text().split()]
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+    return children
 
 
 def descendants(pid):
-    try:
-        children = [int(n) for n in Path(f"/proc/{pid}/task/{pid}/children").read_text().split()]
-    except (FileNotFoundError, ProcessLookupError):
-        return []
+    children = children_of(pid)
     return children + [child for parent in children for child in descendants(parent)]
+
+
+def image_name(cmdline):
+    """The Windows image a Wine process runs, as `taskkill /IM` matches it.
+
+    Wine rewrites a process's argument list so the first argument is the
+    Windows path of its executable. None for Wine's own processes and for
+    anything that is not Wine.
+    """
+    first = cmdline.split(b"\0", 1)[0].decode("utf-8", "replace")
+    name = first.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    lower = name.lower()
+    if not lower.endswith(".exe") or lower in SYSTEM_IMAGES:
+        return None
+    return name
+
+
+def environment(data):
+    env = {}
+    for pair in data.split(b"\0"):
+        key, equals, value = pair.partition(b"=")
+        if equals and key:
+            key = os.fsdecode(key)
+            if key not in LOADER_PRIVATE:
+                env[key] = os.fsdecode(value)
+    return env
+
+
+def wine_processes(pids, proc=Path("/proc")):
+    """The Windows processes among `pids`, as (pid, image, environment)."""
+    found = []
+    for pid in sorted(set(pids)):
+        try:
+            env = environment((proc / str(pid) / "environ").read_bytes())
+            cmdline = (proc / str(pid) / "cmdline").read_bytes()
+        except OSError:
+            continue
+        image = image_name(cmdline)
+        if "WINEPREFIX" in env and image:
+            found.append((pid, image, env))
+    return found
+
+
+def close_command(wine, found):
+    """The `taskkill` that asks every one of `found` to close, run as the first
+    of them would be, as (argv, environment). None when there is nothing to
+    ask. The same request the window makes for a title outside a view."""
+    if not found:
+        return None
+    named = []
+    for _, image, _ in found:
+        if not any(n.lower() == image.lower() for n in named):
+            named.append(image)
+    argv = [wine, "taskkill"]
+    for image in named:
+        argv += ["/IM", image]
+    return argv, dict(found[0][2])
+
+
+def ask_to_close(wine, uid, gid):
+    """Ask this launch's title to close, from inside its namespace. Whether
+    anything was asked."""
+    if not os.path.isabs(wine) or not os.access(wine, os.X_OK):
+        return False
+    command = close_command(wine, wine_processes(descendants(os.getpid())))
+    if command is None:
+        return False
+    argv, env = command
+    try:
+        # As the caller, like the title, so that Wine finds the title's
+        # server in the private folder rather than starting another.
+        close = subprocess.Popen(argv, env=env, cwd="/", stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True, preexec_fn=as_caller(uid, gid))
+    except (OSError, subprocess.SubprocessError):
+        return False
+    try:
+        # taskkill exits non-zero when one of the images has no window to
+        # close, which is common and says nothing about the ones that did.
+        close.wait(timeout=ASK_LIMIT)
+        return True
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(close.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        close.kill()
+        close.wait()
+        return False
+
+
+def stop_channel(value):
+    """This launch's end of the window's stop channel, named by `value`, or
+    None. A descriptor that is not a Unix stream socket is left alone: the
+    number may have been reused for something else on the way here."""
+    try:
+        descriptor = int(value)
+    except (TypeError, ValueError):
+        return None
+    if descriptor < 3:
+        return None
+    try:
+        if not stat.S_ISSOCK(os.fstat(descriptor).st_mode):
+            return None
+        channel = socket.socket(fileno=descriptor)
+    except OSError:
+        return None
+    if channel.family != socket.AF_UNIX or channel.type != socket.SOCK_STREAM:
+        channel.detach()
+        return None
+    channel.set_inheritable(False)
+    return channel
+
+
+def serve_stop(channel, ask):
+    """Answer the window's close requests until it lets go of the channel.
+
+    Says `ready` first. A request is `close <wine>`, with the `wine` of the
+    title's runtime; the answer is `asked` when `ask(wine)` asked anything
+    and `none` when there was nothing to ask. The window ends the title
+    itself if it has not exited a while later, or at a second press of Stop.
+    """
+    try:
+        channel.sendall(b"ready\n")
+        with channel.makefile("rb") as requests:
+            for line in requests:
+                if not line.endswith(b"\n"):
+                    break
+                verb, _, wine = line[:-1].partition(b" ")
+                if verb != b"close":
+                    continue
+                asked = ask(os.fsdecode(wine))
+                channel.sendall(b"asked\n" if asked else b"none\n")
+    except OSError:
+        pass
 
 
 def stop_descendants():
@@ -54,6 +251,113 @@ def stop_descendants():
         raise OSError("launch descendants did not exit")
 
 
+def as_caller(uid, gid):
+    """Return a preexec hook that gives the launch the caller's own ids back.
+
+    Mounting needs root in this namespace, but Wine keys its server directory
+    on getuid(): as uid 0 it would use /tmp/.wine-0, which another user can own
+    or create first. A nested user namespace maps the caller's ids onto this
+    one's root. It shares the mount namespace, so the private views stay in
+    place, and the launch ends up with no capabilities over them.
+    """
+    def enter():
+        if hasattr(os, "unshare"):
+            os.unshare(os.CLONE_NEWUSER)
+        else:
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.unshare(0x10000000):  # CLONE_NEWUSER
+                raise OSError(ctypes.get_errno(), "could not create the launch's user namespace")
+        Path("/proc/self/setgroups").write_text("deny")
+        Path("/proc/self/uid_map").write_text(f"{uid} 0 1")
+        Path("/proc/self/gid_map").write_text(f"{gid} 0 1")
+    return enter
+
+
+def outside_server_lock(uid):
+    """The lock file of a wineserver already serving this prefix, if any.
+
+    Wine names the server directory after the prefix's device and inode, and
+    the server holds a write lock on its lock file for as long as it runs.
+    """
+    prefix = os.environ.get("WINEPREFIX")
+    if not prefix and os.environ.get("STEAM_COMPAT_DATA_PATH"):
+        prefix = os.path.join(os.environ["STEAM_COMPAT_DATA_PATH"], "pfx")
+    if not prefix:
+        return None
+    try:
+        info = os.stat(prefix)
+    except OSError:
+        return None
+    return Path(f"/tmp/.wine-{uid}/server-{info.st_dev:x}-{info.st_ino:x}/lock")
+
+
+def server_running(lock):
+    # Waiting is a courtesy to the registry; the private server directory is
+    # what keeps the view safe, so a lock that cannot be read counts as free.
+    try:
+        fd = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        # struct flock: l_type, l_whence, l_start, l_len, l_pid. F_GETLK only
+        # reports a conflicting lock; it does not register with the server
+        # the way connecting to its socket would.
+        probe = struct.pack("hhqqi4x", fcntl.F_WRLCK, os.SEEK_SET, 0, 1, 0)
+        held = struct.unpack("hhqqi4x", fcntl.fcntl(fd, fcntl.F_GETLK, probe))
+        return held[0] != fcntl.F_UNLCK
+    finally:
+        os.close(fd)
+
+
+def wait_for_outside_server(uid, limit=SERVER_WAIT):
+    """Let a session started outside the view end before the launch.
+
+    The launch gets a server of its own (see private_server_dir), and two
+    servers on one prefix each save the registry when they exit, the later
+    one over the earlier. The shim's own `proton run reg add` leaves such a
+    session behind for a few seconds on a prefix's first launch. One that
+    outlasts the limit is another title on the prefix: the launch goes ahead
+    beside it rather than wait for it to be closed.
+    """
+    lock = outside_server_lock(uid)
+    if lock is None:
+        return
+    deadline = time.monotonic() + limit
+    while server_running(lock):
+        if time.monotonic() >= deadline:
+            print("ferestre: a Wine session for this prefix is still running outside the "
+                  "private image view; registry changes made by one of them may be lost",
+                  file=sys.stderr)
+            return
+        time.sleep(0.1)
+
+
+def private_server_dir(uid):
+    """Give the launch a Wine server directory that only this view can see.
+
+    Wine's client sends the server the Unix path of each file it opens, and
+    the server opens it. A server started outside this mount namespace would
+    open the encrypted package files, not the private images bound over them,
+    so the launch must never join one. A tmpfs over /tmp/.wine-<uid> hides
+    every outside server: the launch starts its own, here, which sees the
+    view. The tmpfs is owned by this namespace's root, which is the caller in
+    the launch's namespace, so Wine accepts it as its own.
+    """
+    base = Path(f"/tmp/.wine-{uid}")
+    try:
+        base.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    info = os.lstat(base)
+    # Owned by the caller (root here), a directory in sticky /tmp cannot be
+    # swapped for a link by anyone else between this check and the mount.
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise ValueError(f"{base} is not a directory owned by this user")
+    subprocess.run(["mount", "-t", "tmpfs", "-o", "mode=0700,nodev,nosuid",
+                    "tmpfs", str(base)], check=True)
+    return base
+
+
 def image_entries(mapping, root):
     if not mapping:
         raise ValueError("the client supplied no decrypted image descriptors")
@@ -80,7 +384,8 @@ def main():
     inside = args[:1] == ["--inside"]
     if inside:
         parent_mount = args[1]
-        args = args[2:]
+        uid, gid = int(args[2]), int(args[3])
+        args = args[4:]
         if os.readlink("/proc/self/ns/mnt") == parent_mount:
             raise ValueError("refusing to mount images outside a private namespace")
     if args[:1] == ["--"]:
@@ -92,9 +397,11 @@ def main():
         os.execvp("unshare", [
             "unshare", "--user", "--map-root-user", "--mount",
             "--propagation", "private", sys.executable, str(Path(__file__).resolve()),
-            "--inside", os.readlink("/proc/self/ns/mnt"), "--", *args,
+            "--inside", os.readlink("/proc/self/ns/mnt"), str(os.getuid()), str(os.getgid()),
+            "--", *args,
         ])
 
+    channel = stop_channel(os.environ.pop(CHANNEL_FD, None))
     targets = []
     signal.signal(signal.SIGTERM, signal.default_int_handler)
     # Wine can detach its processes from Proton. Adopt those orphans so Stop
@@ -105,6 +412,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="ferestre-images-") as directory:
         stage = Path(directory)
         mounted = False
+        server_dir = None
         try:
             size = sum((n + 4095) // 4096 * 4096 for _, _, n in entries) + 8 * 1024 * 1024
             subprocess.run(["mount", "-t", "tmpfs", "-o",
@@ -125,10 +433,21 @@ def main():
                 subprocess.run(["mount", "--bind", str(source), str(target)], check=True)
                 targets.append(target)
                 subprocess.run(["mount", "-o", "remount,bind,ro", str(target)], check=True)
+            wait_for_outside_server(uid)
+            server_dir = private_server_dir(uid)
             env = dict(os.environ)
             env.pop("WINE_DLL_FILE_MAP", None)
             env.pop("FERESTRE_IMAGE_VIEW", None)
-            result = subprocess.call(args, env=env, close_fds=True)
+            with subprocess.Popen(args, env=env, close_fds=True,
+                                  preexec_fn=as_caller(uid, gid)) as launch:
+                if channel is not None:
+                    threading.Thread(target=serve_stop, daemon=True, args=(
+                        channel, lambda wine: ask_to_close(wine, uid, gid))).start()
+                try:
+                    result = launch.wait()
+                except BaseException:
+                    launch.kill()
+                    raise
             if result == 0:
                 # The bootstrapper may exit after handing off to another game
                 # image (Halo's campaign does this). Keep both the namespace
@@ -143,6 +462,8 @@ def main():
             try:
                 stop_descendants()
             finally:
+                if server_dir:
+                    subprocess.run(["umount", "-l", str(server_dir)], check=False)
                 for target in reversed(targets):
                     subprocess.run(["umount", "-l", str(target)], check=False)
                 if mounted:
@@ -154,6 +475,6 @@ if __name__ == "__main__":
         sys.exit(main())
     except KeyboardInterrupt:
         sys.exit(130)
-    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
         print(f"ferestre: could not prepare the private image view: {error}", file=sys.stderr)
         sys.exit(1)

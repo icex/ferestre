@@ -312,11 +312,18 @@ if [ -n "$CLIENT_BIN" ]; then
     [ -x "$CLIENT_BIN" ] || die "--client is not an executable: $CLIENT_BIN"
     say "client: $CLIENT_BIN"
     install -Dm755 "$CLIENT_BIN" "$APPDIR/usr/lib/ferestre/client/xodus-cli"
-    if [ -x "$(dirname "$CLIENT_BIN")/xodus-service" ]; then
-        install -Dm755 "$(dirname "$CLIENT_BIN")/xodus-service" \
-            "$APPDIR/usr/lib/ferestre/client/xodus-service"
-        sha256sum "$APPDIR/usr/lib/ferestre/client/xodus-service" | cut -d' ' -f1 > "$APPDIR/usr/lib/ferestre/client/SERVICE_ID"
-    fi
+    # The client is only half of what signs in: every title's Xbox calls go
+    # through xodus-service, and the launcher binds a title to the service
+    # named by SERVICE_ID. A client bundled without it builds a clean-looking
+    # AppImage in which no title can reach Xbox Live, so it is an error rather
+    # than something to skip.
+    [ -x "$(dirname "$CLIENT_BIN")/xodus-service" ] || die \
+        "--client was given but there is no executable xodus-service beside it" \
+        "looked for: $(dirname "$CLIENT_BIN")/xodus-service" \
+        "build both: cargo build --release -p xodus-cli -p xodus-service"
+    install -Dm755 "$(dirname "$CLIENT_BIN")/xodus-service" \
+        "$APPDIR/usr/lib/ferestre/client/xodus-service"
+    sha256 "$APPDIR/usr/lib/ferestre/client/xodus-service" > "$APPDIR/usr/lib/ferestre/client/SERVICE_ID"
 fi
 if [ -n "$BUNDLED_RUNTIME" ]; then
     [ -d "$BUNDLED_RUNTIME" ] || die "--runtime is not a directory: $BUNDLED_RUNTIME"
@@ -455,6 +462,14 @@ chmod +x "$OUT_FILE"
 # The point of this section is that nobody should learn about their host's FUSE
 # situation from a stack trace. Try the normal path, then the fallback, and say
 # plainly which worked.
+#
+# It is also the only check between a build and a release that the packaged
+# command starts at all, so a launcher that cannot answer `version` fails the
+# build. The launcher implements `version` (Cmd::Version in ferestre-cli) just as
+# the placeholder does, so a nonzero exit there is a broken package -- a missing
+# shared library, or a panic before the arguments are even read -- and not a
+# different command surface. The no-FUSE fallback is the deciding run: a host
+# without FUSE is forgiven, a command that fails without mounting is not.
 fuse_ok=unknown
 if [ "$SELF_TEST" -eq 1 ]; then
     say "self-test: running it the way a user would"
@@ -463,34 +478,28 @@ if [ "$SELF_TEST" -eq 1 ]; then
         say "  mounted and ran: $(printf '%s' "$out" | tail -1)"
     elif printf '%s' "$out" | grep -qiE 'fuse|cannot mount'; then
         # The runtime could not mount the squashfs. That is the host's FUSE
-        # setup, and it says nothing about whether the packaged command works.
+        # setup, and it says nothing about whether the packaged command works;
+        # the fallback below is what decides that.
         fuse_ok=no
         warn "  the AppImage could not mount itself here:"
         printf '%s\n' "$out" | sed 's/^/     /' >&2
         warn "  a property of this build host, not of the AppImage"
     else
-        # It mounted and started; whatever ran inside is what returned nonzero.
-        # Do not blame FUSE for that, or the final advice below is wrong.
-        fuse_ok=yes
-        warn "  it mounted, but the packaged command exited nonzero:"
+        # Most likely it mounted and the command inside is what returned
+        # nonzero, but a runtime that words its mount failure differently would
+        # land here too. The fallback below runs the same command without
+        # mounting, so it decides: if that fails as well the package is broken.
+        warn "  the packaged command exited nonzero:"
         printf '%s\n' "$out" | sed 's/^/     /' >&2
     fi
 
     say "self-test: --appimage-extract-and-run (the no-FUSE fallback)"
     if out=$("$OUT_FILE" --appimage-extract-and-run version 2>&1); then
         say "  ran: $(printf '%s' "$out" | tail -1)"
-    elif [ "$PLACEHOLDER" -eq 1 ]; then
-        # The placeholder's command surface is ours, so this is a build bug.
-        die "the AppImage does not run even with --appimage-extract-and-run" \
+    else
+        die "the AppImage does not run 'version' even with --appimage-extract-and-run" \
             "$out" \
             "the staged AppDir is at $APPDIR"
-    else
-        # A real launcher's command surface is not ours to assume; it may not
-        # spell "version" the way the placeholder does. Report, do not fail.
-        warn "  the packaged launcher did not answer 'version':"
-        printf '%s\n' "$out" | sed 's/^/     /' >&2
-        warn "  if that is just a different CLI, ignore it; the self-test cannot"
-        warn "  then confirm anything beyond the AppImage having been produced"
     fi
 
     # Proves the shell scripts made it in and are readable from the mount.

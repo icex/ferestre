@@ -1,0 +1,3499 @@
+From: Ferestre contributors
+Subject: Check what the download writes, and stop when it fails
+
+A streaming install trusted the package completely and reported success
+whatever happened.
+
+Names: every file name in the package -- from its segment metadata or its
+NTFS directory -- is rebuilt from plain components before it is joined to
+the destination. A name that is empty, absolute, carries a drive letter,
+stream, NUL or `.`/`..` component is refused, and the whole install with
+it, before anything is fetched. `run` and `download` apply the same rule.
+An NTFS name holding a separator is refused where it is read.
+
+Integrity: an https CDN root from the package service is preferred; a
+plain http root is used as listed, since the Xbox CDN hosts do not answer
+https for their own names, with a note on stderr (XODUS_REQUIRE_HTTPS_CDN=1
+refuses it instead). `XvdFile::parse_verified` checks the hash tree against the
+header's top hash level by level, then the metadata pages (file table,
+segment metadata, region table) against the tree; the NTFS pages are
+checked as they are read, and every page of every file before it is
+decrypted or written. A damaged page is fetched again, three times at most,
+then the file fails. The header signature is not checked, so the header is
+as trustworthy as the connection it came over. The installed container
+and `run` keep the unchecked `XvdFile::parse`.
+
+Retries: a dropped connection is retried with a doubling wait (1 s to 30 s)
+and given up on after five minutes without a good page; 4xx answers other
+than 408 and 429, and a 200 to a range request, fail at once. Write errors
+are returned instead of retried every 30 s forever. A resumed header
+connection that delivers nothing is retried eight times, then fails.
+
+Result: `streaming` and `extract` exit 1 when the licence is refused, the
+disk is full, or any file fails; the first failing file stops the rest, and
+the container is committed only when every file arrived. Each file is
+written under a temporary name beside it and renamed into place only when
+complete, so neither the failing file nor one stopped mid-write because of
+it is left half written, and a file an update was replacing keeps its old
+contents. The commit flushes the filesystem, renames over the old
+record and syncs the directory. An unreadable old record means "nothing
+installed" rather than a panic, and a file the record lists is fetched
+again if it is missing or the wrong length on disk. Network and sign-in
+failures in the package lookup are reported instead of panicking, the
+progress label is cut on a character boundary, and the final JSON progress
+line is waited for before exiting.
+
+diff --git a/Cargo.lock b/Cargo.lock
+index df6d4db..3093845 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3358,6 +3358,7 @@ dependencies = [
+  "ntfs",
+  "num_enum",
+  "reqwest 0.13.4",
++ "sha2 0.11.0",
+  "thiserror 2.0.20",
+  "tokio",
+  "tokio-util",
+diff --git a/crates/msixvc/Cargo.toml b/crates/msixvc/Cargo.toml
+index d68d8e1..d1961a9 100644
+--- a/crates/msixvc/Cargo.toml
++++ b/crates/msixvc/Cargo.toml
+@@ -22,3 +22,4 @@ num_enum = "0.7.6"
+ tokio-util = { version = "0.7.19", features = ["io-util"] }
+ typenum = { version = "1.20.1", features = ["const-generics"] }
+ zerocopy = { version = "0.8.56", features = ["derive"] }
++sha2 = "0.11.0"
+diff --git a/crates/msixvc/src/streaming.rs b/crates/msixvc/src/streaming.rs
+index 6b06065..eef0be2 100644
+--- a/crates/msixvc/src/streaming.rs
++++ b/crates/msixvc/src/streaming.rs
+@@ -2,6 +2,7 @@ use std::future::Future;
+ use std::io::{Error, ErrorKind, SeekFrom};
+ use std::pin::Pin;
+ use std::task::{Context, Poll};
++use std::time::Duration;
+ 
+ use bytes::Bytes;
+ use futures_util::Stream;
+@@ -11,6 +12,13 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
+ 
+ const UPSTREAM_READ_CHUNK_SIZE: usize = 64 * 1024;
+ 
++/// How many times in a row a resumed connection may deliver nothing before the
++/// read fails. Each is waited for longer than the last, from `RESUME_DELAY` up
++/// to `RESUME_MAX_DELAY`.
++const RESUME_ATTEMPTS: u32 = 8;
++const RESUME_DELAY: Duration = Duration::from_secs(1);
++const RESUME_MAX_DELAY: Duration = Duration::from_secs(30);
++
+ type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+ type PendingHttpOpen = Pin<Box<dyn Future<Output = std::io::Result<OpenedHttpStream>> + Send>>;
+ 
+@@ -18,6 +26,8 @@ struct ActiveHttpStream {
+     next_offset: u64,
+     end_offset: u64,
+     stream: ByteStream,
++    /// Whether this connection has brought any bytes yet.
++    delivered: bool,
+ }
+ 
+ struct OpenedHttpStream {
+@@ -36,6 +46,12 @@ pub struct HttpRead<'t> {
+     pending_chunk: Option<Bytes>,
+     pending_chunk_offset: usize,
+     progress: Option<Box<dyn FnMut(u64, u64) + Send + 't>>,
++    /// Resumes in a row that delivered nothing. A server that accepts the
++    /// request and then closes the connection used to be asked again at once,
++    /// for ever.
++    empty_resumes: u32,
++    resume_delay: Duration,
++    resume_max_delay: Duration,
+ }
+ 
+ impl<'t> HttpRead<'t> {
+@@ -60,10 +76,14 @@ impl<'t> HttpRead<'t> {
+                 next_offset: initial.start,
+                 end_offset: initial.len,
+                 stream: initial.stream,
++                delivered: false,
+             }),
+             pending_chunk: None,
+             pending_chunk_offset: 0,
+             progress: progress.map(|v| Box::new(v) as Box<dyn FnMut(u64, u64) + Send + 't>),
++            empty_resumes: 0,
++            resume_delay: RESUME_DELAY,
++            resume_max_delay: RESUME_MAX_DELAY,
+         })
+     }
+ 
+@@ -79,11 +99,43 @@ impl<'t> HttpRead<'t> {
+         let client = self.client.clone();
+         let url = self.url.clone();
+         let range_start = if start == 0 { None } else { Some(start) };
++        let delay = if self.empty_resumes == 0 {
++            Duration::ZERO
++        } else {
++            self.resume_delay
++                .saturating_mul(1u32 << (self.empty_resumes - 1).min(16))
++                .min(self.resume_max_delay)
++        };
+         self.pending_open = Some(Box::pin(async move {
++            if !delay.is_zero() {
++                tokio::time::sleep(delay).await;
++            }
+             open_http_stream(client, url, range_start).await
+         }));
+     }
+ 
++    /// The stream ended or failed before the end of the file. Count it if it
++    /// brought nothing, and stop once that has happened too often.
++    fn lost_stream(&mut self, delivered: bool, why: String) -> std::io::Result<()> {
++        self.active = None;
++        if delivered {
++            self.empty_resumes = 0;
++            return Ok(());
++        }
++        self.empty_resumes += 1;
++        if self.empty_resumes > RESUME_ATTEMPTS {
++            return Err(Error::new(
++                ErrorKind::UnexpectedEof,
++                format!(
++                    "the download stopped at byte {} of {}: {RESUME_ATTEMPTS} resumed \
++                     connections in a row delivered nothing ({why})",
++                    self.pos, self.len
++                ),
++            ));
++        }
++        Ok(())
++    }
++
+     fn poll_open_if_needed(
+         mut self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+@@ -107,6 +159,7 @@ impl<'t> HttpRead<'t> {
+                     next_offset: opened.start,
+                     end_offset: opened.len,
+                     stream: opened.stream,
++                    delivered: false,
+                 });
+                 Poll::Ready(Ok(()))
+             }
+@@ -173,6 +226,9 @@ impl<'t> AsyncRead for HttpRead<'t> {
+                 Poll::Pending => return Poll::Pending,
+                 Poll::Ready(Some(Ok(chunk))) => {
+                     active.next_offset += chunk.len() as u64;
++                    if !chunk.is_empty() {
++                        active.delivered = true;
++                    }
+                     if active.next_offset > active.end_offset {
+                         return Poll::Ready(Err(Error::new(
+                             ErrorKind::InvalidData,
+@@ -182,15 +238,22 @@ impl<'t> AsyncRead for HttpRead<'t> {
+                     self.pending_chunk = Some(chunk);
+                     self.pending_chunk_offset = 0;
+                 }
+-                Poll::Ready(Some(Err(_err))) => {
+-                    self.active = None;
++                Poll::Ready(Some(Err(err))) => {
++                    let delivered = active.delivered;
++                    if let Err(err) = self.lost_stream(delivered, err.to_string()) {
++                        return Poll::Ready(Err(err));
++                    }
+                     continue;
+                 }
+                 Poll::Ready(None) => {
+-                    self.active = None;
++                    let delivered = active.delivered;
+                     if self.pos >= self.len {
++                        self.active = None;
+                         return Poll::Ready(Ok(()));
+                     }
++                    if let Err(err) = self.lost_stream(delivered, "connection closed".into()) {
++                        return Poll::Ready(Err(err));
++                    }
+                     continue;
+                 }
+             }
+@@ -710,6 +773,8 @@ mod tests {
+         body: Arc<Vec<u8>>,
+         first_body_limit: Option<usize>,
+         resume_start_adjustment: i64,
++        /// Cut every resumed response to this many bytes of body.
++        resume_body_limit: Option<usize>,
+         requests: Arc<Mutex<Vec<RequestRecord>>>,
+         request_count: Arc<AtomicUsize>,
+     }
+@@ -741,6 +806,15 @@ mod tests {
+         body: Vec<u8>,
+         first_body_limit: Option<usize>,
+         resume_start_adjustment: i64,
++    ) -> io::Result<TestServer> {
++        spawn_server_with(body, first_body_limit, resume_start_adjustment, None).await
++    }
++
++    async fn spawn_server_with(
++        body: Vec<u8>,
++        first_body_limit: Option<usize>,
++        resume_start_adjustment: i64,
++        resume_body_limit: Option<usize>,
+     ) -> io::Result<TestServer> {
+         let listener = TcpListener::bind("127.0.0.1:0").await?;
+         let addr = listener.local_addr()?;
+@@ -749,6 +823,7 @@ mod tests {
+             body: Arc::new(body),
+             first_body_limit,
+             resume_start_adjustment,
++            resume_body_limit,
+             requests: requests.clone(),
+             request_count: Arc::new(AtomicUsize::new(0)),
+         };
+@@ -823,8 +898,11 @@ mod tests {
+                 } else {
+                     (start as i64 + config.resume_start_adjustment) as u64
+                 };
+-                let body = config.body[adjusted_start as usize..].to_vec();
++                let mut body = config.body[adjusted_start as usize..].to_vec();
+                 let content_length = body.len();
++                if let Some(limit) = config.resume_body_limit {
++                    body.truncate(limit);
++                }
+                 (
+                     "HTTP/1.1 206 Partial Content\r\n".to_owned(),
+                     format!(
+@@ -971,4 +1049,35 @@ mod tests {
+         assert!(err.to_string().contains("range resume mismatch"));
+         let _ = std::fs::remove_file(cache);
+     }
++
++    /// A server that takes the resumed request and then sends nothing used to
++    /// be asked again straight away, for ever: the read never returned and the
++    /// process spun. It now waits between attempts and gives up.
++    #[tokio::test]
++    async fn resumes_that_bring_nothing_are_given_up_on() {
++        let server = spawn_server_with(test_body(), Some(96), 0, Some(0))
++            .await
++            .unwrap();
++        let mut http = HttpRead::open(reqwest::Client::new(), &server.url, Some(|_, _| {}))
++            .await
++            .unwrap();
++        http.resume_delay = std::time::Duration::from_millis(1);
++        http.resume_max_delay = std::time::Duration::from_millis(4);
++
++        let mut buf = vec![0u8; 256];
++        let result = tokio::time::timeout(
++            std::time::Duration::from_secs(20),
++            http.read_exact(&mut buf),
++        )
++        .await
++        .expect("still resuming after 20 s");
++        let err = result.unwrap_err();
++        assert!(err.to_string().contains("delivered nothing"), "{err}");
++        // The first request and then one per allowed resume, plus the one
++        // that tipped it over.
++        assert_eq!(
++            server.request_ranges().len(),
++            1 + super::RESUME_ATTEMPTS as usize + 1
++        );
++    }
+ }
+diff --git a/crates/msixvc/src/streaming_ntfs.rs b/crates/msixvc/src/streaming_ntfs.rs
+index 00e2811..2581a1a 100644
+--- a/crates/msixvc/src/streaming_ntfs.rs
++++ b/crates/msixvc/src/streaming_ntfs.rs
+@@ -79,6 +79,17 @@ where
+         if name == "." || name == ".." {
+             continue;
+         }
++        // NTFS does not allow a separator inside a name, so one that has one
++        // was made to be split -- `..\..\x` as a single name is a path that
++        // climbs out of wherever it is extracted to. Refused here rather than
++        // trusted to be caught later.
++        if name.contains(['/', '\\', '\0']) {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::InvalidData,
++                format!("NTFS name {name:?} holds a path separator or NUL"),
++            )
++            .into());
++        }
+ 
+         let path = join_ntfs_path(base_path, name.as_ref());
+         let file = entry.to_file(ntfs, fs)?;
+diff --git a/crates/msixvc/src/xvd.rs b/crates/msixvc/src/xvd.rs
+index b74a7ae..72387e7 100644
+--- a/crates/msixvc/src/xvd.rs
++++ b/crates/msixvc/src/xvd.rs
+@@ -2,12 +2,16 @@ use std::cmp::min;
+ use std::collections::HashMap;
+ use std::fmt::Debug;
+ use std::io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write};
++use std::path::PathBuf;
++use std::time::{Duration, Instant};
+ 
+ use aes::cipher::KeyInit;
+ use aes::{Aes128Dec, Aes128Enc};
+ use futures_util::StreamExt;
+ use msixvc_common::parse::{BinaryParse, BinaryTryParse};
+-use reqwest::header::RANGE;
++use reqwest::StatusCode;
++use reqwest::header::{CONTENT_RANGE, RANGE};
++use sha2::{Digest, Sha256};
+ use tokio::fs::OpenOptions;
+ use tokio::io::{
+     AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader,
+@@ -19,13 +23,12 @@ use uuid::Uuid;
+ use zerocopy::IntoBytes;
+ 
+ use crate::crypt::{TweakGenerator, decrypt_page_xts};
+-use crate::layout::{Bytes, PAGE_SIZE, PAGES_PER_BLOCK, Pages};
+-use crate::math::calculate_hash_block_num_and_run_for_block_num;
++use crate::layout::{Bytes, PAGE_SIZE};
+ use crate::models::xvd::layout::XvdLayout;
+ use crate::models::xvd::{
+-    XvcInfo, XvcRegionHeader, XvcRegionId, XvdHashEntry, XvdHeader, XvdSegmentMetadataHeader,
+-    XvdSegmentMetadataSegment, XvdSegmentMetadataSegmentFlags, XvdUserDataHeader,
+-    XvdUserDataPackageFileEntry, XvdUserDataPackageFilesHeader,
++    HASH_ENTRIES_IN_PAGE, HASH_ENTRY_LENGTH, XvcInfo, XvcRegionHeader, XvcRegionId, XvdHashEntry,
++    XvdHeader, XvdSegmentMetadataHeader, XvdSegmentMetadataSegment, XvdSegmentMetadataSegmentFlags,
++    XvdUserDataHeader, XvdUserDataPackageFileEntry, XvdUserDataPackageFilesHeader,
+ };
+ use crate::streaming_ntfs::collect_ntfs_stream_layouts;
+ 
+@@ -169,25 +172,50 @@ impl Debug for XvdEncryptionInfo {
+     }
+ }
+ 
+-struct XvdStream<R> {
++struct XvdStream<'t, R> {
+     inner: R,
+     offset: u64,
+     end_offset: u64,
+ 
+     encryption_info: Option<XvdEncryptionInfo>,
++
++    /// When set, every page is checked against the package's hash tree before
++    /// any of it is handed out. The filesystem metadata read through this
++    /// stream decides which files are written and where, so it is held to the
++    /// same standard as the files themselves.
++    hashes: Option<&'t HashTree>,
++    /// Pages already read and checked, so that the filesystem parser's habit of
++    /// reading a record at a time does not mean hashing a page per record.
++    checked_pages: HashMap<u64, Box<[u8; PAGE_SIZE]>>,
+ }
+ 
+-impl<R> Debug for XvdStream<R> {
++/// How many checked pages [`XvdStream`] keeps. A megabyte: enough for the
++/// parser's back-and-forth between an index and the records it names.
++const CHECKED_PAGE_CACHE: usize = 256;
++
++impl<R> Debug for XvdStream<'_, R> {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         f.debug_struct("XvdStream")
+             .field("offset", &self.offset)
+             .field("end_offset", &self.end_offset)
+             .field("encryption_info", &self.encryption_info)
++            .field("checked", &self.hashes.is_some())
+             .finish_non_exhaustive()
+     }
+ }
+ 
+-impl<R> XvdStream<R> {
++impl<'t, R> XvdStream<'t, R> {
++    fn new(inner: R, offset: u64, end_offset: u64, hashes: Option<&'t HashTree>) -> Self {
++        XvdStream {
++            inner,
++            offset,
++            end_offset,
++            encryption_info: None,
++            hashes,
++            checked_pages: HashMap::new(),
++        }
++    }
++
+     fn len(&self) -> u64 {
+         self.end_offset - self.offset
+     }
+@@ -197,7 +225,7 @@ impl<R> XvdStream<R> {
+     }
+ }
+ 
+-impl<R: Seek> XvdStream<R> {
++impl<R: Seek> XvdStream<'_, R> {
+     fn current_relative_pos(&mut self) -> std::io::Result<u64> {
+         let absolute = self.inner.stream_position()?;
+         absolute
+@@ -206,7 +234,7 @@ impl<R: Seek> XvdStream<R> {
+     }
+ }
+ 
+-impl<R: Read + Seek> Read for XvdStream<R> {
++impl<R: Read + Seek> Read for XvdStream<'_, R> {
+     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+         let current = self.current_relative_pos()?;
+         if current >= self.len() {
+@@ -217,11 +245,35 @@ impl<R: Read + Seek> Read for XvdStream<R> {
+             .map_err(|_| Error::new(ErrorKind::InvalidData, "remaining range too large"))?;
+         let to_read = remaining.min(buf.len());
+ 
+-        self.inner.read(&mut buf[..to_read])
++        let Some(hashes) = self.hashes else {
++            return self.inner.read(&mut buf[..to_read]);
++        };
++
++        // Whole pages only: a page is what the hash tree vouches for, so a
++        // read is served from a page that has been checked, never from bytes
++        // that merely happen to be in the cache file.
++        let absolute = self.offset + current;
++        let page = absolute / PAGE_SIZE as u64;
++        let within = (absolute % PAGE_SIZE as u64) as usize;
++        if !self.checked_pages.contains_key(&page) {
++            let mut data = Box::new([0u8; PAGE_SIZE]);
++            self.inner.seek(SeekFrom::Start(page * PAGE_SIZE as u64))?;
++            self.inner.read_exact(&mut data[..])?;
++            hashes.check(page, &data)?;
++            if self.checked_pages.len() >= CHECKED_PAGE_CACHE {
++                self.checked_pages.clear();
++            }
++            self.checked_pages.insert(page, data);
++        }
++        let data = &self.checked_pages[&page];
++        let n = to_read.min(PAGE_SIZE - within);
++        buf[..n].copy_from_slice(&data[within..within + n]);
++        self.inner.seek(SeekFrom::Start(absolute + n as u64))?;
++        Ok(n)
+     }
+ }
+ 
+-impl<R: Seek> Seek for XvdStream<R> {
++impl<R: Seek> Seek for XvdStream<'_, R> {
+     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+         let new_relative = match pos {
+             SeekFrom::Start(n) => n,
+@@ -258,7 +310,7 @@ impl<R: Seek> Seek for XvdStream<R> {
+     }
+ }
+ 
+-impl<R> Write for XvdStream<R> {
++impl<R> Write for XvdStream<'_, R> {
+     fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+         Err(Error::new(
+             ErrorKind::PermissionDenied,
+@@ -274,6 +326,11 @@ pub struct XvdFile {
+     header: XvdHeader,
+     layout: XvdLayout,
+     encrypted_section_infos: Vec<EncryptedSectionInfo>,
++    hashes: HashTree,
++    /// Whether the hash tree was checked against the header when the package
++    /// was parsed. Only then is it worth checking pages against: a tree that
++    /// was not checked vouches for nothing.
++    verified: bool,
+ }
+ 
+ #[derive(Debug)]
+@@ -284,11 +341,7 @@ pub struct EncryptedSectionInfo {
+     header_id: XvcRegionId,
+     vduid: Uuid,
+ 
+-    // If integrity is enabled, this must contain one entry per page in the section.
+-    // If integrity is disabled, use page_in_section as the data unit instead.
+-    data_units: Option<Vec<u32>>,
+     first_segment_index: u32,
+-    data_hashs: Vec<[u8; 20]>,
+ }
+ 
+ pub struct UserPackageFile {
+@@ -303,6 +356,309 @@ pub struct SegmentFile {
+     pub keep_encrypted: bool,
+ }
+ 
++/// A page whose contents do not hash to what the package's hash tree says.
++#[derive(Debug, thiserror::Error)]
++#[error("page {page} of the package does not match its hash tree")]
++pub struct PageHashMismatch {
++    pub page: u64,
++}
++
++/// The level-0 entries of the package's hash tree: for every page from the
++/// start of the user data to the end of the drive, the truncated SHA-256 of
++/// the page as stored, and the data unit its encryption tweak uses.
++///
++/// Read once, in full, when the package is parsed. That is no more than the
++/// old per-region read did -- the regions cover nearly the whole drive -- and
++/// it means a page can be checked wherever it is read.
++struct HashTree {
++    /// The absolute page number of hashed page 0.
++    first_page: u64,
++    hashes: Vec<[u8; 20]>,
++    units: Vec<u32>,
++}
++
++fn page_digest(page: &[u8]) -> [u8; 20] {
++    let digest = Sha256::digest(page);
++    let mut out = [0u8; 20];
++    out.copy_from_slice(&digest[..20]);
++    out
++}
++
++impl HashTree {
++    fn index(&self, page: u64) -> Option<usize> {
++        let index = usize::try_from(page.checked_sub(self.first_page)?).ok()?;
++        (index < self.hashes.len()).then_some(index)
++    }
++
++    fn unit(&self, page: u64) -> Option<u32> {
++        self.index(page).map(|i| self.units[i])
++    }
++
++    /// The hashes of `count` pages starting at absolute page `first`.
++    fn range(&self, first: u64, count: u64) -> Option<&[[u8; 20]]> {
++        if count == 0 {
++            return Some(&[]);
++        }
++        let start = self.index(first)?;
++        let end = start.checked_add(usize::try_from(count).ok()?)?;
++        self.hashes.get(start..end)
++    }
++
++    fn check(&self, page: u64, data: &[u8; PAGE_SIZE]) -> io::Result<()> {
++        let Some(index) = self.index(page) else {
++            return Err(Error::new(
++                ErrorKind::InvalidData,
++                format!("page {page} lies outside the part of the package its hash tree covers"),
++            ));
++        };
++        if page_digest(data) != self.hashes[index] {
++            return Err(Error::new(
++                ErrorKind::InvalidData,
++                PageHashMismatch { page },
++            ));
++        }
++        Ok(())
++    }
++
++    /// Read the tree, top level first. With `verify`, the top page must hash
++    /// to what the header records and every page below must hash to its entry
++    /// in the level above, so the level-0 hashes kept at the end are exactly as
++    /// trustworthy as the header.
++    async fn load<Reader>(
++        file: &mut Reader,
++        header: &XvdHeader,
++        layout: &XvdLayout,
++        verify: bool,
++    ) -> Result<HashTree, Box<dyn std::error::Error>>
++    where
++        Reader: AsyncRead + AsyncSeek + Unpin,
++    {
++        if !header.volume_flags.is_data_integrity_enabled() {
++            return Err(Box::new(Error::new(
++                ErrorKind::InvalidData,
++                "the package has no hash tree (data integrity is off), so nothing in it can be checked",
++            )));
++        }
++        if header.volume_flags.is_resiliency_enabled() {
++            return Err(Box::new(Error::new(
++                ErrorKind::Unsupported,
++                "the package uses a resilient hash tree, which is not supported",
++            )));
++        }
++
++        let tree = &layout.hash_tree_layout;
++        let levels = [tree.level0, tree.level1, tree.level2, tree.level3];
++        let top = tree.top_level() as usize;
++        let base = layout.hash_tree.start.to_bytes().0;
++
++        // The hashes the pages of the level being read must have. The top
++        // level's single page is vouched for by the header instead.
++        let mut expected: Vec<[u8; 20]> = Vec::new();
++        let mut hashes: Vec<[u8; 20]> = Vec::new();
++        let mut units: Vec<u32> = Vec::new();
++        let mut page = [0u8; PAGE_SIZE];
++
++        for level in (0..=top).rev() {
++            let this = levels[level];
++            let entries = this.num_hashes.0 as usize;
++            let mut found: Vec<[u8; 20]> = Vec::with_capacity(entries);
++            if level == 0 {
++                units.reserve_exact(entries);
++            }
++
++            file.seek(SeekFrom::Start(base + this.page_range.start.to_bytes().0))
++                .await?;
++            let mut reader = BufReader::with_capacity(64 * PAGE_SIZE, &mut *file);
++            for index in 0..this.num_pages().0 as usize {
++                reader.read_exact(&mut page).await?;
++                if verify {
++                    let matches = if level == top {
++                        Sha256::digest(page)[..] == header.top_hash_block_hash[..]
++                    } else {
++                        expected.get(index) == Some(&page_digest(&page))
++                    };
++                    if !matches {
++                        return Err(Box::new(Error::new(
++                            ErrorKind::InvalidData,
++                            format!(
++                                "the package's hash tree is damaged: page {index} of level {level} \
++                                 does not match {}",
++                                if level == top {
++                                    "the package header"
++                                } else {
++                                    "the level above it"
++                                }
++                            ),
++                        )));
++                    }
++                }
++                let in_page = (entries - found.len()).min(HASH_ENTRIES_IN_PAGE);
++                let (in_use, _) =
++                    page[..in_page * HASH_ENTRY_LENGTH].as_chunks::<HASH_ENTRY_LENGTH>();
++                for entry in in_use {
++                    let entry = XvdHashEntry::from_slice(entry);
++                    found.push(entry.block_hash);
++                    if level == 0 {
++                        units.push(entry.unit);
++                    }
++                }
++            }
++            if found.len() != entries {
++                return Err(Box::new(Error::new(
++                    ErrorKind::InvalidData,
++                    format!(
++                        "hash tree level {level} holds {} entries, expected {entries}",
++                        found.len()
++                    ),
++                )));
++            }
++            if level == 0 {
++                hashes = found;
++            } else {
++                expected = found;
++            }
++        }
++
++        Ok(HashTree {
++            first_page: layout.user_data.start.0 as u64,
++            hashes,
++            units,
++        })
++    }
++}
++
++/// Turn a path as the package spells it into one that can only name something
++/// inside the directory it is joined to.
++///
++/// The names come from the package itself -- its segment metadata and its NTFS
++/// directory -- so they are not trusted to be well formed. Only plain names
++/// survive: a name that is empty, that starts or ends with a separator, that
++/// has an empty, `.` or `..` component, or that holds a NUL or a colon (which
++/// covers both drive letters and alternate streams) is refused outright rather
++/// than cleaned up, because a package that needs cleaning up is not one to
++/// install from.
++pub fn package_relative_path(name: &str) -> io::Result<PathBuf> {
++    let refuse = |why: &str| {
++        Err(Error::new(
++            ErrorKind::InvalidData,
++            format!("unsafe file name in package {name:?}: {why}"),
++        ))
++    };
++    if name.is_empty() {
++        return refuse("it is empty");
++    }
++    let mut path = PathBuf::new();
++    for component in name.split(['\\', '/']) {
++        match component {
++            "" => return refuse("it has an empty component or a leading or trailing separator"),
++            "." | ".." => return refuse("it steps outside its folder"),
++            c if c.contains(['\0', ':']) => {
++                return refuse("it holds a drive, stream or NUL character");
++            }
++            c => path.push(c),
++        }
++    }
++    Ok(path)
++}
++
++/// How long and how often a download keeps asking before it gives up.
++#[derive(Clone, Debug)]
++pub struct RetryPolicy {
++    /// The wait before the first retry, doubled for each one after it.
++    pub first_delay: Duration,
++    /// The longest wait between two attempts.
++    pub max_delay: Duration,
++    /// Give up once this long has passed without a single good page.
++    pub give_up_after: Duration,
++    /// How long one request, or the gap between two chunks, may take.
++    pub stall: Duration,
++    /// How many times one page may arrive damaged before the download fails.
++    pub bad_page_limit: u32,
++}
++
++impl Default for RetryPolicy {
++    /// Patient with a connection that drops -- five minutes of nothing before
++    /// giving up, retrying at most every thirty seconds -- and not at all with
++    /// an answer that will not change, like a 404.
++    fn default() -> Self {
++        RetryPolicy {
++            first_delay: Duration::from_secs(1),
++            max_delay: Duration::from_secs(30),
++            give_up_after: Duration::from_secs(300),
++            stall: Duration::from_secs(5),
++            bad_page_limit: 3,
++        }
++    }
++}
++
++impl RetryPolicy {
++    fn delay(&self, failures: u32) -> Duration {
++        let doublings = failures.saturating_sub(1).min(16);
++        self.first_delay
++            .saturating_mul(1u32 << doublings)
++            .min(self.max_delay)
++    }
++}
++
++type ByteStream =
++    std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>;
++
++enum RangeError {
++    /// Worth asking again: the network, a timeout, the server being busy.
++    Retry(String),
++    /// Asking again will get the same answer.
++    Fatal(String),
++}
++
++/// Ask for `start..=end` of `url`, and accept only that range back.
++async fn open_range(
++    client: &reqwest::Client,
++    url: &str,
++    start: u64,
++    end: u64,
++    stall: Duration,
++) -> Result<ByteStream, RangeError> {
++    let request = client
++        .get(url)
++        .header(RANGE, format!("bytes={start}-{end}"))
++        .send();
++    let response = match timeout(stall, request).await {
++        Err(_) => return Err(RangeError::Retry(format!("no answer within {stall:?}"))),
++        Ok(Err(err)) => return Err(RangeError::Retry(err.to_string())),
++        Ok(Ok(response)) => response,
++    };
++    let status = response.status();
++    if status == StatusCode::PARTIAL_CONTENT {
++        // A server that answers a different range than the one asked for would
++        // have its bytes written at the wrong place.
++        let starts_right = response
++            .headers()
++            .get(CONTENT_RANGE)
++            .and_then(|v| v.to_str().ok())
++            .and_then(|v| v.strip_prefix("bytes "))
++            .and_then(|v| v.split_once('-'))
++            .and_then(|(s, _)| s.parse::<u64>().ok())
++            == Some(start);
++        if !starts_right {
++            return Err(RangeError::Retry(format!(
++                "the server answered a different range than bytes={start}-{end}"
++            )));
++        }
++        return Ok(Box::pin(response.bytes_stream()));
++    }
++    let message = format!("the server answered {status} for bytes={start}-{end}");
++    if status.is_server_error()
++        || status == StatusCode::REQUEST_TIMEOUT
++        || status == StatusCode::TOO_MANY_REQUESTS
++    {
++        Err(RangeError::Retry(message))
++    } else {
++        // A 403, 404 or 416 means the object is not there for us, and a 200
++        // means the server ignores ranges; neither changes by asking again.
++        Err(RangeError::Fatal(message))
++    }
++}
++
+ impl XvdFile {
+     pub fn content_id(&self) -> uuid::Uuid {
+         self.header.vduid
+@@ -338,7 +694,35 @@ impl XvdFile {
+         Self::parse(&mut file).await
+     }
+ 
+-    pub async fn parse<Reader>(mut file: Reader) -> Result<Self, Box<dyn std::error::Error>>
++    /// Parse a package without checking it: for a container already on disk,
++    /// which was checked when it was downloaded.
++    pub async fn parse<Reader>(file: Reader) -> Result<Self, Box<dyn std::error::Error>>
++    where
++        Reader: AsyncRead + AsyncSeek + Unpin,
++    {
++        Self::parse_ex(file, false).await
++    }
++
++    /// Parse a package and check it against itself before trusting any of it.
++    ///
++    /// The header's top hash vouches for the hash tree, the hash tree for every
++    /// page after it. The metadata pages -- the file table, the segment
++    /// metadata, the region table that says what is encrypted -- are checked
++    /// here, the filesystem pages as they are read, and the data pages of every
++    /// file as it is downloaded or extracted. What none of this covers is the
++    /// header itself: its signature is not checked, so the header is only as
++    /// good as the connection it came over.
++    pub async fn parse_verified<Reader>(file: Reader) -> Result<Self, Box<dyn std::error::Error>>
++    where
++        Reader: AsyncRead + AsyncSeek + Unpin,
++    {
++        Self::parse_ex(file, true).await
++    }
++
++    async fn parse_ex<Reader>(
++        mut file: Reader,
++        verify: bool,
++    ) -> Result<Self, Box<dyn std::error::Error>>
+     where
+         Reader: AsyncRead + AsyncSeek + Unpin,
+     {
+@@ -347,16 +731,36 @@ impl XvdFile {
+             file.read_exact(&mut buf).await?;
+             XvdHeader::try_from_array(&buf)?
+         };
++        if xvd_header.number_of_hashed_pages().0 == 0 {
++            return Err(Box::new(Error::new(
++                ErrorKind::InvalidData,
++                "the package header describes no data",
++            )));
++        }
+ 
+         let layout = xvd_header.layout();
++        let hashes = HashTree::load(&mut file, &xvd_header, &layout, verify).await?;
++
++        if verify {
++            // Everything between the hash tree and the drive: the user data
++            // with its file table and segment metadata, and the XVC info with
++            // the region table. Small, and read in full below anyway.
++            let first = layout.user_data.start.0 as u64;
++            let count = xvd_header.number_of_metadata_pages().0 as u64;
++            file.seek(SeekFrom::Start(first * PAGE_SIZE as u64)).await?;
++            let mut page = [0u8; PAGE_SIZE];
++            for n in first..first + count {
++                file.read_exact(&mut page).await?;
++                hashes.check(n, &page)?;
++            }
++        }
+ 
+         let mut region_headers: Vec<XvcRegionHeader> = Vec::new();
+ 
+         // TODO: Check if we have proper content type
+         if layout.xvc_info.len > Bytes(0) {
+             file.seek(std::io::SeekFrom::Start(layout.xvc_info.start.to_bytes().0))
+-                .await
+-                .expect("Unable to seek");
++                .await?;
+ 
+             let xvc_info = {
+                 let mut buf = XvcInfo::buffer();
+@@ -377,49 +781,30 @@ impl XvdFile {
+         }
+ 
+         let mut enc_sections: Vec<EncryptedSectionInfo> = vec![];
+-        let mut reader = BufReader::with_capacity(PAGES_PER_BLOCK * XvdHashEntry::SIZE, file);
+         for h in region_headers {
+-            let key_id = h.key_id;
+-            let num_pages = h.length.0;
+-            match key_id.get() {
++            match h.key_id.get() {
+                 None => continue,
+                 Some(0) => (),
+-                Some(n) => todo!("KeyID other than 0 or unencrypted is not supported, found {n}"),
++                Some(n) => {
++                    return Err(Box::new(Error::new(
++                        ErrorKind::Unsupported,
++                        format!("region encrypted with key {n}: only key 0 is supported"),
++                    )));
++                }
+             }
+ 
+-            let start_page = h.offset - layout.user_data.start;
+-            let mut data_units: Vec<u32> = Vec::with_capacity(num_pages as usize);
+-            let mut data_hashs: Vec<[u8; 20]> = Vec::with_capacity(num_pages as usize);
+-
+-            let mut page = 0;
+-            loop {
+-                if page >= num_pages {
+-                    break;
+-                }
+-                let (hash_block, entry_start, run_length) =
+-                    calculate_hash_block_num_and_run_for_block_num(
+-                        xvd_header.xvd_type as u32,
+-                        layout.hash_tree_layout.top_level() as u64 + 1,
+-                        xvd_header.number_of_hashed_pages(),
+-                        start_page.0 + page,
+-                        0,
+-                        false,
+-                        false,
+-                    );
+-                let run_length = min(run_length, num_pages - page);
+-                page += run_length;
+-                let read_offset = layout.hash_tree.start.to_bytes()
+-                    + Pages(hash_block).to_bytes()
+-                    + Bytes(entry_start as u64 * XvdHashEntry::SIZE as u64);
+-                reader.seek(SeekFrom::Start(read_offset.0)).await?;
+-
+-                let mut buf = XvdHashEntry::buffer();
+-                for _ in 0..run_length {
+-                    reader.read_exact(&mut buf).await?;
+-                    let hash = XvdHashEntry::from_array(&buf);
+-                    data_units.push(hash.unit);
+-                    data_hashs.push(hash.block_hash);
+-                }
++            // Every page of an encrypted region needs its data unit to be
++            // decrypted at all, so a region the tree does not cover is a
++            // damaged package, not something to discover halfway through a file.
++            let first = h.offset.0 as u64;
++            if hashes.range(first, h.length.0 as u64).is_none() {
++                return Err(Box::new(Error::new(
++                    ErrorKind::InvalidData,
++                    format!(
++                        "encrypted region at page {first} ({} pages) lies outside the hash tree",
++                        h.length.0
++                    ),
++                )));
+             }
+ 
+             enc_sections.push(EncryptedSectionInfo {
+@@ -427,15 +812,15 @@ impl XvdFile {
+                 section_length: h.length.to_bytes().0,
+                 header_id: h.region_id,
+                 vduid: xvd_header.vduid,
+-                data_units: Some(data_units),
+                 first_segment_index: h.first_segment_index,
+-                data_hashs,
+             });
+         }
+         Ok(XvdFile {
+             header: xvd_header,
+             layout,
+             encrypted_section_infos: enc_sections,
++            hashes,
++            verified: verify,
+         })
+     }
+ 
+@@ -477,7 +862,7 @@ impl XvdFile {
+                     .iter()
+                     .position(|&c| c == 0)
+                     .unwrap_or(fullname.len());
+-                let pfull_name: String = String::from_utf16(&fullname[..end]).unwrap();
++                let pfull_name: String = String::from_utf16(&fullname[..end])?;
+ 
+                 files.insert(
+                     pfull_name,
+@@ -532,7 +917,7 @@ impl XvdFile {
+                 ))
+                 .await?;
+                 file.read_exact(buf.as_mut_bytes()).await?;
+-                let file_name: String = String::from_utf16(buf.as_slice()).unwrap();
++                let file_name: String = String::from_utf16(buf.as_slice())?;
+                 let page_length = if segment.filesize == 0 {
+                     1
+                 } else {
+@@ -543,10 +928,15 @@ impl XvdFile {
+                 {
+                     break;
+                 }
+-                let end = page_offset as usize - segment_page_start as usize
+-                    + segment.filesize.div_ceil(PAGE_SIZE as u64) as usize;
+-                let data_hashs: Vec<[u8; 20]> = section.data_hashs
+-                    [page_offset as usize - segment_page_start as usize..end]
++                let data_hashs: Vec<[u8; 20]> = self
++                    .hashes
++                    .range(page_offset, segment.filesize.div_ceil(PAGE_SIZE as u64))
++                    .ok_or_else(|| {
++                        Error::new(
++                            ErrorKind::InvalidData,
++                            format!("{file_name} lies outside the package's hash tree"),
++                        )
++                    })?
+                     .into();
+                 files.insert(
+                     file_name,
+@@ -596,35 +986,20 @@ impl XvdFile {
+                 .into());
+             }
+ 
+-            let segment_page_start = section.section_offset.div_ceil(PAGE_SIZE as u64);
+             let page_offset = file.offset.div_ceil(PAGE_SIZE as u64);
+-            let page_count = file.length.div_ceil(PAGE_SIZE as u64) as usize;
+-            let start = page_offset.checked_sub(segment_page_start).ok_or_else(|| {
+-                io::Error::new(
+-                    ErrorKind::InvalidInput,
+-                    format!(
+-                        "segment page offset before section start: {} ({})",
+-                        name, file.offset
+-                    ),
+-                )
+-            })? as usize;
+-            let end = start + page_count;
+-
+-            if end > section.data_hashs.len() {
++            let page_count = file.length.div_ceil(PAGE_SIZE as u64);
++            let Some(hashes) = self.hashes.range(page_offset, page_count) else {
+                 return Err(io::Error::new(
+                     ErrorKind::InvalidInput,
+                     format!(
+-                        "missing data hashes for {}: need [{}..{}], have {}",
+-                        name,
+-                        start,
+-                        end,
+-                        section.data_hashs.len()
++                        "missing data hashes for {}: need {} pages from page {}",
++                        name, page_count, page_offset
+                     ),
+                 )
+                 .into());
+-            }
++            };
+ 
+-            file.data_hashs = section.data_hashs[start..end].into();
++            file.data_hashs = hashes.into();
+         }
+ 
+         Ok(())
+@@ -642,15 +1017,18 @@ impl XvdFile {
+         let drive_size = self.header.drive_size;
+         let drive_plain_len = self.non_encrypted_prefix_len(drive_data_offset, drive_size.0);
+ 
++        // Checked only for a package parsed with `parse_verified`; see there.
++        let hashes = self.verified.then_some(&self.hashes);
++
+         block_in_place(|| {
+             let block_size = 4096;
+             let drive = SyncSubstream::new(
+-                XvdStream {
+-                    inner: SyncIoBridge::new(file),
+-                    offset: drive_data_offset,
+-                    end_offset: drive_data_offset + drive_plain_len,
+-                    encryption_info: None,
+-                },
++                XvdStream::new(
++                    SyncIoBridge::new(file),
++                    drive_data_offset,
++                    drive_data_offset + drive_plain_len,
++                    hashes,
++                ),
+                 0,
+                 drive_plain_len,
+             );
+@@ -674,19 +1052,19 @@ impl XvdFile {
+                     io::Error::new(ErrorKind::NotFound, "no used GPT partition found")
+                 })?;
+ 
+-            let part_start = part.bytes_start(*gp.logical_block_size()).unwrap();
+-            let part_len = part.bytes_len(*gp.logical_block_size()).unwrap();
++            let part_start = part.bytes_start(*gp.logical_block_size())?;
++            let part_len = part.bytes_len(*gp.logical_block_size())?;
+ 
+             let bridge = gp.take_device().into_inner().into_inner();
+             let partition_offset = drive_data_offset + part_start;
+             let partition_plain_len = self.non_encrypted_prefix_len(partition_offset, part_len);
+             let mut fs = SyncSubstream::new(
+-                XvdStream {
+-                    inner: bridge,
+-                    offset: partition_offset,
+-                    end_offset: partition_offset + partition_plain_len,
+-                    encryption_info: None,
+-                },
++                XvdStream::new(
++                    bridge,
++                    partition_offset,
++                    partition_offset + partition_plain_len,
++                    hashes,
++                ),
+                 0,
+                 partition_plain_len,
+             );
+@@ -731,7 +1109,102 @@ impl XvdFile {
+         })
+     }
+ 
++    /// The pieces both decrypting paths need: the section a file lies in (if
++    /// it is to be decrypted) and the ciphers for it.
++    fn file_crypto(
++        &self,
++        sfile: &SegmentFile,
++        full_key: [u8; 32],
++        decrypt: bool,
++    ) -> Option<(&EncryptedSectionInfo, TweakGenerator, Aes128Enc, Aes128Dec)> {
++        let s = self.encrypted_section_infos.iter().find(|s| {
++            sfile.offset >= s.section_offset && sfile.offset < s.section_offset + s.section_length
++        })?;
++        if !decrypt {
++            return None;
++        }
++        let mut tweak_key = [0u8; 16];
++        let mut data_key = [0u8; 16];
++        tweak_key.copy_from_slice(&full_key[..16]);
++        data_key.copy_from_slice(&full_key[16..]);
++        Some((
++            s,
++            TweakGenerator::new(s.header_id, s.vduid),
++            Aes128Enc::new((&tweak_key).into()),
++            Aes128Dec::new((&data_key).into()),
++        ))
++    }
++
++    /// Decrypt one page of a file in place, given its absolute page number.
++    fn decrypt_page(
++        &self,
++        page: &mut [u8; PAGE_SIZE],
++        absolute_page: u64,
++        crypto: &(&EncryptedSectionInfo, TweakGenerator, Aes128Enc, Aes128Dec),
++    ) -> io::Result<()> {
++        let (_, tweak, tweak_cipher, data_cipher) = crypto;
++        let unit = self.hashes.unit(absolute_page).ok_or_else(|| {
++            io::Error::new(
++                io::ErrorKind::InvalidInput,
++                format!("missing data unit for page {absolute_page}"),
++            )
++        })?;
++        decrypt_page_xts(page, tweak.with_data_unit(unit), tweak_cipher, data_cipher);
++        Ok(())
++    }
++
++    fn first_page_of(sfile: &SegmentFile) -> io::Result<u64> {
++        if !sfile.offset.is_multiple_of(PAGE_SIZE as u64) {
++            return Err(Error::new(
++                ErrorKind::InvalidData,
++                format!("file at offset {} does not start on a page", sfile.offset),
++            ));
++        }
++        Ok(sfile.offset / PAGE_SIZE as u64)
++    }
++
+     pub async fn download_file_http<Writer, Progress>(
++        &self,
++        client: &reqwest::Client,
++        url: &str,
++        out: &mut Writer,
++        sfile: &SegmentFile,
++        full_key: [u8; 32],
++        progress: Progress,
++    ) -> Result<(), Box<dyn std::error::Error>>
++    where
++        Writer: AsyncWrite + Unpin,
++        Progress: FnMut(u64, u64),
++    {
++        self.download_file_http_with(
++            client,
++            url,
++            out,
++            sfile,
++            full_key,
++            progress,
++            &RetryPolicy::default(),
++        )
++        .await
++    }
++
++    /// Download one file's pages with a ranged GET, resuming where a dropped
++    /// connection left off.
++    ///
++    /// Every page is checked against the hash tree before it is decrypted or
++    /// written (for a package parsed with `parse_verified`). A damaged page is
++    /// fetched again, a few times, and then the file fails: a proxy that
++    /// mangles the stream would otherwise be written straight into the game.
++    ///
++    /// A connection that drops is retried with a growing wait, and given up on
++    /// once no good page has arrived for `policy.give_up_after`; an answer
++    /// that will not change (a 404, a server that ignores ranges) fails at
++    /// once. Neither used to end: the request was repeated without a pause for
++    /// as long as it kept failing, and a write that failed was retried every
++    /// thirty seconds forever, so a full disk hung the install instead of
++    /// stopping it.
++    #[allow(clippy::too_many_arguments)]
++    pub async fn download_file_http_with<Writer, Progress>(
+         &self,
+         client: &reqwest::Client,
+         url: &str,
+@@ -739,6 +1212,7 @@ impl XvdFile {
+         sfile: &SegmentFile,
+         full_key: [u8; 32],
+         mut progress: Progress,
++        policy: &RetryPolicy,
+     ) -> Result<(), Box<dyn std::error::Error>>
+     where
+         Writer: AsyncWrite + Unpin,
+@@ -748,137 +1222,111 @@ impl XvdFile {
+             return Ok(());
+         }
+ 
+-        let s = &self.encrypted_section_infos.iter().find(|s| {
+-            sfile.offset >= s.section_offset && sfile.offset < s.section_offset + s.section_length
+-        });
+-
+-        let mut tweak = None;
+-        let mut tweak_cipher = None;
+-        let mut data_cipher = None;
+-
+-        let file_offset_in_section;
+-
+-        if let Some(s) = s
+-            && !sfile.keep_encrypted
+-        {
+-            let mut tweak_key = [0u8; 16];
+-            let mut data_key = [0u8; 16];
+-            tweak_key.copy_from_slice(&full_key[..16]);
+-            data_key.copy_from_slice(&full_key[16..]);
+-
+-            tweak = Some(TweakGenerator::new(s.header_id, s.vduid));
+-            tweak_cipher = Some(Aes128Enc::new((&tweak_key).into()));
+-            data_cipher = Some(Aes128Dec::new((&data_key).into()));
+-            file_offset_in_section = sfile.offset - s.section_offset;
+-        } else {
+-            // TODO for data integrity we need a section for unencrypted sections...
+-            file_offset_in_section = sfile.offset;
+-        }
+-        let page_start = file_offset_in_section / PAGE_SIZE as u64;
++        let first_page = Self::first_page_of(sfile)?;
++        let crypto = self.file_crypto(sfile, full_key, !sfile.keep_encrypted);
+         let page_count = sfile.length.div_ceil(PAGE_SIZE as u64);
++        let last_byte = sfile.offset + page_count * PAGE_SIZE as u64 - 1;
+ 
+         let mut page = [0u8; PAGE_SIZE];
+         let mut remaining = sfile.length;
+-        let mut page_in_section = page_start;
+-        let page_length = sfile.length.div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
+-        let mut stream = None;
++        let mut done_pages: u64 = 0;
++        let mut stream: Option<ByteStream> = None;
+         let mut pending = bytes::BytesMut::new();
+-        let mut v: u64 = 0;
+-
+-        let stall_timeout = tokio::time::Duration::from_secs(5);
+-        if let Ok(Ok(Ok(response))) = timeout(
+-            stall_timeout,
+-            client
+-                .get(url)
+-                .header(
+-                    RANGE,
+-                    format!(
+-                        "bytes={}-{}",
+-                        sfile.offset + v,
+-                        sfile.offset + page_length - 1
+-                    ),
+-                )
+-                .send(),
+-        )
+-        .await
+-        .map(|o| o.map(|o| o.error_for_status()))
+-            && response.status() == 206
+-        {
+-            stream = Some(response.bytes_stream());
+-        }
+-        loop {
+-            if page_in_section >= page_start + page_count || remaining == 0 {
+-                break;
+-            }
+-            let next = if let Some(s) = stream.as_mut() {
+-                timeout(stall_timeout, s.next()).await
+-            } else {
+-                Ok(None)
+-            };
+-            let data;
+-            if let Ok(Some(Ok(b))) = next {
+-                data = b;
+-            } else {
+-                // error
+-                if let Ok(Ok(Ok(response))) = timeout(
+-                    stall_timeout,
+-                    client
+-                        .get(url)
+-                        .header(
+-                            RANGE,
++        let mut reported: u64 = 0;
++
++        let mut failures: u32 = 0;
++        let mut last_good = Instant::now();
++        let mut last_error = String::new();
++        let mut bad_page: Option<(u64, u32)> = None;
++
++        while done_pages < page_count {
++            let Some(s) = stream.as_mut() else {
++                if failures > 0 {
++                    if last_good.elapsed() >= policy.give_up_after {
++                        return Err(Box::new(Error::new(
++                            ErrorKind::TimedOut,
+                             format!(
+-                                "bytes={}-{}",
+-                                sfile.offset + v,
+-                                sfile.offset + page_length - 1
++                                "gave up after {:?} without progress ({} of {} bytes): {last_error}",
++                                policy.give_up_after,
++                                done_pages * PAGE_SIZE as u64,
++                                sfile.length
+                             ),
+-                        )
+-                        .send(),
+-                )
+-                .await
+-                .map(|o| o.map(|o| o.error_for_status()))
+-                    && response.status() == 206
+-                {
+-                    stream = Some(response.bytes_stream());
+-                    continue;
++                        )));
++                    }
++                    sleep(policy.delay(failures)).await;
++                }
++                let start = sfile.offset + done_pages * PAGE_SIZE as u64 + pending.len() as u64;
++                match open_range(client, url, start, last_byte, policy.stall).await {
++                    Ok(opened) => stream = Some(opened),
++                    Err(RangeError::Fatal(message)) => {
++                        return Err(Box::new(Error::other(message)));
++                    }
++                    Err(RangeError::Retry(message)) => {
++                        failures += 1;
++                        last_error = message;
++                    }
+                 }
+                 continue;
+-            }
++            };
+ 
+-            v += data.len() as u64;
+-            progress(min(v, sfile.length), sfile.length);
++            match timeout(policy.stall, s.next()).await {
++                Ok(Some(Ok(data))) => pending.extend_from_slice(&data),
++                Ok(Some(Err(err))) => {
++                    stream = None;
++                    failures += 1;
++                    last_error = err.to_string();
++                }
++                Ok(None) => {
++                    stream = None;
++                    failures += 1;
++                    last_error = "the connection closed early".to_owned();
++                }
++                Err(_) => {
++                    stream = None;
++                    failures += 1;
++                    last_error = format!("no data for {:?}", policy.stall);
++                }
++            }
+ 
+-            pending.extend_from_slice(&data);
++            let received = min(
++                done_pages * PAGE_SIZE as u64 + pending.len() as u64,
++                sfile.length,
++            );
++            if received > reported {
++                reported = received;
++                progress(reported, sfile.length);
++            }
+ 
+-            while pending.len() >= 4096 {
+-                if page_in_section >= page_start + page_count || remaining == 0 {
++            while pending.len() >= PAGE_SIZE && done_pages < page_count {
++                let absolute_page = first_page + done_pages;
++                page.copy_from_slice(&pending[..PAGE_SIZE]);
++                if self.verified
++                    && let Err(err) = self.hashes.check(absolute_page, &page)
++                {
++                    // Throw away this page and whatever came after it on the
++                    // same connection, and ask again from here.
++                    let count = match bad_page {
++                        Some((p, n)) if p == absolute_page => n + 1,
++                        _ => 1,
++                    };
++                    if count >= policy.bad_page_limit {
++                        return Err(Box::new(Error::new(
++                            ErrorKind::InvalidData,
++                            format!("{err}, {count} times over; giving up on this file"),
++                        )));
++                    }
++                    bad_page = Some((absolute_page, count));
++                    pending.clear();
++                    stream = None;
++                    failures += 1;
++                    last_error = err.to_string();
+                     break;
+                 }
+-                let chunk = pending.split_to(4096);
+-                page.copy_from_slice(&chunk);
++                let _ = pending.split_to(PAGE_SIZE);
++
+                 let to_write_remaining = remaining.min(PAGE_SIZE as u64) as usize;
+-                let to_write = if let Some(tweak) = &tweak {
+-                    let tweak = tweak.with_data_unit(match &s.unwrap().data_units {
+-                        Some(units) => *units.get(page_in_section as usize).ok_or_else(|| {
+-                            io::Error::new(
+-                                io::ErrorKind::InvalidInput,
+-                                format!(
+-                                    "{} units {} page_in_section {} ({}+{})",
+-                                    "missing data unit",
+-                                    (*units).len(),
+-                                    page_in_section,
+-                                    page_start,
+-                                    page_count
+-                                ),
+-                            )
+-                        })?,
+-                        None => page_in_section as u32,
+-                    });
+-                    decrypt_page_xts(
+-                        &mut page,
+-                        tweak,
+-                        tweak_cipher.as_ref().unwrap(),
+-                        data_cipher.as_ref().unwrap(),
+-                    );
++                let to_write = if let Some(crypto) = &crypto {
++                    self.decrypt_page(&mut page, absolute_page, crypto)?;
+                     to_write_remaining
+                 } else if sfile.keep_encrypted {
+                     // Decryption needs full 4k blocks
+@@ -886,22 +1334,14 @@ impl XvdFile {
+                 } else {
+                     to_write_remaining
+                 };
+-                while let Err(err) = out.write_all(&page[..to_write]).await {
+-                    eprintln!("Error write file {} waiting 30s", err);
+-                    println!("Error write file {} waiting 30s", err);
+-                    sleep(tokio::time::Duration::from_secs(30)).await;
+-                }
++                out.write_all(&page[..to_write]).await?;
+                 remaining -= to_write_remaining as u64;
++                done_pages += 1;
+ 
+-                page_in_section += 1;
++                failures = 0;
++                last_good = Instant::now();
+             }
+         }
+-        if remaining > 0 {
+-            return Err(Box::new(std::io::Error::other(format!(
+-                "{} of {} missing have {}",
+-                remaining, sfile.length, v
+-            ))));
+-        }
+         Ok(())
+     }
+ 
+@@ -923,74 +1363,29 @@ impl XvdFile {
+             return Ok(());
+         }
+ 
+-        let s = &self.encrypted_section_infos.iter().find(|s| {
+-            sfile.offset >= s.section_offset && sfile.offset < s.section_offset + s.section_length
+-        });
+-
+-        let mut tweak = None;
+-        let mut tweak_cipher = None;
+-        let mut data_cipher = None;
+-
+-        let file_offset_in_section;
+-
+-        if let Some(s) = s
+-            && (!sfile.keep_encrypted || decrypt_all)
+-        {
+-            let mut tweak_key = [0u8; 16];
+-            let mut data_key = [0u8; 16];
+-            tweak_key.copy_from_slice(&full_key[..16]);
+-            data_key.copy_from_slice(&full_key[16..]);
+-
+-            tweak = Some(TweakGenerator::new(s.header_id, s.vduid));
+-            tweak_cipher = Some(Aes128Enc::new((&tweak_key).into()));
+-            data_cipher = Some(Aes128Dec::new((&data_key).into()));
+-            file_offset_in_section = sfile.offset - s.section_offset;
+-        } else {
+-            // TODO for data integrity we need a section for unencrypted sections...
+-            file_offset_in_section = sfile.offset;
+-        }
+-        let page_start = file_offset_in_section / PAGE_SIZE as u64;
++        let first_page = Self::first_page_of(sfile)?;
++        let crypto = self.file_crypto(sfile, full_key, !sfile.keep_encrypted || decrypt_all);
+         let page_count = sfile.length.div_ceil(PAGE_SIZE as u64);
++        // Reading from a package's own pages, they are checked like downloaded
++        // ones. Mounting reads a file already on disk, written raw, and is
++        // left as it was.
++        let verify = self.verified && !decrypt_all;
+ 
+         let mut page = [0u8; PAGE_SIZE];
+ 
+-        for page_in_section in page_start..page_start + page_count {
+-            progress(
+-                min((page_in_section - page_start) * 4096, sfile.length),
+-                sfile.length,
+-            );
++        for n in 0..page_count {
++            progress(min(n * PAGE_SIZE as u64, sfile.length), sfile.length);
+             i.read_exact(&mut page).await?;
++            let absolute_page = first_page + n;
++            if verify {
++                self.hashes.check(absolute_page, &page)?;
++            }
+             let to_write = min(
+-                PAGE_SIZE,
+-                sfile.length as usize
+-                    - min(
+-                        (page_in_section - page_start) as usize * 4096_usize,
+-                        sfile.length as usize,
+-                    ),
++                PAGE_SIZE as u64,
++                sfile.length - min(n * PAGE_SIZE as u64, sfile.length),
+             ) as usize;
+-            let to_write = if let Some(tweak) = &tweak {
+-                let tweak = tweak.with_data_unit(match &s.unwrap().data_units {
+-                    Some(units) => *units.get(page_in_section as usize).ok_or_else(|| {
+-                        io::Error::new(
+-                            io::ErrorKind::InvalidInput,
+-                            format!(
+-                                "{} units {} page_in_section {} ({}+{})",
+-                                "missing data unit",
+-                                (*units).len(),
+-                                page_in_section,
+-                                page_start,
+-                                page_count
+-                            ),
+-                        )
+-                    })?,
+-                    None => page_in_section as u32,
+-                });
+-                decrypt_page_xts(
+-                    &mut page,
+-                    tweak,
+-                    tweak_cipher.as_ref().unwrap(),
+-                    data_cipher.as_ref().unwrap(),
+-                );
++            let to_write = if let Some(crypto) = &crypto {
++                self.decrypt_page(&mut page, absolute_page, crypto)?;
+                 to_write
+             } else if sfile.keep_encrypted {
+                 // Decryption needs full 4k blocks
+@@ -998,11 +1393,7 @@ impl XvdFile {
+             } else {
+                 to_write
+             };
+-            while let Err(err) = out.write_all(&page[..to_write]).await {
+-                eprintln!("Error write file {} waiting 30s", err);
+-                println!("Error write file {} waiting 30s", err);
+-                sleep(tokio::time::Duration::from_secs(30)).await;
+-            }
++            out.write_all(&page[..to_write]).await?;
+         }
+         Ok(())
+     }
+@@ -1044,3 +1435,548 @@ impl XvdFile {
+             .await
+     }
+ }
++
++/// A package built in memory, for tests here and in the crates that use this
++/// one. Not part of the API.
++#[doc(hidden)]
++pub mod testing {
++    use sha2::{Digest, Sha256};
++
++    use super::PAGE_SIZE;
++    use crate::models::xvd::{HASH_ENTRIES_IN_PAGE, HASH_ENTRY_LENGTH, XvdHeader};
++    use msixvc_common::parse::BinaryTryParse;
++
++    pub const DRIVE_PAGES: usize = 340;
++
++    /// Small enough to build in a test and large enough to need a two-level
++    /// hash tree: three header pages, the tree, one page of user data and
++    /// `DRIVE_PAGES` pages of plain drive data, every hash real. Nothing in it
++    /// is encrypted.
++    pub struct Package {
++        pub bytes: Vec<u8>,
++        pub tree_start: usize,
++        pub user_data_page: usize,
++        pub drive_page: usize,
++    }
++
++    fn drive_page_bytes(n: usize) -> Vec<u8> {
++        (0..PAGE_SIZE)
++            .map(|i| ((i * 7 + n * 13) % 251) as u8)
++            .collect()
++    }
++
++    fn header_bytes(top_hash: &[u8; 32]) -> Vec<u8> {
++        let mut h = vec![0u8; 3 * PAGE_SIZE];
++        h[0x200..0x208].copy_from_slice(b"msft-xvd");
++        // Created in 2019, as a FILETIME.
++        h[0x210..0x218].copy_from_slice(&132_000_000_000_000_000i64.to_le_bytes());
++        h[0x218..0x220].copy_from_slice(&((DRIVE_PAGES * PAGE_SIZE) as u64).to_le_bytes());
++        h[0x240..0x260].copy_from_slice(top_hash);
++        h[0x28C..0x290].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
++        h
++    }
++
++    fn entry(page: &[u8]) -> [u8; HASH_ENTRY_LENGTH] {
++        let digest = Sha256::digest(page);
++        let mut e = [0u8; HASH_ENTRY_LENGTH];
++        e.copy_from_slice(&digest[..HASH_ENTRY_LENGTH]);
++        e
++    }
++
++    /// Hash entries packed the way a level stores them: `HASH_ENTRIES_IN_PAGE`
++    /// to a page, the rest of each page zero.
++    fn level_pages(entries: &[[u8; HASH_ENTRY_LENGTH]]) -> Vec<Vec<u8>> {
++        entries
++            .chunks(HASH_ENTRIES_IN_PAGE)
++            .map(|chunk| {
++                let mut page = vec![0u8; PAGE_SIZE];
++                for (i, e) in chunk.iter().enumerate() {
++                    page[i * HASH_ENTRY_LENGTH..(i + 1) * HASH_ENTRY_LENGTH].copy_from_slice(e);
++                }
++                page
++            })
++            .collect()
++    }
++
++    pub fn package() -> Package {
++        let mut buf = XvdHeader::buffer();
++        let len = buf.len();
++        buf.copy_from_slice(&header_bytes(&[0; 32])[..len]);
++        let layout = XvdHeader::try_from_array(&buf).unwrap().layout();
++        let tree = layout.hash_tree_layout;
++        assert_eq!(
++            tree.top_level(),
++            1,
++            "the fixture is meant to need two levels"
++        );
++
++        // User data: a header whose type says "no package file table".
++        let mut user_data = vec![0u8; PAGE_SIZE];
++        user_data[8..12].copy_from_slice(&1u32.to_le_bytes());
++        let mut data_pages = vec![user_data];
++        data_pages.extend((0..DRIVE_PAGES).map(drive_page_bytes));
++
++        let level0 = level_pages(&data_pages.iter().map(|p| entry(p)).collect::<Vec<_>>());
++        let level1 = level_pages(&level0.iter().map(|p| entry(p)).collect::<Vec<_>>());
++        assert_eq!(level0.len(), tree.level0.num_pages().0 as usize);
++        assert_eq!(level1.len(), 1);
++        let top: [u8; 32] = Sha256::digest(&level1[0]).into();
++
++        let mut bytes = header_bytes(&top);
++        let tree_start = layout.hash_tree.start.0 as usize;
++        assert_eq!(bytes.len(), tree_start * PAGE_SIZE);
++        for page in level1.iter().chain(level0.iter()) {
++            bytes.extend_from_slice(page);
++        }
++        let user_data_page = layout.user_data.start.0 as usize;
++        assert_eq!(bytes.len(), user_data_page * PAGE_SIZE);
++        for page in &data_pages {
++            bytes.extend_from_slice(page);
++        }
++        Package {
++            bytes,
++            tree_start,
++            user_data_page,
++            drive_page: layout.drive_data.start.0 as usize,
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::io::Cursor;
++    use std::pin::Pin;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    use std::sync::{Arc, Mutex};
++    use std::task::{Context, Poll};
++    use std::time::Duration;
++
++    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
++    use tokio::net::TcpListener;
++
++    use super::testing::{DRIVE_PAGES, Package, package};
++    use super::{
++        PAGE_SIZE, PageHashMismatch, RetryPolicy, SegmentFile, XvdFile, package_relative_path,
++    };
++
++    fn flip(bytes: &mut [u8], offset: usize) {
++        bytes[offset] ^= 0x01;
++    }
++
++    /// Pages 5..8 of the drive and a little of page 8, as a file of the package.
++    fn sample_file(p: &Package) -> (SegmentFile, Vec<u8>) {
++        let first = p.drive_page + 5;
++        let length = 3 * PAGE_SIZE + 100;
++        let file = SegmentFile {
++            offset: (first * PAGE_SIZE) as u64,
++            length: length as u64,
++            data_hashs: vec![],
++            keep_encrypted: false,
++        };
++        let expected = p.bytes[first * PAGE_SIZE..first * PAGE_SIZE + length].to_vec();
++        (file, expected)
++    }
++
++    async fn parse_verified(bytes: &[u8]) -> Result<XvdFile, Box<dyn std::error::Error>> {
++        XvdFile::parse_verified(Cursor::new(bytes.to_vec())).await
++    }
++
++    #[test]
++    fn package_names_cannot_leave_the_install_folder() {
++        assert_eq!(
++            package_relative_path(r"Content\Paks\data.pak").unwrap(),
++            std::path::PathBuf::from("Content/Paks/data.pak")
++        );
++        assert_eq!(
++            package_relative_path("Game.exe").unwrap(),
++            std::path::PathBuf::from("Game.exe")
++        );
++        for bad in [
++            "",
++            r"..\..\.config\autostart\x.desktop",
++            r"Content\..\..\x",
++            "../x",
++            r"\etc\passwd",
++            "/etc/passwd",
++            r"C:\Windows\x.dll",
++            "C:x",
++            r"a\\b",
++            r"a\",
++            r".\a",
++            "a\0b",
++            "file.txt:stream",
++        ] {
++            assert!(
++                package_relative_path(bad).is_err(),
++                "{bad:?} should have been refused"
++            );
++        }
++    }
++
++    #[test]
++    fn retry_waits_double_up_to_the_cap() {
++        let policy = RetryPolicy::default();
++        assert_eq!(policy.delay(1), Duration::from_secs(1));
++        assert_eq!(policy.delay(2), Duration::from_secs(2));
++        assert_eq!(policy.delay(5), Duration::from_secs(16));
++        assert_eq!(policy.delay(6), Duration::from_secs(30));
++        assert_eq!(policy.delay(1000), Duration::from_secs(30));
++    }
++
++    #[tokio::test]
++    async fn an_intact_package_verifies() {
++        let p = package();
++        let xvd = parse_verified(&p.bytes).await.unwrap();
++        assert!(xvd.verified);
++        // Hashed page 0 is the first user data page.
++        assert_eq!(xvd.hashes.first_page, p.user_data_page as u64);
++        assert_eq!(xvd.hashes.hashes.len(), 1 + DRIVE_PAGES);
++    }
++
++    #[tokio::test]
++    async fn a_damaged_hash_tree_is_refused() {
++        let p = package();
++        // A level-0 entry: its page no longer matches the level above.
++        let mut bytes = p.bytes.clone();
++        flip(&mut bytes, (p.tree_start + 1) * PAGE_SIZE + 30);
++        let err = parse_verified(&bytes).await.err().unwrap();
++        assert!(err.to_string().contains("hash tree is damaged"), "{err}");
++
++        // The top page: it no longer matches the header.
++        let mut bytes = p.bytes.clone();
++        flip(&mut bytes, p.tree_start * PAGE_SIZE + 3);
++        let err = parse_verified(&bytes).await.err().unwrap();
++        assert!(err.to_string().contains("the package header"), "{err}");
++
++        // Unchecked parsing is what the installed container gets, and it
++        // takes the tree as it is.
++        assert!(XvdFile::parse(Cursor::new(bytes)).await.is_ok());
++    }
++
++    #[tokio::test]
++    async fn a_damaged_metadata_page_is_refused() {
++        let p = package();
++        let mut bytes = p.bytes.clone();
++        flip(&mut bytes, p.user_data_page * PAGE_SIZE + 100);
++        let err = parse_verified(&bytes).await.err().unwrap();
++        assert!(
++            err.to_string().contains("does not match its hash tree"),
++            "{err}"
++        );
++    }
++
++    #[tokio::test]
++    async fn extracting_checks_every_page() {
++        let p = package();
++        let xvd = parse_verified(&p.bytes).await.unwrap();
++        let (file, expected) = sample_file(&p);
++
++        let mut out = Vec::new();
++        xvd.extract_file(
++            &mut Cursor::new(p.bytes.clone()),
++            &mut out,
++            &file,
++            [0; 32],
++            |_, _| {},
++        )
++        .await
++        .unwrap();
++        assert_eq!(out, expected);
++
++        let mut damaged = p.bytes.clone();
++        flip(&mut damaged, file.offset as usize + 2 * PAGE_SIZE + 9);
++        let mut out = Vec::new();
++        let err = xvd
++            .extract_file(
++                &mut Cursor::new(damaged),
++                &mut out,
++                &file,
++                [0; 32],
++                |_, _| {},
++            )
++            .await
++            .unwrap_err();
++        let io = err.downcast_ref::<std::io::Error>().unwrap();
++        let mismatch = io
++            .get_ref()
++            .and_then(|e| e.downcast_ref::<PageHashMismatch>())
++            .unwrap();
++        assert_eq!(mismatch.page, file.offset / PAGE_SIZE as u64 + 2);
++        // Nothing from the damaged page or after it was written.
++        assert_eq!(out.len(), 2 * PAGE_SIZE);
++    }
++
++    /// What the test server does with the request it is numbered.
++    #[derive(Clone, Copy, Debug)]
++    enum Answer {
++        /// The range asked for.
++        Serve,
++        /// The range asked for, with one byte changed.
++        Damaged,
++        /// The first `n` bytes of the range, then the connection closes.
++        Short(usize),
++        /// Just this status.
++        Status(u16),
++        /// Accept the connection and close it without a word.
++        Hang,
++    }
++
++    struct Server {
++        url: String,
++        ranges: Arc<Mutex<Vec<String>>>,
++        handle: tokio::task::JoinHandle<()>,
++    }
++
++    impl Drop for Server {
++        fn drop(&mut self) {
++            self.handle.abort();
++        }
++    }
++
++    async fn serve(body: Vec<u8>, script: Vec<Answer>, then: Answer) -> Server {
++        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let url = format!("http://{}/package", listener.local_addr().unwrap());
++        let ranges = Arc::new(Mutex::new(Vec::new()));
++        let seen = ranges.clone();
++        let count = Arc::new(AtomicUsize::new(0));
++        let body = Arc::new(body);
++        let handle = tokio::spawn(async move {
++            while let Ok((mut stream, _)) = listener.accept().await {
++                let n = count.fetch_add(1, Ordering::SeqCst);
++                let answer = script.get(n).copied().unwrap_or(then);
++                let body = body.clone();
++                let seen = seen.clone();
++                tokio::spawn(async move {
++                    let mut request = Vec::new();
++                    let mut buf = [0u8; 1024];
++                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
++                        match stream.read(&mut buf).await {
++                            Ok(0) | Err(_) => return,
++                            Ok(n) => request.extend_from_slice(&buf[..n]),
++                        }
++                    }
++                    let text = String::from_utf8_lossy(&request).to_string();
++                    let range = text
++                        .lines()
++                        .find_map(|l| l.strip_prefix("range: ").or(l.strip_prefix("Range: ")))
++                        .unwrap_or("")
++                        .to_owned();
++                    seen.lock().unwrap().push(range.clone());
++                    let (start, end) = range
++                        .strip_prefix("bytes=")
++                        .and_then(|r| r.split_once('-'))
++                        .map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()))
++                        .unwrap_or((0, body.len() - 1));
++                    let mut part = body[start..=end].to_vec();
++                    let head = |status: &str, len: usize| {
++                        format!(
++                            "HTTP/1.1 {status}\r\nContent-Length: {len}\r\n\
++                             Content-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n",
++                            body.len()
++                        )
++                    };
++                    let reply = match answer {
++                        Answer::Serve => {
++                            [head("206 Partial Content", part.len()).into_bytes(), part].concat()
++                        }
++                        Answer::Damaged => {
++                            part[PAGE_SIZE / 2] ^= 0x40;
++                            [head("206 Partial Content", part.len()).into_bytes(), part].concat()
++                        }
++                        Answer::Short(n) => {
++                            let len = part.len();
++                            part.truncate(n);
++                            [head("206 Partial Content", len).into_bytes(), part].concat()
++                        }
++                        Answer::Status(code) => format!(
++                            "HTTP/1.1 {code} Nope\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
++                        )
++                        .into_bytes(),
++                        Answer::Hang => Vec::new(),
++                    };
++                    let _ = stream.write_all(&reply).await;
++                    let _ = stream.shutdown().await;
++                });
++            }
++        });
++        Server {
++            url,
++            ranges,
++            handle,
++        }
++    }
++
++    fn quick() -> RetryPolicy {
++        RetryPolicy {
++            first_delay: Duration::from_millis(5),
++            max_delay: Duration::from_millis(20),
++            give_up_after: Duration::from_millis(500),
++            stall: Duration::from_secs(2),
++            bad_page_limit: 3,
++        }
++    }
++
++    async fn download(
++        xvd: &XvdFile,
++        server: &Server,
++        file: &SegmentFile,
++        out: &mut (impl AsyncWrite + Unpin),
++        policy: &RetryPolicy,
++    ) -> Result<(), String> {
++        let client = reqwest::Client::new();
++        // Bounded, so a regression to retrying for ever fails the test instead
++        // of hanging it.
++        tokio::time::timeout(
++            Duration::from_secs(20),
++            xvd.download_file_http_with(
++                &client,
++                &server.url,
++                out,
++                file,
++                [0; 32],
++                |_, _| {},
++                policy,
++            ),
++        )
++        .await
++        .map_err(|_| "still retrying after 20 s".to_owned())?
++        .map_err(|e| e.to_string())
++    }
++
++    #[tokio::test(flavor = "multi_thread")]
++    async fn a_download_resumes_where_the_connection_dropped() {
++        let p = package();
++        let xvd = parse_verified(&p.bytes).await.unwrap();
++        let (file, expected) = sample_file(&p);
++        let server = serve(
++            p.bytes.clone(),
++            vec![Answer::Short(PAGE_SIZE + 10)],
++            Answer::Serve,
++        )
++        .await;
++
++        let mut out = Vec::new();
++        download(&xvd, &server, &file, &mut out, &quick())
++            .await
++            .unwrap();
++        assert_eq!(out, expected);
++        let ranges = server.ranges.lock().unwrap().clone();
++        assert_eq!(ranges.len(), 2);
++        assert_eq!(
++            ranges[1],
++            format!(
++                "bytes={}-{}",
++                file.offset + PAGE_SIZE as u64 + 10,
++                file.offset + 4 * PAGE_SIZE as u64 - 1
++            )
++        );
++    }
++
++    #[tokio::test(flavor = "multi_thread")]
++    async fn a_damaged_page_is_fetched_again_and_never_written() {
++        let p = package();
++        let xvd = parse_verified(&p.bytes).await.unwrap();
++        let (file, expected) = sample_file(&p);
++        let server = serve(p.bytes.clone(), vec![Answer::Damaged], Answer::Serve).await;
++
++        let mut out = Vec::new();
++        download(&xvd, &server, &file, &mut out, &quick())
++            .await
++            .unwrap();
++        assert_eq!(out, expected);
++        let ranges = server.ranges.lock().unwrap().clone();
++        assert_eq!(ranges.len(), 2, "{ranges:?}");
++        // The damage was in the first page, so it was asked for again whole.
++        assert_eq!(ranges[0], ranges[1]);
++    }
++
++    #[tokio::test(flavor = "multi_thread")]
++    async fn a_page_that_stays_damaged_fails_the_file() {
++        let p = package();
++        let xvd = parse_verified(&p.bytes).await.unwrap();
++        let (file, _) = sample_file(&p);
++        let server = serve(p.bytes.clone(), vec![], Answer::Damaged).await;
++
++        let mut out = Vec::new();
++        let err = download(&xvd, &server, &file, &mut out, &quick())
++            .await
++            .unwrap_err();
++        assert!(err.contains("does not match its hash tree"), "{err}");
++        assert!(out.is_empty());
++        assert_eq!(server.ranges.lock().unwrap().len(), 3);
++    }
++
++    #[tokio::test(flavor = "multi_thread")]
++    async fn a_missing_object_fails_at_once() {
++        let p = package();
++        let xvd = parse_verified(&p.bytes).await.unwrap();
++        let (file, _) = sample_file(&p);
++        for code in [403, 404, 416, 200] {
++            let server = serve(p.bytes.clone(), vec![], Answer::Status(code)).await;
++            let err = download(
++                &xvd,
++                &server,
++                &file,
++                &mut Vec::new(),
++                &RetryPolicy::default(),
++            )
++            .await
++            .unwrap_err();
++            assert!(err.contains(&code.to_string()), "{err}");
++            assert_eq!(
++                server.ranges.lock().unwrap().len(),
++                1,
++                "{code} was asked again"
++            );
++        }
++    }
++
++    #[tokio::test(flavor = "multi_thread")]
++    async fn a_dead_connection_is_given_up_on() {
++        let p = package();
++        let xvd = parse_verified(&p.bytes).await.unwrap();
++        let (file, _) = sample_file(&p);
++        for answer in [Answer::Hang, Answer::Status(503)] {
++            let server = serve(p.bytes.clone(), vec![], answer).await;
++            let err = download(&xvd, &server, &file, &mut Vec::new(), &quick())
++                .await
++                .unwrap_err();
++            assert!(err.contains("without progress"), "{err}");
++            let asked = server.ranges.lock().unwrap().len();
++            // Retried, but with a wait between attempts rather than flat out:
++            // in half a second at 5 ms doubling to 20 ms, a few dozen at most.
++            assert!((2..60).contains(&asked), "{answer:?} asked {asked} times");
++        }
++    }
++
++    struct FullDisk;
++
++    impl AsyncWrite for FullDisk {
++        fn poll_write(
++            self: Pin<&mut Self>,
++            _: &mut Context<'_>,
++            _: &[u8],
++        ) -> Poll<std::io::Result<usize>> {
++            Poll::Ready(Err(std::io::Error::from_raw_os_error(28)))
++        }
++        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
++            Poll::Ready(Ok(()))
++        }
++        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
++            Poll::Ready(Ok(()))
++        }
++    }
++
++    #[tokio::test(flavor = "multi_thread")]
++    async fn a_write_error_fails_the_file() {
++        let p = package();
++        let xvd = parse_verified(&p.bytes).await.unwrap();
++        let (file, _) = sample_file(&p);
++        let server = serve(p.bytes.clone(), vec![], Answer::Serve).await;
++
++        let err = download(&xvd, &server, &file, &mut FullDisk, &quick())
++            .await
++            .unwrap_err();
++        assert!(err.contains("No space left"), "{err}");
++    }
++}
+diff --git a/crates/xodus-cli/src/commands/download.rs b/crates/xodus-cli/src/commands/download.rs
+index a1358b9..63943ab 100644
+--- a/crates/xodus-cli/src/commands/download.rs
++++ b/crates/xodus-cli/src/commands/download.rs
+@@ -8,7 +8,7 @@ use tokio::io::AsyncWriteExt;
+ use xodus::models::packagespc::PackageFile;
+ use xodus::tokens::TokenManager;
+ 
+-use crate::package::{get_content_id, get_packages};
++use crate::package::{get_content_id, get_packages, package_url};
+ 
+ pub async fn run(
+     client: &reqwest::Client,
+@@ -55,39 +55,85 @@ pub async fn run(
+     };
+     println!();
+     for file in files {
+-        let url = format!(
+-            "{}{}",
+-            file.cdn_root_paths.first().unwrap(),
+-            file.relative_url
+-        );
++        let url = match package_url(&file.cdn_root_paths, &file.relative_url) {
++            Ok(url) => url,
++            Err(err) => {
++                eprintln!("{err}");
++                return ExitCode::FAILURE;
++            }
++        };
+         if dry_run {
+             println!("{}", url);
+             continue;
+         }
++        // Saved in the current directory under the name the service gives,
++        // which must therefore be a plain file name and nothing more.
++        let name = match msixvc::xvd::package_relative_path(&file.file_name) {
++            Ok(name) if name.components().count() == 1 => name,
++            Ok(_) => {
++                eprintln!(
++                    "refusing to save {:?}: not a plain file name",
++                    file.file_name
++                );
++                return ExitCode::FAILURE;
++            }
++            Err(err) => {
++                eprintln!("{err}");
++                return ExitCode::FAILURE;
++            }
++        };
+ 
+         let progress_bar = ProgressBar::new(file.file_size as u64).with_style(
+             ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) ({eta})").unwrap()
+             .progress_chars("#>-")
+         );
+ 
+-        let res = client
+-            .get(url)
++        let res = match client
++            .get(&url)
+             .send()
+             .await
+-            .expect("Failed to request the download");
+-        let mut file = tokio::fs::OpenOptions::new()
++            .and_then(|res| res.error_for_status())
++        {
++            Ok(res) => res,
++            Err(err) => {
++                eprintln!("could not download {url}: {err}");
++                return ExitCode::FAILURE;
++            }
++        };
++        let mut out = match tokio::fs::OpenOptions::new()
+             .create(true)
+             .write(true)
+             .truncate(true)
+-            .open(file.file_name)
++            .open(&name)
+             .await
+-            .unwrap();
++        {
++            Ok(out) => out,
++            Err(err) => {
++                eprintln!("could not write {}: {err}", name.display());
++                return ExitCode::FAILURE;
++            }
++        };
+         let mut stream = res.bytes_stream();
+ 
+         while let Some(chunk) = stream.next().await {
+-            let chk = chunk.expect("Failed to stream file");
+-            file.write_all(&chk).await.expect("Failed to write to file");
+-            progress_bar.inc(chk.len() as u64);
++            let written = match chunk {
++                Ok(chk) => out.write_all(&chk).await.map(|()| chk.len()),
++                Err(err) => {
++                    eprintln!("the download of {url} stopped: {err}");
++                    return ExitCode::FAILURE;
++                }
++            };
++            match written {
++                Ok(n) => progress_bar.inc(n as u64),
++                Err(err) => {
++                    eprintln!("could not write {}: {err}", name.display());
++                    return ExitCode::FAILURE;
++                }
++            }
++        }
++        if let Err(err) = out.flush().await {
++            eprintln!("could not write {}: {err}", name.display());
++            return ExitCode::FAILURE;
+         }
+ 
+         progress_bar.finish();
+diff --git a/crates/xodus-cli/src/commands/run.rs b/crates/xodus-cli/src/commands/run.rs
+index c5c3404..60286fa 100644
+--- a/crates/xodus-cli/src/commands/run.rs
++++ b/crates/xodus-cli/src/commands/run.rs
+@@ -4,7 +4,7 @@ use std::path::Path;
+ use std::process::ExitCode;
+ 
+ use msixvc::layout::PAGE_SIZE;
+-use msixvc::xvd::{SegmentFile, XvdFile};
++use msixvc::xvd::{SegmentFile, XvdFile, package_relative_path};
+ use nix::sys::signal::{Signal, kill};
+ use nix::unistd::Pid;
+ #[cfg(target_os = "linux")]
+@@ -214,9 +214,18 @@ pub async fn run(
+         if !file.1.keep_encrypted {
+             continue;
+         }
+-        let mut game_exe = File::from_std(make_temp_file(&mount_dir, file.0).unwrap());
++        // The name comes from the package; it must not reach outside the
++        // game's folder, here any more than when it was installed.
++        let relative = match package_relative_path(file.0) {
++            Ok(relative) => relative,
++            Err(err) => {
++                eprintln!("{err}");
++                return ExitCode::FAILURE;
++            }
++        };
++        let source_path = out.join(relative);
+ 
+-        let source_path = out.join(file.0.replace("\\", "/"));
++        let mut game_exe = File::from_std(make_temp_file(&mount_dir, file.0).unwrap());
+ 
+         let mut i = File::open(&source_path).await.unwrap();
+ 
+diff --git a/crates/xodus-cli/src/commands/streaming.rs b/crates/xodus-cli/src/commands/streaming.rs
+index 77d94e2..dc136d6 100644
+--- a/crates/xodus-cli/src/commands/streaming.rs
++++ b/crates/xodus-cli/src/commands/streaming.rs
+@@ -6,18 +6,19 @@ use std::time::{Duration, Instant};
+ use std::vec;
+ 
+ use fs2::available_space;
+-use futures_util::{StreamExt, stream};
++use futures_util::{TryStreamExt, stream};
+ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
++use msixvc::layout::PAGE_SIZE;
+ use msixvc::streaming;
+-use msixvc::xvd::{SegmentFile, XvdFile};
+-use tokio::fs::{File, OpenOptions};
+-use tokio::io::AsyncRead;
++use msixvc::xvd::{SegmentFile, XvdFile, package_relative_path};
++use tokio::fs::File;
++use tokio::io::{AsyncRead, AsyncWriteExt};
+ use tokio::sync::mpsc::{Receiver, Sender};
+ use uuid::Uuid;
+ use xodus::tokens::TokenManager;
+ 
+ use crate::license::get_license;
+-use crate::package::{get_content_id, get_packages};
++use crate::package::{get_content_id, get_packages, package_url};
+ 
+ struct Job {
+     name: String,
+@@ -42,7 +43,7 @@ pub async fn run(
+     market: Option<String>,
+ ) -> ExitCode {
+     let (tx, rx) = tokio::sync::mpsc::channel::<ProgressEvent>(256);
+-    if source.starts_with("file://") {
++    let result = if source.starts_with("file://") {
+         let fsrc = source.strip_prefix("file://").unwrap_or_default();
+         let f = match File::open(fsrc).await {
+             Ok(f) => f,
+@@ -68,12 +69,18 @@ pub async fn run(
+             f,
+             l,
+             &source,
+-            &tx,
++            tx,
+             rx,
+         )
+-        .await;
++        .await
+     } else {
+         let vurl = if source.starts_with("http://") || source.starts_with("https://") {
++            if source.starts_with("http://") {
++                eprintln!(
++                    "warning: {source} is plain http; the package's pages are checked against \
++                     its hash tree, but nothing vouches for its header"
++                );
++            }
+             source
+         } else {
+             let content_id = if Uuid::try_parse(&source).is_err() {
+@@ -120,22 +127,27 @@ pub async fn run(
+                 }
+                 return ExitCode::FAILURE;
+             };
+-            format!(
+-                "{}{}",
+-                file.cdn_root_paths.first().unwrap(),
+-                file.relative_url
+-            )
++            match package_url(&file.cdn_root_paths, &file.relative_url) {
++                Ok(url) => url,
++                Err(err) => {
++                    eprintln!("{err}");
++                    return ExitCode::FAILURE;
++                }
++            }
+         };
+         let url = &vurl;
++        // Its own sender, owned by the reader, so that the channel closes when
++        // the download is over and the progress task can finish.
++        let progress_tx = tx.clone();
+         let mut pos = 0;
+-        let http_file = streaming::HttpRead::open(
++        let http_file = match streaming::HttpRead::open(
+             client.clone(),
+             url,
+-            Some(|c, _| {
+-                if tx
++            Some(move |c: u64, _| {
++                if progress_tx
+                     .try_send(ProgressEvent::Advanced {
+                         id: usize::MAX,
+-                        delta: c - pos,
++                        delta: c.saturating_sub(pos),
+                     })
+                     .is_ok()
+                 {
+@@ -144,7 +156,13 @@ pub async fn run(
+             }),
+         )
+         .await
+-        .expect("ok");
++        {
++            Ok(http_file) => http_file,
++            Err(err) => {
++                eprintln!("could not start the download from {url}: {err}");
++                return ExitCode::FAILURE;
++            }
++        };
+         let l = http_file.len();
+ 
+         run_cli_reader(
+@@ -157,13 +175,23 @@ pub async fn run(
+             http_file,
+             l,
+             url,
+-            &tx,
++            tx,
+             rx,
+         )
+-        .await;
+-    }
++        .await
++    };
+ 
+-    ExitCode::SUCCESS
++    // Every way this can fail ends here, and none of them is a success. A
++    // licence refused, a full disk or a file that would not extract all used
++    // to return early from a function with nothing to return, and the process
++    // exited 0 -- so an update that never happened was reported as finished.
++    match result {
++        Ok(()) => ExitCode::SUCCESS,
++        Err(err) => {
++            eprintln!("{err}");
++            ExitCode::FAILURE
++        }
++    }
+ }
+ 
+ /// Download progress another program can read.
+@@ -228,13 +256,13 @@ async fn run_cli_reader<Reader>(
+     reader: Reader,
+     l: u64,
+     url: &str,
+-    tx: &Sender<ProgressEvent>,
++    tx: Sender<ProgressEvent>,
+     mut rx: Receiver<ProgressEvent>,
+-) -> ()
++) -> Result<(), String>
+ where
+     Reader: AsyncRead + Unpin,
+ {
+-    tokio::spawn(async move {
++    let progress = tokio::spawn(async move {
+         let multi_progress = MultiProgress::new();
+         let total_progess = multi_progress.add(ProgressBar::new(l).with_style(
+             ProgressStyle::with_template("{msg:30!} {bytes:>12}/{total_bytes:>12} {bytes_per_sec:>12} [{bar:40.cyan/blue}] {percent:>3}%").unwrap()
+@@ -283,7 +311,7 @@ where
+         json.emit(&total_progess, true);
+         total_progess.abandon();
+     });
+-    run_reader(
++    let result = run_reader(
+         client,
+         tokens,
+         destination,
+@@ -293,30 +321,137 @@ where
+         reader,
+         l,
+         url,
+-        tx,
++        &tx,
+     )
+-    .await
++    .await;
++    // The task above ends when the last sender goes, and the forced final line
++    // is the last thing it does. Without waiting for it here, `main` returned
++    // and the runtime dropped the task first as often as not.
++    drop(tx);
++    let _ = progress.await;
++    result
+ }
+ 
+-/// Report a streaming failure and stop, instead of panicking.
++/// Describe a streaming failure, instead of panicking.
+ ///
+ /// These parses read the package header through a cache that the HTTP response
+ /// fills. When the response ends early the cache is shorter than it recorded --
+ /// `cache ended before cached_len` -- and every read past that point fails. That
+ /// is an interrupted download, and it reached the user as a Rust panic and a
+ /// backtrace, which says nothing about what happened or what to do next.
+-fn or_stop<T, E: std::fmt::Display>(what: &str, result: Result<T, E>) -> T {
+-    match result {
+-        Ok(value) => value,
+-        Err(err) => {
+-            eprintln!("failed to {what}: {err}");
+-            eprintln!(
+-                "the download did not finish -- this is usually the connection dropping \
+-                 partway through, so trying again is the first thing to do"
+-            );
+-            std::process::exit(1);
++fn stopped<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> String + '_ {
++    move |err| {
++        format!(
++            "failed to {what}: {err}\n\
++             the download did not finish -- this is usually the connection dropping \
++             partway through, so trying again is the first thing to do"
++        )
++    }
++}
++
++/// The progress label for a file: its last characters, if it is long.
++///
++/// Counted in characters, not bytes. Slicing at a byte offset panicked on a
++/// name with anything but ASCII near its end -- deterministically, so a title
++/// with such a file could never be installed.
++fn shown_name(path: &str) -> String {
++    const WIDTH: usize = 30;
++    if path.chars().count() <= WIDTH {
++        return path.to_owned();
++    }
++    let tail: Vec<char> = path.chars().rev().take(WIDTH - 3).collect();
++    format!("...{}", tail.into_iter().rev().collect::<String>())
++}
++
++/// How long a file is on disk once it is fully written: what it holds, or
++/// whole pages for one kept encrypted, which is written a page at a time.
++fn written_len(file: &SegmentFile) -> u64 {
++    if file.keep_encrypted {
++        file.length.div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64
++    } else {
++        file.length
++    }
++}
++
++/// Whether a file has to be fetched, given what the last install recorded.
++///
++/// The record is the container the last install committed, and it says what
++/// the package held, not what reached the disk. A file the record says is
++/// current is therefore also checked for being there at its full length, so
++/// one that was truncated or lost -- by a crash, a full disk, a hand -- is
++/// fetched again instead of being skipped for ever.
++fn needs_download(
++    out: &Path,
++    name: &str,
++    remote: &SegmentFile,
++    local: Option<&SegmentFile>,
++) -> bool {
++    let Some(local) = local else {
++        return true;
++    };
++    if remote.data_hashs.is_empty() || remote.data_hashs != local.data_hashs {
++        return true;
++    }
++    let Ok(relative) = package_relative_path(name) else {
++        return true;
++    };
++    std::fs::metadata(out.join(relative)).map_or(true, |m| m.len() != written_len(remote))
++}
++
++/// Read the container the last install committed, for what it says is there.
++async fn read_installed(final_path: &Path) -> Result<HashMap<String, SegmentFile>, String> {
++    let mut file = File::open(final_path).await.map_err(|e| e.to_string())?;
++    let xvd = XvdFile::parse(&mut file).await.map_err(|e| e.to_string())?;
++    let mut lfiles = HashMap::new();
++    let files = xvd
++        .parse_user_package_files(&mut file)
++        .await
++        .map_err(|e| e.to_string())?;
++    for (k, v) in &files {
++        if k == "SegmentMetadata.bin" {
++            lfiles = xvd
++                .parse_segment_metadata(&mut file, v)
++                .await
++                .map_err(|e| e.to_string())?;
+         }
+     }
++
++    if let Ok(sfiles) = xvd
++        .parse_ntfs_segment_metadata(&mut file, !lfiles.is_empty())
++        .await
++    {
++        lfiles.extend(sfiles);
++    }
++    Ok(lfiles)
++}
++
++/// Make the new container the record of what is installed, durably.
++///
++/// The files go to disk first and the record after them, and the record
++/// replaces the old one in a single rename. Before, the old record was deleted,
++/// the new one renamed into its place and nothing synced at all: a power cut
++/// soon after could leave an empty or partial record, which every later update
++/// then failed to parse, or game files that never reached the disk under a
++/// record saying they had.
++fn commit(out: &Path, cache_path: &Path, final_path: &Path) -> Result<(), String> {
++    let dir =
++        std::fs::File::open(out).map_err(|e| format!("could not open {}: {e}", out.display()))?;
++    #[cfg(target_os = "linux")]
++    rustix::fs::syncfs(&dir)
++        .map_err(|e| format!("could not flush {} to disk: {e}", out.display()))?;
++    #[cfg(not(target_os = "linux"))]
++    std::fs::File::open(cache_path)
++        .and_then(|f| f.sync_all())
++        .map_err(|e| format!("could not flush {} to disk: {e}", cache_path.display()))?;
++    std::fs::rename(cache_path, final_path).map_err(|e| {
++        format!(
++            "could not record the install ({} -> {}): {e}",
++            cache_path.display(),
++            final_path.display()
++        )
++    })?;
++    dir.sync_all()
++        .map_err(|e| format!("could not flush {} to disk: {e}", out.display()))
+ }
+ 
+ async fn run_reader<Reader>(
+@@ -330,38 +465,37 @@ async fn run_reader<Reader>(
+     l: u64,
+     url: &str,
+     tx: &Sender<ProgressEvent>,
+-) -> ()
++) -> Result<(), String>
+ where
+     Reader: AsyncRead + Unpin,
+ {
+     let out: &Path = Path::new(&destination);
+ 
+-    std::fs::create_dir_all(out).expect("ok");
++    std::fs::create_dir_all(out).map_err(|e| format!("could not create {}: {e}", out.display()))?;
+ 
+     let cache_path = out.join(".xodus-streaming-tmp.msixvc");
+     let final_path = out.join(".xodus-streaming.msixvc");
+ 
+-    let mut remote_file = or_stop(
+-        "open the download cache",
+-        streaming::PrefixCacheFile::new(reader, l, cache_path.clone()).await,
+-    );
+-    let remote_xvd = or_stop(
+-        "read the package header",
+-        XvdFile::parse(&mut remote_file).await,
+-    );
++    let mut remote_file = streaming::PrefixCacheFile::new(reader, l, cache_path.clone())
++        .await
++        .map_err(stopped("open the download cache"))?;
++    // Checked against itself before anything in it is believed: see
++    // `XvdFile::parse_verified`.
++    let remote_xvd = XvdFile::parse_verified(&mut remote_file)
++        .await
++        .map_err(stopped("read the package header"))?;
+     let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
+-    let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
+ 
+-    let files = or_stop(
+-        "read the package file table",
+-        remote_xvd.parse_user_package_files(&mut remote_file).await,
+-    );
++    let files = remote_xvd
++        .parse_user_package_files(&mut remote_file)
++        .await
++        .map_err(stopped("read the package file table"))?;
+     for (k, v) in &files {
+         if k == "SegmentMetadata.bin" {
+-            rfiles = or_stop(
+-                "read the package segment metadata",
+-                remote_xvd.parse_segment_metadata(&mut remote_file, v).await,
+-            );
++            rfiles = remote_xvd
++                .parse_segment_metadata(&mut remote_file, v)
++                .await
++                .map_err(stopped("read the package segment metadata"))?;
+         }
+     }
+ 
+@@ -371,37 +505,36 @@ where
+         })
+         .await
+         .ok();
+-        let sfiles = or_stop(
+-            "read the package filesystem",
+-            remote_xvd
+-                .parse_ntfs_segment_metadata(&mut remote_file, !rfiles.is_empty())
+-                .await,
+-        );
++        let sfiles = remote_xvd
++            .parse_ntfs_segment_metadata(&mut remote_file, !rfiles.is_empty())
++            .await
++            .map_err(stopped("read the package filesystem"))?;
+         rfiles.extend(sfiles);
+     }
++    // The cache has everything it is going to get; the rest comes from the
++    // files' own ranges.
++    drop(remote_file);
+ 
+-    let file = OpenOptions::new()
+-        .read(true)
+-        .open(final_path.to_owned())
+-        .await
+-        .ok();
+-
+-    if let Some(mut file) = file {
+-        let xvd = XvdFile::parse(&mut file).await.expect("no err");
+-
+-        let files = xvd.parse_user_package_files(&mut file).await.expect("ok");
+-        for (k, v) in &files {
+-            if k == "SegmentMetadata.bin" {
+-                let sfiles = xvd.parse_segment_metadata(&mut file, v).await.expect("ok");
+-                lfiles = sfiles;
+-            }
+-        }
++    // Every name the package gives is checked before anything is fetched, so a
++    // package that names a file outside the destination is refused whole, not
++    // after it has written the files that came before.
++    for name in rfiles.keys() {
++        package_relative_path(name)
++            .map_err(|e| format!("refusing to install this package: {e}"))?;
++    }
+ 
+-        if let Ok(sfiles) = xvd
+-            .parse_ntfs_segment_metadata(&mut file, !lfiles.is_empty())
+-            .await
+-        {
+-            lfiles.extend(sfiles);
++    let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
++    if final_path.exists() {
++        // Only a record of what is there; if it cannot be read, everything is
++        // fetched again, which is slow but right. It used to be a panic on
++        // every later run.
++        match read_installed(&final_path).await {
++            Ok(files) => lfiles = files,
++            Err(err) => eprintln!(
++                "the record of the last install ({}) could not be read ({err}); \
++                 every file will be downloaded again",
++                final_path.display()
++            ),
+         }
+     }
+ 
+@@ -412,58 +545,53 @@ where
+         market.unwrap_or("neutral".to_string()),
+     )
+     .await;
+-    if let Err(err) = license {
+-        eprintln!("{}", err);
+-        return;
+-    }
+-    let (key, game_splicense) = license.unwrap();
++    let (key, game_splicense) = license.map_err(|err| err.to_string())?;
+     if game_splicense.content_keys.len() != 1 {
+-        eprintln!(
++        return Err(format!(
+             "unexpected number of content keys {}",
+             game_splicense.content_keys.len()
+-        );
+-        return;
++        ));
+     }
+     let Some((_, content_key)) = game_splicense.content_keys.into_iter().next() else {
+-        return;
++        return Err("the licence holds no content key".into());
+     };
+ 
+-    let full_key = content_key.unpack(&key).expect("failed to unpack");
++    let full_key = content_key
++        .unpack(&key)
++        .map_err(|e| format!("could not unpack the content key: {e}"))?;
+ 
+-    let total_size = rfiles
++    let jobs: Vec<Job> = rfiles
+         .iter()
+-        .filter(|(k, v1)| {
+-            if let Some(v2) = lfiles.get(*k) {
+-                v1.data_hashs != v2.data_hashs || v1.data_hashs.is_empty()
+-            } else {
+-                true
+-            }
++        .filter(|(k, v1)| needs_download(out, k, v1, lfiles.get(*k)))
++        .map(|(n, v)| Job {
++            name: n.clone(),
++            content: SegmentFile {
++                offset: v.offset,
++                length: v.length,
++                data_hashs: vec![],
++                keep_encrypted: v.keep_encrypted,
++            },
+         })
+-        .map(|(_, v)| v.length)
+-        .sum();
++        .collect();
++    let total_size: u64 = jobs.iter().map(|job| job.content.length).sum();
+ 
+     let required_free_space = total_size;
+-    let available_free_space = match available_space(out) {
+-        Ok(space) => space,
+-        Err(err) => {
+-            eprintln!(
+-                "failed to determine available space for {}: {}",
+-                out.display(),
+-                err
+-            );
+-            return;
+-        }
+-    };
++    let available_free_space = available_space(out).map_err(|err| {
++        format!(
++            "failed to determine available space for {}: {}",
++            out.display(),
++            err
++        )
++    })?;
+ 
+     if available_free_space < required_free_space {
+-        eprintln!(
++        return Err(format!(
+             "not enough free disk space on {}: need {} bytes, have {} bytes (files: {})",
+             out.display(),
+             required_free_space,
+             available_free_space,
+             total_size
+-        );
+-        return;
++        ));
+     }
+ 
+     tx.send(ProgressEvent::UpdateRemaining {
+@@ -473,101 +601,452 @@ where
+     .await
+     .ok();
+ 
+-    let remote_xvd_ref = &remote_xvd;
+-    stream::iter(
+-        rfiles
+-            .iter()
+-            .filter(|(k, v1)| {
+-                if let Some(v2) = lfiles.get(*k) {
+-                    v1.data_hashs != v2.data_hashs || v1.data_hashs.is_empty()
+-                } else {
+-                    true
++    // Stops at the first file that fails, and that failure is the result. The
++    // cache is not committed unless every file arrived, so the next run still
++    // sees the old record and fetches whatever this one did not finish.
++    fetch_files(client, &remote_xvd, jobs, out, url, *full_key, parallel, tx).await?;
++
++    commit(out, &cache_path, &final_path)
++}
++
++/// A file being written under a temporary name beside the one it is for, and
++/// removed when dropped unless it was put in place. The first file that fails
++/// drops every other job mid-write; writing over the real name would leave
++/// those files half written -- for an update, the good copies they were
++/// replacing truncated -- until a later run noticed.
++struct PartFile {
++    path: std::path::PathBuf,
++    armed: bool,
++}
++
++impl PartFile {
++    /// Create (or empty) the temporary file for `target`. Opened here rather
++    /// than through tokio, so that once this returns the guard owns the file:
++    /// an open still running on a blocking thread when the job is dropped
++    /// would create it after the guard had removed it.
++    fn create(target: &Path, id: usize) -> Result<(Self, File), String> {
++        let path = target.with_file_name(format!(".xodus-part-{id}"));
++        let file = std::fs::OpenOptions::new()
++            .create(true)
++            .write(true)
++            .truncate(true)
++            .open(&path)
++            .map_err(|e| format!("could not write {}: {e}", path.display()))?;
++        Ok((Self { path, armed: true }, File::from_std(file)))
++    }
++
++    /// Rename the finished file over `target`.
++    fn put_in_place(mut self, target: &Path) -> Result<(), String> {
++        std::fs::rename(&self.path, target)
++            .map_err(|e| format!("could not write {}: {e}", target.display()))?;
++        self.armed = false;
++        Ok(())
++    }
++}
++
++impl Drop for PartFile {
++    fn drop(&mut self) {
++        if self.armed {
++            let _ = std::fs::remove_file(&self.path);
++        }
++    }
++}
++
++/// Fetch every file in `jobs` into `out`, `parallel` at a time, from `url`
++/// (a package over http(s), or a container on disk as `file://`).
++///
++/// The first file that fails stops the rest and is the result. Each file is
++/// written under a temporary name and renamed into place only once all of it
++/// is written, so neither the file that failed nor one stopped because of it
++/// is left half written, and a file being replaced keeps its old contents.
++#[allow(clippy::too_many_arguments)]
++async fn fetch_files(
++    client: &reqwest::Client,
++    xvd: &XvdFile,
++    jobs: Vec<Job>,
++    out: &Path,
++    url: &str,
++    full_key: [u8; 32],
++    parallel: Option<usize>,
++    tx: &Sender<ProgressEvent>,
++) -> Result<(), String> {
++    stream::iter(jobs.into_iter().enumerate().map(Ok::<_, String>))
++        .try_for_each_concurrent(parallel.unwrap_or(4), |(id, job)| {
++            let tx = tx.clone();
++            let client = client.clone();
++            async move {
++                let relative = package_relative_path(&job.name)
++                    .map_err(|e| format!("refusing to install this package: {e}"))?;
++                let target_file = out.join(relative);
++                if let Some(folder) = target_file.parent() {
++                    std::fs::create_dir_all(folder)
++                        .map_err(|e| format!("could not create {}: {e}", folder.display()))?;
+                 }
+-            })
+-            .map(|(n, v)| Job {
+-                name: n.clone(),
+-                content: SegmentFile {
+-                    offset: v.offset,
+-                    length: v.length,
+-                    data_hashs: vec![],
+-                    keep_encrypted: v.keep_encrypted,
+-                },
+-            })
+-            .enumerate(),
+-    )
+-    .for_each_concurrent(parallel.unwrap_or(4), |(id, job)| {
+-        let tx = tx.clone();
+-        let client = client.clone();
+-        async move {
+-            let target_file = out.join(job.name.replace("\\", "/"));
+-            if let Some(folder) = target_file.parent() {
+-                std::fs::create_dir_all(folder).expect("ok");
+-            }
+-            let mut fout = OpenOptions::new()
+-                .create(true)
+-                .write(true)
+-                .truncate(true)
+-                .open(target_file)
++                let (part, mut fout) = PartFile::create(&target_file, id)?;
++                let mut lp = 0;
++
++                let progress = |pos: u64, _| {
++                    if tx
++                        .try_send(ProgressEvent::Advanced {
++                            id,
++                            delta: pos.saturating_sub(lp),
++                        })
++                        .is_ok()
++                    {
++                        lp = pos;
++                    }
++                };
++                tx.send(ProgressEvent::Started {
++                    id,
++                    name: shown_name(&job.name),
++                    total: job.content.length,
++                })
+                 .await
+-                .expect("ok");
+-            let mut lp = 0;
++                .ok();
+ 
+-            let progress = |pos, _| {
+-                if tx
+-                    .try_send(ProgressEvent::Advanced {
+-                        id,
+-                        delta: pos - lp,
+-                    })
+-                    .is_ok()
+-                {
+-                    lp = pos;
+-                }
+-            };
+-            let path = job.name.to_owned();
+-            let shown = if path.len() > 30 {
+-                format!("...{}", &path[path.len() - 27..])
+-            } else {
+-                path.clone()
+-            };
+-            tx.send(ProgressEvent::Started {
+-                id,
+-                name: shown,
+-                total: job.content.length,
+-            })
+-            .await
+-            .ok();
+-
+-            if let Some(fpath) = url.strip_prefix("file://") {
+-                let mut i = File::open(&fpath).await.unwrap();
+-                // A local container is often a *prefix* of the package -- the
+-                // streaming install keeps only what it read. Extracting from one
+-                // therefore runs off the end partway through, and `early eof`
+-                // arriving as a panic reads as a bug in the extractor rather
+-                // than as "this container does not go that far".
+-                if let Err(err) = remote_xvd_ref
+-                    .extract_file(&mut i, &mut fout, &job.content, *full_key, progress)
+-                    .await
+-                {
+-                    eprintln!(
+-                        "{}: {err}\n  {fpath} does not contain this file. A container left by a \
+-                         streaming install holds only the part of the package that was read; \
+-                         extracting the whole title needs the package, not the cache.",
+-                        job.name
+-                    );
+-                    return;
+-                }
+-                tx.send(ProgressEvent::Finished { id }).await.ok();
+-            } else {
+-                remote_xvd_ref
+-                    .download_file_http(&client, url, &mut fout, &job.content, *full_key, progress)
++                let result = if let Some(fpath) = url.strip_prefix("file://") {
++                    match File::open(&fpath).await {
++                        Err(err) => Err(format!("could not open {fpath}: {err}")),
++                        // A local container is often a *prefix* of the
++                        // package -- the streaming install keeps only what it
++                        // read. Extracting from one therefore runs off the end
++                        // partway through, and `early eof` arriving as a panic
++                        // reads as a bug in the extractor rather than as "this
++                        // container does not go that far".
++                        Ok(mut i) => xvd
++                            .extract_file(&mut i, &mut fout, &job.content, full_key, progress)
++                            .await
++                            .map_err(|err| {
++                                format!(
++                                    "{}: {err}\n  {fpath} does not contain this file. A container \
++                                     left by a streaming install holds only the part of the \
++                                     package that was read; extracting the whole title needs \
++                                     the package, not the cache.",
++                                    job.name
++                                )
++                            }),
++                    }
++                } else {
++                    xvd.download_file_http(
++                        &client,
++                        url,
++                        &mut fout,
++                        &job.content,
++                        full_key,
++                        progress,
++                    )
+                     .await
+-                    .expect("msg");
++                    .map_err(|err| format!("{}: {err}", job.name))
++                };
++                // tokio hands writes to another thread; an error from the last
++                // of them (a full disk, say) only shows up here.
++                let result = match result {
++                    Ok(()) => fout
++                        .flush()
++                        .await
++                        .map_err(|e| format!("could not write {}: {e}", target_file.display())),
++                    Err(err) => Err(err),
++                };
++                #[cfg(not(target_os = "linux"))]
++                let result = match result {
++                    Ok(()) => fout
++                        .sync_all()
++                        .await
++                        .map_err(|e| format!("could not write {}: {e}", target_file.display())),
++                    Err(err) => Err(err),
++                };
++                // Half a file is not left looking like a file: `part` removes
++                // it on an error, and when this job is dropped because
++                // another one failed.
++                result?;
++                drop(fout);
++                part.put_in_place(&target_file)?;
+                 tx.send(ProgressEvent::Finished { id }).await.ok();
++                Ok(())
+             }
++        })
++        .await
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn file(length: u64, hashes: &[u8], keep_encrypted: bool) -> SegmentFile {
++        SegmentFile {
++            offset: 0,
++            length,
++            data_hashs: hashes.iter().map(|&b| [b; 20]).collect(),
++            keep_encrypted,
+         }
+-    })
+-    .await;
++    }
++
++    #[test]
++    fn long_names_are_shortened_on_a_character_boundary() {
++        assert_eq!(shown_name("Content/short.pak"), "Content/short.pak");
++        // Each of these characters is three bytes, so byte `len - 27` falls
++        // inside one: the old slice panicked here.
++        let name = "Content/ローカライズ/テキストテキストテキストテキスト.pak";
++        let shown = shown_name(name);
++        assert!(shown.starts_with("..."));
++        assert_eq!(shown.chars().count(), 30);
++        assert!(name.ends_with(&shown[3..]));
++    }
++
++    #[test]
++    fn a_file_the_record_lists_is_still_fetched_if_it_is_not_all_there() {
++        let dir = tempfile::tempdir().unwrap();
++        let out = dir.path();
++        std::fs::create_dir_all(out.join("Content")).unwrap();
++        let name = r"Content\data.pak";
++        let remote = file(5000, &[1, 2], false);
++        let same = file(5000, &[1, 2], false);
++
++        // Not on disk at all.
++        assert!(needs_download(out, name, &remote, Some(&same)));
++        // Cut short, as a crash before the data reached the disk leaves it.
++        std::fs::write(out.join("Content/data.pak"), vec![0u8; 100]).unwrap();
++        assert!(needs_download(out, name, &remote, Some(&same)));
++        // Whole, and unchanged in the package: skipped.
++        std::fs::write(out.join("Content/data.pak"), vec![0u8; 5000]).unwrap();
++        assert!(!needs_download(out, name, &remote, Some(&same)));
++        // Changed in the package, or not in the record: fetched.
++        assert!(needs_download(
++            out,
++            name,
++            &remote,
++            Some(&file(5000, &[1, 3], false))
++        ));
++        assert!(needs_download(out, name, &remote, None));
+ 
+-    std::fs::remove_file(&final_path).ok();
+-    std::fs::rename(&cache_path, &final_path).expect("ok");
++        // A file kept encrypted is written in whole pages.
++        let exe = file(5000, &[4, 5], true);
++        std::fs::write(out.join("Game.exe"), vec![0u8; 5000]).unwrap();
++        assert!(needs_download(
++            out,
++            "Game.exe",
++            &exe,
++            Some(&file(5000, &[4, 5], true))
++        ));
++        std::fs::write(out.join("Game.exe"), vec![0u8; 8192]).unwrap();
++        assert!(!needs_download(
++            out,
++            "Game.exe",
++            &exe,
++            Some(&file(5000, &[4, 5], true))
++        ));
++    }
++
++    #[test]
++    fn the_commit_replaces_the_record_in_one_step() {
++        let dir = tempfile::tempdir().unwrap();
++        let out = dir.path();
++        let cache = out.join(".xodus-streaming-tmp.msixvc");
++        let record = out.join(".xodus-streaming.msixvc");
++        std::fs::write(&record, b"old").unwrap();
++        std::fs::write(&cache, b"new").unwrap();
++        commit(out, &cache, &record).unwrap();
++        assert_eq!(std::fs::read(&record).unwrap(), b"new");
++        assert!(!cache.exists());
++    }
++
++    /// A package on disk, the parsed package, and a job for pages 5..8 of its
++    /// drive plus a little of page 8.
++    async fn fixture(dir: &Path) -> (std::path::PathBuf, XvdFile, Job, Vec<u8>) {
++        let p = msixvc::xvd::testing::package();
++        let path = dir.join("package.msixvc");
++        std::fs::write(&path, &p.bytes).unwrap();
++        let xvd = XvdFile::parse_verified(std::io::Cursor::new(p.bytes.clone()))
++            .await
++            .unwrap();
++        let first = (p.drive_page + 5) * PAGE_SIZE;
++        let length = 3 * PAGE_SIZE + 100;
++        let job = Job {
++            name: r"Content\data.pak".into(),
++            content: SegmentFile {
++                offset: first as u64,
++                length: length as u64,
++                data_hashs: vec![],
++                keep_encrypted: false,
++            },
++        };
++        (path, xvd, job, p.bytes[first..first + length].to_vec())
++    }
++
++    #[tokio::test(flavor = "multi_thread")]
++    async fn files_are_extracted_from_a_container() {
++        let dir = tempfile::tempdir().unwrap();
++        let (path, xvd, job, expected) = fixture(dir.path()).await;
++        let out = dir.path().join("game");
++        let (tx, _rx) = tokio::sync::mpsc::channel(256);
++        let url = format!("file://{}", path.display());
++
++        fetch_files(
++            &reqwest::Client::new(),
++            &xvd,
++            vec![job],
++            &out,
++            &url,
++            [0; 32],
++            None,
++            &tx,
++        )
++        .await
++        .unwrap();
++        assert_eq!(
++            std::fs::read(out.join("Content/data.pak")).unwrap(),
++            expected
++        );
++    }
++
++    /// Extracting from a container that stops short: the file that runs off
++    /// the end is an error, the error is the result, and the half-written
++    /// file is gone. Before, the worker printed a message and returned, the
++    /// container was committed as if the extract were complete, and the
++    /// process exited 0 -- so a later run skipped the truncated file for good.
++    #[tokio::test(flavor = "multi_thread")]
++    async fn a_file_that_cannot_be_extracted_fails_the_run() {
++        let dir = tempfile::tempdir().unwrap();
++        let (path, xvd, job, _) = fixture(dir.path()).await;
++        let cut = job.content.offset + PAGE_SIZE as u64 + 7;
++        std::fs::File::options()
++            .write(true)
++            .open(&path)
++            .unwrap()
++            .set_len(cut)
++            .unwrap();
++        let out = dir.path().join("game");
++        let (tx, _rx) = tokio::sync::mpsc::channel(256);
++        let url = format!("file://{}", path.display());
++
++        let err = fetch_files(
++            &reqwest::Client::new(),
++            &xvd,
++            vec![job],
++            &out,
++            &url,
++            [0; 32],
++            None,
++            &tx,
++        )
++        .await
++        .unwrap_err();
++        assert!(err.contains("does not contain this file"), "{err}");
++        assert!(!out.join("Content/data.pak").exists());
++    }
++
++    /// A damaged page in the source is refused, not installed.
++    #[tokio::test(flavor = "multi_thread")]
++    async fn a_damaged_page_fails_the_run() {
++        let dir = tempfile::tempdir().unwrap();
++        let (path, xvd, job, _) = fixture(dir.path()).await;
++        let mut bytes = std::fs::read(&path).unwrap();
++        bytes[job.content.offset as usize + 2 * PAGE_SIZE + 1] ^= 1;
++        std::fs::write(&path, bytes).unwrap();
++        let out = dir.path().join("game");
++        let (tx, _rx) = tokio::sync::mpsc::channel(256);
++        let url = format!("file://{}", path.display());
++
++        let err = fetch_files(
++            &reqwest::Client::new(),
++            &xvd,
++            vec![job],
++            &out,
++            &url,
++            [0; 32],
++            None,
++            &tx,
++        )
++        .await
++        .unwrap_err();
++        assert!(err.contains("does not match its hash tree"), "{err}");
++        assert!(!out.join("Content/data.pak").exists());
++    }
++
++    /// The first file that fails stops the others mid-write. None of them is
++    /// left half written: a file being replaced keeps its old contents, and no
++    /// temporary file is left behind.
++    #[tokio::test(flavor = "multi_thread")]
++    async fn a_failure_leaves_the_other_files_as_they_were() {
++        let dir = tempfile::tempdir().unwrap();
++        let (path, xvd, job, _) = fixture(dir.path()).await;
++        let out = dir.path().join("game");
++        std::fs::create_dir_all(out.join("Content")).unwrap();
++        std::fs::write(out.join("Content/data.pak"), b"the old, good copy").unwrap();
++        let failing = Job {
++            name: r"..\escaped.txt".into(),
++            content: SegmentFile {
++                offset: job.content.offset,
++                length: job.content.length,
++                data_hashs: vec![],
++                keep_encrypted: false,
++            },
++        };
++        let (tx, _rx) = tokio::sync::mpsc::channel(256);
++        let url = format!("file://{}", path.display());
++
++        let err = fetch_files(
++            &reqwest::Client::new(),
++            &xvd,
++            vec![job, failing],
++            &out,
++            &url,
++            [0; 32],
++            Some(2),
++            &tx,
++        )
++        .await
++        .unwrap_err();
++        assert!(err.contains("refusing to install"), "{err}");
++        // Anything a dropped job had left running on a blocking thread.
++        tokio::time::sleep(Duration::from_millis(200)).await;
++        assert_eq!(
++            std::fs::read(out.join("Content/data.pak")).unwrap(),
++            b"the old, good copy"
++        );
++        let left: Vec<_> = std::fs::read_dir(out.join("Content"))
++            .unwrap()
++            .map(|e| e.unwrap().file_name())
++            .collect();
++        assert_eq!(left, ["data.pak"]);
++    }
++
++    /// A name that climbs out of the destination is refused before anything is
++    /// written anywhere.
++    #[tokio::test(flavor = "multi_thread")]
++    async fn a_file_named_outside_the_destination_is_refused() {
++        let dir = tempfile::tempdir().unwrap();
++        let (path, xvd, mut job, _) = fixture(dir.path()).await;
++        job.name = r"..\escaped.txt".into();
++        let out = dir.path().join("game");
++        let (tx, _rx) = tokio::sync::mpsc::channel(256);
++        let url = format!("file://{}", path.display());
++
++        let err = fetch_files(
++            &reqwest::Client::new(),
++            &xvd,
++            vec![job],
++            &out,
++            &url,
++            [0; 32],
++            None,
++            &tx,
++        )
++        .await
++        .unwrap_err();
++        assert!(err.contains("refusing to install"), "{err}");
++        assert!(!dir.path().join("escaped.txt").exists());
++    }
++
++    /// An unreadable record is not a reason to stop: it is read as "nothing
++    /// installed" and everything is fetched. It used to panic on every run.
++    #[tokio::test(flavor = "multi_thread")]
++    async fn a_damaged_record_reads_as_an_error_not_a_panic() {
++        let dir = tempfile::tempdir().unwrap();
++        let record = dir.path().join(".xodus-streaming.msixvc");
++        std::fs::write(&record, b"").unwrap();
++        assert!(read_installed(&record).await.is_err());
++        std::fs::write(&record, vec![0x5au8; 3 * 4096]).unwrap();
++        assert!(read_installed(&record).await.is_err());
++    }
+ }
+diff --git a/crates/xodus-cli/src/package.rs b/crates/xodus-cli/src/package.rs
+index 1a32e59..568caca 100644
+--- a/crates/xodus-cli/src/package.rs
++++ b/crates/xodus-cli/src/package.rs
+@@ -19,6 +19,65 @@ pub fn available_version(package: &PackageDetails) -> Option<&str> {
+     Some(&version[..prefix_len])
+ }
+ 
++/// Set to `1` to refuse a download when the package service lists only plain
++/// http CDN roots for it.
++pub const REQUIRE_HTTPS_CDN_ENV: &str = "XODUS_REQUIRE_HTTPS_CDN";
++
++/// Where to download a package file from, out of the CDN roots the package
++/// service lists.
++///
++/// An https root is taken if there is one. Otherwise the first root is used as
++/// it is, and so far that has meant plain `http://`: the Xbox package CDN hosts
++/// answer https with a certificate for other names, so asking them for the
++/// same path over https fails every time. Over http the pages are still
++/// checked against the package's hash tree, but the header that vouches for
++/// that tree is not, so a note says so. `XODUS_REQUIRE_HTTPS_CDN=1` refuses
++/// such a package instead. A root in any other scheme is refused.
++pub fn package_url(cdn_roots: &[String], relative_url: &str) -> Result<String, String> {
++    let url = package_url_with(
++        cdn_roots,
++        relative_url,
++        std::env::var(REQUIRE_HTTPS_CDN_ENV).is_ok_and(|v| v == "1"),
++    )?;
++    if !has_scheme(&url, "https://") {
++        eprintln!(
++            "note: the package service lists only plain http for this package; its pages \
++             are checked against its hash tree, but nothing vouches for its header"
++        );
++    }
++    Ok(url)
++}
++
++fn has_scheme(url: &str, scheme: &str) -> bool {
++    url.get(..scheme.len())
++        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
++}
++
++fn package_url_with(
++    cdn_roots: &[String],
++    relative_url: &str,
++    require_https: bool,
++) -> Result<String, String> {
++    if let Some(root) = cdn_roots.iter().find(|root| has_scheme(root, "https://")) {
++        return Ok(format!("{root}{relative_url}"));
++    }
++    let Some(root) = cdn_roots.first() else {
++        return Err("the package service listed no download location for this package".into());
++    };
++    if !has_scheme(root, "http://") {
++        return Err(format!(
++            "refusing the download location {root}: only http and https are used"
++        ));
++    }
++    if require_https {
++        return Err(format!(
++            "refusing the download location {root}: it is plain http and \
++             {REQUIRE_HTTPS_CDN_ENV}=1 asks for https"
++        ));
++    }
++    Ok(format!("{root}{relative_url}"))
++}
++
+ pub async fn get_content_id(
+     client: &reqwest::Client,
+     product: String,
+@@ -110,17 +169,30 @@ pub async fn get_packages(
+     tokens: &TokenManager,
+     content_id: String,
+ ) -> Result<PackageDetails, Box<dyn std::error::Error>> {
+-    let dev_token = tokens.get_device_sts_token().unwrap();
++    // Each of these used to be an unwrap or an expect, so being offline or
++    // signed out ended the client with a panic instead of a reason.
++    let dev_token = tokens
++        .get_device_sts_token()
++        .map_err(|e| format!("no device token ({e}); sign in again"))?;
+     let Token::Legacy(dev_token) = dev_token else {
+         return Err(Box::new(std::io::Error::other("Invalid STS token")));
+     };
+-    let user_token = tokens.get_user_sts_token().unwrap();
++    let user_token = tokens
++        .get_user_sts_token()
++        .map_err(|e| format!("no user token ({e}); sign in again"))?;
+     let Token::Legacy(legacy) = user_token else {
+         return Err(Box::new(std::io::Error::other("Unsupported user token")));
+     };
+ 
+-    let xsts_token =
+-        xodus::api::xbox::run(client, dev_token, legacy, "http://update.xboxlive.com").await;
++    let xsts_token = xodus::api::xbox::try_run_with_signer(
++        client,
++        dev_token,
++        legacy,
++        "http://update.xboxlive.com",
++        None,
++    )
++    .await
++    .map_err(|e| format!("could not sign in to the package service: {e}"))?;
+ 
+     let response = client
+         .get(format!(
+@@ -133,9 +205,12 @@ pub async fn get_packages(
+         )
+         .send()
+         .await
+-        .unwrap();
++        .map_err(|e| format!("could not reach the package service: {e}"))?;
+ 
+-    let res: PackageResponse = response.json().await.expect("Failed to get data");
++    let res: PackageResponse = response
++        .json()
++        .await
++        .map_err(|e| format!("the package service sent an answer that could not be read: {e}"))?;
+ 
+     let PackageResponse::Found(package) = res else {
+         return Err(Box::new(std::io::Error::other(
+@@ -168,4 +243,36 @@ mod tests {
+         with_build_id.version = "3.688.109.0.3b6b700a-992b-45fc-b16b-4ea65141d98c".into();
+         assert_eq!(available_version(&with_build_id), Some("3.688.109.0"));
+     }
++
++    #[test]
++    fn packages_are_fetched_from_the_roots_the_service_lists() {
++        let roots = |r: &[&str]| r.iter().map(|s| s.to_string()).collect::<Vec<_>>();
++        let rel = "/8/abc/package.msixvc";
++
++        // A plain http root is used as it is: the CDN hosts do not answer
++        // https for their own names, so rewriting it would fail every install.
++        assert_eq!(
++            package_url_with(&roots(&["http://assets1.xboxlive.com"]), rel, false).unwrap(),
++            "http://assets1.xboxlive.com/8/abc/package.msixvc"
++        );
++        // An https root, wherever it is in the list, is preferred.
++        assert_eq!(
++            package_url_with(
++                &roots(&[
++                    "http://assets1.xboxlive.com",
++                    "HTTPS://assets2.xboxlive.com"
++                ]),
++                rel,
++                true
++            )
++            .unwrap(),
++            "HTTPS://assets2.xboxlive.com/8/abc/package.msixvc"
++        );
++        // Only when asked for is a plain http list refused.
++        assert!(package_url_with(&roots(&["http://assets1.xboxlive.com"]), rel, true).is_err());
++        // No roots, or one in another scheme, is an error rather than a panic.
++        assert!(package_url_with(&[], rel, false).is_err());
++        assert!(package_url_with(&roots(&["ftp://x"]), rel, false).is_err());
++        assert!(package_url_with(&roots(&["h"]), rel, false).is_err());
++    }
+ }

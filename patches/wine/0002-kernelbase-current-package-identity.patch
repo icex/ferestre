@@ -12,10 +12,10 @@ index 2e33b6b..5a7e40f 100644
  	registry.c \
 diff --git a/dlls/kernelbase/package.c b/dlls/kernelbase/package.c
 new file mode 100644
-index 0000000..8ad38bc
+index 0000000..c6b5d08
 --- /dev/null
 +++ b/dlls/kernelbase/package.c
-@@ -0,0 +1,526 @@
+@@ -0,0 +1,751 @@
 +/*
 + * Current-process package identity
 + *
@@ -228,23 +228,174 @@ index 0000000..8ad38bc
 +    return buf;
 +}
 +
-+/* Copy the value of attribute @attr (given with a leading space, e.g. " Name=\"")
-+ * from the first @elem element (e.g. "<Identity") into @out. */
++static BOOL is_xml_space( char c )
++{
++    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
++}
++
++/* Find the start tag of element @elem (a bare name, e.g. "Application") and
++ * return a pointer just past its name. The name has to end there: a plain
++ * substring search for "<Application" finds the <Applications> wrapper first,
++ * and the Id it was after belongs to the element inside it. Comments,
++ * processing instructions and CDATA are skipped, because a '<' in them does
++ * not start an element. */
++static const char *find_element( const char *xml, const char *elem )
++{
++    size_t n = strlen( elem );
++    const char *p = xml;
++
++    while ((p = strchr( p, '<' )))
++    {
++        if (!strncmp( p, "<!--", 4 ))
++        {
++            if (!(p = strstr( p + 4, "-->" ))) return NULL;
++            p += 3;
++        }
++        else if (!strncmp( p, "<![CDATA[", 9 ))
++        {
++            if (!(p = strstr( p + 9, "]]>" ))) return NULL;
++            p += 3;
++        }
++        else if (p[1] == '?')
++        {
++            if (!(p = strstr( p + 2, "?>" ))) return NULL;
++            p += 2;
++        }
++        else if (!strncmp( p + 1, elem, n ) &&
++                 (is_xml_space( p[1 + n] ) || p[1 + n] == '/' || p[1 + n] == '>'))
++            return p + 1 + n;
++        else p++;
++    }
++    return NULL;
++}
++
++/* Append code point @c to @out as UTF-8. FALSE when it does not fit. */
++static BOOL put_utf8( unsigned int c, char *out, size_t cap, size_t *pos )
++{
++    char tmp[4];
++    size_t n, i;
++
++    if (c < 0x80) { tmp[0] = c; n = 1; }
++    else if (c < 0x800) { tmp[0] = 0xc0 | (c >> 6); tmp[1] = 0x80 | (c & 0x3f); n = 2; }
++    else if (c < 0x10000)
++    {
++        tmp[0] = 0xe0 | (c >> 12); tmp[1] = 0x80 | ((c >> 6) & 0x3f); tmp[2] = 0x80 | (c & 0x3f);
++        n = 3;
++    }
++    else
++    {
++        tmp[0] = 0xf0 | (c >> 18); tmp[1] = 0x80 | ((c >> 12) & 0x3f);
++        tmp[2] = 0x80 | ((c >> 6) & 0x3f); tmp[3] = 0x80 | (c & 0x3f);
++        n = 4;
++    }
++    if (*pos + n >= cap) return FALSE;
++    for (i = 0; i < n; i++) out[(*pos)++] = tmp[i];
++    return TRUE;
++}
++
++/* Copy the attribute value @src (@len bytes, between its quotes) into @out as
++ * the string an XML parser would hand over: the five predefined entities and
++ * numeric character references decoded, and literal whitespace turned into
++ * spaces. The publisher id is a hash of the decoded string, so a Publisher
++ * written "CN=A &amp; B" has to be hashed as "CN=A & B" or the family name
++ * comes out wrong. FALSE when the value is malformed or does not fit. */
++static BOOL decode_xml_value( const char *src, size_t len, char *out, size_t cap )
++{
++    static const struct { const char *name; char c; } entities[] =
++    {
++        { "amp;", '&' }, { "lt;", '<' }, { "gt;", '>' }, { "quot;", '"' }, { "apos;", '\'' },
++    };
++    const char *end = src + len;
++    size_t pos = 0, i;
++
++    while (src < end)
++    {
++        unsigned int c;
++
++        if (*src != '&')
++        {
++            if (*src == '\r' && src + 1 < end && src[1] == '\n') src++;
++            c = is_xml_space( *src ) ? ' ' : (unsigned char)*src;
++            src++;
++            if (pos + 1 >= cap) return FALSE;
++            out[pos++] = c;
++            continue;
++        }
++        src++;
++        if (src < end && *src == '#')
++        {
++            BOOL hex = FALSE;
++            unsigned int digits = 0;
++
++            src++;
++            if (src < end && *src == 'x') { hex = TRUE; src++; }
++            c = 0;
++            while (src < end && *src != ';')
++            {
++                unsigned int d;
++
++                if (*src >= '0' && *src <= '9') d = *src - '0';
++                else if (hex && *src >= 'a' && *src <= 'f') d = *src - 'a' + 10;
++                else if (hex && *src >= 'A' && *src <= 'F') d = *src - 'A' + 10;
++                else return FALSE;
++                c = c * (hex ? 16 : 10) + d;
++                if (c > 0x10ffff) return FALSE;
++                digits++;
++                src++;
++            }
++            if (src >= end || !digits || !c || (c >= 0xd800 && c <= 0xdfff)) return FALSE;
++            src++;
++            if (!put_utf8( c, out, cap, &pos )) return FALSE;
++            continue;
++        }
++        for (i = 0; i < ARRAY_SIZE(entities); i++)
++        {
++            size_t n = strlen( entities[i].name );
++            if ((size_t)(end - src) >= n && !memcmp( src, entities[i].name, n ))
++            {
++                if (pos + 1 >= cap) return FALSE;
++                out[pos++] = entities[i].c;
++                src += n;
++                break;
++            }
++        }
++        if (i == ARRAY_SIZE(entities)) return FALSE;
++    }
++    out[pos] = 0;
++    return TRUE;
++}
++
++/* Copy the decoded value of attribute @attr (a bare name, e.g. "Publisher")
++ * of the first @elem element into @out. Attributes are read one by one rather
++ * than searched for, so a name only matches a whole attribute name, whatever
++ * whitespace precedes it and whichever quote it uses. */
 +static BOOL manifest_attr( const char *xml, const char *elem, const char *attr,
 +                          char *out, size_t cap )
 +{
-+    const char *start, *end, *value;
-+    size_t len;
++    size_t attr_len = strlen( attr );
++    const char *p, *name, *name_end, *value;
++    char quote;
 +
-+    if (!(start = strstr( xml, elem ))) return FALSE;
-+    if (!(end = strchr( start, '>' ))) return FALSE;
-+    if (!(value = strstr( start, attr )) || value > end) return FALSE;
-+    value += strlen( attr );
-+    len = strcspn( value, "\"" );
-+    if (len >= cap) return FALSE;
-+    memcpy( out, value, len );
-+    out[len] = 0;
-+    return TRUE;
++    if (!(p = find_element( xml, elem ))) return FALSE;
++    for (;;)
++    {
++        while (is_xml_space( *p )) p++;
++        if (!*p || *p == '>' || *p == '/') return FALSE;
++        name = p;
++        while (*p && *p != '=' && *p != '>' && *p != '/' && !is_xml_space( *p )) p++;
++        name_end = p;
++        while (is_xml_space( *p )) p++;
++        if (*p != '=') return FALSE;
++        p++;
++        while (is_xml_space( *p )) p++;
++        if (*p != '"' && *p != '\'') return FALSE;
++        quote = *p++;
++        value = p;
++        if (!(p = strchr( value, quote ))) return FALSE;
++        if ((size_t)(name_end - name) == attr_len && !memcmp( name, attr, attr_len ))
++            return decode_xml_value( value, p - value, out, cap );
++        p++;
++    }
 +}
 +
 +static WCHAR *utf8_to_wide( const char *s )
@@ -256,31 +407,101 @@ index 0000000..8ad38bc
 +    return w;
 +}
 +
-+/* Locate the manifest and its directory. Returns TRUE and fills @manifest /
-+ * @dir (both MAX_PATH DOS paths) when a packaged layout is found. */
-+static BOOL find_manifest( WCHAR *manifest, WCHAR *dir )
++/* An environment variable in a buffer of whatever size it needs. A fixed
++ * MAX_PATH buffer is not enough: for a longer value GetEnvironmentVariableW
++ * reports the size it wants and leaves the buffer untouched, and a game under a
++ * deep data directory can have a path past 260 characters. */
++static WCHAR *get_env_alloc( const WCHAR *name )
 +{
-+    static const WCHAR appx[] = L"AppxManifest.xml";
-+    static const WCHAR gdk[]  = L"MicrosoftGame.config";
-+    WCHAR exe[MAX_PATH], *slash;
++    WCHAR *buf = NULL;
++    DWORD size = 0, got;
 +
-+    if (GetEnvironmentVariableW( L"WINE_PACKAGE_MANIFEST", manifest, MAX_PATH ) &&
-+        GetFileAttributesW( manifest ) != INVALID_FILE_ATTRIBUTES)
++    for (;;)
 +    {
-+        lstrcpynW( dir, manifest, MAX_PATH );
-+        if ((slash = wcsrchr( dir, '\\' ))) *slash = 0;
-+        return TRUE;
++        got = GetEnvironmentVariableW( name, buf, size );
++        if (!got) break;
++        if (got < size) return buf;
++        HeapFree( GetProcessHeap(), 0, buf );
++        size = got;
++        if (!(buf = HeapAlloc( GetProcessHeap(), 0, size * sizeof(WCHAR) ))) return NULL;
++    }
++    HeapFree( GetProcessHeap(), 0, buf );
++    return NULL;
++}
++
++/* The main executable's path, likewise not limited to MAX_PATH. */
++static WCHAR *get_exe_path_alloc( void )
++{
++    WCHAR *buf = NULL, *grown;
++    DWORD size = MAX_PATH, got;
++
++    while (size <= 32768)
++    {
++        grown = buf ? HeapReAlloc( GetProcessHeap(), 0, buf, size * sizeof(WCHAR) )
++                    : HeapAlloc( GetProcessHeap(), 0, size * sizeof(WCHAR) );
++        if (!grown) break;
++        buf = grown;
++        if (!(got = GetModuleFileNameW( NULL, buf, size ))) break;
++        if (got < size) return buf;
++        size *= 2;
++    }
++    HeapFree( GetProcessHeap(), 0, buf );
++    return NULL;
++}
++
++/* @dir followed by a backslash and @file, newly allocated. */
++static WCHAR *path_join_alloc( const WCHAR *dir, const WCHAR *file )
++{
++    SIZE_T n = lstrlenW( dir ) + 1 + lstrlenW( file ) + 1;
++    WCHAR *r = HeapAlloc( GetProcessHeap(), 0, n * sizeof(WCHAR) );
++
++    if (r) swprintf( r, n, L"%s\\%s", dir, file );
++    return r;
++}
++
++/* Locate the manifest and its directory. Returns TRUE and sets @manifest and
++ * @dir to newly allocated DOS paths when a packaged layout is found. */
++static BOOL find_manifest( WCHAR **manifest, WCHAR **dir )
++{
++    static const WCHAR * const names[] = { L"AppxManifest.xml", L"MicrosoftGame.config" };
++    WCHAR *path, *exe_dir, *slash;
++    unsigned int i;
++
++    *manifest = *dir = NULL;
++
++    if ((path = get_env_alloc( L"WINE_PACKAGE_MANIFEST" )))
++    {
++        if (GetFileAttributesW( path ) != INVALID_FILE_ATTRIBUTES &&
++            (*dir = HeapAlloc( GetProcessHeap(), 0, (lstrlenW( path ) + 1) * sizeof(WCHAR) )))
++        {
++            lstrcpyW( *dir, path );
++            if ((slash = wcsrchr( *dir, '\\' ))) *slash = 0;
++            *manifest = path;
++            return TRUE;
++        }
++        HeapFree( GetProcessHeap(), 0, path );
 +    }
 +
-+    if (!GetModuleFileNameW( NULL, exe, MAX_PATH )) return FALSE;
-+    if (!(slash = wcsrchr( exe, '\\' ))) return FALSE;
++    if (!(exe_dir = get_exe_path_alloc())) return FALSE;
++    if (!(slash = wcsrchr( exe_dir, '\\' )))
++    {
++        HeapFree( GetProcessHeap(), 0, exe_dir );
++        return FALSE;
++    }
 +    *slash = 0;
-+    lstrcpynW( dir, exe, MAX_PATH );
 +
-+    swprintf( manifest, MAX_PATH, L"%s\\%s", dir, appx );
-+    if (GetFileAttributesW( manifest ) != INVALID_FILE_ATTRIBUTES) return TRUE;
-+    swprintf( manifest, MAX_PATH, L"%s\\%s", dir, gdk );
-+    if (GetFileAttributesW( manifest ) != INVALID_FILE_ATTRIBUTES) return TRUE;
++    for (i = 0; i < ARRAY_SIZE(names); i++)
++    {
++        if (!(path = path_join_alloc( exe_dir, names[i] ))) break;
++        if (GetFileAttributesW( path ) != INVALID_FILE_ATTRIBUTES)
++        {
++            *manifest = path;
++            *dir = exe_dir;
++            return TRUE;
++        }
++        HeapFree( GetProcessHeap(), 0, path );
++    }
++    HeapFree( GetProcessHeap(), 0, exe_dir );
 +    return FALSE;
 +}
 +
@@ -302,35 +523,37 @@ index 0000000..8ad38bc
 +
 +static BOOL WINAPI resolve_identity( INIT_ONCE *once, void *param, void **ctx )
 +{
-+    WCHAR manifest[MAX_PATH], dir[MAX_PATH], buf[512];
++    WCHAR *manifest, *dir, buf[512];
 +    WCHAR *name_w = NULL, *pub_w = NULL, *arch_w, *ver_w, *app_w;
 +    char name[128], publisher[512], version[64], arch[32], app[128];
 +    WCHAR pubid[14];
 +    char *xml;
 +
-+    if (!find_manifest( manifest, dir ))
++    if (!find_manifest( &manifest, &dir ))
 +    {
 +        TRACE( "no manifest found; process is unpackaged.\n" );
 +        return TRUE;
 +    }
 +    if (!(xml = read_text_file( manifest )))
-+    {
 +        WARN( "manifest %s could not be read.\n", debugstr_w(manifest) );
-+        return TRUE;
-+    }
-+
-+    if (!manifest_attr( xml, "<Identity", " Name=\"", name, sizeof(name) ) ||
-+        !manifest_attr( xml, "<Identity", " Publisher=\"", publisher, sizeof(publisher) ))
++    else if (!manifest_attr( xml, "Identity", "Name", name, sizeof(name) ) ||
++             !manifest_attr( xml, "Identity", "Publisher", publisher, sizeof(publisher) ))
 +    {
 +        WARN( "manifest %s lacks an <Identity Name/Publisher>.\n", debugstr_w(manifest) );
 +        HeapFree( GetProcessHeap(), 0, xml );
++        xml = NULL;
++    }
++    HeapFree( GetProcessHeap(), 0, manifest );
++    if (!xml)
++    {
++        HeapFree( GetProcessHeap(), 0, dir );
 +        return TRUE;
 +    }
-+    if (!manifest_attr( xml, "<Identity", " Version=\"", version, sizeof(version) ))
++    if (!manifest_attr( xml, "Identity", "Version", version, sizeof(version) ))
 +        strcpy( version, "1.0.0.0" );
-+    if (!manifest_attr( xml, "<Identity", " ProcessorArchitecture=\"", arch, sizeof(arch) ))
++    if (!manifest_attr( xml, "Identity", "ProcessorArchitecture", arch, sizeof(arch) ))
 +        strcpy( arch, "x64" );
-+    if (!manifest_attr( xml, "<Application", " Id=\"", app, sizeof(app) ))
++    if (!manifest_attr( xml, "Application", "Id", app, sizeof(app) ))
 +        strcpy( app, "App" );
 +
 +    name_w = utf8_to_wide( name );
@@ -351,7 +574,8 @@ index 0000000..8ad38bc
 +        swprintf( buf, ARRAY_SIZE(buf), L"%s_%s_%s__%s", name_w, ver_w, arch_w, pubid );
 +        pkg_full_name = wide_dup( buf );
 +
-+        pkg_path = wide_dup( dir );
++        pkg_path = dir;
++        dir = NULL;
 +
 +        swprintf( buf, ARRAY_SIZE(buf), L"%s!%s", pkg_family_name, app_w );
 +        pkg_aumid = wide_dup( buf );
@@ -365,6 +589,7 @@ index 0000000..8ad38bc
 +    HeapFree( GetProcessHeap(), 0, arch_w );
 +    HeapFree( GetProcessHeap(), 0, ver_w );
 +    HeapFree( GetProcessHeap(), 0, app_w );
++    HeapFree( GetProcessHeap(), 0, dir );
 +    return TRUE;
 +}
 +

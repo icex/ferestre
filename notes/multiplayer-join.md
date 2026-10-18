@@ -256,7 +256,9 @@ older run at a different base.
 
 There is nothing to pin, so the implementation reports no thumbprints and lets
 the caller do the TLS validation it would do anyway —
-`XNetworkingVerifyServerCertificate` already accepts the connection.
+`XNetworkingVerifyServerCertificate` accepted the connection at the time; since
+xgameruntime patch 0034 it verifies the request's certificate chain against its
+host, as WinHTTP does, honouring the request's own `SECURITY_FLAG_IGNORE_*`.
 
 ## 2026-09-06 — fixed: the initial connectivity-hint callback was never delivered
 

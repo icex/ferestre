@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Exercise the shipped CLI's cancellation protocol with an offline downloader."""
+import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import tempfile
 import time
@@ -27,26 +29,40 @@ def stop(*_):
     (dest / "cleaned").write_text("done")
     sys.exit(0)
 signal.signal(signal.SIGTERM, stop)
+parent = os.getppid()
 (dest / "partial").write_text("downloaded bytes")
 (dest / "ready").write_text(str(os.getpid()))
-while True:
+# Outliving the launcher would leave this spinning after a failed run, so a
+# downloader whose parent is gone has nobody left to clean up for.
+while os.getppid() == parent:
     time.sleep(0.05)
+sys.exit(3)
 ''')
                     stub.chmod(0o755)
-                    dest = home / "game"
+                    # The folder given to install is a library; the title
+                    # gets its own folder inside it.
+                    library = home / "library"
+                    dest = library / "9zzcancel001"
                     record = home / "state/ferestre/installed/9ZZCANCEL001.json"
+                    previous_record = None
                     if existing:
-                        dest.mkdir()
+                        # An earlier install of this title, recorded where it
+                        # is: the folder is the title's own, so the update goes
+                        # over it rather than being refused as somebody's files.
+                        dest.mkdir(parents=True)
                         (dest / "original-save").write_text("keep me")
                         record.parent.mkdir(parents=True)
-                        record.write_text('{"previous_record":true}')
+                        previous_record = json.dumps({"product_id": "9ZZCANCEL001", "dir": str(dest),
+                                                      "content_ids": [], "previous_record": True})
+                        record.write_text(previous_record)
                     env = dict(os.environ, HOME=tmp, XDG_STATE_HOME=str(home / "state"),
                                XDG_CONFIG_HOME=str(home / "config"), XDG_CACHE_HOME=str(home / "cache"),
                                XODUS_CLI_DIR=str(client), XODUS_GAMES_DIR=str(home / "games"),
                                FERESTRE_TITLES=str(home / "titles"), FERESTRE_GUI_CANCELLATION="1")
-                    process = subprocess.Popen([str(binary), "install", "9ZZCANCEL001", str(dest)],
+                    process = subprocess.Popen([str(binary), "install", "9ZZCANCEL001", str(library)],
                                                env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                                stderr=subprocess.PIPE)
+                    downloader_fd = None
                     try:
                         deadline = time.monotonic() + 10
                         while not (dest / "ready").exists() and time.monotonic() < deadline:
@@ -55,6 +71,9 @@ while True:
                             time.sleep(0.02)
                         self.assertTrue((dest / "ready").exists())
                         downloader = int((dest / "ready").read_text())
+                        # A handle on this process rather than its number, so
+                        # the cleanup below can never signal a recycled PID.
+                        downloader_fd = os.pidfd_open(downloader)
                         if not disappear:
                             process.stdin.write(b"x")
                             process.stdin.flush()
@@ -68,13 +87,22 @@ while True:
                             os.kill(downloader, 0)
                         if existing:
                             self.assertEqual((dest / "original-save").read_text(), "keep me")
-                            self.assertEqual(record.read_text(), '{"previous_record":true}')
+                            self.assertEqual(record.read_text(), previous_record)
                         else:
                             self.assertFalse(record.exists(), "stopped download was recorded as installed")
                     finally:
                         if process.poll() is None:
                             process.kill()
                             process.wait()
+                        # The downloader runs in its own process group, so
+                        # killing the launcher leaves it behind; a failed run
+                        # must not leave it running.
+                        if downloader_fd is not None:
+                            try:
+                                signal.pidfd_send_signal(downloader_fd, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            os.close(downloader_fd)
 
 
 if __name__ == "__main__":

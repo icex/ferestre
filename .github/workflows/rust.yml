@@ -1,13 +1,23 @@
-# The launcher's own tests. Two jobs, because they need different things.
+# The launcher's own tests. Separate jobs, because they need different things.
 #
 # `test` is the fast one: everything decided in `ferestre-core` and in the GUI's
 # `model` is pure, so it runs anywhere with a Rust toolchain -- no display, no
 # runtime, no Microsoft account, no game.
 #
+# `msrv` builds and tests the same workspace with the oldest compiler it claims
+# to support, the `rust-version` in Cargo.toml, so that claim cannot quietly go
+# stale when Cargo.lock moves a dependency onto a newer one.
+#
 # `gui` drives the real window through AT-SPI, which needs a display server and
 # the accessibility bus. It is the only thing that can catch a row that renders
 # with the wrong label or a button wired to nothing, and it is worth the extra
 # minute of setup.
+#
+# Every job here runs with a read-only token that is not written to the
+# checkout, and every third-party action is pinned to a commit, because a tag
+# or a branch can be moved to code nobody reviewed. Every cargo call is
+# --locked: CI tests the dependency versions in Cargo.lock, which are the ones
+# a release ships.
 name: Rust
 
 on:
@@ -28,18 +38,32 @@ on:
       - 'tests/test_download_cancel.py'
       - 'tests/test_media_dependencies.py'
       - 'tests/test_client_dependencies.py'
-      - 'tools/xsts_probe.py'
-      - 'tools/test_xsts_probe.py'
+      - 'tools/**'
+      - 'tests/endpoint_suite.py'
       - 'titles/**'
       # The `patches` job below is the only thing that checks these, and a
       # patch-only commit is exactly the kind that breaks them.
       - 'patches/**'
-      - 'scripts/check-patches.sh'
-      - 'scripts/real-path-image-view.py'
-      - 'scripts/proton-wine-shim.sh'
+      # All of scripts/, not a list: the shim sources xodus-env.sh on every
+      # launch, launch-core tests read launch-gdk.sh, and the shell syntax step
+      # covers the rest. A list left out exactly the files a change to one
+      # would break.
+      - 'scripts/**'
+      - 'packaging/**'
       - 'tests/test_real_path_image_view.py'
+      - 'tests/test_caller_ids_image_view.py'
       - 'tests/test_proton_wine_shim.py'
-      - '.github/workflows/rust.yml'
+      - 'tests/test_fix_xcurl.py'
+      - 'tests/test_launch_gdk.py'
+      - 'tests/test_install_xodus_proton.py'
+      - 'tests/test_build_appimage.py'
+      - 'tests/test_release_signing.py'
+      - 'tests/test_workflows.py'
+      # The native harnesses and fixtures: the shell syntax step and the
+      # `patches` job check these.
+      - 'tests/*.sh'
+      - 'tests/license_token_fixture.py'
+      - '.github/workflows/**'
   pull_request:
     paths:
       - 'crates/**'
@@ -52,18 +76,32 @@ on:
       - 'tests/test_download_cancel.py'
       - 'tests/test_media_dependencies.py'
       - 'tests/test_client_dependencies.py'
-      - 'tools/xsts_probe.py'
-      - 'tools/test_xsts_probe.py'
+      - 'tools/**'
+      - 'tests/endpoint_suite.py'
       - 'titles/**'
       # The `patches` job below is the only thing that checks these, and a
       # patch-only commit is exactly the kind that breaks them.
       - 'patches/**'
-      - 'scripts/check-patches.sh'
-      - 'scripts/real-path-image-view.py'
-      - 'scripts/proton-wine-shim.sh'
+      # All of scripts/, not a list: the shim sources xodus-env.sh on every
+      # launch, launch-core tests read launch-gdk.sh, and the shell syntax step
+      # covers the rest. A list left out exactly the files a change to one
+      # would break.
+      - 'scripts/**'
+      - 'packaging/**'
       - 'tests/test_real_path_image_view.py'
+      - 'tests/test_caller_ids_image_view.py'
       - 'tests/test_proton_wine_shim.py'
-      - '.github/workflows/rust.yml'
+      - 'tests/test_fix_xcurl.py'
+      - 'tests/test_launch_gdk.py'
+      - 'tests/test_install_xodus_proton.py'
+      - 'tests/test_build_appimage.py'
+      - 'tests/test_release_signing.py'
+      - 'tests/test_workflows.py'
+      # The native harnesses and fixtures: the shell syntax step and the
+      # `patches` job check these.
+      - 'tests/*.sh'
+      - 'tests/license_token_fixture.py'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 permissions:
@@ -76,38 +114,135 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # The GUI crate links GTK4 and libadwaita, so the workspace needs them
       # even to type-check.
+      # minisign for the release signing tests, shellcheck for the shell
+      # syntax step, PyYAML for the workflow checks.
       - name: System libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev minisign shellcheck python3-yaml
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
+          toolchain: stable
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Format
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      # Ubuntu's runners restrict unprivileged user namespaces through
+      # AppArmor, and the image-view tests skip themselves where the namespace
+      # probe fails -- which would leave the code that keeps decrypted game
+      # files private, and the graceful Stop of a title inside the image
+      # view's namespaces (stop.rs), untested behind a green tick. Lift the
+      # restriction for this runner before any test runs, and tell the tests
+      # a skip is a failure here.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user --mount true
 
       - name: Test
-        run: cargo test --workspace
+        env:
+          FERESTRE_REQUIRE_USERNS: '1'
+        run: cargo test --locked --workspace
 
       - name: Download cancellation (offline)
-        run: cargo build -p ferestre-cli && python3 tests/test_download_cancel.py && python3 tests/test_media_dependencies.py && python3 tests/test_client_dependencies.py
+        run: cargo build --locked -p ferestre-cli && python3 tests/test_download_cancel.py && python3 tests/test_media_dependencies.py && python3 tests/test_client_dependencies.py
 
       - name: Launch helper tests
-        run: python3 -m unittest discover -s tests -p 'test_*image_view.py' && python3 tests/test_proton_wine_shim.py
+        env:
+          FERESTRE_REQUIRE_USERNS: '1'
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -p 'test_*image_view.py'
+          python3 tests/test_proton_wine_shim.py
+          python3 tests/test_fix_xcurl.py
+          python3 tests/test_launch_gdk.py
+          python3 tests/test_install_xodus_proton.py
 
-      - name: Authentication probe tests (offline)
-        run: python3 -m unittest discover -s tools -p test_xsts_probe.py
+      # Syntax for every shell script, under the shell its #! names: the shim
+      # and xodus-env.sh run under /bin/sh, which is dash here, so a bashism
+      # in them is caught by sh -n and would otherwise only show at launch.
+      # shellcheck at error severity on top, which finds what -n cannot (an
+      # unquoted array, a test that is always true) without failing on style.
+      - name: Shell syntax
+        run: |
+          set -euo pipefail
+          status=0
+          while IFS= read -r -d '' f; do
+              case "$(head -n1 "$f")" in
+                  *bash*) shell='bash' ;;
+                  '#!/bin/sh'*|'#!/usr/bin/env sh'*) shell='sh' ;;
+                  *) case "$f" in *.sh) shell='sh' ;; *) continue ;; esac ;;
+              esac
+              "$shell" -n "$f" || status=1
+              shellcheck --severity=error --shell="$shell" "$f" || status=1
+          done < <(find scripts packaging tests -type f \( -name '*.sh' -o -name AppRun \) -print0)
+          exit "$status"
+
+      - name: Packaging and release tests
+        env:
+          FERESTRE_REQUIRE_MINISIGN: '1'
+        run: |
+          python3 tests/test_workflows.py
+          python3 tests/test_release_signing.py
+          python3 tests/test_build_appimage.py
+
+      - name: Developer tool tests (offline)
+        run: python3 -m unittest discover -s tools -p 'test_*.py'
+
+  # The oldest compiler the workspace says it builds with. 1.88 is not a
+  # preference: it is what the dependency versions in Cargo.lock require
+  # (zopfli, under zip's deflate feature, is the newest at 1.88). Raise this
+  # together with `rust-version` in Cargo.toml, in the commit that moves the
+  # lock; tests/test_workflows.py checks the two agree.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: '1.88'
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # As in `test`: the namespace tests must run, not skip.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user --mount true
+
+      # Named explicitly, so a runner image with a different default compiler
+      # cannot make this job test something else.
+      - name: Test with the minimum supported Rust
+        env:
+          FERESTRE_REQUIRE_USERNS: '1'
+        run: |
+          rustc +1.88 --version
+          cargo +1.88 test --locked --workspace
 
   # The cheap half of testing the runtime. Building it needs a 26 GB tree and an
   # hour, so `tests/run-*.sh` cannot run per push -- but checking that the
@@ -121,16 +256,21 @@ jobs:
   patches:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # The client is a submodule pinned at the commit the series targets.
-      # The Proton submodule is not initialised: its Wine tree is too large
-      # to clone per push, and the wine series stays a local check. The
-      # xgameruntime and vkd3d-proton trees are small enough, so they are
-      # cloned into the places the submodule would put them.
+      # The Proton submodule's own submodules are not initialised: its Wine
+      # tree is too large to clone per push, and the wine series stays a
+      # local check. Proton itself is cloned without blobs, for the proton
+      # patch; the xgameruntime and vkd3d-proton trees are small enough, so
+      # they are cloned into the places the submodules would put them.
       - name: Fetch the repositories the patches target
         run: |
           git submodule update --init --quiet third_party/xodus-cli
+          git clone --quiet --filter=blob:none https://github.com/xodus-gaming/Proton.git \
+            third_party/xodus-proton
           git clone --quiet https://github.com/xodus-gaming/xgameruntime \
             third_party/xodus-proton/wine/dlls/xgameruntime
           # Without blobs: the history is needed to find the pinned base, but
@@ -141,18 +281,29 @@ jobs:
       - name: Patches apply
         run: scripts/check-patches.sh
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
 
-      - name: Service test dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev libdbus-1-dev protobuf-compiler
+      # WebKitGTK, GTK 3 and libsoup because xodus-cli links wry for the
+      # sign-in window, and its tests link the binary's crate.
+      - name: Client test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libdbus-1-dev protobuf-compiler \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev
 
       - name: Fixture script syntax
         run: |
           bash -n tests/run-tests.sh tests/build-license-service-fixture.sh
           python3 -m py_compile tests/license_token_fixture.py
 
-      - name: Apply the client series and test the service offline
+      # Offline, loopback only: the service, the download integrity checks
+      # (msixvc's hash tree and retries, the CLI's path and commit rules),
+      # the profile store and the file-backed key chain.
+      - name: Apply the client series and test it offline
         run: |
+          set -euo pipefail
           for patch in "$GITHUB_WORKSPACE"/patches/xodus-cli/*.patch; do
             case "$(basename "$patch")" in 0001-*) continue ;; esac
             git -C third_party/xodus-cli apply "$patch"
@@ -160,11 +311,16 @@ jobs:
           cd third_party/xodus-cli
           cargo test --locked -p xodus-service
           cargo test --locked -p xodus profile
+          cargo test --locked -p msixvc
+          cargo test --locked -p xodus-cli
+          cargo test --locked -p xodus --features key-chain-file --test key_chain_file
 
   gui:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: System libraries
         run: |
@@ -174,11 +330,13 @@ jobs:
             at-spi2-core gir1.2-atspi-2.0 python3-gi \
             xvfb dbus-x11
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build the window
-        run: cargo build -p ferestre-gui -p ferestre-cli
+        run: cargo build --locked -p ferestre-gui -p ferestre-cli
 
       # A session bus for the accessibility bus to live on, a display for the
       # window to map into, and then the test drives it by pressing things.

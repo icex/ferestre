@@ -120,16 +120,33 @@ impl Selection {
     }
 }
 
+/// Where the Store and Player choice is kept.
+pub fn roles_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("account-roles.json")
+}
+
+/// Read the saved choice. A file that does not parse is an error, not "no
+/// roles": treating it as none would point the launcher at the shared state
+/// directory and could show one account's library to another. [`save`]
+/// replaces such a file, so choosing accounts again repairs it.
 pub fn load(config_dir: &Path) -> Result<Option<Selection>> {
-    let bytes = match std::fs::read(config_dir.join("account-roles.json")) {
+    let path = roles_path(config_dir);
+    let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("Cannot read {}", path.display())))
+        }
     };
-    let selection: Selection =
-        serde_json::from_slice(&bytes).context("Invalid account role settings")?;
+    parse_selection(&bytes)
+        .with_context(|| format!("Invalid account role settings in {}", path.display()))
+        .map(Some)
+}
+
+fn parse_selection(bytes: &[u8]) -> Result<Selection> {
+    let selection: Selection = serde_json::from_slice(bytes)?;
     selection.validate()?;
-    Ok(Some(selection))
+    Ok(selection)
 }
 
 pub fn launch_selection(config_dir: &Path) -> Result<Option<Selection>> {
@@ -146,21 +163,51 @@ pub fn launch_selection(config_dir: &Path) -> Result<Option<Selection>> {
 }
 
 pub fn save(config_dir: &Path, store: &str, player: &str) -> Result<Selection> {
-    let generation = load(config_dir)?
-        .map_or(0, |s| s.generation)
-        .checked_add(1)
-        .context("Account selection generation exhausted")?;
     let selection = Selection {
         store: store.into(),
         player: player.into(),
-        generation,
+        generation: 0,
     };
     selection.validate()?;
-    crate::cache::write(
-        &config_dir.join("account-roles.json"),
-        &serde_json::to_vec(&selection)?,
-    )?;
+    let path = roles_path(config_dir);
+    let previous = match std::fs::read(&path) {
+        Ok(bytes) => match parse_selection(&bytes) {
+            Ok(old) => old.generation,
+            // Unreadable: a hand edit, a crash, or a newer Ferestre's format.
+            // Choosing accounts again is how a person fixes that, so it must
+            // not fail on the very file it is replacing. The old file is kept
+            // beside it for whoever wants to see what it said.
+            Err(_) => {
+                crate::cache::write(&config_dir.join("account-roles.json.invalid"), &bytes)?;
+                unknown_generation()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("Cannot read {}", path.display())))
+        }
+    };
+    let selection = Selection {
+        generation: previous
+            .checked_add(1)
+            .context("Account selection generation exhausted")?,
+        ..selection
+    };
+    crate::cache::write(&path, &serde_json::to_vec(&selection)?)?;
     Ok(selection)
+}
+
+/// A generation for when the previous one cannot be read. It has to differ
+/// from every generation used before, because it keys the service binding.
+/// The counter only counts saves, so the current time in nanoseconds is far
+/// past anything it reached, and past any earlier recovery plus the saves
+/// made since.
+fn unknown_generation() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_nanos()).ok())
+        .unwrap_or(u64::MAX / 2)
 }
 
 pub fn private_state(state: &Path, selection: Option<&Selection>) -> PathBuf {
@@ -183,6 +230,34 @@ pub fn player_prefix(original: &Path, player: &Profile) -> Result<PathBuf> {
         .join("players")
         .join(&player.save_namespace)
         .join(name))
+}
+
+/// Every Wine prefix a title has on disk, `base` being the one
+/// [`crate::paths::Paths::prefix_dir`] gives it: `base` itself, which every
+/// launch used before accounts had roles, then each Player's own copy beside
+/// it, `players/<namespace>/<base's name>`, sorted. A Player's copy that is a
+/// symlink is not one of them.
+///
+/// The window's Remove dialog lists exactly these, and `ferestre uninstall
+/// --prefix` removes exactly what it is given from them.
+pub fn title_prefixes(base: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if base.is_dir() {
+        found.push(base.to_path_buf());
+    }
+    let (Some(parent), Some(name)) = (base.parent(), base.file_name()) else {
+        return found;
+    };
+    let mut players: Vec<PathBuf> = std::fs::read_dir(parent.join("players"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|namespace| namespace.path().join(name))
+        .filter(|prefix| prefix.is_dir() && !prefix.is_symlink())
+        .collect();
+    players.sort();
+    found.extend(players);
+    found
 }
 
 pub fn require_service(binary: &Path) -> Result<()> {
@@ -266,6 +341,42 @@ mod tests {
         profile.legacy_saves = true;
         assert_eq!(player_prefix(prefix, &profile).unwrap(), prefix);
         assert!(save(root.path(), "../escape", PLAYER).is_err());
+    }
+
+    /// A damaged or newer-format file must not lock a person out of the one
+    /// dialog that could replace it. Reading still refuses it -- guessing
+    /// would mix one account's state into another's -- but saving recovers.
+    #[test]
+    fn an_unreadable_role_file_is_replaced_by_choosing_again() {
+        let root = tempfile::tempdir().unwrap();
+        let first = save(root.path(), OWNER, PLAYER).unwrap();
+        let mut last = first.generation;
+        for damaged in [
+            &b""[..],
+            b"{\"store\":",
+            br#"{"store":"11111111111111111111111111111111","player":"22222222222222222222222222222222","generation":3,"added_later":true}"#,
+        ] {
+            std::fs::write(roles_path(root.path()), damaged).unwrap();
+            let error = format!("{:#}", load(root.path()).unwrap_err());
+            assert!(error.contains("account-roles.json"), "names the file: {error}");
+
+            let repaired = save(root.path(), OWNER, PLAYER).unwrap();
+            assert_eq!(load(root.path()).unwrap(), Some(repaired.clone()));
+            assert!(
+                repaired.generation > last,
+                "a new generation, so no earlier service binding is reused"
+            );
+            last = save(root.path(), OWNER, PLAYER).unwrap().generation;
+            assert_ne!(
+                repaired.service_key("fixture-service"),
+                first.service_key("fixture-service")
+            );
+            assert_eq!(
+                std::fs::read(root.path().join("account-roles.json.invalid")).unwrap(),
+                damaged,
+                "what was there is kept for inspection"
+            );
+        }
     }
     #[test]
     fn signed_out_roles_and_old_protocols_are_refused() {

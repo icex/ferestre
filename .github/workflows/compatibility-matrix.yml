@@ -32,7 +32,9 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # The generator is stdlib-only, but tomllib means 3.11 or newer. Print it
       # so a runner image change shows up as a version, not a stack trace.
@@ -41,6 +43,9 @@ jobs:
 
       - name: Recipes validate
         run: python3 titles/validate.py
+
+      - name: Validator tests
+        run: python3 titles/test_validate.py
 
       - name: docs/COMPATIBILITY.md matches titles/*.toml
         run: python3 .github/scripts/gen-compatibility.py --check

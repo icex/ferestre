@@ -20,8 +20,6 @@ set -eu
 
 BUILD_DIR=${BUILD_DIR:-$XODUS_BUILD_DIR}
 REPO_DIR=${REPO_DIR:-$XODUS_REPO_DIR}
-# The tool may not exist yet on a first install; default to the Steam we found.
-TOOL_DIR=${TOOL_DIR:-${XODUS_PROTON_DIR:-${XODUS_STEAM_DIR:-$HOME/.steam/steam}/compatibilitytools.d/xodus}}
 PATCH=$REPO_DIR/patches/proton/0001-keep-inherited-fds-mediaconv-and-system-ffmpeg.patch
 J=${J:-16}
 
@@ -89,12 +87,38 @@ else
     echo "   !! no vkd3d-proton tree at $VKD3D_SRC; set VKD3D_SRC if the build ships a stale d3d12core.dll" >&2
 fi
 
-echo ":: building and installing (log: $BUILD_DIR/install.log)"
+# The build runs in containers. `newgrp docker` is only for a session that
+# predates its docker group membership; it does nothing for podman (there is no
+# such group to switch to) or for a user who can already reach the engine, and
+# fails outright on a host without the group.
+ENGINE=$(sed -n 's/^CONTAINER_ENGINE[[:space:]]*:=[[:space:]]*//p' Makefile | tail -n 1)
+ENGINE=${ENGINE:-docker}
+in_docker_session() { case " $(id -nG) " in *" docker "*) return 0 ;; esac; return 1; }
+build() {
+    if [ "$ENGINE" = docker ] && ! docker info >/dev/null 2>&1 \
+        && getent group docker >/dev/null && ! in_docker_session; then
+        echo "make install -j$J" | newgrp docker
+    else
+        make install -j"$J"
+    fi
+}
+
+echo ":: building and installing with $ENGINE (log: $BUILD_DIR/install.log)"
 # The exit status of a pipeline is the last command's, so a failed build would
 # otherwise be reported as success and the previous build left installed.
 set -o pipefail
-echo "make install -j$J" | newgrp docker 2>&1 | tee install.log | tail -3
+build 2>&1 | tee install.log | tail -3
 set +o pipefail
+
+# Check and patch the tree `make install` just wrote, which it names in its
+# log, not XODUS_PROTON_DIR: that may well point at a packaged, read-only copy.
+# TOOL_DIR still overrides it, for an install moved somewhere else by hand.
+INSTALLED=$(sed -n 's/^Installed Proton to //p' install.log | tail -n 1)
+if [ -z "$INSTALLED" ]; then
+    NAME=$(sed -n 's/^BUILD_NAME[[:space:]]*:=[[:space:]]*//p' Makefile | tail -n 1)
+    INSTALLED=$HOME/.steam/root/compatibilitytools.d/${NAME:-xodus}
+fi
+TOOL_DIR=${TOOL_DIR:-$INSTALLED}
 
 echo ":: re-applying the proton patch"
 cd "$TOOL_DIR"

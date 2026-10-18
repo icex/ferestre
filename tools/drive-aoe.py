@@ -35,6 +35,8 @@ import sys
 import time
 from pathlib import Path
 
+from private_out import private_dir
+
 HOME = Path.home()
 GAMES = Path(os.environ.get("XODUS_GAMES_DIR", HOME / "xbox-games"))
 SLUG = "age-of-empires-definitive-edition"
@@ -47,7 +49,9 @@ TOOL = Path(
 ) / "files"
 WINE = TOOL / "bin" / "wine"
 BOT = Path(os.environ.get("XODUS_BOT_EXE", GAME_DIR / "_bot.exe"))
-OUT = Path(os.environ.get("AOE_OUT", "/tmp/ferestre-drive-aoe"))
+# Private to this user: the bot carries out the input scripts written here,
+# and KWin runs the raise script.
+OUT = private_dir(os.environ.get("AOE_OUT"), "ferestre-drive-aoe")
 LOG = GAMES / f"{SLUG}-launch.log"
 REPO = Path(__file__).resolve().parent.parent
 
@@ -146,7 +150,6 @@ def shot(tag="aoe"):
         from PIL import Image
     except ImportError:
         die("python-pillow is needed to crop the screenshot")
-    OUT.mkdir(parents=True, exist_ok=True)
     raise_window()
     full = OUT / f"{tag}_screen.png"
     full.unlink(missing_ok=True)
@@ -172,7 +175,6 @@ def shot(tag="aoe"):
 
 
 def script(lines):
-    OUT.mkdir(parents=True, exist_ok=True)
     path = OUT / "script.txt"
     path.write_text("\n".join(lines) + "\n")
     # The bot is a Windows binary and wants a Windows path.

@@ -8,6 +8,7 @@ Examples:
 
 import argparse
 import datetime
+import glob
 import json
 import os
 from pathlib import Path
@@ -24,9 +25,23 @@ XSTS_TOKEN_REQUEST = 5
 TITLE_ENDPOINTS_URL = "https://title.mgt.xboxlive.com/titles/current/endpoints"
 
 
-def socket_path():
-    runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+def session_dir():
+    return os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+
+
+def socket_path(override=None):
+    """The service socket, found the way the launcher and the DLL find it:
+    XODUS_RUNTIME_DIR first, then the session's runtime directory."""
+    if override:
+        return override
+    runtime_dir = os.environ.get("XODUS_RUNTIME_DIR") or session_dir()
     return os.path.join(runtime_dir, "xodus.sock")
+
+
+def scoped_sockets():
+    """Sockets of the services the launcher starts per title, for a hint when
+    the default one is not there."""
+    return sorted(glob.glob(os.path.join(session_dir(), "ferestre-services", "*", "xodus.sock")))
 
 
 def read_title_metadata(game_dir):
@@ -60,7 +75,7 @@ def receive_exact(connection, size):
     return bytes(result)
 
 
-def request_token(url, title=None):
+def request_token(url, title=None, path=None):
     request = ET.Element("XSTSTokenRequest")
     for name, value in [
         ("Url", url),
@@ -76,7 +91,7 @@ def request_token(url, title=None):
         raise ValueError("request exceeds the service message size limit")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(120)
-        connection.connect(socket_path())
+        connection.connect(path or socket_path())
         connection.sendall(struct.pack("<IHH", XML_MAGIC, XSTS_TOKEN_REQUEST, len(payload)) + payload)
         magic, message_type, size = struct.unpack("<IHH", receive_exact(connection, 8))
         if magic != XML_MAGIC or message_type != XSTS_TOKEN_REQUEST + 1:
@@ -158,6 +173,7 @@ def main(argv=None):
     parser.add_argument("url", nargs="?", default=TITLE_ENDPOINTS_URL, help="URL to request authentication for")
     parser.add_argument("--game-dir", type=Path, help="installed game directory containing MicrosoftGame.config")
     parser.add_argument("--check-endpoints", action="store_true", help="perform a GET only to the fixed Microsoft title-management URL")
+    parser.add_argument("--socket", help="service socket to ask (default: $XODUS_RUNTIME_DIR, else $XDG_RUNTIME_DIR, /xodus.sock)")
     args = parser.parse_args(argv)
     if args.check_endpoints and args.url != TITLE_ENDPOINTS_URL:
         parser.error("--check-endpoints requires the default title-management URL")
@@ -167,10 +183,15 @@ def main(argv=None):
         parser.error(str(error))
     except (OSError, ET.ParseError):
         parser.error("could not read game metadata")
+    path = socket_path(args.socket)
     try:
-        response, size = request_token(args.url, title)
+        response, size = request_token(args.url, title, path)
     except (OSError, EOFError, ValueError, ET.ParseError) as error:
         print(f"Token request failed ({type(error).__name__}); inspect the service log", file=sys.stderr)
+        if not os.path.exists(path):
+            print(f"No service socket at {path}", file=sys.stderr)
+            for candidate in scoped_sockets():
+                print(f"  a title's service is listening at {candidate}; pass it with --socket", file=sys.stderr)
         return 1
     print_summary(response, size, title)
     if not usable_token(response):

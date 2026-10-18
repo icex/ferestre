@@ -28,6 +28,8 @@ import sys
 import time
 from pathlib import Path
 
+from private_out import private_dir
+
 HOME = Path.home()
 GAMES = Path(os.environ.get("XODUS_GAMES_DIR", HOME / "xbox-games"))
 SLUG = "fh5"
@@ -40,7 +42,9 @@ TOOL = Path(
 ) / "files"
 WINE = TOOL / "bin" / "wine"
 BOT = Path(os.environ.get("XODUS_BOT_EXE", GAME_DIR / "_bot.exe"))
-OUT = Path(os.environ.get("FH5_OUT", "/tmp/ferestre-drive-fh5"))
+# Private to this user: the bot carries out the input scripts written here,
+# and KWin runs the raise script.
+OUT = private_dir(os.environ.get("FH5_OUT"), "ferestre-drive-fh5")
 LOG = GAMES / f"{SLUG}-launch.log"
 REPO = Path(__file__).resolve().parent.parent
 
@@ -110,7 +114,6 @@ def window_rect():
 
 def raise_window():
     """Put the game in front in the compositor's opinion, not just Wine's."""
-    OUT.mkdir(parents=True, exist_ok=True)
     script_path = OUT / "raise.js"
     script_path.write_text(
         "for (const w of workspace.windowList()) {\n"
@@ -135,7 +138,6 @@ def raise_window():
 
 def shot(tag="fh5"):
     """Capture the desktop and crop to the game window."""
-    OUT.mkdir(parents=True, exist_ok=True)
     raise_window()
     full = OUT / f"{tag}_screen.png"
     full.unlink(missing_ok=True)
@@ -168,7 +170,6 @@ def shot(tag="fh5"):
 
 def press_start():
     """Tap Return, which is what the welcome screen offers as START GAME."""
-    OUT.mkdir(parents=True, exist_ok=True)
     path = OUT / "script.txt"
     path.write_text(f"focus {WINDOW}\nwait 800\nkey {VK_RETURN}\nwait 2000\n")
     return bot(["script", "Z:" + str(path).replace("/", "\\")])
@@ -179,7 +180,6 @@ def launch():
         print(":: already running")
         return
     print(":: launching")
-    OUT.mkdir(parents=True, exist_ok=True)
     launcher_log = OUT / "launcher.log"
     env = dict(os.environ, WINEDEBUG=os.environ.get("XODUS_WINEDEBUG", "+timestamp,+gdkc"))
     with launcher_log.open("w") as output:

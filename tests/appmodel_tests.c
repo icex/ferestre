@@ -3,13 +3,17 @@
  * kernelbase/package.c (the fix for UWP apps aborting with
  * APPMODEL_ERROR_NO_PACKAGE).
  *
- * Run in two modes:
- *   appmodel_tests packaged   - WINE_PACKAGE_MANIFEST points at the fixture;
- *                               expect a fully derived identity.
- *   appmodel_tests bare       - no manifest anywhere; expect NO_PACKAGE.
+ * Run in three modes:
+ *   appmodel_tests packaged       - WINE_PACKAGE_MANIFEST points at the
+ *                                   Minecraft fixture; expect a fully derived
+ *                                   identity, checked against known answers too.
+ *   appmodel_tests packaged-other - the same checks for any other manifest,
+ *                                   without the Minecraft known answers.
+ *   appmodel_tests bare           - no manifest anywhere; expect NO_PACKAGE.
  *
  * Expected strings come from the environment (EXPECT_FAMILY/EXPECT_FULL/
- * EXPECT_AUMID) so the test runner stays the single source of truth.
+ * EXPECT_AUMID, and EXPECT_PATH when the runner knows it) so the test runner
+ * stays the single source of truth.
  */
 
 #include <windows.h>
@@ -31,9 +35,9 @@ static void getenv_w(const char *name, WCHAR *out, int cap)
     if (!GetEnvironmentVariableW(wname, out, cap)) out[0] = 0;
 }
 
-static void test_packaged(void)
+static void test_packaged(BOOL known_answers)
 {
-    WCHAR buf[512], expect_family[512], expect_full[512], expect_aumid[512];
+    WCHAR buf[1024], expect_family[512], expect_full[512], expect_aumid[512], expect_path[1024];
     BYTE idbuf[1024];
     UINT32 len;
     LONG r;
@@ -41,6 +45,7 @@ static void test_packaged(void)
     getenv_w("EXPECT_FAMILY", expect_family, 512);
     getenv_w("EXPECT_FULL",   expect_full,   512);
     getenv_w("EXPECT_AUMID",  expect_aumid,  512);
+    getenv_w("EXPECT_PATH",   expect_path,   1024);
 
     /* Length-query pattern: NULL buffer must report required size. */
     len = 0;
@@ -68,6 +73,8 @@ static void test_packaged(void)
     r = GetCurrentPackagePath(&len, buf);
     OK(r == ERROR_SUCCESS, "GetCurrentPackagePath -> SUCCESS (got %ld)", r);
     OK(buf[0] != 0, "package path is non-empty (%ls)", buf);
+    if (expect_path[0])
+        OK(!lstrcmpiW(buf, expect_path), "package path = %ls (want %ls)", buf, expect_path);
 
     /* Buffer too small must fail with the required length, not corrupt memory. */
     len = 2;
@@ -87,12 +94,15 @@ static void test_packaged(void)
         idlen = sizeof(idbuf);
         r = GetCurrentPackageId(&idlen, idbuf);
         OK(r == ERROR_SUCCESS, "GetCurrentPackageId -> SUCCESS (got %ld)", r);
-        OK(!lstrcmpW(id->publisherId, L"8wekyb3d8bbwe"),
-           "id.publisherId = %ls (want 8wekyb3d8bbwe)", id->publisherId);
-        OK(!lstrcmpW(id->name, L"Microsoft.MinecraftUWP"),
-           "id.name = %ls (want Microsoft.MinecraftUWP)", id->name);
-        OK(id->version.Major == 1 && id->version.Minor == 21,
-           "id.version = %u.%u (want 1.21)", id->version.Major, id->version.Minor);
+        if (known_answers)
+        {
+            OK(!lstrcmpW(id->publisherId, L"8wekyb3d8bbwe"),
+               "id.publisherId = %ls (want 8wekyb3d8bbwe)", id->publisherId);
+            OK(!lstrcmpW(id->name, L"Microsoft.MinecraftUWP"),
+               "id.name = %ls (want Microsoft.MinecraftUWP)", id->name);
+            OK(id->version.Major == 1 && id->version.Minor == 21,
+               "id.version = %u.%u (want 1.21)", id->version.Major, id->version.Minor);
+        }
     }
 
     /* GetCurrentPackageInfo: size query, then a filled record. */
@@ -113,8 +123,9 @@ static void test_packaged(void)
            "info.packageFullName = %ls", info->packageFullName);
         OK(!lstrcmpW(info->packageFamilyName, expect_family),
            "info.packageFamilyName = %ls", info->packageFamilyName);
-        OK(!lstrcmpW(info->packageId.name, L"Microsoft.MinecraftUWP"),
-           "info.packageId.name = %ls", info->packageId.name);
+        if (known_answers)
+            OK(!lstrcmpW(info->packageId.name, L"Microsoft.MinecraftUWP"),
+               "info.packageId.name = %ls", info->packageId.name);
         OK(info->path && info->path[0], "info.path is non-empty (%ls)", info->path);
         HeapFree(GetProcessHeap(), 0, pi);
     }
@@ -147,7 +158,8 @@ static void test_bare(void)
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "bare")) test_bare();
-    else test_packaged();
+    else if (argc > 1 && !strcmp(argv[1], "packaged-other")) test_packaged(FALSE);
+    else test_packaged(TRUE);
 
     if (fails) { printf("\nFAILED (%d)\n", fails); return 1; }
     printf("\nPASSED\n");

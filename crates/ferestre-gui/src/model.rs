@@ -27,6 +27,10 @@ pub enum Action {
     Play,
     /// Owned, with a recipe, but not on disk yet: `ferestre install <product>`.
     Install,
+    /// A download that stopped before it finished left files behind. The same
+    /// command as [`Action::Install`], which picks up where it stopped; its own
+    /// state so the row does not offer to launch half a game.
+    Resume,
     /// Installed, and the catalog is offering a build this one does not have.
     Update,
     /// Owned, but nobody has written a recipe. Opens the editor rather than
@@ -54,6 +58,7 @@ impl Action {
         match self {
             Action::Play => "Play",
             Action::Install => "Install",
+            Action::Resume => "Resume",
             Action::Update => "Update",
             Action::Adopt => "Set up",
             Action::Stop => "Stop",
@@ -67,7 +72,8 @@ impl Action {
     }
 
     pub fn is_enabled_during_download(&self, downloading: bool) -> bool {
-        self.is_enabled() && !(downloading && matches!(self, Action::Install | Action::Update))
+        self.is_enabled()
+            && !(downloading && matches!(self, Action::Install | Action::Resume | Action::Update))
     }
 
     /// The `ferestre` arguments this action runs, or `None` when it runs nothing.
@@ -78,7 +84,7 @@ impl Action {
             Action::Play => Some(["run", product_id]),
             // Updating is a reinstall today. Fetching only what changed is a
             // separate piece of work and this is the honest version of it.
-            Action::Install | Action::Update => Some(["install", product_id]),
+            Action::Install | Action::Resume | Action::Update => Some(["install", product_id]),
             // Both are handled by the window rather than by a command: `Adopt`
             // opens the editor, `Stop` signals a process this window started.
             Action::Adopt | Action::Stop | Action::Installing | Action::Blocked(_) => None,
@@ -147,7 +153,11 @@ pub fn state_label(state: TitleState) -> (&'static str, &'static str) {
 /// Everything a row needs that the pure code cannot find out for itself.
 pub struct Inputs<'a> {
     pub recipes: &'a [Recipe],
-    pub runtime: Option<&'a InstalledRuntime>,
+    /// Every runtime installed here, newest first. A row is judged against the
+    /// one its launch would use, not simply the newest: see [`launch_runtime`].
+    pub runtimes: &'a [InstalledRuntime],
+    /// The runtime chosen for a title in "Choose runtime", by product id.
+    pub selected_runtime: &'a dyn Fn(&str) -> Option<PathBuf>,
     /// `titles/capabilities.toml`, when it was found. Without it a refusal
     /// still names the missing capabilities; with it, it also names the symptom.
     pub registry: Option<&'a Registry>,
@@ -169,6 +179,11 @@ pub struct Inputs<'a> {
     /// answer is a filesystem probe, and keeping it out of here is what lets a
     /// test describe a half-installed machine in one line.
     pub installed: &'a dyn Fn(&Recipe) -> bool,
+    /// Whether a download of this product stopped before it finished and left
+    /// files where the title goes. Such a folder is not an install -- the
+    /// package header and the manifest land long before the rest -- and it is
+    /// not nothing either: it is resumed, or removed.
+    pub incomplete: &'a dyn Fn(&str) -> bool,
     /// Whether a title with no recipe is nevertheless on disk, by product id.
     /// Installed-but-undescribed happens when the automatic recipe could not
     /// find an executable, or when somebody downloaded it by other means.
@@ -271,13 +286,18 @@ fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
     // Access source is labelled separately from runtime compatibility.
     let mut caution = broken;
 
-    let Some(runtime) = inputs.runtime else {
-        return blocked("install the patched runtime first".into());
-    };
-
     let game_dir = (inputs.game_dir)(recipe);
     let inferred = autofix::infer(recipe, game_dir.as_deref());
-    let assessment = runtime::assess(&inferred.recipe, runtime, inputs.registry);
+    let requested = (inputs.selected_runtime)(&recipe.title.product_id);
+    let assessment = match launch_runtime(
+        &inferred.recipe,
+        inputs.runtimes,
+        requested.as_deref(),
+        inputs.registry,
+    ) {
+        Ok((_, assessment)) => assessment,
+        Err(why) => return blocked(why),
+    };
     if !assessment.is_satisfied() {
         // `assess` writes a paragraph for a terminal. A row gets one line.
         let line = row_sized(&assessment.explanation, &recipe.title.name);
@@ -294,10 +314,47 @@ fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
 
     let action = if (inputs.installed)(recipe) {
         Action::Play
+    } else if (inputs.incomplete)(&recipe.title.product_id) {
+        Action::Resume
     } else {
         Action::Install
     };
     (action, caution)
+}
+
+/// The runtime a launch of `recipe` would use, and how it measures up to it.
+///
+/// The rule `ferestre run` follows, so a row cannot offer Play for a launch
+/// that is then refused, or refuse one that would work. A runtime chosen for
+/// the title is the one used, and only it: if it is gone, that is the answer.
+/// Otherwise the newest runtime that satisfies the recipe, and when none does,
+/// the newest, whose assessment then says what is missing. A miss against a
+/// published capability list refuses; a miss against a probed one only warns,
+/// because a probe cannot see most of what a build provides.
+///
+/// `Err` is a sentence for the row when there is no runtime to judge by.
+pub fn launch_runtime<'a>(
+    recipe: &Recipe,
+    runtimes: &'a [InstalledRuntime],
+    requested: Option<&Path>,
+    registry: Option<&Registry>,
+) -> Result<(&'a InstalledRuntime, runtime::Assessment), String> {
+    if runtimes.is_empty() {
+        return Err("install the patched runtime first".into());
+    }
+    if let Some(path) = requested {
+        if !runtimes.iter().any(|rt| rt.path == path) {
+            return Err(format!(
+                "the runtime chosen for this title is no longer installed ({}); choose another \
+                 with Choose runtime",
+                path.display()
+            ));
+        }
+    }
+    // The launcher's own choice, so the row and `ferestre run` agree.
+    runtime::choose(recipe, runtimes, requested, registry)
+        .map(|choice| (choice.runtime, choice.assessment))
+        .map_err(|e| e.to_string())
 }
 
 /// The first line of an explanation `assess` wrote for a terminal, cut down to
@@ -389,7 +446,7 @@ pub fn gamepass(
                 .catalog
                 .get(&id.to_ascii_uppercase())
                 .and_then(|p| p.product_kind.as_deref())
-                .map_or(true, |kind| kind.eq_ignore_ascii_case("Game"))
+                .is_none_or(|kind| kind.eq_ignore_ascii_case("Game"))
         })
         .map(|product_id| {
             let key = product_id.to_ascii_uppercase();
@@ -410,6 +467,7 @@ pub fn gamepass(
                 .unwrap_or_else(|| product_id.clone());
             let installed = (inputs.installed_product)(product_id);
             let installing = (inputs.installing)(product_id);
+            let incomplete = !installed && !installing && (inputs.incomplete)(product_id);
             let runnable = product.and_then(Product::is_runnable_here);
 
             // Said before the download, not after it. A title outside the
@@ -427,6 +485,8 @@ pub fn gamepass(
             }];
             if installed {
                 parts.insert(0, installed_version_or(inputs.records.get(&key), product));
+            } else if incomplete {
+                parts.insert(0, INCOMPLETE.into());
             }
             if let Some(note) = package_note(inputs, product) {
                 parts.push(note);
@@ -448,6 +508,7 @@ pub fn gamepass(
                         Action::Adopt
                     }
                 }
+                (false, _) if incomplete => Action::Resume,
                 (false, Some(false)) => {
                     let container = product
                         .and_then(|p| p.package_format.clone())
@@ -838,6 +899,7 @@ fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
     let subtitle = match (&action, installed) {
         (Action::Stop, _) => format!("{}  ·  running", installed_version_or(record, product)),
         (Action::Blocked(_), _) => view.subtitle,
+        (Action::Resume, _) => join(Some(INCOMPLETE.into()), &view.subtitle),
         (_, true) => {
             let on_disk = (inputs.installed_version)(recipe);
             let status = installed_status(record, product, update, on_disk.as_deref());
@@ -872,6 +934,9 @@ fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
         action,
     }
 }
+
+/// What a row says about a download that stopped before it finished.
+const INCOMPLETE: &str = "Download incomplete: resume it, or remove what arrived";
 
 /// The version to show, from the record if there is one and the disk if not.
 fn installed_version_or(record: Option<&Record>, _product: Option<&Product>) -> String {
@@ -1042,8 +1107,11 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
         }
         None => "No recipe yet".to_string(),
     };
+    let incomplete = !on_disk && !installing && (inputs.incomplete)(product_id);
     let subtitle = if on_disk {
         installed_status(inputs.records.get(key), product, None, None)
+    } else if incomplete {
+        join(Some(INCOMPLETE.into()), &subtitle)
     } else {
         subtitle
     };
@@ -1075,6 +1143,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
             _ if installing => Action::Installing,
             (true, true) => Action::Play,
             (true, false) => Action::Adopt,
+            (false, _) if incomplete => Action::Resume,
             (false, _) => Action::Install,
         },
     }
@@ -1209,9 +1278,209 @@ pub fn client_reports_signed_out(stderr: &str) -> bool {
     stderr.contains(SIGNED_OUT_MARKER)
 }
 
+/// Why a launch is refused before it starts when the Store and Player
+/// accounts differ, or `None` to let it go ahead.
+///
+/// Sharing an account needs a runtime that provides it, and the window can
+/// only tell which runtime a launch will use when it has the title's recipe.
+/// Without one -- a title on disk that describes itself, whose recipe `run`
+/// writes on the way past -- the check is left to `ferestre run`, which makes
+/// it with the recipe in hand and says precisely what is missing. Refusing
+/// here instead sent people to a runtime menu that could never help.
+pub fn account_sharing_refusal(has_recipe: bool, runtime_shares: bool) -> Option<&'static str> {
+    (has_recipe && !runtime_shares).then_some(
+        "Select an account-sharing runtime for this game using its runtime button, then try again.",
+    )
+}
+
+/// The `ferestre uninstall` arguments for what the Remove dialog said would
+/// go: the title's files, and, when the box was ticked, exactly the Wine
+/// prefixes it listed. Each prefix is named, so a Player's prefix that
+/// appeared after the dialog was drawn is not removed unseen. `None` when a
+/// prefix's path cannot be passed as text.
+pub fn uninstall_args(product_id: &str, prefixes: Option<&[PathBuf]>) -> Option<Vec<String>> {
+    let mut args = vec![
+        "uninstall".to_string(),
+        product_id.to_string(),
+        "--yes".into(),
+    ];
+    if let Some(prefixes) = prefixes.filter(|p| !p.is_empty()) {
+        args.push("--prefix".into());
+        for prefix in prefixes {
+            args.push("--prefix-path".into());
+            args.push(prefix.to_str()?.to_string());
+        }
+    }
+    Some(args)
+}
+
+/// `ferestre uninstall` arguments that forget a title's record and touch no
+/// file: for a record that names a library rather than the title's own
+/// folder, which nothing may delete as one title.
+pub fn forget_args(product_id: &str) -> Vec<String> {
+    ["uninstall", product_id, "--yes", "--keep-files"]
+        .map(String::from)
+        .to_vec()
+}
+
+/// What is in a folder named as an install destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Folder {
+    Missing,
+    NotADirectory,
+    Empty,
+    /// This product's own install: its record names the folder, or the
+    /// package in it says it is this product.
+    This,
+    /// Only what a stopped download leaves before the package says what it is.
+    Download,
+    /// Anything else: other games, or somebody's files.
+    Other,
+}
+
+/// Expand a leading `~` the way a shell would. `~user` is not supported.
+fn expand_home(text: &str, home: Option<&Path>) -> Result<PathBuf, String> {
+    let rest = match text.strip_prefix('~') {
+        None => return Ok(PathBuf::from(text)),
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => rest.trim_start_matches('/'),
+        Some(_) => {
+            return Err("Write the folder as a full path, like ~/Games or /mnt/games.".into())
+        }
+    };
+    let home = home.ok_or("HOME is not set, so ~ cannot be expanded. Use a full path.")?;
+    Ok(if rest.is_empty() {
+        home.to_path_buf()
+    } else {
+        home.join(rest)
+    })
+}
+
+/// Where an install goes, from what was typed in "Install to".
+///
+/// The field names a library folder, the way other launchers do: the title is
+/// installed into its own folder inside it, `folder_name`, so a library holding
+/// other games is never the title's folder -- and never what Remove deletes.
+/// Naming a title's own existing folder still works, for a repair or an
+/// update. `~` is expanded, and anything that is not a full path is refused
+/// rather than resolved against whatever directory the window started in.
+pub fn install_destination(
+    typed: &str,
+    home: Option<&Path>,
+    folder_name: &Path,
+    inspect: &dyn Fn(&Path) -> Folder,
+) -> Result<PathBuf, String> {
+    let text = typed.trim();
+    if text.is_empty() {
+        return Err("Choose the folder to install into.".into());
+    }
+    let chosen = expand_home(text, home)?;
+    if !chosen.is_absolute() {
+        return Err("Write the folder as a full path, like ~/Games or /mnt/games.".into());
+    }
+    if chosen
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("Write the folder without \"..\" in it.".into());
+    }
+    // Components, so `/mnt/games/` and `/mnt/./games` are the same folder.
+    let chosen: PathBuf = chosen.components().collect();
+    match inspect(&chosen) {
+        Folder::This => return Ok(chosen),
+        Folder::NotADirectory => {
+            return Err(format!("{} is a file, not a folder.", chosen.display()))
+        }
+        _ => {}
+    }
+    let destination = chosen.join(folder_name);
+    match inspect(&destination) {
+        Folder::Missing | Folder::Empty | Folder::This | Folder::Download => Ok(destination),
+        Folder::NotADirectory => Err(format!(
+            "{} is a file, not a folder.",
+            destination.display()
+        )),
+        Folder::Other => Err(format!(
+            "{} already holds other files. Choose another folder.",
+            destination.display()
+        )),
+    }
+}
+
+/// The library a destination from [`install_destination`] was made in: the
+/// destination without the title's own `folder_name` on the end. `None` when
+/// it does not end in that folder.
+pub fn library_of<'a>(destination: &'a Path, folder_name: &Path) -> Option<&'a Path> {
+    if !destination.ends_with(folder_name) {
+        return None;
+    }
+    destination
+        .ancestors()
+        .nth(folder_name.components().count())
+}
+
+/// How long to leave a background check that failed before trying it again
+/// on its own. A Refresh still tries at once.
+pub fn retry_delay(failures: u32) -> std::time::Duration {
+    let minutes = match failures {
+        0 => 0,
+        1 => 1,
+        2 => 5,
+        3 => 15,
+        _ => 60,
+    };
+    std::time::Duration::from_secs(minutes * 60)
+}
+
+/// The ids in `wanted` not yet in `asked`, which records them as asked. So a
+/// lookup that came back with nothing is not repeated on every redraw.
+pub fn unasked(wanted: Vec<String>, asked: &mut BTreeSet<String>) -> Vec<String> {
+    wanted
+        .into_iter()
+        .filter(|id| asked.insert(id.to_ascii_uppercase()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Remove passes the prefixes its dialog listed, each by name, and none
+    /// when the box was not ticked.
+    #[test]
+    fn remove_names_each_listed_prefix() {
+        let prefixes = [
+            PathBuf::from("/g/game-proton"),
+            PathBuf::from("/g/players/aa/game-proton"),
+        ];
+        assert_eq!(
+            uninstall_args("9ZZA", None).unwrap(),
+            ["uninstall", "9ZZA", "--yes"]
+        );
+        assert_eq!(
+            uninstall_args("9ZZA", Some(&[])).unwrap(),
+            ["uninstall", "9ZZA", "--yes"]
+        );
+        assert_eq!(
+            uninstall_args("9ZZA", Some(&prefixes)).unwrap(),
+            [
+                "uninstall",
+                "9ZZA",
+                "--yes",
+                "--prefix",
+                "--prefix-path",
+                "/g/game-proton",
+                "--prefix-path",
+                "/g/players/aa/game-proton",
+            ]
+        );
+        use std::os::unix::ffi::OsStrExt;
+        let odd = PathBuf::from(std::ffi::OsStr::from_bytes(b"/g/\xff-proton"));
+        assert_eq!(uninstall_args("9ZZA", Some(&[odd])), None);
+        assert_eq!(
+            forget_args("9ZZA"),
+            ["uninstall", "9ZZA", "--yes", "--keep-files"]
+        );
+    }
     use ferestre_core::runtime::CapabilitySource;
     use std::collections::BTreeSet;
 
@@ -1285,7 +1554,9 @@ mod tests {
     ) -> Inputs<'a> {
         Inputs {
             recipes,
-            runtime,
+            runtimes: runtime.map(std::slice::from_ref).unwrap_or(&[]),
+            selected_runtime: NO_SELECTION,
+            incomplete: NOTHING_INCOMPLETE,
             registry: None,
             ownership,
             catalog: empty_catalog(),
@@ -1376,6 +1647,10 @@ mod tests {
     const NOTHING_DESCRIBES_ITSELF: &dyn Fn(&str) -> bool = &|_| false;
     /// And nothing is being downloaded.
     const NOTHING_INSTALLING: &dyn Fn(&str) -> bool = &|_| false;
+    /// And no download stopped halfway.
+    const NOTHING_INCOMPLETE: &dyn Fn(&str) -> bool = &|_| false;
+    /// And nobody chose a runtime for a title.
+    const NO_SELECTION: &dyn Fn(&str) -> Option<PathBuf> = &|_| None;
 
     #[test]
     fn a_playable_installed_title_plays() {
@@ -1559,7 +1834,9 @@ mod tests {
         let avail = offering("9ZZTESTGAME1", "1.26.4600.0");
         let rows = library(&Inputs {
             recipes: &recipes,
-            runtime: Some(&rt),
+            runtimes: std::slice::from_ref(&rt),
+            selected_runtime: NO_SELECTION,
+            incomplete: NOTHING_INCOMPLETE,
             registry: None,
             ownership: &own,
             catalog: &cat,
@@ -1771,7 +2048,9 @@ mod tests {
         let avail = BTreeMap::new();
         let rows = library(&Inputs {
             recipes: &recipes,
-            runtime: Some(&rt),
+            runtimes: std::slice::from_ref(&rt),
+            selected_runtime: NO_SELECTION,
+            incomplete: NOTHING_INCOMPLETE,
             registry: None,
             ownership: &own,
             catalog: &cat,
@@ -1824,7 +2103,9 @@ mod tests {
         let unknown = Ownership::Unknown;
         let rows = library(&Inputs {
             recipes: &recipes,
-            runtime: None,
+            runtimes: &[],
+            selected_runtime: NO_SELECTION,
+            incomplete: NOTHING_INCOMPLETE,
             registry: None,
             ownership: &unknown,
             catalog: &catalog,
@@ -1869,7 +2150,9 @@ mod tests {
         let avail = BTreeMap::new();
         let rows = library(&Inputs {
             recipes: &[],
-            runtime: Some(&rt),
+            runtimes: std::slice::from_ref(&rt),
+            selected_runtime: NO_SELECTION,
+            incomplete: NOTHING_INCOMPLETE,
             registry: None,
             ownership: &own,
             catalog: &cat,
@@ -1928,7 +2211,9 @@ mod tests {
         let cat = catalog(vec![console]);
         let rows = library(&Inputs {
             recipes: &[],
-            runtime: None,
+            runtimes: &[],
+            selected_runtime: NO_SELECTION,
+            incomplete: NOTHING_INCOMPLETE,
             registry: None,
             ownership: &own,
             catalog: &cat,
@@ -1976,7 +2261,9 @@ mod tests {
         let cat = catalog(vec![bundle, child]);
         let rows = library(&Inputs {
             recipes: &[],
-            runtime: None,
+            runtimes: &[],
+            selected_runtime: NO_SELECTION,
+            incomplete: NOTHING_INCOMPLETE,
             registry: None,
             ownership: &own,
             catalog: &cat,
@@ -2037,7 +2324,9 @@ mod tests {
         let cat = catalog(vec![bundle]);
         let rows = library(&Inputs {
             recipes: &[],
-            runtime: None,
+            runtimes: &[],
+            selected_runtime: NO_SELECTION,
+            incomplete: NOTHING_INCOMPLETE,
             registry: None,
             ownership: &own,
             catalog: &cat,
@@ -2086,7 +2375,9 @@ mod tests {
         let rows = gamepass(
             &Inputs {
                 recipes: &[],
-                runtime: None,
+                runtimes: &[],
+                selected_runtime: NO_SELECTION,
+                incomplete: NOTHING_INCOMPLETE,
                 registry: None,
                 ownership: &own,
                 catalog: &cat,
@@ -2153,7 +2444,9 @@ mod tests {
             recipes: &[],
             // Signed out, so nothing is known about what the account owns.
             ownership: &Ownership::Unknown,
-            runtime: None,
+            runtimes: &[],
+            selected_runtime: NO_SELECTION,
+            incomplete: NOTHING_INCOMPLETE,
             registry: None,
             catalog: &cat,
             records: &recs,
@@ -2189,7 +2482,9 @@ mod tests {
         let rows = library(&Inputs {
             recipes: &[],
             ownership: &Ownership::Unknown,
-            runtime: None,
+            runtimes: &[],
+            selected_runtime: NO_SELECTION,
+            incomplete: NOTHING_INCOMPLETE,
             registry: None,
             catalog: &cat,
             records: &recs,
@@ -2207,7 +2502,9 @@ mod tests {
         let rows = library(&Inputs {
             recipes: &[],
             ownership: &Ownership::Unknown,
-            runtime: None,
+            runtimes: &[],
+            selected_runtime: NO_SELECTION,
+            incomplete: NOTHING_INCOMPLETE,
             registry: None,
             catalog: &cat,
             records: &recs,
@@ -2333,7 +2630,9 @@ mod tests {
         let rows = gamepass(
             &Inputs {
                 recipes: &[],
-                runtime: None,
+                runtimes: &[],
+                selected_runtime: NO_SELECTION,
+                incomplete: NOTHING_INCOMPLETE,
                 registry: None,
                 ownership: &Ownership::Unknown,
                 catalog: &cat,
@@ -2388,7 +2687,9 @@ mod tests {
         let own = Ownership::Known(entries(&["9ZZTESTGDK1"]));
         let rows = library(&Inputs {
             recipes: &[],
-            runtime: None,
+            runtimes: &[],
+            selected_runtime: NO_SELECTION,
+            incomplete: NOTHING_INCOMPLETE,
             registry: None,
             ownership: &own,
             catalog: &cat,
@@ -2428,7 +2729,9 @@ mod tests {
         let avail = BTreeMap::new();
         let rows = library(&Inputs {
             recipes: &recipes,
-            runtime: Some(&rt),
+            runtimes: std::slice::from_ref(&rt),
+            selected_runtime: NO_SELECTION,
+            incomplete: NOTHING_INCOMPLETE,
             registry: None,
             ownership: &own,
             catalog: &cat,
@@ -2461,7 +2764,9 @@ mod tests {
         let avail = offering("9ZZTESTGAME1", "1.26.4600.0");
         let rows = library(&Inputs {
             recipes: &recipes,
-            runtime: Some(&rt),
+            runtimes: std::slice::from_ref(&rt),
+            selected_runtime: NO_SELECTION,
+            incomplete: NOTHING_INCOMPLETE,
             registry: None,
             ownership: &own,
             catalog: &cat,
@@ -2494,7 +2799,9 @@ mod tests {
         let avail = BTreeMap::new();
         let rows = library(&Inputs {
             recipes: &recipes,
-            runtime: Some(&rt),
+            runtimes: std::slice::from_ref(&rt),
+            selected_runtime: NO_SELECTION,
+            incomplete: NOTHING_INCOMPLETE,
             registry: None,
             ownership: &own,
             catalog: &cat,
@@ -2612,7 +2919,9 @@ mod tests {
         let running: &dyn Fn(&str) -> bool = &|id| id == "9ZZTESTGAME1";
         let rows = library(&Inputs {
             recipes: &recipes,
-            runtime: Some(&rt),
+            runtimes: std::slice::from_ref(&rt),
+            selected_runtime: NO_SELECTION,
+            incomplete: NOTHING_INCOMPLETE,
             registry: None,
             ownership: &own,
             catalog: &cat,
@@ -2780,5 +3089,262 @@ mod tests {
             "thread 'main' panicked: Failed to authenticate Xbox user: MSA user token exchange failed: error sending request"
         ));
         assert!(!client_reports_signed_out("profile settings: HTTP 503"));
+    }
+
+    // --- the runtime a row is judged against --------------------------------
+
+    fn runtime_at(path: &str, version: &str, caps: &[&str]) -> InstalledRuntime {
+        InstalledRuntime {
+            path: PathBuf::from(path),
+            version: Some(version.into()),
+            provides: caps.iter().map(|c| c.to_string()).collect::<BTreeSet<_>>(),
+            source: CapabilitySource::Manifest,
+        }
+    }
+
+    fn row_with(
+        recipes: &[Recipe],
+        runtimes: &[InstalledRuntime],
+        selected: &dyn Fn(&str) -> Option<PathBuf>,
+    ) -> LibraryRow {
+        let own = Ownership::Unknown;
+        library(&Inputs {
+            runtimes,
+            selected_runtime: selected,
+            ..inputs(recipes, None, &own, ALL_INSTALLED)
+        })
+        .remove(0)
+    }
+
+    /// The newest runtime lost a capability the recipe needs, and an older one
+    /// still has it. `ferestre run` picks the older one, so the row plays; it
+    /// used to be blocked because only the newest was ever assessed.
+    #[test]
+    fn a_row_is_judged_against_the_runtime_its_launch_will_use() {
+        let recipes = vec![recipe(
+            "9ZZTESTGAME1",
+            "playable",
+            &["loader.memfd-main-image"],
+        )];
+        let runtimes = vec![
+            runtime_at("/runtimes/new", "11", &[]),
+            runtime_at("/runtimes/old", "10", &["loader.memfd-main-image"]),
+        ];
+        assert_eq!(
+            row_with(&recipes, &runtimes, NO_SELECTION).action,
+            Action::Play
+        );
+
+        // Chosen for the title: that one, and only that one, decides.
+        let new: &dyn Fn(&str) -> Option<PathBuf> = &|_| Some(PathBuf::from("/runtimes/new"));
+        assert!(
+            matches!(
+                row_with(&recipes, &runtimes, new).action,
+                Action::Blocked(_)
+            ),
+            "the chosen runtime lacks what the recipe requires"
+        );
+        let old: &dyn Fn(&str) -> Option<PathBuf> = &|_| Some(PathBuf::from("/runtimes/old"));
+        assert_eq!(row_with(&recipes, &runtimes, old).action, Action::Play);
+
+        // Chosen, then removed: the launch would be refused, so the row says so.
+        let gone: &dyn Fn(&str) -> Option<PathBuf> = &|_| Some(PathBuf::from("/runtimes/gone"));
+        let Action::Blocked(why) = row_with(&recipes, &runtimes, gone).action else {
+            panic!("a chosen runtime that is gone must block");
+        };
+        assert!(why.contains("no longer installed"), "{why}");
+    }
+
+    #[test]
+    fn with_no_runtime_satisfying_it_the_newest_explains_what_is_missing() {
+        let recipes = [recipe(
+            "9ZZTESTGAME1",
+            "playable",
+            &["loader.memfd-main-image"],
+        )];
+        let runtimes = vec![
+            runtime_at("/runtimes/new", "11", &[]),
+            runtime_at("/runtimes/old", "10", &[]),
+        ];
+        let (chosen, assessment) =
+            launch_runtime(&recipes[0], &runtimes, None, None).expect("a runtime to judge by");
+        assert_eq!(chosen.path, PathBuf::from("/runtimes/new"));
+        assert!(!assessment.is_satisfied());
+        assert!(launch_runtime(&recipes[0], &[], None, None).is_err());
+    }
+
+    // --- downloads that stopped ---------------------------------------------
+
+    /// A stopped download leaves a folder with the package header and the
+    /// manifest in it. That is not an installed title: Play would launch half
+    /// a game. The row offers to resume instead.
+    #[test]
+    fn a_stopped_download_offers_to_resume_not_to_play() {
+        let recipes = vec![recipe("9ZZTESTGAME1", "playable", &[])];
+        let rt = runtime_with(&[], CapabilitySource::Manifest);
+        let own = Ownership::Known(entries(&["9ZZTESTGAME1", "9ZZNORECIPE1"]));
+        let incomplete: &dyn Fn(&str) -> bool = &|_| true;
+        let rows = library(&Inputs {
+            incomplete,
+            ..inputs(&recipes, Some(&rt), &own, NOTHING_INSTALLED)
+        });
+        for row in &rows {
+            assert_eq!(row.action, Action::Resume, "{}", row.product_id);
+            assert_eq!(row.action.label(), "Resume");
+            assert_eq!(row.action.command("X"), Some(["install", "X"]));
+            assert!(!row.installed, "{} is not installed", row.product_id);
+            assert!(
+                row.subtitle.contains("Download incomplete"),
+                "{}",
+                row.subtitle
+            );
+            assert!(
+                !row.action.is_enabled_during_download(true),
+                "one download at a time"
+            );
+        }
+    }
+
+    // --- launching with separate Store and Player accounts -------------------
+
+    /// A title with no recipe cannot be checked here, because which runtime a
+    /// launch uses depends on the recipe. `ferestre run` writes one and checks
+    /// precisely; refusing here meant it never got the chance.
+    #[test]
+    fn a_title_without_a_recipe_is_left_for_the_launcher_to_check() {
+        assert_eq!(account_sharing_refusal(false, false), None);
+        assert!(account_sharing_refusal(true, false).is_some());
+        assert_eq!(account_sharing_refusal(true, true), None);
+    }
+
+    // --- where an install goes ----------------------------------------------
+
+    fn fake_disk<'a>(disk: &'a [(&'a str, Folder)]) -> impl Fn(&Path) -> Folder + 'a {
+        move |path| {
+            disk.iter()
+                .find(|(p, _)| Path::new(p) == path)
+                .map_or(Folder::Missing, |(_, f)| *f)
+        }
+    }
+
+    #[test]
+    fn install_to_names_a_library_and_the_title_gets_a_folder_in_it() {
+        let disk = [("/mnt/games", Folder::Other)];
+        let inspect = fake_disk(&disk);
+        let home = Some(Path::new("/home/u"));
+        let fh6 = Path::new("forza-horizon-6");
+        assert_eq!(
+            install_destination("/mnt/games", home, fh6, &inspect),
+            Ok(PathBuf::from("/mnt/games/forza-horizon-6")),
+            "a library holding other games is never the title's own folder"
+        );
+        assert_eq!(
+            install_destination("  /mnt/games/  ", home, fh6, &inspect),
+            Ok(PathBuf::from("/mnt/games/forza-horizon-6"))
+        );
+        assert_eq!(
+            install_destination("~/Games", home, Path::new("bedrock/game"), &inspect),
+            Ok(PathBuf::from("/home/u/Games/bedrock/game")),
+            "~ is expanded, and a recipe's nested layout is kept"
+        );
+        assert_eq!(
+            install_destination("~", home, fh6, &inspect),
+            Ok(PathBuf::from("/home/u/forza-horizon-6"))
+        );
+    }
+
+    #[test]
+    fn install_to_refuses_what_it_cannot_use_safely() {
+        let disk = [
+            ("/mnt/games/forza-horizon-6", Folder::Other),
+            ("/mnt/file", Folder::NotADirectory),
+        ];
+        let inspect = fake_disk(&disk);
+        let home = Some(Path::new("/home/u"));
+        let fh6 = Path::new("forza-horizon-6");
+        for typed in [
+            "Games",
+            "./Games",
+            "",
+            "   ",
+            "~other/Games",
+            "/mnt/../etc",
+            "/mnt/file",
+        ] {
+            assert!(
+                install_destination(typed, home, fh6, &inspect).is_err(),
+                "{typed:?} must be refused"
+            );
+        }
+        assert!(install_destination("~/Games", None, fh6, &inspect).is_err());
+        let Err(why) = install_destination("/mnt/games", home, fh6, &inspect) else {
+            panic!("someone else's files in the title's folder must be refused");
+        };
+        assert!(why.contains("already holds other files"), "{why}");
+    }
+
+    #[test]
+    fn a_titles_own_folder_still_works_for_a_repair() {
+        let disk = [
+            ("/mnt/x/fh6", Folder::This),
+            ("/mnt/y/forza-horizon-6", Folder::Download),
+            ("/mnt/z/forza-horizon-6", Folder::Empty),
+        ];
+        let inspect = fake_disk(&disk);
+        let fh6 = Path::new("forza-horizon-6");
+        assert_eq!(
+            install_destination("/mnt/x/fh6", None, fh6, &inspect),
+            Ok(PathBuf::from("/mnt/x/fh6")),
+            "the title's existing folder is used as it is"
+        );
+        assert_eq!(
+            install_destination("/mnt/y", None, fh6, &inspect),
+            Ok(PathBuf::from("/mnt/y/forza-horizon-6")),
+            "a stopped download in the title's folder is resumed"
+        );
+        assert_eq!(
+            install_destination("/mnt/z", None, fh6, &inspect),
+            Ok(PathBuf::from("/mnt/z/forza-horizon-6"))
+        );
+    }
+
+    /// What `ferestre install` is given for a fresh install: the library the
+    /// title's folder was made in, so it finds the same folder itself.
+    #[test]
+    fn the_library_is_the_destination_without_the_titles_folder() {
+        assert_eq!(
+            library_of(
+                Path::new("/mnt/games/bedrock/game"),
+                Path::new("bedrock/game")
+            ),
+            Some(Path::new("/mnt/games"))
+        );
+        assert_eq!(
+            library_of(Path::new("/mnt/games/fh6"), Path::new("fh6")),
+            Some(Path::new("/mnt/games"))
+        );
+        assert_eq!(
+            library_of(Path::new("/mnt/games/other"), Path::new("fh6")),
+            None
+        );
+    }
+
+    // --- background retries and lookups --------------------------------------
+
+    #[test]
+    fn a_failing_background_check_waits_longer_each_time() {
+        let delays: Vec<u64> = (0..6).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(delays, [0, 60, 300, 900, 3600, 3600]);
+    }
+
+    #[test]
+    fn each_lookup_is_asked_once() {
+        let mut asked = BTreeSet::new();
+        assert_eq!(
+            unasked(vec!["9abc".into(), "9DEF".into()], &mut asked),
+            ["9abc", "9DEF"]
+        );
+        assert!(unasked(vec!["9ABC".into(), "9def".into()], &mut asked).is_empty());
+        assert_eq!(unasked(vec!["9GHI".into()], &mut asked), ["9GHI"]);
     }
 }

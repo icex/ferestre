@@ -86,9 +86,9 @@ keys, or let one process read what it should not:
   title or another local process get at either.
 - Patches that weaken a boundary Wine or Proton was relying on.
 - Scripts that fetch and install a binary. `scripts/fix-xcurl.sh` downloads a
-  curl build over HTTPS and installs it into a game directory; it verifies the
-  exports the title imports, not a pinned checksum. If you can turn that into
-  code execution, that is a report.
+  pinned curl build over HTTPS, checks the archive against its pinned sha256,
+  and installs it into a game directory after verifying the exports the title
+  imports. If you can turn that into code execution, that is a report.
 - Anything in the tooling that writes a token, key or identifier to a file, a
   log, or the terminal where it can be pasted by accident.
 
@@ -107,6 +107,38 @@ keys, or let one process read what it should not:
   Report them upstream; a note here so the patch set can be adjusted is
   welcome, but the fix belongs there.
 - Missing hardening with no attack behind it. Say what an attacker gains.
+
+## Known limitations
+
+These are known and not yet fixed. A report that finds a way to make one of
+them worse, or a fix, is welcome.
+
+- **Package downloads over plain http can be rewritten in transit, unless
+  the package service vouches for the header.** The package service usually
+  lists only plain `http://` CDN roots (their `https://` names answer with a
+  certificate for other hosts), and the client uses them, with a note on
+  stderr. Every page the client installs is checked against the package's
+  hash tree, and the hash tree against the top hash in the package header
+  (client patch 0022). When the authenticated package service gives a
+  `HashOfHashes` for the package, the header's top hash must equal it, and a
+  header that does not is refused before anything it describes is read
+  (client patch 0025); the whole download is then anchored to an answer that
+  came over TLS. Reading `HashOfHashes` as the header's top hash is the
+  client's interpretation: no package checked so far has carried one -- no
+  `HashOfHashes`, and an empty `FileHash` for each file -- so it has not been
+  confirmed against a real one. And the header's own signature is not
+  checked. For those packages the header is only as
+  trustworthy as the connection it came over, and the client says so on
+  stderr. Someone who can change traffic between you and the CDN (an
+  untrusted network, a hostile proxy) can rewrite the header, the hash tree
+  and the package's file table together, consistently, and so install files
+  of their choosing into a title's folder. Those files run when the title
+  starts. Accidental corruption is caught; a deliberate rewrite of an
+  unanchored plain http download is not. To refuse plain http CDN roots and
+  fail instead, set `XODUS_REQUIRE_HTTPS_CDN=1` for `ferestre install` (and
+  the client). Closing this for every package needs the header checked
+  against Microsoft's XVD signing key, or the package service sending its
+  hash.
 
 ## What this project stores
 

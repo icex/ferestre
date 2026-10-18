@@ -251,9 +251,22 @@ pub fn prefix_dir(recipe: &Recipe, dirs: &Dirs, options: &Options) -> PathBuf {
 ///
 /// Named after the slug rather than the install directory so that a relocated
 /// install still logs in a predictable place.
+///
+/// The slug comes from a recipe file, and a launch appends the title's whole
+/// output to this path, so one that is not a slug -- `../../.config/x`, or
+/// anything with a `/` -- is not joined to anything. [`Recipe::parse`] already
+/// refuses such a recipe; this covers one built some other way. The lowercase
+/// product id stands in, and failing that a fixed name.
 pub fn log_path(recipe: &Recipe, dirs: &Dirs) -> PathBuf {
-    dirs.games_dir
-        .join(format!("{}-launch.log", recipe.title.slug))
+    let product = recipe.title.product_id.to_ascii_lowercase();
+    let name = if crate::recipe::is_slug(&recipe.title.slug) {
+        recipe.title.slug.as_str()
+    } else if crate::recipe::is_slug(&product) {
+        product.as_str()
+    } else {
+        "title"
+    };
+    dirs.games_dir.join(format!("{name}-launch.log"))
 }
 
 /// Build the plan for launching a title.
@@ -612,6 +625,18 @@ summary = "Runs."
             PathBuf::from("/games/example-proton")
         );
         assert_eq!(log_path(&r, &d), PathBuf::from("/games/example-launch.log"));
+
+        // A slug that is not one never steers the log out of the games
+        // directory, however the recipe was put together.
+        let mut hostile = recipe("");
+        for slug in ["../../.config/autostart/x", "a/b", "", "..", "/etc/x"] {
+            hostile.title.slug = slug.into();
+            assert_eq!(
+                log_path(&hostile, &d),
+                PathBuf::from("/games/9ppt8k6gqhrz-launch.log"),
+                "{slug}"
+            );
+        }
 
         // A recipe may move both, which is how Bedrock keeps its package one
         // level down.

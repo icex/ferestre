@@ -2,7 +2,8 @@
 <!-- Hand-written fixture for the app-model regression tests. Not extracted from
      a shipped package: it carries only the identity fields the tests need in
      order to check that a real title's package family name is derived
-     correctly. -->
+     correctly. The Application Id is deliberately not "App", the value the
+     DLL falls back to, so a lookup that misses it cannot pass by accident. -->
 <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
   <Identity Name="Microsoft.MinecraftUWP"
             Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
@@ -13,7 +14,7 @@
     <PublisherDisplayName>Mojang</PublisherDisplayName>
   </Properties>
   <Applications>
-    <Application Id="App" Executable="Minecraft.Windows.exe" EntryPoint="Minecraft.App">
+    <Application Id="Game" Executable="Minecraft.Windows.exe" EntryPoint="Minecraft.App">
     </Application>
   </Applications>
 </Package>

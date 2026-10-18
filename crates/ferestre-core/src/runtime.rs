@@ -115,21 +115,30 @@ impl InstalledRuntime {
         })
     }
 
-    /// Examine the runtime [`Paths`] resolved.
+    /// The runtime a launch would use when nothing more specific was chosen.
     ///
-    /// The search order lives there, with the rest of what `xodus-env.sh`
-    /// resolves; a second copy of it here would be one to drift. A directory
-    /// that came from `XODUS_PROTON_DIR` is used as given, so a wrong override
-    /// is an error naming it rather than a silent fall-through to some other
-    /// install the user did not choose.
+    /// A directory that came from `XODUS_PROTON_DIR` is used as given, so a
+    /// wrong override is an error naming it rather than a silent fall-through
+    /// to some other install the user did not choose. Otherwise it is the
+    /// newest of [`all`]: the managed downloads in the state directory as well
+    /// as the legacy Steam compatibility tool. An AppImage brings no runtime of
+    /// its own, so looking only at the legacy places reported "no runtime" on
+    /// exactly the machines `ferestre install-runtime` had set up.
     pub fn discover(paths: &Paths) -> anyhow::Result<Self> {
-        let dir = paths.runtime_dir().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no patched Proton runtime found. Install one (ferestre install-runtime), \
-                 or set XODUS_PROTON_DIR to an existing compatibility tool"
-            )
-        })?;
-        Self::at(dir)
+        if let Some(dir) = paths.runtime_override() {
+            return Self::at(dir);
+        }
+        if let Some(runtime) = all(paths).into_iter().next() {
+            return Ok(runtime);
+        }
+        if let Some(dir) = paths.runtime_dir() {
+            // Found by probing but not usable: say what is wrong with it.
+            return Self::at(dir);
+        }
+        anyhow::bail!(
+            "no patched Proton runtime found. Install one (ferestre install-runtime), \
+             or set XODUS_PROTON_DIR to an existing compatibility tool"
+        )
     }
 
     pub fn provides(&self, capability: &str) -> bool {
@@ -146,11 +155,31 @@ impl InstalledRuntime {
 }
 
 /// A published runtime archive, found from the normal GitHub release feed.
+///
+/// Everything here has been checked to be safe to use as a path component:
+/// [`Release::version`] names the runtime's directory and
+/// [`Release::asset_name`] the cached archive, so neither may climb out of
+/// the directory it is joined to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
     pub tag: String,
+    /// The tag without its `runtime-` prefix ([`release_version`]).
+    pub version: String,
+    /// Always exactly [`archive_name`] of the version.
     pub asset_name: String,
     pub url: String,
+    /// The minisign signature published beside the archive
+    /// (`<asset>.minisig`), if the release has one. A caller must not install
+    /// an archive that has none; see [`crate::signing`] and
+    /// [`crate::http::download_signed`].
+    pub signature_url: Option<String>,
+}
+
+impl Release {
+    /// What the archive's signature has to have been made for.
+    pub fn artefact(&self) -> crate::signing::Artefact<'_> {
+        crate::signing::Artefact::new(&self.asset_name, &self.version)
+    }
 }
 
 #[derive(Deserialize)]
@@ -165,25 +194,138 @@ struct GithubAsset {
     browser_download_url: String,
 }
 
+/// Whether `name` is one ordinary path component: joined to a directory, it
+/// names something directly inside it and nothing else.
+fn one_component(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(only)), None) if only == std::ffi::OsStr::new(name)
+    )
+}
+
+/// The version a runtime release tag names: `runtime-11.0.20261018` is
+/// `11.0.20261018`. It becomes a directory name, so it must start with a
+/// letter or digit and hold only letters, digits, `.`, `-` and `_`.
+pub fn release_version(tag: &str) -> anyhow::Result<&str> {
+    tag.strip_prefix("runtime-")
+        .filter(|version| {
+            version.starts_with(|c: char| c.is_ascii_alphanumeric())
+                && version
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+                && one_component(version)
+        })
+        .ok_or_else(|| anyhow::anyhow!("runtime release has an unsafe version: {tag}"))
+}
+
+/// The one archive name a runtime release of `version` may publish.
+pub fn archive_name(version: &str) -> String {
+    format!("ferestre-runtime-{version}.tar.xz")
+}
+
 /// Select the newest runtime release in GitHub's reverse-chronological release
 /// feed. It deliberately ignores launcher releases and checksum files.
+///
+/// The archive is taken only under its exact name,
+/// `ferestre-runtime-<version>.tar.xz` for the tag `runtime-<version>`, and
+/// its signature only as that name plus `.minisig`. The newest runtime release
+/// that publishes some other archive-like name, or whose tag is not a usable
+/// version, is an error rather than a reason to fall back to an older one.
 pub fn latest_release(json: &str) -> anyhow::Result<Release> {
+    find_release(json)?
+        .ok_or_else(|| anyhow::anyhow!("no runtime archive was published in the Ferestre releases"))
+}
+
+/// [`latest_release`] for one page of the feed: `None` when the page holds
+/// no runtime release at all, so the caller can look at the next page, and
+/// an error when the newest one it holds cannot be used.
+pub fn find_release(json: &str) -> anyhow::Result<Option<Release>> {
     let releases: Vec<GithubRelease> = serde_json::from_str(json)?;
     for release in releases {
         if !release.tag_name.starts_with("runtime-") {
             continue;
         }
-        if let Some(asset) = release.assets.into_iter().find(|asset| {
-            asset.name.starts_with("ferestre-runtime-") && asset.name.ends_with(".tar.xz")
-        }) {
-            return Ok(Release {
-                tag: release.tag_name,
-                asset_name: asset.name,
-                url: asset.browser_download_url,
-            });
+        let looks_like_archive =
+            |name: &str| name.starts_with("ferestre-runtime-") && name.ends_with(".tar.xz");
+        if !release
+            .assets
+            .iter()
+            .any(|asset| looks_like_archive(&asset.name))
+        {
+            continue;
         }
+        let version = release_version(&release.tag_name)?;
+        let expected = archive_name(version);
+        let Some(asset) = release.assets.iter().find(|asset| asset.name == expected) else {
+            let published: Vec<&str> = release
+                .assets
+                .iter()
+                .map(|asset| asset.name.as_str())
+                .filter(|name| looks_like_archive(name))
+                .collect();
+            anyhow::bail!(
+                "runtime release {} publishes {} instead of {expected}; it was not used",
+                release.tag_name,
+                published.join(", ")
+            );
+        };
+        if !one_component(&asset.name) {
+            anyhow::bail!(
+                "runtime release {} has an unsafe archive name",
+                release.tag_name
+            );
+        }
+        let signature = format!("{}{}", asset.name, crate::signing::SIGNATURE_SUFFIX);
+        let signature_url = release
+            .assets
+            .iter()
+            .find(|other| other.name == signature)
+            .map(|other| other.browser_download_url.clone());
+        return Ok(Some(Release {
+            tag: release.tag_name.clone(),
+            version: version.to_string(),
+            asset_name: asset.name.clone(),
+            url: asset.browser_download_url.clone(),
+            signature_url,
+        }));
     }
-    anyhow::bail!("no runtime archive was published in the Ferestre releases")
+    Ok(None)
+}
+
+/// The exit status of `ferestre install-runtime` when it refused to replace
+/// a newer installed runtime with an older release. The window asks, and runs
+/// it again with `--allow-downgrade` if the person agrees.
+pub const EXIT_DOWNGRADE_REFUSED: u8 = 3;
+
+/// The numbers in a version, in order, for comparing releases: `11.0.10`
+/// is newer than `11.0.9`, and `11.0.1-2` than `11.0.1`.
+fn version_numbers(version: &str) -> Vec<u64> {
+    version
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse().unwrap_or(u64::MAX))
+        .collect()
+}
+
+/// Compare two release versions by their numbers.
+pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    version_numbers(a).cmp(&version_numbers(b))
+}
+
+/// The newest runtime `install-runtime` put in `runtimes_dir` that is newer
+/// than `version`, by the release version it was installed as (its
+/// directory's name). `None` when installing `version` is not a downgrade.
+pub fn newer_installed(runtimes_dir: &Path, version: &str) -> Option<String> {
+    std::fs::read_dir(runtimes_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            (!name.starts_with('.') && InstalledRuntime::at(&entry.path()).is_ok()).then_some(name)
+        })
+        .filter(|name| compare_versions(name, version).is_gt())
+        .max_by(|a, b| compare_versions(a, b).then_with(|| a.cmp(b)))
 }
 
 /// Every valid runtime in a directory of versioned runtime installs. Invalid
@@ -205,15 +347,8 @@ pub fn installed(dir: &Path) -> Vec<InstalledRuntime> {
 /// `ferestre-11.0.20261017.1` must precede `xodus-...20261013.3`, and build 10
 /// must precede build 9. Keep the full name/path as deterministic tie breakers.
 fn runtime_order(a: &InstalledRuntime, b: &InstalledRuntime) -> std::cmp::Ordering {
-    let numbers = |runtime: &InstalledRuntime| -> Vec<u64> {
-        runtime
-            .version
-            .as_deref()
-            .unwrap_or_default()
-            .split(|c: char| !c.is_ascii_digit())
-            .filter(|part| !part.is_empty())
-            .map(|part| part.parse().unwrap_or(u64::MAX))
-            .collect()
+    let numbers = |runtime: &InstalledRuntime| {
+        version_numbers(runtime.version.as_deref().unwrap_or_default())
     };
     numbers(b)
         .cmp(&numbers(a))
@@ -239,8 +374,10 @@ pub fn all(paths: &Paths) -> Vec<InstalledRuntime> {
 
 /// Per-title runtime choices kept outside shipped recipes. A release can update
 /// the compatibility matrix without overwriting the runtime a person chose.
+///
+/// Unknown keys are tolerated: a file a newer build wrote must still give this
+/// one the choices it can read, rather than read as no choices at all.
 #[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 struct Selections {
     #[serde(default)]
     titles: BTreeMap<String, PathBuf>,
@@ -250,27 +387,53 @@ fn selections_file(config_dir: &Path) -> PathBuf {
     config_dir.join("runtime-selections.toml")
 }
 
+/// The saved choices. `Ok(default)` when there is no file; an error naming
+/// the file when there is one that cannot be read.
+fn read_selections(config_dir: &Path) -> anyhow::Result<Selections> {
+    let file = selections_file(config_dir);
+    let text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Selections::default()),
+        Err(e) => anyhow::bail!("{}: {e}", file.display()),
+    };
+    toml::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "{}: {e}\nfix the file, or move it aside to forget every saved runtime choice",
+            file.display()
+        )
+    })
+}
+
 /// Read a local runtime choice for a Store product id.
+///
+/// A file that cannot be read is said on stderr and treated as no choice, so
+/// a launch still happens -- with the automatic runtime, which the message
+/// says.
 pub fn selected(config_dir: &Path, product_id: &str) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(selections_file(config_dir)).ok()?;
-    let selections: Selections = toml::from_str(&text).ok()?;
-    selections
-        .titles
-        .get(&product_id.to_ascii_uppercase())
-        .cloned()
+    match read_selections(config_dir) {
+        Ok(selections) => selections
+            .titles
+            .get(&product_id.to_ascii_uppercase())
+            .cloned(),
+        Err(e) => {
+            eprintln!("-- ignoring the saved runtime choices: {e}");
+            None
+        }
+    }
 }
 
 /// Persist a local runtime choice. Passing `None` restores automatic selection.
+///
+/// A file that is there and cannot be read is an error, not a blank slate:
+/// rewriting it with only this one choice would silently throw away every
+/// other title's.
 pub fn set_selected(
     config_dir: &Path,
     product_id: &str,
     path: Option<&Path>,
 ) -> anyhow::Result<()> {
     let file = selections_file(config_dir);
-    let mut selections: Selections = std::fs::read_to_string(&file)
-        .ok()
-        .and_then(|text| toml::from_str(&text).ok())
-        .unwrap_or_default();
+    let mut selections = read_selections(config_dir)?;
     match path {
         Some(path) => {
             selections
@@ -281,16 +444,33 @@ pub fn set_selected(
             selections.titles.remove(&product_id.to_ascii_uppercase());
         }
     }
-    std::fs::create_dir_all(config_dir)?;
-    let temporary = file.with_extension("toml.part");
-    std::fs::write(&temporary, toml::to_string_pretty(&selections)?)?;
-    std::fs::rename(temporary, file)?;
-    Ok(())
+    crate::cache::write(&file, toml::to_string_pretty(&selections)?.as_bytes())
+}
+
+/// The runtime a person asked for, for one title: their choice for that title
+/// if they made one, otherwise the one `XODUS_PROTON_DIR` names.
+///
+/// `XODUS_PROTON_DIR` is a choice too, made for every title at once, so it is
+/// the requested runtime rather than one more candidate that a newer managed
+/// download would quietly outrank. A value that is not a runtime is an error
+/// naming it, as [`InstalledRuntime::discover`] has always made it.
+pub fn requested(paths: &Paths, product_id: &str) -> anyhow::Result<Option<PathBuf>> {
+    if let Some(chosen) = selected(paths.config_dir(), product_id) {
+        return Ok(Some(chosen));
+    }
+    match paths.runtime_override() {
+        Some(dir) => InstalledRuntime::at(dir).map(|runtime| Some(runtime.path)),
+        None => Ok(None),
+    }
 }
 
 /// Pick the requested runtime, or the newest compatible installed runtime.
 /// A path is only accepted when it names one of the discovered installs; this
 /// prevents a stale title override from silently running an arbitrary Proton.
+///
+/// Refuses before anything else can look at the answer, which leaves a caller
+/// no way to launch anyway or to explain the refusal. [`choose`] is the one to
+/// use before a launch.
 pub fn select<'a>(
     recipe: &Recipe,
     runtimes: &'a [InstalledRuntime],
@@ -301,16 +481,84 @@ pub fn select<'a>(
         .iter()
         .filter(|rt| assess(recipe, rt, registry).is_satisfied());
     if let Some(path) = requested {
-        return candidates.find(|rt| rt.path == path).ok_or_else(|| {
-            anyhow::anyhow!(
-                "{}: selected runtime is unavailable or incompatible",
-                path.display()
-            )
-        });
+        return candidates
+            .find(|rt| same_path(&rt.path, path))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{}: selected runtime is unavailable or incompatible",
+                    path.display()
+                )
+            });
     }
     candidates
         .next()
         .ok_or_else(|| anyhow::anyhow!("no installed runtime satisfies {}", recipe.title.name))
+}
+
+/// The runtime a launch would use, and what it is missing.
+#[derive(Debug, Clone)]
+pub struct Choice<'a> {
+    pub runtime: &'a InstalledRuntime,
+    /// Whether the runtime satisfies the recipe, with the words for why not.
+    /// The decision whether to launch is the caller's: a probed runtime that
+    /// "could not be seen" to have something may well have it, and `--force`
+    /// exists for a person who knows better than the recipe.
+    pub assessment: Assessment,
+}
+
+/// Pick the runtime for a launch without refusing on the recipe's behalf.
+///
+/// The requested runtime when there is one, whatever it is missing -- someone
+/// chose it -- and an error only when it is not installed. Otherwise the
+/// newest runtime that satisfies the recipe, and failing that the newest
+/// runtime, so the caller can show what is missing, suggest an update, and
+/// honour `--force`. An error only when there is no runtime at all.
+pub fn choose<'a>(
+    recipe: &Recipe,
+    runtimes: &'a [InstalledRuntime],
+    requested: Option<&Path>,
+    registry: Option<&Registry>,
+) -> anyhow::Result<Choice<'a>> {
+    let choice = |runtime: &'a InstalledRuntime| Choice {
+        runtime,
+        assessment: assess(recipe, runtime, registry),
+    };
+    if let Some(path) = requested {
+        return runtimes
+            .iter()
+            .find(|rt| same_path(&rt.path, path))
+            .map(choice)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{}: the runtime chosen for {} is not installed; choose another, or \
+                     clear the choice to use the newest",
+                    path.display(),
+                    recipe.title.name
+                )
+            });
+    }
+    let mut assessed = runtimes.iter().map(choice);
+    let first = assessed.next().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no patched Proton runtime is installed. Install one (ferestre install-runtime), \
+             or set XODUS_PROTON_DIR to an existing compatibility tool"
+        )
+    })?;
+    if first.assessment.is_satisfied() {
+        return Ok(first);
+    }
+    Ok(assessed
+        .find(|candidate| candidate.assessment.is_satisfied())
+        .unwrap_or(first))
+}
+
+/// Two names for the same runtime: a choice saved through a symlink, or with
+/// a trailing slash, still names the install it meant.
+fn same_path(a: &Path, b: &Path) -> bool {
+    a == b
+        || a.canonicalize()
+            .ok()
+            .is_some_and(|a| b.canonicalize().ok().is_some_and(|b| a == b))
 }
 
 fn read_capabilities(dir: &Path) -> anyhow::Result<(BTreeSet<Capability>, CapabilitySource)> {
@@ -1039,6 +1287,303 @@ hangs"""
                 .path,
             old.path()
         );
+    }
+
+    #[test]
+    fn a_saved_choice_file_that_cannot_be_read_is_not_overwritten() {
+        // Rewriting it with only the new choice would throw away every other
+        // title's without a word.
+        let config = TempDir::new("runtime-choice-corrupt");
+        let file = config.path().join("runtime-selections.toml");
+        std::fs::write(&file, "[titles\nbroken = ").unwrap();
+        let chosen = Path::new("/opt/ferestre/runtimes/11.0.2");
+        let err = set_selected(config.path(), "9NNX1VVR3KNQ", Some(chosen))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("runtime-selections.toml"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "[titles\nbroken = "
+        );
+        assert_eq!(selected(config.path(), "9NNX1VVR3KNQ"), None);
+
+        // A key from a newer build is no reason to lose the choices.
+        std::fs::write(
+            &file,
+            "future = 1\n[titles]\n9NNX1VVR3KNQ = \"/opt/a\"\n9PPT8K6GQHRZ = \"/opt/b\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            selected(config.path(), "9PPT8K6GQHRZ").as_deref(),
+            Some(Path::new("/opt/b"))
+        );
+        set_selected(config.path(), "9NNX1VVR3KNQ", Some(chosen)).unwrap();
+        assert_eq!(
+            selected(config.path(), "9PPT8K6GQHRZ").as_deref(),
+            Some(Path::new("/opt/b"))
+        );
+        assert_eq!(
+            selected(config.path(), "9NNX1VVR3KNQ").as_deref(),
+            Some(chosen)
+        );
+    }
+
+    /// The gate after the choice decides whether to launch; the choice itself
+    /// must hand it a runtime and the reasons, not refuse first.
+    #[test]
+    fn choosing_leaves_the_refusal_to_the_caller() {
+        let probed = fake_runtime("choose-probed", true, true);
+        probed.write("version", "11.0.3\n");
+        let lacking = fake_runtime("choose-lacking", true, false);
+        lacking.write("version", "11.0.2\n");
+        lacking.write(MANIFEST_PATH, r#"["loader.memfd-main-image"]"#);
+        let complete = fake_runtime("choose-complete", true, false);
+        complete.write("version", "11.0.1\n");
+        complete.write(
+            MANIFEST_PATH,
+            r#"["loader.memfd-main-image", "gameinput.v2"]"#,
+        );
+        let recipe = Recipe::parse(RECIPE).unwrap();
+        let mut runtimes = vec![
+            InstalledRuntime::at(probed.path()).unwrap(),
+            InstalledRuntime::at(lacking.path()).unwrap(),
+            InstalledRuntime::at(complete.path()).unwrap(),
+        ];
+        runtimes.sort_by(runtime_order);
+
+        // The newest one that satisfies the recipe, even if older.
+        let choice = choose(&recipe, &runtimes, None, None).unwrap();
+        assert_eq!(choice.runtime.path, complete.path());
+        assert!(choice.assessment.is_satisfied());
+
+        // A probed runtime that was asked for is handed over with its doubts,
+        // where select() refused it outright.
+        assert!(select(&recipe, &runtimes, Some(probed.path()), None).is_err());
+        let choice = choose(&recipe, &runtimes, Some(probed.path()), None).unwrap();
+        assert_eq!(choice.runtime.path, probed.path());
+        assert_eq!(choice.assessment.source, CapabilitySource::Probed);
+        assert!(!choice.assessment.is_satisfied());
+
+        // Nothing satisfies it: the newest, with what it is missing, so the
+        // caller can explain it and honour --force.
+        let only_lacking = vec![InstalledRuntime::at(lacking.path()).unwrap()];
+        assert!(select(&recipe, &only_lacking, None, None).is_err());
+        let choice = choose(&recipe, &only_lacking, None, None).unwrap();
+        assert_eq!(choice.runtime.path, lacking.path());
+        assert!(choice
+            .assessment
+            .matched
+            .missing_required
+            .contains("gameinput.v2"));
+
+        // A choice that is not installed, and no runtime at all, are errors.
+        assert!(choose(&recipe, &runtimes, Some(Path::new("/nonexistent")), None).is_err());
+        let err = choose(&recipe, &[], None, None).unwrap_err().to_string();
+        assert!(err.contains("install-runtime"), "{err}");
+    }
+
+    /// A managed runtime in the state directory, which is all an AppImage
+    /// user has.
+    fn managed_paths(state: &Path, extra: &[(&str, &str)]) -> Paths {
+        let mut vars = vec![
+            ("HOME", "/home/tester".to_string()),
+            ("XDG_STATE_HOME", state.display().to_string()),
+            (
+                "XDG_CONFIG_HOME",
+                state.join("config").display().to_string(),
+            ),
+        ];
+        vars.extend(extra.iter().map(|(k, v)| (*k, v.to_string())));
+        Paths::resolve(&Env::from_map(vars)).unwrap()
+    }
+
+    #[test]
+    fn discovery_finds_a_runtime_install_runtime_put_in_the_state_directory() {
+        let state = TempDir::new("managed-state");
+        let managed = state.path().join("ferestre/runtimes/11.0.5");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::write(managed.join("proton"), "close_fds=False\n").unwrap();
+        let paths = managed_paths(state.path(), &[]);
+        assert_eq!(paths.runtime_dir(), None);
+        let found = InstalledRuntime::discover(&paths).expect("the managed runtime");
+        assert_eq!(found.path, managed);
+    }
+
+    #[test]
+    fn the_runtime_override_is_the_requested_runtime() {
+        let state = TempDir::new("override-state");
+        let managed = state.path().join("ferestre/runtimes/99.0.0");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::write(managed.join("proton"), "close_fds=False\n").unwrap();
+        std::fs::write(managed.join("version"), "99.0.0\n").unwrap();
+        let named = fake_runtime("override-named", true, true);
+        named.write("version", "1.0.0\n");
+        let paths = managed_paths(
+            state.path(),
+            &[("XODUS_PROTON_DIR", &named.path().display().to_string())],
+        );
+
+        // Newer managed downloads do not outrank the one that was named.
+        assert_eq!(
+            InstalledRuntime::discover(&paths).unwrap().path,
+            named.path()
+        );
+        assert_eq!(
+            requested(&paths, "9NBLGGH2JHXJ").unwrap().as_deref(),
+            Some(named.path())
+        );
+        let runtimes = all(&paths);
+        let recipe = Recipe::parse(RECIPE).unwrap();
+        let wanted = requested(&paths, "9NBLGGH2JHXJ").unwrap();
+        let choice = choose(&recipe, &runtimes, wanted.as_deref(), None).unwrap();
+        assert_eq!(choice.runtime.path, named.path());
+
+        // A per-title choice is more specific than the variable.
+        let config = paths.config_dir().to_path_buf();
+        set_selected(&config, "9NBLGGH2JHXJ", Some(&managed)).unwrap();
+        assert_eq!(
+            requested(&paths, "9NBLGGH2JHXJ").unwrap().as_deref(),
+            Some(managed.as_path())
+        );
+        std::fs::remove_dir_all(&config).unwrap();
+
+        // A wrong value is an error naming it, not a silent fall back.
+        let wrong = TempDir::new("override-wrong");
+        let paths = managed_paths(
+            state.path(),
+            &[("XODUS_PROTON_DIR", &wrong.path().display().to_string())],
+        );
+        let err = requested(&paths, "9NBLGGH2JHXJ").unwrap_err().to_string();
+        assert!(err.contains(&wrong.path().display().to_string()), "{err}");
+        assert!(InstalledRuntime::discover(&paths).is_err());
+    }
+
+    #[test]
+    fn a_runtime_release_carries_its_signature() {
+        let release = latest_release(
+            r#"[{"tag_name":"runtime-11.0.20261018","assets":[
+                {"name":"ferestre-runtime-11.0.20261018.tar.xz","browser_download_url":"https://example.invalid/runtime"},
+                {"name":"ferestre-runtime-11.0.20261018.tar.xz.minisig","browser_download_url":"https://example.invalid/runtime.minisig"}
+            ]}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            release.signature_url.as_deref(),
+            Some("https://example.invalid/runtime.minisig")
+        );
+        let unsigned = latest_release(
+            r#"[{"tag_name":"runtime-1","assets":[
+                {"name":"ferestre-runtime-1.tar.xz","browser_download_url":"https://example.invalid/r"}]}]"#,
+        )
+        .unwrap();
+        assert_eq!(unsigned.signature_url, None);
+    }
+
+    fn feed(tag: &str, assets: &[&str]) -> String {
+        let assets: Vec<serde_json::Value> = assets
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "browser_download_url": format!("https://example.invalid/{tag}/{name}"),
+                })
+            })
+            .collect();
+        serde_json::json!([{ "tag_name": tag, "assets": assets }]).to_string()
+    }
+
+    /// The archive's name and the runtime's directory both come from the
+    /// feed; each is taken only in the one shape that stays inside the
+    /// directory it is joined to.
+    #[test]
+    fn a_release_is_taken_only_under_its_exact_archive_name() {
+        let release = latest_release(&feed(
+            "runtime-11.0.5",
+            &[
+                "ferestre-runtime-11.0.5.tar.xz.minisig",
+                "ferestre-runtime-11.0.5.tar.xz",
+            ],
+        ))
+        .unwrap();
+        assert_eq!(release.version, "11.0.5");
+        assert_eq!(release.asset_name, "ferestre-runtime-11.0.5.tar.xz");
+        assert_eq!(
+            release.artefact(),
+            crate::signing::Artefact::new("ferestre-runtime-11.0.5.tar.xz", "11.0.5")
+        );
+        assert!(release.signature_url.is_some());
+
+        for (tag, asset) in [
+            // Another release's archive under this tag.
+            ("runtime-11.0.5", "ferestre-runtime-11.0.4.tar.xz"),
+            // Names that would leave the cache directory.
+            ("runtime-11.0.5", "ferestre-runtime-11.0.5/../../x.tar.xz"),
+            ("runtime-11.0.5", "ferestre-runtime-/../11.0.5.tar.xz"),
+            // Versions that would leave the runtimes directory, or hide in it.
+            ("runtime-..", "ferestre-runtime-...tar.xz"),
+            ("runtime-../11", "ferestre-runtime-../11.tar.xz"),
+            ("runtime-.11", "ferestre-runtime-.11.tar.xz"),
+            ("runtime-", "ferestre-runtime-.tar.xz"),
+            ("runtime-11/0", "ferestre-runtime-11/0.tar.xz"),
+        ] {
+            let error = latest_release(&feed(tag, &[asset]))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("not used") || error.contains("unsafe"),
+                "{tag} {asset}: {error}"
+            );
+        }
+        // An unusable newest release is an error, not a quiet fall back to
+        // the one before it.
+        let two = format!(
+            "[{},{}]",
+            feed("runtime-11.0.6", &["ferestre-runtime-11.0.6-hotfix.tar.xz"])
+                .trim_matches(|c| c == '[' || c == ']'),
+            feed("runtime-11.0.5", &["ferestre-runtime-11.0.5.tar.xz"])
+                .trim_matches(|c| c == '[' || c == ']'),
+        );
+        assert!(latest_release(&two).is_err());
+        // A signature under any other name is not this archive's.
+        let release = latest_release(&feed(
+            "runtime-11.0.5",
+            &[
+                "ferestre-runtime-11.0.5.tar.xz",
+                "ferestre-runtime-11.0.5.minisig",
+            ],
+        ))
+        .unwrap();
+        assert_eq!(release.signature_url, None);
+    }
+
+    #[test]
+    fn release_versions_compare_by_their_numbers() {
+        use std::cmp::Ordering::*;
+        assert_eq!(compare_versions("11.0.10", "11.0.9"), Greater);
+        assert_eq!(compare_versions("11.0.20261018", "11.0.20261017"), Greater);
+        assert_eq!(compare_versions("11.0.1-2", "11.0.1"), Greater);
+        assert_eq!(compare_versions("10.9", "11.0"), Less);
+        assert_eq!(compare_versions("11.0.1", "11.0.1"), Equal);
+    }
+
+    #[test]
+    fn a_downgrade_is_found_against_the_installed_release_versions() {
+        let root = TempDir::new("runtime-downgrade");
+        for version in ["11.0.9", "11.0.10", ".11.0.99.installing-1", "12.0.0"] {
+            let dir = root.path().join(version);
+            std::fs::create_dir_all(&dir).unwrap();
+            if version != "12.0.0" {
+                // 12.0.0 is a directory a download left, not a runtime.
+                std::fs::write(dir.join("proton"), "#!/bin/sh\n").unwrap();
+            }
+        }
+        assert_eq!(
+            newer_installed(root.path(), "11.0.2").as_deref(),
+            Some("11.0.10")
+        );
+        assert_eq!(newer_installed(root.path(), "11.0.10"), None);
+        assert_eq!(newer_installed(root.path(), "11.0.11"), None);
+        assert_eq!(newer_installed(&root.path().join("none"), "1"), None);
     }
 
     // --- assessment ----------------------------------------------------------

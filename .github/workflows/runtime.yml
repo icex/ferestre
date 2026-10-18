@@ -24,6 +24,21 @@
 # ref needs stating; --recurse-submodules produces exactly the tree
 # scripts/check-patches.sh checks the series against.
 #
+# Two jobs. `build` compiles a third-party tree of millions of lines with a
+# read-only token that is not written to any checkout; `publish` runs only on a
+# tag, after `build` succeeded, and only checks, signs and uploads the tarball
+# it is handed. It is the one job that can write a release and the only one
+# that sees the minisign key: the MINISIGN_SECRET_KEY and MINISIGN_PASSWORD
+# secrets of the `release` GitHub Environment, as in release.yml. Each
+# signature's trusted comment is `file:<name> version:<version>`. The launcher
+# refuses a runtime whose signature does not verify against the public key
+# built into ferestre-core.
+#
+# A workflow_dispatch run builds the same tarball and attaches it to the run
+# UNSIGNED, and says so; the launcher will not install it. That holds for a
+# manual run started on a tag ref too: signing and publishing ask for a push. See
+# docs/RELEASING.md.
+#
 # Cutting a runtime release:
 #
 #   git tag -a runtime-11.0.20260907 -m 'what changed' && git push origin runtime-11.0.20260907
@@ -55,8 +70,11 @@ jobs:
     # An hour and a quarter cold, and a runner that dies at the default six
     # hours mid-link wastes the whole build rather than reporting anything.
     timeout-minutes: 330
-    permissions:
-      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      proton: ${{ steps.commits.outputs.proton }}
+      wine: ${{ steps.commits.outputs.wine }}
+      xgameruntime: ${{ steps.commits.outputs.xgameruntime }}
     steps:
       # A Proton build tree is ~26 GB and a stock runner has about 25 GB free.
       # The pre-installed toolchains nothing here uses are worth ~30 GB, so
@@ -72,15 +90,18 @@ jobs:
           sudo docker image prune --all --force || true
           df -h /
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: ferestre
+          # Every configure script and Makefile in the Proton tree runs in
+          # this job; none of them needs the token, so none of them gets it.
+          persist-credentials: false
 
       # A tag can be created on any branch, and a release cut from dev would
       # publish work that never reached main. Now that there are two branches
       # this is worth one fetch to be sure of.
       - name: The tag must be on main
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: |
           set -euo pipefail
           git -C "ferestre" fetch --quiet --depth=100 origin main
@@ -90,14 +111,27 @@ jobs:
           fi
           echo ":: $GITHUB_REF_NAME is on main"
 
+      # Only a manual run from a branch may build another Proton commit. A tag
+      # push always builds the pin, and a manual run started on a tag ref is
+      # refused another ref: its tarball would carry the tag's version.
       - name: Resolve the Proton ref
         id: ref
         env:
+          PINNED_REF: '7c0b4354'
           INPUT_REF: ${{ inputs.proton_ref }}
         run: |
+          set -euo pipefail
           # Through the environment, not interpolated: a dispatch input is text
           # somebody typed.
-          ref=${INPUT_REF:-7c0b4354}
+          ref=$PINNED_REF
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ -n "$INPUT_REF" ]; then
+              if [ "$GITHUB_REF_TYPE" != tag ]; then
+                  ref=$INPUT_REF
+              elif [ "$INPUT_REF" != "$PINNED_REF" ]; then
+                  echo "::error::a manual run on the tag $GITHUB_REF_NAME builds only the pinned Proton $PINNED_REF; start it from a branch to build $INPUT_REF"
+                  exit 1
+              fi
+          fi
           echo "proton=$ref" >> "$GITHUB_OUTPUT"
 
       - name: Clone Proton, Wine and the GDK runtime
@@ -114,6 +148,18 @@ jobs:
           echo ":: proton   $(git rev-parse --short HEAD)"
           echo ":: wine     $(git -C wine rev-parse --short HEAD)"
           echo ":: xgr      $(git -C wine/dlls/xgameruntime rev-parse --short HEAD)"
+
+      # For the release notes, which the publish job writes without a Proton
+      # tree of its own.
+      - name: Record the commits
+        id: commits
+        run: |
+          set -euo pipefail
+          {
+              echo "proton=$(git -C proton rev-parse HEAD)"
+              echo "wine=$(git -C proton/wine rev-parse HEAD)"
+              echo "xgameruntime=$(git -C proton/wine/dlls/xgameruntime rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
 
       # The same series scripts/check-patches.sh verifies per push, applied for
       # real. If one has drifted, this is where the build stops -- before an
@@ -159,11 +205,16 @@ jobs:
       # exec, and the client hands Wine a memfd holding the decrypted
       # executable. Without this every GDK title fails to launch with exit
       # code 1, so a runtime without it is not a runtime this launcher can use.
+      #
+      # --fuzz=0 because patch's default accepts a hunk whose context has
+      # drifted and applies it a few lines away; scripts/check-patches.sh checks
+      # the same patch against the same Proton commit with git apply, which
+      # also takes no fuzz.
       - name: Keep inherited descriptors
         run: |
           set -euo pipefail
           cd proton/build/dist
-          patch -p1 < "$GITHUB_WORKSPACE/ferestre/patches/proton/0001-keep-inherited-fds-mediaconv-and-system-ffmpeg.patch"
+          patch -p1 --fuzz=0 --forward < "$GITHUB_WORKSPACE/ferestre/patches/proton/0001-keep-inherited-fds-mediaconv-and-system-ffmpeg.patch"
           grep -q close_fds=False proton
 
       # What the runtime can do, measured against the tree that was just built
@@ -210,7 +261,16 @@ jobs:
           cat SHA256SUMS
           ls -lh
 
-      - uses: actions/upload-artifact@v4
+      - name: Unsigned build
+        if: github.event_name != 'push' || github.ref_type != 'tag'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          msg="runtime $VERSION was built by a manual run and is UNSIGNED; ferestre install-runtime refuses it. Only a runtime-* tag signs and publishes."
+          echo "::notice::$msg"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ferestre-runtime-${{ steps.version.outputs.version }}
           path: out/*
@@ -219,14 +279,66 @@ jobs:
           # on the release instead.
           retention-days: 14
 
+  publish:
+    needs: build
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    # Where the signing secrets live; see release.yml and docs/RELEASING.md.
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          # The signing script, and the key the launcher at this commit
+          # trusts.
+          sparse-checkout: |
+            packaging
+            crates/ferestre-core/src
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ferestre-runtime-${{ needs.build.outputs.version }}
+          path: out
+
+      - name: minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+      # Checks SHA256SUMS, then signs the tarball and the sums. The key has to
+      # be the one ferestre-core's signing.rs carries (RELEASE_PUBLIC_KEY), or
+      # every launcher would refuse this runtime; a placeholder there stops
+      # the release here.
+      - name: Sign
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          FERESTRE_EXPECT_PUBKEY_IN: crates/ferestre-core/src/signing.rs
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag_version=${GITHUB_REF_NAME#runtime-}
+          if [ "$tag_version" != "$VERSION" ]; then
+              echo "::error::built as $VERSION, but the tag $GITHUB_REF_NAME says $tag_version"
+              exit 1
+          fi
+          packaging/sign-release.sh out "$tag_version"
+          ls -lh out
+
       - name: Publish
-        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
+          PROTON_COMMIT: ${{ needs.build.outputs.proton }}
+          WINE_COMMIT: ${{ needs.build.outputs.wine }}
+          XGR_COMMIT: ${{ needs.build.outputs.xgameruntime }}
         run: |
-          cd ferestre
-          gh release create "$GITHUB_REF_NAME" "$GITHUB_WORKSPACE"/out/* \
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" out/* \
             --title "runtime $VERSION" \
             --notes "
           The patched Proton runtime: Wine, the from-scratch Xbox GDK runtime
@@ -234,15 +346,16 @@ jobs:
 
           Install it with \`ferestre install-runtime\`, or extract the tarball
           into \`~/.steam/steam/compatibilitytools.d/\`. The
-          \`ferestre-runtime-bin\` AUR package fetches this file.
+          \`ferestre-runtime-bin\` AUR package fetches this file. Each file
+          has a minisign signature beside it (\`.minisig\`).
 
           Built from pinned commits, not branches:
 
           | Component | Commit |
           |---|---|
-          | xodus-gaming/Proton | \`$(git -C "$GITHUB_WORKSPACE/proton" rev-parse HEAD)\` |
-          | xodus-gaming/wine | \`$(git -C "$GITHUB_WORKSPACE/proton/wine" rev-parse HEAD)\` |
-          | xodus-gaming/xgameruntime | \`$(git -C "$GITHUB_WORKSPACE/proton/wine/dlls/xgameruntime" rev-parse HEAD)\` |
+          | xodus-gaming/Proton | \`$PROTON_COMMIT\` |
+          | xodus-gaming/wine | \`$WINE_COMMIT\` |
+          | xodus-gaming/xgameruntime | \`$XGR_COMMIT\` |
 
           plus the patch series in \`patches/\` at this tag. \`capabilities.json\`
           inside the tarball says what this build actually provides, measured

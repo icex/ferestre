@@ -32,13 +32,20 @@ names, described below.
 `schema = 1` at the top, then these tables. Unknown keys are an error: a
 misspelled key would otherwise silently read as "not set".
 
+The launcher also writes `generated = true` at the top of a recipe it made by
+itself from a package manifest, in the user's titles directory. Such a recipe
+is a stopgap: a packaged recipe for the same product id wins over it, while a
+recipe someone edited (the editor drops the mark when it saves) wins over the
+packaged one. A recipe in this directory never carries the mark, and the
+validator refuses one that does.
+
 ### `[title]` — required
 
 | key | type | | meaning |
 |---|---|---|---|
 | `product-id` | string | required | 12 characters, `[0-9A-Z]`. Must match the filename. |
 | `name` | string | required | As the Store shows it. Goes in the compatibility matrix. |
-| `slug` | string | required | Lowercase; names the install directory, the prefix and the log unless overridden. |
+| `slug` | string | required | Lowercase letters, digits and dashes, starting with a letter or digit; names the install directory, the prefix and the log unless overridden. |
 | `publisher` | string | optional | |
 | `package-identity` | string | optional | `<Identity Name=…>` from `MicrosoftGame.Config`. Useful when hunting save paths. |
 | `title-id` | string | optional | The hex `<TitleId>`. Appears in save container names and in Xbox Live traces. |
@@ -50,18 +57,20 @@ Where the title and its prefix live, relative to `XODUS_GAMES_DIR`.
 
 | key | type | | meaning |
 |---|---|---|---|
-| `dir` | string | optional | Default: where the launcher recorded installing the title, while that directory exists, otherwise the slug. Forward slashes, must stay inside the games directory. |
-| `dir-env` | string | optional | An environment variable that overrides `dir`, for compatibility with the existing scripts. |
+| `dir` | string | optional | Default: the slug. Forward slashes, must stay inside the games directory. Where the launcher recorded installing the title wins over it while that directory still holds the title. |
+| `dir-env` | string | optional | An environment variable that overrides `dir`, for compatibility with the existing scripts. Must be the slug's own variable: the slug uppercased with dashes as underscores, then `_DIR` (`halo-infinite` gives `HALO_INFINITE_DIR`), and not one of the launcher's or the system's own (`XODUS_*`, `FERESTRE_*`, `XDG_*`, `STEAM_*`, `PROTON_*`, `WINE*`) even when a slug spells one. Any other variable would make whatever it names, say the whole games directory, the title's folder, which is what an uninstall deletes. |
 | `prefix` | string | optional | Default: `<slug>-proton`. |
-| `prefix-env` | string | optional | As `dir-env`, for the prefix. |
+| `prefix-env` | string | optional | As `dir-env`, for the prefix: the slug's own variable ending in `_PREFIX` (`HALO_INFINITE_PREFIX`). |
 
 ### `[launch]` — required
 
 | key | type | | meaning |
 |---|---|---|---|
 | `executable` | string | required | Backslash path **relative to the install directory**, as Windows writes it. Use a TOML literal string (single quotes) so backslashes stay backslashes. |
-| `arguments` | array of string | optional | |
 | `env` (alias `environment`) | table | optional | Extra environment, on top of what the launcher sets for every title. Only put something here that is genuinely this title's. |
+
+There is no way to pass arguments to the title: the client starts the
+executable with none, so a key for them would be a promise nothing keeps.
 
 The executable named in `MicrosoftGame.Config` is not always the one to run —
 Expedition 33 declares a wrapper — so this is the observed path, not a copy of
@@ -113,8 +122,8 @@ pedantic about.
 | key | type | | meaning |
 |---|---|---|---|
 | `state` | string | required | See below. |
-| `summary` | string | required | One sentence, used verbatim in the matrix. |
-| `stops-at` | string | required for `menus` and `broken` | Precisely where it stops. "Does not launch" is not an answer. |
+| `summary` | string | required | One sentence, used verbatim in the matrix, so on one line. |
+| `stops-at` | string | required for `menus` and `broken` | Precisely where it stops. "Does not launch" is not an answer. One line. |
 | `blocked-by` | string | required for `broken`, and only then | `title-protection`, `runtime-gap`, `client-gap`, `unknown`. |
 | `last-verified` | date | required unless `untested` | A bare TOML date, `2026-09-06`. An entry with no date is a rumour. |
 | `verified-with` | string | optional | How it was checked, so someone else can repeat it. |
@@ -176,8 +185,11 @@ afford to make.
 
 The resolution rules, which reproduce what `scripts/launch-*.sh` do today:
 
-    install dir  = ${dir-env}    if set, else $XODUS_GAMES_DIR/${install.dir or slug}
+    install dir  = ${dir-env}    if set, else the recorded install directory while it
+                                 still holds the title, else $XODUS_GAMES_DIR/${install.dir or slug}
     prefix       = ${prefix-env} if set, else $XODUS_GAMES_DIR/${install.prefix or "<slug>-proton"}
+                                 (while that does not exist yet, the prefix of a generated
+                                 recipe this one replaced, which is where the saves are)
     log          = $XODUS_GAMES_DIR/<slug>-launch.log
 
 So `titles/9NBLGGH2JHXJ.toml` is the same thing as
