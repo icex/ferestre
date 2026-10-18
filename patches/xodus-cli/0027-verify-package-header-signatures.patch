@@ -1,0 +1,4060 @@
+From: Ferestre contributors
+Subject: Verify package header signatures
+
+An XVD package's header is its first page, and its first 0x200 bytes are an
+RSA-4096 signature over the rest of that page (0x200..0x1000): RSASSA-PSS,
+SHA-256, MGF1-SHA-256, a 32-byte salt. Everything the client takes from the
+header -- identity, volume flags, section sizes, the hash tree's top hash --
+is in that range. Until now nothing checked it, so on a plain http CDN a
+download rewritten whole (header, tree and pages together) was installed
+whenever the package service gave no HashOfHashes, which is every package
+seen so far.
+
+The key that signs retail PC game headers is Microsoft's, and this client
+does not carry it. `msixvc::signature` pins the SHA-256 of its
+BCRYPT_RSAPUBLIC_BLOB (183F0AE0...D1229E) and verifies a header with a key
+whose blob hashes to that, and with nothing else. The key is sourced on the
+user's machine at run time (`xvd_key`): DisplayCatalog gives Microsoft Gaming
+Services' (9MWPM2CQNLHN) Windows Update category, the Store's delivery service
+(FE3: GetCookie, SyncUpdates, GetExtendedUpdateInfo2) lists its bundle and
+file URL anonymously -- the ticket is an empty MSA ticket, nothing signs in --
+and the bundle (about 200 MB) is streamed to a temporary file in the cache
+directory, checked against its size and the SHA-256 FE3 gives, and read
+without unpacking: a minimal zip64 reader opens the x64 package where it lies
+in the bundle and streams its binaries (xsapi.dll and drivers/xvdd.sys first)
+through a scanner that keeps only an RSA-4096 public blob with the pinned
+SHA-256. The blob is stored 0600 in a 0700 directory
+($XDG_DATA_HOME/xodus/xvd-key, or XODUS_XVD_KEY_DIR), hashed again on every
+load, and the bundle is deleted. FE3's certificate chains to Microsoft Root
+Certificate Authority 2011, which Linux stores lack and this client does not
+carry: it is fetched from the CA Issuers address in FE3's intermediate
+(www.microsoft.com/pki/certs, plain http), used only if its SHA-256 is the
+pinned 847DF6A7...ED7C61, and is then an extra trust anchor for the FE3
+client only, which is https-only, follows no redirects and talks to
+fe3.delivery.mp.microsoft.com only. The answers are read with quick-xml into
+a bounded tree (size, depth and element limits, no DOCTYPE, predefined
+entities only). The file download is plain http from *.delivery.mp.microsoft.com;
+the SHA-256 and the pin are what hold it.
+
+`xodus-cli xvd-key [status|fetch|forget] [--json]` reports, fetches or
+removes the key. It touches no account, keychain or device identity, and
+prints the fingerprint, never key bytes.
+
+`XvdFile::parse_checked` takes `HeaderChecks`: with a key, the signature is
+verified over the raw header before any of it is parsed; an unsigned header
+(all-zero signature) or one that does not verify is refused, a signed header
+with DATA_INTEGRITY_DISABLED is refused, and with the package service's
+answer the header must name that package: vduid and uduid equal to its
+ContentId, pduid the trailing GUID of its VersionId, package_version the first
+four fields of its Version (the relationships seen on retail packages;
+product_id is not compared, its encoding is unknown). Then the top hash
+(0025) and the hash tree (0022) as before. Bytes 0x1000..0x3000 are not
+signed and are not relied on.
+
+`xodus-cli streaming` uses the stored key. Without one it tries once to fetch
+it, bounded at 180 s; a failed automatic attempt is not repeated for a day,
+and XODUS_XVD_KEY_AUTOFETCH=0 turns automatic fetching off. With no key the
+install goes on with a warning on stderr, as before, unless
+XODUS_REQUIRE_SIGNED_PACKAGE=1, which refuses it. With a key, a header that
+fails stops the install with an error saying it was refused, not a dropped
+connection, and nothing is installed.
+
+This is a reimplementation from the format; no XvdTool code is used. The
+tests use two throwaway RSA-4096 keys generated for them
+(crates/msixvc/src/testdata/TEST-ONLY-*.pem), synthetic signed headers,
+zip fixtures written by the tests and hand-made FE3 answers with made-up
+identifiers. Two ignored tests talk to Microsoft, anonymously: one locates the
+bundle through FE3, the other checks the real key against real headers
+(XODUS_LIVE_XVD_HEADERS), fetching it if it is not stored.
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 3f0ddb7..1ddaed4 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3358,6 +3358,7 @@ dependencies = [
+  "ntfs",
+  "num_enum",
+  "reqwest 0.13.4",
++ "rsa",
+  "sha2 0.11.0",
+  "thiserror 2.0.20",
+  "tokio",
+@@ -7182,6 +7183,7 @@ dependencies = [
+  "console-subscriber",
+  "ctrlc",
+  "eappx",
++ "flate2",
+  "fs2",
+  "futures-util",
+  "indicatif",
+@@ -7189,9 +7191,11 @@ dependencies = [
+  "msixvc",
+  "nix",
+  "p256",
++ "quick-xml 0.42.0",
+  "reqwest 0.13.4",
+  "rustix",
+  "serde_json",
++ "sha2 0.11.0",
+  "tao",
+  "tempfile",
+  "tokio",
+diff --git a/crates/msixvc/Cargo.toml b/crates/msixvc/Cargo.toml
+index d1961a9..9ece06e 100644
+--- a/crates/msixvc/Cargo.toml
++++ b/crates/msixvc/Cargo.toml
+@@ -23,3 +23,8 @@ tokio-util = { version = "0.7.19", features = ["io-util"] }
+ typenum = { version = "1.20.1", features = ["const-generics"] }
+ zerocopy = { version = "0.8.56", features = ["derive"] }
+ sha2 = "0.11.0"
++rsa = { version = "0.9.10", features = ["sha2"] }
++
++[features]
++# Synthetic signing keys and signed headers for tests of the crates using this one.
++test-signing = []
+diff --git a/crates/msixvc/src/lib.rs b/crates/msixvc/src/lib.rs
+index eac1694..8d7b207 100644
+--- a/crates/msixvc/src/lib.rs
++++ b/crates/msixvc/src/lib.rs
+@@ -2,6 +2,7 @@ pub mod crypt;
+ pub mod layout;
+ pub mod math;
+ pub mod models;
++pub mod signature;
+ pub mod streaming;
+ pub mod streaming_ntfs;
+ pub mod xsp;
+diff --git a/crates/msixvc/src/signature.rs b/crates/msixvc/src/signature.rs
+new file mode 100644
+index 0000000..913b987
+--- /dev/null
++++ b/crates/msixvc/src/signature.rs
+@@ -0,0 +1,446 @@
++//! The package header's own signature.
++//!
++//! An XVD package's header is its first page. The first 0x200 bytes of that
++//! page are an RSA-4096 signature, written big-endian, over the rest of the
++//! page, bytes 0x200..0x1000: RSASSA-PSS with SHA-256, MGF1 with SHA-256 and a
++//! 32-byte salt. Everything the client takes from the header -- the identity
++//! fields, the volume flags, the section sizes and the top hash of the hash
++//! tree -- lies in that range, and the hash tree hangs every other page of the
++//! package from the top hash. Nothing past the first page is signed: bytes
++//! 0x1000 onwards are not covered by this signature, and are believed only
++//! where the hash tree covers them.
++//!
++//! This crate carries no Microsoft key. The key that signs retail PC game
++//! headers is found at run time on the user's machine (see `xodus-cli xvd-key`)
++//! and is used only if the SHA-256 of its `BCRYPT_RSAPUBLIC_BLOB` is
++//! [`GAME_PACKAGE_KEY_SHA256`], which is compiled in. The SHA-256 is a
++//! fingerprint, not the key.
++
++use std::fmt;
++
++use rsa::pss::{Signature, VerifyingKey};
++use rsa::signature::Verifier;
++use rsa::{BigUint, RsaPublicKey};
++use sha2::{Digest, Sha256};
++
++/// Bytes of the header taken by the signature.
++pub const SIGNATURE_LEN: usize = 0x200;
++/// The end of the signed range, which starts at [`SIGNATURE_LEN`].
++pub const SIGNED_END: usize = 0x1000;
++/// The PSS salt length the header signature uses.
++pub const SALT_LEN: usize = 32;
++
++/// `BCRYPT_RSAPUBLIC_MAGIC`, as it appears in a blob.
++pub const BLOB_MAGIC: &[u8; 4] = b"RSA1";
++/// The fixed part of a `BCRYPT_RSAKEY_BLOB`: magic, bit length, then the
++/// lengths of the public exponent, the modulus and the two primes.
++pub const BLOB_HEADER_LEN: usize = 24;
++const MODULUS_LEN: usize = 512;
++
++/// SHA-256 of the `BCRYPT_RSAPUBLIC_BLOB` of the key that signs retail PC game
++/// package headers. Found in Microsoft Gaming Services; verified against a
++/// retail package header. The only key this client accepts for packages.
++pub const GAME_PACKAGE_KEY_SHA256: [u8; 32] =
++    hex32("183F0AE05431E4AD91554E88946967C872997227DBE6C85116F5FD2FD2D1229E");
++
++const fn hex32(s: &str) -> [u8; 32] {
++    const fn nibble(c: u8) -> u8 {
++        match c {
++            b'0'..=b'9' => c - b'0',
++            b'a'..=b'f' => c - b'a' + 10,
++            b'A'..=b'F' => c - b'A' + 10,
++            _ => panic!("not a hex digit"),
++        }
++    }
++    let s = s.as_bytes();
++    assert!(s.len() == 64);
++    let mut out = [0u8; 32];
++    let mut i = 0;
++    while i < 32 {
++        out[i] = (nibble(s[2 * i]) << 4) | nibble(s[2 * i + 1]);
++        i += 1;
++    }
++    out
++}
++
++/// Lower-case hex, for messages.
++pub fn hex(bytes: &[u8]) -> String {
++    bytes.iter().map(|b| format!("{b:02x}")).collect()
++}
++
++/// The length of the RSA-4096 `BCRYPT_RSAPUBLIC_BLOB` whose fixed part starts
++/// `data`, or `None` when `data` does not start with one.
++///
++/// Only a public blob of a 4096-bit key qualifies: magic `RSA1`, 4096 bits, a
++/// public exponent of one to eight bytes, a 512-byte modulus and no primes.
++pub fn rsa4096_public_blob_len(data: &[u8]) -> Option<usize> {
++    if data.len() < BLOB_HEADER_LEN || &data[..4] != BLOB_MAGIC {
++        return None;
++    }
++    let field = |i: usize| u32::from_le_bytes(data[4 * i..4 * i + 4].try_into().unwrap());
++    let (bits, exponent, modulus, prime1, prime2) =
++        (field(1), field(2), field(3), field(4), field(5));
++    if bits != 4096
++        || !(1..=8).contains(&exponent)
++        || modulus as usize != MODULUS_LEN
++        || prime1 != 0
++        || prime2 != 0
++    {
++        return None;
++    }
++    Some(BLOB_HEADER_LEN + exponent as usize + MODULUS_LEN)
++}
++
++/// Why a key was not accepted.
++#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
++pub enum KeyError {
++    #[error(
++        "the key's fingerprint is {}, not the pinned {}",
++        hex(found),
++        hex(expected)
++    )]
++    NotPinned { found: [u8; 32], expected: [u8; 32] },
++    #[error("not an RSA-4096 public key blob")]
++    Malformed,
++}
++
++/// A key a package header may be verified with: an RSA-4096 public key whose
++/// blob hashed to the fingerprint it was required to have.
++#[derive(Clone)]
++pub struct XvdSigningKey {
++    key: RsaPublicKey,
++    fingerprint: [u8; 32],
++}
++
++impl fmt::Debug for XvdSigningKey {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "XvdSigningKey({})", hex(&self.fingerprint))
++    }
++}
++
++impl XvdSigningKey {
++    /// Accept `blob` only if it is a well-formed RSA-4096
++    /// `BCRYPT_RSAPUBLIC_BLOB` whose SHA-256 is `pin`. The hash is checked
++    /// first, over exactly the bytes given, so nothing else about an unpinned
++    /// blob is looked at.
++    pub fn from_blob(blob: &[u8], pin: &[u8; 32]) -> Result<Self, KeyError> {
++        let found: [u8; 32] = Sha256::digest(blob).into();
++        if found != *pin {
++            return Err(KeyError::NotPinned {
++                found,
++                expected: *pin,
++            });
++        }
++        let len = rsa4096_public_blob_len(blob).ok_or(KeyError::Malformed)?;
++        if len != blob.len() {
++            return Err(KeyError::Malformed);
++        }
++        let exponent_len = blob.len() - BLOB_HEADER_LEN - MODULUS_LEN;
++        let exponent = &blob[BLOB_HEADER_LEN..BLOB_HEADER_LEN + exponent_len];
++        let modulus = &blob[BLOB_HEADER_LEN + exponent_len..];
++        // A 4096-bit modulus has its top bit set; anything shorter is not one.
++        if modulus[0] & 0x80 == 0 {
++            return Err(KeyError::Malformed);
++        }
++        let key = RsaPublicKey::new(
++            BigUint::from_bytes_be(modulus),
++            BigUint::from_bytes_be(exponent),
++        )
++        .map_err(|_| KeyError::Malformed)?;
++        Ok(XvdSigningKey {
++            key,
++            fingerprint: found,
++        })
++    }
++
++    /// The SHA-256 of the blob this key came from.
++    pub fn fingerprint(&self) -> &[u8; 32] {
++        &self.fingerprint
++    }
++}
++
++/// Why a header's signature was not accepted.
++#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
++pub enum SignatureError {
++    #[error("the package header is shorter than the page its signature covers")]
++    Truncated,
++    #[error("the package header is not signed (its signature is all zeros)")]
++    Unsigned,
++    #[error("the package header's signature does not verify with key {}", hex(.0))]
++    Invalid([u8; 32]),
++}
++
++/// Check the signature at the start of `header`, which must hold at least the
++/// header's first page.
++pub fn verify_header(header: &[u8], key: &XvdSigningKey) -> Result<(), SignatureError> {
++    if header.len() < SIGNED_END {
++        return Err(SignatureError::Truncated);
++    }
++    let signature = &header[..SIGNATURE_LEN];
++    if signature.iter().all(|&b| b == 0) {
++        return Err(SignatureError::Unsigned);
++    }
++    let invalid = || SignatureError::Invalid(key.fingerprint);
++    let signature = Signature::try_from(signature).map_err(|_| invalid())?;
++    VerifyingKey::<rsa::sha2::Sha256>::new_with_salt_len(key.key.clone(), SALT_LEN)
++        .verify(&header[SIGNATURE_LEN..SIGNED_END], &signature)
++        .map_err(|_| invalid())
++}
++
++/// Synthetic keys and signed headers for tests here and in the crates that use
++/// this one. The keys are throwaway RSA-4096 keys generated for these tests and
++/// sign nothing real. Not part of the API.
++#[cfg(any(test, feature = "test-signing"))]
++#[doc(hidden)]
++pub mod testing {
++    use rsa::pkcs8::DecodePrivateKey;
++    use rsa::pss::BlindedSigningKey;
++    use rsa::rand_core::{CryptoRng, RngCore};
++    use rsa::signature::{RandomizedSigner, SignatureEncoding};
++    use rsa::traits::PublicKeyParts;
++    use rsa::{RsaPrivateKey, RsaPublicKey};
++    use sha2::{Digest, Sha256};
++
++    use super::{SALT_LEN, SIGNATURE_LEN, SIGNED_END, XvdSigningKey};
++
++    /// TEST ONLY: a throwaway key made for these tests, not anyone's.
++    const TEST_KEY_PEM: &str = include_str!("testdata/TEST-ONLY-xvd-signing-key-1.pkcs8");
++    /// TEST ONLY: a second throwaway key, for "signed by someone else".
++    const OTHER_KEY_PEM: &str = include_str!("testdata/TEST-ONLY-xvd-signing-key-2.pkcs8");
++
++    pub fn test_key() -> RsaPrivateKey {
++        RsaPrivateKey::from_pkcs8_pem(TEST_KEY_PEM).unwrap()
++    }
++
++    pub fn other_key() -> RsaPrivateKey {
++        RsaPrivateKey::from_pkcs8_pem(OTHER_KEY_PEM).unwrap()
++    }
++
++    /// The key's public half as a `BCRYPT_RSAPUBLIC_BLOB`.
++    pub fn public_blob(key: &RsaPublicKey) -> Vec<u8> {
++        let e = key.e().to_bytes_be();
++        let n = key.n().to_bytes_be();
++        let mut blob = Vec::new();
++        for field in [0x3141_5352u32, 4096, e.len() as u32, n.len() as u32, 0, 0] {
++            blob.extend_from_slice(&field.to_le_bytes());
++        }
++        blob.extend_from_slice(&e);
++        blob.extend_from_slice(&n);
++        blob
++    }
++
++    pub fn blob_sha256(blob: &[u8]) -> [u8; 32] {
++        Sha256::digest(blob).into()
++    }
++
++    /// The test key's public half, pinned to itself.
++    pub fn test_verifying_key() -> XvdSigningKey {
++        let blob = public_blob(&test_key().to_public_key());
++        XvdSigningKey::from_blob(&blob, &blob_sha256(&blob)).unwrap()
++    }
++
++    /// The other key's public half, pinned to itself.
++    pub fn other_verifying_key() -> XvdSigningKey {
++        let blob = public_blob(&other_key().to_public_key());
++        XvdSigningKey::from_blob(&blob, &blob_sha256(&blob)).unwrap()
++    }
++
++    /// Deterministic, and only for making test signatures.
++    struct TestRng(u64);
++    impl RngCore for TestRng {
++        fn next_u32(&mut self) -> u32 {
++            self.next_u64() as u32
++        }
++        fn next_u64(&mut self) -> u64 {
++            // splitmix64
++            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
++            let mut z = self.0;
++            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
++            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
++            z ^ (z >> 31)
++        }
++        fn fill_bytes(&mut self, dest: &mut [u8]) {
++            for chunk in dest.chunks_mut(8) {
++                let v = self.next_u64().to_le_bytes();
++                chunk.copy_from_slice(&v[..chunk.len()]);
++            }
++        }
++        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
++            self.fill_bytes(dest);
++            Ok(())
++        }
++    }
++    impl CryptoRng for TestRng {}
++
++    /// Sign `header` in place, the way a package header is signed, with
++    /// `salt_len` bytes of salt.
++    pub fn sign_with(header: &mut [u8], key: &RsaPrivateKey, salt_len: usize) {
++        let signer =
++            BlindedSigningKey::<rsa::sha2::Sha256>::new_with_salt_len(key.clone(), salt_len);
++        let signature = signer
++            .sign_with_rng(&mut TestRng(0x5eed), &header[SIGNATURE_LEN..SIGNED_END])
++            .to_vec();
++        assert_eq!(signature.len(), SIGNATURE_LEN);
++        header[..SIGNATURE_LEN].copy_from_slice(&signature);
++    }
++
++    /// Sign `header` in place with the test key.
++    pub fn sign(header: &mut [u8]) {
++        sign_with(header, &test_key(), SALT_LEN);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::testing::{
++        blob_sha256, other_key, other_verifying_key, public_blob, sign, sign_with, test_key,
++        test_verifying_key,
++    };
++    use super::*;
++
++    fn header() -> Vec<u8> {
++        let mut h: Vec<u8> = (0..0x3000).map(|i| (i * 31 % 251) as u8).collect();
++        h[0x200..0x208].copy_from_slice(b"msft-xvd");
++        sign(&mut h);
++        h
++    }
++
++    #[test]
++    fn the_pinned_fingerprint_is_the_game_package_key() {
++        assert_eq!(
++            hex(&GAME_PACKAGE_KEY_SHA256),
++            "183f0ae05431e4ad91554e88946967c872997227dbe6c85116f5fd2fd2d1229e"
++        );
++    }
++
++    #[test]
++    fn a_signed_header_verifies() {
++        assert_eq!(verify_header(&header(), &test_verifying_key()), Ok(()));
++        // The first page is all that is needed.
++        assert_eq!(
++            verify_header(&header()[..SIGNED_END], &test_verifying_key()),
++            Ok(())
++        );
++    }
++
++    #[test]
++    fn a_changed_signed_byte_fails() {
++        let key = test_verifying_key();
++        for offset in [0x0, 0x1FF, 0x200, 0x208, 0x218, 0x240, 0x288, 0x3AC, 0xFFF] {
++            let mut h = header();
++            h[offset] ^= 0x01;
++            assert_eq!(
++                verify_header(&h, &key),
++                Err(SignatureError::Invalid(*key.fingerprint())),
++                "offset {offset:#x}"
++            );
++        }
++    }
++
++    #[test]
++    fn bytes_past_the_first_page_are_not_signed() {
++        let key = test_verifying_key();
++        for offset in [0x1000, 0x1234, 0x2000, 0x2FFF] {
++            let mut h = header();
++            h[offset] ^= 0x01;
++            assert_eq!(verify_header(&h, &key), Ok(()), "offset {offset:#x}");
++        }
++    }
++
++    #[test]
++    fn another_key_or_salt_fails() {
++        let h = header();
++        let other = other_verifying_key();
++        assert_eq!(
++            verify_header(&h, &other),
++            Err(SignatureError::Invalid(*other.fingerprint()))
++        );
++        let mut signed_by_other = header();
++        sign_with(&mut signed_by_other, &other_key(), SALT_LEN);
++        assert!(verify_header(&signed_by_other, &test_verifying_key()).is_err());
++        for salt in [0, 20, 64] {
++            let mut h = header();
++            sign_with(&mut h, &test_key(), salt);
++            assert!(
++                verify_header(&h, &test_verifying_key()).is_err(),
++                "salt {salt}"
++            );
++        }
++    }
++
++    #[test]
++    fn an_all_zero_signature_is_unsigned_and_a_short_header_is_refused() {
++        let mut h = header();
++        h[..SIGNATURE_LEN].fill(0);
++        assert_eq!(
++            verify_header(&h, &test_verifying_key()),
++            Err(SignatureError::Unsigned)
++        );
++        assert_eq!(
++            verify_header(&header()[..SIGNED_END - 1], &test_verifying_key()),
++            Err(SignatureError::Truncated)
++        );
++        // A signature that is not a number below the modulus.
++        let mut h = header();
++        h[..SIGNATURE_LEN].fill(0xFF);
++        assert!(matches!(
++            verify_header(&h, &test_verifying_key()),
++            Err(SignatureError::Invalid(_))
++        ));
++    }
++
++    #[test]
++    fn only_the_pinned_blob_is_accepted() {
++        let blob = public_blob(&test_key().to_public_key());
++        let pin = blob_sha256(&blob);
++        assert!(XvdSigningKey::from_blob(&blob, &pin).is_ok());
++        assert_eq!(rsa4096_public_blob_len(&blob), Some(blob.len()));
++
++        let other = public_blob(&other_key().to_public_key());
++        assert!(matches!(
++            XvdSigningKey::from_blob(&other, &pin),
++            Err(KeyError::NotPinned { .. })
++        ));
++        // The real pin accepts neither test key.
++        assert!(matches!(
++            XvdSigningKey::from_blob(&blob, &GAME_PACKAGE_KEY_SHA256),
++            Err(KeyError::NotPinned { found, .. }) if found == pin
++        ));
++        // One byte changed is another blob.
++        let mut changed = blob.clone();
++        *changed.last_mut().unwrap() ^= 1;
++        assert!(matches!(
++            XvdSigningKey::from_blob(&changed, &pin),
++            Err(KeyError::NotPinned { .. })
++        ));
++        // Pinned, but not a key: still refused.
++        let mut short = blob.clone();
++        short.truncate(blob.len() - 1);
++        assert!(matches!(
++            XvdSigningKey::from_blob(&short, &blob_sha256(&short)),
++            Err(KeyError::Malformed)
++        ));
++    }
++
++    #[test]
++    fn blob_headers_are_recognised_strictly() {
++        let blob = public_blob(&test_key().to_public_key());
++        assert_eq!(
++            rsa4096_public_blob_len(&blob[..BLOB_HEADER_LEN]),
++            Some(blob.len())
++        );
++        for (field, value) in [
++            (0usize, 0x3241_5352u32),
++            (1, 2048),
++            (2, 0),
++            (2, 9),
++            (3, 256),
++            (4, 1),
++        ] {
++            let mut b = blob.clone();
++            b[4 * field..4 * field + 4].copy_from_slice(&value.to_le_bytes());
++            assert_eq!(rsa4096_public_blob_len(&b), None, "field {field} = {value}");
++        }
++        assert_eq!(rsa4096_public_blob_len(&blob[..BLOB_HEADER_LEN - 1]), None);
++    }
++}
+diff --git a/crates/msixvc/src/testdata/TEST-ONLY-xvd-signing-key-1.pkcs8 b/crates/msixvc/src/testdata/TEST-ONLY-xvd-signing-key-1.pkcs8
+new file mode 100644
+index 0000000..b018378
+--- /dev/null
++++ b/crates/msixvc/src/testdata/TEST-ONLY-xvd-signing-key-1.pkcs8
+@@ -0,0 +1,52 @@
++-----BEGIN PRIVATE KEY-----
++MIIJQgIBADANBgkqhkiG9w0BAQEFAASCCSwwggkoAgEAAoICAQCKvPziMWn25Z8m
++7fKlEA14Ew8QP+U2JHdWnJl7fqZ1bS4U5Vyh49B/0qZqQ/vprkVOpMdQALL8i9OO
++DNl2xeHKaA9G+sr5bHawXUAhNggo7WTUWXQNISlPKyL9O8k9oSRbjCFVIEW/E4YU
++bIrZjvnwG+CsoZbE+ZEyOwmW9CxKL/DPKQrKBZCmumiUtA7l7dTUCyLrDZQItsyU
++qF8JszMjgvE9HC0o4ut83UWSP4/Akdt8wjvOUx7XkFqJYZtpC3PA/510JFAq+rYh
++wDWBEdHKE1gYoweRD2tHUnZ20sEtO5Xkru6kl4CB3dZ9eAWzx8EHZmwi85HAbm6i
++nxCLUzHrVQKyi78olaBOw9kJGmqbhyw7UEcQ2vieXkkWqRlpg0oqbaLU/KajwK4Y
++rAK4P8WI8MSgUUwJIyet/Yvsg/ij31C3VNUjEQHVhXGWCBdkkrrAhhkDIkDuPDTJ
++vY+v8w2wyCBTxSEAz7DL8jLK6X4VYXM3T23yvWcRTQ3ptmNKiinYhPRly+bi73IC
++jJ27/3DWq3jGhhAEI0UdKXAAbyGYnI0vzcnyTkhR9VzOMj2wRNXV2nKZOu0siwaz
++Ch+3iSUPBqThgoVR1UDpLUHKYAoAGmTmc+44N5u8Zp6/SepHPwGxRMMGzT3hSUbO
++GBeYvGY67O53cbKV3KYnP2j+O2fTtwIDAQABAoICACsiQb8zXL4Juvb4ALoH6SAd
++UNAdBW7VXJL9ggxunmMgzDRr8OZWNVMgU2PzegU3jM28FkmNxhgVgvMFlLDEKgRr
++YOCRBX0Rlz8S5ubMbTIISJJqs1WHq1e1Uh4IMfNqv6qEwTI9o+GZuNRtwKeON6/K
++gwo4/O6FpvpGd59Kj+CK0iQeHwAbRdNIXk5pQr6CuGoqgjMxGAazipxnUpDp+Wq/
++gbAdq/6rukoqY0BqaY+V6Xb6zmxB1HNxqmxO/+njSRxGfJYI2jHam7iXkSrtNtvM
++MtYKDcawVAqrHTCpKq0c+ufL6V8byTTXGyIMKD2yS5W45sLhFj4NN3Fw4cxnU7vh
++DkSlQpt8QMMa6iy+Dn5YCiymzDKo12kLAxxUUvfuRS+08LQTLZBxXmweDRgjdjfV
++I/2aiNjF4wlt50VSVuaKwDh3Ehdtnt05QIBiRW6gkt4aPgdE+mkcWNyTRuvHyCre
+++Wg6PnoMxfzdvd4jeq0Wuj+zSIPyllNHzC8jQaI+olRL/j8jFwssaRnD9ITGE2vL
++yumpqp07eyVWcMo9huz61cxFegcRnZwTjjoZbj4CQYez6DIcvdsOcJ5WJxiqqzM1
++9ysODHLKAOyp14Flh1NZa904CWZMkOpaUKFnPEm9WTrD3wmrRdFNrlRGoa7q1g5Q
++YvFFxDMq7Mf3kRtznsQJAoIBAQDAhk1Pq0yEWB2MEpfA72NOn6EkT1ZuOZ5xL7jT
++zJOE8BVfRJNuNEV6F/jFmvIWOxE7nHwfzXAP0tNu+DpAcH9lcI7iBVglzz6CuJt/
++R3xf8s575uy+znPYnxmkVhbtppamCnwDCjYRRbk32ZUUADNGsmJTODIXFpPZL7pX
++ka1ndsH15UXZTHU6g0MfHtqOD641cMtBaByI3p/wXBBCMlSEOErXFE7CGy8evsss
++o+ja84Fn7mwUmc465T0b18ydPIuHP5m2ERXo9ko35TvHy3RoVpxTDMnLWZQnAYRn
++gq+xdHrS5IvyINwAjBuJolOc/A66IqpJ8xZs3s+vN6WHP7aJAoIBAQC4evEXeaNu
++JYEpPCdoJzrT2QCOmQuuw2lCIyftfq/lbFgvP+UMYzu4D5T/cwKh82ly+95ha8Kv
++VgsZYFzjqJjZZ00Wikgfqv5i/Gb4ySlP0RcFWb1YtxVR8FOLFLviSwG+kvda4Otu
++t6Szfee/+/tnTvOo+fAtq6AfKUAH+ObaInap9u5T6PUKqQ1szRBwEGqaJOLEZeGv
++KgBkI8d9LFiowkN8gD9CUOKFRfxXkijaxapWHDIQJOV0g6B5yZAMW1N06ZLxHbaf
++7JUvvq4BKhYpVjeipCbm8bqmHMWWah4htT2RQBo/H7O+OIvid/Bz8+LOT7j36Rkw
++N63ZY+xPcKg/AoIBAAlBq8/rzYcDcZA9iJxXJjAujqHfSqmMDaklgT51tJYMsQpe
++krQWwUxogKaHl6In/uEd2f3xc7TfDxljx/E3N3jaG5SUazOOLlQ8qgVJm5pFY1Yj
++uThHVtyQcbwsA3gzrUSYdnPy9ryH3KrpxDgs9kos43ta1VW02TD1EYGKWIsD87lt
++55jWC0Df9Mc3RYzVBiw9mxgu+EhAY/I7ivCT2OpuhnKm4E6G3hIdXEluLBDy6kLj
++/MBU0MyWHwUKsCTTN2YuUaamVaZYySK82830Y0ls+KEpmT40tWHWudX8O5RNpGYl
++ZPEkUU+ZbO2GJ30BxXd/mS5rCKX9ZIDpLQU+s/kCggEAGeN+4+l5CuMOfifn69Dd
++i48/acOGhS79HX/rgYOu0YZj1bWkwhlG7yyYn0SXkPykxrMb4RYLSynLAvOn9Xba
++hF/fzJL5TiBj9KYxGSa5um7ASUrvrHx87HPKdZEiUL5v7zuWpNU9lNsGrP21QRbu
++j+/fd84ja3VTUiwqxTOjyebeOjnh9jqR8L4KmUMp1GApZZpZjHAzvK4rQeJXg3Ru
++uLgSWm1w8zCAqW1J3UwwmYr1vYHVcLiMzs4N/ilQIrvKOXTx3w5pa4X65alfp+At
++Hf3wbs2UfAJeTCNrgxE/S0Gw8ypIxKUBR2eOEej9AHiwUn2Tmo7GryKRLhm8tuU7
++ZwKCAQEAmaor0eVoCKLcyaO30j2qKTX00h3Yh49c6NLkCDRr2KW1SdyBK3Ak/9g5
++hrFeMOFz8XU6XfMBMAmx+EhykSJbI441zrY/Jesdgwe8RwABHsMIOPktzNlFy33n
++aHm0Eu1oIsLg/rSZPAVZsI4VeWeUNTyJUgspULehRPioqxDXp878h94J/yFUBIob
++SOzxAAZQ5zm3cZVxcMFbh6LfMDvCzTAwKPYPE1INsYEaY+Kz/E3EyEOkrQfTWIf8
++uO0IvLHNgZ0oTeZGbpRPY9U/Fte4PAMadBGWhwMtEl7pIhNyd2NZL88erxXVO7mA
++z2cPykWae57OTpSW/bb6wiCk+sfKJA==
++-----END PRIVATE KEY-----
+diff --git a/crates/msixvc/src/testdata/TEST-ONLY-xvd-signing-key-2.pkcs8 b/crates/msixvc/src/testdata/TEST-ONLY-xvd-signing-key-2.pkcs8
+new file mode 100644
+index 0000000..3514469
+--- /dev/null
++++ b/crates/msixvc/src/testdata/TEST-ONLY-xvd-signing-key-2.pkcs8
+@@ -0,0 +1,52 @@
++-----BEGIN PRIVATE KEY-----
++MIIJQwIBADANBgkqhkiG9w0BAQEFAASCCS0wggkpAgEAAoICAQDlLKVXFoYCqzuJ
++/7zYz/oGkq1fUsOMdjdQgD+8ScNfDeS7sRfHu4f0N1OM1Z7NK5AU7ArLFp6OQE/x
++gy5tLsZiLg6JnAkaccYz7q54h+UhgLpM4xreHqvB8LiXkd84VAtEpptB8IJxZ4mc
++wWBm0wC010oTXbylDJCFC7hZc9nteRzrrmFGJthpObrt3eUylDJOhOJQOtB6Hzd0
++uDpYuiv9+Qvm3mhDPA1hOMXFzZfDT0is3Z0JU6gTcBNAk0f/fJ3ABRuaQyh3lwEY
++uAL6Znewh9WaB3ZY7FXfRCLVkPuhdnOaswyHABY8bHCLX4Udua/5IT2WL50emII0
++wVSn9snk702J0XEtAzganVvp0sMeZ0oF8RwYr34HewMsSmxDuTlxfElJPbxVZvmb
++/SKA5vPkGrKD8cNXBjqL/9Qq7ZNi6bfoQCE2mBrS7yjbj6AjJMgmZEPlLVZJOdwE
++w+CbRAw7a5Z30Ov6HFSG+rfmR/8tbbHZjfB8GqD9da98J7OZFmZMuSKVezZm43TM
++rcW6kpoJO2wGfqtmu2gMDW4vGTCbVODrQED3MREbdrrorPXqxJ682FV0vRSzHMv0
++S7WvIuvHGU3gLfCo91Ergx5ej7n3vd/hzHr96cNtE+8dNEuNe+QOfxN2BBcJYZHb
++PCy11l8hCv9iEnqI9dUZ2197YVVgBwIDAQABAoICAF9PihQGEgXaIRDrgybImDtT
++lTcnvJwWLjsUm207YD2QEajdpf4zR/+RYvYXgcviajHJWVPNPHP820KeRBi0c10x
++umoQstiEqOHASl9mZSzh1JlVej8Wkmg+LQcca7GJgoYypC9wT0/Kt7ix093vs0OC
++phQXz/T0nMY4cZsCS4gv7o82Hs6GKUrZ75wtxLycVa/CJD0puLqRcQbh96IfC1y8
++zu5dYQ9VUls0uUvijVN1DcyW/lB6slQjMF6S4kanFRRfC3PEqnfSHWqiXNq28uBA
++Hd3JbLbe03ffZn1bpssn8DxOas9ageTvVH8iYsJSD5WU9YAYnUe0NbKrFQIl6SC7
++y5/p7tAUP25mG0uLWS50WL8TALEWS3/D0LF6tqI9TIwzhMUmSJxVYg4xyDZUFU52
++LD0EljlwthdIoOtNfAQSZMDO0wLpLyfe/aPi2XLINV2ZrcgLnYBoufQo+VMvn/TE
++RhYJ8Sovtvc4oBVnxkaNCuLe4HCiRegmUKSOAqt0/jHOjfiQMPyjAO5nW8ldGHbV
++tU50uFescJbUKaTiCj05t55kPwHuCd+XeSFC1dePFKJJH8gRvErYAkr9fiRzouof
++OxVqus6Aow33p0MnzfVmRCgQJSQdJ45emm/35Gtl22oMM6w67QLSNayaxesdYA38
++95RGpsDszp1TLITlreABAoIBAQDzv9tQ3Jg26Zj3TG6q6avN+C5hP+werFP1lS9n
++Yd/rQsby7BA4Dgtvr4l7LQkCx5Ze1+Nk9tKenpLMiNQA+7XAnT0PxXzLc6zoenBZ
++QlWBJ3k3ecqMYy52auZ/URbQEDK0HL3Gvn02xLggq8hNRdb0FpYJQkvh3mRlN3Dh
++U+NL9TyljOaNzyDAEdJpPdgjDZFTXIph3T4L9HC0+gD0HBmjZjwNAN4bK4D5W/hf
++/rTnFt8HSbKFEcOHJhMbCimuCrcN/GYJ9YITbdq8mqxIjKNZglDHM0Khg5NumtMb
++k66ANxbvjeEvhLhXqFAAtTyXArHMgarxab1lN29RMGoN9uYBAoIBAQDwsUNNHzHP
++itGLhTWDoBluf2tmr5P3kRl96VEpS309aBzSsOv5wTMROkJpGkkdPrBb82Sn+Aqd
++HOmolcQKp5dik/0h5UotkDiaWolDdzj/clYFr2nQAoujtfmlvVA45Tm+NhRbaS9Y
++NrPhauLrz9H5Gsax9VmZGkNKZNtGAWV4THsuQuNRGU8eExdYC+XPCKMNvdgjp375
++wxLZA0+fVxZIKdVVsExbvabMyVRGIutH44YTJjJQA96jRmymoNVQJFVgs/D03dYC
++ARV3Cv8BD8BAqN8zSrJ4J2WSnKmAcc9oad5RQKypp8CgyZ7qJGOmzFxWQgsAWfwl
++i+nKVeoB0RYHAoIBAQDVi5hQ13JjaXQh9ExgYCesY2n+uUnb9Y348aJ+KDlMm0xB
++Np9e/K74QgloaKQkU0diADGwGq2bWcGyf4187wjknt0IHDSg6c7qPZqAGKVgaXzB
++JWpWY+4owK7/i8M4tXg2Y5e/rtN0UBQgS19Ik48meUMpCXQBhhzesBuszRmtSkS/
++pRm302cV3odAvHXG//P53HFAG9xoDNdRNlXvh07O4Jprqf7sPsjXrcOEFlnWuyrZ
++767+9fkfRjQm1Fh/qdOF5UJgJz62Vt/zrG6TgOL7YDf0zOvrJKLdm7anylJu8dSe
++Oua2Asidw0+TzzQt+KZcTJ2+sqzDKDXWI1xGr7ABAoIBAQCA4Sn8Xbu6OcbCQm3J
++MSzs8eV8cn90jIlt1kTTK8y/2MO2PW3dqgnCK8Prq1uDAVJFqio3lqV4Q0cKMkdq
++vRpeeoeMYs45X4QvglMFgQ1QGtTc7nRmITbMTmCC0r/l9zfYFfUIjWYAgioHhchE
++JF92V1QVbh6v0FQ/vYl8DrtakvlSaBZ4Emk+3VIenyBKn4FPllvpm4JuEnpBIXi9
++BVC1C1FkNKZuaTqrZRJvC7uYHshn8If4OFo6azc6cdxGsW3V/gQD2dUB9bqcp5Kr
++6tcyyDnbqR+vHslQm/pXAJnieu3D7DGIFn8amVsyXJHPepXmyi5B3e0Z3bUt1psa
++pe55AoIBAFuOMXEj5oBRctnuAoTAn6uOiIbvKi6OAQQuHP0P1im0u58xEiATKDLT
++NTkHcshvf/M+IHy1vDFrY/RHC5VpOFsA0Cq0Jcre3BNWkBX7G0wKJjNeEM9wt5L3
++PrwTTuF4v5NCjaE1Fxw7SFeMfZViquJyLS9o2LwTA4RbqXDKxT9ck8tGnv3EP+4p
++O2RO9F+mGJHhAg3ETNTKbBypBeExKL2jBjOC0cK6EucUmcKlWjQqQPKgWtyvZ9rt
++Oz9xBdcN1kFj5jE8e1N1u+YyfVWQfbYm4pB1m8dctn1fJrlw4YuJ3XZHxjI8c2t+
++tT/1fvnVDt8tJgS9T5R4TsFvyQqeDgg=
++-----END PRIVATE KEY-----
+diff --git a/crates/msixvc/src/xvd.rs b/crates/msixvc/src/xvd.rs
+index 5f6cd2d..0e16d25 100644
+--- a/crates/msixvc/src/xvd.rs
++++ b/crates/msixvc/src/xvd.rs
+@@ -30,6 +30,7 @@ use crate::models::xvd::{
+     XvdHeader, XvdSegmentMetadataHeader, XvdSegmentMetadataSegment, XvdSegmentMetadataSegmentFlags,
+     XvdUserDataHeader, XvdUserDataPackageFileEntry, XvdUserDataPackageFilesHeader,
+ };
++use crate::signature::{SignatureError, XvdSigningKey, verify_header};
+ use crate::streaming_ntfs::collect_ntfs_stream_layouts;
+ 
+ pub struct SyncSubstream<R> {
+@@ -372,6 +373,98 @@ fn hex32(bytes: &[u8; 32]) -> String {
+     bytes.iter().map(|b| format!("{b:02x}")).collect()
+ }
+ 
++/// What a package is, as a source the download cannot change says: the
++/// authenticated package service's `ContentId`, `VersionId` and `Version`.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct PackageIdentity {
++    pub content_id: String,
++    pub version_id: String,
++    pub version: String,
++}
++
++/// What a package's header is held to before anything in it is believed.
++#[derive(Debug, Clone, Copy, Default)]
++pub struct HeaderChecks<'a> {
++    /// The top hash the header must carry: see `XvdFile::parse_anchored`.
++    pub top_hash: Option<&'a [u8; 32]>,
++    /// The key the header's signature must verify with.
++    pub signed_by: Option<&'a XvdSigningKey>,
++    /// The package the header must say it is. Compared only once the
++    /// signature has verified, since an unsigned header can say anything.
++    pub identity: Option<&'a PackageIdentity>,
++}
++
++/// A package header refused by `HeaderChecks::signed_by` or `identity`.
++#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
++pub enum HeaderRefused {
++    #[error("{0}")]
++    Signature(#[from] SignatureError),
++    #[error(
++        "the package header is signed but turns its data integrity checks off \
++         (DATA_INTEGRITY_DISABLED), so nothing after it could be checked"
++    )]
++    IntegrityDisabled,
++    #[error(
++        "the package header says its {field} is {header}, but the package service gave {service}"
++    )]
++    Identity {
++        field: &'static str,
++        header: String,
++        service: String,
++    },
++}
++
++/// Hold a signed header to the package the package service named.
++///
++/// The header's `vduid` and `uduid` are the package's `ContentId`, its
++/// `pduid` is the trailing GUID of the `VersionId`, and its `package_version`
++/// is the first four fields of the `Version` (which may go on with a build
++/// id): the relationships seen on retail packages. The header's
++/// `product_id` is not compared; how it is encoded is not known.
++pub fn check_identity(header: &XvdHeader, identity: &PackageIdentity) -> Result<(), HeaderRefused> {
++    let mismatch = |field: &'static str, header: String, service: &str| HeaderRefused::Identity {
++        field,
++        header,
++        service: service.to_string(),
++    };
++    let content_id = Uuid::try_parse(identity.content_id.trim()).ok();
++    for (field, value) in [("vduid", header.vduid), ("uduid", header.uduid)] {
++        if content_id != Some(value) {
++            return Err(mismatch(field, value.to_string(), &identity.content_id));
++        }
++    }
++    let version_id: String = identity
++        .version_id
++        .chars()
++        .filter(|c| !matches!(c, '-' | '{' | '}'))
++        .flat_map(char::to_lowercase)
++        .collect();
++    let pduid = header.pduid.simple().to_string();
++    if header.pduid.is_nil() || !version_id.trim_end().ends_with(&pduid) {
++        return Err(mismatch(
++            "pduid",
++            header.pduid.to_string(),
++            &identity.version_id,
++        ));
++    }
++    let service_version: Option<Vec<u16>> = identity
++        .version
++        .trim()
++        .splitn(5, '.')
++        .take(4)
++        .map(|part| part.parse::<u16>().ok())
++        .collect();
++    let v = &header.package_version;
++    if service_version.as_deref() != Some(&[v.major, v.minor, v.patch, v.build][..]) {
++        return Err(mismatch(
++            "package_version",
++            v.to_string(),
++            &identity.version,
++        ));
++    }
++    Ok(())
++}
++
+ /// A page whose contents do not hash to what the package's hash tree says.
+ #[derive(Debug, thiserror::Error)]
+ #[error("page {page} of the package does not match its hash tree")]
+@@ -716,7 +809,7 @@ impl XvdFile {
+     where
+         Reader: AsyncRead + AsyncSeek + Unpin,
+     {
+-        Self::parse_ex(file, false, None).await
++        Self::parse_ex(file, false, HeaderChecks::default()).await
+     }
+ 
+     /// Parse a package and check it against itself before trusting any of it.
+@@ -732,7 +825,7 @@ impl XvdFile {
+     where
+         Reader: AsyncRead + AsyncSeek + Unpin,
+     {
+-        Self::parse_ex(file, true, None).await
++        Self::parse_ex(file, true, HeaderChecks::default()).await
+     }
+ 
+     /// Parse a package as `parse_verified` does, with its header held to a
+@@ -751,13 +844,39 @@ impl XvdFile {
+     where
+         Reader: AsyncRead + AsyncSeek + Unpin,
+     {
+-        Self::parse_ex(file, true, Some(top_hash)).await
++        Self::parse_checked(
++            file,
++            HeaderChecks {
++                top_hash: Some(top_hash),
++                ..HeaderChecks::default()
++            },
++        )
++        .await
++    }
++
++    /// Parse a package as `parse_verified` does, with its header first held
++    /// to `checks`.
++    ///
++    /// With `signed_by`, the header's signature is verified over the raw bytes
++    /// before any of them is parsed; a header that is unsigned, or whose
++    /// signature does not verify, is refused with `HeaderRefused::Signature`.
++    /// A signed header that turns data integrity off is refused too, and with
++    /// `identity` the header must name that package. Then the top hash, if
++    /// one is given, and then the hash tree, as `parse_anchored` does.
++    pub async fn parse_checked<Reader>(
++        file: Reader,
++        checks: HeaderChecks<'_>,
++    ) -> Result<Self, Box<dyn std::error::Error>>
++    where
++        Reader: AsyncRead + AsyncSeek + Unpin,
++    {
++        Self::parse_ex(file, true, checks).await
+     }
+ 
+     async fn parse_ex<Reader>(
+         mut file: Reader,
+         verify: bool,
+-        top_hash: Option<&[u8; 32]>,
++        checks: HeaderChecks<'_>,
+     ) -> Result<Self, Box<dyn std::error::Error>>
+     where
+         Reader: AsyncRead + AsyncSeek + Unpin,
+@@ -765,9 +884,20 @@ impl XvdFile {
+         let xvd_header = {
+             let mut buf = XvdHeader::buffer();
+             file.read_exact(&mut buf).await?;
++            if let Some(key) = checks.signed_by {
++                verify_header(&buf, key).map_err(HeaderRefused::from)?;
++            }
+             XvdHeader::try_from_array(&buf)?
+         };
+-        if let Some(expected) = top_hash
++        if checks.signed_by.is_some() {
++            if !xvd_header.volume_flags.is_data_integrity_enabled() {
++                return Err(Box::new(HeaderRefused::IntegrityDisabled));
++            }
++            if let Some(identity) = checks.identity {
++                check_identity(&xvd_header, identity)?;
++            }
++        }
++        if let Some(expected) = checks.top_hash
+             && xvd_header.top_hash_block_hash != *expected
+         {
+             return Err(Box::new(TopHashMismatch {
+@@ -1758,6 +1888,201 @@ mod tests {
+         assert!(err.downcast_ref::<TopHashMismatch>().is_some(), "{err}");
+     }
+ 
++    mod signed {
++        use std::io::Cursor;
++
++        use uuid::Uuid;
++
++        use super::super::testing::{Package, package};
++        use super::super::{HeaderChecks, HeaderRefused, PackageIdentity, XvdFile};
++        use crate::layout::PAGE_SIZE;
++        use crate::signature::SignatureError;
++        use crate::signature::testing::{other_verifying_key, sign, test_verifying_key};
++
++        const CONTENT_ID: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
++        const PDUID: &str = "11223344-5566-7788-99aa-bbccddeeff00";
++
++        /// The fixture package naming a content id, a pduid and a version, signed
++        /// with the test key.
++        fn signed_package() -> Package {
++            let mut p = package();
++            let content = Uuid::parse_str(CONTENT_ID).unwrap().to_bytes_le();
++            p.bytes[0x220..0x230].copy_from_slice(&content);
++            p.bytes[0x230..0x240].copy_from_slice(&content);
++            p.bytes[0x3AC..0x3BC].copy_from_slice(&Uuid::parse_str(PDUID).unwrap().to_bytes_le());
++            // 1.2.3.4, stored build first.
++            for (i, part) in [4u16, 3, 2, 1].iter().enumerate() {
++                p.bytes[0x3BC + 2 * i..0x3BE + 2 * i].copy_from_slice(&part.to_le_bytes());
++            }
++            sign(&mut p.bytes);
++            p
++        }
++
++        fn identity() -> PackageIdentity {
++            PackageIdentity {
++                content_id: CONTENT_ID.to_uppercase(),
++                version_id: format!("8c4c1f9a-0000-4000-8000-000000000001-{PDUID}"),
++                version: "1.2.3.4".into(),
++            }
++        }
++
++        async fn parse(
++            bytes: Vec<u8>,
++            identity: Option<&PackageIdentity>,
++            top_hash: Option<&[u8; 32]>,
++        ) -> Result<XvdFile, Box<dyn std::error::Error>> {
++            let key = test_verifying_key();
++            XvdFile::parse_checked(
++                Cursor::new(bytes),
++                HeaderChecks {
++                    top_hash,
++                    signed_by: Some(&key),
++                    identity,
++                },
++            )
++            .await
++        }
++
++        fn refused(err: &(dyn std::error::Error + 'static)) -> HeaderRefused {
++            err.downcast_ref::<HeaderRefused>()
++                .unwrap_or_else(|| panic!("not a refused header: {err}"))
++                .clone()
++        }
++
++        #[tokio::test]
++        async fn a_signed_package_naming_the_package_is_read_and_verified() {
++            let p = signed_package();
++            let top: [u8; 32] = p.bytes[0x240..0x260].try_into().unwrap();
++            let xvd = parse(p.bytes.clone(), Some(&identity()), Some(&top))
++                .await
++                .unwrap();
++            assert!(xvd.verified);
++            assert_eq!(xvd.header.vduid, Uuid::parse_str(CONTENT_ID).unwrap());
++            // Without an identity to hold it to, the signature alone.
++            assert!(parse(p.bytes.clone(), None, None).await.is_ok());
++            // The version id may be just the pduid, in any case and spelling.
++            let mut bare = identity();
++            bare.version_id = PDUID.to_uppercase().replace('-', "");
++            assert!(parse(p.bytes.clone(), Some(&bare), None).await.is_ok());
++            // A version that goes on with a build id.
++            let mut build = identity();
++            build.version = "1.2.3.4.3b6b700a-992b-45fc-b16b-4ea65141d98c".into();
++            assert!(parse(p.bytes, Some(&build), None).await.is_ok());
++        }
++
++        #[tokio::test]
++        async fn a_changed_signed_byte_is_refused_before_anything_else_is_read() {
++            for offset in [0x200, 0x208, 0x218, 0x240, 0x288, 0xFFF] {
++                let mut bytes = signed_package().bytes;
++                bytes[offset] ^= 0x01;
++                // Only the first page: nothing after it is needed to refuse it.
++                bytes.truncate(PAGE_SIZE);
++                let err = parse(bytes, Some(&identity()), None).await.err().unwrap();
++                assert!(
++                    matches!(
++                        refused(&*err),
++                        HeaderRefused::Signature(SignatureError::Invalid(_))
++                    ),
++                    "offset {offset:#x}: {err}"
++                );
++            }
++        }
++
++        #[tokio::test]
++        async fn the_rest_of_the_header_is_not_signed_but_the_tree_still_holds() {
++            // 0x1000..0x3000 is outside the signature. The fixture's hash tree
++            // does not cover it either, so a change there still parses: what
++            // the client takes from the header is all in the signed page.
++            for offset in [0x1000, 0x1800, 0x2FFF] {
++                let mut bytes = signed_package().bytes;
++                bytes[offset] ^= 0x01;
++                assert!(
++                    parse(bytes, Some(&identity()), None).await.is_ok(),
++                    "{offset:#x}"
++                );
++            }
++            // A page the tree covers is still checked against it.
++            let p = signed_package();
++            let mut bytes = p.bytes.clone();
++            bytes[p.user_data_page * PAGE_SIZE + 100] ^= 0x01;
++            assert!(parse(bytes, Some(&identity()), None).await.is_err());
++        }
++
++        #[tokio::test]
++        async fn an_unsigned_or_foreign_header_is_refused() {
++            let mut bytes = signed_package().bytes;
++            bytes[..0x200].fill(0);
++            let err = parse(bytes, None, None).await.err().unwrap();
++            assert_eq!(
++                refused(&*err),
++                HeaderRefused::Signature(SignatureError::Unsigned)
++            );
++            assert!(err.to_string().contains("not signed"), "{err}");
++
++            let other = other_verifying_key();
++            let err = XvdFile::parse_checked(
++                Cursor::new(signed_package().bytes),
++                HeaderChecks {
++                    signed_by: Some(&other),
++                    ..HeaderChecks::default()
++                },
++            )
++            .await
++            .err()
++            .unwrap();
++            assert!(matches!(
++                refused(&*err),
++                HeaderRefused::Signature(SignatureError::Invalid(_))
++            ));
++        }
++
++        #[tokio::test]
++        async fn a_signed_header_without_data_integrity_is_refused() {
++            let mut bytes = signed_package().bytes;
++            bytes[0x208] |= 1 << 2;
++            sign(&mut bytes);
++            let err = parse(bytes, Some(&identity()), None).await.err().unwrap();
++            assert_eq!(refused(&*err), HeaderRefused::IntegrityDisabled);
++        }
++
++        #[tokio::test]
++        async fn a_signed_header_for_another_package_is_refused() {
++            let bytes = signed_package().bytes;
++            type Change = fn(&mut PackageIdentity);
++            let cases: [(&str, Change); 7] = [
++                ("vduid", |i| {
++                    i.content_id = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f1".into()
++                }),
++                ("vduid", |i| i.content_id = "not a guid".into()),
++                ("pduid", |i| {
++                    i.version_id = "11223344-5566-7788-99aa-bbccddeeff01".into()
++                }),
++                ("pduid", |i| i.version_id = format!("{PDUID}-0")),
++                ("package_version", |i| i.version = "1.2.3.5".into()),
++                ("package_version", |i| i.version = "1.2.3".into()),
++                ("package_version", |i| i.version = "".into()),
++            ];
++            for (field, change) in cases {
++                let mut id = identity();
++                change(&mut id);
++                let err = parse(bytes.clone(), Some(&id), None).await.err().unwrap();
++                match refused(&*err) {
++                    HeaderRefused::Identity { field: f, .. } => assert_eq!(f, field, "{err}"),
++                    other => panic!("{field}: {other}"),
++                }
++            }
++            // uduid alone differing from the content id.
++            let mut bytes = signed_package().bytes;
++            bytes[0x230] ^= 1;
++            sign(&mut bytes);
++            let err = parse(bytes, Some(&identity()), None).await.err().unwrap();
++            assert!(matches!(
++                refused(&*err),
++                HeaderRefused::Identity { field: "uduid", .. }
++            ));
++        }
++    }
++
+     #[tokio::test]
+     async fn a_damaged_metadata_page_is_refused() {
+         let p = package();
+diff --git a/crates/xodus-cli/Cargo.toml b/crates/xodus-cli/Cargo.toml
+index 35bfbaa..2684a95 100644
+--- a/crates/xodus-cli/Cargo.toml
++++ b/crates/xodus-cli/Cargo.toml
+@@ -29,9 +29,13 @@ tempfile = "3.27.0"
+ rustix = "1.1.4"
+ ctrlc = "3.5.2"
+ nix = "0.31.3"
++flate2 = "1.1.10"
++quick-xml = "0.42.0"
++sha2 = "0.11.0"
+ 
+ [features]
+ tokio_console = ["dep:console-subscriber"]
+ 
+ [dev-dependencies]
++msixvc = { path = "../msixvc", features = ["test-signing"] }
+ p256 = { version = "0.13", features = ["ecdsa"] }
+diff --git a/crates/xodus-cli/src/commands.rs b/crates/xodus-cli/src/commands.rs
+index 18f5740..f4c8f3a 100644
+--- a/crates/xodus-cli/src/commands.rs
++++ b/crates/xodus-cli/src/commands.rs
+@@ -14,3 +14,4 @@ pub mod run;
+ pub mod splicense;
+ pub mod streaming;
+ pub mod xblcheck;
++pub mod xvd_key;
+diff --git a/crates/xodus-cli/src/commands/download.rs b/crates/xodus-cli/src/commands/download.rs
+index 89edd99..87e3acd 100644
+--- a/crates/xodus-cli/src/commands/download.rs
++++ b/crates/xodus-cli/src/commands/download.rs
+@@ -8,7 +8,7 @@ use tokio::io::AsyncWriteExt;
+ use xodus::models::packagespc::PackageFile;
+ use xodus::tokens::TokenManager;
+ 
+-use crate::package::{get_content_id, get_packages, package_url};
++use crate::package::{HeaderCheck, get_content_id, get_packages, package_url};
+ 
+ pub async fn run(
+     client: &reqwest::Client,
+@@ -55,7 +55,11 @@ pub async fn run(
+     };
+     println!();
+     for file in files {
+-        let url = match package_url(&file.cdn_root_paths, &file.relative_url, false) {
++        let url = match package_url(
++            &file.cdn_root_paths,
++            &file.relative_url,
++            HeaderCheck::Nothing,
++        ) {
+             Ok(url) => url,
+             Err(err) => {
+                 eprintln!("{err}");
+diff --git a/crates/xodus-cli/src/commands/streaming.rs b/crates/xodus-cli/src/commands/streaming.rs
+index 07a9ad6..d649eb1 100644
+--- a/crates/xodus-cli/src/commands/streaming.rs
++++ b/crates/xodus-cli/src/commands/streaming.rs
+@@ -9,8 +9,12 @@ use fs2::available_space;
+ use futures_util::{TryStreamExt, stream};
+ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+ use msixvc::layout::PAGE_SIZE;
++use msixvc::signature::XvdSigningKey;
+ use msixvc::streaming;
+-use msixvc::xvd::{SegmentFile, TopHashMismatch, XvdFile, package_relative_path};
++use msixvc::xvd::{
++    HeaderChecks, HeaderRefused, PackageIdentity, SegmentFile, TopHashMismatch, XvdFile,
++    package_relative_path,
++};
+ use tokio::fs::File;
+ use tokio::io::{AsyncRead, AsyncSeek, AsyncWriteExt};
+ use tokio::sync::mpsc::{Receiver, Sender};
+@@ -18,13 +22,46 @@ use uuid::Uuid;
+ use xodus::tokens::TokenManager;
+ 
+ use crate::license::get_license;
+-use crate::package::{get_content_id, get_packages, header_anchor, package_url, unanchored_note};
++use crate::package::{
++    HeaderCheck, get_content_id, get_packages, header_anchor, package_url, unanchored_note,
++};
+ 
+ struct Job {
+     name: String,
+     content: SegmentFile,
+ }
+ 
++/// What the package header is held to before anything in it is believed.
++#[derive(Default)]
++struct HeaderTrust {
++    /// The package service's `HashOfHashes`, read as the header's top hash.
++    anchor: Option<[u8; 32]>,
++    /// The key the header's signature must verify with.
++    key: Option<XvdSigningKey>,
++    /// The package the package service named, which a signed header must be.
++    identity: Option<PackageIdentity>,
++}
++
++impl HeaderTrust {
++    fn checks(&self) -> HeaderChecks<'_> {
++        HeaderChecks {
++            top_hash: self.anchor.as_ref(),
++            signed_by: self.key.as_ref(),
++            identity: self.identity.as_ref(),
++        }
++    }
++}
++
++/// The key to check the package header's signature with, fetched once if it
++/// is not stored yet; see `crate::xvd_key::for_install`. `Err` when there is
++/// none and `XODUS_REQUIRE_SIGNED_PACKAGE=1`.
++async fn signing_key() -> Result<Option<XvdSigningKey>, ExitCode> {
++    crate::xvd_key::for_install().await.map_err(|err| {
++        eprintln!("{err}");
++        ExitCode::FAILURE
++    })
++}
++
+ enum ProgressEvent {
+     Started { id: usize, name: String, total: u64 },
+     Advanced { id: usize, delta: u64 },
+@@ -59,6 +96,16 @@ pub async fn run(
+                 return ExitCode::FAILURE;
+             }
+         };
++        // A file on disk: its signature is checked if there is a key, but
++        // nothing says which package it should be.
++        let key = match signing_key().await {
++            Ok(key) => key,
++            Err(code) => return code,
++        };
++        let trust = HeaderTrust {
++            key,
++            ..HeaderTrust::default()
++        };
+         run_cli_reader(
+             client,
+             tokens,
+@@ -69,22 +116,33 @@ pub async fn run(
+             f,
+             l,
+             &source,
+-            None,
++            trust,
+             tx,
+             rx,
+         )
+         .await
+     } else {
+         // The top hash the package service vouches for, when the package came
+-        // from it and it gave one. A URL given directly has nothing to go by.
+-        let (vurl, anchor) = if source.starts_with("http://") || source.starts_with("https://") {
++        // from it and it gave one, and the package it named. A URL given
++        // directly has nothing to go by but the header's signature.
++        let (vurl, trust) = if source.starts_with("http://") || source.starts_with("https://") {
++            let key = match signing_key().await {
++                Ok(key) => key,
++                Err(code) => return code,
++            };
+             if source.starts_with("http://") {
+                 eprintln!(
+-                    "warning: {source} is plain http; the package's pages are checked against \
+-                     its hash tree, but nothing vouches for its header"
++                    "warning: {source} is plain http; {}",
++                    HeaderCheck::new(key.is_some(), false).note()
+                 );
+             }
+-            (source, None)
++            (
++                source,
++                HeaderTrust {
++                    key,
++                    ..HeaderTrust::default()
++                },
++            )
+         } else {
+             let content_id = if Uuid::try_parse(&source).is_err() {
+                 let content_id_task = get_content_id(client, source, market.clone()).await;
+@@ -137,11 +195,29 @@ pub async fn run(
+                     return ExitCode::FAILURE;
+                 }
+             };
+-            if anchor.is_none() {
++            let key = match signing_key().await {
++                Ok(key) => key,
++                Err(code) => return code,
++            };
++            if anchor.is_none() && key.is_none() {
+                 eprintln!("{}", unanchored_note(file));
+             }
+-            match package_url(&file.cdn_root_paths, &file.relative_url, anchor.is_some()) {
+-                Ok(url) => (url, anchor),
++            let checked = HeaderCheck::new(key.is_some(), anchor.is_some());
++            // What a signed header must say it is.
++            let identity = PackageIdentity {
++                content_id: package.content_id.clone(),
++                version_id: package.version_id.clone(),
++                version: package.version.clone(),
++            };
++            match package_url(&file.cdn_root_paths, &file.relative_url, checked) {
++                Ok(url) => (
++                    url,
++                    HeaderTrust {
++                        anchor,
++                        key,
++                        identity: Some(identity),
++                    },
++                ),
+                 Err(err) => {
+                     eprintln!("{err}");
+                     return ExitCode::FAILURE;
+@@ -188,7 +264,7 @@ pub async fn run(
+             http_file,
+             l,
+             url,
+-            anchor,
++            trust,
+             tx,
+             rx,
+         )
+@@ -270,7 +346,7 @@ async fn run_cli_reader<Reader>(
+     reader: Reader,
+     l: u64,
+     url: &str,
+-    anchor: Option<[u8; 32]>,
++    trust: HeaderTrust,
+     tx: Sender<ProgressEvent>,
+     mut rx: Receiver<ProgressEvent>,
+ ) -> Result<(), String>
+@@ -336,7 +412,7 @@ where
+         reader,
+         l,
+         url,
+-        anchor,
++        &trust,
+         &tx,
+     )
+     .await;
+@@ -416,28 +492,37 @@ fn needs_download(
+ 
+ /// Parse a package being downloaded, checked before anything in it is believed.
+ ///
+-/// With `anchor`, the header's top hash must be the one the package service
+-/// gave, and a header that is not is refused before the tree it names is read:
+-/// see `XvdFile::parse_anchored`. Without one, the package is checked against
+-/// itself only, as `XvdFile::parse_verified` does.
++/// With a key, the header's signature must verify with it before any of the
++/// header is read, a signed header may not turn data integrity off, and with
++/// an identity it must name the package the package service named. With an
++/// anchor, the header's top hash must be the one the package service gave.
++/// A header that fails any of these is refused before the tree it names is
++/// read: see `XvdFile::parse_checked`. With none of them, the package is
++/// checked against itself only, as `XvdFile::parse_verified` does.
+ async fn read_header<Reader>(
+     remote_file: &mut Reader,
+-    anchor: Option<&[u8; 32]>,
++    trust: &HeaderTrust,
+ ) -> Result<XvdFile, String>
+ where
+     Reader: AsyncRead + AsyncSeek + Unpin,
+ {
+-    let parsed = match anchor {
+-        Some(top_hash) => XvdFile::parse_anchored(remote_file, top_hash).await,
+-        None => XvdFile::parse_verified(remote_file).await,
+-    };
+-    parsed.map_err(|err| match err.downcast_ref::<TopHashMismatch>() {
+-        Some(mismatch) => format!(
+-            "refusing this download: {mismatch}, which the package service gave as its \
+-             HashOfHashes. The package was changed on its way here, or the CDN served \
+-             another package; nothing from it was installed"
+-        ),
+-        None => stopped("read the package header")(err),
++    let parsed = XvdFile::parse_checked(remote_file, trust.checks()).await;
++    parsed.map_err(|err| {
++        if let Some(mismatch) = err.downcast_ref::<TopHashMismatch>() {
++            format!(
++                "refusing this download: {mismatch}, which the package service gave as its \
++                 HashOfHashes. The package was changed on its way here, or the CDN served \
++                 another package; nothing from it was installed"
++            )
++        } else if let Some(refused) = err.downcast_ref::<HeaderRefused>() {
++            format!(
++                "refusing this download: {refused}. The header is checked against the key that \
++                 signs retail game packages, so this package was changed on its way here, or \
++                 is not the one the package service named; nothing from it was installed"
++            )
++        } else {
++            stopped("read the package header")(err)
++        }
+     })
+ }
+ 
+@@ -507,7 +592,7 @@ async fn run_reader<Reader>(
+     reader: Reader,
+     l: u64,
+     url: &str,
+-    anchor: Option<[u8; 32]>,
++    trust: &HeaderTrust,
+     tx: &Sender<ProgressEvent>,
+ ) -> Result<(), String>
+ where
+@@ -523,7 +608,7 @@ where
+     let mut remote_file = streaming::PrefixCacheFile::new(reader, l, cache_path.clone())
+         .await
+         .map_err(stopped("open the download cache"))?;
+-    let remote_xvd = read_header(&mut remote_file, anchor.as_ref()).await?;
++    let remote_xvd = read_header(&mut remote_file, trust).await?;
+     let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
+ 
+     let files = remote_xvd
+@@ -898,7 +983,11 @@ mod tests {
+         let p = msixvc::xvd::testing::package();
+         let top: [u8; 32] = p.bytes[0x240..0x260].try_into().unwrap();
+         let read = |bytes: Vec<u8>, anchor: Option<[u8; 32]>| async move {
+-            read_header(&mut std::io::Cursor::new(bytes), anchor.as_ref()).await
++            let trust = HeaderTrust {
++                anchor,
++                ..HeaderTrust::default()
++            };
++            read_header(&mut std::io::Cursor::new(bytes), &trust).await
+         };
+ 
+         // Match.
+@@ -926,6 +1015,82 @@ mod tests {
+         assert!(err.starts_with("refusing this download"), "{err}");
+     }
+ 
++    /// With the signing key, the header must carry a signature that verifies
++    /// with it and name the package the package service named; anything else
++    /// is refused before the tree is read, and said to be a refusal rather
++    /// than a dropped connection.
++    #[tokio::test]
++    async fn the_header_is_held_to_its_signature_and_the_package_named() {
++        use msixvc::signature::testing::{sign, test_verifying_key};
++
++        let content_id = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
++        let pduid = "11223344-5566-7788-99aa-bbccddeeff00";
++        let mut p = msixvc::xvd::testing::package();
++        let content = uuid::Uuid::parse_str(content_id).unwrap().to_bytes_le();
++        p.bytes[0x220..0x230].copy_from_slice(&content);
++        p.bytes[0x230..0x240].copy_from_slice(&content);
++        p.bytes[0x3AC..0x3BC].copy_from_slice(&uuid::Uuid::parse_str(pduid).unwrap().to_bytes_le());
++        p.bytes[0x3BC..0x3C4].copy_from_slice(&[0, 0, 109, 0, 0xB0, 2, 3, 0]);
++        sign(&mut p.bytes);
++        let top: [u8; 32] = p.bytes[0x240..0x260].try_into().unwrap();
++        let trust = |version: &str| HeaderTrust {
++            anchor: Some(top),
++            key: Some(test_verifying_key()),
++            identity: Some(PackageIdentity {
++                content_id: content_id.into(),
++                version_id: format!("aaaaaaaa-0000-4000-8000-000000000000.{pduid}"),
++                version: version.into(),
++            }),
++        };
++        let read = |bytes: Vec<u8>, trust: HeaderTrust| async move {
++            read_header(&mut std::io::Cursor::new(bytes), &trust).await
++        };
++
++        assert!(read(p.bytes.clone(), trust("3.688.109.0")).await.is_ok());
++
++        // Signed by the right key, for another version of the package.
++        let err = read(p.bytes.clone(), trust("3.688.110.0"))
++            .await
++            .err()
++            .unwrap();
++        assert!(err.starts_with("refusing this download"), "{err}");
++        assert!(err.contains("package_version"), "{err}");
++
++        // One byte of the signed header changed: the signature fails before
++        // the top hash or the tree are looked at.
++        let mut changed = p.bytes[..PAGE_SIZE].to_vec();
++        changed[0x288] ^= 1;
++        let err = read(changed, trust("3.688.109.0")).await.err().unwrap();
++        assert!(err.starts_with("refusing this download"), "{err}");
++        assert!(err.contains("signature does not verify"), "{err}");
++        assert!(!err.contains("trying again"), "{err}");
++
++        // Not signed at all.
++        let mut unsigned = p.bytes.clone();
++        unsigned[..0x200].fill(0);
++        let err = read(unsigned, trust("3.688.109.0")).await.err().unwrap();
++        assert!(err.contains("not signed"), "{err}");
++
++        // Signed, but with data integrity off.
++        let mut no_integrity = p.bytes.clone();
++        no_integrity[0x208] |= 1 << 2;
++        sign(&mut no_integrity);
++        let err = read(no_integrity, trust("3.688.109.0"))
++            .await
++            .err()
++            .unwrap();
++        assert!(err.contains("DATA_INTEGRITY_DISABLED"), "{err}");
++
++        // Without a key, as before: the same unsigned header is read.
++        let mut unsigned = p.bytes.clone();
++        unsigned[..0x200].fill(0);
++        let without_key = HeaderTrust {
++            anchor: Some(top),
++            ..HeaderTrust::default()
++        };
++        assert!(read(unsigned, without_key).await.is_ok());
++    }
++
+     /// A package on disk, the parsed package, and a job for pages 5..8 of its
+     /// drive plus a little of page 8.
+     async fn fixture(dir: &Path) -> (std::path::PathBuf, XvdFile, Job, Vec<u8>) {
+diff --git a/crates/xodus-cli/src/commands/xvd_key.rs b/crates/xodus-cli/src/commands/xvd_key.rs
+new file mode 100644
+index 0000000..f4927a1
+--- /dev/null
++++ b/crates/xodus-cli/src/commands/xvd_key.rs
+@@ -0,0 +1,163 @@
++//! `xodus-cli xvd-key status|fetch|forget`: the key that package header
++//! signatures are checked with. See `crate::xvd_key`.
++//!
++//! None of these signs in, reads the keychain or prints key bytes; the JSON
++//! carries the key's SHA-256 fingerprint and where it is kept.
++
++use std::process::ExitCode;
++
++use msixvc::signature::{GAME_PACKAGE_KEY_SHA256, hex};
++use serde_json::json;
++
++use crate::xvd_key::{
++    self, AUTO_FETCH_ENV, FETCH_TIMEOUT, REQUIRE_SIGNED_ENV, Status, forget_in, key_dir,
++    last_failure, status_of,
++};
++
++fn settings() -> serde_json::Value {
++    json!({
++        "pinned": hex(&GAME_PACKAGE_KEY_SHA256),
++        "required": xvd_key::signature_required(),
++        "auto_fetch": xvd_key::auto_fetch_enabled(),
++    })
++}
++
++fn merge(mut a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
++    if let (Some(a), serde_json::Value::Object(b)) = (a.as_object_mut(), b) {
++        a.extend(b);
++    }
++    a
++}
++
++fn status_json() -> Result<serde_json::Value, String> {
++    let dir = key_dir()?;
++    let last_failed =
++        last_failure(&dir).map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
++    let mut value = match status_of(&dir, &GAME_PACKAGE_KEY_SHA256) {
++        Status::Present { fingerprint } => json!({
++            "status": "present",
++            "fingerprint": hex(&fingerprint),
++        }),
++        Status::Absent => json!({ "status": "absent" }),
++        Status::Invalid(detail) => json!({ "status": "invalid", "detail": detail }),
++    };
++    value = merge(value, settings());
++    value = merge(
++        value,
++        json!({ "dir": dir.display().to_string(), "last_failed_fetch": last_failed }),
++    );
++    Ok(value)
++}
++
++fn fail(json_out: bool, error: &str) -> ExitCode {
++    if json_out {
++        println!("{}", json!({ "status": "error", "error": error }));
++    } else {
++        eprintln!("{error}");
++    }
++    ExitCode::FAILURE
++}
++
++pub fn status(json_out: bool) -> ExitCode {
++    let value = match status_json() {
++        Ok(value) => value,
++        Err(e) => return fail(json_out, &e),
++    };
++    if json_out {
++        println!("{value}");
++    } else {
++        match value["status"].as_str() {
++            Some("present") => println!(
++                "Package signing key present ({}); package headers are checked.",
++                value["fingerprint"].as_str().unwrap_or_default()
++            ),
++            Some("absent") => println!(
++                "No package signing key. It is fetched from Microsoft Gaming Services on the next \
++                 install, or now with `xodus-cli xvd-key fetch`.{}",
++                if xvd_key::auto_fetch_enabled() {
++                    ""
++                } else {
++                    " (Automatic fetching is off.)"
++                }
++            ),
++            _ => println!(
++                "The stored package signing key is unusable: {}",
++                value["detail"].as_str().unwrap_or_default()
++            ),
++        }
++        println!("Kept in {}", value["dir"].as_str().unwrap_or_default());
++        if xvd_key::signature_required() {
++            println!("{REQUIRE_SIGNED_ENV}=1: installs without a checked signature are refused.");
++        }
++        if !xvd_key::auto_fetch_enabled() {
++            println!("{AUTO_FETCH_ENV}=0: installs do not fetch the key.");
++        }
++    }
++    ExitCode::SUCCESS
++}
++
++pub async fn fetch(json_out: bool) -> ExitCode {
++    match tokio::time::timeout(FETCH_TIMEOUT, xvd_key::fetch(FETCH_TIMEOUT)).await {
++        Ok(Ok(fetched)) => {
++            if json_out {
++                let value = merge(
++                    json!({
++                        "status": "present",
++                        "fingerprint": hex(fetched.key.fingerprint()),
++                        "path": fetched.path.display().to_string(),
++                        "source": {
++                            "bundle": fetched.bundle,
++                            "package": fetched.package,
++                            "file": fetched.member,
++                            "bytes": fetched.bytes,
++                        },
++                        "seconds": (fetched.seconds * 10.0).round() / 10.0,
++                    }),
++                    settings(),
++                );
++                println!("{value}");
++            } else {
++                println!(
++                    "Package signing key {} found in {} ({}, {}), stored in {} ({:.1} s; the \
++                     download is deleted)",
++                    hex(fetched.key.fingerprint()),
++                    fetched.bundle,
++                    fetched.package,
++                    fetched.member,
++                    fetched.path.display(),
++                    fetched.seconds
++                );
++            }
++            ExitCode::SUCCESS
++        }
++        Ok(Err(e)) => fail(json_out, &e),
++        Err(_) => fail(
++            json_out,
++            &format!(
++                "fetching the key took longer than {} s",
++                FETCH_TIMEOUT.as_secs()
++            ),
++        ),
++    }
++}
++
++pub fn forget(json_out: bool) -> ExitCode {
++    let removed = match key_dir().and_then(|dir| forget_in(&dir)) {
++        Ok(removed) => removed,
++        Err(e) => return fail(json_out, &e),
++    };
++    if json_out {
++        println!(
++            "{}",
++            merge(
++                json!({ "status": "absent", "removed": removed }),
++                settings()
++            )
++        );
++    } else if removed {
++        println!("Package signing key removed.");
++    } else {
++        println!("There was no package signing key.");
++    }
++    ExitCode::SUCCESS
++}
+diff --git a/crates/xodus-cli/src/main.rs b/crates/xodus-cli/src/main.rs
+index 776eea7..6aeff9f 100644
+--- a/crates/xodus-cli/src/main.rs
++++ b/crates/xodus-cli/src/main.rs
+@@ -9,6 +9,7 @@ mod commands;
+ mod license;
+ mod package;
+ mod webview;
++mod xvd_key;
+ 
+ #[derive(Subcommand)]
+ enum SubCommand {
+@@ -176,6 +177,16 @@ enum SubCommand {
+         #[arg(short, long)]
+         market: Option<String>,
+     },
++    #[command(
++        name = "xvd-key",
++        about = "Show, fetch or remove the key package header signatures are checked with"
++    )]
++    XvdKey {
++        #[command(subcommand)]
++        action: Option<XvdKeyAction>,
++        #[arg(long, default_value_t = false, help = "Emit JSON")]
++        json: bool,
++    },
+     #[command(about = "Generate or decrypt base64-encoded CLEP challenge data")]
+     Clep {
+         #[command(subcommand)]
+@@ -215,6 +226,27 @@ enum PresenceAction {
+     },
+ }
+ 
++#[derive(Subcommand)]
++enum XvdKeyAction {
++    #[command(about = "Whether the key is stored and usable (the default)")]
++    Status {
++        #[arg(long, default_value_t = false, help = "Emit JSON")]
++        json: bool,
++    },
++    #[command(
++        about = "Fetch Microsoft Gaming Services anonymously from the Store, keep the pinned key from it, delete the rest"
++    )]
++    Fetch {
++        #[arg(long, default_value_t = false, help = "Emit JSON")]
++        json: bool,
++    },
++    #[command(about = "Remove the stored key")]
++    Forget {
++        #[arg(long, default_value_t = false, help = "Emit JSON")]
++        json: bool,
++    },
++}
++
+ #[derive(Subcommand)]
+ enum ClepAction {
+     #[command(
+@@ -279,6 +311,17 @@ async fn main() -> ExitCode {
+         .unwrap();
+     let args = CliArgs::parse();
+ 
++    // No account, keychain or device identity: the key is Microsoft's public
++    // key, fetched anonymously, and a launcher asks for its status often.
++    if let SubCommand::XvdKey { action, json } = &args.command {
++        return match action {
++            None => commands::xvd_key::status(*json),
++            Some(XvdKeyAction::Status { json: j }) => commands::xvd_key::status(*json || *j),
++            Some(XvdKeyAction::Fetch { json: j }) => commands::xvd_key::fetch(*json || *j).await,
++            Some(XvdKeyAction::Forget { json: j }) => commands::xvd_key::forget(*json || *j),
++        };
++    }
++
+     xodus::secrets::init_secrets().expect("Unable to initialize credentials");
+     let profile_root = match xodus::profiles::root() {
+         Ok(root) => root,
+@@ -349,7 +392,8 @@ async fn main() -> ExitCode {
+         SubCommand::Login => commands::login::run(&client, &tokens).await,
+         SubCommand::AccountProfiles { .. }
+         | SubCommand::MigrateAccounts
+-        | SubCommand::AddAccount => unreachable!(),
++        | SubCommand::AddAccount
++        | SubCommand::XvdKey { .. } => unreachable!(),
+         SubCommand::Logout { device } => commands::logout::run(&tokens, device).await,
+         SubCommand::Extract {
+             path,
+diff --git a/crates/xodus-cli/src/package.rs b/crates/xodus-cli/src/package.rs
+index c80059a..d3e680b 100644
+--- a/crates/xodus-cli/src/package.rs
++++ b/crates/xodus-cli/src/package.rs
+@@ -100,14 +100,15 @@ pub const REQUIRE_HTTPS_CDN_ENV: &str = "XODUS_REQUIRE_HTTPS_CDN";
+ /// answer https with a certificate for other names, so asking them for the
+ /// same path over https fails every time. Over http the pages are still
+ /// checked against the package's hash tree. The header that vouches for that
+-/// tree is held to the package service's hash when it gives one (`anchored`,
+-/// see `header_anchor`); when it does not, nothing vouches for the header, and
+-/// a note says so. `XODUS_REQUIRE_HTTPS_CDN=1` refuses a plain http package
+-/// either way. A root in any other scheme is refused.
++/// tree is held to the package service's hash when it gives one (see
++/// `header_anchor`) and to its signature when the signing key is here (see
++/// `crate::xvd_key`); `checked` says which. When neither, nothing vouches for
++/// the header, and a note says so. `XODUS_REQUIRE_HTTPS_CDN=1` refuses a plain
++/// http package either way. A root in any other scheme is refused.
+ pub fn package_url(
+     cdn_roots: &[String],
+     relative_url: &str,
+-    anchored: bool,
++    checked: HeaderCheck,
+ ) -> Result<String, String> {
+     let url = package_url_with(
+         cdn_roots,
+@@ -115,20 +116,51 @@ pub fn package_url(
+         std::env::var(REQUIRE_HTTPS_CDN_ENV).is_ok_and(|v| v == "1"),
+     )?;
+     if !has_scheme(&url, "https://") {
+-        if anchored {
+-            eprintln!(
+-                "note: the package service lists only plain http for this package; its \
+-                 header is held to the hash the package service gives, and its pages to \
++        eprintln!(
++            "note: the package service lists only plain http for this package; {}",
++            checked.note()
++        );
++    }
++    Ok(url)
++}
++
++/// What a package's header is checked against, besides itself.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum HeaderCheck {
++    Nothing,
++    ServiceHash,
++    Signature,
++    SignatureAndServiceHash,
++}
++
++impl HeaderCheck {
++    pub fn new(signed: bool, anchored: bool) -> Self {
++        match (signed, anchored) {
++            (false, false) => HeaderCheck::Nothing,
++            (false, true) => HeaderCheck::ServiceHash,
++            (true, false) => HeaderCheck::Signature,
++            (true, true) => HeaderCheck::SignatureAndServiceHash,
++        }
++    }
++
++    pub fn note(self) -> &'static str {
++        match self {
++            HeaderCheck::Nothing => {
++                "its pages are checked against its hash tree, but nothing vouches for its header"
++            }
++            HeaderCheck::ServiceHash => {
++                "its header is held to the hash the package service gives, and its pages to \
+                  the header's hash tree"
+-            );
+-        } else {
+-            eprintln!(
+-                "note: the package service lists only plain http for this package; its pages \
+-                 are checked against its hash tree, but nothing vouches for its header"
+-            );
++            }
++            HeaderCheck::Signature => {
++                "its header is held to its signature, and its pages to the header's hash tree"
++            }
++            HeaderCheck::SignatureAndServiceHash => {
++                "its header is held to its signature and to the hash the package service \
++                 gives, and its pages to the header's hash tree"
++            }
+         }
+     }
+-    Ok(url)
+ }
+ 
+ fn has_scheme(url: &str, scheme: &str) -> bool {
+diff --git a/crates/xodus-cli/src/xvd_key/fe3.rs b/crates/xodus-cli/src/xvd_key/fe3.rs
+new file mode 100644
+index 0000000..7b3393b
+--- /dev/null
++++ b/crates/xodus-cli/src/xvd_key/fe3.rs
+@@ -0,0 +1,615 @@
++//! Anonymous download of a Microsoft Store package through the Store's
++//! Windows Update delivery service (FE3), the way Windows fetches free apps.
++//!
++//! DisplayCatalog gives the product's Windows Update category; FE3's
++//! `GetCookie` and `SyncUpdates` list the updates in that category with their
++//! files and digests; `GetExtendedUpdateInfo2` gives each file's download URL.
++//! Nothing here signs in: the ticket in every request is an empty MSA ticket.
++//!
++//! FE3's TLS certificate chains to Microsoft Root Certificate Authority 2011,
++//! which Linux trust stores do not carry, and which this client does not carry
++//! either. It is fetched from the address FE3's intermediate certificate gives
++//! for it (Microsoft's PKI site, plain http) and used only if its SHA-256 is
++//! the pinned one; it is then a trust anchor for the FE3 client only, and that
++//! client talks to the FE3 host only. The files themselves come from plain
++//! http CDN hosts; each is checked against the SHA-256 that FE3 gave for it.
++
++use std::time::Duration;
++
++use base64::Engine;
++use sha2::{Digest, Sha256};
++use uuid::Uuid;
++
++use super::xml::{self, Element, LIMITS};
++
++/// Microsoft Gaming Services in the Store.
++pub const GAMING_SERVICES_PRODUCT: &str = "9MWPM2CQNLHN";
++/// The prefix of its package names.
++pub const GAMING_SERVICES_PACKAGE: &str = "Microsoft.GamingServices_";
++
++const DISPLAYCATALOG: &str = "https://displaycatalog.mp.microsoft.com/v7.0/products";
++pub const FE3_HOST: &str = "fe3.delivery.mp.microsoft.com";
++const FE3_URL: &str = "https://fe3.delivery.mp.microsoft.com/ClientWebService/client.asmx";
++const FE3_SECURED_URL: &str =
++    "https://fe3.delivery.mp.microsoft.com/ClientWebService/client.asmx/secured";
++/// The download hosts FE3 hands out, and the only ones followed.
++const DOWNLOAD_DOMAIN: &str = ".delivery.mp.microsoft.com";
++
++/// Where Microsoft publishes Microsoft Root Certificate Authority 2011, the
++/// root FE3's chain ends in: the CA Issuers address in FE3's intermediate.
++const MICROSOFT_ROOT_2011_URL: &str =
++    "http://www.microsoft.com/pki/certs/MicRooCerAut2011_2011_03_22.crt";
++/// The root's SHA-256 fingerprint, over its DER encoding.
++pub const MICROSOFT_ROOT_2011_SHA256: &str =
++    "847df6a78497943f27fc72eb93f9a637320a02b561d0a91b09e87a7807ed7c61";
++/// A certificate is about 1.5 KB.
++const MAX_CERTIFICATE: usize = 16 << 10;
++
++const USER_AGENT: &str = "Windows-Update-Agent/10.0.10011.16384 Client-Protocol/2.50";
++const DEVICE_ATTRIBUTES: &str = "BranchReadinessLevel=CB;CurrentBranch=ge_release;\
++    OEMModel=Virtual Machine;FlightRing=Retail;AttrDataVer=331;InstallLanguage=en-US;\
++    OSUILocale=en-US;InstallationType=Client;FlightingBranchName=;App=WU_STORE;AppVer=1.0;\
++    OSArchitecture=AMD64;IsFlightingEnabled=0;TelemetryLevel=1;OSVersion=10.0.26100.1;\
++    DeviceFamily=Windows.Desktop;";
++/// Update IDs a fresh Windows reports as installed, so FE3 answers with what
++/// applies to one.
++const INSTALLED_NON_LEAF: &[u32] = &[
++    1, 2, 3, 11, 19, 2359974, 5169044, 8788830, 23110993, 23110994, 59830006, 59830007, 59830008,
++    60484010, 62450018, 62450019, 62450020, 98959022, 98959023, 98959024, 98959025, 98959026,
++    129905029, 130040031, 138537048, 140377312, 143747671, 158941041, 158941042, 158941043,
++    158941044, 159123858, 159130928,
++];
++
++/// `der` as a trust anchor, if its SHA-256 is `pin` (lower-case hex).
++pub fn pinned_certificate(der: &[u8], pin: &str) -> Result<reqwest::Certificate, String> {
++    let fingerprint = msixvc::signature::hex(&Sha256::digest(der));
++    if fingerprint != pin {
++        return Err(format!(
++            "the Microsoft root certificate fetched has fingerprint {fingerprint}, not the \
++             pinned {pin}"
++        ));
++    }
++    reqwest::Certificate::from_der(der).map_err(|e| e.to_string())
++}
++
++/// Microsoft Root Certificate Authority 2011, fetched from Microsoft and
++/// checked against its pinned fingerprint. The fingerprint is what makes it
++/// trustworthy, not the plain http it comes over.
++pub async fn microsoft_root(timeout: Duration) -> Result<reqwest::Certificate, String> {
++    let client = reqwest::Client::builder()
++        .redirect(reqwest::redirect::Policy::none())
++        .connect_timeout(Duration::from_secs(20))
++        .timeout(timeout)
++        .build()
++        .map_err(|e| e.to_string())?;
++    let mut response = client
++        .get(MICROSOFT_ROOT_2011_URL)
++        .send()
++        .await
++        .map_err(|e| format!("could not fetch Microsoft's root certificate: {e}"))?;
++    if !response.status().is_success() {
++        return Err(format!(
++            "Microsoft's root certificate answered {}",
++            response.status()
++        ));
++    }
++    let der = read_limited(&mut response, MAX_CERTIFICATE).await?;
++    pinned_certificate(&der, MICROSOFT_ROOT_2011_SHA256)
++}
++
++/// The client for FE3: https only, no redirects, and `root` as an extra
++/// trust anchor. Used for `FE3_HOST` and nothing else.
++pub fn fe3_client(
++    root: reqwest::Certificate,
++    timeout: Duration,
++) -> Result<reqwest::Client, String> {
++    reqwest::Client::builder()
++        .user_agent(USER_AGENT)
++        .https_only(true)
++        .redirect(reqwest::redirect::Policy::none())
++        .tls_certs_merge([root])
++        .connect_timeout(Duration::from_secs(20))
++        .timeout(timeout)
++        .build()
++        .map_err(|e| format!("could not set up the Store delivery client: {e}"))
++}
++
++/// The client for the catalogue and the file download: the system's trust
++/// store, and redirects only within the delivery domain.
++pub fn download_client(timeout: Duration) -> Result<reqwest::Client, String> {
++    reqwest::Client::builder()
++        .user_agent(USER_AGENT)
++        .redirect(reqwest::redirect::Policy::custom(|attempt| {
++            if attempt.previous().len() >= 5 {
++                attempt.error("too many redirects")
++            } else if download_url_allowed(attempt.url()) {
++                attempt.follow()
++            } else {
++                attempt.stop()
++            }
++        }))
++        .connect_timeout(Duration::from_secs(20))
++        .timeout(timeout)
++        .build()
++        .map_err(|e| format!("could not set up the download client: {e}"))
++}
++
++/// Whether a file URL FE3 gave is one this fetches: http or https, on a
++/// delivery host, with no credentials or port tricks.
++pub fn download_url_allowed(url: &reqwest::Url) -> bool {
++    matches!(url.scheme(), "http" | "https")
++        && url.username().is_empty()
++        && url.password().is_none()
++        && url.port().is_none()
++        && url
++            .host_str()
++            .is_some_and(|h| h.to_ascii_lowercase().ends_with(DOWNLOAD_DOMAIN))
++}
++
++/// `text` escaped for XML element content.
++fn escape(text: &str) -> String {
++    text.replace('&', "&amp;")
++        .replace('<', "&lt;")
++        .replace('>', "&gt;")
++}
++
++fn timestamp(now: chrono::DateTime<chrono::Utc>) -> String {
++    now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
++}
++
++fn message_id() -> Uuid {
++    let seed = format!(
++        "{:?}{}{:?}",
++        std::time::SystemTime::now(),
++        std::process::id(),
++        std::thread::current().id()
++    );
++    let digest = Sha256::digest(seed.as_bytes());
++    uuid::Builder::from_random_bytes(digest[..16].try_into().unwrap()).into_uuid()
++}
++
++/// A SOAP request to FE3, with the anonymous ticket.
++pub fn envelope(action: &str, to: &str, body: &str, now: chrono::DateTime<chrono::Utc>) -> String {
++    let created = timestamp(now);
++    let expires = timestamp(now + chrono::Duration::minutes(5));
++    format!(
++        r#"<s:Envelope xmlns:a="http://www.w3.org/2005/08/addressing" xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Header><a:Action s:mustUnderstand="1">http://www.microsoft.com/SoftwareDistribution/Server/ClientWebService/{action}</a:Action><a:MessageID>urn:uuid:{id}</a:MessageID><a:To s:mustUnderstand="1">{to}</a:To><o:Security s:mustUnderstand="1" xmlns:o="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"><Timestamp xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"><Created>{created}</Created><Expires>{expires}</Expires></Timestamp><wuws:WindowsUpdateTicketsToken wsu:id="ClientMSA" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd" xmlns:wuws="http://schemas.microsoft.com/msus/2014/10/WindowsUpdateAuthorization"><TicketType Name="MSA" Version="1.0" Policy="MBI_SSL"><User/></TicketType></wuws:WindowsUpdateTicketsToken></o:Security></s:Header><s:Body>{body}</s:Body></s:Envelope>"#,
++        id = message_id(),
++    )
++}
++
++const CWS: &str = "http://www.microsoft.com/SoftwareDistribution/Server/ClientWebService";
++
++pub fn cookie_body(now: chrono::DateTime<chrono::Utc>) -> String {
++    let t = timestamp(now);
++    format!(
++        r#"<GetCookie xmlns="{CWS}"><oldCookie></oldCookie><lastChange>{t}</lastChange><currentTime>{t}</currentTime><protocolVersion>1.40</protocolVersion></GetCookie>"#
++    )
++}
++
++pub fn sync_body(cookie: &str, category: &Uuid) -> String {
++    let installed: String = INSTALLED_NON_LEAF
++        .iter()
++        .map(|id| format!("<int>{id}</int>"))
++        .collect();
++    format!(
++        r#"<SyncUpdates xmlns="{CWS}"><cookie><Expiration>2045-03-11T02:02:48Z</Expiration><EncryptedData>{cookie}</EncryptedData></cookie><parameters><ExpressQuery>false</ExpressQuery><InstalledNonLeafUpdateIDs>{installed}</InstalledNonLeafUpdateIDs><OtherCachedUpdateIDs/><SkipSoftwareSync>false</SkipSoftwareSync><NeedTwoGroupOutOfScopeUpdates>true</NeedTwoGroupOutOfScopeUpdates><FilterAppCategoryIds><CategoryIdentifier><Id>{category}</Id></CategoryIdentifier></FilterAppCategoryIds><TreatAppCategoryIdsAsInstalled>true</TreatAppCategoryIdsAsInstalled><AlsoPerformRegularSync>false</AlsoPerformRegularSync><ComputerSpec/><ExtendedUpdateInfoParameters><XmlUpdateFragmentTypes><XmlUpdateFragmentType>Extended</XmlUpdateFragmentType></XmlUpdateFragmentTypes><Locales><string>en-US</string><string>en</string></Locales></ExtendedUpdateInfoParameters><ClientPreferredLanguages><string>en-US</string></ClientPreferredLanguages><ProductsParameters><SyncCurrentVersionOnly>false</SyncCurrentVersionOnly><DeviceAttributes>{DEVICE_ATTRIBUTES}</DeviceAttributes><CallerAttributes>Interactive=1;IsSeeker=1;</CallerAttributes><Products/></ProductsParameters></parameters></SyncUpdates>"#,
++        cookie = escape(cookie),
++    )
++}
++
++pub fn file_url_body(update_id: &Uuid, revision: u32) -> String {
++    format!(
++        r#"<GetExtendedUpdateInfo2 xmlns="{CWS}"><updateIDs><UpdateIdentity><UpdateID>{update_id}</UpdateID><RevisionNumber>{revision}</RevisionNumber></UpdateIdentity></updateIDs><infoTypes><XmlUpdateFragmentType>FileUrl</XmlUpdateFragmentType><XmlUpdateFragmentType>FileDecryption</XmlUpdateFragmentType></infoTypes><deviceAttributes>{DEVICE_ATTRIBUTES}</deviceAttributes></GetExtendedUpdateInfo2>"#
++    )
++}
++
++/// The Windows Update category of a product, from DisplayCatalog's answer.
++pub fn parse_category(json: &[u8]) -> Result<Uuid, String> {
++    let value: serde_json::Value =
++        serde_json::from_slice(json).map_err(|e| format!("unreadable catalogue answer: {e}"))?;
++    let skus = value["Products"][0]["DisplaySkuAvailabilities"]
++        .as_array()
++        .ok_or("the catalogue answer lists no SKUs")?;
++    for sku in skus {
++        let data = &sku["Sku"]["Properties"]["FulfillmentData"];
++        let data = match data {
++            serde_json::Value::String(s) => serde_json::from_str(s).unwrap_or_default(),
++            other => other.clone(),
++        };
++        if let Some(id) = data["WuCategoryId"].as_str() {
++            return Uuid::try_parse(id).map_err(|_| format!("not a category id: {id:?}"));
++        }
++    }
++    Err("the catalogue answer has no WuCategoryId".into())
++}
++
++/// The cookie in a `GetCookie` answer.
++pub fn parse_cookie(answer: &str) -> Result<String, String> {
++    let root = xml::parse(answer, LIMITS)?;
++    let cookie = root
++        .descendants("EncryptedData")
++        .first()
++        .map(|e| e.text.trim().to_string())
++        .filter(|c| !c.is_empty())
++        .ok_or("the delivery service gave no cookie")?;
++    if cookie.len() > 64 << 10 || !cookie.bytes().all(|b| b.is_ascii_graphic()) {
++        return Err("the delivery service's cookie is not plausible".into());
++    }
++    Ok(cookie)
++}
++
++/// A file of an update, as `SyncUpdates` lists it.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct UpdateFile {
++    pub name: String,
++    pub size: u64,
++    /// The `Digest` attribute: base64 SHA-1, which `GetExtendedUpdateInfo2`
++    /// uses to say which URL is which file.
++    pub digest: String,
++    /// The `AdditionalDigest` with algorithm SHA256.
++    pub sha256: Option<[u8; 32]>,
++    pub installer_id: Option<String>,
++}
++
++/// An update in a category, as `SyncUpdates` lists it.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Update {
++    pub id: String,
++    pub update_id: Uuid,
++    pub revision: u32,
++    pub moniker: Option<String>,
++    pub secured: bool,
++    pub files: Vec<UpdateFile>,
++}
++
++fn fragment(e: &Element) -> Result<Option<Element>, String> {
++    match e.child("Xml") {
++        Some(x) => xml::parse(&x.text, LIMITS).map(Some),
++        None => Ok(None),
++    }
++}
++
++/// The updates in a `SyncUpdates` answer, with the files its extended
++/// information lists for each.
++pub fn parse_sync(answer: &str) -> Result<Vec<Update>, String> {
++    let root = xml::parse(answer, LIMITS)?;
++    let mut updates: Vec<Update> = Vec::new();
++    for info in root.descendants("UpdateInfo") {
++        let Some(id) = info.child("ID").map(|e| e.text.trim().to_string()) else {
++            continue;
++        };
++        let Some(frag) = fragment(info)? else {
++            continue;
++        };
++        let Some(identity) = frag.descendants("UpdateIdentity").first().copied() else {
++            continue;
++        };
++        let (Some(update_id), Some(revision)) = (
++            identity
++                .attribute("UpdateID")
++                .and_then(|v| Uuid::try_parse(v).ok()),
++            identity
++                .attribute("RevisionNumber")
++                .and_then(|v| v.parse().ok()),
++        ) else {
++            continue;
++        };
++        let moniker = frag
++            .descendants("AppxMetadata")
++            .iter()
++            .find_map(|m| m.attribute("PackageMoniker").map(str::to_string));
++        let secured = !frag.descendants("SecuredFragment").is_empty();
++        updates.push(Update {
++            id,
++            update_id,
++            revision,
++            moniker,
++            secured,
++            files: Vec::new(),
++        });
++    }
++    for extended in root.descendants("Update") {
++        let Some(id) = extended.child("ID").map(|e| e.text.trim().to_string()) else {
++            continue;
++        };
++        let Some(update) = updates.iter_mut().find(|u| u.id == id) else {
++            continue;
++        };
++        let Some(frag) = fragment(extended)? else {
++            continue;
++        };
++        for file in frag.descendants("File") {
++            let (Some(name), Some(size), Some(digest)) = (
++                file.attribute("FileName"),
++                file.attribute("Size").and_then(|s| s.parse().ok()),
++                file.attribute("Digest"),
++            ) else {
++                continue;
++            };
++            let sha256 = file
++                .children_named("AdditionalDigest")
++                .find(|d| d.attribute("Algorithm") == Some("SHA256"))
++                .and_then(|d| {
++                    base64::engine::general_purpose::STANDARD
++                        .decode(d.text.trim())
++                        .ok()
++                })
++                .and_then(|d| d.try_into().ok());
++            update.files.push(UpdateFile {
++                name: name.to_string(),
++                size,
++                digest: digest.to_string(),
++                sha256,
++                installer_id: file
++                    .attribute("InstallerSpecificIdentifier")
++                    .map(str::to_string),
++            });
++        }
++    }
++    Ok(updates)
++}
++
++/// The numeric parts of a package moniker's version, for picking the newest.
++fn moniker_version(moniker: &str) -> Vec<u32> {
++    moniker
++        .split('_')
++        .nth(1)
++        .unwrap_or_default()
++        .split('.')
++        .map(|p| p.parse().unwrap_or(0))
++        .collect()
++}
++
++/// The newest Gaming Services bundle among the updates, and its main file.
++pub fn pick_bundle(updates: &[Update]) -> Result<(&Update, &UpdateFile), String> {
++    updates
++        .iter()
++        .filter(|u| u.secured)
++        .filter_map(|u| {
++            let moniker = u.moniker.as_deref()?;
++            if !moniker.starts_with(GAMING_SERVICES_PACKAGE) || !moniker.ends_with("8wekyb3d8bbwe")
++            {
++                return None;
++            }
++            let file = u.files.iter().find(|f| {
++                f.installer_id.as_deref() == Some(moniker) && !f.name.starts_with("Abm_")
++            })?;
++            Some((u, file))
++        })
++        .max_by_key(|(u, _)| moniker_version(u.moniker.as_deref().unwrap_or_default()))
++        .ok_or_else(|| "the delivery service listed no Gaming Services package".to_string())
++}
++
++/// The download URL for the file whose SHA-1 digest is `digest`, from a
++/// `GetExtendedUpdateInfo2` answer.
++pub fn parse_file_url(answer: &str, digest: &str) -> Result<reqwest::Url, String> {
++    let root = xml::parse(answer, LIMITS)?;
++    for location in root.descendants("FileLocation") {
++        if location.child("FileDigest").map(|d| d.text.trim()) != Some(digest) {
++            continue;
++        }
++        let url = location
++            .child("Url")
++            .map(|u| u.text.trim())
++            .ok_or("the delivery service gave a file location without a URL")?;
++        let url = reqwest::Url::parse(url).map_err(|e| format!("bad file URL: {e}"))?;
++        if !download_url_allowed(&url) {
++            return Err(format!(
++                "the delivery service gave a file URL on {}, which is not a delivery host",
++                url.host_str().unwrap_or("no host")
++            ));
++        }
++        return Ok(url);
++    }
++    Err("the delivery service gave no URL for the package".into())
++}
++
++async fn post(
++    client: &reqwest::Client,
++    url: &str,
++    action: &str,
++    body: &str,
++) -> Result<String, String> {
++    debug_assert!(url.starts_with(&format!("https://{FE3_HOST}/")));
++    let request = envelope(action, url, body, chrono::Utc::now());
++    let mut response = client
++        .post(url)
++        .header("Content-Type", "application/soap+xml; charset=utf-8")
++        .body(request)
++        .send()
++        .await
++        .map_err(|e| format!("{action}: {e}"))?;
++    if !response.status().is_success() {
++        return Err(format!(
++            "{action}: the delivery service answered {}",
++            response.status()
++        ));
++    }
++    let text = read_limited(&mut response, LIMITS.max_bytes)
++        .await
++        .map_err(|e| format!("{action}: {e}"))?;
++    String::from_utf8(text).map_err(|_| format!("{action}: the answer is not UTF-8"))
++}
++
++async fn read_limited(response: &mut reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
++    let mut out = Vec::new();
++    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
++        if out.len() + chunk.len() > limit {
++            return Err(format!("the answer is larger than {limit} bytes"));
++        }
++        out.extend_from_slice(&chunk);
++    }
++    Ok(out)
++}
++
++/// What to download: the bundle's URL, size and SHA-256, and its name.
++#[derive(Debug, Clone)]
++pub struct BundleLocation {
++    pub moniker: String,
++    pub url: reqwest::Url,
++    pub size: u64,
++    pub sha256: Option<[u8; 32]>,
++}
++
++/// Find the current Gaming Services bundle, anonymously.
++pub async fn locate_bundle(timeout: Duration) -> Result<BundleLocation, String> {
++    let web = download_client(timeout)?;
++    let mut catalogue = web
++        .get(format!(
++            "{DISPLAYCATALOG}?bigIds={GAMING_SERVICES_PRODUCT}&market=US&languages=en-US,neutral"
++        ))
++        .send()
++        .await
++        .map_err(|e| format!("could not reach the Store catalogue: {e}"))?;
++    if !catalogue.status().is_success() {
++        return Err(format!(
++            "the Store catalogue answered {}",
++            catalogue.status()
++        ));
++    }
++    let category = parse_category(&read_limited(&mut catalogue, 4 << 20).await?)?;
++
++    let fe3 = fe3_client(microsoft_root(timeout).await?, timeout)?;
++    let cookie =
++        parse_cookie(&post(&fe3, FE3_URL, "GetCookie", &cookie_body(chrono::Utc::now())).await?)?;
++    let updates =
++        parse_sync(&post(&fe3, FE3_URL, "SyncUpdates", &sync_body(&cookie, &category)).await?)?;
++    let (update, file) = pick_bundle(&updates)?;
++    let answer = post(
++        &fe3,
++        FE3_SECURED_URL,
++        "GetExtendedUpdateInfo2",
++        &file_url_body(&update.update_id, update.revision),
++    )
++    .await?;
++    Ok(BundleLocation {
++        moniker: update.moniker.clone().unwrap_or_default(),
++        url: parse_file_url(&answer, &file.digest)?,
++        size: file.size,
++        sha256: file.sha256,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Shaped like FE3's answers, with made-up identifiers, digests and URLs.
++    const SYNC: &str = include_str!("testdata/sync-updates.xml");
++    const FILE_URLS: &str = include_str!("testdata/get-extended-update-info2.xml");
++    const COOKIE: &str = include_str!("testdata/get-cookie.xml");
++    const CATALOGUE: &str = include_str!("testdata/displaycatalog.json");
++
++    /// Reaches FE3 through the fetched, pinned Microsoft root and finds the
++    /// Gaming Services bundle and its URL, anonymously; downloads nothing but
++    /// the root certificate and the metadata. Run with `--ignored`.
++    #[tokio::test]
++    #[ignore = "talks to the Microsoft Store delivery service"]
++    async fn live_the_bundle_is_located_anonymously() {
++        let location = locate_bundle(Duration::from_secs(60)).await.unwrap();
++        assert!(location.moniker.starts_with(GAMING_SERVICES_PACKAGE));
++        assert!(download_url_allowed(&location.url));
++        assert!(location.size > 1 << 20);
++        assert!(location.sha256.is_some());
++    }
++
++    #[test]
++    fn only_the_pinned_root_is_taken() {
++        let der = b"not really a certificate, only bytes to pin";
++        let pin = msixvc::signature::hex(&Sha256::digest(der));
++        assert!(pinned_certificate(der, &pin).is_ok());
++        let err = pinned_certificate(der, MICROSOFT_ROOT_2011_SHA256).unwrap_err();
++        assert!(err.contains("not the pinned"), "{err}");
++        assert_eq!(MICROSOFT_ROOT_2011_SHA256.len(), 64);
++        assert!(MICROSOFT_ROOT_2011_SHA256.starts_with("847df6a7"));
++        assert!(MICROSOFT_ROOT_2011_SHA256.ends_with("ed7c61"));
++    }
++
++    #[test]
++    fn the_category_comes_from_the_fulfillment_data() {
++        assert_eq!(
++            parse_category(CATALOGUE.as_bytes()).unwrap(),
++            Uuid::parse_str("aaaaaaaa-1111-4222-8333-444444444444").unwrap()
++        );
++        // As an object rather than a string.
++        let json = br#"{"Products":[{"DisplaySkuAvailabilities":[{"Sku":{"Properties":{}}},{"Sku":{"Properties":{"FulfillmentData":{"WuCategoryId":"aaaaaaaa-1111-4222-8333-444444444445"}}}}]}]}"#;
++        assert!(parse_category(json).is_ok());
++        assert!(parse_category(br#"{"Products":[]}"#).is_err());
++        assert!(parse_category(b"not json").is_err());
++    }
++
++    #[test]
++    fn the_cookie_is_read() {
++        assert_eq!(parse_cookie(COOKIE).unwrap(), "Q29va2llRm9yVGVzdHM=");
++        assert!(parse_cookie("<a><b/></a>").is_err());
++    }
++
++    #[test]
++    fn the_newest_gaming_services_bundle_is_picked_with_its_file() {
++        let updates = parse_sync(SYNC).unwrap();
++        // The category itself, two Gaming Services versions, a framework.
++        assert_eq!(updates.len(), 4);
++        let (update, file) = pick_bundle(&updates).unwrap();
++        assert_eq!(
++            update.moniker.as_deref(),
++            Some("Microsoft.GamingServices_38.118.9001.0_neutral_~_8wekyb3d8bbwe")
++        );
++        assert_eq!(update.revision, 1);
++        assert_eq!(
++            update.update_id,
++            Uuid::parse_str("cccccccc-1111-4222-8333-444444444444").unwrap()
++        );
++        assert_eq!(file.name, "bbbbbbbb-1111-4222-8333-444444444444.appxbundle");
++        assert_eq!(file.size, 200_322_495);
++        assert_eq!(file.digest, "c2hhMS1vZi10aGUtYnVuZGxlISE=");
++        assert_eq!(file.sha256, Some([0x11; 32]));
++
++        let url = parse_file_url(FILE_URLS, &file.digest).unwrap();
++        assert_eq!(
++            url.as_str(),
++            "http://tlu.dl.delivery.mp.microsoft.com/filestreamingservice/files/bbbbbbbb-test?P1=1&P2=2"
++        );
++        // The other file's URL is not taken for it.
++        assert!(parse_file_url(FILE_URLS, "bm8tc3VjaC1kaWdlc3Q=").is_err());
++    }
++
++    #[test]
++    fn only_delivery_hosts_are_fetched_from() {
++        let allowed = |u: &str| download_url_allowed(&reqwest::Url::parse(u).unwrap());
++        assert!(allowed("http://tlu.dl.delivery.mp.microsoft.com/x"));
++        assert!(allowed("https://dl.delivery.mp.microsoft.com/x"));
++        assert!(!allowed("http://evil.example/x"));
++        assert!(!allowed("http://delivery.mp.microsoft.com.evil.example/x"));
++        assert!(!allowed("http://user@tlu.dl.delivery.mp.microsoft.com/x"));
++        assert!(!allowed("http://tlu.dl.delivery.mp.microsoft.com:8080/x"));
++        assert!(!allowed("file:///etc/passwd"));
++        let evil = FILE_URLS.replace("tlu.dl.delivery.mp.microsoft.com", "evil.example");
++        assert!(parse_file_url(&evil, "c2hhMS1vZi10aGUtYnVuZGxlISE=").is_err());
++    }
++
++    #[test]
++    fn requests_carry_the_anonymous_ticket_and_escape_what_they_echo() {
++        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
++        let e = envelope("GetCookie", FE3_URL, &cookie_body(now), now);
++        assert!(e.contains("<User/>"));
++        assert!(e.contains("2023-11-14T22:13:20.000Z"));
++        assert!(xml::parse(&e, LIMITS).is_ok());
++        let body = sync_body("a<b>&c", &Uuid::nil());
++        assert!(body.contains("a&lt;b&gt;&amp;c"));
++        assert!(xml::parse(&body, LIMITS).is_ok());
++    }
++
++    #[test]
++    fn answers_that_are_not_what_they_should_be_are_refused() {
++        assert!(parse_sync("<x>").is_err());
++        let doctype = format!("<!DOCTYPE x>{SYNC}");
++        assert!(parse_sync(&doctype).is_err());
++        // An escaped fragment that is itself malformed.
++        let broken = SYNC.replacen("&lt;UpdateIdentity", "&lt;UpdateIdentity &lt;", 1);
++        assert!(parse_sync(&broken).is_err());
++        // No Gaming Services at all.
++        let none = SYNC.replace("Microsoft.GamingServices_", "Microsoft.Other_");
++        assert!(pick_bundle(&parse_sync(&none).unwrap()).is_err());
++    }
++}
+diff --git a/crates/xodus-cli/src/xvd_key/mod.rs b/crates/xodus-cli/src/xvd_key/mod.rs
+new file mode 100644
+index 0000000..ec23c3f
+--- /dev/null
++++ b/crates/xodus-cli/src/xvd_key/mod.rs
+@@ -0,0 +1,525 @@
++//! The key that signs retail PC game package headers, found on this machine.
++//!
++//! This client does not carry that key. It is a public key, but Microsoft's,
++//! so it is fetched at run time from Microsoft's own Gaming Services package,
++//! downloaded anonymously from the Store's delivery service (see `fe3`), and
++//! kept only if the SHA-256 of its blob is the pinned
++//! `msixvc::signature::GAME_PACKAGE_KEY_SHA256`. The blob is stored 0600 in a
++//! 0700 directory and hashed again every time it is loaded; the downloaded
++//! package is deleted as soon as it has been read.
++//!
++//! Where: `XODUS_XVD_KEY_DIR`, else `$XDG_DATA_HOME/xodus/xvd-key`, else
++//! `~/.local/share/xodus/xvd-key`. The download goes to a temporary file in
++//! `XODUS_XVD_KEY_DIR/.fetch`, else `$XDG_CACHE_HOME/xodus/xvd-key-fetch`, else
++//! `~/.cache/xodus/xvd-key-fetch`.
++
++pub mod fe3;
++pub mod scan;
++pub mod xml;
++pub mod zip;
++
++use std::io::{Read, Write};
++use std::path::{Path, PathBuf};
++use std::time::{Duration, Instant, SystemTime};
++
++use msixvc::signature::{GAME_PACKAGE_KEY_SHA256, XvdSigningKey, hex};
++use sha2::{Digest, Sha256};
++
++/// Overrides where the key, and the download it comes from, are kept.
++pub const KEY_DIR_ENV: &str = "XODUS_XVD_KEY_DIR";
++/// `1`: refuse to install a package whose header signature cannot be checked
++/// because no key is available.
++pub const REQUIRE_SIGNED_ENV: &str = "XODUS_REQUIRE_SIGNED_PACKAGE";
++/// `0`: never fetch the key on the way to an install; only `xvd-key fetch`
++/// does.
++pub const AUTO_FETCH_ENV: &str = "XODUS_XVD_KEY_AUTOFETCH";
++
++const KEY_FILE: &str = "game-package-key.blob";
++/// Its modification time is when an automatic fetch last failed.
++const FAILED_FILE: &str = "last-fetch-failed";
++/// An automatic fetch that failed is not tried again for this long; an
++/// explicit `xvd-key fetch` always is.
++const RETRY_AFTER: Duration = Duration::from_secs(24 * 3600);
++/// How long an install waits for the key before going on without it.
++pub const AUTO_FETCH_TIMEOUT: Duration = Duration::from_secs(180);
++/// How long `xvd-key fetch` waits.
++pub const FETCH_TIMEOUT: Duration = Duration::from_secs(900);
++/// The bundle was about 200 MB when this was written.
++const MAX_BUNDLE: u64 = 1 << 30;
++/// A blob is 539 bytes; a file much larger is not one.
++const MAX_KEY_FILE: u64 = 4096;
++
++fn env_dir(name: &str) -> Option<PathBuf> {
++    std::env::var_os(name)
++        .filter(|v| !v.is_empty())
++        .map(PathBuf::from)
++        .filter(|p| p.is_absolute())
++}
++
++fn home() -> Result<PathBuf, String> {
++    env_dir("HOME").ok_or_else(|| "HOME is not set".to_string())
++}
++
++/// Where the key is kept.
++pub fn key_dir() -> Result<PathBuf, String> {
++    if let Some(dir) = env_dir(KEY_DIR_ENV) {
++        return Ok(dir);
++    }
++    let data = match env_dir("XDG_DATA_HOME") {
++        Some(dir) => dir,
++        None => home()?.join(".local/share"),
++    };
++    Ok(data.join("xodus/xvd-key"))
++}
++
++/// Where the download goes while it is read.
++pub fn fetch_dir() -> Result<PathBuf, String> {
++    if let Some(dir) = env_dir(KEY_DIR_ENV) {
++        return Ok(dir.join(".fetch"));
++    }
++    let cache = match env_dir("XDG_CACHE_HOME") {
++        Some(dir) => dir,
++        None => home()?.join(".cache"),
++    };
++    Ok(cache.join("xodus/xvd-key-fetch"))
++}
++
++/// Make `dir` and its parents, `dir` itself 0700 and this user's.
++fn private_dir(dir: &Path) -> Result<(), String> {
++    let fail = |e: std::io::Error| format!("{}: {e}", dir.display());
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::DirBuilderExt;
++        std::fs::DirBuilder::new()
++            .recursive(true)
++            .mode(0o700)
++            .create(dir)
++            .map_err(fail)?;
++        crate::commands::presence::private_dir(dir, true).map_err(fail)
++    }
++    #[cfg(not(unix))]
++    {
++        std::fs::create_dir_all(dir).map_err(fail)
++    }
++}
++
++/// Whether the key is here, and usable.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Status {
++    Present {
++        fingerprint: [u8; 32],
++    },
++    Absent,
++    /// There is a file, and it is not the pinned key or not safe to use.
++    Invalid(String),
++}
++
++/// Read the key from `dir`, checking the file is this user's alone and the
++/// blob is the pinned one, every time.
++pub fn load_from(dir: &Path, pin: &[u8; 32]) -> Result<Option<XvdSigningKey>, String> {
++    let path = dir.join(KEY_FILE);
++    let mut options = std::fs::OpenOptions::new();
++    options.read(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
++    }
++    let file = match options.open(&path) {
++        Ok(file) => file,
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
++        Err(e) => return Err(format!("{}: {e}", path.display())),
++    };
++    let meta = file
++        .metadata()
++        .map_err(|e| format!("{}: {e}", path.display()))?;
++    if !meta.is_file() {
++        return Err(format!("{} is not a regular file", path.display()));
++    }
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::MetadataExt;
++        // Safety: geteuid cannot fail and touches no memory.
++        if meta.uid() != unsafe { nix::libc::geteuid() } {
++            return Err(format!("{} belongs to another user", path.display()));
++        }
++        if meta.mode() & 0o077 != 0 {
++            return Err(format!("{} is open to other users", path.display()));
++        }
++    }
++    let mut blob = Vec::new();
++    file.take(MAX_KEY_FILE + 1)
++        .read_to_end(&mut blob)
++        .map_err(|e| format!("{}: {e}", path.display()))?;
++    XvdSigningKey::from_blob(&blob, pin)
++        .map(Some)
++        .map_err(|e| format!("{}: {e}", path.display()))
++}
++
++/// What `xvd-key status` reports for `dir`.
++pub fn status_of(dir: &Path, pin: &[u8; 32]) -> Status {
++    match load_from(dir, pin) {
++        Ok(Some(key)) => Status::Present {
++            fingerprint: *key.fingerprint(),
++        },
++        Ok(None) => Status::Absent,
++        Err(e) => Status::Invalid(e),
++    }
++}
++
++/// Write the blob to `dir`, 0600, replacing whatever was there in one rename.
++pub fn store_in(dir: &Path, blob: &[u8]) -> Result<PathBuf, String> {
++    private_dir(dir)?;
++    let path = dir.join(KEY_FILE);
++    let mut tmp = tempfile::Builder::new()
++        .prefix(".key-")
++        .tempfile_in(dir)
++        .map_err(|e| format!("{}: {e}", dir.display()))?;
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        tmp.as_file()
++            .set_permissions(std::fs::Permissions::from_mode(0o600))
++            .map_err(|e| e.to_string())?;
++    }
++    tmp.write_all(blob).map_err(|e| e.to_string())?;
++    tmp.as_file().sync_all().map_err(|e| e.to_string())?;
++    tmp.persist(&path)
++        .map_err(|e| format!("{}: {e}", path.display()))?;
++    Ok(path)
++}
++
++/// Remove the key and the failure record from `dir`. Whether there was a key.
++pub fn forget_in(dir: &Path) -> Result<bool, String> {
++    let _ = std::fs::remove_file(dir.join(FAILED_FILE));
++    match std::fs::remove_file(dir.join(KEY_FILE)) {
++        Ok(()) => Ok(true),
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
++        Err(e) => Err(format!("{}: {e}", dir.join(KEY_FILE).display())),
++    }
++}
++
++/// When an automatic fetch last failed, if one has.
++pub fn last_failure(dir: &Path) -> Option<SystemTime> {
++    std::fs::metadata(dir.join(FAILED_FILE))
++        .and_then(|m| m.modified())
++        .ok()
++}
++
++fn record_failure(dir: &Path) {
++    if private_dir(dir).is_ok() {
++        let _ = std::fs::write(dir.join(FAILED_FILE), b"");
++    }
++}
++
++/// Where a fetched key came from, for the report.
++#[derive(Debug, Clone)]
++pub struct Fetched {
++    pub key: XvdSigningKey,
++    pub path: PathBuf,
++    pub package: String,
++    pub member: String,
++    pub bundle: String,
++    pub bytes: u64,
++    pub seconds: f64,
++}
++
++/// Download `location` into a temporary file in `scratch`, checking its size
++/// and SHA-256 as it comes.
++async fn download(
++    location: &fe3::BundleLocation,
++    scratch: &Path,
++    timeout: Duration,
++) -> Result<tempfile::NamedTempFile, String> {
++    if location.size == 0 || location.size > MAX_BUNDLE {
++        return Err(format!(
++            "the package is said to be {} bytes, outside what is expected",
++            location.size
++        ));
++    }
++    let client = fe3::download_client(timeout)?;
++    let mut response = client
++        .get(location.url.clone())
++        .send()
++        .await
++        .map_err(|e| format!("could not download Gaming Services: {e}"))?;
++    if !response.status().is_success() {
++        return Err(format!(
++            "the Gaming Services download answered {}",
++            response.status()
++        ));
++    }
++    if !fe3::download_url_allowed(response.url()) {
++        return Err("the Gaming Services download ended on another host".into());
++    }
++    let mut file = tempfile::Builder::new()
++        .prefix(".bundle-")
++        .tempfile_in(scratch)
++        .map_err(|e| format!("{}: {e}", scratch.display()))?;
++    let mut hasher = Sha256::new();
++    let mut written = 0u64;
++    while let Some(chunk) = response
++        .chunk()
++        .await
++        .map_err(|e| format!("the Gaming Services download stopped: {e}"))?
++    {
++        written += chunk.len() as u64;
++        if written > location.size {
++            return Err(
++                "the Gaming Services download is larger than the delivery service said".into(),
++            );
++        }
++        hasher.update(&chunk);
++        file.write_all(&chunk).map_err(|e| e.to_string())?;
++    }
++    if written != location.size {
++        return Err(format!(
++            "the Gaming Services download stopped at {written} of {} bytes",
++            location.size
++        ));
++    }
++    if let Some(expected) = location.sha256
++        && <[u8; 32]>::from(hasher.finalize()) != expected
++    {
++        return Err(
++            "the Gaming Services download does not match the SHA-256 the delivery service gave"
++                .into(),
++        );
++    }
++    file.flush().map_err(|e| e.to_string())?;
++    Ok(file)
++}
++
++/// Fetch the key: find Gaming Services, download it, look for the pinned key
++/// in it, store the key and delete the download.
++pub async fn fetch(timeout: Duration) -> Result<Fetched, String> {
++    let dir = key_dir()?;
++    let scratch = fetch_dir()?;
++    private_dir(&scratch)?;
++    let started = Instant::now();
++    let location = fe3::locate_bundle(timeout).await?;
++    let bundle = download(&location, &scratch, timeout).await?;
++    let path = bundle.path().to_path_buf();
++    let scratch_for_scan = scratch.clone();
++    let found = tokio::task::spawn_blocking(move || {
++        let mut stats = scan::ScanStats::default();
++        scan::scan_bundle(
++            &path,
++            &scratch_for_scan,
++            &GAME_PACKAGE_KEY_SHA256,
++            &mut stats,
++        )
++        .map(|found| (found, stats))
++    })
++    .await
++    .map_err(|e| e.to_string())?
++    .map_err(|e| format!("could not read the Gaming Services package: {e}"));
++    // Deleted whatever was found.
++    drop(bundle);
++    let (found, stats) = found?;
++    let found = found.ok_or_else(|| {
++        format!(
++            "{} holds no key with the pinned fingerprint ({} candidate keys in {} files); \
++             Microsoft may have changed the package",
++            location.moniker, stats.candidates, stats.members
++        )
++    })?;
++    let key = XvdSigningKey::from_blob(&found.blob, &GAME_PACKAGE_KEY_SHA256)
++        .map_err(|e| e.to_string())?;
++    let path = store_in(&dir, &found.blob)?;
++    let _ = std::fs::remove_file(dir.join(FAILED_FILE));
++    Ok(Fetched {
++        key,
++        path,
++        package: found.package,
++        member: found.member,
++        bundle: location.moniker,
++        bytes: location.size,
++        seconds: started.elapsed().as_secs_f64(),
++    })
++}
++
++fn env_is(name: &str, value: &str) -> bool {
++    std::env::var(name).is_ok_and(|v| v == value)
++}
++
++pub fn signature_required() -> bool {
++    env_is(REQUIRE_SIGNED_ENV, "1")
++}
++
++pub fn auto_fetch_enabled() -> bool {
++    !env_is(AUTO_FETCH_ENV, "0")
++}
++
++/// The key for checking a package about to be installed.
++///
++/// The stored key if there is one. Otherwise one attempt to fetch it, bounded
++/// by `AUTO_FETCH_TIMEOUT`, unless `XODUS_XVD_KEY_AUTOFETCH=0` or an
++/// automatic attempt failed in the last day. Without a key the install goes
++/// on, with a warning on stderr, unless `XODUS_REQUIRE_SIGNED_PACKAGE=1`, in
++/// which case this is an error.
++pub async fn for_install() -> Result<Option<XvdSigningKey>, String> {
++    let dir = key_dir();
++    let mut why = String::new();
++    if let Ok(dir) = &dir {
++        match load_from(dir, &GAME_PACKAGE_KEY_SHA256) {
++            Ok(Some(key)) => return Ok(Some(key)),
++            Ok(None) => why = "no package signing key is stored".into(),
++            Err(e) => {
++                eprintln!("warning: ignoring the stored package signing key: {e}");
++                why = format!("the stored key is unusable ({e})");
++            }
++        }
++        let recent_failure = last_failure(dir)
++            .and_then(|t| t.elapsed().ok())
++            .is_some_and(|age| age < RETRY_AFTER);
++        if !auto_fetch_enabled() {
++            why.push_str(&format!(" and {AUTO_FETCH_ENV}=0"));
++        } else if recent_failure {
++            why.push_str(" and fetching it failed less than a day ago");
++        } else {
++            eprintln!(
++                "note: fetching the key that signs game packages from Microsoft Gaming Services \
++                 (anonymous Store download, about 200 MB, once)"
++            );
++            match tokio::time::timeout(AUTO_FETCH_TIMEOUT, fetch(AUTO_FETCH_TIMEOUT)).await {
++                Ok(Ok(fetched)) => {
++                    eprintln!(
++                        "note: package signing key {} stored in {}",
++                        hex(fetched.key.fingerprint()),
++                        fetched.path.display()
++                    );
++                    return Ok(Some(fetched.key));
++                }
++                Ok(Err(e)) => {
++                    record_failure(dir);
++                    why = format!("fetching it failed: {e}");
++                }
++                Err(_) => {
++                    record_failure(dir);
++                    why = format!(
++                        "fetching it took longer than {} s",
++                        AUTO_FETCH_TIMEOUT.as_secs()
++                    );
++                }
++            }
++        }
++    } else if let Err(e) = &dir {
++        why = e.clone();
++    }
++    if signature_required() {
++        return Err(format!(
++            "refusing this download: {REQUIRE_SIGNED_ENV}=1, and the package header's signature \
++             cannot be checked: {why}. Run `xodus-cli xvd-key fetch` to fetch the key"
++        ));
++    }
++    eprintln!(
++        "warning: the package header's signature is not checked: {why}. Run `xodus-cli xvd-key \
++         fetch` to fetch the key, or set {REQUIRE_SIGNED_ENV}=1 to refuse such installs"
++    );
++    Ok(None)
++}
++
++#[cfg(test)]
++mod tests {
++    use msixvc::signature::testing::{blob_sha256, other_key, public_blob, test_key};
++
++    use super::*;
++
++    #[cfg(unix)]
++    fn mode(path: &Path) -> u32 {
++        use std::os::unix::fs::PermissionsExt;
++        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
++    }
++
++    #[test]
++    fn a_stored_key_is_private_and_hashed_again_when_loaded() {
++        let root = tempfile::tempdir().unwrap();
++        let dir = root.path().join("xvd-key");
++        let blob = public_blob(&test_key().to_public_key());
++        let pin = blob_sha256(&blob);
++        assert_eq!(status_of(&dir, &pin), Status::Absent);
++
++        let path = store_in(&dir, &blob).unwrap();
++        #[cfg(unix)]
++        {
++            assert_eq!(mode(&path), 0o600);
++            assert_eq!(mode(&dir), 0o700);
++        }
++        assert_eq!(status_of(&dir, &pin), Status::Present { fingerprint: pin });
++        assert!(load_from(&dir, &pin).unwrap().is_some());
++        // The real pin does not accept the test key.
++        assert!(matches!(
++            status_of(&dir, &GAME_PACKAGE_KEY_SHA256),
++            Status::Invalid(e) if e.contains("not the pinned")
++        ));
++
++        // Changed on disk: refused on the next load.
++        let other = public_blob(&other_key().to_public_key());
++        std::fs::write(&path, &other).unwrap();
++        assert!(matches!(status_of(&dir, &pin), Status::Invalid(_)));
++
++        assert!(forget_in(&dir).unwrap());
++        assert!(!forget_in(&dir).unwrap());
++        assert_eq!(status_of(&dir, &pin), Status::Absent);
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn a_key_file_others_can_read_or_a_link_is_refused() {
++        use std::os::unix::fs::PermissionsExt;
++        let root = tempfile::tempdir().unwrap();
++        let dir = root.path().join("xvd-key");
++        let blob = public_blob(&test_key().to_public_key());
++        let pin = blob_sha256(&blob);
++        let path = store_in(&dir, &blob).unwrap();
++        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
++        assert!(matches!(status_of(&dir, &pin), Status::Invalid(e) if e.contains("open to other")));
++
++        std::fs::remove_file(&path).unwrap();
++        let elsewhere = root.path().join("elsewhere.blob");
++        std::fs::write(&elsewhere, &blob).unwrap();
++        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o600)).unwrap();
++        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
++        assert!(matches!(status_of(&dir, &pin), Status::Invalid(_)));
++    }
++
++    /// Checks the key verifies real package headers: the files named by
++    /// `XODUS_LIVE_XVD_HEADERS` (separated by `:`; each at least the first
++    /// 4096 bytes of a retail package, such as an installed
++    /// `.xodus-streaming.msixvc`). Uses the key stored in `XODUS_XVD_KEY_DIR`
++    /// if there is one; otherwise fetches Microsoft Gaming Services
++    /// anonymously from the Store (about 200 MB, into that directory's
++    /// `.fetch`, deleted after). Nothing signs in. Run with `--ignored`.
++    #[tokio::test]
++    #[ignore = "may download Microsoft Gaming Services from the Store"]
++    async fn live_the_key_verifies_retail_headers() {
++        let headers = std::env::var("XODUS_LIVE_XVD_HEADERS")
++            .expect("set XODUS_LIVE_XVD_HEADERS to retail package headers, separated by ':'");
++        let dir = key_dir().unwrap();
++        let key = match load_from(&dir, &GAME_PACKAGE_KEY_SHA256).unwrap() {
++            Some(key) => key,
++            None => {
++                let fetched = fetch(FETCH_TIMEOUT).await.unwrap();
++                assert_eq!(
++                    std::fs::read_dir(fetch_dir().unwrap()).unwrap().count(),
++                    0,
++                    "the download is deleted"
++                );
++                fetched.key
++            }
++        };
++        assert_eq!(key.fingerprint(), &GAME_PACKAGE_KEY_SHA256);
++        for path in headers.split(':') {
++            let mut header = vec![0u8; 4096];
++            std::fs::File::open(path)
++                .and_then(|mut f| f.read_exact(&mut header))
++                .unwrap();
++            msixvc::signature::verify_header(&header, &key)
++                .unwrap_or_else(|e| panic!("{path}: {e}"));
++            // And one changed signed byte does not.
++            header[0x240] ^= 1;
++            assert!(msixvc::signature::verify_header(&header, &key).is_err());
++        }
++    }
++}
+diff --git a/crates/xodus-cli/src/xvd_key/scan.rs b/crates/xodus-cli/src/xvd_key/scan.rs
+new file mode 100644
+index 0000000..07f5dd3
+--- /dev/null
++++ b/crates/xodus-cli/src/xvd_key/scan.rs
+@@ -0,0 +1,355 @@
++//! Finding the pinned key among the bytes of a Microsoft Gaming Services
++//! package.
++//!
++//! The key is a `BCRYPT_RSAPUBLIC_BLOB` held as data in some of the package's
++//! binaries. Every place an RSA-4096 public blob could start is a candidate,
++//! and a candidate is kept only if its SHA-256 is the pin: nothing else about
++//! where it was found is trusted, so a package that holds other keys, or was
++//! changed on its way here, can at worst hold no key this accepts.
++
++use std::fs::File;
++use std::io::{self, Read, Seek, SeekFrom, Write};
++use std::path::Path;
++
++use msixvc::signature::{BLOB_HEADER_LEN, BLOB_MAGIC, rsa4096_public_blob_len};
++use sha2::{Digest, Sha256};
++
++use super::zip::{Archive, Entry, STORED};
++
++/// The longest blob this looks for: an eight-byte exponent.
++const MAX_BLOB: usize = BLOB_HEADER_LEN + 8 + 512;
++const CHUNK: usize = 1 << 20;
++/// No binary in the package is near this; a member that claims to be is
++/// read no further.
++pub const MAX_MEMBER: u64 = 512 << 20;
++/// Nor is a package inside the bundle.
++pub const MAX_NESTED_PACKAGE: u64 = 1 << 30;
++
++#[derive(Debug, Default, Clone, PartialEq, Eq)]
++pub struct ScanStats {
++    /// Members read.
++    pub members: usize,
++    /// Bytes read, after inflating.
++    pub bytes: u64,
++    /// Well-formed RSA-4096 public blobs seen, the pinned one included.
++    pub candidates: usize,
++}
++
++/// The pinned blob, if `reader` holds one.
++pub fn scan_reader(
++    mut reader: impl Read,
++    pin: &[u8; 32],
++    stats: &mut ScanStats,
++) -> io::Result<Option<Vec<u8>>> {
++    let mut buf: Vec<u8> = Vec::with_capacity(CHUNK + MAX_BLOB);
++    let mut chunk = vec![0u8; CHUNK];
++    loop {
++        let n = reader.read(&mut chunk)?;
++        let eof = n == 0;
++        buf.extend_from_slice(&chunk[..n]);
++        stats.bytes += n as u64;
++        // Positions before `done` need nothing past the end of `buf`.
++        let done = if eof {
++            buf.len()
++        } else {
++            buf.len().saturating_sub(MAX_BLOB - 1)
++        };
++        // The magic may straddle `done`; only a start before it is taken now.
++        let window = (done + BLOB_MAGIC.len() - 1).min(buf.len());
++        let mut i = 0;
++        while let Some(found) = memfind(&buf[i..window], BLOB_MAGIC) {
++            let at = i + found;
++            if at >= done {
++                break;
++            }
++            if let Some(len) = rsa4096_public_blob_len(&buf[at..])
++                && at + len <= buf.len()
++            {
++                stats.candidates += 1;
++                let blob = &buf[at..at + len];
++                if Sha256::digest(blob).as_slice() == pin {
++                    return Ok(Some(blob.to_vec()));
++                }
++            }
++            i = at + 1;
++        }
++        if eof {
++            return Ok(None);
++        }
++        buf.drain(..done);
++    }
++}
++
++fn memfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
++    haystack.windows(needle.len()).position(|w| w == needle)
++}
++
++/// Whether a member of a package is worth reading: the two binaries the key
++/// has been found in first, then any other binary.
++fn priority(path: &str) -> Option<u8> {
++    let lower = path.to_ascii_lowercase();
++    let file = lower.rsplit('/').next().unwrap_or(&lower);
++    match file {
++        "xsapi.dll" | "xvdd.sys" => Some(0),
++        _ if [".dll", ".sys", ".exe"]
++            .iter()
++            .any(|ext| file.ends_with(ext)) =>
++        {
++            Some(1)
++        }
++        _ => None,
++    }
++}
++
++/// Whether a member of the bundle is a package worth opening: the x64 one
++/// first, then any other that is not for ARM.
++fn package_priority(path: &str) -> Option<u8> {
++    let lower = path.to_ascii_lowercase();
++    if !(lower.ends_with(".appx") || lower.ends_with(".msix")) {
++        return None;
++    }
++    if lower.contains("arm") {
++        return None;
++    }
++    Some(if lower.contains("x64") { 0 } else { 1 })
++}
++
++fn by_priority(entries: &[Entry], rank: fn(&str) -> Option<u8>) -> Vec<Entry> {
++    let mut ranked: Vec<(u8, Entry)> = entries
++        .iter()
++        .filter_map(|e| rank(&e.path()).map(|r| (r, e.clone())))
++        .collect();
++    ranked.sort_by_key(|(r, _)| *r);
++    ranked.into_iter().map(|(_, e)| e).collect()
++}
++
++/// Where the pinned key was found, and the key.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Found {
++    pub blob: Vec<u8>,
++    pub package: String,
++    pub member: String,
++}
++
++/// Look for the pinned key in the binaries of a package (an Appx or Msix
++/// archive) at `start..start + len` of `file`.
++fn scan_package(
++    file: &mut File,
++    start: u64,
++    len: u64,
++    pin: &[u8; 32],
++    stats: &mut ScanStats,
++) -> io::Result<Option<(Vec<u8>, String)>> {
++    let mut archive = Archive::open(&mut *file, start, len)?;
++    for entry in by_priority(&archive.entries, priority) {
++        stats.members += 1;
++        let reader = archive.reader(&entry, MAX_MEMBER)?;
++        if let Some(blob) = scan_reader(reader, pin, stats)? {
++            return Ok(Some((blob, entry.path())));
++        }
++    }
++    Ok(None)
++}
++
++/// Look for the pinned key in an Appx bundle on disk.
++///
++/// Each package in the bundle is read where it lies when it is stored, as
++/// bundles store them. One that is deflated is inflated into a temporary
++/// file in `scratch`, at most `MAX_NESTED_PACKAGE` bytes, and removed after.
++/// A package given directly, rather than a bundle, is read the same way.
++pub fn scan_bundle(
++    path: &Path,
++    scratch: &Path,
++    pin: &[u8; 32],
++    stats: &mut ScanStats,
++) -> io::Result<Option<Found>> {
++    let mut file = File::open(path)?;
++    let len = file.seek(SeekFrom::End(0))?;
++    let entries = Archive::open(&mut file, 0, len)?.entries;
++    let packages = by_priority(&entries, package_priority);
++    if packages.is_empty() {
++        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
++        return Ok(
++            scan_package(&mut file, 0, len, pin, stats)?.map(|(blob, member)| Found {
++                blob,
++                package: name.unwrap_or_default(),
++                member,
++            }),
++        );
++    }
++    for package in packages {
++        let found = if package.method == STORED {
++            let (start, len) = Archive::open(&mut file, 0, len)?.data_range(&package)?;
++            scan_package(&mut file, start, len, pin, stats)?
++        } else {
++            let mut inflated = tempfile::Builder::new()
++                .prefix(".package-")
++                .tempfile_in(scratch)?;
++            {
++                let mut archive = Archive::open(&mut file, 0, len)?;
++                let mut reader = archive.reader(&package, MAX_NESTED_PACKAGE)?;
++                io::copy(&mut reader, inflated.as_file_mut())?;
++            }
++            inflated.as_file_mut().flush()?;
++            let mut inner = inflated.reopen()?;
++            let inner_len = inner.seek(SeekFrom::End(0))?;
++            scan_package(&mut inner, 0, inner_len, pin, stats)?
++        };
++        if let Some((blob, member)) = found {
++            return Ok(Some(Found {
++                blob,
++                package: package.path(),
++                member,
++            }));
++        }
++    }
++    Ok(None)
++}
++
++#[cfg(test)]
++mod tests {
++    use std::io::Cursor;
++
++    use msixvc::signature::testing::{blob_sha256, other_key, public_blob, test_key};
++
++    use super::super::zip::testing::zip;
++    use super::*;
++
++    fn blob() -> Vec<u8> {
++        public_blob(&test_key().to_public_key())
++    }
++
++    /// A binary with the blob at `at`, among noise and decoys.
++    fn binary(at: usize, len: usize, key: Option<&[u8]>) -> Vec<u8> {
++        let mut data: Vec<u8> = (0..len).map(|i| (i * 131 % 253) as u8).collect();
++        // Decoys: the magic alone, and a 2048-bit header.
++        data[10..14].copy_from_slice(b"RSA1");
++        data[100..104].copy_from_slice(b"RSA1");
++        data[104..108].copy_from_slice(&2048u32.to_le_bytes());
++        if let Some(key) = key {
++            data[at..at + key.len()].copy_from_slice(key);
++        }
++        data
++    }
++
++    #[test]
++    fn the_pinned_blob_is_found_anywhere_in_a_stream() {
++        let key = blob();
++        let pin = blob_sha256(&key);
++        // At the start, across a chunk boundary, and at the very end.
++        for at in [
++            0,
++            CHUNK - 7,
++            CHUNK - MAX_BLOB - 1,
++            CHUNK - MAX_BLOB,
++            CHUNK - MAX_BLOB + 1,
++            CHUNK - MAX_BLOB + 3,
++            3 * CHUNK - key.len(),
++        ] {
++            let data = binary(at, 3 * CHUNK, Some(&key));
++            let mut stats = ScanStats::default();
++            let found = scan_reader(Cursor::new(data), &pin, &mut stats).unwrap();
++            assert_eq!(found.as_deref(), Some(&key[..]), "at {at}");
++            assert_eq!(stats.candidates, 1, "at {at}");
++        }
++        // Not there.
++        let mut stats = ScanStats::default();
++        let data = binary(0, CHUNK + 5, None);
++        assert_eq!(
++            scan_reader(Cursor::new(data), &pin, &mut stats).unwrap(),
++            None
++        );
++        assert_eq!(stats.candidates, 0);
++    }
++
++    #[test]
++    fn a_blob_that_is_not_the_pinned_one_is_not_taken() {
++        let other = public_blob(&other_key().to_public_key());
++        let pin = blob_sha256(&blob());
++        let data = binary(5000, 20_000, Some(&other));
++        let mut stats = ScanStats::default();
++        assert_eq!(
++            scan_reader(Cursor::new(data), &pin, &mut stats).unwrap(),
++            None
++        );
++        assert_eq!(stats.candidates, 1);
++        // The same blob one byte off.
++        let mut changed = blob();
++        changed[300] ^= 1;
++        let data = binary(5000, 20_000, Some(&changed));
++        let mut stats = ScanStats::default();
++        assert_eq!(
++            scan_reader(Cursor::new(data), &pin, &mut stats).unwrap(),
++            None
++        );
++        assert_eq!(stats.candidates, 1);
++    }
++
++    fn bundle(stored_package: bool, key_member: &str, zip64: bool) -> Vec<u8> {
++        let key = blob();
++        let other = public_blob(&other_key().to_public_key());
++        let with_key = binary(777, 50_000, Some(&key));
++        let with_other = binary(10, 9_000, Some(&other));
++        let x64 = zip(
++            &[
++                ("AppxManifest.xml", b"<Package/>", true),
++                ("other.dll", &with_other, true),
++                (key_member, &with_key, true),
++            ],
++            zip64,
++        );
++        let arm = zip(&[("xsapi.dll", &with_other, true)], zip64);
++        zip(
++            &[
++                ("AppxMetadata/AppxBundleManifest.xml", b"<Bundle/>", true),
++                ("Microsoft.Thing_1.0.0.0_arm64.msix", &arm, false),
++                ("Microsoft.Thing_1.0.0.0_x64.msix", &x64, !stored_package),
++            ],
++            zip64,
++        )
++    }
++
++    #[test]
++    fn the_key_is_found_in_a_package_inside_a_bundle() {
++        let dir = tempfile::tempdir().unwrap();
++        let pin = blob_sha256(&blob());
++        for (stored, member, zip64) in [
++            (true, "xsapi.dll", true),
++            (true, "drivers%2Fxvdd.sys", false),
++            (false, "drivers/xvdd.sys", true),
++            (true, "bin/SomethingElse.exe", true),
++        ] {
++            let path = dir.path().join("bundle.appxbundle");
++            std::fs::write(&path, bundle(stored, member, zip64)).unwrap();
++            let mut stats = ScanStats::default();
++            let found = scan_bundle(&path, dir.path(), &pin, &mut stats)
++                .unwrap()
++                .unwrap_or_else(|| panic!("{member}: not found"));
++            assert_eq!(found.blob, blob());
++            assert_eq!(found.package, "Microsoft.Thing_1.0.0.0_x64.msix");
++            assert_eq!(found.member, member.replace("%2F", "/"));
++            assert!(stats.candidates >= 1);
++        }
++        // Nothing left behind in the scratch directory but the bundle.
++        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
++        assert_eq!(left.len(), 1);
++    }
++
++    #[test]
++    fn a_bundle_without_the_pinned_key_yields_nothing() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("bundle.appxbundle");
++        std::fs::write(&path, bundle(true, "xsapi.dll", true)).unwrap();
++        let mut stats = ScanStats::default();
++        let wrong_pin = [7u8; 32];
++        assert_eq!(
++            scan_bundle(&path, dir.path(), &wrong_pin, &mut stats).unwrap(),
++            None
++        );
++        // The ARM package is never opened; both x64 binaries holding a key are.
++        assert_eq!(stats.candidates, 2);
++        // Not a zip at all.
++        std::fs::write(&path, b"not a bundle").unwrap();
++        assert!(scan_bundle(&path, dir.path(), &wrong_pin, &mut stats).is_err());
++    }
++}
+diff --git a/crates/xodus-cli/src/xvd_key/testdata/displaycatalog.json b/crates/xodus-cli/src/xvd_key/testdata/displaycatalog.json
+new file mode 100644
+index 0000000..526168f
+--- /dev/null
++++ b/crates/xodus-cli/src/xvd_key/testdata/displaycatalog.json
+@@ -0,0 +1,21 @@
++{
++ "Products": [
++  {
++   "ProductId": "9MWPM2CQNLHN",
++   "LocalizedProperties": [
++    {
++     "ProductTitle": "Gaming Services"
++    }
++   ],
++   "DisplaySkuAvailabilities": [
++    {
++     "Sku": {
++      "Properties": {
++       "FulfillmentData": "{\"ProductId\": \"9MWPM2CQNLHN\", \"WuBundleId\": \"00000000-0000-4000-8000-000000000000\", \"WuCategoryId\": \"aaaaaaaa-1111-4222-8333-444444444444\", \"PackageFamilyName\": \"Microsoft.GamingServices_8wekyb3d8bbwe\", \"SkuId\": \"0010\"}"
++      }
++     }
++    }
++   ]
++  }
++ ]
++}
+diff --git a/crates/xodus-cli/src/xvd_key/testdata/get-cookie.xml b/crates/xodus-cli/src/xvd_key/testdata/get-cookie.xml
+new file mode 100644
+index 0000000..40b9e23
+--- /dev/null
++++ b/crates/xodus-cli/src/xvd_key/testdata/get-cookie.xml
+@@ -0,0 +1 @@
++<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://www.w3.org/2005/08/addressing"><s:Header><a:Action s:mustUnderstand="1">http://www.microsoft.com/SoftwareDistribution/Server/ClientWebService/GetCookieResponse</a:Action></s:Header><s:Body><GetCookieResponse xmlns="http://www.microsoft.com/SoftwareDistribution/Server/ClientWebService"><GetCookieResult><Expiration>2045-01-01T00:00:00Z</Expiration><EncryptedData>Q29va2llRm9yVGVzdHM=</EncryptedData></GetCookieResult></GetCookieResponse></s:Body></s:Envelope>
+diff --git a/crates/xodus-cli/src/xvd_key/testdata/get-extended-update-info2.xml b/crates/xodus-cli/src/xvd_key/testdata/get-extended-update-info2.xml
+new file mode 100644
+index 0000000..63a6377
+--- /dev/null
++++ b/crates/xodus-cli/src/xvd_key/testdata/get-extended-update-info2.xml
+@@ -0,0 +1 @@
++<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://www.w3.org/2005/08/addressing"><s:Header><a:Action s:mustUnderstand="1">http://www.microsoft.com/SoftwareDistribution/Server/ClientWebService/GetExtendedUpdateInfo2Response</a:Action></s:Header><s:Body><GetExtendedUpdateInfo2Response xmlns="http://www.microsoft.com/SoftwareDistribution/Server/ClientWebService"><GetExtendedUpdateInfo2Result><FileLocations><FileLocation><FileDigest>YWJtLWNhYg==</FileDigest><Url>http://dl.delivery.mp.microsoft.com/filestreamingservice/files/abm-test</Url></FileLocation><FileLocation><FileDigest>c2hhMS1vZi10aGUtYnVuZGxlISE=</FileDigest><Url>http://tlu.dl.delivery.mp.microsoft.com/filestreamingservice/files/bbbbbbbb-test?P1=1&amp;P2=2</Url></FileLocation></FileLocations></GetExtendedUpdateInfo2Result></GetExtendedUpdateInfo2Response></s:Body></s:Envelope>
+diff --git a/crates/xodus-cli/src/xvd_key/testdata/sync-updates.xml b/crates/xodus-cli/src/xvd_key/testdata/sync-updates.xml
+new file mode 100644
+index 0000000..519a970
+--- /dev/null
++++ b/crates/xodus-cli/src/xvd_key/testdata/sync-updates.xml
+@@ -0,0 +1 @@
++<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://www.w3.org/2005/08/addressing"><s:Header><a:Action s:mustUnderstand="1">http://www.microsoft.com/SoftwareDistribution/Server/ClientWebService/SyncUpdatesResponse</a:Action></s:Header><s:Body><SyncUpdatesResponse xmlns="http://www.microsoft.com/SoftwareDistribution/Server/ClientWebService"><SyncUpdatesResult><NewUpdates><UpdateInfo><ID>100</ID><Deployment><ID>9100</ID><Action>Install</Action></Deployment><IsLeaf>true</IsLeaf><Xml>&lt;UpdateIdentity UpdateID="aaaaaaaa-1111-4222-8333-444444444444" RevisionNumber="4" /&gt;&lt;Properties UpdateType="Software" PerUser="true"&gt;&lt;/Properties&gt;</Xml><Verification Signature="dGVzdA==" Algorithm="SHA256"/></UpdateInfo><UpdateInfo><ID>101</ID><Deployment><ID>9101</ID><Action>Install</Action></Deployment><IsLeaf>true</IsLeaf><Xml>&lt;UpdateIdentity UpdateID="dddddddd-1111-4222-8333-444444444444" RevisionNumber="1" /&gt;&lt;Properties UpdateType="Software" PerUser="true"&gt;&lt;SecuredFragment&gt;FileUrl&lt;/SecuredFragment&gt;&lt;/Properties&gt;&lt;ApplicabilityRules&gt;&lt;Metadata&gt;&lt;AppxPackageMetadata&gt;&lt;AppxMetadata PackageType="UAP" IsAppxBundle="true" PackageMoniker="Microsoft.GamingServices_38.100.0.0_neutral_~_8wekyb3d8bbwe"&gt;&lt;ApplicabilityBlob&gt;{"content.type":7,"policy":{"category.second":"Utilities &amp;amp; tools"}}&lt;/ApplicabilityBlob&gt;&lt;/AppxMetadata&gt;&lt;/AppxPackageMetadata&gt;&lt;/Metadata&gt;&lt;/ApplicabilityRules&gt;</Xml><Verification Signature="dGVzdA==" Algorithm="SHA256"/></UpdateInfo><UpdateInfo><ID>102</ID><Deployment><ID>9102</ID><Action>Install</Action></Deployment><IsLeaf>true</IsLeaf><Xml>&lt;UpdateIdentity UpdateID="cccccccc-1111-4222-8333-444444444444" RevisionNumber="1" /&gt;&lt;Properties UpdateType="Software" PerUser="true"&gt;&lt;SecuredFragment&gt;FileUrl&lt;/SecuredFragment&gt;&lt;/Properties&gt;&lt;ApplicabilityRules&gt;&lt;Metadata&gt;&lt;AppxPackageMetadata&gt;&lt;AppxMetadata PackageType="UAP" IsAppxBundle="true" PackageMoniker="Microsoft.GamingServices_38.118.9001.0_neutral_~_8wekyb3d8bbwe"&gt;&lt;ApplicabilityBlob&gt;{"content.type":7,"policy":{"category.second":"Utilities &amp;amp; tools"}}&lt;/ApplicabilityBlob&gt;&lt;/AppxMetadata&gt;&lt;/AppxPackageMetadata&gt;&lt;/Metadata&gt;&lt;/ApplicabilityRules&gt;</Xml><Verification Signature="dGVzdA==" Algorithm="SHA256"/></UpdateInfo><UpdateInfo><ID>103</ID><Deployment><ID>9103</ID><Action>Install</Action></Deployment><IsLeaf>true</IsLeaf><Xml>&lt;UpdateIdentity UpdateID="eeeeeeee-1111-4222-8333-444444444444" RevisionNumber="1" /&gt;&lt;Properties UpdateType="Software" PerUser="true"&gt;&lt;SecuredFragment&gt;FileUrl&lt;/SecuredFragment&gt;&lt;/Properties&gt;&lt;ApplicabilityRules&gt;&lt;Metadata&gt;&lt;AppxPackageMetadata&gt;&lt;AppxMetadata PackageType="UAP" IsAppxBundle="true" PackageMoniker="Microsoft.VCLibs.140.00_14.0.33519.0_x64__8wekyb3d8bbwe"&gt;&lt;ApplicabilityBlob&gt;{"content.type":7,"policy":{"category.second":"Utilities &amp;amp; tools"}}&lt;/ApplicabilityBlob&gt;&lt;/AppxMetadata&gt;&lt;/AppxPackageMetadata&gt;&lt;/Metadata&gt;&lt;/ApplicabilityRules&gt;</Xml><Verification Signature="dGVzdA==" Algorithm="SHA256"/></UpdateInfo></NewUpdates><Truncated>false</Truncated><NewCookie><Expiration>2045-01-01T00:00:00Z</Expiration><EncryptedData>TmV3Q29va2ll</EncryptedData></NewCookie><ExtendedUpdateInfo><Updates><Update><ID>100</ID><Xml>&lt;ExtendedProperties PackageIdentityName="Test" /&gt;&lt;Files&gt;&lt;/Files&gt;</Xml></Update><Update><ID>101</ID><Xml>&lt;ExtendedProperties PackageIdentityName="Test" /&gt;&lt;Files&gt;&lt;File FileName="old00000-1111-4222-8333-444444444444.appxbundle" Digest="b2xkLWJ1bmRsZQ==" DigestAlgorithm="SHA1" Size="190000000" InstallerSpecificIdentifier="Microsoft.GamingServices_38.100.0.0_neutral_~_8wekyb3d8bbwe"&gt;&lt;AdditionalDigest Algorithm="SHA256"&gt;ERERERERERERERERERERERERERERERERERERERERERE=&lt;/AdditionalDigest&gt;&lt;PiecesHashDigest Algorithm="SHA256"&gt;cGllY2Vz&lt;/PiecesHashDigest&gt;&lt;/File&gt;&lt;/Files&gt;</Xml></Update><Update><ID>102</ID><Xml>&lt;ExtendedProperties PackageIdentityName="Test" /&gt;&lt;Files&gt;&lt;File FileName="bbbbbbbb-1111-4222-8333-444444444444.appxbundle" Digest="c2hhMS1vZi10aGUtYnVuZGxlISE=" DigestAlgorithm="SHA1" Size="200322495" InstallerSpecificIdentifier="Microsoft.GamingServices_38.118.9001.0_neutral_~_8wekyb3d8bbwe"&gt;&lt;AdditionalDigest Algorithm="SHA256"&gt;ERERERERERERERERERERERERERERERERERERERERERE=&lt;/AdditionalDigest&gt;&lt;PiecesHashDigest Algorithm="SHA256"&gt;cGllY2Vz&lt;/PiecesHashDigest&gt;&lt;/File&gt;&lt;File FileName="Abm_bbbbbbbb-1111-4222-8333-444444444444.cab" Digest="YWJtLWNhYg==" DigestAlgorithm="SHA1" Size="243427"&gt;&lt;AdditionalDigest Algorithm="SHA256"&gt;ERERERERERERERERERERERERERERERERERERERERERE=&lt;/AdditionalDigest&gt;&lt;PiecesHashDigest Algorithm="SHA256"&gt;cGllY2Vz&lt;/PiecesHashDigest&gt;&lt;/File&gt;&lt;/Files&gt;</Xml></Update><Update><ID>103</ID><Xml>&lt;ExtendedProperties PackageIdentityName="Test" /&gt;&lt;Files&gt;&lt;File FileName="ffffffff-1111-4222-8333-444444444444.appx" Digest="dmNsaWJz" DigestAlgorithm="SHA1" Size="896581" InstallerSpecificIdentifier="Microsoft.VCLibs.140.00_14.0.33519.0_x64__8wekyb3d8bbwe"&gt;&lt;AdditionalDigest Algorithm="SHA256"&gt;ERERERERERERERERERERERERERERERERERERERERERE=&lt;/AdditionalDigest&gt;&lt;PiecesHashDigest Algorithm="SHA256"&gt;cGllY2Vz&lt;/PiecesHashDigest&gt;&lt;/File&gt;&lt;/Files&gt;</Xml></Update></Updates></ExtendedUpdateInfo></SyncUpdatesResult></SyncUpdatesResponse></s:Body></s:Envelope>
+diff --git a/crates/xodus-cli/src/xvd_key/xml.rs b/crates/xodus-cli/src/xvd_key/xml.rs
+new file mode 100644
+index 0000000..788ef0d
+--- /dev/null
++++ b/crates/xodus-cli/src/xvd_key/xml.rs
+@@ -0,0 +1,218 @@
++//! A small, bounded XML tree, for the Store delivery service's answers.
++//!
++//! The answers are SOAP envelopes, some carrying further XML escaped inside
++//! an element's text. They are read into a tree of elements with local names
++//! (namespace prefixes dropped), attributes and text, with hard limits on the
++//! input size, the depth and the number of elements. A document type
++//! declaration is refused, and only the five predefined entities and character
++//! references are expanded, so nothing in an answer can make the parser fetch,
++//! expand or allocate beyond those limits.
++
++use quick_xml::Reader;
++use quick_xml::events::{BytesStart, Event};
++
++#[derive(Debug, Clone, Copy)]
++pub struct Limits {
++    pub max_bytes: usize,
++    pub max_depth: usize,
++    pub max_elements: usize,
++}
++
++/// Generous for every answer seen (the largest, SyncUpdates, is about 170 KB).
++pub const LIMITS: Limits = Limits {
++    max_bytes: 8 << 20,
++    max_depth: 64,
++    max_elements: 200_000,
++};
++
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Element {
++    pub name: String,
++    pub attributes: Vec<(String, String)>,
++    pub text: String,
++    pub children: Vec<Element>,
++}
++
++impl Element {
++    pub fn attribute(&self, name: &str) -> Option<&str> {
++        self.attributes
++            .iter()
++            .find(|(n, _)| n == name)
++            .map(|(_, v)| v.as_str())
++    }
++
++    pub fn child(&self, name: &str) -> Option<&Element> {
++        self.children.iter().find(|c| c.name == name)
++    }
++
++    pub fn children_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Element> {
++        self.children.iter().filter(move |c| c.name == name)
++    }
++
++    /// Every element named `name` at any depth, this one included, in
++    /// document order.
++    pub fn descendants<'a>(&'a self, name: &str) -> Vec<&'a Element> {
++        let mut out = Vec::new();
++        let mut stack = vec![self];
++        while let Some(e) = stack.pop() {
++            if e.name == name {
++                out.push(e);
++            }
++            stack.extend(e.children.iter().rev());
++        }
++        out
++    }
++}
++
++fn local(name: &str) -> String {
++    match name.rsplit_once(':') {
++        Some((_, local)) => local.to_string(),
++        None => name.to_string(),
++    }
++}
++
++fn element(start: &BytesStart<'_>) -> Result<Element, String> {
++    let mut attributes = Vec::new();
++    for attribute in start.attributes() {
++        let attribute = attribute.map_err(|e| format!("bad attribute: {e}"))?;
++        let value = attribute
++            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
++            .map_err(|e| format!("bad attribute value: {e}"))?;
++        attributes.push((local(attribute.key.as_ref()), value.into_owned()));
++    }
++    Ok(Element {
++        name: local(start.name().as_ref()),
++        attributes,
++        ..Element::default()
++    })
++}
++
++/// Read `input` into a tree, under `limits`. A fragment with several top-level
++/// elements, as the escaped update XML is, comes back as the children of an
++/// unnamed root.
++pub fn parse(input: &str, limits: Limits) -> Result<Element, String> {
++    if input.len() > limits.max_bytes {
++        return Err(format!(
++            "the answer is {} bytes, more than the {} allowed",
++            input.len(),
++            limits.max_bytes
++        ));
++    }
++    let mut reader = Reader::from_str(input);
++    reader.config_mut().check_end_names = true;
++    let mut stack: Vec<Element> = vec![Element::default()];
++    let mut elements = 0usize;
++    loop {
++        let event = reader
++            .read_event()
++            .map_err(|e| format!("malformed XML at {}: {e}", reader.buffer_position()))?;
++        match event {
++            Event::Start(ref start) | Event::Empty(ref start) => {
++                elements += 1;
++                if elements > limits.max_elements {
++                    return Err("the answer has too many elements".into());
++                }
++                let e = element(start)?;
++                if matches!(event, Event::Empty(_)) {
++                    stack.last_mut().unwrap().children.push(e);
++                } else {
++                    if stack.len() > limits.max_depth {
++                        return Err("the answer is nested too deeply".into());
++                    }
++                    stack.push(e);
++                }
++            }
++            Event::End(_) => {
++                if stack.len() < 2 {
++                    return Err("malformed XML: unbalanced end tag".into());
++                }
++                let done = stack.pop().unwrap();
++                stack.last_mut().unwrap().children.push(done);
++            }
++            Event::Text(text) => stack
++                .last_mut()
++                .unwrap()
++                .text
++                .push_str(&text.xml10_content()),
++            Event::CData(data) => stack
++                .last_mut()
++                .unwrap()
++                .text
++                .push_str(&data.xml10_content()),
++            Event::GeneralRef(reference) => {
++                let c = if reference.is_char_ref() {
++                    reference
++                        .resolve_char_ref()
++                        .map_err(|e| format!("bad character reference: {e}"))?
++                        .ok_or("bad character reference")?
++                } else {
++                    match &*reference.xml10_content() {
++                        "lt" => '<',
++                        "gt" => '>',
++                        "amp" => '&',
++                        "quot" => '"',
++                        "apos" => '\'',
++                        other => return Err(format!("unknown entity &{other};")),
++                    }
++                };
++                stack.last_mut().unwrap().text.push(c);
++            }
++            Event::DocType(_) => return Err("a document type declaration is not accepted".into()),
++            Event::Decl(_) | Event::PI(_) | Event::Comment(_) => {}
++            Event::Eof => break,
++        }
++    }
++    if stack.len() != 1 {
++        return Err("malformed XML: unclosed element".into());
++    }
++    Ok(stack.pop().unwrap())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn elements_attributes_text_and_entities_are_read() {
++        let root = parse(
++            r#"<?xml version="1.0"?><s:Envelope xmlns:s="urn:x"><s:Body a:x="1&amp;2" y='q'>a &lt;b&gt; &#65;&#x42;<![CDATA[<c>]]><Empty/></s:Body></s:Envelope>"#,
++            LIMITS,
++        )
++        .unwrap();
++        let body = root.descendants("Body")[0];
++        assert_eq!(body.attribute("x"), Some("1&2"));
++        assert_eq!(body.attribute("y"), Some("q"));
++        assert_eq!(body.text, "a <b> AB<c>");
++        assert_eq!(body.child("Empty").unwrap().name, "Empty");
++    }
++
++    #[test]
++    fn hostile_or_broken_input_is_refused() {
++        let doctype = r#"<!DOCTYPE x [<!ENTITY a "aaaa">]><x>&a;</x>"#;
++        assert!(
++            parse(doctype, LIMITS)
++                .unwrap_err()
++                .contains("document type")
++        );
++        assert!(parse("<x>&a;</x>", LIMITS).unwrap_err().contains("entity"));
++        assert!(parse("<x><y></x>", LIMITS).is_err());
++        assert!(parse("<x>", LIMITS).is_err());
++        let deep = "<a>".repeat(100) + &"</a>".repeat(100);
++        assert!(parse(&deep, LIMITS).unwrap_err().contains("deeply"));
++        let small = Limits {
++            max_bytes: 100,
++            max_depth: 64,
++            max_elements: 3,
++        };
++        assert!(
++            parse(&"<a/>".repeat(4), small)
++                .unwrap_err()
++                .contains("many")
++        );
++        assert!(
++            parse(&"x".repeat(101), small)
++                .unwrap_err()
++                .contains("bytes")
++        );
++    }
++}
+diff --git a/crates/xodus-cli/src/xvd_key/zip.rs b/crates/xodus-cli/src/xvd_key/zip.rs
+new file mode 100644
+index 0000000..2048862
+--- /dev/null
++++ b/crates/xodus-cli/src/xvd_key/zip.rs
+@@ -0,0 +1,434 @@
++//! Just enough of the zip format to read members out of an Appx bundle and the
++//! packages inside it, without extracting the rest.
++//!
++//! Appx packages and bundles are zip64 archives whose members are stored or
++//! deflated. Members are found through the central directory, every size and
++//! offset is checked against the bounds of the archive they belong to, and an
++//! archive inside another is read where it lies when it is stored, so a 200 MB
++//! bundle is never unpacked to read two files.
++
++use std::io::{self, Read, Seek, SeekFrom, Take};
++
++use flate2::read::DeflateDecoder;
++
++/// More members than any package this reads has, by a wide margin.
++const MAX_ENTRIES: u64 = 200_000;
++/// More central directory than that many members need.
++const MAX_CENTRAL_DIRECTORY: u64 = 64 << 20;
++const EOCD_SIGNATURE: u32 = 0x0605_4b50;
++const ZIP64_LOCATOR_SIGNATURE: u32 = 0x0706_4b50;
++const ZIP64_EOCD_SIGNATURE: u32 = 0x0606_4b50;
++const CENTRAL_SIGNATURE: u32 = 0x0201_4b50;
++const LOCAL_SIGNATURE: u32 = 0x0403_4b50;
++
++pub const STORED: u16 = 0;
++pub const DEFLATED: u16 = 8;
++
++fn invalid(what: impl Into<String>) -> io::Error {
++    io::Error::new(io::ErrorKind::InvalidData, what.into())
++}
++
++fn u16_at(b: &[u8], at: usize) -> u16 {
++    u16::from_le_bytes([b[at], b[at + 1]])
++}
++
++fn u32_at(b: &[u8], at: usize) -> u32 {
++    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
++}
++
++fn u64_at(b: &[u8], at: usize) -> u64 {
++    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
++}
++
++/// A member of an archive.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Entry {
++    pub name: String,
++    pub method: u16,
++    pub compressed_size: u64,
++    pub size: u64,
++    /// Where the member's local header is, from the start of the archive.
++    local_header: u64,
++}
++
++impl Entry {
++    /// The member's name as the package means it: Appx packages
++    /// percent-encode names, and both separators are seen.
++    pub fn path(&self) -> String {
++        let mut out = Vec::with_capacity(self.name.len());
++        let bytes = self.name.as_bytes();
++        let mut i = 0;
++        while i < bytes.len() {
++            if bytes[i] == b'%'
++                && i + 2 < bytes.len()
++                && let Ok(byte) = u8::from_str_radix(
++                    std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("zz"),
++                    16,
++                )
++            {
++                out.push(byte);
++                i += 3;
++                continue;
++            }
++            out.push(if bytes[i] == b'\\' { b'/' } else { bytes[i] });
++            i += 1;
++        }
++        String::from_utf8_lossy(&out).into_owned()
++    }
++}
++
++/// An archive occupying `start..start + len` of `file`.
++pub struct Archive<R> {
++    file: R,
++    start: u64,
++    len: u64,
++    pub entries: Vec<Entry>,
++}
++
++impl<R: Read + Seek> Archive<R> {
++    /// Read the central directory of the archive at `start..start + len`.
++    pub fn open(mut file: R, start: u64, len: u64) -> io::Result<Self> {
++        let entries = read_central_directory(&mut file, start, len)?;
++        Ok(Archive {
++            file,
++            start,
++            len,
++            entries,
++        })
++    }
++
++    /// Where a member's data lies, from the start of `file`, and how long it is.
++    pub fn data_range(&mut self, entry: &Entry) -> io::Result<(u64, u64)> {
++        let mut local = [0u8; 30];
++        if entry
++            .local_header
++            .checked_add(30)
++            .is_none_or(|end| end > self.len)
++        {
++            return Err(invalid(format!(
++                "{}: local header out of bounds",
++                entry.name
++            )));
++        }
++        self.file
++            .seek(SeekFrom::Start(self.start + entry.local_header))?;
++        self.file.read_exact(&mut local)?;
++        if u32_at(&local, 0) != LOCAL_SIGNATURE {
++            return Err(invalid(format!("{}: no local header", entry.name)));
++        }
++        let skip = 30 + u16_at(&local, 26) as u64 + u16_at(&local, 28) as u64;
++        let data = entry.local_header + skip;
++        match data.checked_add(entry.compressed_size) {
++            Some(end) if end <= self.len => Ok((self.start + data, entry.compressed_size)),
++            _ => Err(invalid(format!("{}: data out of bounds", entry.name))),
++        }
++    }
++
++    /// A reader of a member's contents, inflated if need be, that stops at
++    /// the size the directory gives and at `cap` bytes, whichever is less.
++    pub fn reader(&mut self, entry: &Entry, cap: u64) -> io::Result<Box<dyn Read + '_>> {
++        let (data, len) = self.data_range(entry)?;
++        self.file.seek(SeekFrom::Start(data))?;
++        let raw: Take<&mut R> = (&mut self.file).take(len);
++        let limit = entry.size.min(cap);
++        match entry.method {
++            STORED => Ok(Box::new(raw.take(limit))),
++            DEFLATED => Ok(Box::new(DeflateDecoder::new(raw).take(limit))),
++            other => Err(invalid(format!(
++                "{}: compression method {other} is not supported",
++                entry.name
++            ))),
++        }
++    }
++
++    #[cfg(test)]
++    pub fn into_inner(self) -> R {
++        self.file
++    }
++}
++
++fn read_central_directory<R: Read + Seek>(
++    file: &mut R,
++    start: u64,
++    len: u64,
++) -> io::Result<Vec<Entry>> {
++    // The end of central directory record is in the last 64 KiB + 22 bytes.
++    let tail_len = len.min(0xFFFF + 22);
++    if tail_len < 22 {
++        return Err(invalid("not a zip archive: too short"));
++    }
++    let tail_start = len - tail_len;
++    let mut tail = vec![0u8; tail_len as usize];
++    file.seek(SeekFrom::Start(start + tail_start))?;
++    file.read_exact(&mut tail)?;
++    let eocd = (0..=tail.len() - 22)
++        .rev()
++        .find(|&i| u32_at(&tail, i) == EOCD_SIGNATURE)
++        .ok_or_else(|| invalid("not a zip archive: no end of central directory"))?;
++    let mut count = u16_at(&tail, eocd + 10) as u64;
++    let mut cd_size = u32_at(&tail, eocd + 12) as u64;
++    let mut cd_offset = u32_at(&tail, eocd + 16) as u64;
++
++    // Zip64: the locator sits just before the record above.
++    if eocd >= 20 && u32_at(&tail, eocd - 20) == ZIP64_LOCATOR_SIGNATURE {
++        let record = u64_at(&tail, eocd - 20 + 8);
++        if record.checked_add(56).is_none_or(|end| end > len) {
++            return Err(invalid("zip64 end of central directory out of bounds"));
++        }
++        let mut z = [0u8; 56];
++        file.seek(SeekFrom::Start(start + record))?;
++        file.read_exact(&mut z)?;
++        if u32_at(&z, 0) != ZIP64_EOCD_SIGNATURE {
++            return Err(invalid("no zip64 end of central directory"));
++        }
++        count = u64_at(&z, 32);
++        cd_size = u64_at(&z, 40);
++        cd_offset = u64_at(&z, 48);
++    }
++    if count > MAX_ENTRIES || cd_size > MAX_CENTRAL_DIRECTORY {
++        return Err(invalid("zip central directory is implausibly large"));
++    }
++    if cd_offset.checked_add(cd_size).is_none_or(|end| end > len) {
++        return Err(invalid("zip central directory out of bounds"));
++    }
++    let mut cd = vec![0u8; cd_size as usize];
++    file.seek(SeekFrom::Start(start + cd_offset))?;
++    file.read_exact(&mut cd)?;
++
++    let mut entries = Vec::with_capacity(count as usize);
++    let mut at = 0usize;
++    for _ in 0..count {
++        if at + 46 > cd.len() || u32_at(&cd, at) != CENTRAL_SIGNATURE {
++            return Err(invalid("zip central directory entry is damaged"));
++        }
++        let method = u16_at(&cd, at + 10);
++        let mut compressed_size = u32_at(&cd, at + 20) as u64;
++        let mut size = u32_at(&cd, at + 24) as u64;
++        let name_len = u16_at(&cd, at + 28) as usize;
++        let extra_len = u16_at(&cd, at + 30) as usize;
++        let comment_len = u16_at(&cd, at + 32) as usize;
++        let mut local_header = u32_at(&cd, at + 42) as u64;
++        let name_at = at + 46;
++        let extra_at = name_at + name_len;
++        let next = extra_at + extra_len + comment_len;
++        if next > cd.len() {
++            return Err(invalid("zip central directory entry is damaged"));
++        }
++        let name = String::from_utf8_lossy(&cd[name_at..extra_at]).into_owned();
++
++        // The zip64 extra field holds, in order, whichever of these is
++        // 0xFFFFFFFF in the fixed part.
++        let mut extra = &cd[extra_at..extra_at + extra_len];
++        while extra.len() >= 4 {
++            let id = u16_at(extra, 0);
++            let field_len = u16_at(extra, 2) as usize;
++            if 4 + field_len > extra.len() {
++                break;
++            }
++            if id == 0x0001 {
++                let mut field = &extra[4..4 + field_len];
++                for value in [&mut size, &mut compressed_size, &mut local_header] {
++                    if *value == 0xFFFF_FFFF {
++                        if field.len() < 8 {
++                            return Err(invalid(format!("{name}: zip64 field too short")));
++                        }
++                        *value = u64_at(field, 0);
++                        field = &field[8..];
++                    }
++                }
++            }
++            extra = &extra[4 + field_len..];
++        }
++        entries.push(Entry {
++            name,
++            method,
++            compressed_size,
++            size,
++            local_header,
++        });
++        at = next;
++    }
++    Ok(entries)
++}
++
++/// Writing archives, for tests: stored or deflated members, optionally with
++/// zip64 records, the way Appx packages are written.
++#[cfg(test)]
++pub mod testing {
++    use std::io::Write;
++
++    use flate2::Compression;
++    use flate2::write::DeflateEncoder;
++
++    pub fn zip(members: &[(&str, &[u8], bool)], zip64: bool) -> Vec<u8> {
++        let mut out = Vec::new();
++        let mut central = Vec::new();
++        for (name, data, deflate) in members {
++            let (method, body) = if *deflate {
++                let mut e = DeflateEncoder::new(Vec::new(), Compression::default());
++                e.write_all(data).unwrap();
++                (8u16, e.finish().unwrap())
++            } else {
++                (0u16, data.to_vec())
++            };
++            let offset = out.len() as u64;
++            let crc = 0u32; // not checked by the reader
++            let (c32, s32, o32) = if zip64 {
++                (0xFFFF_FFFFu32, 0xFFFF_FFFFu32, 0xFFFF_FFFFu32)
++            } else {
++                (body.len() as u32, data.len() as u32, offset as u32)
++            };
++            // Local header, with an extra field of its own length to make
++            // sure the reader takes the local lengths for the data offset.
++            let local_extra = [0xAAu8, 0xAA, 3, 0, 1, 2, 3];
++            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
++            out.extend_from_slice(&[45, 0, 0, 0]);
++            out.extend_from_slice(&method.to_le_bytes());
++            out.extend_from_slice(&[0, 0, 0, 0]);
++            out.extend_from_slice(&crc.to_le_bytes());
++            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
++            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
++            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
++            out.extend_from_slice(&(local_extra.len() as u16).to_le_bytes());
++            out.extend_from_slice(name.as_bytes());
++            out.extend_from_slice(&local_extra);
++            out.extend_from_slice(&body);
++
++            let mut extra = Vec::new();
++            if zip64 {
++                extra.extend_from_slice(&1u16.to_le_bytes());
++                extra.extend_from_slice(&24u16.to_le_bytes());
++                extra.extend_from_slice(&(data.len() as u64).to_le_bytes());
++                extra.extend_from_slice(&(body.len() as u64).to_le_bytes());
++                extra.extend_from_slice(&offset.to_le_bytes());
++            }
++            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
++            central.extend_from_slice(&[45, 0, 45, 0, 0, 0]);
++            central.extend_from_slice(&method.to_le_bytes());
++            central.extend_from_slice(&[0, 0, 0, 0]);
++            central.extend_from_slice(&crc.to_le_bytes());
++            central.extend_from_slice(&c32.to_le_bytes());
++            central.extend_from_slice(&s32.to_le_bytes());
++            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
++            central.extend_from_slice(&(extra.len() as u16).to_le_bytes());
++            // Comment length, disk, internal and external attributes.
++            central.extend_from_slice(&[0; 10]);
++            central.extend_from_slice(&o32.to_le_bytes());
++            central.extend_from_slice(name.as_bytes());
++            central.extend_from_slice(&extra);
++        }
++        let cd_offset = out.len() as u64;
++        out.extend_from_slice(&central);
++        let count = members.len() as u64;
++        if zip64 {
++            let record = out.len() as u64;
++            out.extend_from_slice(&0x0606_4b50u32.to_le_bytes());
++            out.extend_from_slice(&44u64.to_le_bytes());
++            out.extend_from_slice(&[45, 0, 45, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
++            out.extend_from_slice(&count.to_le_bytes());
++            out.extend_from_slice(&count.to_le_bytes());
++            out.extend_from_slice(&(central.len() as u64).to_le_bytes());
++            out.extend_from_slice(&cd_offset.to_le_bytes());
++            out.extend_from_slice(&0x0706_4b50u32.to_le_bytes());
++            out.extend_from_slice(&0u32.to_le_bytes());
++            out.extend_from_slice(&record.to_le_bytes());
++            out.extend_from_slice(&1u32.to_le_bytes());
++        }
++        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
++        out.extend_from_slice(&[0, 0, 0, 0]);
++        let (n16, cds, cdo) = if zip64 {
++            (0xFFFFu16, 0xFFFF_FFFFu32, 0xFFFF_FFFFu32)
++        } else {
++            (count as u16, central.len() as u32, cd_offset as u32)
++        };
++        out.extend_from_slice(&n16.to_le_bytes());
++        out.extend_from_slice(&n16.to_le_bytes());
++        out.extend_from_slice(&cds.to_le_bytes());
++        out.extend_from_slice(&cdo.to_le_bytes());
++        out.extend_from_slice(&0u16.to_le_bytes());
++        out
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::io::{Cursor, Read};
++
++    use super::testing::zip;
++    use super::*;
++
++    fn read_all(archive: &mut Archive<Cursor<Vec<u8>>>, name: &str, cap: u64) -> Vec<u8> {
++        let entry = archive
++            .entries
++            .iter()
++            .find(|e| e.name == name)
++            .unwrap()
++            .clone();
++        let mut out = Vec::new();
++        archive
++            .reader(&entry, cap)
++            .unwrap()
++            .read_to_end(&mut out)
++            .unwrap();
++        out
++    }
++
++    #[test]
++    fn members_are_read_stored_or_deflated_with_and_without_zip64() {
++        let big: Vec<u8> = (0..100_000u32).map(|i| (i % 7) as u8).collect();
++        for zip64 in [false, true] {
++            let bytes = zip(
++                &[("a.txt", b"hello", false), ("dir%2Fb.bin", &big, true)],
++                zip64,
++            );
++            let len = bytes.len() as u64;
++            let mut archive = Archive::open(Cursor::new(bytes), 0, len).unwrap();
++            assert_eq!(archive.entries.len(), 2);
++            assert_eq!(archive.entries[1].path(), "dir/b.bin");
++            assert_eq!(read_all(&mut archive, "a.txt", u64::MAX), b"hello");
++            assert_eq!(read_all(&mut archive, "dir%2Fb.bin", u64::MAX), big);
++            // The cap holds.
++            assert_eq!(read_all(&mut archive, "dir%2Fb.bin", 10).len(), 10);
++        }
++    }
++
++    #[test]
++    fn an_archive_inside_another_is_read_where_it_lies() {
++        let inner = zip(&[("drivers/x.sys", b"inner data", true)], true);
++        let mut outer_bytes = vec![0xEEu8; 100]; // something before the archive
++        let outer = zip(&[("pkg.appx", &inner, false)], true);
++        outer_bytes.extend_from_slice(&outer);
++        let len = outer.len() as u64;
++        let mut archive = Archive::open(Cursor::new(outer_bytes), 100, len).unwrap();
++        let entry = archive.entries[0].clone();
++        let (start, len) = archive.data_range(&entry).unwrap();
++        let mut nested = Archive::open(archive.into_inner(), start, len).unwrap();
++        assert_eq!(nested.entries[0].name, "drivers/x.sys");
++        let e = nested.entries[0].clone();
++        let mut out = Vec::new();
++        nested
++            .reader(&e, u64::MAX)
++            .unwrap()
++            .read_to_end(&mut out)
++            .unwrap();
++        assert_eq!(out, b"inner data");
++    }
++
++    #[test]
++    fn damaged_archives_are_refused() {
++        assert!(Archive::open(Cursor::new(vec![0u8; 10]), 0, 10).is_err());
++        assert!(Archive::open(Cursor::new(vec![0u8; 1000]), 0, 1000).is_err());
++        // A directory that points past the end.
++        let mut bytes = zip(&[("a", b"x", false)], false);
++        let n = bytes.len();
++        bytes[n - 6..n - 2].copy_from_slice(&0x00FF_FFFFu32.to_le_bytes());
++        assert!(Archive::open(Cursor::new(bytes), 0, n as u64).is_err());
++        // A member whose data runs past the end of the archive it is in.
++        let bytes = zip(&[("a", b"xyz", false)], false);
++        let n = bytes.len() as u64;
++        let mut archive = Archive::open(Cursor::new(bytes), 0, n).unwrap();
++        let mut entry = archive.entries[0].clone();
++        entry.compressed_size = n;
++        assert!(archive.data_range(&entry).is_err());
++    }
++}
