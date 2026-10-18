@@ -11,8 +11,10 @@
 //! executable has to stay a child of the process that opened it.
 mod accounts_ui;
 mod cancel;
+mod client_check;
 mod editor;
 mod model;
+mod packagekit;
 mod progress;
 mod state;
 
@@ -109,6 +111,10 @@ struct Ui {
     /// a game runs for hours and must not hold the window's other work.
     running: Rc<RefCell<BTreeMap<String, u32>>>,
     running_servers: Rc<RefCell<BTreeMap<String, (PathBuf, PathBuf)>>>,
+    /// Says the Xbox client cannot start, for as long as that is true.
+    banner: adw::Banner,
+    /// Why the client cannot start, when the last check found it could not.
+    client_blocked: Rc<RefCell<Option<client_check::Blocked>>>,
 }
 
 fn main() -> glib::ExitCode {
@@ -271,8 +277,17 @@ fn build_ui(app: &adw::Application) {
     activity.append(&activity_detail);
     activity.append(&keep_open);
 
+    // Under the header and outside the content, like the activity panel: it
+    // has to survive every redraw, and it is about the whole window.
+    let banner = adw::Banner::builder()
+        .use_markup(false)
+        .revealed(false)
+        .visible(false)
+        .build();
+
     let content_view = adw::ToolbarView::new();
     content_view.add_top_bar(&content_header);
+    content_view.add_top_bar(&banner);
     content_view.add_bottom_bar(&activity);
     content_view.add_bottom_bar(&download.root);
     content_view.set_content(Some(&toasts));
@@ -324,6 +339,8 @@ fn build_ui(app: &adw::Application) {
         fetching_entitlements: Rc::new(RefCell::new(false)),
         entitlements_owed: Rc::new(Cell::new(false)),
         download: download.clone(),
+        banner: banner.clone(),
+        client_blocked: Rc::new(RefCell::new(None)),
     };
 
     window.connect_close_request(glib::clone!(
@@ -411,6 +428,11 @@ fn build_ui(app: &adw::Application) {
         ui,
         move |_| account_pressed(&ui)
     ));
+    banner.connect_button_clicked(glib::clone!(
+        #[strong]
+        ui,
+        move |_| client_check::banner_pressed(&ui)
+    ));
 
     render(&ui);
     // The account is cheap and answers the first question the window raises --
@@ -428,6 +450,7 @@ fn build_ui(app: &adw::Application) {
     }
 
     window.present();
+    client_check::check(&ui, None, false);
     refresh_entitlements(&ui, false);
     fetch_gamepass(&ui, false);
     // Tier upgrades happen outside this window. The listing is reused for a
@@ -2826,7 +2849,13 @@ fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {
 fn account_pressed(ui: &Ui) {
     if ui.model.borrow().account.is_some() {
         account_menu(ui);
-    } else if ui.model.borrow().roles.is_some() {
+        return;
+    }
+    // A client the loader refuses cannot sign in: say why and offer the fix.
+    if client_check::blocks(ui, account_pressed) {
+        return;
+    }
+    if ui.model.borrow().roles.is_some() {
         accounts_ui::open(ui);
     } else {
         sign_in(ui);
