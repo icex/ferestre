@@ -1,5 +1,5 @@
 diff --git a/dlls/gameinput/gameinput.c b/dlls/gameinput/gameinput.c
-index a2e83a9..8502ab1 100644
+index e0a8083..d104c33 100644
 --- a/dlls/gameinput/gameinput.c
 +++ b/dlls/gameinput/gameinput.c
 @@ -749,6 +749,16 @@ struct virtual_device

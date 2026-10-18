@@ -1,5 +1,5 @@
 diff --git a/dlls/gameinput/gameinput.c b/dlls/gameinput/gameinput.c
-index d342bc9..a2e83a9 100644
+index 06fb5d1..e0a8083 100644
 --- a/dlls/gameinput/gameinput.c
 +++ b/dlls/gameinput/gameinput.c
 @@ -27,6 +27,7 @@

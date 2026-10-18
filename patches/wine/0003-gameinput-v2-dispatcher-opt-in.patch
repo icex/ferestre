@@ -10,7 +10,7 @@ index 4d766e7..629352a 100644
  
  EXTRADLLFLAGS = -Wb,--prefer-native
 diff --git a/dlls/gameinput/gameinput.c b/dlls/gameinput/gameinput.c
-index f928648..d342bc9 100644
+index f928648..06fb5d1 100644
 --- a/dlls/gameinput/gameinput.c
 +++ b/dlls/gameinput/gameinput.c
 @@ -354,12 +354,25 @@ static HRESULT device_callback_create( IGameInputDevice_v0 *device, GameInputKin
@@ -889,7 +889,14 @@ index f928648..d342bc9 100644
  static struct device *find_device( struct list *devices, const DEV_OBJECT *object )
  {
      struct device *device;
-@@ -684,20 +1517,34 @@ static struct game_input *game_input_create(void)
+@@ -678,26 +1511,39 @@ static void WINAPI device_query_cb( HDEVQUERY devquery, void *context, const DEV
+     }
+ }
+ 
+-static struct game_input *game_input_create(void)
++static struct game_input *game_input_create( BOOL devquery )
+ {
+     struct game_input *impl;
  
      if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
      impl->IGameInput_v0_iface.lpVtbl = &game_input_v0_vtbl;
@@ -914,10 +921,9 @@ index f928648..d342bc9 100644
  
 +    /* Device enumeration goes through DevQuery, which drives a PnP-service RPC
 +     * that is not reliably available in the prefixes we target and can fault
-+     * its notification thread. Skip it by default -- the object is still valid,
-+     * just with no devices -- and allow opting back in with
-+     * WINE_GAMEINPUT_DEVQUERY once that service path is sound. */
-+    if (getenv( "WINE_GAMEINPUT_DEVQUERY" ) &&
++     * its notification thread. The caller decides whether to run it; without
++     * it the object is still valid, just with no enumerated devices. */
++    if (devquery &&
 +        FAILED(DevCreateObjectQuery( DevObjectTypeDeviceInterface, DevQueryFlagUpdateResults | DevQueryFlagAllProperties,
 +                                     0, NULL, 0, NULL, device_query_cb, impl, &impl->query )))
 +    {
@@ -929,14 +935,11 @@ index f928648..d342bc9 100644
      TRACE( "created GameInput %p\n", impl );
      return impl;
  }
-@@ -705,10 +1552,20 @@ static struct game_input *game_input_create(void)
+@@ -705,20 +1551,39 @@ static struct game_input *game_input_create(void)
  HRESULT WINAPI GameInputCreate( IGameInput_v0 **out )
  {
      struct game_input *impl;
--
--    const char *sgi, *sd;
--    if ((!(sgi = getenv( "SteamGameId" )) || strcmp(sgi, "1771300") /* Kingdom Come Deliverance II */)) goto failed;
--    if ((sd = getenv( "SteamDeck" )) && atoi( sd )) goto failed; /* not on Steam Deck */
++    BOOL opt_in, devquery;
 +    const char *env;
 +
 +    /* The implementation below is complete enough to drive a title, but
@@ -945,16 +948,28 @@ index f928648..d342bc9 100644
 +     * validated. GDK/UWP titles such as Minecraft treat a missing GameInput
 +     * runtime as a fatal error ("GameInput Runtime could not be loaded"), so
 +     * WINE_GAMEINPUT=1 opts a launcher into the real object regardless. */
-+    if (!((env = getenv( "WINE_GAMEINPUT" )) && atoi( env )))
++    if (!(opt_in = (env = getenv( "WINE_GAMEINPUT" )) && atoi( env )))
 +    {
 +        const char *sgi, *sd;
 +        if ((!(sgi = getenv( "SteamGameId" )) || strcmp(sgi, "1771300") /* Kingdom Come Deliverance II */)) goto failed;
 +        if ((sd = getenv( "SteamDeck" )) && atoi( sd )) goto failed; /* not on Steam Deck */
 +    }
  
+-    const char *sgi, *sd;
+-    if ((!(sgi = getenv( "SteamGameId" )) || strcmp(sgi, "1771300") /* Kingdom Come Deliverance II */)) goto failed;
+-    if ((sd = getenv( "SteamDeck" )) && atoi( sd )) goto failed; /* not on Steam Deck */
++    /* DevQuery stays off on the opt-in path by default (see game_input_create)
++     * and WINE_GAMEINPUT_DEVQUERY turns it back on there. The allow-listed
++     * title keeps it, as upstream always ran it: its IGameInput_v0 finds pads
++     * only through that enumeration. */
++    devquery = !opt_in || getenv( "WINE_GAMEINPUT_DEVQUERY" );
+ 
      TRACE( "out %p\n", out );
  
-@@ -718,7 +1575,9 @@ HRESULT WINAPI GameInputCreate( IGameInput_v0 **out )
+     EnterCriticalSection( &game_input_cs );
+     if ((impl = game_input)) impl->refcount++;
+-    else impl = game_input = game_input_create();
++    else impl = game_input = game_input_create( devquery );
      LeaveCriticalSection( &game_input_cs );
      if (!impl) return E_OUTOFMEMORY;
  
