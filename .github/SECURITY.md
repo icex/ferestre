@@ -113,32 +113,42 @@ keys, or let one process read what it should not:
 These are known and not yet fixed. A report that finds a way to make one of
 them worse, or a fix, is welcome.
 
-- **Package downloads over plain http can be rewritten in transit, unless
-  the package service vouches for the header.** The package service usually
-  lists only plain `http://` CDN roots (their `https://` names answer with a
+- **Package downloads over plain http can be rewritten in transit when the
+  client has no package signing key.** The package service usually lists
+  only plain `http://` CDN roots (their `https://` names answer with a
   certificate for other hosts), and the client uses them, with a note on
   stderr. Every page the client installs is checked against the package's
   hash tree, and the hash tree against the top hash in the package header
   (client patch 0022). When the authenticated package service gives a
-  `HashOfHashes` for the package, the header's top hash must equal it, and a
-  header that does not is refused before anything it describes is read
-  (client patch 0025); the whole download is then anchored to an answer that
-  came over TLS. Reading `HashOfHashes` as the header's top hash is the
-  client's interpretation: no package checked so far has carried one -- no
-  `HashOfHashes`, and an empty `FileHash` for each file -- so it has not been
-  confirmed against a real one. And the header's own signature is not
-  checked. For those packages the header is only as
-  trustworthy as the connection it came over, and the client says so on
-  stderr. Someone who can change traffic between you and the CDN (an
-  untrusted network, a hostile proxy) can rewrite the header, the hash tree
-  and the package's file table together, consistently, and so install files
-  of their choosing into a title's folder. Those files run when the title
-  starts. Accidental corruption is caught; a deliberate rewrite of an
-  unanchored plain http download is not. To refuse plain http CDN roots and
-  fail instead, set `XODUS_REQUIRE_HTTPS_CDN=1` for `ferestre install` (and
-  the client). Closing this for every package needs the header checked
-  against Microsoft's XVD signing key, or the package service sending its
-  hash.
+  `HashOfHashes`, the header's top hash must equal it (client patch 0025);
+  no package checked so far has carried one. Since client patch 0027 the
+  header's own signature is checked as well: the client fetches Microsoft's
+  game package key at run time, anonymously, from Microsoft Gaming Services
+  in the Store, keeps it only if its SHA-256 is the one it pins, and refuses
+  a header that is unsigned, does not verify, turns integrity checks off or
+  names another package than the package service did
+  ([docs/PACKAGE-SIGNATURES.md](../docs/PACKAGE-SIGNATURES.md)). Neither
+  Ferestre nor the client ships the key. Until the key has been fetched --
+  the first install tries once, for at most three minutes, and a failed
+  attempt is not repeated for a day -- or if fetching it fails, an install
+  goes on unchecked with a warning on stderr, and for that install the
+  header is only as trustworthy as the connection it came over: someone who
+  can change traffic between you and the CDN can rewrite the header, the
+  hash tree and the file table together and install files of their choosing
+  into a title's folder, which run when the title starts. Set
+  `XODUS_REQUIRE_SIGNED_PACKAGE=1` to refuse such installs instead, or
+  `XODUS_REQUIRE_HTTPS_CDN=1` to refuse plain http CDN roots. `ferestre
+  doctor` says whether signatures are checked. The relation between the
+  header's identity fields and the package service's answer was confirmed on
+  one title, and the key on eleven; a package signed otherwise is refused
+  rather than installed.
+- **Fetching the key trusts Microsoft Root Certificate Authority 2011 for
+  one host.** The Store delivery service's certificate chains to that root,
+  which Linux stores do not carry. The client fetches it from Microsoft over
+  plain http, accepts it only by its pinned SHA-256, and trusts it only for
+  `fe3.delivery.mp.microsoft.com`. The Gaming Services package itself comes
+  over plain http and is held to the SHA-256 the delivery service gave and,
+  in the end, to the key's pinned SHA-256.
 
 ## What this project stores
 

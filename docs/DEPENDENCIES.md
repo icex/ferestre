@@ -117,3 +117,17 @@ PlayStation button prompts, can have raw HID back: set `PROTON_ENABLE_HIDRAW=1`
 (or `PROTON_DISABLE_HIDRAW=0`) in the environment, in the recipe's
 `[launch.env]`, or in Proton's `user_settings.py`. Ferestre then leaves the
 choice to Proton.
+
+## Microsoft's package signing key, fetched at run time
+
+The client checks the signature on every game package's header with
+Microsoft's game package key. Nothing installs it and nothing ships it: the
+first install fetches Microsoft Gaming Services anonymously from the Store
+(about 200 MB, a few seconds on a fast connection), keeps the 539-byte key
+if its fingerprint is the pinned one, and deletes the rest. It needs
+`displaycatalog.mp.microsoft.com`, `fe3.delivery.mp.microsoft.com`,
+`www.microsoft.com` and `*.dl.delivery.mp.microsoft.com` to be reachable,
+once. `ferestre doctor` reports **package signatures are checked** when the
+key is in place, and `xodus-cli xvd-key fetch` fetches it by hand. See
+[PACKAGE-SIGNATURES.md](PACKAGE-SIGNATURES.md) for what is checked and the
+settings.
