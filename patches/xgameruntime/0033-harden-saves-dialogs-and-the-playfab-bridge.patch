@@ -1,0 +1,882 @@
+From: Ferestre contributors
+Subject: Harden game saves, message dialogs and the PlayFab save bridge
+
+A headless message dialog is dismissed, so it completes with the title's
+cancel button rather than the focused default, which is often the
+destructive answer ("delete this save?").
+
+The package identity and the MicrosoftGame.config cache are resolved under
+InitOnce, so concurrent first callers no longer see "done" before the family
+name exists and send saves to Packages\UnknownPackage.
+
+A container manifest that exists but cannot be read is an error, as an
+unreadable index already is; only a missing one is an empty container. An
+update no longer rebuilds an unreadable container from its own blobs alone.
+
+When several <XUID>_<SCID> folders exist, the configured user's (XGR_XUID)
+is used, otherwise the one whose index was written last, ties going to the
+lowest name, with a warning; never whichever the listing returned first.
+
+XGameSaveSubmitUpdateAsync and XGameSaveDeleteContainerAsync do their disk
+work on a background writer, in submission order, instead of on the caller's
+thread. Container and update handles are reference counted so a title may
+close them while the work is pending.
+
+The PFX bridge clears a reused XAsyncBlock before starting the SDK operation,
+returns the folder path itself as the async payload, and only treats a
+payload it produced as a folder result. The cached backend DLL is copied
+under a temporary name and renamed into place, reused only at the source's
+size, and copied again once if it does not load. The temporary
+ForceUseInprocGameSaves override is recorded in a marker first, and a run
+that finds the marker restores the prior setting if the override is still in
+place.
+
+diff --git a/pfxgamesave.c b/pfxgamesave.c
+index d0adbaa..d409a2a 100644
+--- a/pfxgamesave.c
++++ b/pfxgamesave.c
+@@ -70,7 +70,13 @@ struct pfx_work
+     struct PFXGameSaveConfig *config;
+     UINT32 kind;
+ };
+-struct folder_result { char *folder; HRESULT status; };
++/* Folder results live in the title's XAsyncBlock until it reads them, as the
++ * path itself, so XAsyncGetResult copies out the string its size describes.
++ * They are listed here too, so a block that holds anything else -- one reused
++ * from an unrelated call, whose payload is some other operation's -- is
++ * recognised before its payload is read or freed as one of these. */
++struct folder_result { struct list entry; char *folder; HRESULT status; };
++static struct list folder_results = LIST_INIT(folder_results);
+ static struct list configs = LIST_INIT(configs);
+ static struct PFXGameSaveUiCallbacks callbacks;
+ static PFXGameSaveDeviceChangedCallback *device_callback;
+@@ -215,35 +221,106 @@ static char *to_utf8( const WCHAR *wide )
+     return s;
+ }
+ 
++/* Where initialize_private_sdk notes that the override below is in place,
++ * and what the setting was before it, until it has been put back. */
++static const WCHAR override_marker[] = L"Software\\Wine\\xgameruntime\\ForceUseInprocGameSaves";
++
++/* A run that died inside the private SDK's initialization -- killed, or a
++ * crash in the foreign SDK -- left the override behind, and in a prefix that
++ * is permanent: every later title would find it and pick the in-process
++ * engine, and the next run here would even save it as "the prefix's own
++ * setting". Undo it, but only while it still holds exactly what was written
++ * (REG_DWORD 1); anything else has been set since, deliberately. */
++static void recover_override( HKEY key, const WCHAR *name )
++{
++    BYTE prior[256];
++    DWORD type, size = sizeof(prior), current = 0, current_type, current_size = sizeof(current);
++    HKEY marker;
++    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, override_marker, 0, KEY_QUERY_VALUE, &marker)) return;
++    if (!RegQueryValueExW(key, name, NULL, &current_type, (BYTE *)&current, &current_size) &&
++        current_type == REG_DWORD && current_size == sizeof(current) && current == 1)
++    {
++        if (!RegQueryValueExW(marker, L"Prior", NULL, &type, prior, &size))
++            RegSetValueExW(key, name, 0, type, prior, size);
++        else
++            RegDeleteValueW(key, name);
++        WARN("put back the save provider setting an interrupted earlier run left overridden.\n");
++    }
++    RegCloseKey(marker);
++    RegDeleteKeyW(HKEY_LOCAL_MACHINE, override_marker);
++}
++
+ static HRESULT initialize_private_sdk( const char *root )
+ {
+     static const WCHAR key_name[] = L"Software\\Microsoft\\GamingServices";
+     static const WCHAR name[] = L"ForceUseInprocGameSaves";
+     BYTE saved[256]; DWORD type = 0, size = sizeof(saved), one = 1;
+     LONG status, prior;
+-    HKEY key;
++    HKEY key, marker;
+     HRESULT hr;
+     struct pf_init_args args = { NULL, 0, root };
+ 
+     /* The primary GDK SDK has already selected its GRTS provider before it
+      * calls PFXInitializeConfig. Only the private instance selects the native
+      * in-process sync engine here. Restore the prefix's exact setting even
+-     * when initialization fails; never leave an override for older titles. */
++     * when initialization fails; never leave an override for older titles.
++     * The marker written first is what lets the next run restore it if this
++     * one never gets that far. */
+     status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, key_name, 0, NULL, 0,
+                             KEY_QUERY_VALUE | KEY_SET_VALUE, NULL, &key, NULL);
+     if (status) return HRESULT_FROM_WIN32(status);
++    recover_override(key, name);
+     prior = RegQueryValueExW(key, name, NULL, &type, saved, &size);
+     if (prior != ERROR_SUCCESS && prior != ERROR_FILE_NOT_FOUND)
+     { RegCloseKey(key); return HRESULT_FROM_WIN32(prior); }
++    if (!(status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, override_marker, 0, NULL, 0, KEY_SET_VALUE, NULL, &marker, NULL)))
++    {
++        if (prior == ERROR_SUCCESS) status = RegSetValueExW(marker, L"Prior", 0, type, saved, size);
++        RegCloseKey(marker);
++    }
++    if (status) WARN("could not record the save provider setting, error %ld.\n", status);
+     status = RegSetValueExW(key, name, 0, REG_DWORD, (BYTE *)&one, sizeof(one));
+     hr = status ? HRESULT_FROM_WIN32(status) : api.initialize(&args);
+     if (prior == ERROR_SUCCESS) status = RegSetValueExW(key, name, 0, type, saved, size);
+     else status = RegDeleteValueW(key, name);
+     RegCloseKey(key);
+     if (status && status != ERROR_FILE_NOT_FOUND) return HRESULT_FROM_WIN32(status);
++    RegDeleteKeyW(HKEY_LOCAL_MACHINE, override_marker);
+     return hr;
+ }
+ 
++/* The title's PlayFabGameSave.dll, copied to a name of its own so the private
++ * instance is a second module rather than the title's. Reused across runs,
++ * but only once it is known to be whole: a copy cut short -- the disk filled,
++ * the process was killed -- would otherwise be loaded, fail, and disable
++ * PlayFab saves for that title until someone found and deleted it. So the
++ * copy is made under a temporary name and renamed into place, and an existing
++ * one is used only if it is the source's size. */
++static BOOL backend_copy_whole( const WCHAR *path, const WIN32_FILE_ATTRIBUTE_DATA *source )
++{
++    WIN32_FILE_ATTRIBUTE_DATA copy;
++    return GetFileAttributesExW(path, GetFileExInfoStandard, &copy) &&
++           copy.nFileSizeHigh == source->nFileSizeHigh && copy.nFileSizeLow == source->nFileSizeLow;
++}
++
++static HRESULT copy_backend( const WCHAR *source, const WCHAR *destination, const WIN32_FILE_ATTRIBUTE_DATA *attributes )
++{
++    WCHAR temporary[4096];
++    DWORD error;
++    if (backend_copy_whole(destination, attributes)) return S_OK;
++    if (wcslen(destination) + 16 >= ARRAY_SIZE(temporary)) return E_INVALIDARG;
++    swprintf(temporary, ARRAY_SIZE(temporary), L"%s.%08lx.tmp", destination, GetCurrentProcessId());
++    if (!CopyFileW(source, temporary, FALSE)) error = GetLastError();
++    else if (!backend_copy_whole(temporary, attributes)) error = ERROR_FILE_INVALID;
++    else if (!MoveFileExW(temporary, destination, MOVEFILE_REPLACE_EXISTING)) error = GetLastError();
++    else return S_OK;
++    DeleteFileW(temporary);
++    /* another process in this prefix may have put a whole one there first */
++    if (backend_copy_whole(destination, attributes)) return S_OK;
++    WARN("could not copy the PlayFab save backend, error %lu.\n", error);
++    return HRESULT_FROM_WIN32(error);
++}
++
+ static void WINAPI ui_progress(void *, UINT32, void *);
+ static void WINAPI ui_failed(void *, UINT32, HRESULT, void *);
+ static void WINAPI ui_contention(void *, struct pf_descriptor *, struct pf_descriptor *, void *);
+@@ -275,10 +352,16 @@ static BOOL CALLBACK load_backend( INIT_ONCE *once, void *parameter, void **cont
+     if (!make_dirs(path)) { backend_status = HRESULT_FROM_WIN32(GetLastError()); goto done; }
+     swprintf(destination, ARRAY_SIZE(destination), L"%s\\pgs-%08lx-%08lx-%08lx.dll", path,
+              modified.dwHighDateTime, modified.dwLowDateTime, attributes.nFileSizeLow);
+-    if (!CopyFileW(source, destination, TRUE) && GetLastError() != ERROR_FILE_EXISTS)
+-    { backend_status = HRESULT_FROM_WIN32(GetLastError()); goto done; }
+-    api.save = LoadLibraryExW(destination, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+-    if (!api.save) { backend_status = HRESULT_FROM_WIN32(GetLastError()); goto done; }
++    if (FAILED(backend_status = copy_backend(source, destination, &attributes))) goto done;
++    if (!(api.save = LoadLibraryExW(destination, NULL, LOAD_WITH_ALTERED_SEARCH_PATH)))
++    {
++        /* whole but unusable all the same; one fresh copy, then give up */
++        WARN("cached PlayFab save backend did not load, error %lu; copying it again.\n", GetLastError());
++        DeleteFileW(destination);
++        if (FAILED(backend_status = copy_backend(source, destination, &attributes))) goto done;
++        if (!(api.save = LoadLibraryExW(destination, NULL, LOAD_WITH_ALTERED_SEARCH_PATH)))
++        { backend_status = HRESULT_FROM_WIN32(GetLastError()); goto done; }
++    }
+ #define LOAD(field, module, name) do { if (!(api.field = (void *)GetProcAddress(api.module, name))) \
+     { backend_status = HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND); goto done; } } while (0)
+     LOAD(create_service, core, "PFServiceConfigCreateHandle");
+@@ -381,7 +464,8 @@ static void CALLBACK work_complete( XAsyncBlock *inner )
+         if (result) result->status = hr;
+         if (FAILED(hr) && hr != (HRESULT)0x80830004 && result)
+         { free(result->folder); free(result); result = NULL; }
+-        xgr_async_complete_ex(w->outer, hr, result, result ? size : 0);
++        if (result) { EnterCriticalSection(&pfx_cs); list_add_tail(&folder_results, &result->entry); LeaveCriticalSection(&pfx_cs); }
++        xgr_async_complete_ex(w->outer, hr, result ? result->folder : NULL, result ? size : 0);
+     }
+     else
+     {
+@@ -403,6 +487,11 @@ static HRESULT start_work( PFXGameSaveConfigHandle handle, XAsyncBlock *outer, U
+     if (!(w = calloc(1, sizeof(*w)))) { release_config(c); return E_OUTOFMEMORY; }
+     w->config = c; w->outer = outer; w->kind = kind;
+     w->inner.queue = outer->queue; w->inner.context = w; w->inner.callback = work_complete;
++    /* The outcome lands in the caller's block only when the SDK finishes, so
++     * clear what an earlier call left there first, as XAsyncBegin does: a
++     * reused block would otherwise read as complete straight away, with the
++     * previous call's status and payload. */
++    memset(outer->internal, 0, sizeof(outer->internal));
+     if (!kind) hr = api.add_user(c->local_user, c->flags & 3, &w->inner);
+     else if (kind == 1) hr = api.upload(c->local_user, options, &w->inner);
+     else hr = api.description(c->local_user, description, &w->inner);
+@@ -418,16 +507,34 @@ HRESULT pfx_description_async( PFXGameSaveConfigHandle c, const char *s, XAsyncB
+ 
+ HRESULT pfx_folder_result( XAsyncBlock *async, SIZE_T size, char *folder )
+ {
+-    struct folder_result *r;
++    struct folder_result *r = NULL, *known;
+     HRESULT hr;
+     SIZE_T needed;
++    void *payload;
++    BOOL ours = FALSE, taken = FALSE;
+     if (!async || !folder) return E_INVALIDARG;
+-    if (!xgr_async_completed(async, &hr, (void **)&r)) return E_PENDING;
+-    if (!r) return FAILED(hr) ? hr : E_FAIL;
+-    needed = strlen(r->folder) + 1;
+-    if (size < needed) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+-    memcpy(folder, r->folder, needed); hr = r->status;
+-    free(r->folder); free(r); async->internal[2] = NULL;
++    if (!xgr_async_completed(async, &hr, &payload)) return E_PENDING;
++    if (!payload) return FAILED(hr) ? hr : E_FAIL;
++    EnterCriticalSection(&pfx_cs);
++    LIST_FOR_EACH_ENTRY(known, &folder_results, struct folder_result, entry)
++        if (known->folder == payload) { r = known; ours = TRUE; break; }
++    if (ours)
++    {
++        needed = strlen(r->folder) + 1;
++        if (size < needed) hr = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
++        else
++        {
++            memcpy(folder, r->folder, needed); hr = r->status;
++            list_remove(&r->entry); async->internal[2] = NULL; taken = TRUE;
++        }
++    }
++    LeaveCriticalSection(&pfx_cs);
++    if (!ours)
++    {
++        WARN("block %p holds no folder result.\n", async);
++        return E_INVALIDARG;
++    }
++    if (taken) { free(r->folder); free(r); }
+     return hr;
+ }
+ 
+diff --git a/xgamesave.c b/xgamesave.c
+index ce74d5c..a65c839 100644
+--- a/xgamesave.c
++++ b/xgamesave.c
+@@ -112,6 +112,7 @@ struct x_string_entry
+ 
+ struct XGameSaveContainer
+ {
++    LONG ref;               /* the title's handle, and each update or read on it */
+     struct XGameSaveProvider *provider;
+     WCHAR *name;
+     struct list strings;    /* blob names handed out to the title */
+@@ -129,6 +130,7 @@ struct wgs_op
+ 
+ struct XGameSaveUpdate
+ {
++    LONG ref;               /* the title's handle, and a submit in flight */
+     struct XGameSaveContainer *container;
+     WCHAR *display_name;
+     struct list ops;
+@@ -241,32 +243,47 @@ static UINT64 filetime_now( void )
+ 
+ /* ---- files -------------------------------------------------------------- */
+ 
++/* On failure the last error says why, and only a file that is not there
++ * reports ERROR_FILE_NOT_FOUND or ERROR_PATH_NOT_FOUND: callers treat those
++ * two as "nothing saved yet", which an unreadable file must never pass for. */
+ static BOOL read_whole_file( const WCHAR *path, BYTE **data, SIZE_T *size )
+ {
+     HANDLE file;
+     LARGE_INTEGER len;
+-    DWORD read, total = 0;
+-    BYTE *buf;
++    DWORD read, total = 0, error;
++    BYTE *buf = NULL;
+ 
+     *data = NULL;
+     *size = 0;
+     file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL );
+     if (file == INVALID_HANDLE_VALUE) return FALSE;
+-    if (!GetFileSizeEx( file, &len ) || len.QuadPart > 0x7fffffff || !(buf = malloc( len.QuadPart + 1 )))
++    if (!GetFileSizeEx( file, &len )) error = GetLastError();
++    else if (len.QuadPart > 0x7fffffff) error = ERROR_FILE_TOO_LARGE;
++    else if (!(buf = malloc( len.QuadPart + 1 ))) error = ERROR_NOT_ENOUGH_MEMORY;
++    else error = ERROR_SUCCESS;
++    if (error)
+     {
+         CloseHandle( file );
++        SetLastError( error );
+         return FALSE;
+     }
+     while (total < len.QuadPart)
+     {
+-        if (!ReadFile( file, buf + total, len.QuadPart - total, &read, NULL ) || !read) break;
++        if (!ReadFile( file, buf + total, len.QuadPart - total, &read, NULL )) break;
++        if (!read)
++        {
++            SetLastError( ERROR_HANDLE_EOF );
++            break;
++        }
+         total += read;
+     }
++    error = GetLastError();
+     CloseHandle( file );
+     if (total != len.QuadPart)
+     {
+         free( buf );
++        SetLastError( error );
+         return FALSE;
+     }
+     buf[total] = 0;
+@@ -519,22 +536,24 @@ static BOOL publisher_hash( const char *publisher, WCHAR out[14] )
+ 
+ static WCHAR *package_family;   /* <Name>_<hash>, NULL when unknown */
+ static WCHAR *package_aumid;    /* <family>!<executable id> */
+-static BOOL package_identity_done;
+ 
+-/* Work out the package family name from MicrosoftGame.config, once. */
+-static void resolve_package_identity( void )
++/* Work out the package family name from MicrosoftGame.config, once.
++ *
++ * Any thread can be first here -- a provider opened on a worker while the
++ * main thread asks for its persistent local storage -- and the work takes
++ * a file read and a hash. Run under an InitOnce, so a second caller waits
++ * for the answer instead of seeing "done" with no family yet and putting
++ * the saves under Packages\UnknownPackage for the rest of the session. */
++static BOOL WINAPI init_package_identity( INIT_ONCE *once, void *param, void **context )
+ {
+     BYTE *xml;
+     char name[128], publisher[512], app[128];
+     WCHAR hash[14], *name_w, buf[320];
+ 
+-    if (package_identity_done) return;
+-    package_identity_done = TRUE;
+-
+     if (!(xml = load_game_config()))
+     {
+         WARN( "MicrosoftGame.config not found, package identity unknown.\n" );
+-        return;
++        return TRUE;
+     }
+     if (xml_attr( (char *)xml, "<Identity", " Name=\"", name, sizeof(name) ) &&
+         xml_attr( (char *)xml, "<Identity", " Publisher=\"", publisher, sizeof(publisher) ) &&
+@@ -555,6 +574,14 @@ static void resolve_package_identity( void )
+     }
+     else WARN( "could not read package identity from MicrosoftGame.config.\n" );
+     free( xml );
++    return TRUE;
++}
++
++static void resolve_package_identity( void )
++{
++    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
++
++    InitOnceExecuteOnce( &once, init_package_identity, NULL, NULL );
+ }
+ 
+ /* %LOCALAPPDATA%\Packages\<family>\SystemAppData\wgs, unless overridden */
+@@ -629,14 +656,46 @@ static BOOL suffix_all_zero( const WCHAR *suffix )
+     return TRUE;
+ }
+ 
+-/* The per-user folder for a service configuration. An existing folder with
+- * the right SCID suffix wins whatever XUID it carries, which is how a save
+- * copied over from Windows is picked up; otherwise one is named after the
+- * local user. */
++/* When a candidate folder's containers.index was last written, or 0 for a
++ * folder that has none. */
++static UINT64 index_mtime( const WCHAR *root, const WCHAR *leaf )
++{
++    WIN32_FILE_ATTRIBUTE_DATA info;
++    WCHAR *dir, *path;
++    UINT64 mtime = 0;
++
++    if (!(dir = path_join( root, leaf ))) return 0;
++    if ((path = path_join( dir, L"containers.index" )))
++    {
++        if (GetFileAttributesExW( path, GetFileExInfoStandard, &info ))
++            mtime = ((UINT64)info.ftLastWriteTime.dwHighDateTime << 32) | info.ftLastWriteTime.dwLowDateTime;
++        free( path );
++    }
++    free( dir );
++    return mtime;
++}
++
++/* The per-user folder for a service configuration, <XUID>_<SCID>.
++ *
++ * An existing folder with the right SCID suffix is used whatever XUID it
++ * carries, which is how a save copied over from Windows is picked up. When
++ * there are several -- a profile played here before the Windows one was
++ * copied in, or a Windows install with more than one account -- the choice
++ * must not be whichever the directory listing happens to return first:
++ *
++ *   - the folder of the configured user (XGR_XUID) wins outright;
++ *   - otherwise the one whose index was written last, the profile in use;
++ *   - and a tie goes to the lowest name, so the answer never changes between
++ *     runs on its own.
++ *
++ * With no folder at all, one is named after the local user. */
+ static WCHAR *resolve_user_dir( const WCHAR *root, const char *scid )
+ {
+-    WCHAR suffix[33], leaf[80], *pattern, *dir = NULL;
++    WCHAR suffix[33], leaf[80], best[MAX_PATH] = { 0 }, *pattern;
+     WIN32_FIND_DATAW data;
++    UINT64 xuid = xgr_local_xuid(), best_mtime = 0;
++    unsigned int candidates = 0;
++    BOOL exact = FALSE;
+     HANDLE find;
+ 
+     if (!scid_to_suffix( scid, suffix )) return NULL;
+@@ -646,26 +705,46 @@ static WCHAR *resolve_user_dir( const WCHAR *root, const char *scid )
+         TRACE( "title named no service configuration; using its own, %s.\n", debugstr_w( suffix ) );
+     swprintf( leaf, ARRAY_SIZE(leaf), L"*_%s", suffix );
+     if (!(pattern = path_join( root, leaf ))) return NULL;
++    swprintf( leaf, ARRAY_SIZE(leaf), L"%016I64X_%s", xuid, suffix );
+     find = FindFirstFileW( pattern, &data );
+     free( pattern );
+     if (find != INVALID_HANDLE_VALUE)
+     {
+         do
+         {
+-            if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && wcslen( data.cFileName ) == 16 + 1 + 32)
++            UINT64 mtime;
++
++            if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || wcslen( data.cFileName ) != 16 + 1 + 32 ||
++                data.cFileName[16] != '_' || _wcsicmp( data.cFileName + 17, suffix ))
++                continue;
++            candidates++;
++            if (exact) continue;
++            if (xuid && !_wcsicmp( data.cFileName, leaf ))
++            {
++                wcscpy( best, data.cFileName );
++                exact = TRUE;
++                continue;
++            }
++            mtime = index_mtime( root, data.cFileName );
++            if (!best[0] || mtime > best_mtime || (mtime == best_mtime && _wcsicmp( data.cFileName, best ) < 0))
+             {
+-                dir = path_join( root, data.cFileName );
+-                break;
++                wcscpy( best, data.cFileName );
++                best_mtime = mtime;
+             }
+         } while (FindNextFileW( find, &data ));
+         FindClose( find );
+     }
+-    if (!dir)
++    if (best[0])
+     {
+-        swprintf( leaf, ARRAY_SIZE(leaf), L"%016I64X_%s", xgr_local_xuid(), suffix );
+-        dir = path_join( root, leaf );
++        if (candidates > 1 && !exact)
++            WARN( "%u save folders for %s; using %s, the most recently written%s.\n", candidates,
++                  debugstr_w( suffix ), debugstr_w( best ), xuid ? "" : " (set XGR_XUID to choose)" );
++        else if (candidates > 1)
++            WARN( "%u save folders for %s; using %s, the configured user's.\n", candidates,
++                  debugstr_w( suffix ), debugstr_w( best ) );
++        return path_join( root, best );
+     }
+-    return dir;
++    return path_join( root, leaf );
+ }
+ 
+ /* ---- shared package identity (used by XPackage too) --------------------- */
+@@ -900,8 +979,15 @@ static WCHAR *blob_path( const WCHAR *dir, const GUID *file )
+     return path_join( dir, name );
+ }
+ 
+-/* S_OK: parsed; S_FALSE: no manifest (empty list); error: corrupt. Sizes come
+- * from the blob files themselves, the manifest only maps names to them. */
++/* S_OK: parsed; S_FALSE: no manifest (empty list); error: corrupt or
++ * unreadable. Sizes come from the blob files themselves, the manifest only
++ * maps names to them.
++ *
++ * Only a manifest that is not there is an empty container. One that exists
++ * but cannot be read -- a sharing violation, no access, no memory -- is an
++ * error, as it is for the index: an update built on an empty list instead
++ * writes a manifest naming only its own blobs, and every other blob in the
++ * container is lost to the title. */
+ static HRESULT manifest_read( const WCHAR *dir, const struct wgs_container *c, struct list *blobs )
+ {
+     WCHAR *path;
+@@ -914,6 +1000,16 @@ static HRESULT manifest_read( const WCHAR *dir, const struct wgs_container *c, s
+     if (!(path = manifest_path( dir, c->number ))) return E_OUTOFMEMORY;
+     if (!read_whole_file( path, &data, &size ))
+     {
++        DWORD err = GetLastError();
++
++        if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND)
++        {
++            ERR( "cannot read %s, error %lu.\n", debugstr_w( path ), err );
++            free( path );
++            return E_GS_NO_ACCESS;
++        }
++        if (c->size) WARN( "%s is missing; container %s, %I64u bytes, has no blobs.\n",
++                           debugstr_w( path ), debugstr_w( c->name ), c->size );
+         free( path );
+         return S_FALSE;
+     }
+@@ -1304,6 +1400,8 @@ done:
+     return hr;
+ }
+ 
++static void container_release( struct XGameSaveContainer *container );
++
+ static void free_read_request( struct read_request *req )
+ {
+     UINT32 i;
+@@ -1311,6 +1409,7 @@ static void free_read_request( struct read_request *req )
+     if (!req) return;
+     if (req->names) for (i = 0; i < req->count; i++) free( req->names[i] );
+     free( req->names );
++    container_release( req->container );
+     free( req );
+ }
+ 
+@@ -1602,6 +1701,155 @@ static HRESULT queue_op( struct XGameSaveUpdate *update, const char *blob_name,
+     return S_OK;
+ }
+ 
++/* ---- handles ------------------------------------------------------------ */
++
++static void container_addref( struct XGameSaveContainer *container )
++{
++    InterlockedIncrement( &container->ref );
++}
++
++static void container_release( struct XGameSaveContainer *container )
++{
++    struct x_string_entry *e, *next;
++
++    if (!container || InterlockedDecrement( &container->ref )) return;
++    EnterCriticalSection( &gs_cs );
++    LIST_FOR_EACH_ENTRY_SAFE( e, next, &container->strings, struct x_string_entry, entry )
++    {
++        list_remove( &e->entry );
++        free( e );
++    }
++    LeaveCriticalSection( &gs_cs );
++    provider_release( container->provider );
++    free( container->name );
++    free( container );
++}
++
++static void update_release( struct XGameSaveUpdate *update )
++{
++    struct wgs_op *op, *next;
++
++    if (InterlockedDecrement( &update->ref )) return;
++    LIST_FOR_EACH_ENTRY_SAFE( op, next, &update->ops, struct wgs_op, entry )
++    {
++        list_remove( &op->entry );
++        free_op( op );
++    }
++    container_release( update->container );
++    free( update->display_name );
++    free( update );
++}
++
++/* ---- background writes --------------------------------------------------- */
++
++/* SubmitUpdateAsync and DeleteContainerAsync are what a title calls from a
++ * thread it cannot stall -- an autosave from the render loop -- and the work
++ * behind them is not small: up to 16 MB of blob files, a manifest and the
++ * index, each flushed to disk. So they are done here, off the caller's
++ * thread, and the block completes when the data is on disk.
++ *
++ * One worker at a time takes them in the order they were submitted. Two
++ * updates to the same container, submitted back to back, must reach the disk
++ * in that order: running them side by side on the pool could leave the older
++ * one on top. Each holds what it needs alive -- the update and through it its
++ * container and provider -- so a title may close its handles as soon as the
++ * call returns. */
++struct save_job
++{
++    struct list entry;
++    XAsyncBlock *async;
++    struct XGameSaveUpdate *update;         /* a submit... */
++    struct XGameSaveProvider *provider;     /* ...or a delete */
++    char *name;
++};
++
++static struct list save_jobs = LIST_INIT( save_jobs );
++static BOOL save_worker_running;
++static CRITICAL_SECTION jobs_cs;
++static CRITICAL_SECTION_DEBUG jobs_cs_debug =
++{
++    0, 0, &jobs_cs,
++    { &jobs_cs_debug.ProcessLocksList, &jobs_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": jobs_cs") }
++};
++static CRITICAL_SECTION jobs_cs = { &jobs_cs_debug, -1, 0, 0, 0, 0 };
++
++static void free_save_job( struct save_job *job )
++{
++    if (job->update) update_release( job->update );
++    if (job->provider) provider_release( job->provider );
++    free( job->name );
++    free( job );
++}
++
++static void run_save_jobs( void )
++{
++    struct save_job *job;
++    XAsyncBlock *async;
++    HRESULT hr;
++
++    for (;;)
++    {
++        EnterCriticalSection( &jobs_cs );
++        if (list_empty( &save_jobs ))
++        {
++            save_worker_running = FALSE;
++            LeaveCriticalSection( &jobs_cs );
++            return;
++        }
++        job = LIST_ENTRY( list_head( &save_jobs ), struct save_job, entry );
++        list_remove( &job->entry );
++        LeaveCriticalSection( &jobs_cs );
++
++        EnterCriticalSection( &gs_cs );
++        if (job->update) hr = submit_update( job->update );
++        else hr = delete_container( job->provider, job->name );
++        LeaveCriticalSection( &gs_cs );
++        TRACE( "%s for block %p finished, hr %#lx.\n", job->update ? "update" : "delete", job->async, hr );
++
++        async = job->async;
++        free_save_job( job );
++        xgr_async_complete( async, hr, NULL );
++    }
++}
++
++static void CALLBACK save_jobs_pool_callback( TP_CALLBACK_INSTANCE *instance, void *context )
++{
++    run_save_jobs();
++}
++
++static DWORD WINAPI save_jobs_thread( void *context )
++{
++    run_save_jobs();
++    return 0;
++}
++
++/* Takes ownership of the job. The block reads as pending from here until the
++ * worker completes it. */
++static void queue_save_job( struct save_job *job )
++{
++    HANDLE thread;
++    BOOL start;
++
++    memset( job->async->internal, 0, sizeof(job->async->internal) );
++    EnterCriticalSection( &jobs_cs );
++    list_add_tail( &save_jobs, &job->entry );
++    start = !save_worker_running;
++    save_worker_running = TRUE;
++    LeaveCriticalSection( &jobs_cs );
++    if (!start) return;
++
++    if (TrySubmitThreadpoolCallback( save_jobs_pool_callback, NULL, NULL )) return;
++    if ((thread = CreateThread( NULL, 0, save_jobs_thread, NULL, 0, NULL )))
++    {
++        CloseHandle( thread );
++        return;
++    }
++    /* nowhere else to run it; doing it late beats not doing it */
++    WARN( "no thread for the save writer, error %lu; writing on the caller's thread.\n", GetLastError() );
++    run_save_jobs();
++}
++
+ /* ---- interface ---------------------------------------------------------- */
+ 
+ struct x_game_save
+@@ -1770,13 +2018,29 @@ static HRESULT WINAPI x_game_save_XGameSaveDeleteContainer( IXGameSaveImpl4 *ifa
+ 
+ static HRESULT WINAPI x_game_save_XGameSaveDeleteContainerAsync( IXGameSaveImpl4 *iface, XGameSaveProviderHandle provider, const char *containerName, XAsyncBlock *async )
+ {
+-    HRESULT hr;
++    struct save_job *job;
++    HRESULT hr = S_OK;
+ 
+     TRACE( "iface %p, provider %p, containerName %s, async %p.\n", iface, provider, debugstr_a( containerName ), async );
+ 
+     if (!async) return E_INVALIDARG;
+-    hr = x_game_save_XGameSaveDeleteContainer( iface, provider, containerName );
+-    xgr_async_complete( async, hr, NULL );
++    if (!provider) hr = E_INVALIDARG;
++    else if (!valid_container_name( containerName )) hr = E_GS_INVALID_CONTAINER_NAME;
++    if (FAILED( hr ))
++    {
++        xgr_async_complete( async, hr, NULL );
++        return S_OK;
++    }
++    if (!(job = calloc( 1, sizeof(*job) ))) return E_OUTOFMEMORY;
++    if (!(job->name = narrow_dup( containerName )))
++    {
++        free( job );
++        return E_OUTOFMEMORY;
++    }
++    job->async = async;
++    job->provider = provider;
++    provider_addref( provider );
++    queue_save_job( job );
+     return S_OK;
+ }
+ 
+@@ -1879,6 +2143,7 @@ static HRESULT WINAPI x_game_save_XGameSaveCreateContainer( IXGameSaveImpl4 *ifa
+         return E_OUTOFMEMORY;
+     }
+     list_init( &container->strings );
++    container->ref = 1;
+     container->provider = provider;
+     provider_addref( provider );
+     /* nothing reaches the disk until an update is submitted */
+@@ -1888,21 +2153,9 @@ static HRESULT WINAPI x_game_save_XGameSaveCreateContainer( IXGameSaveImpl4 *ifa
+ 
+ static void WINAPI x_game_save_XGameSaveCloseContainer( IXGameSaveImpl4 *iface, XGameSaveContainerHandle context )
+ {
+-    struct x_string_entry *e, *next;
+-
+     TRACE( "iface %p, context %p.\n", iface, context );
+ 
+-    if (!context) return;
+-    EnterCriticalSection( &gs_cs );
+-    LIST_FOR_EACH_ENTRY_SAFE( e, next, &context->strings, struct x_string_entry, entry )
+-    {
+-        list_remove( &e->entry );
+-        free( e );
+-    }
+-    LeaveCriticalSection( &gs_cs );
+-    provider_release( context->provider );
+-    free( context->name );
+-    free( context );
++    container_release( context );
+ }
+ 
+ static HRESULT enumerate_blobs( struct XGameSaveContainer *container, const char *prefix, void *context, XGameSaveBlobInfoCallback *callback )
+@@ -1993,6 +2246,7 @@ static HRESULT WINAPI x_game_save_XGameSaveReadBlobDataAsync( IXGameSaveImpl4 *i
+     if (!container || !async) return E_INVALIDARG;
+     if (!(req = calloc( 1, sizeof(*req) ))) return E_OUTOFMEMORY;
+     req->container = container;
++    container_addref( container );
+     if (blobNames)
+     {
+         req->count = n;
+@@ -2064,25 +2318,18 @@ static HRESULT WINAPI x_game_save_XGameSaveCreateUpdate( IXGameSaveImpl4 *iface,
+         return E_OUTOFMEMORY;
+     }
+     list_init( &update->ops );
++    update->ref = 1;
+     update->container = container;
++    container_addref( container );
+     *updateContext = update;
+     return S_OK;
+ }
+ 
+ static void WINAPI x_game_save_XGameSaveCloseUpdate( IXGameSaveImpl4 *iface, XGameSaveUpdateHandle context )
+ {
+-    struct wgs_op *op, *next;
+-
+     TRACE( "iface %p, context %p.\n", iface, context );
+ 
+-    if (!context) return;
+-    LIST_FOR_EACH_ENTRY_SAFE( op, next, &context->ops, struct wgs_op, entry )
+-    {
+-        list_remove( &op->entry );
+-        free_op( op );
+-    }
+-    free( context->display_name );
+-    free( context );
++    if (context) update_release( context );
+ }
+ 
+ static HRESULT WINAPI x_game_save_XGameSaveSubmitBlobWrite( IXGameSaveImpl4 *iface, XGameSaveUpdateHandle updateContext, const char *blobName, UINT8 *data, SIZE_T byteCount )
+@@ -2116,13 +2363,21 @@ static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdate( IXGameSaveImpl4 *iface,
+ 
+ static HRESULT WINAPI x_game_save_XGameSaveSubmitUpdateAsync( IXGameSaveImpl4 *iface, XGameSaveUpdateHandle updateContext, XAsyncBlock *async )
+ {
+-    HRESULT hr;
++    struct save_job *job;
+ 
+     TRACE( "iface %p, updateContext %p, async %p.\n", iface, updateContext, async );
+ 
+     if (!async) return E_INVALIDARG;
+-    hr = x_game_save_XGameSaveSubmitUpdate( iface, updateContext );
+-    xgr_async_complete( async, hr, NULL );
++    if (!updateContext)
++    {
++        xgr_async_complete( async, E_INVALIDARG, NULL );
++        return S_OK;
++    }
++    if (!(job = calloc( 1, sizeof(*job) ))) return E_OUTOFMEMORY;
++    job->async = async;
++    job->update = updateContext;
++    InterlockedIncrement( &updateContext->ref );
++    queue_save_job( job );
+     return S_OK;
+ }
+ 
+diff --git a/xgameui.c b/xgameui.c
+index 893a013..f5928de 100644
+--- a/xgameui.c
++++ b/xgameui.c
+@@ -26,7 +26,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+ /*
+  * The system UI, offline and headless: there is no overlay to show and no user
+  * to click it, so each dialog completes immediately with the outcome a
+- * dismissed dialog would give -- the default button for a message box, an empty
++ * dismissed dialog would give -- the cancel button for a message box, an empty
+  * pick for a player picker, a cancelled entry for text input. Web
+  * authentication cannot happen offline, so it reports cancellation rather than
+  * hanging. Returning these instead of E_NOTIMPL keeps a title that waits on a
+@@ -88,9 +88,25 @@ static ULONG WINAPI x_game_ui_Release( IXGameUiImpl4 *iface )
+ 
+ static HRESULT WINAPI x_game_ui_XGameUiShowMessageDialogAsync( IXGameUiImpl4 *iface, XAsyncBlock *async, const char *titleText, const char *contentText, const char *firstButtonText, const char *secondButtonText, const char *thirdButtonText, XGameUiMessageDialogButton defaultButton, XGameUiMessageDialogButton cancelButton )
+ {
+-    TRACE( "iface %p, async %p, titleText %s, contentText %s, defaultButton %d.\n", iface, async, debugstr_a( titleText ), debugstr_a( contentText ), defaultButton );
++    const char *texts[] = { firstButtonText, secondButtonText, thirdButtonText };
++    XGameUiMessageDialogButton button = cancelButton;
++
++    TRACE( "iface %p, async %p, titleText %s, contentText %s, defaultButton %d, cancelButton %d.\n", iface, async, debugstr_a( titleText ), debugstr_a( contentText ), defaultButton, cancelButton );
+     if (!async) return E_INVALIDARG;
+-    xgr_async_complete( async, S_OK, (void *)(ULONG_PTR)defaultButton );
++
++    /* Nobody sees the dialog, so it is dismissed, and dismissing a message box
++     * (B, or Escape) picks its cancel button. The default button is only the
++     * one that has focus, and for the prompts that matter -- "delete this
++     * corrupted save?", "overwrite?" -- it is often the destructive answer,
++     * which must never be given on the player's behalf. Only a button that
++     * has no text, and so does not exist, falls back to one that does. */
++    if ((UINT32)button >= ARRAY_SIZE(texts) || !texts[button])
++    {
++        button = (UINT32)defaultButton < ARRAY_SIZE(texts) && texts[defaultButton] ? defaultButton
++                                                                                  : XGameUiMessageDialogButton_First;
++        WARN( "cancel button %d has no text; dismissing to button %d.\n", cancelButton, button );
++    }
++    xgr_async_complete( async, S_OK, (void *)(ULONG_PTR)button );
+     return S_OK;
+ }
+ 
+diff --git a/xpackage.c b/xpackage.c
+index 995da6e..f20977d 100644
+--- a/xpackage.c
++++ b/xpackage.c
+@@ -109,18 +109,22 @@ static char *current_mount_path( void )
+     return path;
+ }
+ 
+-/* MicrosoftGame.config text, loaded once (inline or from disk). */
++/* MicrosoftGame.config text, loaded once (inline or from disk). Under an
++ * InitOnce, so threads asking at the same time share one copy rather than
++ * each loading their own. */
++static BOOL WINAPI init_game_config( INIT_ONCE *once, void *param, void **context )
++{
++    *context = xgr_load_game_config();
++    return TRUE;
++}
++
+ static const char *game_config( void )
+ {
+-    static char *cached;
+-    static BOOL loaded;
++    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
++    void *config = NULL;
+ 
+-    if (!loaded)
+-    {
+-        cached = xgr_load_game_config();
+-        loaded = TRUE;
+-    }
+-    return cached;
++    InitOnceExecuteOnce( &once, init_game_config, NULL, &config );
++    return config;
+ }
+ 
+ /* See private.h: the text of <element>text</element> in MicrosoftGame.config. */

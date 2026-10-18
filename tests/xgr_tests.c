@@ -590,14 +590,14 @@ static void test_xgameui(void)
 
     printf( "# XGameUI\n" );
 
-    /* a message dialog dismisses to its default button, without a real UI */
+    /* a message dialog is dismissed, without a real UI, to its cancel button */
     memset( &async, 0, sizeof(async) );
     hr = IXGameUiImpl4_XGameUiShowMessageDialogAsync( gameui, &async, "Title", "Body",
             "OK", NULL, NULL, XGameUiMessageDialogButton_Second, XGameUiMessageDialogButton_First );
     CHECK( SUCCEEDED( hr ), "ShowMessageDialogAsync succeeds (0x%08lx)", hr );
     hr = IXGameUiImpl4_XGameUiShowMessageDialogResult( gameui, &async, &button );
-    CHECK( SUCCEEDED( hr ) && button == XGameUiMessageDialogButton_Second,
-           "message dialog returns the default button (%d)", button );
+    CHECK( SUCCEEDED( hr ) && button == XGameUiMessageDialogButton_First,
+           "message dialog returns the cancel button (%d)", button );
 
     /* an error dialog just dismisses */
     memset( &async, 0, sizeof(async) );
@@ -1665,6 +1665,17 @@ static void test_runtime_discovery( HMODULE mod )
            "available runtime version matches the installed implementation" );
 }
 
+static void test_xgameui_dismisses_to_cancel(void);
+static int identity_race_child(void);
+static int read_owner_child( const char *scid );
+static int pfx_recovery_child(void);
+static void test_package_identity_race(void);
+static void test_gamesave_unreadable_manifest(void);
+static void test_gamesave_user_folder_choice(void);
+static void test_gamesave_async_writes(void);
+static void test_pfx_backend_recovery(void);
+static void test_pfx_reused_block(void);
+
 int main(int argc, char **argv)
 {
     HMODULE mod;
@@ -1686,7 +1697,10 @@ int main(int argc, char **argv)
     query = (void *)GetProcAddress( mod, "QueryApiImpl" );
     if (!init || !query) { printf( "Bail out! missing exports\n" ); return 100; }
     g_query = query;
-    test_runtime_discovery( mod );
+    /* a test's helper process starts from a clean slate and says nothing */
+    if (argc < 2 || (strcmp( argv[1], "--identity-race" ) && strcmp( argv[1], "--read-owner" ) &&
+                     strcmp( argv[1], "--pfx-recovery-child" )))
+        test_runtime_discovery( mod );
     init( 10002, 7822 );
 
     if (FAILED( hr = query( &CLSID_XPackageImpl, &IID_IXPackageImpl3, (void **)&pkg ) ) ||
@@ -1700,6 +1714,9 @@ int main(int argc, char **argv)
         return 100;
     }
 
+    if (argc > 1 && !strcmp(argv[1], "--identity-race")) return identity_race_child();
+    if (argc > 2 && !strcmp(argv[1], "--read-owner")) return read_owner_child( argv[2] );
+    if (argc > 1 && !strcmp(argv[1], "--pfx-recovery-child")) return pfx_recovery_child();
     if (argc > 1 && !strcmp(argv[1], "--store-lifetime"))
     {
         test_store_product_lifetime();
@@ -1715,7 +1732,9 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "--pfx"))
     {
         test_xuser();
+        test_pfx_backend_recovery();
         test_pfx_backend();
+        test_pfx_reused_block();
         printf("%s: %d checks, %d failed\n", g_failed ? "FAILED" : "PASSED", g_run, g_failed);
         return g_failed;
     }
@@ -1728,8 +1747,594 @@ int main(int argc, char **argv)
     test_xthreading();
     test_xgamesave( scid );
     test_gamesave_interface4( scid );
+    test_xgameui_dismisses_to_cancel();
+    test_package_identity_race();
+    test_gamesave_unreadable_manifest();
+    test_gamesave_user_folder_choice();
+    test_gamesave_async_writes();
 
     printf( "\n1..%d\n", g_run );
     printf( "%s: %d checks, %d failed\n", g_failed ? "FAILED" : "PASSED", g_run, g_failed );
     return g_failed;
+}
+
+/* ---- XGameUI: a dismissed message dialog -------------------------------- */
+
+static void test_xgameui_dismisses_to_cancel(void)
+{
+    XGameUiMessageDialogButton button = 99;
+    XAsyncBlock async;
+    HRESULT hr;
+
+    printf( "# XGameUI message dialog dismissal\n" );
+
+    /* "Delete this save?" with the destructive answer focused: nobody saw it,
+     * so nobody chose to delete anything */
+    memset( &async, 0, sizeof(async) );
+    hr = IXGameUiImpl4_XGameUiShowMessageDialogAsync( gameui, &async, "Corrupted save",
+            "Delete it and start over?", "Delete", "Cancel", NULL,
+            XGameUiMessageDialogButton_First, XGameUiMessageDialogButton_Second );
+    CHECK( SUCCEEDED( hr ), "two-button dialog starts (0x%08lx)", hr );
+    hr = IXGameUiImpl4_XGameUiShowMessageDialogResult( gameui, &async, &button );
+    CHECK( SUCCEEDED( hr ) && button == XGameUiMessageDialogButton_Second,
+           "a dismissed dialog answers with its cancel button, not the focused one (%d)", button );
+
+    /* a cancel button that does not exist cannot be the answer */
+    button = 99;
+    memset( &async, 0, sizeof(async) );
+    hr = IXGameUiImpl4_XGameUiShowMessageDialogAsync( gameui, &async, "Notice", "Body",
+            "Continue", "Quit", NULL, XGameUiMessageDialogButton_First, XGameUiMessageDialogButton_Third );
+    hr = IXGameUiImpl4_XGameUiShowMessageDialogResult( gameui, &async, &button );
+    CHECK( SUCCEEDED( hr ) && button == XGameUiMessageDialogButton_First,
+           "a cancel button without text falls back to one that has it (%d)", button );
+}
+
+/* ---- helpers for tests that need a process of their own ----------------- */
+
+/* Run this executable again with `args`, XGR_XUID set to `xuid` (or unset),
+ * and return its exit code. The package identity and the local XUID are
+ * worked out once per process, so a fresh one is the only clean slate. */
+static DWORD run_child( const char *args, const char *xuid )
+{
+    char exe[MAX_PATH], cmd[MAX_PATH + 256], saved[64];
+    STARTUPINFOA si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+    DWORD code = 255, had;
+
+    if (!GetModuleFileNameA( NULL, exe, sizeof(exe) )) return code;
+    snprintf( cmd, sizeof(cmd), "\"%s\" %s", exe, args );
+    had = GetEnvironmentVariableA( "XGR_XUID", saved, sizeof(saved) );
+    SetEnvironmentVariableA( "XGR_XUID", xuid );
+    fflush( stdout );
+    if (CreateProcessA( exe, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi ))
+    {
+        if (WaitForSingleObject( pi.hProcess, 60000 ) == WAIT_OBJECT_0) GetExitCodeProcess( pi.hProcess, &code );
+        else TerminateProcess( pi.hProcess, 254 );
+        CloseHandle( pi.hThread );
+        CloseHandle( pi.hProcess );
+    }
+    SetEnvironmentVariableA( "XGR_XUID", had && had < sizeof(saved) ? saved : NULL );
+    return code;
+}
+
+static XUserHandle add_quiet_user(void)
+{
+    XAsyncBlock async = { 0 };
+    XUserHandle added = NULL;
+
+    if (FAILED( IXUserImpl_XUserAddAsync( users, XUserAddOptions_AddDefaultUserSilently, &async ) )) return NULL;
+    if (FAILED( IXUserImpl_XUserAddResult( users, &async, &added ) )) return NULL;
+    return added;
+}
+
+/* The save root the harness points XGR_WGS_ROOT at, as a Windows path. */
+static BOOL save_root( char *out, DWORD size )
+{
+    DWORD len = GetEnvironmentVariableA( "XGR_WGS_ROOT", out, size );
+    return len && len < size;
+}
+
+/* The one entry of `dir` matching `pattern`, of the kind asked for. */
+static BOOL find_entry( const char *dir, const char *pattern, BOOL want_dir, char *out, size_t size )
+{
+    WIN32_FIND_DATAA data;
+    char spec[MAX_PATH];
+    HANDLE find;
+    BOOL found = FALSE;
+
+    snprintf( spec, sizeof(spec), "%s\\%s", dir, pattern );
+    if ((find = FindFirstFileA( spec, &data )) == INVALID_HANDLE_VALUE) return FALSE;
+    do
+    {
+        if (!strcmp( data.cFileName, "." ) || !strcmp( data.cFileName, ".." )) continue;
+        if (!!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != !!want_dir) continue;
+        snprintf( out, size, "%s\\%s", dir, data.cFileName );
+        found = TRUE;
+        break;
+    } while (FindNextFileA( find, &data ));
+    FindClose( find );
+    return found;
+}
+
+static HRESULT write_one_blob( XGameSaveProviderHandle provider, const char *container_name,
+                               const char *blob, const char *value )
+{
+    XGameSaveContainerHandle container = NULL;
+    XGameSaveUpdateHandle update = NULL;
+    HRESULT hr;
+
+    if (FAILED( hr = IXGameSaveImpl3_XGameSaveCreateContainer( gs, provider, container_name, &container ) )) return hr;
+    if (SUCCEEDED( hr = IXGameSaveImpl3_XGameSaveCreateUpdate( gs, container, container_name, &update ) ))
+    {
+        hr = IXGameSaveImpl3_XGameSaveSubmitBlobWrite( gs, update, blob, (UINT8 *)value, strlen( value ) + 1 );
+        if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveSubmitUpdate( gs, update );
+        IXGameSaveImpl3_XGameSaveCloseUpdate( gs, update );
+    }
+    IXGameSaveImpl3_XGameSaveCloseContainer( gs, container );
+    return hr;
+}
+
+/* What blob `blob` of `container_name` holds, or "" if it cannot be read. */
+static HRESULT read_one_blob( XGameSaveProviderHandle provider, const char *container_name,
+                              const char *blob, char *out, size_t size )
+{
+    XGameSaveContainerHandle container = NULL;
+    const char *names[1] = { blob };
+    union { XGameSaveBlob blob; char bytes[512]; } buffer;
+    UINT32 count = 1;
+    HRESULT hr;
+
+    out[0] = 0;
+    if (FAILED( hr = IXGameSaveImpl3_XGameSaveCreateContainer( gs, provider, container_name, &container ) )) return hr;
+    hr = IXGameSaveImpl3_XGameSaveReadBlobData( gs, container, names, &count, sizeof(buffer), &buffer.blob );
+    if (SUCCEEDED( hr ) && count == 1 && buffer.blob.info.size && buffer.blob.info.size <= size)
+    {
+        memcpy( out, buffer.blob.data, buffer.blob.info.size );
+        out[buffer.blob.info.size - 1] = 0;
+    }
+    IXGameSaveImpl3_XGameSaveCloseContainer( gs, container );
+    return hr;
+}
+
+/* ---- package identity, resolved once from many threads ------------------ */
+
+static volatile LONG race_go, race_failures;
+static IXPersistentLocalStorageImpl3 *race_pls;
+
+static DWORD WINAPI identity_race_thread( void *arg )
+{
+    SIZE_T size = 0;
+
+    while (!race_go) YieldProcessor();
+    if (FAILED( IXPersistentLocalStorageImpl3_XPersistentLocalStorageGetPathSize( race_pls, &size ) ) || size <= 1)
+        InterlockedIncrement( &race_failures );
+    return 0;
+}
+
+/* Child: sixteen threads ask for the package's storage at the same instant,
+ * the first time anything in the process needs the package identity. */
+static int identity_race_child(void)
+{
+    HANDLE threads[16];
+    unsigned int i, started = 0;
+
+    if (FAILED( g_query( &CLSID_XPersistentLocalStorageImpl, &IID_IXPersistentLocalStorageImpl3, (void **)&race_pls ) ))
+        return 100;
+    for (i = 0; i < ARRAY_SIZE(threads); i++)
+        if ((threads[started] = CreateThread( NULL, 0, identity_race_thread, NULL, 0, NULL ))) started++;
+    Sleep( 100 );
+    race_go = 1;
+    WaitForMultipleObjects( started, threads, TRUE, 30000 );
+    for (i = 0; i < started; i++) CloseHandle( threads[i] );
+    return race_failures;
+}
+
+static void test_package_identity_race(void)
+{
+    DWORD code;
+
+    printf( "# package identity from concurrent first callers\n" );
+    code = run_child( "--identity-race", NULL );
+    CHECK( code == 0, "no first caller finds the package identity missing (%lu failed)", code );
+}
+
+/* ---- XGameSave: an unreadable container manifest ------------------------ */
+
+static void test_gamesave_unreadable_manifest(void)
+{
+    static const char scid[] = "00000000-0000-0000-0000-0000000000e3";
+    XGameSaveProviderHandle provider = NULL;
+    XGameSaveContainerHandle container = NULL;
+    XGameSaveUpdateHandle update = NULL;
+    char root[MAX_PATH], dir[MAX_PATH], folder[MAX_PATH], manifest[MAX_PATH], value[64];
+    HANDLE locked;
+    HRESULT hr;
+
+    printf( "# XGameSave with an unreadable container manifest\n" );
+    hr = IXGameSaveImpl3_XGameSaveInitializeProvider( gs, user, scid, FALSE, &provider );
+    CHECK( SUCCEEDED( hr ) && provider, "provider opens (0x%08lx)", hr );
+    if (!provider) return;
+
+    hr = IXGameSaveImpl3_XGameSaveCreateContainer( gs, provider, "manifest_test", &container );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveCreateUpdate( gs, container, "Manifest", &update );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveSubmitBlobWrite( gs, update, "progress", (UINT8 *)"chapter 9", 10 );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveSubmitBlobWrite( gs, update, "settings", (UINT8 *)"old", 4 );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveSubmitUpdate( gs, update );
+    if (update) IXGameSaveImpl3_XGameSaveCloseUpdate( gs, update );
+    if (container) IXGameSaveImpl3_XGameSaveCloseContainer( gs, container );
+    CHECK( SUCCEEDED( hr ), "a container with two blobs is written (0x%08lx)", hr );
+
+    if (!save_root( root, sizeof(root) ) || !find_entry( root, "*_000000000000000000000000000000E3", TRUE, dir, sizeof(dir) ) ||
+        !find_entry( dir, "*", TRUE, folder, sizeof(folder) ) ||
+        !find_entry( folder, "container.*", FALSE, manifest, sizeof(manifest) ))
+    {
+        CHECK( 0, "found the container manifest on disk" );
+        IXGameSaveImpl3_XGameSaveCloseProvider( gs, provider );
+        return;
+    }
+
+    /* the manifest is there but cannot be opened: another program has it */
+    locked = CreateFileA( manifest, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL );
+    CHECK( locked != INVALID_HANDLE_VALUE, "the manifest is held open without sharing" );
+    hr = write_one_blob( provider, "manifest_test", "settings", "new" );
+    CHECK( FAILED( hr ), "an update to a container whose manifest cannot be read fails (0x%08lx)", hr );
+    CloseHandle( locked );
+
+    hr = read_one_blob( provider, "manifest_test", "progress", value, sizeof(value) );
+    CHECK( SUCCEEDED( hr ) && !strcmp( value, "chapter 9" ),
+           "the container's other blob survives that update (0x%08lx, '%s')", hr, value );
+    hr = write_one_blob( provider, "manifest_test", "settings", "new" );
+    CHECK( SUCCEEDED( hr ), "once readable again, the update goes through (0x%08lx)", hr );
+    hr = read_one_blob( provider, "manifest_test", "progress", value, sizeof(value) );
+    CHECK( SUCCEEDED( hr ) && !strcmp( value, "chapter 9" ), "and keeps the other blob (0x%08lx, '%s')", hr, value );
+
+    IXGameSaveImpl3_XGameSaveDeleteContainer( gs, provider, "manifest_test" );
+    IXGameSaveImpl3_XGameSaveCloseProvider( gs, provider );
+}
+
+/* ---- XGameSave: which <XUID>_<SCID> folder is used ---------------------- */
+
+static void set_index_age( const char *dir, BOOL old )
+{
+    char path[MAX_PATH];
+    SYSTEMTIME st = { 2001, 1, 1, 1 };
+    FILETIME ft;
+    HANDLE file;
+
+    snprintf( path, sizeof(path), "%s\\containers.index", dir );
+    if (old) SystemTimeToFileTime( &st, &ft );
+    else GetSystemTimeAsFileTime( &ft );
+    file = CreateFileA( path, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL );
+    if (file == INVALID_HANDLE_VALUE) return;
+    SetFileTime( file, NULL, NULL, &ft );
+    CloseHandle( file );
+}
+
+/* Write a one-blob profile through `scid`, then move its folder to `name`. */
+static BOOL make_profile( const char *scid, const char *suffix, const char *who, const char *name, BOOL old )
+{
+    XGameSaveProviderHandle provider = NULL;
+    char root[MAX_PATH], from[MAX_PATH], pattern[64], to[MAX_PATH];
+    BOOL ok;
+
+    if (FAILED( IXGameSaveImpl3_XGameSaveInitializeProvider( gs, user, scid, FALSE, &provider ) )) return FALSE;
+    ok = SUCCEEDED( write_one_blob( provider, "profile", "who", who ) );
+    IXGameSaveImpl3_XGameSaveCloseProvider( gs, provider );
+    snprintf( pattern, sizeof(pattern), "*_%s", suffix );
+    if (!ok || !save_root( root, sizeof(root) ) || !find_entry( root, pattern, TRUE, from, sizeof(from) )) return FALSE;
+    snprintf( to, sizeof(to), "%s\\%s", root, name );
+    if (!MoveFileA( from, to )) return FALSE;
+    set_index_age( to, old );
+    return TRUE;
+}
+
+/* Child: whose profile does a provider for `scid` open? */
+static int read_owner_child( const char *scid )
+{
+    XGameSaveProviderHandle provider = NULL;
+    char who[64];
+
+    if (!(user = add_quiet_user())) return 100;
+    if (FAILED( IXGameSaveImpl3_XGameSaveInitializeProvider( gs, user, scid, FALSE, &provider ) )) return 101;
+    read_one_blob( provider, "profile", "who", who, sizeof(who) );
+    IXGameSaveImpl3_XGameSaveCloseProvider( gs, provider );
+    if (!strcmp( who, "configured" )) return 1;
+    if (!strcmp( who, "placeholder" )) return 2;
+    if (!strcmp( who, "older" )) return 3;
+    if (!strcmp( who, "newer" )) return 4;
+    return 5;
+}
+
+static void test_gamesave_user_folder_choice(void)
+{
+    static const char sfx_a[] = "0000000000000000000000000000A001", sfx_b[] = "0000000000000000000000000000B001";
+    char name[64];
+    BOOL ok;
+    DWORD code;
+
+    printf( "# XGameSave folder choice among several users\n" );
+
+    /* the configured user's folder wins, even over a newer placeholder that
+     * the directory listing returns first */
+    snprintf( name, sizeof(name), "0000000000000000_%s", sfx_a );
+    ok = make_profile( "00000000-0000-0000-0000-00000000A0F1", "0000000000000000000000000000A0F1", "placeholder", name, FALSE );
+    snprintf( name, sizeof(name), "00000000000ABCDE_%s", sfx_a );
+    ok = ok && make_profile( "00000000-0000-0000-0000-00000000A0F2", "0000000000000000000000000000A0F2", "configured", name, TRUE );
+    CHECK( ok, "two profiles for one service configuration are set up" );
+    code = run_child( "--read-owner 00000000-0000-0000-0000-00000000a001", "00000000000ABCDE" );
+    CHECK( code == 1, "XGR_XUID picks that user's folder (child %lu)", code );
+
+    /* with no user configured, the profile written last is the one in use */
+    snprintf( name, sizeof(name), "0000000000000001_%s", sfx_b );
+    ok = make_profile( "00000000-0000-0000-0000-00000000B0F1", "0000000000000000000000000000B0F1", "older", name, TRUE );
+    snprintf( name, sizeof(name), "0000000000000002_%s", sfx_b );
+    ok = ok && make_profile( "00000000-0000-0000-0000-00000000B0F2", "0000000000000000000000000000B0F2", "newer", name, FALSE );
+    CHECK( ok, "an older and a newer profile are set up" );
+    code = run_child( "--read-owner 00000000-0000-0000-0000-00000000b001", NULL );
+    CHECK( code == 4, "without XGR_XUID the most recently written profile is used (child %lu)", code );
+    code = run_child( "--read-owner 00000000-0000-0000-0000-00000000b001", NULL );
+    CHECK( code == 4, "and the same one again on the next run (child %lu)", code );
+}
+
+/* ---- XGameSave: asynchronous writes leave the caller's thread ----------- */
+
+static HANDLE hold_inside, hold_release;
+
+static BOOLEAN __stdcall hold_save_lock( const XGameSaveContainerInfo *info, void *context )
+{
+    SetEvent( hold_inside );
+    WaitForSingleObject( hold_release, 10000 );
+    return FALSE;
+}
+
+static DWORD WINAPI hold_saves_thread( void *provider )
+{
+    IXGameSaveImpl3_XGameSaveEnumerateContainerInfo( gs, provider, NULL, hold_save_lock );
+    return 0;
+}
+
+struct async_submit
+{
+    XGameSaveUpdateHandle update;
+    XAsyncBlock *async;
+    HRESULT hr;
+};
+
+static DWORD WINAPI submit_async_thread( void *arg )
+{
+    struct async_submit *submit = arg;
+    submit->hr = IXGameSaveImpl3_XGameSaveSubmitUpdateAsync( gs, submit->update, submit->async );
+    return 0;
+}
+
+static void test_gamesave_async_writes(void)
+{
+    static const char scid[] = "00000000-0000-0000-0000-0000000000f5";
+    XGameSaveProviderHandle provider = NULL;
+    XGameSaveContainerHandle container = NULL;
+    XGameSaveUpdateHandle first = NULL, second = NULL;
+    XAsyncBlock a1, a2, a3;
+    struct async_submit submit;
+    HANDLE holder = NULL, submitter;
+    char value[64];
+    int blob_count = -1;
+    BOOL returned;
+    HRESULT hr;
+
+    printf( "# XGameSave asynchronous writes\n" );
+    hr = IXGameSaveImpl3_XGameSaveInitializeProvider( gs, user, scid, FALSE, &provider );
+    CHECK( SUCCEEDED( hr ) && provider, "provider opens (0x%08lx)", hr );
+    if (!provider) return;
+    hr = write_one_blob( provider, "unit_test_container", "order", "initial" );
+    CHECK( SUCCEEDED( hr ), "a container exists to write to (0x%08lx)", hr );
+
+    /* another thread is in the middle of a save call, holding the saves */
+    hold_inside = CreateEventA( NULL, TRUE, FALSE, NULL );
+    hold_release = CreateEventA( NULL, TRUE, FALSE, NULL );
+    holder = CreateThread( NULL, 0, hold_saves_thread, provider, 0, NULL );
+    CHECK( WaitForSingleObject( hold_inside, 5000 ) == WAIT_OBJECT_0, "another thread holds the saves" );
+
+    hr = IXGameSaveImpl3_XGameSaveCreateContainer( gs, provider, "unit_test_container", &container );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveCreateUpdate( gs, container, NULL, &first );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveSubmitBlobWrite( gs, first, "order", (UINT8 *)"first", 6 );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveCreateUpdate( gs, container, NULL, &second );
+    if (SUCCEEDED( hr )) hr = IXGameSaveImpl3_XGameSaveSubmitBlobWrite( gs, second, "order", (UINT8 *)"second", 7 );
+    CHECK( SUCCEEDED( hr ), "two updates are prepared (0x%08lx)", hr );
+
+    memset( &a1, 0, sizeof(a1) );
+    memset( &a2, 0, sizeof(a2) );
+    submit.update = first;
+    submit.async = &a1;
+    submit.hr = E_FAIL;
+    submitter = CreateThread( NULL, 0, submit_async_thread, &submit, 0, NULL );
+    returned = WaitForSingleObject( submitter, 2000 ) == WAIT_OBJECT_0;
+    CHECK( returned && SUCCEEDED( submit.hr ), "SubmitUpdateAsync returns without waiting for the disk (0x%08lx)", submit.hr );
+    if (returned)
+    {
+        CHECK( IXThreadingImpl_XAsyncGetStatus( threading, &a1, FALSE ) == E_PENDING, "the write is still pending" );
+        hr = IXGameSaveImpl3_XGameSaveSubmitUpdateAsync( gs, second, &a2 );
+        CHECK( SUCCEEDED( hr ), "a second update queues behind it (0x%08lx)", hr );
+        /* the title lets go of its handles straight away */
+        IXGameSaveImpl3_XGameSaveCloseUpdate( gs, first );
+        IXGameSaveImpl3_XGameSaveCloseUpdate( gs, second );
+        IXGameSaveImpl3_XGameSaveCloseContainer( gs, container );
+    }
+    SetEvent( hold_release );
+    WaitForSingleObject( holder, 15000 );
+    WaitForSingleObject( submitter, 15000 );
+    CloseHandle( holder );
+    CloseHandle( submitter );
+    CloseHandle( hold_inside );
+    CloseHandle( hold_release );
+    if (!returned)
+    {
+        IXGameSaveImpl3_XGameSaveCloseUpdate( gs, first );
+        IXGameSaveImpl3_XGameSaveCloseUpdate( gs, second );
+        IXGameSaveImpl3_XGameSaveCloseContainer( gs, container );
+    }
+    else
+    {
+        hr = IXThreadingImpl_XAsyncGetStatus( threading, &a1, TRUE );
+        CHECK( hr == S_OK && IXGameSaveImpl3_XGameSaveSubmitUpdateResult( gs, &a1 ) == S_OK,
+               "the first write completes once the saves are free (0x%08lx)", hr );
+        hr = IXThreadingImpl_XAsyncGetStatus( threading, &a2, TRUE );
+        CHECK( hr == S_OK && IXGameSaveImpl3_XGameSaveSubmitUpdateResult( gs, &a2 ) == S_OK,
+               "the second completes too (0x%08lx)", hr );
+    }
+    hr = read_one_blob( provider, "unit_test_container", "order", value, sizeof(value) );
+    CHECK( SUCCEEDED( hr ) && !strcmp( value, "second" ), "the writes reached the disk in order ('%s')", value );
+
+    memset( &a3, 0, sizeof(a3) );
+    hr = IXGameSaveImpl3_XGameSaveDeleteContainerAsync( gs, provider, "unit_test_container", &a3 );
+    CHECK( SUCCEEDED( hr ), "DeleteContainerAsync starts (0x%08lx)", hr );
+    hr = IXThreadingImpl_XAsyncGetStatus( threading, &a3, TRUE );
+    CHECK( hr == S_OK && IXGameSaveImpl3_XGameSaveDeleteContainerResult( gs, &a3 ) == S_OK,
+           "the delete completes (0x%08lx)", hr );
+    IXGameSaveImpl3_XGameSaveEnumerateContainerInfo( gs, provider, &blob_count, find_container );
+    CHECK( blob_count == -1, "and the container is gone" );
+    memset( &a3, 0, sizeof(a3) );
+    hr = IXGameSaveImpl3_XGameSaveDeleteContainerAsync( gs, provider, "bad name!", &a3 );
+    CHECK( SUCCEEDED( hr ) && IXThreadingImpl_XAsyncGetStatus( threading, &a3, TRUE ) == E_GS_INVALID_CONTAINER_NAME,
+           "an invalid name still completes with its error" );
+    IXGameSaveImpl3_XGameSaveCloseProvider( gs, provider );
+}
+
+/* ---- PFX: the cached backend copy and the provider override ------------- */
+
+static BOOL pfx_backend_paths( char *source, char *destination, size_t size, WIN32_FILE_ATTRIBUTE_DATA *attributes )
+{
+    HMODULE save = LoadLibraryA( "PlayFabGameSave.dll" );
+    char local[MAX_PATH], family[128], dir[MAX_PATH];
+    char *p;
+
+    if (!save || !GetModuleFileNameA( save, source, size ) ||
+        !GetFileAttributesExA( source, GetFileExInfoStandard, attributes ) ||
+        !GetEnvironmentVariableA( "LOCALAPPDATA", local, sizeof(local) ) ||
+        !GetEnvironmentVariableA( "XGR_EXPECTED_FAMILY", family, sizeof(family) ))
+        return FALSE;
+    snprintf( dir, sizeof(dir), "%s\\Packages\\%s\\SystemAppData\\PFXGameSave\\backend", local, family );
+    for (p = dir + 3; *p; p++) if (*p == '\\') { *p = 0; CreateDirectoryA( dir, NULL ); *p = '\\'; }
+    CreateDirectoryA( dir, NULL );
+    snprintf( destination, size, "%s\\pgs-%08lx-%08lx-%08lx.dll", dir, attributes->ftLastWriteTime.dwHighDateTime,
+              attributes->ftLastWriteTime.dwLowDateTime, attributes->nFileSizeLow );
+    return TRUE;
+}
+
+/* Child: the backend loads from a cache holding a cut-short copy, and an
+ * override an earlier run left behind is put back. */
+static int pfx_recovery_child(void)
+{
+    static const char marker_key[] = "Software\\Wine\\xgameruntime\\ForceUseInprocGameSaves";
+    struct PFXGameSaveConfigRequest request = { NULL, "4D5E6F70", "https://fixture.invalid", 0, NULL, NULL, NULL };
+    PFXGameSaveConfigHandle config = NULL;
+    IXGameSaveImpl4 *modern = NULL;
+    DWORD one = 1, value = 0, size = sizeof(value);
+    HKEY key, marker;
+    LONG status;
+    HRESULT hr;
+
+    if (!(request.requestingUser = add_quiet_user())) return 100;
+    if (!LoadLibraryA( "PlayFabCore.dll" ) || !LoadLibraryA( "PlayFabGameSave.dll" )) return 101;
+    if (FAILED( g_query( &CLSID_XGameSaveImpl, &IID_IXGameSaveImpl4, (void **)&modern ) )) return 102;
+
+    /* what a run killed inside the private SDK's initialization leaves: the
+     * override in place, and the note that the setting did not exist before */
+    RegCreateKeyExA( HKEY_LOCAL_MACHINE, "Software\\Microsoft\\GamingServices", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL );
+    RegSetValueExA( key, "ForceUseInprocGameSaves", 0, REG_DWORD, (BYTE *)&one, sizeof(one) );
+    if (!RegCreateKeyExA( HKEY_LOCAL_MACHINE, marker_key, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &marker, NULL ))
+        RegCloseKey( marker );
+
+    hr = IXGameSaveImpl4_PFXGameSaveInitializeConfig( modern, &request, &config );
+    CHECK( hr == S_OK && config, "the backend loads despite a cut-short cached copy (0x%08lx)", hr );
+    status = RegQueryValueExA( key, "ForceUseInprocGameSaves", NULL, NULL, (BYTE *)&value, &size );
+    CHECK( status == ERROR_FILE_NOT_FOUND, "an override left by an interrupted run is removed (%ld, %lu)", status, value );
+    status = RegOpenKeyExA( HKEY_LOCAL_MACHINE, marker_key, 0, KEY_READ, &marker );
+    CHECK( status == ERROR_FILE_NOT_FOUND, "and nothing is left marked as pending (%ld)", status );
+    if (!status) RegCloseKey( marker );
+    RegCloseKey( key );
+    if (config) IXGameSaveImpl4_PFXGameSaveFreeConfig( modern, config );
+    IXGameSaveImpl4_Release( modern );
+    return g_failed;
+}
+
+static void test_pfx_backend_recovery(void)
+{
+    char source[MAX_PATH], destination[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA attributes, copy;
+    HANDLE file;
+    DWORD written = 0, code;
+
+    printf( "# PFX backend copy and provider override recovery\n" );
+    if (!pfx_backend_paths( source, destination, sizeof(source), &attributes ))
+    {
+        CHECK( 0, "found the PlayFab save backend and its cache" );
+        return;
+    }
+    /* a copy cut short by a full disk or a killed process */
+    file = CreateFileA( destination, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        WriteFile( file, "MZ", 2, &written, NULL );
+        CloseHandle( file );
+    }
+    CHECK( written == 2, "a truncated backend copy is in the cache" );
+    code = run_child( "--pfx-recovery-child", NULL );
+    CHECK( code == 0, "the backend recovers in a fresh process (%lu failed)", code );
+    CHECK( GetFileAttributesExA( destination, GetFileExInfoStandard, &copy ) &&
+           copy.nFileSizeLow == attributes.nFileSizeLow && copy.nFileSizeHigh == attributes.nFileSizeHigh,
+           "the cached copy is whole again" );
+}
+
+/* ---- PFX: a reused XAsyncBlock ------------------------------------------ */
+
+static void test_pfx_reused_block(void)
+{
+    struct PFXGameSaveConfigRequest request = { user, "4D5E6F70", "https://fixture.invalid", 0, NULL, NULL, NULL };
+    PFXGameSaveConfigHandle config = NULL;
+    IXGameSaveImpl4 *modern = NULL;
+    XUserHandle added = NULL;
+    XAsyncBlock a = { 0 }, b = { 0 };
+    char folder[128], generic[128];
+    SIZE_T used = 0;
+    HRESULT hr;
+
+    printf( "# PFX operations on a reused XAsyncBlock\n" );
+    if (FAILED( g_query( &CLSID_XGameSaveImpl, &IID_IXGameSaveImpl4, (void **)&modern ) ))
+    {
+        CHECK( 0, "PFX interface is available" );
+        return;
+    }
+    hr = IXGameSaveImpl4_PFXGameSaveInitializeConfig( modern, &request, &config );
+    CHECK( hr == S_OK && config, "a configuration initializes (0x%08lx)", hr );
+    if (!config)
+    {
+        IXGameSaveImpl4_Release( modern );
+        return;
+    }
+
+    /* a block that already carries a finished result */
+    hr = IXGameSaveImpl4_PFXGameSaveFilesUploadWithUiAsync( modern, config, 0, &a );
+    CHECK( hr == S_OK && IXThreadingImpl_XAsyncGetStatus( threading, &a, TRUE ) == S_OK, "an upload completes on the block" );
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiAsync( modern, config, &a );
+    CHECK( hr == S_OK, "the same block starts a folder synchronization" );
+    CHECK( IXThreadingImpl_XAsyncGetStatus( threading, &a, FALSE ) == E_PENDING,
+           "the reused block is pending, not complete with the upload's result" );
+    CHECK( IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult( modern, &a, sizeof(folder), folder ) == E_PENDING,
+           "its result is not available yet" );
+    CHECK( IXThreadingImpl_XAsyncGetStatus( threading, &a, TRUE ) == S_OK, "the synchronization completes" );
+    hr = IXThreadingImpl_XAsyncGetResult( threading, &a, NULL, sizeof(generic), generic, &used );
+    CHECK( hr == S_OK && used == sizeof("C:\\pfx-fixture\\account-save") && !strcmp( generic, "C:\\pfx-fixture\\account-save" ),
+           "generic retrieval copies the folder path (0x%08lx)", hr );
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult( modern, &a, sizeof(folder), folder );
+    CHECK( hr == S_OK && !strcmp( folder, "C:\\pfx-fixture\\account-save" ), "the typed result returns the folder" );
+
+    /* a block that another API completed is not a folder result */
+    hr = IXUserImpl_XUserAddAsync( users, XUserAddOptions_AddDefaultUserSilently, &b );
+    CHECK( SUCCEEDED( hr ), "another API completes a block" );
+    hr = IXGameSaveImpl4_PFXGameSaveFilesGetFolderWithUiResult( modern, &b, sizeof(folder), folder );
+    CHECK( hr == E_INVALIDARG, "the folder result refuses a block it did not complete (0x%08lx)", hr );
+    if (SUCCEEDED( IXUserImpl_XUserAddResult( users, &b, &added ) ) && added) IXUserImpl_XUserCloseHandle( users, added );
+
+    IXGameSaveImpl4_PFXGameSaveFreeConfig( modern, config );
+    IXGameSaveImpl4_Release( modern );
 }
