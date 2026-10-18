@@ -16,14 +16,115 @@ as the audience. The title can retry once the list is back. The service's
 own licence path, which names a fixed URL, and an unbound service are
 unchanged.
 
+A service bound to a Store product but to no title identity refuses every
+XSTS request that claims a title, from the title and from its own licence
+path, and a licence request naming a title. Every launcher that binds a
+product binds the title identity with it, so there is nothing such a claim
+could be checked against. A request claiming no title is unchanged.
+
+diff --git a/crates/xodus-service/src/connection/license.rs b/crates/xodus-service/src/connection/license.rs
+index 2f31cdd..a7a6904 100644
+--- a/crates/xodus-service/src/connection/license.rs
++++ b/crates/xodus-service/src/connection/license.rs
+@@ -181,6 +181,19 @@ where
+         );
+         return Err("licence token request is for another title");
+     }
++    // Bound to the product but to no title identity, which no released
++    // launcher does: a title on the request could not be held to anything,
++    // and the XSTS request would refuse it anyway. Say so here.
++    if context.title.is_none() && req.title_id.parse::<u32>().is_ok_and(|id| id > 0) {
++        tracing::warn!(
++            "refused a licence token for title {:?}; this service is bound to {} without a title identity",
++            req.title_id,
++            bound.product()
++        );
++        return Err(
++            "licence token request names a title, and this service has a product binding but no title",
++        );
++    }
+     if let Err(refusal) = bound.admit_products(&req.product_ids.ids, lookup).await {
+         tracing::warn!("{refusal}");
+         return Err("licence token request names products outside the bound title");
+diff --git a/crates/xodus-service/src/connection/license/tests.rs b/crates/xodus-service/src/connection/license/tests.rs
+index dd44548..add24fa 100644
+--- a/crates/xodus-service/src/connection/license/tests.rs
++++ b/crates/xodus-service/src/connection/license/tests.rs
+@@ -216,7 +216,9 @@ async fn offline_service_fixture() {
+         let client = client.clone();
+         tokio::spawn(async move {
+             let mut magic = [0; 4];
+-            if socket.read_exact(&mut magic).await.is_err() { return; }
++            if socket.read_exact(&mut magic).await.is_err() {
++                return;
++            }
+             assert_eq!(&magic, b"XSDX");
+             let (message, bytes) = super::super::xml::read_request(&mut socket).await.unwrap();
+             let message = message as u16;
+@@ -496,14 +498,31 @@ async fn an_unbound_service_signs_licence_requests_as_before() {
+     assert_eq!(req.title_id, "1298034544");
+     assert_eq!(req.title_client_id, "client");
+     assert_eq!(req.product_ids.ids, ["9OTHERGAME00"]);
++}
+ 
+-    // A service bound to a product by an older launcher, which passed no
+-    // title identity, still scopes the products but keeps the request's title.
+-    let mut context = context;
++#[tokio::test]
++async fn a_product_bound_service_without_a_title_identity_refuses_a_titles_licence_request() {
++    // No released launcher binds a product without the title identity, so a
++    // title on the request has nothing to be held to.
++    let mut context = crate::simple_context::tests::context("owner-product", "player-product");
+     context.entitlement = Some(crate::entitlement::Entitlement::fixture("9TESTSTORE0I"));
+-    let mut req = bound_request(&["9TESTADDON00"], "1298034544", "client");
++    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
++    for (title, client) in [("1298034544", "client"), ("1805509784", "")] {
++        let mut req = bound_request(&["9TESTSTORE0I"], title, client);
++        assert_eq!(
++            scope(&context, &mut req, lookup(&calls)).await,
++            Err(
++                "licence token request names a title, and this service has a product binding but no title"
++            ),
++            "{title}"
++        );
++    }
++    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
++    // A request naming no title is still held to the product.
++    let mut req = bound_request(&["9TESTSTORE0I"], "", "");
+     scope(&context, &mut req, lookup(&calls)).await.unwrap();
+-    assert_eq!(req.title_id, "1298034544");
++    let mut req = bound_request(&["9OTHERGAME00"], "0", "");
++    assert!(scope(&context, &mut req, lookup(&calls)).await.is_err());
+ }
+ 
+ #[tokio::test]
 diff --git a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/src/connection/xml.rs
-index 645764c..2860c2e 100644
+index 645764c..1a0b181 100644
 --- a/crates/xodus-service/src/connection/xml.rs
 +++ b/crates/xodus-service/src/connection/xml.rs
-@@ -380,13 +380,40 @@ fn bound(context: &SimpleContext) -> bool {
+@@ -380,13 +380,59 @@ fn bound(context: &SimpleContext) -> bool {
      context.entitlement.is_some() || context.title.is_some()
  }
  
++/// Refuse a title claim in a service bound to a Store product but to no title
++/// identity.
++///
++/// Product binding came with title binding: every launcher that passes
++/// `XODUS_STORE_PRODUCT` passes `XODUS_TITLE_ID` too, empty when the config
++/// names no title. A product alone is therefore not a launch this client
++/// knows, and a claim it cannot check against anything is not signed.
++fn product_only_title_gate(context: &SimpleContext, req: &XSTSTokenRequest) -> Result<(), String> {
++    match (&context.entitlement, &context.title, req.title()) {
++        (Some(product), None, Some(_)) => Err(format!(
++            "refused an XSTS request for title {:?} (client {:?}); this service is bound to the Store product {} without a title identity, so no request may claim a title",
++            req.title_id,
++            req.title_client_id,
++            product.product()
++        )),
++        _ => Ok(()),
++    }
++}
++
 +/// The hosts licence tokens are minted for. The gate below goes by these as
 +/// well as by what the endpoint list maps the licence service to: that list is
 +/// fetched over the network, and the gate must hold when it maps the licence
@@ -63,7 +164,7 @@ index 645764c..2860c2e 100644
  /// is refused. A Player who is another account gets their own licensing
  /// authorization, as on any other machine.
  fn licensing_audience_gate(
-@@ -404,10 +431,9 @@ fn licensing_audience_gate(
+@@ -404,10 +450,9 @@ fn licensing_audience_gate(
              .unwrap_or(&rp);
          rp.trim_end_matches('/').to_string()
      };
@@ -77,7 +178,7 @@ index 645764c..2860c2e 100644
          return Ok(());
      }
      Err(format!(
-@@ -415,6 +441,38 @@ fn licensing_audience_gate(
+@@ -415,6 +460,38 @@ fn licensing_audience_gate(
      ))
  }
  
@@ -116,7 +217,26 @@ index 645764c..2860c2e 100644
  #[cfg(test)]
  pub(super) async fn xsts_token(
      context: &mut SimpleContext,
-@@ -524,15 +582,10 @@ async fn xsts_token_with(
+@@ -485,8 +562,16 @@ async fn xsts_token_with(
+         tracing::warn!("{refusal}");
+         return Err(refusal.into());
+     }
+-    // Bound to a product alone, without a title identity: the audience still
+-    // comes from the endpoint list, never from the request.
++    // Bound to a product alone, without a title identity: no released
++    // launcher binds that way, so there is no title a claim could be checked
++    // against. Fail closed: a request claiming a title is refused, whoever
++    // asks, and only the user/device token is left.
++    if let Err(refusal) = product_only_title_gate(context, &req) {
++        tracing::warn!("{refusal}");
++        return Err(refusal.into());
++    }
++    // And the audience still comes from the endpoint list, never from the
++    // request.
+     if caller == Caller::Title && bound(context) && !req.relying_party.is_empty() {
+         let refusal = format!(
+             "refused an XSTS request naming its own relying party {:?}; a bound service resolves it from the endpoint list",
+@@ -524,15 +609,10 @@ async fn xsts_token_with(
              .ok_or("invalid title signing key")?,
          None => SIGNER.clone(),
      };
@@ -137,7 +257,7 @@ index 645764c..2860c2e 100644
          match title_endpoints_for(&context.client, *id, identity).await {
              Ok(list) => endpoints.title = Some(list),
 diff --git a/crates/xodus-service/src/connection/xml_tests.rs b/crates/xodus-service/src/connection/xml_tests.rs
-index 2d238a6..b8a3cc3 100644
+index 2d238a6..25f6243 100644
 --- a/crates/xodus-service/src/connection/xml_tests.rs
 +++ b/crates/xodus-service/src/connection/xml_tests.rs
 @@ -570,6 +570,122 @@ fn a_bound_title_cannot_take_the_store_accounts_licensing_audience() {
@@ -263,3 +383,102 @@ index 2d238a6..b8a3cc3 100644
  #[tokio::test]
  async fn a_bound_service_issues_no_msa_tickets_and_an_unbound_one_does() {
      for client in ["own-client", "another-client", ""] {
+@@ -618,6 +734,7 @@ async fn a_product_bound_service_refuses_a_chosen_relying_party() {
+     let mut product = crate::simple_context::tests::context("owner-xsts", "player-xsts");
+     product.entitlement = Some(crate::entitlement::Entitlement::fixture("9P5786PJB9RP"));
+     let mut req = request("https://title.example.test/", "GET", b"");
++    req.title_id = String::new();
+     req.relying_party = "http://licensing.xboxlive.com".into();
+     let message = xsts_token(&mut product, req)
+         .await
+@@ -628,8 +745,10 @@ async fn a_product_bound_service_refuses_a_chosen_relying_party() {
+         message.starts_with("refused an XSTS request naming its own relying party"),
+         "{message}"
+     );
+-    // The same request without a chosen audience gets past the gate.
+-    let req = request("https://title.example.test/", "GET", b"");
++    // The same request without a chosen audience, and claiming no title,
++    // gets past the gate.
++    let mut req = request("https://title.example.test/", "GET", b"");
++    req.title_id = String::new();
+     let message = xsts_token(&mut product, req)
+         .await
+         .err()
+@@ -637,3 +756,60 @@ async fn a_product_bound_service_refuses_a_chosen_relying_party() {
+         .to_string();
+     assert_eq!(message, "no signed-in credentials");
+ }
++
++#[tokio::test]
++async fn a_product_bound_service_without_a_title_identity_refuses_every_title_claim() {
++    let mut product = crate::simple_context::tests::context("owner-product", "player-product");
++    product.entitlement = Some(crate::entitlement::Entitlement::fixture("9P5786PJB9RP"));
++    for (title, client) in [
++        ("12345", ""),
++        ("1805509784", "own-client"),
++        ("4294967295", "00000000-0000-0000-0000-00004C26E6C9"),
++    ] {
++        // From the title and from the service's own licence path alike.
++        for caller in [Caller::Title, Caller::Licensing] {
++            let mut req = request("https://userpresence.xboxlive.com/users/me", "GET", b"");
++            req.title_id = title.into();
++            req.title_client_id = client.into();
++            let message = xsts_token_for(&mut product, req, caller)
++                .await
++                .err()
++                .unwrap()
++                .to_string();
++            assert!(
++                message.starts_with("refused an XSTS request for title")
++                    && message.contains("without a title identity"),
++                "{title}: {message}"
++            );
++        }
++    }
++    // Claiming no title -- empty, zero or not a number -- is the user and
++    // device only, and gets past the gate.
++    for title in ["", "0", "not-a-title"] {
++        let mut req = request("https://userpresence.xboxlive.com/users/me", "GET", b"");
++        req.title_id = title.into();
++        let message = xsts_token(&mut product, req)
++            .await
++            .err()
++            .unwrap()
++            .to_string();
++        assert_eq!(message, "no signed-in credentials", "{title:?}");
++    }
++
++    // With the title identity bound, or with no binding at all, a claim goes
++    // on to the usual checks.
++    let mut titled = crate::simple_context::tests::context("owner-product", "player-product");
++    titled.entitlement = Some(crate::entitlement::Entitlement::fixture("9P5786PJB9RP"));
++    titled.title = Some(crate::title::TitleIdentity::fixture(
++        1805509784,
++        "own-client",
++    ));
++    let mut unbound = crate::simple_context::tests::context("owner-product", "player-product");
++    for context in [&mut titled, &mut unbound] {
++        let mut req = request("https://userpresence.xboxlive.com/users/me", "GET", b"");
++        req.title_id = "1805509784".into();
++        req.title_client_id = "own-client".into();
++        let message = xsts_token(context, req).await.err().unwrap().to_string();
++        assert_eq!(message, "no signed-in credentials");
++    }
++}
+diff --git a/crates/xodus-service/src/main.rs b/crates/xodus-service/src/main.rs
+index 552d984..d2a2c6b 100644
+--- a/crates/xodus-service/src/main.rs
++++ b/crates/xodus-service/src/main.rs
+@@ -91,9 +91,10 @@ async fn main() {
+     let entitlement = entitlement::Entitlement::from_env().expect("Invalid Store title binding");
+     let title = title::TitleIdentity::from_env().expect("Invalid title identity binding");
+     if entitlement.is_some() && title.is_none() {
+-        // An older launcher: the product is bound, the title identity is not.
++        // No released launcher binds a product without the title identity.
++        // The service still starts, but signs no request that claims a title.
+         tracing::warn!(
+-            "bound to a Store product without XODUS_TITLE_ID; title identities on requests are not pinned"
++            "bound to a Store product without XODUS_TITLE_ID; requests claiming a title will be refused"
+         );
+     }
+     xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await;
