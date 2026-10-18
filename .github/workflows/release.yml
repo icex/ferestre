@@ -209,6 +209,44 @@ jobs:
           sha256sum ./*.AppImage ./*.tar.zst > SHA256SUMS
           cat SHA256SUMS
 
+      # Signed with the release key, so the launcher can check what it
+      # downloads against the public key compiled into it (ferestre-core's
+      # signing.rs). Each file gets <name>.minisig beside it, and its trusted
+      # comment names the file. A tag is never published unsigned; a manual run
+      # signs only when the key is available to it.
+      - name: Sign
+        working-directory: out
+        env:
+          MINISIGN_SECRET_L2: ${{ secrets.MINISIGN_SECRET_L2 }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$MINISIGN_SECRET_L2" ]; then
+              if [ "$GITHUB_REF_TYPE" = tag ]; then
+                  echo "::error::MINISIGN_SECRET_L2 is not set; a release is never published unsigned"
+                  exit 1
+              fi
+              echo "-- no signing key in this run; the artefacts are unsigned"
+              exit 0
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y minisign
+          key="$RUNNER_TEMP/minisign.key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$MINISIGN_SECRET_L2" > "$key")
+          for file in ./*.AppImage ./*.tar.zst SHA256SUMS; do
+              name=$(basename "$file")
+              # The password on stdin when the key has one; a key made with
+              # `minisign -G -W` has none and asks for nothing.
+              if [ -n "${MINISIGN_PASSWORD:-}" ]; then
+                  printf '%s\n' "$MINISIGN_PASSWORD" |
+                      minisign -S -s "$key" -m "$file" -t "file:$name"
+              else
+                  minisign -S -s "$key" -m "$file" -t "file:$name" < /dev/null
+              fi
+          done
+          ls -l ./*.minisig
+
       - uses: actions/upload-artifact@v4
         with:
           name: ferestre-${{ steps.version.outputs.version }}

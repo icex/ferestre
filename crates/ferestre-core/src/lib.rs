@@ -32,6 +32,7 @@ pub mod playfab;
 pub mod recipe;
 pub mod runtime;
 pub mod sdl;
+pub mod signing;
 pub mod steam;
 pub mod updates;
 pub mod winrt;
