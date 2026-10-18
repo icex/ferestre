@@ -86,6 +86,7 @@ def main():
     windows=s.Windows(str(home))
     passed=False
     try:
+        s.check_panic_detection(str(home))
         write(home/"profiles.json",json.dumps({"schema":1,"capabilities":["store-player-accounts"],"default_profile":OWNER,
             "profiles":[{"id":OWNER,"label":"Owner Fixture","signed_in":True,"legacy_saves":True,"save_namespace":"a"*64}]}))
         write(home/"client/xodus-cli",CLIENT,True)

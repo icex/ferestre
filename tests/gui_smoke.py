@@ -538,10 +538,13 @@ def check(condition, message, root=None):
     print(f"  ok: {message}")
 
 
-# How Rust reports a panic, on any thread. A child's message can mention one
-# too -- the unreachable-client stub prints the real client's "panicked:" line,
-# and the window may pass that on -- but only a panic hook writes "panicked at".
-PANIC = re.compile(r"thread '[^']*' panicked at ")
+# How Rust reports a panic, on any thread. The line around it has changed
+# between releases -- current ones put the thread id after the name, as in
+# "thread 'main' (2848203) panicked at src/main.rs:1:62:" -- so only the part
+# every release writes is matched. A child's message can mention a panic too --
+# the unreachable-client stub prints the real client's "panicked:" line, and
+# the window may pass that on -- but only a panic hook writes "panicked at".
+PANIC = re.compile(r"\bpanicked at ")
 # GTK's theme parser complains about the system theme on every start and it
 # says nothing about this launcher.
 STDERR_NOISE = ("Theme parser error", "prefer-dark-theme", "radv is not a conformant")
@@ -568,7 +571,7 @@ class Windows:
         self.logs.append((what, path))
         return process
 
-    def problems(self):
+    def problems(self, quiet=False):
         """Print what each window said on stderr, and return a failure for
         every window that panicked."""
         failures = []
@@ -580,12 +583,63 @@ class Windows:
                 continue
             interesting = [line for line in text.splitlines()
                            if line.strip() and not any(n in line for n in STDERR_NOISE)]
-            if interesting:
+            if interesting and not quiet:
                 print(f"\nstderr of the {what} window:", file=sys.stderr)
                 print("\n".join(interesting), file=sys.stderr)
             if any(PANIC.search(line) for line in interesting):
                 failures.append(f"the {what} window panicked; see its stderr above")
         return failures
+
+
+def check_panic_detection(home):
+    """Make sure a panic in a window would be reported, before trusting a
+    clean run to mean there was none.
+
+    The pattern above silently matched nothing once, when Rust added the
+    thread id to its panic line, and every run still said "all good". So this
+    checks it against the lines each Rust release writes, against the stub's
+    line that must not count, and, when a compiler is at hand, against what a
+    real panicking program prints today.
+    """
+    scratch = os.path.join(home, "panic-check")
+    os.makedirs(scratch, exist_ok=True)
+    samples = {
+        "current": "thread 'main' (2848203) panicked at src/main.rs:1:62:\n",
+        "unnamed": "thread '<unnamed>' (2848204) panicked at src/app.rs:9:5:\n",
+        "older": "thread 'main' panicked at src/main.rs:1:62:\n",
+        "oldest": "thread 'main' panicked at 'boom', src/main.rs:1:62\n",
+    }
+    for what, line in samples.items():
+        windows = Windows(scratch)
+        path = os.path.join(scratch, f"{what}.log")
+        with open(path, "w") as f:
+            f.write(line)
+        windows.logs.append((f"panic-check {what}", path))
+        if not windows.problems(quiet=True):
+            raise Failure(f"a {what} Rust panic line is not reported as a panic: {line!r}")
+    stub = Windows(scratch)
+    path = os.path.join(scratch, "stub.log")
+    with open(path, "w") as f:
+        f.write("thread 'main' panicked: Failed to authenticate Xbox user\n")
+    stub.logs.append(("panic-check stub", path))
+    if stub.problems(quiet=True):
+        raise Failure("the unreachable-client stub's message is reported as a window panic")
+
+    rustc = shutil.which("rustc")
+    if rustc is None:
+        print("  ok: panic lines are recognised (no rustc for a live check)")
+        return
+    source = os.path.join(scratch, "panics.rs")
+    program = os.path.join(scratch, "panics")
+    with open(source, "w") as f:
+        f.write('fn main() { let _ = std::thread::spawn(|| panic!("worker")).join(); }\n')
+    subprocess.run([rustc, "-o", program, source], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    live = Windows(scratch)
+    live.start([program], dict(os.environ), "panic-check program").wait(timeout=30)
+    if not live.problems(quiet=True):
+        raise Failure("a real worker-thread panic from this rustc is not reported as a panic")
+    print("  ok: a real Rust panic in a window is reported")
 
 
 def cli_calls(home, command):
@@ -633,6 +687,7 @@ def main():
     # has, which is the state most worth testing.
     home = tempfile.mkdtemp(prefix="ferestre-gui-smoke-")
     windows = Windows(home)
+    check_panic_detection(home)
     recipes_dir = os.path.join(home, "titles")
     shutil.copytree(os.path.join(os.getcwd(), "titles"), recipes_dir)
     # A fixed fixture keeps this warning check independent of live compatibility.
