@@ -33,10 +33,13 @@ while True:
     time.sleep(0.05)
 ''')
                     stub.chmod(0o755)
-                    dest = home / "game"
+                    # The folder given to install is a library; the title
+                    # gets its own folder inside it.
+                    library = home / "library"
+                    dest = library / "9zzcancel001"
                     record = home / "state/ferestre/installed/9ZZCANCEL001.json"
                     if existing:
-                        dest.mkdir()
+                        dest.mkdir(parents=True)
                         (dest / "original-save").write_text("keep me")
                         record.parent.mkdir(parents=True)
                         record.write_text('{"previous_record":true}')
@@ -44,7 +47,7 @@ while True:
                                XDG_CONFIG_HOME=str(home / "config"), XDG_CACHE_HOME=str(home / "cache"),
                                XODUS_CLI_DIR=str(client), XODUS_GAMES_DIR=str(home / "games"),
                                FERESTRE_TITLES=str(home / "titles"), FERESTRE_GUI_CANCELLATION="1")
-                    process = subprocess.Popen([str(binary), "install", "9ZZCANCEL001", str(dest)],
+                    process = subprocess.Popen([str(binary), "install", "9ZZCANCEL001", str(library)],
                                                env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                                stderr=subprocess.PIPE)
                     try:

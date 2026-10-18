@@ -139,7 +139,10 @@ enum Cmd {
         /// The 12-character Store product id.
         #[arg(value_name = "PRODUCT-ID")]
         product_id: String,
-        /// Where to put it. Defaults to the recipe's install directory.
+        /// A library folder to put it in: the title gets its own folder inside
+        /// it, named as in the games directory. The title's own folder is used
+        /// as it is, to repair or update it. Defaults to the recipe's install
+        /// directory.
         #[arg(value_name = "DIR")]
         dir: Option<PathBuf>,
     },
@@ -461,28 +464,67 @@ fn cmd_updates(cli: &Cli) -> Result<ExitCode> {
     let xodus_cli = paths
         .xodus_cli()
         .ok_or_else(|| anyhow!("no xodus-cli found; set XODUS_CLI_DIR (see: ferestre doctor)"))?;
+    let results = check_updates(&paths, &xodus_cli)?;
+    if cli.json {
+        print_json(&json!({ "schema": JSON_SCHEMA, "updates": results }));
+    } else if results.is_empty() {
+        println!("no installed packages could be checked");
+    } else {
+        for result in results {
+            println!(
+                "{}: {}",
+                result["product_id"].as_str().unwrap_or("package"),
+                update_state(&result)
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Ask the update service about every recorded install.
+///
+/// One title the service could not answer for is reported and skipped; it
+/// used to end the whole check, and the titles after it were never asked.
+fn check_updates(paths: &Paths, xodus_cli: &Path) -> Result<Vec<Value>> {
     let records: Vec<_> = install::all(paths.state_dir())
         .into_iter()
         .filter(|record| !record.is_stale())
         .collect();
+    let roles = accounts::load(paths.config_dir())?;
     let mut results = Vec::new();
     for record in records {
         let Some(content_id) = record.content_ids.first() else {
             continue;
         };
-        let mut command = update_command(&xodus_cli, content_id);
-        if let Some(roles) = accounts::load(paths.config_dir())? {
+        let mut command = update_command(xodus_cli, content_id);
+        if let Some(roles) = &roles {
             roles.apply(&mut command);
         }
-        let output = command
-            .output()
-            .with_context(|| format!("running {} update", xodus_cli.display()))?;
+        let output = match command.output() {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!(
+                    "-- {}: could not run {}: {error}",
+                    record.product_id,
+                    xodus_cli.display()
+                );
+                continue;
+            }
+        };
         if !output.status.success() {
             eprintln!("-- {}: update service unavailable", record.product_id);
             continue;
         }
-        let value: Value = serde_json::from_slice(&output.stdout)
-            .context("the update client returned invalid JSON")?;
+        let value: Value = match serde_json::from_slice(&output.stdout) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!(
+                    "-- {}: the update client's answer was not JSON ({error})",
+                    record.product_id
+                );
+                continue;
+            }
+        };
         let version = value["version"].as_str().unwrap_or_default().to_string();
         let available = record.update_available(Some(&version));
         results.push(json!({
@@ -492,25 +534,17 @@ fn cmd_updates(cli: &Cli) -> Result<ExitCode> {
             "update_available": available,
         }));
     }
-    if cli.json {
-        print_json(&json!({ "schema": JSON_SCHEMA, "updates": results }));
-    } else if results.is_empty() {
-        println!("no installed packages could be checked");
-    } else {
-        for result in results {
-            let state = if result["update_available"] == Value::Bool(true) {
-                "update available"
-            } else {
-                "up to date"
-            };
-            println!(
-                "{}: {}",
-                result["product_id"].as_str().unwrap_or("package"),
-                state
-            );
-        }
+    Ok(results)
+}
+
+/// The text for one title's answer. `null` is "cannot tell" -- a version is
+/// missing on one side -- and is said so rather than shown as up to date.
+fn update_state(result: &Value) -> &'static str {
+    match result["update_available"] {
+        Value::Bool(true) => "update available",
+        Value::Bool(false) => "up to date",
+        _ => "unknown (no version to compare)",
     }
-    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_run(
@@ -531,7 +565,58 @@ fn cmd_run(
     }
 
     let paths = Paths::from_env()?;
-    let (dir, mut recipes) = load_recipes(cli)?;
+    let request = LaunchRequest {
+        dry_run,
+        force,
+        steam,
+    };
+    let prepared = prepare_launch(cli, &paths, title, request)?;
+    if dry_run {
+        // Nothing has been started or written: a dry run prints and stops.
+        if cli.json {
+            print_json(&json!({
+                "schema": JSON_SCHEMA,
+                "plan": plan_json(&prepared.plan, cli.show_account),
+            }));
+        } else {
+            print!("{}", render_plan(&prepared.plan, cli.show_account));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    launch_prepared(&paths, prepared, force)
+}
+
+/// What `run` was asked for, beyond the title.
+#[derive(Debug, Clone, Copy, Default)]
+struct LaunchRequest {
+    dry_run: bool,
+    force: bool,
+    steam: bool,
+}
+
+/// A launch worked out and checked, with nothing started yet.
+struct PreparedLaunch {
+    recipe: Recipe,
+    runtime: InstalledRuntime,
+    registry: Option<Registry>,
+    dirs: launch::Dirs,
+    options: launch::Options,
+    plan: launch::Plan,
+    service_socket: Option<PathBuf>,
+}
+
+/// Everything a launch decides before it starts anything: the recipe, the
+/// runtime and whether it may run the title, the account roles, and the plan.
+///
+/// Reads only, apart from describing an undescribed title, which a dry run
+/// does in memory: `--dry-run` must not leave anything behind.
+fn prepare_launch(
+    cli: &Cli,
+    paths: &Paths,
+    title: &str,
+    request: LaunchRequest,
+) -> Result<PreparedLaunch> {
+    let (dir, mut recipes) = recipes_from(cli, paths)?;
 
     // Nothing describes it, but it is on disk and its package says how to start
     // it -- so describe it and carry on rather than stopping to ask. The
@@ -540,12 +625,17 @@ fn cmd_run(
     // thousands of files. Writing it down means the answer survives, and stays
     // editable when a title turns out to need something else.
     if !recipes.iter().any(|r| r.matches(title)) {
-        if let Some(written) = describe_from_disk(&paths, title)? {
-            eprintln!(
-                "-- no recipe, so one was written from the package manifest: {}",
-                written.display()
-            );
-            recipes = load_recipes(cli)?.1;
+        if let Some((detected, written)) = describe_from_disk(paths, title, !request.dry_run)? {
+            match written {
+                Some(written) => eprintln!(
+                    "-- no recipe, so one was written from the package manifest: {}",
+                    written.display()
+                ),
+                None => {
+                    eprintln!("-- no recipe; a launch would write one from the package manifest")
+                }
+            }
+            recipes.push(detected);
         }
     }
 
@@ -563,34 +653,36 @@ fn cmd_run(
     // Checked before anything is started, because the alternative is a title
     // that exits 1 with an empty log and someone guessing which of eleven
     // patches is missing.
-    let runtimes = runtime::all(&paths);
+    let runtimes = runtime::all(paths);
     let requested_runtime = runtime::selected(paths.config_dir(), &recipe.title.product_id);
-    let runtime = runtime::select(
+    let registry = registry_for(paths);
+    let runtime = choose_runtime(
         &inferred.recipe,
         &runtimes,
         requested_runtime.as_deref(),
-        registry_for(&paths).as_ref(),
+        registry.as_ref(),
     )?;
-    let recipe = &engine_defaults(inferred, runtime, &paths);
-    let registry = registry_for(&paths);
-    let assessment = runtime::assess(recipe, runtime, registry.as_ref());
+    let recipe = engine_defaults(inferred, runtime, paths);
+    let assessment = runtime::assess(&recipe, runtime, registry.as_ref());
     let verdict = gate(&assessment);
-    if verdict == Gate::Refused && !force {
+    if verdict == Gate::Refused && !request.force {
         bail!("{}", refusal(&assessment, runtime));
     }
-    for line in warnings(recipe, &assessment, verdict, force) {
+    for line in warnings(&recipe, &assessment, verdict, request.force) {
         eprintln!("{line}");
     }
 
-    let dirs = launch_dirs_for_runtime(&paths, &runtime.path)?;
+    let dirs = launch_dirs_for_runtime(paths, &runtime.path)?;
     let roles = accounts::launch_selection(paths.config_dir())?;
-    let mut prefix = paths.prefix_dir(recipe)?;
+    let mut prefix = paths.prefix_dir(&recipe)?;
     // `XGR_XUID` is the Windows install's XUID, so it names the imported
     // player's save folders. Another player has their own prefix and their own
     // XUID: inheriting it would name their saves after somebody else, and
     // report that XUID whenever the live lookup has not answered yet.
     let mut own_xuid = true;
     if let Some(roles) = &roles {
+        // Read even for a dry run: the Player decides which prefix the plan
+        // names.
         let profiles = accounts::fetch(&dirs.xodus_cli())?;
         let (store, player) = roles.selected(&profiles)?;
         if roles.split() && !runtime.provides(accounts::CAPABILITY) {
@@ -599,7 +691,9 @@ fn cmd_run(
         if !runtime.provides(SERVICE_SOCKET_OVERRIDE) {
             bail!("This runtime cannot isolate the selected account service. Update the runtime first.");
         }
-        accounts::require_service(&dirs.xodus_service())?;
+        if !request.dry_run {
+            accounts::require_service(&dirs.xodus_service())?;
+        }
         prefix = accounts::player_prefix(&prefix, player)?;
         own_xuid = player.legacy_saves;
         if cli.show_account {
@@ -608,19 +702,16 @@ fn cmd_run(
             eprintln!(":: using the selected Store and Player accounts");
         }
     }
-    if let Some(registry) = &registry {
-        register_winrt_classes(&prefix, registry, runtime);
-    }
     let options = launch::Options {
-        steam_integration: steam,
+        steam_integration: request.steam,
         xuid: paths
             .var("XGR_XUID")
             .filter(|_| own_xuid)
             .map(str::to_string),
-        game_dir: Some(paths.install_dir(recipe)?),
+        game_dir: Some(paths.install_dir(&recipe)?),
         prefix_dir: Some(prefix),
     };
-    let mut plan = launch::plan(recipe, &dirs, &options);
+    let mut plan = launch::plan(&recipe, &dirs, &options);
     if !own_xuid {
         plan.env_set.remove("XGR_XUID");
         plan.env_unset.push("XGR_XUID".into());
@@ -647,23 +738,42 @@ fn cmd_run(
             &mut plan,
             &recipe.title.product_id,
             content,
-            &launch::game_dir(recipe, &dirs, &options),
+            &launch::game_dir(&recipe, &dirs, &options),
         )?;
     }
     let service_socket = plan_service_socket(&mut plan, &dirs, runtime, roles.as_ref())?;
+    Ok(PreparedLaunch {
+        runtime: runtime.clone(),
+        recipe,
+        registry,
+        dirs,
+        options,
+        plan,
+        service_socket,
+    })
+}
 
-    if dry_run {
-        if cli.json {
-            print_json(&json!({ "schema": JSON_SCHEMA, "plan": plan_json(&plan) }));
-        } else {
-            print!("{}", render_plan(&plan));
-        }
-        return Ok(ExitCode::SUCCESS);
-    }
+/// Start a prepared launch and wait for the title.
+fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Result<ExitCode> {
+    let PreparedLaunch {
+        recipe,
+        runtime,
+        registry,
+        dirs,
+        options,
+        plan,
+        service_socket,
+    } = prepared;
+    // Held while the title runs: an install, update or removal of it waits
+    // for this, and this does not start while one of those is under way.
+    let _lock = TitleLock::take(paths, &recipe.title.product_id, LockMode::Run)?;
+    // Through the checked path: the slug is recipe data, and the log is
+    // created wherever this says.
+    let log = paths.log_file(&recipe)?;
 
     // The three things a Plan deliberately does not model, in the order
     // launch-gdk.sh does them.
-    let game_dir = launch::game_dir(recipe, &dirs, &options);
+    let game_dir = launch::game_dir(&recipe, &dirs, &options);
     if !game_dir.is_dir() {
         bail!(
             "{} is not installed at {} -- download it: ferestre install {}",
@@ -672,20 +782,36 @@ fn cmd_run(
             recipe.title.product_id
         );
     }
-    run_setup(recipe, "every-launch", &dirs, &game_dir)?;
-    std::fs::create_dir_all(launch::prefix_dir(recipe, &dirs, &options))
-        .context("creating the Wine prefix directory")?;
+    // A download that stopped partway leaves the client's working container;
+    // the tree beside it is part old build, part new, and part missing.
+    if game_dir.join(STREAMING_TEMPORARY).exists() {
+        if !force {
+            bail!(
+                "{} did not finish downloading at {} -- finish it: ferestre install {} \
+                 (or launch what is there anyway with --force)",
+                recipe.title.name,
+                game_dir.display(),
+                recipe.title.product_id
+            );
+        }
+        eprintln!(
+            "-- --force: launching an unfinished download in {}",
+            game_dir.display()
+        );
+    }
+    let prefix = launch::prefix_dir(&recipe, &dirs, &options);
+    if let Some(registry) = &registry {
+        register_winrt_classes(&prefix, registry, &runtime);
+    }
+    run_setup(&recipe, "every-launch", &dirs.scripts_dir, &game_dir)?;
+    std::fs::create_dir_all(&prefix).context("creating the Wine prefix directory")?;
     if runtime.provides("xgameruntime.playfab-file-saves") {
         if let Some(identity) = install::package_identity(&game_dir) {
             let backups = paths
                 .state_dir()
                 .join("save-backups")
                 .join(&recipe.title.product_id);
-            for backup in ferestre_core::playfab::repair_package(
-                &launch::prefix_dir(recipe, &dirs, &options),
-                &identity,
-                &backups,
-            )? {
+            for backup in ferestre_core::playfab::repair_package(&prefix, &identity, &backups)? {
                 eprintln!(
                     ":: preserved unsynced save cache at {}; saved progress will be rescanned",
                     backup.display()
@@ -696,6 +822,11 @@ fn cmd_run(
     // From here on a signal must not end this process outright: it holds a
     // claim on the service, released only by finishing.
     let forwarding = Forwarding::install()?;
+    forwarding.set_session(Some(Arc::new(PrefixSession::for_runtime(
+        &runtime.path,
+        &prefix,
+        &recipe.launch.executable,
+    ))));
     // Before the service is looked for: a launch finishing now must not stop a
     // service this one is about to reuse.
     let _service_use = ServiceUse::begin(service_socket.as_deref())?;
@@ -718,11 +849,43 @@ fn cmd_run(
             );
         }
     }
-    run_teed(
-        plan.to_command(),
-        &launch::log_path(recipe, &dirs),
-        &forwarding,
-    )
+    run_teed(plan.to_command(), &log, &forwarding)
+}
+
+/// The runtime a launch uses, whether or not it can run the title.
+///
+/// Deciding that is the gate's job, not this one's: a runtime filtered out here
+/// left only "no installed runtime satisfies X", with no list of what was
+/// missing, `--force` doing nothing, and a probed runtime -- which cannot be
+/// checked, only warned about -- refused outright. So: the runtime chosen for
+/// the title if it is still installed; otherwise the newest that satisfies the
+/// recipe; otherwise the newest there is, for the gate to judge.
+fn choose_runtime<'a>(
+    recipe: &Recipe,
+    runtimes: &'a [InstalledRuntime],
+    requested: Option<&Path>,
+    registry: Option<&Registry>,
+) -> Result<&'a InstalledRuntime> {
+    if let Some(path) = requested {
+        return runtimes.iter().find(|rt| rt.path == path).ok_or_else(|| {
+            anyhow!(
+                "{}: the runtime chosen for {} is not installed any more; choose another, \
+                 or install one (ferestre install-runtime)",
+                path.display(),
+                recipe.title.name
+            )
+        });
+    }
+    runtimes
+        .iter()
+        .find(|rt| runtime::assess(recipe, rt, registry).is_satisfied())
+        .or_else(|| runtimes.first())
+        .ok_or_else(|| {
+            anyhow!(
+                "no patched Proton runtime is installed; run: ferestre install-runtime \
+                 (or set XODUS_PROTON_DIR)"
+            )
+        })
 }
 
 /// The recipe a launch uses once a detected engine's defaults are settled,
@@ -781,22 +944,30 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
              e.g. 9NBLGGH2JHXJ -- it is in the Store URL)"
         )));
     }
-    let product_id = normalise_product_id(product_id);
-
     let paths = Paths::from_env()?;
+    install_title(cli, &paths, product_id, dir, &cancellation)
+}
+
+fn install_title(
+    cli: &Cli,
+    paths: &Paths,
+    product_id: &str,
+    dir: Option<&Path>,
+    cancellation: &cancel::Cancellation,
+) -> Result<ExitCode> {
+    let product_id = normalise_product_id(product_id);
     let xodus_cli = paths
         .xodus_cli()
         .ok_or_else(|| anyhow!("no xodus-cli found; set XODUS_CLI_DIR (see: ferestre doctor)"))?;
-    let (_, recipes) = load_recipes(cli).unwrap_or_else(|_| (PathBuf::new(), Vec::new()));
+    // Not swallowed: with a recipe that does not parse, this would download to
+    // the wrong place, skip the title's setup, and then write a blank recipe
+    // over the person's own.
+    let recipes = recipes_for_change(cli, paths)?;
     let recipe = recipes.iter().find(|r| r.matches(&product_id));
 
     // A recipe knows the layout a title expects -- Bedrock's package lives one
     // level down -- so it decides the destination when there is one.
-    let dest = match (dir, recipe) {
-        (Some(d), _) => d.to_path_buf(),
-        (None, Some(r)) => paths.install_dir(r)?,
-        (None, None) => paths.games_dir().join(product_id.to_ascii_lowercase()),
-    };
+    let dest = install_destination(paths, &product_id, recipe, dir)?;
 
     let mut command = streaming_command(&xodus_cli, &product_id, &dest);
     if let Some(roles) = accounts::load(paths.config_dir())? {
@@ -814,8 +985,13 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
         return Ok(ExitCode::SUCCESS);
     }
 
+    // Held until the command ends: a launch must not start on a tree that is
+    // being rewritten, and a running title's files must not be replaced.
+    let _lock = TitleLock::take(paths, &product_id, LockMode::Change)?;
+
     // Remembered so a failed install can put the disk back the way it found it.
     let dest_existed = dest.is_dir();
+    let before = container_state(&dest);
     std::fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
     eprintln!(":: {product_id} -> {}", dest.display());
     let code = cancellation.run(command)?;
@@ -880,23 +1056,63 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
         );
         return Ok(ExitCode::from(code));
     }
-
-    // A download replaces whatever was patched last time -- Microsoft's
-    // XCurl.dll comes back with every update -- so the after-install steps run
-    // again here, not once at first install.
-    if let Some(recipe) = recipe {
-        let dirs = launch_dirs(&paths)?;
-        run_setup(recipe, "after-install", &dirs, &dest)?;
+    // An update the client gave up on still exits zero -- a lapsed licence, too
+    // little disk space -- and leaves the previous build's manifest and
+    // container where they were, so the checks above pass. Two things tell it
+    // apart from a finished run: the client's working container is renamed
+    // over the old one only once every file is written, so one still there
+    // means it stopped early; and a finished run always replaces the
+    // container, so the very same file as before means nothing was installed.
+    if let Some(problem) = unfinished_update(&dest, before.as_ref()) {
+        if before.is_some() {
+            eprintln!("!! {product_id} was not updated: {problem}");
+            eprintln!(
+                "   the reason is in the client's output above; the build that was installed \
+                 in {} is still there, and `ferestre install {product_id}` tries again",
+                dest.display()
+            );
+        } else {
+            eprintln!("!! {product_id} did not finish installing: {problem}");
+            eprintln!(
+                "   the reason is in the client's output above; the files are kept in {}, \
+                 and `ferestre install {product_id}` carries on from them",
+                dest.display()
+            );
+        }
+        return Ok(ExitCode::FAILURE);
     }
 
-    // Written last, and only on success, because a record for a download that
-    // failed halfway would claim a build is installed that is not.
+    // Recorded before the setup steps run: the files are there and the
+    // version can be read, whatever a setup step then does. A setup step that
+    // fails used to leave a finished download unrecorded, which the window
+    // then had no way to remove.
     cancellation.check()?;
-    match record_install(&paths, &product_id, &dest) {
+    match record_install(paths, &product_id, &dest) {
         Ok(record) => eprintln!("{}", installed_summary(&record)),
         // The title is installed either way. Failing the command over the
         // bookkeeping would be the tail wagging the dog.
         Err(e) => eprintln!("-- installed, but could not record the version: {e}"),
+    }
+
+    // A download replaces whatever was patched last time -- Microsoft's
+    // XCurl.dll comes back with every update -- so the after-install steps run
+    // again here, not once at first install. They need the scripts and nothing
+    // else: asking for a runtime here failed every install on a machine whose
+    // only runtime is one `install-runtime` downloaded.
+    let mut setup_failed = false;
+    if let Some(recipe) = recipe {
+        let scripts = paths
+            .scripts_dir()
+            .ok_or_else(|| anyhow!("cannot find the scripts directory; set XODUS_REPO_DIR"));
+        if let Err(error) = scripts.and_then(|s| run_setup(recipe, "after-install", s, &dest)) {
+            print_error(&error);
+            eprintln!(
+                "   {} is installed and recorded, but its setup did not finish; \
+                 `ferestre install {product_id}` runs it again",
+                recipe.title.name
+            );
+            setup_failed = true;
+        }
     }
 
     // A title nobody has described can describe itself now that it is on disk.
@@ -905,7 +1121,7 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
     // it here rather than in the window means `ferestre install <anything>`
     // leaves something runnable whichever way it was invoked.
     if recipe.is_none() {
-        match write_detected_recipe(&paths, &product_id, &dest) {
+        match write_detected_recipe(paths, &product_id, &dest) {
             Ok(Some(path)) => eprintln!(
                 "-- wrote a recipe from the package manifest: {}\n\
                     check it with `ferestre titles`, and edit it if the title \
@@ -919,7 +1135,22 @@ fn cmd_install(cli: &Cli, product_id: &str, dir: Option<&Path>) -> Result<ExitCo
             Err(e) => eprintln!("-- could not write a recipe: {e}"),
         }
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(if setup_failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Why an update that exited zero did not install anything, if it did not.
+fn unfinished_update(dest: &Path, before: Option<&ContainerState>) -> Option<&'static str> {
+    if dest.join(STREAMING_TEMPORARY).exists() {
+        return Some("the client stopped before every file was written");
+    }
+    if before.is_some() && container_state(dest).as_ref() == before {
+        return Some("the client did not replace the package, so nothing changed");
+    }
+    None
 }
 
 /// Remove a title: the files, and the record that says it is installed.
@@ -936,18 +1167,61 @@ fn cmd_uninstall(
     remove_prefix: bool,
     yes: bool,
 ) -> Result<ExitCode> {
-    let product_id = normalise_product_id(product_id);
     let paths = Paths::from_env()?;
+    let mut stdin = std::io::stdin().lock();
+    uninstall_title(
+        cli,
+        &paths,
+        product_id,
+        Removal {
+            keep_files,
+            remove_prefix,
+            yes,
+        },
+        &mut stdin,
+    )
+}
+
+/// What `uninstall` was asked to do.
+#[derive(Debug, Clone, Copy)]
+struct Removal {
+    keep_files: bool,
+    remove_prefix: bool,
+    yes: bool,
+}
+
+fn uninstall_title(
+    cli: &Cli,
+    paths: &Paths,
+    title: &str,
+    removal: Removal,
+    answers: &mut dyn BufRead,
+) -> Result<ExitCode> {
+    let recipes = recipes_for_change(cli, paths)?;
+    // Only a product id or a recipe's slug. Anything else used to fall
+    // through to `<games dir>/<what was typed>`: an empty id named the games
+    // directory itself, and `..` named the home directory.
+    let product_id = if is_product_id(title) {
+        normalise_product_id(title)
+    } else if let Some(recipe) = recipes
+        .iter()
+        .find(|r| r.title.slug.eq_ignore_ascii_case(title))
+    {
+        recipe.title.product_id.to_ascii_uppercase()
+    } else {
+        return Err(usage(&format!(
+            "'{title}' is not a Store product id (12 characters, letters and digits) or the \
+             slug of a recipe (see: ferestre titles)"
+        )));
+    };
+    let recipe = recipes.iter().find(|r| r.matches(&product_id));
 
     // The record first, then the recipe: the record is what the launcher acted
     // on, and a recipe's install directory is where it *would* have gone.
     let record = install::load(paths.state_dir(), &product_id);
-    let (_, recipes) = load_recipes(cli).unwrap_or_else(|_| (PathBuf::new(), Vec::new()));
     let dir = match &record {
         Some(record) => Some(record.dir.clone()),
-        None => recipes
-            .iter()
-            .find(|r| r.matches(&product_id))
+        None => recipe
             .and_then(|r| paths.install_dir(r).ok())
             // Neither recorded nor described, but a directory may still be
             // there: this is exactly what a failed install leaves, and refusing
@@ -962,18 +1236,19 @@ fn cmd_uninstall(
     let Some(dir) = dir else {
         bail!("nothing is recorded or described for {product_id}, so there is nothing to remove");
     };
-    let removing = !keep_files && dir.is_dir();
+    let removing = !removal.keep_files && dir.is_dir();
 
     // The Wine prefix is a separate directory and it outlives the install: it
     // is where a title's saved games are, so removing it silently alongside the
     // files would throw away the thing somebody most wants to keep. Named
     // either way, because a directory left behind that nothing mentions is how
     // `stardew-valley-proton` sat there after Stardew Valley was uninstalled.
-    let prefix = recipes
-        .iter()
-        .find(|r| r.matches(&product_id))
+    // Every Player's own copy is named too: with account roles, a Player's
+    // saves are in `players/<namespace>/<prefix>`, not in the shared one.
+    let prefixes = recipe
         .and_then(|r| paths.prefix_dir(r).ok())
-        .filter(|p| p.is_dir());
+        .map(|base| title_prefixes(&base))
+        .unwrap_or_default();
 
     if cli.json {
         print_json(&json!({
@@ -982,43 +1257,72 @@ fn cmd_uninstall(
             "directory": dir.display().to_string(),
             "removing_files": removing,
             "had_record": record.is_some(),
-            "prefix": prefix.as_ref().map(|p| p.display().to_string()),
-            "removing_prefix": remove_prefix && prefix.is_some(),
+            "prefix": prefixes.first().map(|p| p.display().to_string()),
+            "prefixes": prefixes.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            "removing_prefix": removal.remove_prefix && !prefixes.is_empty(),
         }));
         return Ok(ExitCode::SUCCESS);
     }
 
+    // Checked before anything is asked, so the question is never put for a
+    // directory that would then be refused.
     if removing {
-        install::safe_to_remove(&dir)?;
-        let size = install::tree_size(&dir);
-        eprintln!(
-            ":: removing {} ({})",
-            dir.display(),
-            ferestre_core::human_bytes(size)
-        );
-        if !yes {
-            // Asked, not assumed. This is the only command here that destroys
-            // something, and `--yes` exists for the window, which asks first in
-            // its own dialog.
-            eprint!("   delete it? [y/N] ");
-            use std::io::Write;
-            std::io::stderr().flush().ok();
-            let mut answer = String::new();
-            std::io::stdin().read_line(&mut answer)?;
-            if !matches!(answer.trim(), "y" | "Y" | "yes") {
-                eprintln!("-- left alone");
-                return Ok(ExitCode::FAILURE);
-            }
+        check_removable(&dir, paths, &product_id, Removable::Install)?;
+    }
+    if removal.remove_prefix {
+        for prefix in &prefixes {
+            check_removable(prefix, paths, &product_id, Removable::Prefix)?;
         }
+    }
+    // Not while it runs, and not while something else is installing it.
+    let _lock = TitleLock::take(paths, &product_id, LockMode::Change)?;
+
+    // Everything that is about to go, named with its size, and asked about
+    // once.
+    let mut doomed: Vec<&Path> = Vec::new();
+    if removing {
+        doomed.push(&dir);
+    }
+    if removal.remove_prefix {
+        doomed.extend(prefixes.iter().map(PathBuf::as_path));
+    }
+    for (i, path) in doomed.iter().enumerate() {
+        eprintln!(
+            ":: removing {}{} ({})",
+            if i > 0 || !removing {
+                "the Wine prefix "
+            } else {
+                ""
+            },
+            path.display(),
+            ferestre_core::human_bytes(install::tree_size(path))
+        );
+    }
+    if !doomed.is_empty() && !removal.yes {
+        // Asked, not assumed. This is the only command here that destroys
+        // something, and `--yes` exists for the window, which asks first in
+        // its own dialog.
+        eprint!(
+            "   delete {}? [y/N] ",
+            if doomed.len() == 1 { "it" } else { "them" }
+        );
+        std::io::stderr().flush().ok();
+        let mut answer = String::new();
+        answers.read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            eprintln!("-- left alone");
+            return Ok(ExitCode::FAILURE);
+        }
+    }
+    if removing {
         std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
         eprintln!("-- removed {}", dir.display());
-    } else if !keep_files {
+    } else if !removal.keep_files {
         eprintln!(":: {} is already gone", dir.display());
     }
 
-    if let Some(prefix) = &prefix {
-        if remove_prefix {
-            install::safe_to_remove(prefix)?;
+    for prefix in &prefixes {
+        if removal.remove_prefix {
             std::fs::remove_dir_all(prefix)
                 .with_context(|| format!("removing {}", prefix.display()))?;
             eprintln!("-- removed the Wine prefix {}", prefix.display());
@@ -1028,16 +1332,441 @@ fn cmd_uninstall(
                 prefix.display(),
                 ferestre_core::human_bytes(install::tree_size(prefix))
             );
-            eprintln!("   remove it too with: ferestre uninstall {product_id} --prefix");
         }
+    }
+    if !removal.remove_prefix && !prefixes.is_empty() {
+        eprintln!("   remove them too with: ferestre uninstall {product_id} --prefix");
     }
 
     install::forget(paths.state_dir(), &product_id)?;
     eprintln!("-- forgot the install record for {product_id}");
-    if keep_files {
+    if removal.keep_files {
         eprintln!("   the files are still in {}", dir.display());
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// A title's Wine prefixes that are on disk: the shared one, then each
+/// Player's own (`players/<namespace>/<prefix name>` beside it), sorted.
+fn title_prefixes(base: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if base.is_dir() {
+        found.push(base.to_path_buf());
+    }
+    let (Some(parent), Some(name)) = (base.parent(), base.file_name()) else {
+        return found;
+    };
+    let mut players: Vec<PathBuf> = std::fs::read_dir(parent.join("players"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|namespace| namespace.path().join(name))
+        .filter(|prefix| prefix.is_dir() && !prefix.is_symlink())
+        .collect();
+    players.sort();
+    found.extend(players);
+    found
+}
+
+// ---------------------------------------------------------------------------
+// install destinations, removal and per-title locks
+// ---------------------------------------------------------------------------
+
+/// The client's working container. It is created when a download starts and
+/// renamed over [`STREAMING_CONTAINER`] only once every file is written, so
+/// one still there means a download that did not finish.
+const STREAMING_TEMPORARY: &str = ".xodus-streaming-tmp.msixvc";
+const STREAMING_CONTAINER: &str = ".xodus-streaming.msixvc";
+
+/// Where `install` puts a title.
+///
+/// A folder the person chose is a library to install *into*: the title goes
+/// in its own folder inside it, named as it would be in the games directory.
+/// Installing straight into the chosen folder mixed the package into
+/// whatever was there, recorded the whole folder as the title, and a later
+/// Remove deleted all of it. The one exception is the title's own folder,
+/// chosen again to repair or update it.
+fn install_destination(
+    paths: &Paths,
+    product_id: &str,
+    recipe: Option<&Recipe>,
+    chosen: Option<&Path>,
+) -> Result<PathBuf> {
+    let dest = match (chosen, recipe) {
+        (Some(chosen), _) => {
+            let chosen = absolute_dir(paths, chosen)?;
+            if is_own_install(paths, product_id, &chosen) {
+                chosen
+            } else {
+                chosen.join(game_folder(recipe, product_id)?)
+            }
+        }
+        (None, Some(recipe)) => paths.install_dir(recipe)?,
+        // An update of a title with no recipe goes where it was installed,
+        // not into a second copy under the games directory.
+        (None, None) => install::load(paths.state_dir(), product_id)
+            .map(|record| record.dir)
+            .filter(|dir| dir.is_absolute() && dir.is_dir())
+            .unwrap_or_else(|| paths.games_dir().join(product_id.to_ascii_lowercase())),
+    };
+    if let Some(reason) = protected_reason(&dest, paths) {
+        return Err(usage(&format!(
+            "{} is {reason}; choose a folder to install into",
+            dest.display()
+        )));
+    }
+    if let Some(other) = package_store_id(&dest).filter(|id| id != product_id) {
+        return Err(usage(&format!(
+            "{} already holds another title ({other}); choose another folder",
+            dest.display()
+        )));
+    }
+    Ok(dest)
+}
+
+/// The folder a title gets inside a library: the recipe's install directory
+/// (Bedrock's is `bedrock/game`), or the product id, as in the games
+/// directory.
+fn game_folder(recipe: Option<&Recipe>, product_id: &str) -> Result<PathBuf> {
+    let name = match recipe {
+        Some(recipe) => recipe.install_dir().to_string(),
+        None => product_id.to_ascii_lowercase(),
+    };
+    let folder = Path::new(&name);
+    let normal = folder
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if name.is_empty() || !normal {
+        bail!("{product_id}: install dir \"{name}\" must be a relative path with no \"..\"");
+    }
+    Ok(folder.to_path_buf())
+}
+
+/// A folder as typed, made absolute.
+///
+/// `~` is expanded: the window passes its "Install to" text through as typed,
+/// and without a shell in between a literal `~` folder appeared under
+/// whatever the working directory was. A relative folder is taken from the
+/// working directory, as a shell user means it, and kept absolute, so the
+/// record names the same place from the window and from Steam.
+fn absolute_dir(paths: &Paths, typed: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    let mut components = typed.components();
+    let expanded = match components.clone().next() {
+        Some(Component::Normal(first)) if first == "~" => {
+            components.next();
+            paths.home().join(components.as_path())
+        }
+        Some(Component::Normal(first)) if first.to_string_lossy().starts_with('~') => {
+            return Err(usage(&format!(
+                "{}: only ~ on its own is expanded; write the path out",
+                typed.display()
+            )));
+        }
+        Some(_) => typed.to_path_buf(),
+        None => return Err(usage("the install folder is empty")),
+    };
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .context("finding the working directory")?
+            .join(expanded)
+    };
+    if !absolute
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Ok(absolute);
+    }
+    // `..` means something only once the folders it climbs out of exist.
+    std::fs::canonicalize(&absolute).map_err(|_| {
+        usage(&format!(
+            "{}: a folder with \"..\" in it has to exist; write the path out",
+            typed.display()
+        ))
+    })
+}
+
+/// Whether `dir` is this title's own install -- recorded there, or holding
+/// its package -- rather than a library to put it in.
+fn is_own_install(paths: &Paths, product_id: &str, dir: &Path) -> bool {
+    let recorded = install::load(paths.state_dir(), product_id)
+        .is_some_and(|record| same_dir(&record.dir, dir));
+    recorded || package_store_id(dir).as_deref() == Some(product_id)
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The Store id the package in `dir` names in its `MicrosoftGame.config`,
+/// upper case.
+fn package_store_id(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(install::game_config(dir)?).ok()?;
+    let open = "<StoreId>";
+    let start = text.find(open)? + open.len();
+    let value = text[start..].split_once("</StoreId>")?.0.trim();
+    (!value.is_empty()).then(|| value.to_ascii_uppercase())
+}
+
+/// Why `dir` is a directory no title owns, if it is one: the home directory,
+/// the games directory, the launcher's own directories, or a folder holding
+/// any of them.
+fn protected_reason(dir: &Path, paths: &Paths) -> Option<String> {
+    let resolved = resolve_existing(dir);
+    let mut protected: Vec<(PathBuf, &str)> = vec![
+        (paths.home().to_path_buf(), "the home directory"),
+        (paths.games_dir().to_path_buf(), "the games directory"),
+        (
+            paths.games_dir().join("players"),
+            "where Players' saves are kept",
+        ),
+        (
+            paths.state_dir().to_path_buf(),
+            "the launcher's state directory",
+        ),
+        (paths.config_dir().to_path_buf(), "the launcher's settings"),
+        (paths.cache_dir().to_path_buf(), "the launcher's cache"),
+        (paths.runtimes_dir(), "where runtimes are installed"),
+    ];
+    for (dir, what) in [
+        (paths.titles_dir(), "the recipe directory"),
+        (paths.scripts_dir(), "the launcher's scripts"),
+        (paths.cli_dir(), "the Xbox client's directory"),
+        (paths.tree_dir(), "the launcher's installation"),
+        (paths.steam_dir(), "the Steam directory"),
+    ] {
+        if let Some(dir) = dir {
+            protected.push((dir.to_path_buf(), what));
+        }
+    }
+    for name in ["XDG_RUNTIME_DIR", "XODUS_RUNTIME_DIR"] {
+        if let Some(dir) = paths
+            .var(name)
+            .map(PathBuf::from)
+            .filter(|d| d.is_absolute())
+        {
+            protected.push((dir, "the session's runtime directory"));
+        }
+    }
+    protected.into_iter().find_map(|(other, what)| {
+        let other = resolve_existing(&other);
+        if other == resolved {
+            Some(what.to_string())
+        } else if other.starts_with(&resolved) {
+            Some(format!("a folder holding {what} ({})", other.display()))
+        } else {
+            None
+        }
+    })
+}
+
+/// A path with its symlinks and `..` resolved as far as it exists, so two
+/// spellings of one directory compare equal.
+fn resolve_existing(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(resolved) = std::fs::canonicalize(existing) {
+            return rest
+                .iter()
+                .rev()
+                .fold(resolved, |acc: PathBuf, part: &&std::ffi::OsStr| {
+                    acc.join(part)
+                });
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Which kind of directory is about to be deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removable {
+    Install,
+    Prefix,
+}
+
+/// Refuse to delete anything that is not this title's own.
+///
+/// A record is a JSON file anybody can edit, a recipe can name a directory
+/// through an environment variable, and an install directory used to be
+/// whatever was typed, so the path is checked here and not trusted: it is
+/// never the home, games or launcher directories or a folder holding them,
+/// never holds another title's install, and an install directory never holds
+/// Wine prefixes -- that is a games library, not a title.
+fn check_removable(dir: &Path, paths: &Paths, product_id: &str, kind: Removable) -> Result<()> {
+    install::safe_to_remove(dir)?;
+    if dir
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!("{} has \"..\" in it; remove it by hand", dir.display());
+    }
+    if let Some(reason) = protected_reason(dir, paths) {
+        bail!("{} is {reason}; refusing to delete it", dir.display());
+    }
+    let resolved = resolve_existing(dir);
+    for other in install::all(paths.state_dir()) {
+        if other.product_id.eq_ignore_ascii_case(product_id) {
+            continue;
+        }
+        if resolve_existing(&other.dir).starts_with(&resolved) {
+            bail!(
+                "{} holds {}'s install ({}); refusing to delete it",
+                dir.display(),
+                other.product_id,
+                other.dir.display()
+            );
+        }
+    }
+    if kind == Removable::Install {
+        if let Some(inside) = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|child| holds_other_titles(child, product_id))
+        {
+            bail!(
+                "{} looks like a games library, not one title's folder ({} is in it); \
+                 refusing to delete it",
+                dir.display(),
+                inside.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether `child`, inside a folder about to be deleted, belongs to the games
+/// library rather than to the title: a Wine prefix (`<slug>-proton` with its
+/// `pfx`), the Players' prefixes, or another title's download. Told by what
+/// is inside, not the name alone, so a game's own `players` folder is not
+/// mistaken for one.
+fn holds_other_titles(child: &Path, product_id: &str) -> bool {
+    if !child.is_dir() || child.is_symlink() {
+        return false;
+    }
+    let name = child.file_name().unwrap_or_default().to_string_lossy();
+    if name.ends_with("-proton") && child.join("pfx").is_dir() {
+        return true;
+    }
+    if name == "players"
+        && std::fs::read_dir(child)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|namespace| {
+                let name = namespace.file_name();
+                let name = name.to_string_lossy();
+                name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+    {
+        return true;
+    }
+    child.join(STREAMING_CONTAINER).is_file()
+        && package_store_id(child).is_some_and(|id| id != product_id)
+}
+
+/// What a per-title lock is held for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockMode {
+    /// A launch, held while the title runs. Any number at once.
+    Run,
+    /// Install, update or remove. Only with nothing else holding the title.
+    Change,
+}
+
+/// One title's claim, shared between launches and exclusive for anything that
+/// rewrites or deletes its files.
+///
+/// Without it the window offered Remove for a title Steam had started, an
+/// update rewrote a running game's files, and a launch could start halfway
+/// through an update. Not waited for: the person is told what holds the title
+/// instead of watching a command hang. Only an instant's grace, because a
+/// process starting a child at the moment a lock is let go can hold a copy of
+/// its descriptor until that child has started.
+struct TitleLock {
+    _file: std::fs::File,
+}
+
+impl TitleLock {
+    fn take(paths: &Paths, product_id: &str, mode: LockMode) -> Result<Option<Self>> {
+        use std::os::fd::AsRawFd;
+        let directory = paths.state_dir().join("locks");
+        std::fs::create_dir_all(&directory)
+            .with_context(|| format!("creating {}", directory.display()))?;
+        let path = directory.join(format!("{}.lock", product_id.to_ascii_uppercase()));
+        let file = open_lock(&path)?;
+        let operation = match mode {
+            LockMode::Run => libc::LOCK_SH,
+            LockMode::Change => libc::LOCK_EX,
+        } | libc::LOCK_NB;
+        let patience = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            // Safety: a plain flock on a descriptor owned here.
+            if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+                return Ok(Some(Self { _file: file }));
+            }
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EWOULDBLOCK) if std::time::Instant::now() < patience => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Some(libc::EWOULDBLOCK) => bail!(match mode {
+                    LockMode::Run => format!(
+                        "{product_id} is being installed, updated or removed; \
+                         wait for that to finish"
+                    ),
+                    LockMode::Change => format!(
+                        "{product_id} is running, or another install or removal of it is \
+                         under way; close it and try again"
+                    ),
+                }),
+                Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOSYS) => {
+                    eprintln!(
+                        "-- {} cannot be locked ({error}); nothing stops a launch and an \
+                         update of this title overlapping",
+                        path.display()
+                    );
+                    return Ok(None);
+                }
+                _ => return Err(error).with_context(|| format!("locking {}", path.display())),
+            }
+        }
+    }
+}
+
+/// Which file the package container is, so a run that replaced it can be told
+/// from one that left it alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContainerState {
+    device: u64,
+    inode: u64,
+    modified: (i64, i64),
+    length: u64,
+}
+
+fn container_state(dir: &Path) -> Option<ContainerState> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(dir.join(STREAMING_CONTAINER)).ok()?;
+    Some(ContainerState {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        modified: (metadata.mtime(), metadata.mtime_nsec()),
+        length: metadata.len(),
+    })
 }
 
 /// Tell the prefix about the WinRT classes this runtime hosts.
@@ -1175,8 +1904,13 @@ fn wait_at_most(child: &mut std::process::Child, limit: std::time::Duration) -> 
 ///
 /// `Ok(None)` covers three honest cases that are all "there is nothing to write
 /// down": nothing recorded this product, the directory it recorded is gone, or
-/// the manifest names no entry point.
-fn describe_from_disk(paths: &Paths, title: &str) -> Result<Option<PathBuf>> {
+/// the manifest names no entry point. With `write` false the description is
+/// only returned, for a dry run, which must not leave a file behind.
+fn describe_from_disk(
+    paths: &Paths,
+    title: &str,
+    write: bool,
+) -> Result<Option<(Recipe, Option<PathBuf>)>> {
     let product_id = normalise_product_id(title);
     let Some(record) = install::load(paths.state_dir(), &product_id) else {
         return Ok(None);
@@ -1184,7 +1918,15 @@ fn describe_from_disk(paths: &Paths, title: &str) -> Result<Option<PathBuf>> {
     if !install::looks_installed(&record.dir) {
         return Ok(None);
     }
-    write_detected_recipe(paths, &product_id, &record.dir)
+    let Some(recipe) = detected_recipe(paths, &product_id, &record.dir) else {
+        return Ok(None);
+    };
+    let written = if write {
+        Some(save_detected_recipe(paths, &recipe)?)
+    } else {
+        None
+    };
+    Ok(Some((recipe, written)))
 }
 
 /// Write a recipe for a title that had none, from what the package says.
@@ -1194,9 +1936,31 @@ fn describe_from_disk(paths: &Paths, title: &str) -> Result<Option<PathBuf>> {
 /// failure that looks like the launcher's fault rather than an unfinished
 /// description.
 fn write_detected_recipe(paths: &Paths, product_id: &str, dest: &Path) -> Result<Option<PathBuf>> {
-    let Some(executable) = install::executable(dest) else {
-        return Ok(None);
-    };
+    match detected_recipe(paths, product_id, dest) {
+        Some(recipe) => save_detected_recipe(paths, &recipe).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Save a detected recipe, never over a file that is already there: that file
+/// is somebody's -- an edit, or a recipe this build could not read -- and a
+/// guess must not replace it.
+fn save_detected_recipe(paths: &Paths, recipe: &Recipe) -> Result<PathBuf> {
+    let existing = paths.user_titles_dir().join(format!(
+        "{}.toml",
+        recipe.title.product_id.to_ascii_uppercase()
+    ));
+    if existing.exists() {
+        bail!(
+            "{} already exists and was left as it is",
+            existing.display()
+        );
+    }
+    recipe.save_to(&paths.user_titles_dir())
+}
+
+fn detected_recipe(paths: &Paths, product_id: &str, dest: &Path) -> Option<Recipe> {
+    let executable = install::executable(dest)?;
 
     // The catalog knows the name; without it the product id is still a name.
     let (market, language) = paths.market();
@@ -1220,8 +1984,7 @@ fn write_detected_recipe(paths: &Paths, product_id: &str, dest: &Path) -> Result
         recipe.install.dir = Some(relative.to_string_lossy().into_owned());
     }
     detected_requirements(&mut recipe, dest);
-    let path = recipe.save_to(&paths.user_titles_dir())?;
-    Ok(Some(path))
+    Some(recipe)
 }
 
 /// What a recipe written from a package can honestly ask of the runtime.
@@ -1300,13 +2063,39 @@ fn installed_summary(record: &install::Record) -> String {
 /// GitHub's release feed is public. Runtime tags share the same repository as
 /// the small launcher releases, and `runtime::latest_release` filters the two
 /// deliberately rather than relying on a mutable "latest" link.
-const RELEASES_API: &str = "https://api.github.com/repos/icex/ferestre/releases?per_page=30";
+const RELEASES_API: &str = "https://api.github.com/repos/icex/ferestre/releases";
+
+/// How many pages of the release feed are read looking for a runtime. Launcher
+/// releases are frequent and runtime releases rare, so the newest runtime can
+/// be well past the first page.
+const RELEASE_PAGES: u32 = 10;
+const RELEASES_PER_PAGE: usize = 100;
 
 fn cmd_install_runtime(cli: &Cli) -> Result<ExitCode> {
     let cancellation = cancel::Cancellation::from_gui();
     let paths = Paths::from_env()?;
+    install_runtime(
+        cli,
+        &paths,
+        RELEASES_API,
+        ferestre_core::signing::RELEASE_PUBLIC_KEY,
+        &cancellation,
+    )
+}
+
+fn install_runtime(
+    cli: &Cli,
+    paths: &Paths,
+    releases_api: &str,
+    public_key: &str,
+    cancellation: &cancel::Cancellation,
+) -> Result<ExitCode> {
     eprintln!("-- checking for the latest Ferestre runtime");
-    let release = runtime::latest_release(&http::get_text(RELEASES_API)?)?;
+    let release = newest_runtime_release(|page| {
+        http::get_text(&format!(
+            "{releases_api}?per_page={RELEASES_PER_PAGE}&page={page}"
+        ))
+    })?;
     cancellation.check()?;
     let version = release
         .tag
@@ -1319,29 +2108,65 @@ fn cmd_install_runtime(cli: &Cli) -> Result<ExitCode> {
         })
         .ok_or_else(|| anyhow!("runtime release has an unsafe version: {}", release.tag))?;
     let destination = paths.runtimes_dir().join(version);
-    if InstalledRuntime::at(&destination).is_ok() {
-        println!(
-            "-- runtime {version} is already installed at {}",
-            destination.display()
-        );
-        return Ok(ExitCode::SUCCESS);
-    }
+    let installed = InstalledRuntime::at(&destination).is_ok();
+    // The document and nothing else on stdout, whatever the answer.
     if cli.json {
         print_json(&json!({
             "schema": JSON_SCHEMA,
             "release": release.tag,
             "asset": release.asset_name,
             "destination": destination,
+            "installed": installed,
         }));
         return Ok(ExitCode::SUCCESS);
     }
+    if installed {
+        eprintln!(
+            "-- runtime {version} is already installed at {}",
+            destination.display()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
 
-    let archive = paths.cache_dir().join("runtime").join(&release.asset_name);
-    eprintln!("-- downloading runtime {version} (this is a one-time download)");
-    http::download_large_cancellable(&release.url, &archive, || cancellation.requested())?;
-    cancellation.check()?;
-    eprintln!("-- unpacking runtime {version}");
+    let cache = paths.cache_dir().join("runtime");
+    std::fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
     std::fs::create_dir_all(paths.runtimes_dir())?;
+    // One at a time: two downloads of one archive wrote over each other's
+    // partial file, and the cache then held a corrupt archive.
+    let _lock = runtime_install_lock(&cache)?;
+    remove_abandoned_installs(&paths.runtimes_dir());
+
+    // Fetched first: without a signature there is nothing to check a
+    // download against, and no point making one.
+    let signature = http::get_text(&format!("{}.minisig", release.url))
+        .context("fetching the runtime's signature")?;
+    let verify = |archive: &Path| {
+        ferestre_core::signing::verify_file(public_key, archive, &signature, &release.asset_name)
+    };
+    let archive = cache.join(&release.asset_name);
+    // A cached archive is checked like a fresh one. A bad one used to be
+    // reused by every later attempt, failing each the same way.
+    if archive.is_file() {
+        if let Err(error) = verify(&archive) {
+            eprintln!("-- the cached archive does not verify ({error:#}); downloading it again");
+            std::fs::remove_file(&archive)
+                .with_context(|| format!("removing {}", archive.display()))?;
+        }
+    }
+    if !archive.is_file() {
+        eprintln!("-- downloading runtime {version} (this is a one-time download)");
+        http::download_large_cancellable(&release.url, &archive, || cancellation.requested())?;
+        cancellation.check()?;
+        if let Err(error) = verify(&archive) {
+            let _ = std::fs::remove_file(&archive);
+            return Err(error.context(format!(
+                "the downloaded runtime {version} was not signed by the Ferestre release key;                  it was deleted, and nothing was installed"
+            )));
+        }
+    }
+    eprintln!("-- verified the signature of {}", release.asset_name);
+
+    eprintln!("-- unpacking runtime {version}");
     let temporary = paths
         .runtimes_dir()
         .join(format!(".{version}.installing-{}", std::process::id()));
@@ -1357,6 +2182,9 @@ fn cmd_install_runtime(cli: &Cli) -> Result<ExitCode> {
     if cancellation.requested() || !matches!(code, Ok(0)) {
         let _ = std::fs::remove_dir_all(&temporary);
         cancellation.check()?;
+        // It verified, so it is the published archive; the next attempt
+        // still starts from a fresh download rather than this file.
+        let _ = std::fs::remove_file(&archive);
         bail!(
             "could not unpack {}; tar exited {}",
             archive.display(),
@@ -1364,7 +2192,11 @@ fn cmd_install_runtime(cli: &Cli) -> Result<ExitCode> {
         );
     }
     let unpacked = temporary.join(format!("ferestre-runtime-{version}"));
-    InstalledRuntime::at(&unpacked)?;
+    if let Err(error) = InstalledRuntime::at(&unpacked) {
+        let _ = std::fs::remove_dir_all(&temporary);
+        let _ = std::fs::remove_file(&archive);
+        return Err(error);
+    }
     if destination.exists() {
         let _ = std::fs::remove_dir_all(&temporary);
         bail!(
@@ -1374,11 +2206,79 @@ fn cmd_install_runtime(cli: &Cli) -> Result<ExitCode> {
     }
     std::fs::rename(&unpacked, &destination)?;
     let _ = std::fs::remove_dir_all(&temporary);
-    println!(
+    // Installed, so the archive is never read again: every runtime release
+    // used to leave its full archive in the cache for good.
+    let _ = std::fs::remove_file(&archive);
+    eprintln!(
         "-- installed runtime {version} at {}",
         destination.display()
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// The newest runtime release, looking past the first page of the feed.
+///
+/// The feed holds launcher and runtime releases together, newest first. Only
+/// the first page was read, so once enough launcher releases followed the last
+/// runtime, a new machine could find no runtime at all.
+fn newest_runtime_release(fetch: impl Fn(u32) -> Result<String>) -> Result<runtime::Release> {
+    for page in 1..=RELEASE_PAGES {
+        let text = fetch(page)?;
+        let releases: Vec<Value> =
+            serde_json::from_str(&text).context("the release feed is not a JSON list")?;
+        if let Ok(release) = runtime::latest_release(&text) {
+            return Ok(release);
+        }
+        if releases.len() < RELEASES_PER_PAGE {
+            break;
+        }
+    }
+    bail!("no runtime archive was published in the Ferestre releases")
+}
+
+/// The lock that keeps two runtime installs apart. Not waited on: the person
+/// is told one is already running.
+fn runtime_install_lock(cache: &Path) -> Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    let path = cache.join(".install.lock");
+    let file = open_lock(&path)?;
+    loop {
+        // Safety: a plain flock on a descriptor owned here.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(file));
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EWOULDBLOCK) => {
+                bail!("another runtime install is already running; wait for it to finish")
+            }
+            Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOSYS) => return Ok(None),
+            _ => return Err(error).with_context(|| format!("locking {}", path.display())),
+        }
+    }
+}
+
+/// Unpacked trees an install left behind when it was killed. Each is named
+/// for the process that made it, so a later install never removed another's.
+fn remove_abandoned_installs(runtimes: &Path) {
+    for entry in std::fs::read_dir(runtimes).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .filter(|name| name.starts_with('.'))
+            .and_then(|name| name.rsplit_once(".installing-"))
+            .map(|(_, pid)| pid)
+        else {
+            continue;
+        };
+        let alive = pid
+            .parse::<u32>()
+            .is_ok_and(|pid| Path::new("/proc").join(pid.to_string()).exists());
+        if !alive && entry.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 fn cmd_env(cli: &Cli) -> Result<ExitCode> {
@@ -1427,8 +2327,15 @@ fn load_recipes(cli: &Cli) -> Result<(PathBuf, Vec<Recipe>)> {
             .with_context(|| format!("reading recipes from {}", dir.display()))?;
         return Ok((dir.clone(), recipes));
     }
+    recipes_from(cli, &Paths::from_env()?)
+}
 
-    let paths = Paths::from_env()?;
+fn recipes_from(cli: &Cli, paths: &Paths) -> Result<(PathBuf, Vec<Recipe>)> {
+    if let Some(dir) = &cli.titles_dir {
+        let recipes = Recipe::load_dir(dir)
+            .with_context(|| format!("reading recipes from {}", dir.display()))?;
+        return Ok((dir.clone(), recipes));
+    }
     let dir = paths
         .titles_dir()
         .ok_or_else(|| {
@@ -1441,19 +2348,30 @@ fn load_recipes(cli: &Cli) -> Result<(PathBuf, Vec<Recipe>)> {
     Ok((dir, recipes))
 }
 
+/// The recipes a command that changes the disk goes by.
+///
+/// A recipe that does not parse stops the command before it does anything:
+/// carrying on as if the title had none sent an install to the wrong
+/// directory, skipped its setup and wrote a blank recipe over the person's
+/// own. No packaged recipes at all is not an error -- an installed tree may
+/// ship none -- and then only the person's own are read.
+fn recipes_for_change(cli: &Cli, paths: &Paths) -> Result<Vec<Recipe>> {
+    let loaded = if cli.titles_dir.is_some() || paths.titles_dir().is_some() {
+        recipes_from(cli, paths).map(|(_, recipes)| recipes)
+    } else {
+        let user = paths.user_titles_dir();
+        Recipe::load_layered(std::slice::from_ref(&user))
+            .with_context(|| format!("reading recipes from {}", user.display()))
+    };
+    loaded.context("fix or remove the recipe named above; nothing was changed")
+}
+
 /// `titles/capabilities.toml`, which turns "missing gameinput.v2" into the
 /// message the title would actually have printed. Optional everywhere, so a
 /// failure to read it is not worth failing a launch over.
 fn registry_for(paths: &Paths) -> Option<Registry> {
     let file = paths.titles_dir()?.join("capabilities.toml");
     Registry::load(&file).ok()
-}
-
-fn launch_dirs(paths: &Paths) -> Result<launch::Dirs> {
-    let runtime = paths
-        .runtime_dir()
-        .ok_or_else(|| anyhow!("no patched Proton found; run: ferestre install-runtime"))?;
-    launch_dirs_for_runtime(paths, runtime)
 }
 
 fn launch_dirs_for_runtime(paths: &Paths, runtime: &Path) -> Result<launch::Dirs> {
@@ -1548,21 +2466,33 @@ fn run_teed(mut command: Command, log: &Path, forwarding: &Forwarding) -> Result
         .with_context(|| format!("running {:?}", command.get_program()))?;
     let out = child.stdout.take().expect("piped stdout");
     let err = child.stderr.take().expect("piped stderr");
-    let t_out = tee(out, Arc::clone(&file), false);
-    let t_err = tee(err, Arc::clone(&file), true);
+    let t_out = tee(out, Arc::clone(&file), std::io::stdout());
+    let t_err = tee(err, Arc::clone(&file), std::io::stderr());
 
     let status = forwarding
         .wait(&mut child)
         .context("waiting for the title")?;
-    let _ = t_out.join();
-    let _ = t_err.join();
+    // The title's process is gone, but Wine started the game in a session of
+    // its own, and the prefix's wineserver and system processes outlive it by
+    // a few seconds. The service claim is held until they have gone too; a
+    // signal now ends them rather than being swallowed.
+    forwarding.finish(SESSION_WAIT);
+    // Wine processes hold the pipes as long as they run. Whatever is still
+    // writing to them after that is not worth holding the launch for.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !(t_out.is_finished() && t_err.is_finished()) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 
     let code = exit_code_from(status.code(), signal_of(&status));
     if let Ok(mut f) = file.lock() {
         let _ = writeln!(f, "=== exited rc={code} ===");
     }
     if code != 0 {
-        eprintln!(
+        // Not `eprintln!`: the window that was reading this may have closed,
+        // and a failed write must not turn the title's status into a panic.
+        let _ = writeln!(
+            std::io::stderr(),
             "-- the title exited {code}; the log is at {}",
             log.display()
         );
@@ -1570,22 +2500,49 @@ fn run_teed(mut command: Command, log: &Path, forwarding: &Forwarding) -> Result
     Ok(ExitCode::from(code))
 }
 
-fn tee<R: std::io::Read + Send + 'static>(
-    reader: R,
-    log: Arc<Mutex<std::fs::File>>,
-    is_stderr: bool,
-) -> std::thread::JoinHandle<()> {
+/// How long a stopped title gets to close by itself, and how long a finished
+/// launch waits for the rest of its Wine session.
+const SESSION_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Copy a child's output to `terminal` and the log as it arrives.
+///
+/// Bytes, not text: a title writing its own code page, or anything else that is
+/// not UTF-8, used to end the copy at that line, and everything after it was
+/// missing from the log the recipes' `log-match` reads. A terminal that went
+/// away -- the window closed while the game ran -- is ignored rather than
+/// fatal, and the log keeps being written: the pipe is drained to the end
+/// either way, so nothing in the title blocks or dies writing to it.
+fn tee<R, W>(reader: R, log: Arc<Mutex<std::fs::File>>, terminal: W) -> std::thread::JoinHandle<()>
+where
+    R: std::io::Read + Send + 'static,
+    W: Write + Send + 'static,
+{
     std::thread::spawn(move || {
-        for line in BufReader::new(reader).lines() {
-            let Ok(line) = line else { break };
-            if is_stderr {
-                eprintln!("{line}");
-            } else {
-                println!("{line}");
+        let mut reader = BufReader::with_capacity(64 * 1024, reader);
+        let mut terminal = Some(terminal);
+        loop {
+            let chunk = match reader.fill_buf() {
+                Ok([]) => break,
+                Ok(chunk) => chunk,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            // A whole line where there is one, so the two streams interleave
+            // in the log by line; a line longer than the buffer goes in parts.
+            let length = chunk
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(chunk.len(), |at| at + 1);
+            let line = &chunk[..length];
+            if let Some(out) = terminal.as_mut() {
+                if out.write_all(line).and_then(|()| out.flush()).is_err() {
+                    terminal = None;
+                }
             }
             if let Ok(mut f) = log.lock() {
-                let _ = writeln!(f, "{line}");
+                let _ = f.write_all(line);
             }
+            reader.consume(length);
         }
     })
 }
@@ -1596,7 +2553,7 @@ const LAUNCH_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIG
 
 static SIGNAL_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 static SIGNAL_RECEIVED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-static FORWARDING: std::sync::OnceLock<Arc<Mutex<Option<i32>>>> = std::sync::OnceLock::new();
+static FORWARDING: std::sync::OnceLock<Arc<Shared>> = std::sync::OnceLock::new();
 
 extern "C" fn on_launch_signal(signal: libc::c_int) {
     use std::sync::atomic::Ordering;
@@ -1614,22 +2571,167 @@ extern "C" fn on_launch_signal(signal: libc::c_int) {
     }
 }
 
+/// The Wine side of a running title, for ending it.
+///
+/// Stopping the launch does not stop the game by itself: Wine starts a game in
+/// a session of its own, so neither a signal to the launch nor one to its
+/// process group reaches it, and a game left running lost its Xbox service
+/// when the launch let go of it. So the game is asked to close, the way its
+/// window's close button asks, and given [`SESSION_WAIT`] to save and go; the
+/// prefix is then ended. A second signal ends it at once.
+struct PrefixSession {
+    wine: PathBuf,
+    wineserver: PathBuf,
+    wine_prefix: PathBuf,
+    executable: String,
+    grace: std::time::Duration,
+    running: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl PrefixSession {
+    fn for_runtime(runtime: &Path, prefix: &Path, executable: &str) -> Self {
+        let wine_prefix = prefix.join("pfx");
+        let probe = wine_prefix.clone();
+        PrefixSession {
+            wine: runtime.join("files/bin/wine"),
+            wineserver: runtime.join("files/bin/wineserver"),
+            executable: executable
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(executable)
+                .to_string(),
+            wine_prefix,
+            grace: SESSION_WAIT,
+            running: Box::new(move || wineserver_running(&probe) == Some(true)),
+        }
+    }
+
+    fn command(&self, program: &Path) -> Command {
+        let mut command = Command::new(program);
+        command
+            .env("WINEPREFIX", &self.wine_prefix)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    }
+
+    /// Ask the title's windows to close. `taskkill` without `/F` posts
+    /// WM_CLOSE, which is what the close button does: a game saves or asks.
+    fn request_close(&self) {
+        if self.executable.is_empty() {
+            return;
+        }
+        let mut close = self.command(&self.wine);
+        close.args(["taskkill", "/IM", &self.executable]);
+        if let Ok(mut child) = close.spawn() {
+            wait_at_most(&mut child, std::time::Duration::from_secs(10));
+        }
+    }
+
+    /// End every process in the prefix.
+    fn kill(&self) {
+        let mut kill = self.command(&self.wineserver);
+        kill.arg("-k");
+        if let Ok(mut child) = kill.spawn() {
+            wait_at_most(&mut child, std::time::Duration::from_secs(10));
+        }
+    }
+}
+
+/// What the signal forwarder and the launch share.
+struct Shared {
+    state: Mutex<ForwardState>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct ForwardState {
+    title: Option<i32>,
+    signals: u32,
+    last: i32,
+    session: Option<Arc<PrefixSession>>,
+    stopper: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Shared {
+    fn new() -> Arc<Self> {
+        Arc::new(Shared {
+            state: Mutex::new(ForwardState::default()),
+            changed: std::sync::Condvar::new(),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ForwardState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A signal arrived: pass it to the title, and start ending its session.
+    fn deliver(self: &Arc<Self>, signal: i32) {
+        let mut state = self.lock();
+        state.signals += 1;
+        state.last = signal;
+        // Kept across the kill: `wait` clears the pid under the same lock
+        // before it reaps the title, so the pid cannot be reaped and reused in
+        // between.
+        if let Some(pid) = state.title {
+            // Safety: an unreaped child of ours while the lock is held.
+            unsafe { libc::kill(pid, signal) };
+        }
+        if state.signals == 1 {
+            if let Some(session) = state.session.clone() {
+                let shared = Arc::clone(self);
+                state.stopper = Some(std::thread::spawn(move || shared.stop(&session)));
+            }
+        }
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    /// Ask the title to close, give it its grace period, then end the prefix.
+    /// Cut short by a second signal.
+    fn stop(&self, session: &PrefixSession) {
+        session.request_close();
+        let deadline = std::time::Instant::now() + session.grace;
+        let mut state = self.lock();
+        while state.signals < 2 && (session.running)() {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let wait = (deadline - now).min(std::time::Duration::from_millis(200));
+            state = self
+                .changed
+                .wait_timeout(state, wait)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        drop(state);
+        if (session.running)() {
+            session.kill();
+        }
+    }
+}
+
 /// Signals that would end a launch, passed on to its title instead.
 ///
 /// Ended by a signal, this process never unwinds: its claim on the service is
 /// never dropped, and the service is never stopped. Caught, the signal goes to
-/// the title, which ends; the launch then finishes the ordinary way, and the
-/// last title out still stops the service. Handlers do not survive exec, so
-/// every child starts with the default dispositions.
+/// the title, and its Wine session is ended (see [`PrefixSession`]); the
+/// launch then finishes the ordinary way, and the last title out still stops
+/// the service. Handlers do not survive exec, so every child starts with the
+/// default dispositions.
 struct Forwarding {
-    title: Arc<Mutex<Option<i32>>>,
+    shared: Arc<Shared>,
+    installed: bool,
 }
 
 impl Forwarding {
     fn install() -> Result<Self> {
-        if let Some(title) = FORWARDING.get() {
+        if let Some(shared) = FORWARDING.get() {
             return Ok(Self {
-                title: Arc::clone(title),
+                shared: Arc::clone(shared),
+                installed: true,
             });
         }
         use std::os::fd::FromRawFd;
@@ -1644,25 +2746,14 @@ impl Forwarding {
         unsafe { libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK) };
         SIGNAL_PIPE.store(fds[1], std::sync::atomic::Ordering::SeqCst);
 
-        let title = Arc::new(Mutex::new(None::<i32>));
-        let forwarded = Arc::clone(&title);
+        let shared = Shared::new();
+        let forwarded = Arc::clone(&shared);
         std::thread::spawn(move || {
             use std::io::Read;
             let mut byte = [0u8];
             loop {
                 match read.read(&mut byte) {
-                    Ok(1) => {
-                        // Keep the guard across the kill: `wait` clears the
-                        // pid under the same lock before it reaps the title,
-                        // so the pid cannot be reaped and reused in between.
-                        let guard = forwarded.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(pid) = *guard {
-                            // Safety: an unreaped child of ours while the
-                            // guard is held; see `wait`.
-                            unsafe { libc::kill(pid, libc::c_int::from(byte[0])) };
-                        }
-                        drop(guard);
-                    }
+                    Ok(1) => forwarded.deliver(libc::c_int::from(byte[0])),
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     _ => break,
                 }
@@ -1681,23 +2772,47 @@ impl Forwarding {
                 }
             }
         }
-        let _ = FORWARDING.set(Arc::clone(&title));
-        Ok(Self { title })
+        let _ = FORWARDING.set(Arc::clone(&shared));
+        Ok(Self {
+            shared,
+            installed: true,
+        })
     }
 
     /// The last signal caught, if any.
     fn received(&self) -> Option<i32> {
-        Some(SIGNAL_RECEIVED.load(std::sync::atomic::Ordering::SeqCst)).filter(|s| *s != 0)
+        let last = self.shared.lock().last;
+        let caught = if self.installed {
+            SIGNAL_RECEIVED.load(std::sync::atomic::Ordering::SeqCst)
+        } else {
+            0
+        };
+        Some(if last != 0 { last } else { caught }).filter(|s| *s != 0)
+    }
+
+    /// The Wine session a signal should end, once there is one.
+    fn set_session(&self, session: Option<Arc<PrefixSession>>) {
+        self.shared.lock().session = session;
     }
 
     /// Wait for the title, passing signals on to it meanwhile.
     fn wait(&self, child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
         let pid = child.id() as i32;
-        *self.title.lock().unwrap_or_else(|e| e.into_inner()) = Some(pid);
-        // One that came before there was a title to pass it to.
-        if let Some(signal) = self.received() {
-            // Safety: our own child, not yet reaped.
-            unsafe { libc::kill(pid, signal) };
+        {
+            let mut state = self.shared.lock();
+            state.title = Some(pid);
+            // One that came before there was a title to pass it to.
+            let early = if state.last != 0 {
+                state.last
+            } else if self.installed {
+                SIGNAL_RECEIVED.load(std::sync::atomic::Ordering::SeqCst)
+            } else {
+                0
+            };
+            if early != 0 {
+                // Safety: our own child, not yet reaped.
+                unsafe { libc::kill(pid, early) };
+            }
         }
         // Wait without reaping, so the pid cannot be reused while it may
         // still be signalled.
@@ -1718,8 +2833,37 @@ impl Forwarding {
                 break;
             }
         }
-        *self.title.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.shared.lock().title = None;
         child.wait()
+    }
+
+    /// After the title: let a stop that is under way finish, or wait up to
+    /// `limit` for the rest of the Wine session to end by itself. A signal
+    /// meanwhile starts a stop, and a second one cuts it short.
+    fn finish(&self, limit: std::time::Duration) {
+        let deadline = std::time::Instant::now() + limit;
+        let mut state = self.shared.lock();
+        loop {
+            if let Some(stopper) = state.stopper.take() {
+                drop(state);
+                let _ = stopper.join();
+                return;
+            }
+            let Some(session) = state.session.clone() else {
+                return;
+            };
+            let now = std::time::Instant::now();
+            if now >= deadline || !(session.running)() {
+                return;
+            }
+            let wait = (deadline - now).min(std::time::Duration::from_millis(200));
+            state = self
+                .shared
+                .changed
+                .wait_timeout(state, wait)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
     }
 }
 
@@ -2412,7 +3556,7 @@ fn service_socket_live(socket: &Path) -> bool {
 /// a recipe is data, and data that can run commands is not data. An unknown
 /// action stops the launch rather than being skipped, so a recipe written for a
 /// newer build says so instead of half-working.
-fn run_setup(recipe: &Recipe, when: &str, dirs: &launch::Dirs, game_dir: &Path) -> Result<()> {
+fn run_setup(recipe: &Recipe, when: &str, scripts_dir: &Path, game_dir: &Path) -> Result<()> {
     for step in recipe
         .setup
         .iter()
@@ -2424,7 +3568,7 @@ fn run_setup(recipe: &Recipe, when: &str, dirs: &launch::Dirs, game_dir: &Path) 
         };
         match step.action.as_str() {
             "substitute-xcurl" => {
-                let script = dirs.scripts_dir.join("fix-xcurl.sh");
+                let script = scripts_dir.join("fix-xcurl.sh");
                 if !script.is_file() {
                     bail!(
                         "{} is missing, and {} needs it",
@@ -2759,7 +3903,14 @@ fn doctor_checks(paths: &Paths) -> Vec<Check> {
         }
     }
 
-    match InstalledRuntime::discover(paths) {
+    // The runtime a launch would pick first: managed runtimes included, which
+    // `discover` alone never saw, so a machine whose only runtime came from
+    // `install-runtime` was told it had none.
+    let found = match runtime::all(paths).into_iter().next() {
+        Some(rt) => Ok(rt),
+        None => InstalledRuntime::discover(paths),
+    };
+    match found {
         Ok(rt) => {
             checks.push(Check::ok("runtime", "patched Proton").with_detail(rt.label()));
             checks.push(
@@ -2870,20 +4021,31 @@ fn doctor_checks(paths: &Paths) -> Vec<Check> {
             .with_hint("sign-in needs a Secret Service provider; unlock your keyring, or start gnome-keyring / kwallet")
     });
 
-    match paths.titles_dir() {
-        Some(dir) => {
-            let count = Recipe::load_dir(dir).map(|r| r.len());
-            checks.push(match count {
-                Ok(n) => Check::ok("recipes", format!("{n} title recipe(s)"))
-                    .with_detail(dir.display().to_string()),
-                Err(err) => Check::fail("recipes", "recipes do not parse")
-                    .with_hint(first_line(&err.to_string())),
-            });
-        }
-        None => checks.push(
+    // Every directory a launch reads, the person's own included: a file there
+    // that does not parse stops every command that loads recipes.
+    let dirs: Vec<PathBuf> = paths
+        .title_dirs()
+        .into_iter()
+        .filter(|dir| dir.is_dir())
+        .collect();
+    if paths.titles_dir().is_none() && dirs.is_empty() {
+        checks.push(
             Check::warn("recipes", "no title recipes found")
                 .with_hint("set XODUS_REPO_DIR, or pass --titles-dir"),
-        ),
+        );
+    } else {
+        let shown = dirs
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        checks.push(match Recipe::load_layered(&dirs) {
+            Ok(recipes) => Check::ok("recipes", format!("{} title recipe(s)", recipes.len()))
+                .with_detail(shown),
+            Err(err) => Check::fail("recipes", "a recipe does not parse")
+                .with_detail(first_line(&err.to_string()))
+                .with_hint("fix or remove that file; until then, install and run refuse to act"),
+        });
     }
 
     checks
@@ -3131,11 +4293,23 @@ fn library_json(rows: &[&library::Row], skipped: &[(String, &'static str)]) -> V
     })
 }
 
-fn plan_json(plan: &launch::Plan) -> Value {
+/// The plan as JSON, with account identifiers in its environment masked the
+/// way `ferestre env` masks them.
+fn plan_json(plan: &launch::Plan, show_account: bool) -> Value {
+    let env_set: serde_json::Map<String, Value> = plan
+        .env_set
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.clone(),
+                Value::String(env_display(name, value, show_account)),
+            )
+        })
+        .collect();
     json!({
         "program": plan.program.display().to_string(),
         "args": plan.args,
-        "env_set": plan.env_set,
+        "env_set": env_set,
         "env_unset": plan.env_unset,
         "cwd": plan.cwd.as_ref().map(|p| p.display().to_string()),
     })
@@ -3189,14 +4363,20 @@ fn indent(text: &str, prefix: &str) -> String {
 
 /// `--dry-run`: the launch written so it can be pasted into a shell and run.
 /// That is the point -- someone debugging a launch needs the exact command, not
-/// a description of it.
-fn render_plan(plan: &launch::Plan) -> String {
+/// a description of it. Account identifiers -- `XGR_XUID`, the Store and Player
+/// profiles -- are masked unless `--show-account` is given, like everywhere
+/// else, so the output stays safe to paste into a bug report; with the flag it
+/// runs as printed.
+fn render_plan(plan: &launch::Plan, show_account: bool) -> String {
     let mut out = String::new();
     for name in &plan.env_unset {
         out.push_str(&format!("unset {name}\n"));
     }
     for (name, value) in &plan.env_set {
-        out.push_str(&format!("export {name}={}\n", shell_quote(value)));
+        out.push_str(&format!(
+            "export {name}={}\n",
+            shell_quote(&env_display(name, value, show_account))
+        ));
     }
     if let Some(cwd) = &plan.cwd {
         out.push_str(&format!("cd {}\n", shell_quote(&cwd.display().to_string())));
@@ -4269,7 +5449,7 @@ summary = "Runs."
             env_unset: vec!["LD_PRELOAD".into()],
             cwd: None,
         };
-        let out = render_plan(&plan);
+        let out = render_plan(&plan, false);
         assert!(out.starts_with("unset LD_PRELOAD\n"), "{out}");
         assert!(out.contains("export WINE_GAMEINPUT=1\n"), "{out}");
         assert!(
@@ -4454,5 +5634,1088 @@ summary = "Runs."
                 );
             }
         }
+    }
+
+    // -- fixtures for whole commands ---------------------------------------
+
+    /// An exit code, comparable: `ExitCode` has no `PartialEq` before Rust
+    /// 1.79, and the launcher builds with 1.77.
+    fn code(code: ExitCode) -> String {
+        format!("{code:?}")
+    }
+
+    /// A home directory of its own: games, state, config and cache under one
+    /// temporary root, a stand-in Xbox client, scripts and recipes, and
+    /// `Paths` resolved from exactly that and nothing on the host.
+    struct Home {
+        scratch: Scratch,
+        extra: Vec<(String, String)>,
+    }
+
+    impl Home {
+        fn new(name: &str) -> Self {
+            let scratch = Scratch::new(name);
+            for dir in [
+                "home",
+                "games",
+                "client",
+                "scripts",
+                "titles",
+                "config/ferestre",
+            ] {
+                std::fs::create_dir_all(scratch.root.join(dir)).unwrap();
+            }
+            let home = Home {
+                scratch,
+                extra: Vec::new(),
+            };
+            home.client("exit 0");
+            home
+        }
+
+        fn root(&self) -> &Path {
+            &self.scratch.root
+        }
+
+        fn games(&self) -> PathBuf {
+            self.root().join("games")
+        }
+
+        fn paths(&self) -> Paths {
+            let root = self.root();
+            let mut vars: Vec<(String, String)> = [
+                ("HOME", "home"),
+                ("XODUS_GAMES_DIR", "games"),
+                ("XODUS_CLI_DIR", "client"),
+                ("FERESTRE_SCRIPTS_DIR", "scripts"),
+                ("FERESTRE_TITLES", "titles"),
+                ("XDG_STATE_HOME", "state"),
+                ("XDG_CONFIG_HOME", "config"),
+                ("XDG_CACHE_HOME", "cache"),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), root.join(v).display().to_string()))
+            .collect();
+            vars.extend(self.extra.iter().cloned());
+            Paths::resolve(&ferestre_core::paths::Env::from_map(vars)).unwrap()
+        }
+
+        /// The stand-in client: `$1` is the command, `$3` the destination.
+        fn client(&self, body: &str) {
+            let script = self.root().join("client/xodus-cli");
+            std::fs::write(
+                &script,
+                format!("#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/calls\"\n{body}\n"),
+            )
+            .unwrap();
+            make_executable(&script);
+        }
+
+        fn client_ran(&self) -> bool {
+            self.root().join("client/calls").exists()
+        }
+
+        fn recipe(&self, dir: &str, file: &str, text: &str) -> PathBuf {
+            let dir = self.root().join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(file);
+            std::fs::write(&path, text).unwrap();
+            path
+        }
+
+        fn script(&self, name: &str, body: &str) {
+            let script = self.root().join("scripts").join(name);
+            std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+            make_executable(&script);
+        }
+
+        /// A runtime as `install-runtime` leaves one: in the state directory,
+        /// publishing `provides`, or probed when that is `None`.
+        fn runtime(&self, version: &str, provides: Option<&[&str]>) -> PathBuf {
+            let dir = self.root().join("state/ferestre/runtimes").join(version);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("proton"), "#!/bin/sh\n").unwrap();
+            std::fs::write(dir.join("version"), format!("1 {version}\n")).unwrap();
+            if let Some(provides) = provides {
+                let manifest = dir.join(runtime::MANIFEST_PATH);
+                std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+                std::fs::write(manifest, serde_json::to_string(provides).unwrap()).unwrap();
+            }
+            dir
+        }
+    }
+
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn cli() -> Cli {
+        Cli {
+            command: Cmd::Version,
+            json: false,
+            titles_dir: None,
+            show_account: false,
+            no_color: true,
+        }
+    }
+
+    const GAME: &str = "9ZZTESTGAME1";
+
+    fn game_recipe(extra: &str) -> String {
+        format!(
+            r#"schema = 1
+[title]
+product-id = "{GAME}"
+name = "Test Game"
+slug = "testgame"
+[launch]
+executable = 'Game.exe'
+[status]
+state = "playable"
+summary = "Runs."
+{extra}"#
+        )
+    }
+
+    /// A finished install: the manifest, the container, and the config naming
+    /// the product.
+    fn installed_package(dir: &Path, product_id: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("appxmanifest.xml"),
+            r#"<Package><Identity Name="Test" Version="1.0.0.0"/></Package>"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join(STREAMING_CONTAINER), b"old container").unwrap();
+        std::fs::write(
+            dir.join("MicrosoftGame.config"),
+            format!("<Game><StoreId>{product_id}</StoreId></Game>"),
+        )
+        .unwrap();
+    }
+
+    fn record(paths: &Paths, product_id: &str, dir: &Path) {
+        install::save(
+            paths.state_dir(),
+            &install::Record {
+                product_id: product_id.into(),
+                dir: dir.to_path_buf(),
+                content_ids: vec!["content".into()],
+                installed_at: Some("2020-01-01T00:00:00Z".into()),
+                package_version: Some("1.0.0.0".into()),
+            },
+        )
+        .unwrap();
+    }
+
+    fn uninstall(paths: &Paths, title: &str, removal: Removal) -> Result<ExitCode> {
+        uninstall_title(&cli(), paths, title, removal, &mut std::io::empty())
+    }
+
+    const YES: Removal = Removal {
+        keep_files: false,
+        remove_prefix: false,
+        yes: true,
+    };
+
+    // -- uninstall ----------------------------------------------------------
+
+    /// `uninstall "" --yes` removed the games directory with every prefix in
+    /// it, and `uninstall .. --yes` emptied the home directory.
+    #[test]
+    fn uninstall_takes_only_a_product_id_or_a_recipe_slug() {
+        let home = Home::new("uninstall-ids");
+        let paths = home.paths();
+        installed_package(&home.games().join("other"), "9ZZOTHERGAME");
+        std::fs::write(home.root().join("home/keep"), b"precious").unwrap();
+        for title in ["", ".", "..", "../home", "/", "9ZZ/../..", "testgame"] {
+            let error = uninstall(&paths, title, YES).unwrap_err();
+            assert_eq!(exit_code_for(&error), EXIT_USAGE, "{title:?}: {error}");
+        }
+        assert!(home.games().join("other/appxmanifest.xml").exists());
+        assert!(home.root().join("home/keep").exists());
+
+        // A slug a recipe gives is fine, and means that recipe's product.
+        home.recipe("titles", "game.toml", &game_recipe(""));
+        let dir = home.games().join("testgame");
+        installed_package(&dir, GAME);
+        assert_eq!(
+            code(uninstall(&paths, "testgame", YES).unwrap()),
+            code(ExitCode::SUCCESS)
+        );
+        assert!(!dir.exists());
+        assert!(home.games().join("other/appxmanifest.xml").exists());
+    }
+
+    /// A record is a file anybody can edit, and an install directory used to be
+    /// whatever was typed: the library, the home directory or a folder of
+    /// other titles is never deleted on its say-so.
+    #[test]
+    fn uninstall_never_deletes_a_library_or_the_launchers_own_directories() {
+        let home = Home::new("uninstall-guard");
+        let paths = home.paths();
+        let games = home.games();
+        installed_package(&games.join("other"), "9ZZOTHERGAME");
+        record(&paths, "9ZZOTHERGAME", &games.join("other"));
+        std::fs::create_dir_all(games.join("other-proton/pfx")).unwrap();
+
+        let library = home.root().join("library");
+        installed_package(&library, GAME);
+        std::fs::create_dir_all(library.join("testgame-proton/pfx")).unwrap();
+        // A folder holding another title's recorded install.
+        let shelf = home.root().join("shelf");
+        installed_package(&shelf.join("third"), "9ZZTHIRDGAME");
+        record(&paths, "9ZZTHIRDGAME", &shelf.join("third"));
+        for dir in [
+            games.clone(),
+            games.join(".."),
+            home.root().join("home"),
+            home.root().join("state/ferestre"),
+            library.clone(),
+            shelf.clone(),
+        ] {
+            record(&paths, GAME, &dir);
+            let result = uninstall(&paths, GAME, YES);
+            assert!(result.is_err(), "{} was accepted", dir.display());
+        }
+        assert!(games.join("other/appxmanifest.xml").exists());
+        assert!(library.join("appxmanifest.xml").exists());
+        assert!(shelf.join("third/appxmanifest.xml").exists());
+
+        // The title's own folder goes, with a folder of its own that happens
+        // to be called `players`.
+        let own = games.join("testgame");
+        installed_package(&own, GAME);
+        std::fs::create_dir_all(own.join("players/data")).unwrap();
+        record(&paths, GAME, &own);
+        assert_eq!(
+            code(uninstall(&paths, GAME, YES).unwrap()),
+            code(ExitCode::SUCCESS)
+        );
+        assert!(!own.exists());
+        assert!(install::load(paths.state_dir(), GAME).is_none());
+    }
+
+    /// With account roles each Player plays from their own prefix, which
+    /// `--prefix` used to leave behind without a word.
+    #[test]
+    fn uninstall_names_and_removes_every_players_prefix() {
+        let home = Home::new("uninstall-prefixes");
+        home.recipe("titles", "game.toml", &game_recipe(""));
+        let paths = home.paths();
+        let games = home.games();
+        installed_package(&games.join("testgame"), GAME);
+        let base = games.join("testgame-proton");
+        let player = games
+            .join("players")
+            .join("a".repeat(64))
+            .join("testgame-proton");
+        let unrelated = games
+            .join("players")
+            .join("b".repeat(64))
+            .join("other-proton");
+        for dir in [&base, &player, &unrelated] {
+            std::fs::create_dir_all(dir.join("pfx")).unwrap();
+        }
+        assert_eq!(title_prefixes(&base), vec![base.clone(), player.clone()]);
+
+        // Kept unless asked.
+        uninstall(&paths, GAME, YES).unwrap();
+        assert!(base.exists() && player.exists());
+        installed_package(&games.join("testgame"), GAME);
+        uninstall(
+            &paths,
+            GAME,
+            Removal {
+                remove_prefix: true,
+                ..YES
+            },
+        )
+        .unwrap();
+        assert!(!base.exists());
+        assert!(!player.exists());
+        assert!(unrelated.exists());
+    }
+
+    /// Asked once for everything, and a "no" leaves everything.
+    #[test]
+    fn uninstall_asks_before_deleting_the_prefix_too() {
+        let home = Home::new("uninstall-ask");
+        home.recipe("titles", "game.toml", &game_recipe(""));
+        let paths = home.paths();
+        let prefix = home.games().join("testgame-proton");
+        std::fs::create_dir_all(&prefix).unwrap();
+        record(&paths, GAME, &home.games().join("gone"));
+        let removal = Removal {
+            keep_files: false,
+            remove_prefix: true,
+            yes: false,
+        };
+        let mut no = std::io::Cursor::new(b"n\n".to_vec());
+        let answered = uninstall_title(&cli(), &paths, GAME, removal, &mut no).unwrap();
+        assert_eq!(code(answered), code(ExitCode::FAILURE));
+        assert!(prefix.exists());
+        let mut yes = std::io::Cursor::new(b"y\n".to_vec());
+        uninstall_title(&cli(), &paths, GAME, removal, &mut yes).unwrap();
+        assert!(!prefix.exists());
+    }
+
+    // -- install ------------------------------------------------------------
+
+    /// "Install to" is a library: the title gets its own folder in it, and its
+    /// own folder chosen again is used as it is.
+    #[test]
+    fn an_install_folder_is_a_library_the_title_gets_a_folder_in() {
+        let home = Home::new("destination");
+        let recipe = Recipe::parse(&game_recipe("[install]\ndir = \"testgame/package\"")).unwrap();
+        let paths = home.paths();
+        let library = home.root().join("library");
+        std::fs::create_dir_all(library.join("someone-elses-files")).unwrap();
+
+        let dest = install_destination(&paths, GAME, Some(&recipe), Some(&library)).unwrap();
+        assert_eq!(dest, library.join("testgame/package"));
+        let dest = install_destination(&paths, "9ZZNORECIPE1", None, Some(&library)).unwrap();
+        assert_eq!(dest, library.join("9zznorecipe1"));
+
+        // `~` is the home directory, not a folder called `~`.
+        let dest = install_destination(&paths, GAME, None, Some(Path::new("~/Games"))).unwrap();
+        assert_eq!(
+            dest,
+            home.root().join("home/Games").join(GAME.to_lowercase())
+        );
+        assert!(install_destination(&paths, GAME, None, Some(Path::new("~bob/x"))).is_err());
+        // Relative means from here, and is kept absolute.
+        let dest = install_destination(&paths, GAME, None, Some(Path::new("lib"))).unwrap();
+        assert!(dest.is_absolute(), "{}", dest.display());
+        assert_eq!(
+            dest,
+            std::env::current_dir()
+                .unwrap()
+                .join("lib")
+                .join(GAME.to_lowercase())
+        );
+
+        // The title's own folder, by its package or by its record, is used
+        // for a repair or an update.
+        let own = home.root().join("elsewhere/my-game");
+        installed_package(&own, GAME);
+        assert_eq!(
+            install_destination(&paths, GAME, Some(&recipe), Some(&own)).unwrap(),
+            own
+        );
+        let recorded = home.root().join("recorded");
+        std::fs::create_dir_all(&recorded).unwrap();
+        record(&paths, GAME, &recorded);
+        assert_eq!(
+            install_destination(&paths, GAME, Some(&recipe), Some(&recorded)).unwrap(),
+            recorded
+        );
+        // Another title's package is not overwritten.
+        installed_package(&library.join("9zzotherone1"), "9ZZOTHERGAME");
+        let error = install_destination(&paths, "9ZZOTHERONE1", None, Some(&library)).unwrap_err();
+        assert!(error.to_string().contains("another title"), "{error}");
+    }
+
+    /// An update of a title with no recipe goes where it was installed.
+    #[test]
+    fn an_update_without_a_recipe_goes_to_the_recorded_folder() {
+        let home = Home::new("destination-record");
+        let paths = home.paths();
+        let elsewhere = home.root().join("ssd/game");
+        installed_package(&elsewhere, GAME);
+        record(&paths, GAME, &elsewhere);
+        assert_eq!(
+            install_destination(&paths, GAME, None, None).unwrap(),
+            elsewhere
+        );
+    }
+
+    fn install(home: &Home, dir: Option<&Path>) -> Result<ExitCode> {
+        install_title(
+            &cli(),
+            &home.paths(),
+            GAME,
+            dir,
+            &cancel::Cancellation::default(),
+        )
+    }
+
+    /// The client gives up on an update -- a lapsed licence, a full disk --
+    /// and still exits zero. That used to be recorded as a fresh install.
+    #[test]
+    fn an_update_the_client_did_not_finish_is_a_failure_and_not_recorded() {
+        let home = Home::new("update-unfinished");
+        home.recipe("titles", "game.toml", &game_recipe(""));
+        let paths = home.paths();
+        let dir = home.games().join("testgame");
+        installed_package(&dir, GAME);
+        record(&paths, GAME, &dir);
+        let before = install::load(paths.state_dir(), GAME).unwrap();
+
+        // Stopped partway: its working container is still there.
+        home.client("touch \"$3/.xodus-streaming-tmp.msixvc\"");
+        assert_eq!(code(install(&home, None).unwrap()), code(ExitCode::FAILURE));
+        assert_eq!(install::load(paths.state_dir(), GAME).unwrap(), before);
+        std::fs::remove_file(dir.join(STREAMING_TEMPORARY)).unwrap();
+
+        // Did nothing at all.
+        home.client("exit 0");
+        assert_eq!(code(install(&home, None).unwrap()), code(ExitCode::FAILURE));
+        assert_eq!(install::load(paths.state_dir(), GAME).unwrap(), before);
+
+        // A finished run replaces the container.
+        home.client(
+            "printf new > \"$3/.xodus-streaming-tmp.msixvc\" && \
+             mv \"$3/.xodus-streaming-tmp.msixvc\" \"$3/.xodus-streaming.msixvc\"",
+        );
+        assert_eq!(code(install(&home, None).unwrap()), code(ExitCode::SUCCESS));
+        assert_ne!(install::load(paths.state_dir(), GAME).unwrap(), before);
+    }
+
+    /// The after-install step needs the scripts, not a runtime: a machine
+    /// whose only runtime came from `install-runtime` failed every install at
+    /// the very end. And a step that fails leaves the install recorded.
+    #[test]
+    fn after_install_setup_runs_without_a_runtime_and_a_failure_keeps_the_record() {
+        let home = Home::new("after-install");
+        home.recipe(
+            "titles",
+            "game.toml",
+            &game_recipe("[[setup]]\naction = \"substitute-xcurl\"\nwhen = \"after-install\"\n"),
+        );
+        let paths = home.paths();
+        assert!(paths.runtime_dir().is_none());
+        home.client(
+            "mkdir -p \"$3\" && printf m > \"$3/appxmanifest.xml\" && \
+             printf c > \"$3/.xodus-streaming.msixvc\"",
+        );
+        home.script("fix-xcurl.sh", "touch \"$1/patched\"");
+        assert_eq!(code(install(&home, None).unwrap()), code(ExitCode::SUCCESS));
+        let dir = home.games().join("testgame");
+        assert!(dir.join("patched").exists());
+        assert!(install::load(paths.state_dir(), GAME).is_some());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        install::forget(paths.state_dir(), GAME).unwrap();
+        home.script("fix-xcurl.sh", "exit 3");
+        assert_eq!(code(install(&home, None).unwrap()), code(ExitCode::FAILURE));
+        assert!(install::load(paths.state_dir(), GAME).is_some());
+    }
+
+    /// One recipe that does not parse stops an install before it starts,
+    /// instead of sending it to the wrong place and writing a blank recipe
+    /// over the person's own.
+    #[test]
+    fn a_recipe_that_does_not_parse_stops_install_and_uninstall_before_anything_happens() {
+        let home = Home::new("broken-recipe");
+        let own = home.recipe(
+            "config/ferestre/titles",
+            &format!("{GAME}.toml"),
+            &game_recipe(""),
+        );
+        let edited = std::fs::read_to_string(&own).unwrap();
+        home.recipe("config/ferestre/titles", "broken.toml", "schema = [");
+        let error = install(&home, None).unwrap_err();
+        assert!(format!("{error:#}").contains("broken.toml"), "{error:#}");
+        assert!(!home.client_ran());
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), edited);
+        assert!(uninstall(&home.paths(), GAME, YES).is_err());
+    }
+
+    /// A detected recipe never replaces a file that is already there.
+    #[test]
+    fn a_detected_recipe_is_never_written_over_an_existing_file() {
+        let home = Home::new("detected-existing");
+        let paths = home.paths();
+        let existing = home.recipe("config/ferestre/titles", &format!("{GAME}.toml"), "mine");
+        let mut recipe = Recipe::blank(GAME, "Test");
+        recipe.launch.executable = "Game.exe".into();
+        assert!(save_detected_recipe(&paths, &recipe).is_err());
+        assert_eq!(std::fs::read_to_string(existing).unwrap(), "mine");
+    }
+
+    /// A launch holds its title shared; install, update and remove need it
+    /// to themselves, and say so instead of waiting.
+    #[test]
+    fn a_running_title_is_not_installed_over_or_removed() {
+        let home = Home::new("title-lock");
+        home.recipe("titles", "game.toml", &game_recipe(""));
+        let paths = home.paths();
+        let first = TitleLock::take(&paths, GAME, LockMode::Run).unwrap();
+        let second = TitleLock::take(&paths, GAME, LockMode::Run).unwrap();
+        assert!(first.is_some() && second.is_some());
+        let error = install(&home, None).unwrap_err();
+        assert!(error.to_string().contains("running"), "{error}");
+        assert!(!home.client_ran());
+        let dir = home.games().join("testgame");
+        installed_package(&dir, GAME);
+        assert!(uninstall(&paths, GAME, YES).is_err());
+        assert!(dir.exists());
+        drop((first, second));
+
+        let change = TitleLock::take(&paths, GAME, LockMode::Change).unwrap();
+        let error = TitleLock::take(&paths, GAME, LockMode::Run)
+            .err()
+            .expect("a launch waits for nothing while an install runs");
+        assert!(error.to_string().contains("being installed"), "{error}");
+        drop(change);
+        assert!(TitleLock::take(&paths, GAME, LockMode::Run).is_ok());
+    }
+
+    // -- choosing a runtime -------------------------------------------------
+
+    fn installed_runtime(
+        name: &str,
+        provides: &[&str],
+        source: CapabilitySource,
+    ) -> InstalledRuntime {
+        InstalledRuntime {
+            path: PathBuf::from(format!("/runtimes/{name}")),
+            version: Some(name.into()),
+            provides: names(provides),
+            source,
+        }
+    }
+
+    /// The gate decides, so it can say what is missing, and `--force` and a
+    /// probed runtime work.
+    #[test]
+    fn a_runtime_missing_a_requirement_is_still_chosen_for_the_gate_to_judge() {
+        let recipe = recipe();
+        let full = installed_runtime(
+            "full",
+            &["loader.memfd-main-image", "gameinput.v2"],
+            CapabilitySource::Manifest,
+        );
+        let newer = installed_runtime(
+            "newer",
+            &["loader.memfd-main-image"],
+            CapabilitySource::Manifest,
+        );
+        // The newest that satisfies, first.
+        let runtimes = [newer.clone(), full.clone()];
+        assert_eq!(
+            choose_runtime(&recipe, &runtimes, None, None).unwrap(),
+            &full
+        );
+        // Then the newest at all, refused with the reason.
+        let runtimes = [newer.clone()];
+        let chosen = choose_runtime(&recipe, &runtimes, None, None).unwrap();
+        let assessment = runtime::assess(&recipe, chosen, None);
+        assert_eq!(gate(&assessment), Gate::Refused);
+        assert!(refusal(&assessment, chosen).contains("gameinput.v2"));
+        // A probed one launches unverified.
+        let probed = [installed_runtime(
+            "probed",
+            &["loader.memfd-main-image"],
+            CapabilitySource::Probed,
+        )];
+        let chosen = choose_runtime(&recipe, &probed, None, None).unwrap();
+        assert_eq!(
+            gate(&runtime::assess(&recipe, chosen, None)),
+            Gate::Unverified
+        );
+        // A chosen runtime is used even if it falls short, and named if gone.
+        let runtimes = [full.clone(), newer.clone()];
+        assert_eq!(
+            choose_runtime(&recipe, &runtimes, Some(&newer.path), None).unwrap(),
+            &newer
+        );
+        assert!(choose_runtime(&recipe, &runtimes, Some(Path::new("/gone")), None).is_err());
+        assert!(choose_runtime(&recipe, &[], None, None).is_err());
+    }
+
+    /// The whole of `run`'s decision, with a runtime `install-runtime` would
+    /// have left: refused with the missing capability named, and launched
+    /// with `--force`.
+    #[test]
+    fn run_refuses_with_the_reason_and_force_gets_past_it() {
+        let mut home = Home::new("run-force");
+        home.recipe(
+            "titles",
+            "game.toml",
+            &game_recipe("[runtime]\nrequires = [\"loader.memfd-main-image\", \"gameinput.v2\"]\n"),
+        );
+        home.runtime("ferestre-11.0.2", Some(&["loader.memfd-main-image"]));
+        home.extra
+            .push(("XGR_XUID".into(), "2533274812345678".into()));
+        let paths = home.paths();
+        let request = LaunchRequest {
+            dry_run: true,
+            ..LaunchRequest::default()
+        };
+        let error = prepare_launch(&cli(), &paths, "testgame", request)
+            .err()
+            .expect("refused");
+        let message = error.to_string();
+        assert!(message.contains("gameinput.v2"), "{message}");
+        assert!(message.contains("--force"), "{message}");
+
+        let forced = LaunchRequest {
+            force: true,
+            ..request
+        };
+        let prepared = prepare_launch(&cli(), &paths, "testgame", forced).unwrap();
+        assert!(prepared.runtime.path.ends_with("ferestre-11.0.2"));
+        // What a dry run prints is safe to paste.
+        let text = render_plan(&prepared.plan, false);
+        assert!(!text.contains("2533274812345678"), "{text}");
+        assert!(text.contains("XGR_XUID='************5678'"), "{text}");
+        let doc = plan_json(&prepared.plan, false).to_string();
+        assert!(!doc.contains("2533274812345678"), "{doc}");
+        assert!(render_plan(&prepared.plan, true).contains("2533274812345678"));
+    }
+
+    /// A download that stopped partway is part old build, part new and part
+    /// missing; it is not launched, and nothing is started for it.
+    #[test]
+    fn an_unfinished_download_is_not_launched() {
+        let home = Home::new("run-unfinished");
+        home.recipe("titles", "game.toml", &game_recipe(""));
+        home.runtime("ferestre-11.0.2", Some(&["loader.memfd-main-image"]));
+        let paths = home.paths();
+        let dir = home.games().join("testgame");
+        installed_package(&dir, GAME);
+        std::fs::write(dir.join(STREAMING_TEMPORARY), b"").unwrap();
+        let prepared =
+            prepare_launch(&cli(), &paths, "testgame", LaunchRequest::default()).unwrap();
+        let error = launch_prepared(&paths, prepared, false).expect_err("refused");
+        assert!(
+            error.to_string().contains("did not finish downloading"),
+            "{error}"
+        );
+        assert!(!home.games().join("testgame-proton").exists());
+    }
+
+    /// The launch log is named by the recipe's slug, which is data: it goes
+    /// through the games directory's containment check, not around it.
+    #[test]
+    fn a_slug_cannot_put_the_launch_log_outside_the_games_directory() {
+        let home = Home::new("run-log");
+        home.recipe(
+            "titles",
+            "game.toml",
+            &game_recipe("[install]\ndir = \"x\"\nprefix = \"x-proton\"\n")
+                .replace("slug = \"testgame\"", "slug = \"../escaped\""),
+        );
+        home.runtime("ferestre-11.0.2", Some(&["loader.memfd-main-image"]));
+        let paths = home.paths();
+        installed_package(&home.games().join("x"), GAME);
+        let launched = prepare_launch(&cli(), &paths, GAME, LaunchRequest::default())
+            .and_then(|prepared| launch_prepared(&paths, prepared, false));
+        assert!(launched.is_err());
+        assert!(!home.root().join("escaped-launch.log").exists());
+    }
+
+    // -- the launch log and the end of a launch ------------------------------
+
+    /// A title writing bytes that are not UTF-8, to a terminal that has gone
+    /// away, still has every line in its log.
+    #[test]
+    fn the_log_keeps_everything_after_bad_bytes_and_a_closed_terminal() {
+        let scratch = Scratch::new("tee");
+        let log_path = scratch.root.join("launch.log");
+        let log = Arc::new(Mutex::new(std::fs::File::create(&log_path).unwrap()));
+        // A terminal nobody reads any more.
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        unsafe { libc::close(fds[0]) };
+        use std::os::fd::FromRawFd;
+        let closed = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        let mut input = b"first line\n\xff\xfe code page \x80\n".to_vec();
+        input.extend(std::iter::repeat(b'x').take(200_000));
+        input.extend_from_slice(b"\nlast line\n");
+        tee(std::io::Cursor::new(input.clone()), log, closed)
+            .join()
+            .unwrap();
+        assert_eq!(std::fs::read(&log_path).unwrap(), input);
+    }
+
+    struct FakeWine {
+        scratch: Scratch,
+        running: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FakeWine {
+        fn new(name: &str) -> Self {
+            let scratch = Scratch::new(name);
+            for tool in ["wine", "wineserver"] {
+                let path = scratch.root.join(tool);
+                std::fs::write(
+                    &path,
+                    format!(
+                        "#!/bin/sh\necho \"{tool} $* $WINEPREFIX\" >> \"$(dirname \"$0\")/calls\"\n"
+                    ),
+                )
+                .unwrap();
+                make_executable(&path);
+            }
+            FakeWine {
+                scratch,
+                running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            }
+        }
+
+        fn session(&self, grace: std::time::Duration) -> Arc<PrefixSession> {
+            let running = Arc::clone(&self.running);
+            Arc::new(PrefixSession {
+                wine: self.scratch.root.join("wine"),
+                wineserver: self.scratch.root.join("wineserver"),
+                wine_prefix: self.scratch.root.join("prefix/pfx"),
+                executable: "Game.exe".into(),
+                grace,
+                running: Box::new(move || running.load(std::sync::atomic::Ordering::SeqCst)),
+            })
+        }
+
+        fn calls(&self) -> String {
+            std::fs::read_to_string(self.scratch.root.join("calls")).unwrap_or_default()
+        }
+
+        fn detached(&self, grace: std::time::Duration) -> Forwarding {
+            let forwarding = Forwarding {
+                shared: Shared::new(),
+                installed: false,
+            };
+            forwarding.set_session(Some(self.session(grace)));
+            forwarding
+        }
+    }
+
+    /// Wine starts a game in a session of its own, so a stopped launch left
+    /// it running, without its service. Stopping now asks the game to close,
+    /// waits, and then ends the prefix.
+    #[test]
+    fn a_stopped_launch_asks_the_game_to_close_and_then_ends_the_prefix() {
+        let wine = FakeWine::new("stop-grace");
+        let forwarding = wine.detached(std::time::Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        forwarding.shared.deliver(libc::SIGTERM);
+        forwarding.finish(std::time::Duration::from_secs(30));
+        let calls = wine.calls();
+        let close = calls.find("wine taskkill /IM Game.exe").expect(&calls);
+        let kill = calls.find("wineserver -k").expect(&calls);
+        assert!(close < kill, "{calls}");
+        assert!(calls.contains("prefix/pfx"), "{calls}");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        assert_eq!(forwarding.received(), Some(libc::SIGTERM));
+    }
+
+    #[test]
+    fn a_game_that_closes_when_asked_is_not_killed() {
+        let wine = FakeWine::new("stop-closes");
+        let forwarding = wine.detached(std::time::Duration::from_secs(30));
+        let running = Arc::clone(&wine.running);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            running.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        forwarding.shared.deliver(libc::SIGINT);
+        forwarding.finish(std::time::Duration::from_secs(30));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let calls = wine.calls();
+        assert!(calls.contains("taskkill"), "{calls}");
+        assert!(!calls.contains("wineserver -k"), "{calls}");
+    }
+
+    #[test]
+    fn a_second_signal_ends_the_game_at_once() {
+        let wine = FakeWine::new("stop-twice");
+        let forwarding = wine.detached(std::time::Duration::from_secs(60));
+        let started = std::time::Instant::now();
+        forwarding.shared.deliver(libc::SIGTERM);
+        let shared = Arc::clone(&forwarding.shared);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            shared.deliver(libc::SIGTERM);
+        });
+        forwarding.finish(std::time::Duration::from_secs(60));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(wine.calls().contains("wineserver -k"));
+    }
+
+    /// After the title exits, the launch waits a bounded time for the rest
+    /// of its Wine session -- and a signal then is not swallowed.
+    #[test]
+    fn after_the_title_a_signal_still_ends_the_wait() {
+        let wine = FakeWine::new("stop-after");
+        let forwarding = wine.detached(std::time::Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        forwarding.finish(std::time::Duration::from_millis(300));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        assert!(wine.calls().is_empty());
+
+        let started = std::time::Instant::now();
+        let shared = Arc::clone(&forwarding.shared);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            shared.deliver(libc::SIGINT);
+        });
+        forwarding.finish(std::time::Duration::from_secs(60));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(wine.calls().contains("wineserver -k"));
+
+        // Nothing left running: nothing to wait for.
+        wine.running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let quiet = wine.detached(std::time::Duration::from_secs(60));
+        quiet.finish(std::time::Duration::from_secs(60));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// The signal still reaches the title, before the session is ended.
+    #[test]
+    fn a_stopped_launch_still_signals_its_title() {
+        let mut wine = FakeWine::new("stop-title");
+        wine.running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let forwarding = wine.detached(std::time::Duration::from_millis(100));
+        let root = wine.scratch.root.clone();
+        let title = wine.scratch.stand_in("title", &root, false);
+        let shared = Arc::clone(&forwarding.shared);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            shared.deliver(libc::SIGTERM);
+        });
+        let status = forwarding.wait(&mut wine.scratch.children[title]).unwrap();
+        assert_eq!(signal_of(&status), Some(libc::SIGTERM));
+        forwarding.finish(std::time::Duration::from_secs(5));
+    }
+
+    // -- the runtime download -------------------------------------------------
+
+    /// A tiny web server for the release feed and its files. Each path is
+    /// answered with what `routes` says, every time it is asked.
+    fn serve(routes: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>) -> String {
+        use std::io::Read;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in server.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => request.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let text = String::from_utf8_lossy(&request);
+                let path = text.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let path = path.split('?').next().unwrap_or("/").to_string();
+                let body = routes.lock().unwrap().get(&path).cloned();
+                let _ = match body {
+                    Some(body) => stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .and_then(|()| stream.write_all(&body)),
+                    None => stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    ),
+                };
+            }
+        });
+        base
+    }
+
+    /// A runtime archive as runtime.yml makes one.
+    fn runtime_archive(root: &Path, version: &str) -> Vec<u8> {
+        let tree = root.join("archive-tree");
+        let top = tree.join(format!("ferestre-runtime-{version}"));
+        std::fs::create_dir_all(&top).unwrap();
+        std::fs::write(top.join("proton"), "#!/bin/sh\n").unwrap();
+        std::fs::write(top.join("version"), format!("1 ferestre-{version}\n")).unwrap();
+        let archive = root.join("archive.tar.xz");
+        let status = Command::new("tar")
+            .arg("-cJf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&tree)
+            .arg(format!("ferestre-runtime-{version}"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::read(archive).unwrap()
+    }
+
+    /// Everything `install-runtime` fetches checks out against the release
+    /// key before it is unpacked; anything that does not is thrown away.
+    #[test]
+    fn install_runtime_installs_only_what_the_release_key_signed() {
+        use ferestre_core::signing::testing::TestKey;
+        let home = Home::new("install-runtime");
+        let paths = home.paths();
+        let version = "11.0.3";
+        let name = format!("ferestre-runtime-{version}.tar.xz");
+        let archive = runtime_archive(home.root(), version);
+        let key = TestKey::generate();
+        let routes = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let base = serve(Arc::clone(&routes));
+        let feed = json!([
+            { "tag_name": "v0.1.13", "assets": [] },
+            { "tag_name": format!("runtime-{version}"), "assets": [
+                { "name": name, "browser_download_url": format!("{base}/download/{name}") },
+            ]},
+        ]);
+        {
+            let mut routes = routes.lock().unwrap();
+            routes.insert("/releases".to_string(), feed.to_string().into_bytes());
+            routes.insert(format!("/download/{name}"), archive.clone());
+            // Signed, but by somebody else.
+            let stranger = TestKey::generate();
+            routes.insert(
+                format!("/download/{name}.minisig"),
+                stranger
+                    .sign(&archive, &format!("file:{name}"))
+                    .into_bytes(),
+            );
+        }
+        let api = format!("{base}/releases");
+        let run = |cli: &Cli| {
+            install_runtime(
+                cli,
+                &paths,
+                &api,
+                &key.public_key(),
+                &cancel::Cancellation::default(),
+            )
+        };
+        let runtimes = paths.runtimes_dir();
+        let cached = paths.cache_dir().join("runtime").join(&name);
+        // Left by an install that was killed.
+        let abandoned = runtimes.join(format!(".{version}.installing-4000000000"));
+        std::fs::create_dir_all(&abandoned).unwrap();
+
+        let error = run(&cli()).unwrap_err();
+        assert!(format!("{error:#}").contains("not signed"), "{error:#}");
+        assert!(!cached.exists(), "a bad download stays in the cache");
+        assert!(!runtimes.join(version).exists());
+
+        routes.lock().unwrap().insert(
+            format!("/download/{name}.minisig"),
+            key.sign(&archive, &format!("timestamp:1 file:{name}"))
+                .into_bytes(),
+        );
+        // A corrupt archive already in the cache is replaced, not reused.
+        std::fs::write(&cached, b"corrupt").unwrap();
+        assert_eq!(code(run(&cli()).unwrap()), code(ExitCode::SUCCESS));
+        assert!(InstalledRuntime::at(&runtimes.join(version)).is_ok());
+        assert!(!cached.exists(), "the archive is not kept once installed");
+        assert!(!abandoned.exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&runtimes)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .filter(|n| n.to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        // Installed already: said so, and nothing fetched.
+        routes.lock().unwrap().remove(&format!("/download/{name}"));
+        assert_eq!(code(run(&cli()).unwrap()), code(ExitCode::SUCCESS));
+    }
+
+    /// Launcher releases are many and runtime releases few, so the newest
+    /// runtime can be past the first page of the feed.
+    #[test]
+    fn the_newest_runtime_is_found_past_the_first_page() {
+        let launcher_page = |n: usize| {
+            let releases: Vec<Value> = (0..n)
+                .map(|i| json!({ "tag_name": format!("v0.{i}"), "assets": [] }))
+                .collect();
+            serde_json::to_string(&releases).unwrap()
+        };
+        let runtime_page = json!([{ "tag_name": "runtime-11.0.1", "assets": [
+            { "name": "ferestre-runtime-11.0.1.tar.xz", "browser_download_url": "https://x/r" }
+        ]}])
+        .to_string();
+        let asked = std::cell::Cell::new(0);
+        let release = newest_runtime_release(|page| {
+            asked.set(page);
+            Ok(if page < 3 {
+                launcher_page(RELEASES_PER_PAGE)
+            } else {
+                runtime_page.clone()
+            })
+        })
+        .unwrap();
+        assert_eq!(release.tag, "runtime-11.0.1");
+        assert_eq!(asked.get(), 3);
+        // A short page is the last one.
+        let error = newest_runtime_release(|_| Ok(launcher_page(3))).unwrap_err();
+        assert!(error.to_string().contains("no runtime"), "{error}");
+    }
+
+    // -- updates and doctor -------------------------------------------------
+
+    /// "Cannot tell" is not "up to date", and one bad answer does not end the
+    /// check for every other title.
+    #[test]
+    fn updates_say_unknown_and_carry_on_past_a_bad_answer() {
+        let home = Home::new("updates");
+        let paths = home.paths();
+        for (id, content) in [("9ZZBADANSWER", "bad"), ("9ZZGOODANSWR", "good")] {
+            let dir = home.games().join(id);
+            installed_package(&dir, id);
+            install::save(
+                paths.state_dir(),
+                &install::Record {
+                    product_id: id.into(),
+                    dir,
+                    content_ids: vec![content.into()],
+                    installed_at: None,
+                    package_version: Some("1.0.0.0".into()),
+                },
+            )
+            .unwrap();
+        }
+        home.client(
+            "case \"$2\" in bad) echo 'not json';; good) echo '{\"version\":\"2.0.0.0\"}';; esac",
+        );
+        let results = check_updates(&paths, &home.root().join("client/xodus-cli")).unwrap();
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0]["product_id"], "9ZZGOODANSWR");
+        assert_eq!(update_state(&results[0]), "update available");
+        assert_eq!(
+            update_state(&json!({ "update_available": null })),
+            "unknown (no version to compare)"
+        );
+        assert_eq!(
+            update_state(&json!({ "update_available": false })),
+            "up to date"
+        );
+    }
+
+    /// Doctor sees a runtime `install-runtime` downloaded, and a recipe of the
+    /// person's own that does not parse.
+    #[test]
+    fn doctor_sees_managed_runtimes_and_broken_user_recipes() {
+        let home = Home::new("doctor");
+        home.runtime("ferestre-11.0.2", Some(&["loader.memfd-main-image"]));
+        home.recipe("config/ferestre/titles", "broken.toml", "schema = [");
+        let checks = doctor_checks(&home.paths());
+        let runtime = checks.iter().find(|c| c.section == "runtime").unwrap();
+        assert_eq!(runtime.status, CheckStatus::Ok, "{runtime:?}");
+        assert!(runtime
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("ferestre-11.0.2"));
+        let recipes = checks.iter().find(|c| c.section == "recipes").unwrap();
+        assert_eq!(recipes.status, CheckStatus::Fail, "{recipes:?}");
+        assert!(recipes
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("broken.toml"));
     }
 }
