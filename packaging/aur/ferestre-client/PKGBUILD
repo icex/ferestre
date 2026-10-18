@@ -23,7 +23,7 @@
 
 pkgname=ferestre-client
 pkgver=0.1.0.r130.g3e75c9f
-pkgrel=4
+pkgrel=5
 pkgdesc='Xodus client for Microsoft Store titles, with the ferestre patches (sign-in, licences, MSIXVC download and decrypt)'
 arch=('x86_64')
 url='https://github.com/xodus-gaming/xodus'
@@ -105,6 +105,7 @@ _patches=(
   "0018-extend-xsts-signing-frames-and-isolate-service-sockets.patch"
   "0019-serve-read-only-store-catalog.patch"
   "0020-separate-store-and-player-accounts.patch"
+  "0021-scope-service-tokens-to-the-bound-title.patch"
 )
 source=("xodus::git+https://github.com/xodus-gaming/xodus.git#commit=$_commit")
 for _patch in "${_patches[@]}"; do
@@ -132,6 +133,7 @@ sha256sums=(
   'abb39e2c6aede929a5ad33d6a6b9f5f45db880571ada2235ea2fc714dbcfc016'
   '041bb4b80da350c7cfe427d3ba4188dab1c1b4219512dff92bb3e7e056b19c39'
   '0b76dd562210434726fad24bd52aba16b7d9f4f6caeebab7ffec59e09d479434'
+  '529cb5505ba5a026ea0ee467e6bdbff0b196b4dfab6958735d967d91dec4c976'
 )
 
 prepare() {

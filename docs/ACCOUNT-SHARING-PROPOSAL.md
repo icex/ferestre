@@ -47,6 +47,26 @@ with the selected player; Ferestre does not create an entitlement for the player
   generation, the packaged service fingerprint and the bound product/content ID.
   IPC does not accept a title-selected profile or credentials, and licence-token
   requests are signed only for the bound title.
+- `patches/xodus-cli/0021-scope-service-tokens-to-the-bound-title.patch` binds
+  the service to the title's identity as well as its product. The launcher reads
+  `TitleId` and `MSAAppId` from the install's `MicrosoftGame.config` the way the
+  runtime does and passes them as `XODUS_TITLE_ID` (decimal) and
+  `XODUS_TITLE_CLIENT_ID`; both are empty when the config names no title. The
+  bound service mints XSTS tokens only for that identity or with no title claim
+  at all (the runtime's own sign-in lookup asks that way; such a token carries
+  the user and device only), refuses a request that names its own relying
+  party, and signs licence-token requests as that title whatever they claim.
+  Licence tokens cover the bound product and products whose own Store catalog
+  entry names it (`addOnParent`, `Parent`, `Extends`): add-ons
+  and editions, not bundles or storefronts the game lists. A product the
+  catalog cannot confirm is refused and logged. When the Player is
+  the Store account, a title's own XSTS request for the audience the licence
+  service uses is refused too, since a token for it with a signature over a
+  licence body would get round that scope. A bound service answers no MSA token
+  requests (the runtime makes none; any MSA ticket is enough to sign in to Xbox
+  from scratch for any title). The service advertises `title-scoped-tokens` in
+  `--capabilities`, and a launch with account roles refuses a service without
+  it. Unbound services keep the previous behaviour.
 - Store library, subscription, download, content licence and XStore licence-token
   calls use Store credentials. XUser/MSA/Xbox/PlayFab calls use Player credentials.
   Public catalog/tier data stays shared; private library, account and update

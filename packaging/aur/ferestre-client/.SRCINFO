@@ -1,7 +1,7 @@
 pkgbase = ferestre-client
 	pkgdesc = Xodus client for Microsoft Store titles, with the ferestre patches (sign-in, licences, MSIXVC download and decrypt)
 	pkgver = 0.1.0.r130.g3e75c9f
-	pkgrel = 4
+	pkgrel = 5
 	url = https://github.com/xodus-gaming/xodus
 	arch = x86_64
 	license = GPL-3.0-only
@@ -45,6 +45,7 @@ pkgbase = ferestre-client
 	source = https://raw.githubusercontent.com/icex/ferestre/396e7cd39241d9d7779a34161e767e435713d0e7/patches/xodus-cli/0018-extend-xsts-signing-frames-and-isolate-service-sockets.patch
 	source = https://raw.githubusercontent.com/icex/ferestre/396e7cd39241d9d7779a34161e767e435713d0e7/patches/xodus-cli/0019-serve-read-only-store-catalog.patch
 	source = https://raw.githubusercontent.com/icex/ferestre/396e7cd39241d9d7779a34161e767e435713d0e7/patches/xodus-cli/0020-separate-store-and-player-accounts.patch
+	source = https://raw.githubusercontent.com/icex/ferestre/396e7cd39241d9d7779a34161e767e435713d0e7/patches/xodus-cli/0021-scope-service-tokens-to-the-bound-title.patch
 	sha256sums = SKIP
 	sha256sums = 20d613add707a69f488b50041e53c60f8a0096132c05338b66d594fa8963c918
 	sha256sums = c15806efefdfe7613755ada8ee0fe28784ad955ea7df26825ddeabc7be731256
@@ -65,5 +66,6 @@ pkgbase = ferestre-client
 	sha256sums = abb39e2c6aede929a5ad33d6a6b9f5f45db880571ada2235ea2fc714dbcfc016
 	sha256sums = 041bb4b80da350c7cfe427d3ba4188dab1c1b4219512dff92bb3e7e056b19c39
 	sha256sums = 0b76dd562210434726fad24bd52aba16b7d9f4f6caeebab7ffec59e09d479434
+	sha256sums = 529cb5505ba5a026ea0ee467e6bdbff0b196b4dfab6958735d967d91dec4c976
 
 pkgname = ferestre-client
