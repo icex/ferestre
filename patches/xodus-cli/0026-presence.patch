@@ -1,11 +1,39 @@
 From: Ferestre contributors
 Subject: Report a launched game's presence under its own title identity
 
+On Windows the Game Bar keeps a running title's presence alive. Under Proton
+nothing does, so a game started from a launcher never shows on anyone's
+friends list. This adds `xodus-cli presence run`, a long-running child a
+launcher starts next to the game, and `presence get`, a one-shot read of the
+status friends see.
+
+`presence run` mints one SISU identity for the game's own TitleId and
+MSAAppId (from --game-dir's MicrosoftGame.config, or --title-id and
+--title-client-id) and keeps it in memory for the run, so the service sees
+one device. It re-posts {"state":"active"} to titles/current as often as
+X-Heartbeat-After asks (clamped to 60-900 s, 300 s when absent), follows
+Retry-After on 429 and 503, backs off on network errors, re-mints once on
+401, and on stdin EOF, SIGTERM or a signed-out account deletes the record
+before exiting. It never borrows another title's identity: a config without
+an MSAAppId gets the no-title-identity error. Events go to stdout as JSON
+lines; nothing prints a token, and diagnostics are scrubbed.
+
+One runner per account holds presence-<profile>.lock. The lock lives in
+XODUS_RUNTIME_DIR or XDG_RUNTIME_DIR when that is a directory private to
+this user, and otherwise in .run under the account profile root, created
+0700; never in the shared temporary directory. It is opened without
+following symlinks and refused unless it is a regular file this user owns.
+
+`account-profiles --json` lists the capability presence-v1. The misnamed
+XBOX_APP_* constants are Minecraft for Windows' identity and are renamed to
+say so. The tests run against a local server with a fake token provider and
+never sign in.
+
 diff --git a/Cargo.lock b/Cargo.lock
-index df6d4db..a3cb5ba 100644
+index 3093845..3f0ddb7 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -7187,6 +7187,7 @@ dependencies = [
+@@ -7188,6 +7188,7 @@ dependencies = [
   "inquire",
   "msixvc",
   "nix",
@@ -38,10 +66,10 @@ index 2f3559e..18f5740 100644
  pub mod run;
 diff --git a/crates/xodus-cli/src/commands/presence.rs b/crates/xodus-cli/src/commands/presence.rs
 new file mode 100644
-index 0000000..d892d09
+index 0000000..1bad342
 --- /dev/null
 +++ b/crates/xodus-cli/src/commands/presence.rs
-@@ -0,0 +1,1103 @@
+@@ -0,0 +1,1195 @@
 +//! Show the player as playing the game a launcher started, and read back what
 +//! friends see.
 +//!
@@ -848,22 +876,45 @@ index 0000000..d892d09
 +    Io(std::io::Error),
 +}
 +
-+/// `$XODUS_RUNTIME_DIR/presence-<profile>.lock`, held for the whole run.
++/// `presence-<profile>.lock` in [`runtime_dir`], held for the whole run.
 +///
 +/// One runner per account: two would post from two devices and fight over
 +/// which is current. The lock is the backstop for a second launcher process;
 +/// the file descriptor is released however the process ends.
++///
++/// `dir` should be private to this user (see [`runtime_dir`]). The file is
++/// opened without following a symlink, and refused unless it is a regular
++/// file this user owns, so nobody else can choose what it is.
 +pub fn lock(dir: &Path, profile: &str) -> Result<std::fs::File, LockError> {
 +    use fs2::FileExt;
-+    use std::os::unix::fs::OpenOptionsExt;
++    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
++    if profile != "default" && !xodus::profiles::valid_id(profile) {
++        return Err(LockError::Io(std::io::Error::other(
++            "invalid account profile ID",
++        )));
++    }
 +    let path = dir.join(format!("presence-{profile}.lock"));
 +    let file = std::fs::OpenOptions::new()
 +        .create(true)
 +        .truncate(false)
 +        .write(true)
 +        .mode(0o600)
++        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
 +        .open(&path)
 +        .map_err(LockError::Io)?;
++    let meta = file.metadata().map_err(LockError::Io)?;
++    if !meta.file_type().is_file() {
++        return Err(LockError::Io(std::io::Error::other(format!(
++            "{} is not a regular file",
++            path.display()
++        ))));
++    }
++    if meta.uid() != current_uid() {
++        return Err(LockError::Io(std::io::Error::other(format!(
++            "{} belongs to another user",
++            path.display()
++        ))));
++    }
 +    match file.try_lock_exclusive() {
 +        Ok(()) => Ok(file),
 +        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Err(LockError::Busy),
@@ -874,12 +925,78 @@ index 0000000..d892d09
 +    }
 +}
 +
-+pub fn runtime_dir() -> PathBuf {
-+    ["XODUS_RUNTIME_DIR", "XDG_RUNTIME_DIR"]
++fn current_uid() -> u32 {
++    // Safety: geteuid cannot fail and touches no memory.
++    unsafe { nix::libc::geteuid() }
++}
++
++/// Whether `dir` is a directory, not a symlink, that only this user can
++/// enter: owned by them, with no group or other permissions. With `tighten`,
++/// an owned directory that is too open is set to 0700 rather than refused;
++/// only for the directory this client makes for itself.
++pub fn private_dir(dir: &Path, tighten: bool) -> std::io::Result<()> {
++    use std::os::unix::fs::{MetadataExt, PermissionsExt};
++    let meta = std::fs::symlink_metadata(dir)?;
++    if !meta.file_type().is_dir() {
++        return Err(std::io::Error::other(format!(
++            "{} is not a directory",
++            dir.display()
++        )));
++    }
++    if meta.uid() != current_uid() {
++        return Err(std::io::Error::other(format!(
++            "{} belongs to another user",
++            dir.display()
++        )));
++    }
++    if meta.mode() & 0o077 != 0 {
++        if !tighten {
++            return Err(std::io::Error::other(format!(
++                "{} is open to other users",
++                dir.display()
++            )));
++        }
++        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
++    }
++    Ok(())
++}
++
++/// Where the lock lives: `XODUS_RUNTIME_DIR`, else `XDG_RUNTIME_DIR`, else
++/// `.run` under the account profile root, created 0700. Each must be private
++/// to this user; one that is not is skipped. Never the shared temporary
++/// directory, where another user could plant the file first.
++pub fn runtime_dir() -> std::io::Result<PathBuf> {
++    let candidates: Vec<PathBuf> = ["XODUS_RUNTIME_DIR", "XDG_RUNTIME_DIR"]
 +        .iter()
-+        .find_map(|name| std::env::var_os(name).filter(|value| !value.is_empty()))
++        .filter_map(|name| std::env::var_os(name).filter(|value| !value.is_empty()))
 +        .map(PathBuf::from)
-+        .unwrap_or_else(std::env::temp_dir)
++        .collect();
++    let root = xodus::profiles::root().map_err(|e| std::io::Error::other(e.to_string()))?;
++    choose_runtime_dir(&candidates, &root)
++}
++
++/// [`runtime_dir`] with its inputs given: the first private candidate, else
++/// `.run` under `profile_root`.
++pub fn choose_runtime_dir(candidates: &[PathBuf], profile_root: &Path) -> std::io::Result<PathBuf> {
++    use std::os::unix::fs::DirBuilderExt;
++    for candidate in candidates {
++        // Only an absolute path: a relative one depends on where this runs.
++        if candidate.is_absolute() && private_dir(candidate, false).is_ok() {
++            return Ok(candidate.clone());
++        }
++    }
++    std::fs::DirBuilder::new()
++        .recursive(true)
++        .mode(0o700)
++        .create(profile_root)?;
++    let dir = profile_root.join(".run");
++    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
++        Ok(()) => {}
++        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
++        Err(error) => return Err(error),
++    }
++    private_dir(&dir, true)?;
++    Ok(dir)
 +}
 +
 +/// The name friends see is the one the service holds, which the client cannot
@@ -977,7 +1094,10 @@ index 0000000..d892d09
 +    };
 +
 +    let profile = tokens.profile_id().unwrap_or("default").to_string();
-+    let _lock = match lock(&runtime_dir(), &profile) {
++    let _lock = match runtime_dir()
++        .map_err(LockError::Io)
++        .and_then(|dir| lock(&dir, &profile))
++    {
 +        Ok(file) => Some(file),
 +        Err(LockError::Busy) => {
 +            emit(&mut stdout, json, &Event::Busy);
@@ -1147,10 +1267,10 @@ index 0000000..d892d09
 +mod tests;
 diff --git a/crates/xodus-cli/src/commands/presence/tests.rs b/crates/xodus-cli/src/commands/presence/tests.rs
 new file mode 100644
-index 0000000..96e9ad3
+index 0000000..9e9bb42
 --- /dev/null
 +++ b/crates/xodus-cli/src/commands/presence/tests.rs
-@@ -0,0 +1,1161 @@
+@@ -0,0 +1,1256 @@
 +//! The heartbeat loop against a local server, with credentials from a fake
 +//! provider. Nothing here signs in or reaches the network: the server is a
 +//! listener on 127.0.0.1 that answers from a script and records what it saw.
@@ -2081,6 +2201,101 @@ index 0000000..96e9ad3
 +    assert_eq!(mode & 0o777, 0o600);
 +}
 +
++#[test]
++fn the_lock_does_not_follow_a_planted_symlink() {
++    let dir = tempfile::tempdir().expect("tempdir");
++    let target = dir.path().join("elsewhere");
++    std::fs::write(&target, b"keep").unwrap();
++    let profile = "0123456789abcdef0123456789abcdef";
++    std::os::unix::fs::symlink(&target, dir.path().join(format!("presence-{profile}.lock")))
++        .unwrap();
++    assert!(matches!(lock(dir.path(), profile), Err(LockError::Io(_))));
++    assert_eq!(std::fs::read(&target).unwrap(), b"keep");
++}
++
++#[test]
++fn the_lock_is_refused_when_it_is_not_a_regular_file() {
++    let dir = tempfile::tempdir().expect("tempdir");
++    std::fs::create_dir(dir.path().join("presence-default.lock")).unwrap();
++    assert!(matches!(lock(dir.path(), "default"), Err(LockError::Io(_))));
++}
++
++#[test]
++fn a_profile_id_cannot_name_a_path() {
++    let dir = tempfile::tempdir().expect("tempdir");
++    for profile in ["../x", "a/b", "", "0123456789ABCDEF0123456789ABCDEF"] {
++        assert!(
++            matches!(lock(dir.path(), profile), Err(LockError::Io(_))),
++            "{profile:?}"
++        );
++    }
++    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
++}
++
++fn mode_of(path: &Path) -> u32 {
++    std::os::unix::fs::PermissionsExt::mode(&std::fs::symlink_metadata(path).unwrap().permissions())
++        & 0o777
++}
++
++#[test]
++fn the_runtime_dir_is_a_private_candidate_or_one_under_the_profile_root() {
++    use std::os::unix::fs::PermissionsExt;
++    let scratch = tempfile::tempdir().expect("tempdir");
++    let root = scratch.path().join("state/xodus/accounts");
++
++    // A private candidate is used as it is.
++    let private = scratch.path().join("private");
++    std::fs::create_dir(&private).unwrap();
++    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
++    assert_eq!(
++        choose_runtime_dir(std::slice::from_ref(&private), &root).unwrap(),
++        private
++    );
++    assert!(!root.exists(), "nothing created when a candidate will do");
++
++    // Missing, relative or symlinked candidates are passed over, and the
++    // fallback is made private under the profile root.
++    let link = scratch.path().join("link");
++    std::os::unix::fs::symlink(&private, &link).unwrap();
++    let candidates = [
++        scratch.path().join("missing"),
++        PathBuf::from("relative"),
++        link,
++    ];
++    let chosen = choose_runtime_dir(&candidates, &root).unwrap();
++    assert_eq!(chosen, root.join(".run"));
++    assert_eq!(mode_of(&chosen), 0o700);
++    assert_eq!(mode_of(&root), 0o700);
++
++    // A candidate open to others is passed over and left as it is; the
++    // fallback, which is this client's own, is tightened if it was opened.
++    let open = scratch.path().join("open");
++    std::fs::create_dir(&open).unwrap();
++    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
++    std::fs::set_permissions(root.join(".run"), std::fs::Permissions::from_mode(0o755)).unwrap();
++    assert_eq!(
++        choose_runtime_dir(std::slice::from_ref(&open), &root).unwrap(),
++        root.join(".run")
++    );
++    assert_eq!(mode_of(&open), 0o777);
++    assert_eq!(mode_of(&root.join(".run")), 0o700);
++
++    // A fallback that was tampered into a symlink is refused, not followed.
++    std::fs::remove_dir(root.join(".run")).unwrap();
++    std::os::unix::fs::symlink(&private, root.join(".run")).unwrap();
++    assert!(choose_runtime_dir(&[], &root).is_err());
++}
++
++#[test]
++fn the_runtime_dir_never_falls_back_to_the_shared_temp_dir() {
++    let scratch = tempfile::tempdir().expect("tempdir");
++    let root = scratch.path().join("accounts");
++    // Named outright, the shared temp dir is still passed over: it is open
++    // to everyone, and nobody else's is private to this user.
++    let chosen = choose_runtime_dir(&[PathBuf::from("/tmp")], &root).unwrap();
++    assert_eq!(chosen, root.join(".run"));
++}
++
 +#[tokio::test]
 +async fn no_token_reaches_stdout_whatever_happens() {
 +    let scripts = vec![
@@ -2313,7 +2528,7 @@ index 0000000..96e9ad3
 +    assert_eq!(server.seen().last().unwrap().method, "DELETE");
 +}
 diff --git a/crates/xodus-cli/src/commands/profiles.rs b/crates/xodus-cli/src/commands/profiles.rs
-index c74daad..624dd9c 100644
+index ec96815..b678fb7 100644
 --- a/crates/xodus-cli/src/commands/profiles.rs
 +++ b/crates/xodus-cli/src/commands/profiles.rs
 @@ -3,6 +3,10 @@ use std::process::ExitCode;
@@ -2325,9 +2540,9 @@ index c74daad..624dd9c 100644
 +pub const CAPABILITIES: &[&str] = &["store-player-accounts", "presence-v1"];
 +
  pub fn manager(root: &Path, id: Option<&str>) -> Result<TokenManager, TokenStoreError> {
-     let id = match id {
-         Some(id) => Some(id.to_owned()),
-@@ -31,10 +35,8 @@ pub fn list(root: &Path, json: bool) -> ExitCode {
+     match profiles::select(root, id)? {
+         Some(id) => TokenManager::for_profile(&id),
+@@ -41,10 +45,8 @@ pub fn list(root: &Path, json: bool) -> ExitCode {
              value["signed_in"] = signed_in.into();
              result.push(value);
          }
@@ -2341,7 +2556,7 @@ index c74daad..624dd9c 100644
      match result {
          Ok(value) => {
 diff --git a/crates/xodus-cli/src/commands/xblcheck.rs b/crates/xodus-cli/src/commands/xblcheck.rs
-index 4c0e12c..23828cb 100644
+index 6bdc233..f8e65ac 100644
 --- a/crates/xodus-cli/src/commands/xblcheck.rs
 +++ b/crates/xodus-cli/src/commands/xblcheck.rs
 @@ -68,32 +68,37 @@ impl TitleIdentity {
@@ -2403,7 +2618,7 @@ index 4c0e12c..23828cb 100644
          std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
      let element = |name: &str| -> Option<String> {
 diff --git a/crates/xodus-cli/src/main.rs b/crates/xodus-cli/src/main.rs
-index a6ade67..2c8b134 100644
+index 613d053..776eea7 100644
 --- a/crates/xodus-cli/src/main.rs
 +++ b/crates/xodus-cli/src/main.rs
 @@ -97,6 +97,11 @@ enum SubCommand {
@@ -2453,7 +2668,7 @@ index a6ade67..2c8b134 100644
  #[derive(Subcommand)]
  enum ClepAction {
      #[command(
-@@ -392,6 +425,35 @@ async fn main() -> ExitCode {
+@@ -394,6 +427,35 @@ async fn main() -> ExitCode {
                  }
              }
          }
