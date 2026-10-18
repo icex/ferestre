@@ -446,7 +446,7 @@ pub fn gamepass(
                 .catalog
                 .get(&id.to_ascii_uppercase())
                 .and_then(|p| p.product_kind.as_deref())
-                .map_or(true, |kind| kind.eq_ignore_ascii_case("Game"))
+                .is_none_or(|kind| kind.eq_ignore_ascii_case("Game"))
         })
         .map(|product_id| {
             let key = product_id.to_ascii_uppercase();
