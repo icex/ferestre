@@ -166,7 +166,7 @@ put() {
     local src=$1 dst=$2 tmp
     tmp=$(mktemp "$(dirname "$dst")/.$(basename "$dst").XXXXXX") || return 1
     if cp "$src" "$tmp" && cmp -s "$src" "$tmp" \
-        && if [ -e "$dst" ]; then chmod --reference="$dst" "$tmp"; else chmod =rw "$tmp"; fi \
+        && if [ -e "$dst" ]; then chmod --reference="$dst" "$tmp"; else chmod '=rw' "$tmp"; fi \
         && mv -f "$tmp" "$dst"; then
         return 0
     fi
