@@ -367,7 +367,14 @@ fn protected_dirs(paths: &crate::paths::Paths) -> Vec<(&'static str, PathBuf)> {
 /// The one exception is a folder that already is this title's install --
 /// its recorded directory, or a folder whose package names this product --
 /// which is used as it is, so a repair or an update lands on the existing
-/// files rather than in a new copy one level down.
+/// files rather than in a new copy one level down. A download that was
+/// cancelled before it named its product counts as this title's too, chosen
+/// directly or found at `<chosen>/<folder>`: a first download has no record
+/// yet, and Resume has to continue it rather than be refused.
+///
+/// `<chosen>/<folder>` may already exist only if it is empty, this title's,
+/// or such a download. Anything else in it is somebody's files, and they
+/// would go with the title when it is removed.
 ///
 /// A leading `~` means the home directory; anything else must be absolute.
 pub fn resolve_destination(
@@ -409,31 +416,42 @@ pub fn resolve_destination(
     }
 
     let resolve = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let is_this_product = |dir: &Path| {
-        let recorded = load(paths.state_dir(), product_id)
-            .is_some_and(|record| resolve(&record.dir) == resolve(dir));
-        recorded
-            || ((looks_installed(dir) || is_partial(dir))
-                && store_id(dir).is_some_and(|id| id.eq_ignore_ascii_case(product_id)))
-    };
+    let owner = |dir: &Path| owner_of(dir, product_id, paths);
 
-    let holds_a_package = |dir: &Path| dir.is_dir() && (looks_installed(dir) || is_partial(dir));
-    let destination = if chosen.is_dir() && is_this_product(&chosen) {
-        chosen
-    } else if holds_a_package(&chosen) {
-        bail!(
-            "{} is another title's folder; choose the folder your games go in",
+    let destination = match owner(&chosen) {
+        Owner::This | Owner::Unknown => chosen,
+        Owner::Other(other) => bail!(
+            "{} is the folder of {other}; choose the folder your games go in",
             chosen.display()
-        );
-    } else {
-        chosen.join(folder_path)
+        ),
+        Owner::Nobody => chosen.join(folder_path),
     };
 
-    if holds_a_package(&destination) && !is_this_product(&destination) {
-        bail!(
-            "{} already holds another title's files; choose another folder",
+    match owner(&destination) {
+        Owner::This | Owner::Unknown => {}
+        Owner::Other(other) => bail!(
+            "{} already holds the files of {other}; choose another folder",
             destination.display()
-        );
+        ),
+        Owner::Nobody => {
+            if destination.exists() && !destination.is_dir() {
+                bail!(
+                    "{} is a file, not a folder; choose another folder",
+                    destination.display()
+                );
+            }
+            let occupied = std::fs::read_dir(&destination)
+                .map(|mut entries| entries.next().is_some())
+                .unwrap_or(false);
+            if occupied {
+                bail!(
+                    "{} already exists and holds other files; the title needs a folder \
+                     of its own, and removing it later would remove those too. Move them \
+                     or choose another folder",
+                    destination.display()
+                );
+            }
+        }
     }
     let resolved = resolve(&destination);
     for (what, protected) in protected_dirs(paths) {
@@ -446,6 +464,59 @@ pub fn resolve_destination(
         }
     }
     Ok(destination)
+}
+
+/// Whose files a folder holds, as far as [`resolve_destination`] can tell.
+enum Owner {
+    /// This product's: its recorded install, or a package naming it.
+    This,
+    /// Another product's, by its record or its package.
+    Other(String),
+    /// A download that started and has not got as far as naming its
+    /// product. A first download leaves no record until it succeeds and the
+    /// package's config is often not there yet, so this is what a cancelled
+    /// first download looks like -- and it has to be resumable.
+    Unknown,
+    /// No package at all: nothing, or somebody's other files.
+    Nobody,
+}
+
+fn owner_of(dir: &Path, product_id: &str, paths: &crate::paths::Paths) -> Owner {
+    if !dir.is_dir() {
+        return Owner::Nobody;
+    }
+    let resolve = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let resolved = resolve(dir);
+    let mut recorded_here = all(paths.state_dir())
+        .into_iter()
+        .filter(|record| record.dir.is_absolute() && resolve(&record.dir) == resolved)
+        .map(|record| record.product_id)
+        .collect::<Vec<_>>();
+    if recorded_here
+        .iter()
+        .any(|id| id.eq_ignore_ascii_case(product_id))
+    {
+        return if recorded_here.len() == 1 {
+            Owner::This
+        } else {
+            recorded_here.retain(|id| !id.eq_ignore_ascii_case(product_id));
+            Owner::Other(recorded_here.join(" and "))
+        };
+    }
+    if !recorded_here.is_empty() {
+        return Owner::Other(recorded_here.join(" and "));
+    }
+    let installed = looks_installed(dir);
+    let partial = is_partial(dir);
+    if !installed && !partial {
+        return Owner::Nobody;
+    }
+    match store_id(dir) {
+        Some(id) if id.eq_ignore_ascii_case(product_id) => Owner::This,
+        Some(id) => Owner::Other(id),
+        None if partial => Owner::Unknown,
+        None => Owner::Other("a title the launcher cannot name".into()),
+    }
 }
 
 /// Bytes used by a directory tree, following no symlinks.
@@ -1270,6 +1341,107 @@ mod tests {
             p
         )
         .is_err());
+    }
+
+    /// A first download leaves no record until it finishes, and its config
+    /// usually has not arrived when it is cancelled. Resume has to land on
+    /// it again, wherever it was, not be refused as somebody else's title.
+    #[test]
+    fn a_cancelled_first_download_can_be_resumed_where_it_is() {
+        let home = Home::new("resume");
+        let p = &home.paths;
+        let partial = |dir: &Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(PARTIAL_CONTAINER), b"part").unwrap();
+        };
+
+        let library = home.root.join("library");
+        partial(&library.join("fh5"));
+        let fh5 = library.join("fh5");
+        assert_eq!(
+            resolve_destination(library.to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p).unwrap(),
+            fh5
+        );
+        assert_eq!(
+            resolve_destination(fh5.to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p).unwrap(),
+            fh5
+        );
+        partial(&home.games().join("fh5"));
+        assert_eq!(
+            resolve_destination(home.games().to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p).unwrap(),
+            home.games().join("fh5")
+        );
+
+        // Once the download names its product, or a record names another
+        // one, it is that title's and nobody else resumes into it.
+        std::fs::write(
+            fh5.join("MicrosoftGame.Config"),
+            "<Game><StoreId>9ZZOTHERGAME</StoreId></Game>",
+        )
+        .unwrap();
+        for typed in [&library, &fh5] {
+            let err = resolve_destination(typed.to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("9ZZOTHERGAME"), "{err}");
+        }
+        let games_fh5 = home.games().join("fh5");
+        let mut other = record(&[]);
+        other.product_id = "9ZZOTHERGAME".into();
+        other.dir = games_fh5.clone();
+        save(p.state_dir(), &other).unwrap();
+        let err = resolve_destination(home.games().to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("9ZZOTHERGAME"), "{err}");
+    }
+
+    /// The title's own folder is what Remove deletes later, so it cannot be
+    /// a folder that already holds somebody's other files.
+    #[test]
+    fn a_title_is_not_installed_over_somebody_elses_files() {
+        let home = Home::new("occupied");
+        let p = &home.paths;
+        let library = home.root.join("lib2");
+        std::fs::create_dir_all(library.join("fh5")).unwrap();
+        // An empty folder of the right name is fine.
+        assert_eq!(
+            resolve_destination(library.to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p).unwrap(),
+            library.join("fh5")
+        );
+        std::fs::write(library.join("fh5/my-notes.txt"), b"mine").unwrap();
+        let err = resolve_destination(library.to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("other files"), "{err}");
+        // Choosing that folder itself puts the title one level down, which
+        // is empty, so that is allowed and leaves the notes alone.
+        assert_eq!(
+            resolve_destination(
+                library.join("fh5").to_str().unwrap(),
+                "fh5",
+                "9NNX1VVR3KNQ",
+                p
+            )
+            .unwrap(),
+            library.join("fh5/fh5")
+        );
+        // A file where the folder would go.
+        std::fs::write(library.join("bedrock"), b"not a folder").unwrap();
+        assert!(
+            resolve_destination(library.to_str().unwrap(), "bedrock", "9NBLGGH2JHXJ", p).is_err()
+        );
+        // A package that names nothing and is not a download in progress is
+        // still somebody's.
+        let nameless = home.game("nameless");
+        assert!(resolve_destination(
+            home.games().to_str().unwrap(),
+            "nameless",
+            "9NNX1VVR3KNQ",
+            p
+        )
+        .is_err());
+        assert!(resolve_destination(nameless.to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p).is_err());
     }
 
     #[test]
