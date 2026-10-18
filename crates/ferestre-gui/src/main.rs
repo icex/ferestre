@@ -115,6 +115,9 @@ struct Ui {
     banner: adw::Banner,
     /// Why the client cannot start, when the last check found it could not.
     client_blocked: Rc<RefCell<Option<client_check::Blocked>>>,
+    /// A PackageKit install asked for while another task held the window, and
+    /// what to carry on with after it. Started by the next finish.
+    install_owed: Rc<Cell<Option<client_check::Owed>>>,
 }
 
 fn main() -> glib::ExitCode {
@@ -341,6 +344,7 @@ fn build_ui(app: &adw::Application) {
         download: download.clone(),
         banner: banner.clone(),
         client_blocked: Rc::new(RefCell::new(None)),
+        install_owed: Rc::new(Cell::new(None)),
     };
 
     window.connect_close_request(glib::clone!(
@@ -420,6 +424,7 @@ fn build_ui(app: &adw::Application) {
             fetch_gamepass(&ui, true);
             refresh_entitlements(&ui, true);
             refresh_updates(&ui, true);
+            client_check::check(&ui, None, false);
         }
     ));
 
@@ -432,6 +437,17 @@ fn build_ui(app: &adw::Application) {
         #[strong]
         ui,
         move |_| client_check::banner_pressed(&ui)
+    ));
+    // Coming back from a terminal or a software centre is when the library
+    // most likely appeared.
+    window.connect_is_active_notify(glib::clone!(
+        #[strong]
+        ui,
+        move |window| {
+            if window.is_active() {
+                client_check::check_if_blocked(&ui);
+            }
+        }
     ));
 
     render(&ui);
@@ -2900,6 +2916,11 @@ fn finish(ui: &Ui) {
     glib::idle_add_local_once(move || {
         if *ui.closing.borrow() && ui.busy.borrow().is_none() {
             ui.window.close();
+        } else if ui.busy.borrow().is_none() && ui.install_owed.get().is_some() {
+            // Only once the window is free, or it would be owed again.
+            if let Some((package, then)) = ui.install_owed.take() {
+                client_check::install(&ui, package, then);
+            }
         } else if ui.entitlements_owed.get() {
             refresh_entitlements(&ui, true);
         }
