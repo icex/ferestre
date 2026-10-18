@@ -36,6 +36,10 @@ XGR_BASE=${XGR_BASE:-64aebcabb8c66121eae25d3bf0ace4b582ebb0da}
 # pins its vkd3d-proton submodule to, because that is the tree the runtime
 # build applies the series to. Move it only together with that pin.
 VKD3D_BASE=${VKD3D_BASE:-651f17762e439feeef22dbb4ee7eff167ee503d4}
+# And for Proton itself, whose `proton` script patches/proton/ changes after the
+# build. This must name the same commit as the runtime workflow's default
+# proton_ref, because that is the tree the release applies the patch to.
+PROTON_BASE=${PROTON_BASE:-7c0b435495814349735c913fde78da906aecea52}
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -57,6 +61,7 @@ cleanup() {
     [ -d "$WORK/xgr" ] && git -C "$XGR_REPO" worktree remove --force "$WORK/xgr" 2>/dev/null
     [ -d "$WORK/client" ] && git -C "$CLIENT_REPO" worktree remove --force "$WORK/client" 2>/dev/null
     [ -d "$WORK/vkd3d" ] && git -C "$VKD3D_REPO" worktree remove --force "$WORK/vkd3d" 2>/dev/null
+    [ -d "$WORK/proton" ] && git -C "$PROTON_REPO" worktree remove --force "$WORK/proton" 2>/dev/null
     rm -rf "$WORK" 2>/dev/null
 }
 trap cleanup EXIT
@@ -176,6 +181,35 @@ if [ -e "$VKD3D_REPO/.git" ]; then
     fi
 else
     say "vkd3d-proton series: skipped, no repository at $VKD3D_REPO"
+    SKIPPED=$((SKIPPED + 1))
+fi
+
+# --- the proton patch: the script the release build patches after `make` --
+#
+# runtime.yml applies this to proton/build/dist/proton, which the build copies
+# unchanged from the Proton repository's own `proton`, so the repository at the
+# pinned commit is the tree to check it against. git apply accepts no fuzz, the
+# same as the workflow's patch --fuzz=0: a patch whose context has drifted is
+# refused rather than applied a few lines away from where it was written.
+PROTON_REPO=${PROTON_REPO:-$(dirname "$WINE_REPO")}
+if [ -e "$PROTON_REPO/.git" ]; then
+    if git -C "$PROTON_REPO" cat-file -e "$PROTON_BASE^{commit}" 2>/dev/null; then
+        say "proton series against ${PROTON_BASE:0:8}"
+        CHECKED=$((CHECKED + 1))
+        git -C "$PROTON_REPO" worktree add -q --detach "$WORK/proton" "$PROTON_BASE"
+        for p in "$REPO_DIR"/patches/proton/*.patch; do
+            if git -C "$WORK/proton" apply --check "$p" 2>/dev/null; then
+                git -C "$WORK/proton" apply "$p"
+                ok "$(basename "$p")"
+            else
+                bad "$(basename "$p") does not apply"
+            fi
+        done
+    else
+        bad "Proton base $PROTON_BASE is not available (fetch it first)"
+    fi
+else
+    say "proton series: skipped, no repository at $PROTON_REPO"
     SKIPPED=$((SKIPPED + 1))
 fi
 

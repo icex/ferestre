@@ -36,8 +36,9 @@ weight:
    instead of only in a document. Aggregation would be legal in one package —
    this is about it staying obvious.
 2. **Build cost.** The client links `webkit2gtk-4.1` (its Microsoft sign-in
-   window is a `wry`/`tao` webview). The launcher links nothing. Nobody should
-   rebuild webkit-linked Rust to pick up a launcher fix.
+   window is a `wry`/`tao` webview). The launcher's window links GTK4 and
+   libadwaita but not WebKit. Nobody should rebuild webkit-linked Rust to pick
+   up a launcher fix.
 3. **Provenance.** It is someone else's project, carried as a fork that
    [cannot be upstreamed](../../NOTICE). It moves on its own schedule.
 
@@ -149,6 +150,13 @@ PKGBUILD assumes a shape. The contract:
 - `package()` refuses to build if `proton` lacks the `close_fds=False` patch or
   if `xgameruntime.dll` is missing. Both have been shipped broken before by
   hand; both look like the title crashing rather than like a packaging mistake.
+- **Signatures.** The workflow's publish job puts a minisign signature beside
+  every file it uploads (`<file>.minisig`, including `SHA256SUMS.minisig`),
+  made with the key in the `MINISIGN_SECRET_KEY` secret. `ferestre
+  install-runtime` checks them against the public key built into the launcher.
+  This package does not: the `sha256sums` entry recorded when `pkgver` is
+  bumped already pins the one file that was checked, and makepkg has no
+  minisign support to add to that.
 
 The runtime workflow produces the release `.tar.xz` shape used by both the
 launcher installer and this package. The local `scripts/package-runtime.sh`

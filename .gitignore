@@ -1,7 +1,6 @@
 
 /build/
 # build outputs
-Cargo.lock
 *.dll
 # local scratch
 *.log
