@@ -157,6 +157,9 @@ struct Ui {
     /// a game runs for hours and must not hold the window's other work.
     running: Rc<RefCell<BTreeMap<String, stop::Launch>>>,
     running_servers: Rc<RefCell<BTreeMap<String, (PathBuf, PathBuf)>>>,
+    /// Each running launch's stop channel, through which an image view asks
+    /// a title in its namespaces to close (see [`stop::Channel`]).
+    running_channels: Rc<RefCell<BTreeMap<String, std::sync::Arc<stop::Channel>>>>,
     /// Says the Xbox client cannot start, for as long as that is true.
     banner: adw::Banner,
     /// Why the client cannot start, when the last check found it could not.
@@ -391,6 +394,7 @@ fn build_ui(app: &adw::Application) {
         download_control: Rc::new(RefCell::new(None)),
         running: Rc::new(RefCell::new(BTreeMap::new())),
         running_servers: Rc::new(RefCell::new(BTreeMap::new())),
+        running_channels: Rc::new(RefCell::new(BTreeMap::new())),
         asked_names: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
         asked_icons: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
         fetching_gamepass: Rc::new(RefCell::new(false)),
@@ -2262,6 +2266,9 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
         None => command.stderr(std::process::Stdio::inherit()),
     };
     let output = output.map(|(path, _)| path);
+    // Without one, Stop still asks what it can reach from here, and ends the
+    // rest.
+    let channel = stop::Channel::attach(&mut command).ok();
     let child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
@@ -2271,6 +2278,10 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
         }
     };
 
+    // The launch's end of the channel goes with the command: only the launch
+    // holds it from here on.
+    drop(command);
+
     // setsid makes the child its own group leader, so the group id is its pid.
     let pgid = child.id();
     ui.running.borrow_mut().insert(
@@ -2279,6 +2290,16 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
     );
     if let Some(server) = server {
         ui.running_servers.borrow_mut().insert(key.clone(), server);
+    }
+    match channel {
+        Some(channel) => {
+            ui.running_channels
+                .borrow_mut()
+                .insert(key.clone(), std::sync::Arc::new(channel));
+        }
+        None => {
+            ui.running_channels.borrow_mut().remove(&key);
+        }
     }
     render(ui);
     ui.toasts.add_toast(toast(format!("Starting {name}")));
@@ -2310,6 +2331,7 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
         {
             ui.running.borrow_mut().remove(&key);
             ui.running_servers.borrow_mut().remove(&key);
+            ui.running_channels.borrow_mut().remove(&key);
         }
         render(&ui);
         match status {
@@ -2401,14 +2423,17 @@ fn ask_title_to_close(ui: &Ui, key: &str, pgid: u32, name: &str) {
         launch.asked = Some(asked_at);
     }
     render(ui);
+    let channel = ui.running_channels.borrow().get(key).cloned();
     let ui = ui.clone();
     let key = key.to_string();
     let name = name.to_string();
     glib::spawn_future_local(async move {
         let (wineserver, prefix) = server;
-        let asked = gio::spawn_blocking(move || stop::ask_to_close(&wineserver, &prefix))
-            .await
-            .unwrap_or(false);
+        let asked = gio::spawn_blocking(move || {
+            stop::ask_to_close(&wineserver, &prefix, channel.as_deref())
+        })
+        .await
+        .unwrap_or(false);
         if !still_asking(&ui, &key, pgid, asked_at) {
             return;
         }

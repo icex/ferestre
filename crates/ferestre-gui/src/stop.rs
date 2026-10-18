@@ -20,19 +20,22 @@
 //! namespaces of its own, with a private Wine server folder mounted over
 //! `/tmp/.wine-<uid>`. A `taskkill` started out here would not find that
 //! server and would start a second one, and a second Wine session, on the
-//! live prefix. So the `taskkill` for such a title first joins the title's
-//! namespaces ([`Join`]): the window's user owns them, so no privilege is
-//! needed, and inside them it sees the title's server folder and the same
-//! user id the title has.
+//! live prefix, so those processes are left out of the search. The view
+//! asks them instead: every launch takes one end of a [`Channel`] with it,
+//! and the view, which is already inside the namespaces, answers a close
+//! request on it by running the same `taskkill` beside its title. The window
+//! never enters those namespaces itself, and only ever talks to the launch
+//! it started.
 
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// How long a title gets to close after being asked, before it is ended.
@@ -45,6 +48,12 @@ pub const PLAY_GRACE: Duration = Duration::from_millis(1500);
 pub const REPEAT_GRACE: Duration = Duration::from_secs(1);
 /// How long `taskkill` itself may take.
 const ASK_LIMIT: Duration = Duration::from_secs(10);
+/// How long the image view may take to answer a close request: its own
+/// `taskkill` has [`ASK_LIMIT`], and finding what to ask takes a moment more.
+const VIEW_ANSWER: Duration = Duration::from_secs(15);
+/// The variable that names the launch's end of its [`Channel`], by
+/// descriptor number.
+pub const CHANNEL_FD: &str = "FERESTRE_STOP_FD";
 
 /// A title this window started and has not seen exit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,13 +105,11 @@ pub struct WineProcess {
     /// The executable's file name, as `taskkill /IM` matches it.
     pub image: String,
     pub env: Vec<(OsString, OsString)>,
-    /// The user and mount namespaces it runs in, when they are not the
-    /// window's own: a `taskkill` for it has to [`Join`] them.
-    pub namespaces: Option<String>,
 }
 
 /// Wine's own processes, and Proton's launcher, which own no window a person
-/// would close. Asking them is noise in the best case.
+/// would close. Asking them is noise in the best case. The image view keeps
+/// the same list (`scripts/real-path-image-view.py`).
 const SYSTEM_IMAGES: &[&str] = &[
     "conhost.exe",
     "explorer.exe",
@@ -133,8 +140,14 @@ fn image_name(cmdline: &[u8]) -> Option<String> {
 /// What Wine's loader hands one process of its own when it starts it: the
 /// file descriptor of that process's connection to the wineserver, and where
 /// its preloader reserved memory. Copied into another process they point at
-/// nothing, and that process cannot reach the server at all.
-const LOADER_PRIVATE: &[&str] = &["WINESERVERSOCKET", "WINEPRELOADRESERVE", "WINELOADERNOEXEC"];
+/// nothing, and that process cannot reach the server at all. The launch's
+/// [`Channel`] descriptor is the same kind of thing.
+const LOADER_PRIVATE: &[&str] = &[
+    "WINESERVERSOCKET",
+    "WINEPRELOADRESERVE",
+    "WINELOADERNOEXEC",
+    CHANNEL_FD,
+];
 
 fn environment(bytes: &[u8]) -> Vec<(OsString, OsString)> {
     bytes
@@ -172,31 +185,18 @@ fn owner(status: &str) -> Option<u32> {
         .ok()
 }
 
-/// The user and mount namespaces of the process at `dir`, when they are not
-/// the window's own. A title launched through the real-path image view runs
-/// Wine in namespaces of its own, with a private Wine server folder: a
-/// `taskkill` started out here cannot reach its server, and would start a
-/// second server and Wine session on the live prefix instead. It has to
-/// [`Join`] them first.
-fn foreign_namespaces(proc_root: &Path, dir: &Path) -> Option<String> {
-    let links = |at: &Path| {
-        ["ns/user", "ns/mnt"].map(|ns| {
-            std::fs::read_link(at.join(ns))
-                .map(|link| link.to_string_lossy().into_owned())
-                .ok()
-        })
-    };
-    let (own, theirs) = (links(&proc_root.join("self")), links(dir));
-    (own != theirs).then(|| {
-        theirs
-            .map(|link| link.unwrap_or_else(|| "?".into()))
-            .join(" ")
-    })
+/// Whether the process at `dir` runs in the window's own user and mount
+/// namespaces. One that does not -- a title in the real-path image view --
+/// has a Wine server this window cannot reach: a `taskkill` started out here
+/// for it would start a second server and Wine session on the live prefix.
+/// Its view asks it through the launch's [`Channel`] instead.
+fn in_own_namespaces(proc_root: &Path, dir: &Path) -> bool {
+    let links = |at: &Path| ["ns/user", "ns/mnt"].map(|ns| std::fs::read_link(at.join(ns)).ok());
+    links(&proc_root.join("self")) == links(dir)
 }
 
-/// Every Windows process of `uid` running in `prefix`, read from `proc_root`
-/// (`/proc`, or a fixture in a test). Those in namespaces of their own say
-/// so, in [`WineProcess::namespaces`].
+/// Every Windows process of `uid` running in `prefix` in the window's own
+/// namespaces, read from `proc_root` (`/proc`, or a fixture in a test).
 pub fn processes_in(proc_root: &Path, uid: u32, prefix: &Path) -> Vec<WineProcess> {
     let Ok(entries) = std::fs::read_dir(proc_root) else {
         return Vec::new();
@@ -213,17 +213,11 @@ pub fn processes_in(proc_root: &Path, uid: u32, prefix: &Path) -> Vec<WineProces
             let in_prefix = env
                 .iter()
                 .any(|(key, value)| key == "WINEPREFIX" && same_dir(Path::new(value), prefix));
-            if !in_prefix {
+            if !in_prefix || !in_own_namespaces(proc_root, &dir) {
                 return None;
             }
             let image = image_name(&std::fs::read(dir.join("cmdline")).ok()?)?;
-            let namespaces = foreign_namespaces(proc_root, &dir);
-            Some(WineProcess {
-                pid,
-                image,
-                env,
-                namespaces,
-            })
+            Some(WineProcess { pid, image, env })
         })
         .collect();
     found.sort_by_key(|p| p.pid);
@@ -254,128 +248,107 @@ pub fn close_command(wine: &Path, found: &[WineProcess]) -> Option<Command> {
     Some(command)
 }
 
-/// The namespaces to join, in order, to run a command where a process in
-/// namespaces of its own runs: every user namespace from the window's own
-/// down to the process's, each entered from its parent, and the process's
-/// mount namespace right after the user namespace that owns it.
+/// The window's end of a launch's stop channel: a socket pair, the other end
+/// of which the launch inherits, named by [`CHANNEL_FD`].
 ///
-/// No privilege is needed when the window's user made them, as the image
-/// view does with `unshare`: the creator of a user namespace has every
-/// capability in it and in the namespaces it owns. Entered that way, without
-/// changing ids, the command keeps the window's user, which inside the
-/// namespaces is the same user id the title has, and so finds the same Wine
-/// server folder. A process whose namespaces cannot be entered like that --
-/// somebody else's, or a mount namespace of the window's own user namespace
-/// -- has no `Join`.
-pub struct Join {
-    steps: Vec<(File, libc::c_int)>,
+/// Only the real-path image view reads it. Once it has started its title it
+/// says `ready`; a close request is `close <wine>`, and it answers `asked`
+/// when it ran `taskkill` for the title, inside its namespaces, or `none`
+/// when there was nothing to ask. Every other launch leaves it unread, and
+/// the window then asks nothing through it.
+pub struct Channel {
+    ours: UnixStream,
+    ready: AtomicBool,
 }
 
-/// A namespace's identity, as `stat` gives it on its nsfs file.
-fn namespace_id(file: &File) -> std::io::Result<(u64, u64)> {
-    let meta = file.metadata()?;
-    Ok((meta.dev(), meta.ino()))
-}
-
-/// The namespace an `NS_GET_*` request on `file` names.
-fn namespace_of(file: &File, request: libc::Ioctl) -> std::io::Result<File> {
-    // Safety: an ioctl on a descriptor owned here; on success it returns a
-    // new descriptor, owned by the caller from then on.
-    let fd = unsafe { libc::ioctl(file.as_raw_fd(), request) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // Safety: just returned by the kernel, and nothing else owns it.
-    Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
-}
-
-/// Whether `uid`, as the window sees it, has an id inside the user namespace
-/// whose `uid_map` is `map` -- read from outside, so each line's second
-/// column is in the window's terms.
-fn maps_uid(map: &str, uid: u32) -> bool {
-    map.lines().any(|line| {
-        let numbers: Vec<u64> = line
-            .split_whitespace()
-            .filter_map(|n| n.parse().ok())
-            .collect();
-        matches!(numbers[..], [_, outside, count] if (outside..outside + count).contains(&u64::from(uid)))
-    })
-}
-
-impl Join {
-    /// How to join the namespaces of process `pid`, read from `proc_root`
-    /// (`/proc`). `None` when they cannot be joined from here.
-    pub fn to(proc_root: &Path, pid: u32, uid: u32) -> std::io::Result<Option<Join>> {
-        let process = proc_root.join(pid.to_string());
-        if !maps_uid(&std::fs::read_to_string(process.join("uid_map"))?, uid) {
-            return Ok(None);
-        }
-        let own_user = namespace_id(&File::open(proc_root.join("self/ns/user"))?)?;
-        let own_mount = namespace_id(&File::open(proc_root.join("self/ns/mnt"))?)?;
-        let mount = File::open(process.join("ns/mnt"))?;
-
-        // Up from the process's user namespace to the window's. Asking past
-        // the window's own fails (EPERM), and that is a namespace this
-        // window's user did not make.
-        let mut users = Vec::new();
-        let mut user = File::open(process.join("ns/user"))?;
-        while namespace_id(&user)? != own_user {
-            if users.len() >= 32 {
-                return Ok(None);
-            }
-            let Ok(parent) = namespace_of(&user, libc::NS_GET_PARENT) else {
-                return Ok(None);
-            };
-            users.push(std::mem::replace(&mut user, parent));
-        }
-        users.reverse();
-
-        // Joined right after the user namespace that owns it, which has to
-        // be one of those being entered: one the window's own user namespace
-        // owns, or one outside it, would need privileges the window lacks.
-        let mount_after = if namespace_id(&mount)? == own_mount {
-            None
-        } else {
-            let owner = namespace_id(&namespace_of(&mount, libc::NS_GET_USERNS)?)?;
-            let mut position = None;
-            for (i, user) in users.iter().enumerate() {
-                if namespace_id(user)? == owner {
-                    position = Some(i);
-                }
-            }
-            if position.is_none() {
-                return Ok(None);
-            }
-            position
-        };
-        let mut mount = Some(mount);
-        let mut steps = Vec::new();
-        for (i, user) in users.into_iter().enumerate() {
-            steps.push((user, libc::CLONE_NEWUSER));
-            if mount_after == Some(i) {
-                if let Some(mount) = mount.take() {
-                    steps.push((mount, libc::CLONE_NEWNS));
-                }
-            }
-        }
-        Ok(Some(Join { steps }))
-    }
-
-    /// Make `command` join the namespaces before it runs. The descriptors go
-    /// with the command, and close when it is dropped.
-    pub fn apply(self, command: &mut Command) {
-        let steps = self.steps;
-        // Safety: setns is async-signal-safe, and runs in the forked child,
-        // which has a single thread, as entering a user namespace requires.
+impl Channel {
+    /// Make a channel for the launch `command` starts. The launch's end goes
+    /// with the command, and closes when the command is dropped.
+    pub fn attach(command: &mut Command) -> std::io::Result<Channel> {
+        // Both ends close on exec; the launch's is opened up in the child
+        // alone, so nothing else this window starts holds it.
+        let (channel, theirs) = Channel::pair()?;
+        command.env(CHANNEL_FD, theirs.as_raw_fd().to_string());
+        // Safety: fcntl is async-signal-safe, and changes only the child's
+        // copy of a descriptor the closure owns.
         unsafe {
             command.pre_exec(move || {
-                for (namespace, kind) in &steps {
-                    if libc::setns(namespace.as_raw_fd(), *kind) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
+                let fd = theirs.as_raw_fd();
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) != 0 {
+                    return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
             });
+        }
+        Ok(channel)
+    }
+
+    /// A channel, and the other end of it.
+    fn pair() -> std::io::Result<(Channel, UnixStream)> {
+        let (ours, theirs) = UnixStream::pair()?;
+        let channel = Channel {
+            ours,
+            ready: AtomicBool::new(false),
+        };
+        Ok((channel, theirs))
+    }
+
+    /// Whether an image view at the other end has said it is listening. Does
+    /// not wait for it.
+    pub fn view_listening(&self) -> bool {
+        if self.ready.load(Ordering::Relaxed) {
+            return true;
+        }
+        let mut pending = Vec::new();
+        if self.ours.set_nonblocking(true).is_ok() {
+            let mut chunk = [0u8; 64];
+            while let Ok(n @ 1..) = (&self.ours).read(&mut chunk) {
+                pending.extend_from_slice(&chunk[..n]);
+            }
+            let _ = self.ours.set_nonblocking(false);
+        }
+        let ready = pending.split(|b| *b == b'\n').any(|line| line == b"ready");
+        if ready {
+            self.ready.store(true, Ordering::Relaxed);
+        }
+        ready
+    }
+
+    /// Ask the image view to close its title with `wine`, and wait up to
+    /// `limit` for its answer. `None` when no view is listening, or it did
+    /// not answer; otherwise whether it asked anything.
+    pub fn ask(&self, wine: &Path, limit: Duration) -> Option<bool> {
+        let wine = wine.as_os_str().as_bytes();
+        if wine.contains(&b'\n') || !self.view_listening() {
+            return None;
+        }
+        let mut request = b"close ".to_vec();
+        request.extend_from_slice(wine);
+        request.push(b'\n');
+        (&self.ours).write_all(&request).ok()?;
+        let answer = self.line(Instant::now() + limit)?;
+        Some(answer == b"asked")
+    }
+
+    /// The next line from the view, without its newline, if it comes by
+    /// `deadline`.
+    fn line(&self, deadline: Instant) -> Option<Vec<u8>> {
+        let mut line = Vec::new();
+        let mut byte = [0u8];
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            self.ours.set_read_timeout(Some(left)).ok()?;
+            match (&self.ours).read(&mut byte) {
+                Ok(0) => return None,
+                Ok(_) if byte[0] == b'\n' => return Some(line),
+                Ok(_) => line.push(byte[0]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return None,
+            }
         }
     }
 }
@@ -388,55 +361,25 @@ fn wine_beside(server: &Path) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-/// The `taskkill`s that ask every one of `found` to close: one for the
-/// processes in the window's own namespaces, and one for each set of
-/// namespaces of their own, run inside them. A set that cannot be joined is
-/// left out: asking it from out here would start a second Wine session on
-/// its prefix.
-pub fn close_commands(
-    proc_root: &Path,
-    uid: u32,
-    wine: &Path,
-    found: &[WineProcess],
-) -> Vec<Command> {
-    let mut groups: Vec<(Option<&str>, Vec<WineProcess>)> = Vec::new();
-    for process in found {
-        let key = process.namespaces.as_deref();
-        match groups.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, group)) => group.push(process.clone()),
-            None => groups.push((key, vec![process.clone()])),
-        }
-    }
-    groups
-        .into_iter()
-        .filter_map(|(key, group)| {
-            let mut command = close_command(wine, &group)?;
-            if key.is_some() {
-                Join::to(proc_root, group[0].pid, uid)
-                    .ok()
-                    .flatten()?
-                    .apply(&mut command);
-            }
-            Some(command)
-        })
-        .collect()
-}
-
-/// Ask the title running in `prefix` to close. Blocking; returns whether
-/// anything was asked.
-pub fn ask_to_close(server: &Path, prefix: &Path) -> bool {
+/// Ask the title running in `prefix` to close: a `taskkill` from here for its
+/// processes in the window's own namespaces, and a request through the
+/// launch's `channel` to the image view, if one is listening, for those in
+/// its namespaces. Blocking; returns whether anything was asked.
+pub fn ask_to_close(server: &Path, prefix: &Path, channel: Option<&Channel>) -> bool {
     let Some(wine) = wine_beside(server) else {
         return false;
     };
     // Safety: getuid cannot fail.
     let uid = unsafe { libc::getuid() };
-    let proc_root = Path::new("/proc");
-    let found = processes_in(proc_root, uid, prefix);
+    let found = processes_in(Path::new("/proc"), uid, prefix);
     let mut asked = false;
-    for mut command in close_commands(proc_root, uid, &wine, &found) {
+    if let Some(mut command) = close_command(&wine, &found) {
         // taskkill exits non-zero when one of the images has no window to
         // close, which is common and says nothing about the ones that did.
         asked |= crate::deadline::status(&mut command, ASK_LIMIT).is_ok();
+    }
+    if let Some(channel) = channel {
+        asked |= channel.ask(&wine, VIEW_ANSWER) == Some(true);
     }
     asked
 }
@@ -462,6 +405,7 @@ pub fn end(pgid: u32, server: Option<&(PathBuf, PathBuf)>) -> Option<std::proces
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::FromRawFd;
 
     #[test]
     fn a_press_right_after_play_is_the_rest_of_a_double_click() {
@@ -598,13 +542,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A title in the real-path view's namespaces is found from out here,
-    /// and marked: its `taskkill` has to run inside them. One whose
-    /// namespaces cannot be joined is not asked at all -- from out here the
-    /// request would start a second Wine session on its prefix -- so Stop
-    /// ends it.
+    /// A title in the real-path view's namespaces has a Wine server this
+    /// window cannot reach: a `taskkill` from out here would start a second
+    /// Wine session on its prefix. It is left out of the search, for its view
+    /// to ask.
     #[test]
-    fn a_title_in_another_namespace_is_asked_only_from_inside_it() {
+    fn a_title_in_another_namespace_is_left_to_its_view() {
         let root =
             std::env::temp_dir().join(format!("ferestre-gui-proc-ns-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -616,6 +559,7 @@ mod tests {
         let env = format!("WINEPREFIX={}\0", prefix.display()).into_bytes();
         for (pid, user, mnt) in [
             (300, "user:[4026533000]", "mnt:[4026533001]"),
+            (301, "user:[4026531837]", "mnt:[4026533001]"),
             (400, "user:[4026531837]", "mnt:[4026531841]"),
         ] {
             fake_process(&root, pid, 1000, b"C:\\Game\\HaloInfinite.exe\0", &env);
@@ -625,35 +569,162 @@ mod tests {
             std::os::unix::fs::symlink(mnt, ns.join("mnt")).unwrap();
         }
         let found = processes_in(&root, 1000, &prefix);
-        assert_eq!(
-            found
-                .iter()
-                .map(|p| (p.pid, p.namespaces.as_deref()))
-                .collect::<Vec<_>>(),
-            [
-                (300, Some("user:[4026533000] mnt:[4026533001]")),
-                (400, None)
-            ]
-        );
-        // The fixture's namespaces are only names: there is nothing to join,
-        // so only the process in the window's own namespaces is asked.
-        let commands = close_commands(&root, 1000, Path::new("wine"), &found);
-        assert_eq!(commands.len(), 1);
-        assert_eq!(
-            commands[0].get_args().collect::<Vec<_>>(),
-            ["taskkill", "/IM", "HaloInfinite.exe"]
-        );
-        assert!(close_commands(&root, 1000, Path::new("wine"), &found[..1]).is_empty());
+        assert_eq!(found.iter().map(|p| p.pid).collect::<Vec<_>>(), [400]);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// What an image view does with its end: say it is listening, then
+    /// answer one close request with `answer`, after checking it.
+    fn fake_view(theirs: UnixStream, answer: &'static [u8]) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            (&theirs).write_all(b"ready\n").unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8];
+            while (&theirs).read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {
+                request.push(byte[0]);
+            }
+            (&theirs).write_all(answer).unwrap();
+            request
+        })
+    }
+
     #[test]
-    fn a_uid_map_read_from_outside_says_whether_the_window_user_is_in_it() {
-        assert!(maps_uid("         0       1000          1\n", 1000));
-        assert!(maps_uid("      1000       1000          1\n", 1000));
-        assert!(maps_uid("         0     100000      65536\n", 100_500));
-        assert!(!maps_uid("         0       1001          1\n", 1000));
-        assert!(!maps_uid("", 1000));
+    fn a_view_that_is_listening_is_asked_and_its_answer_counts() {
+        for (answer, expected) in [(&b"asked\n"[..], true), (b"none\n", false)] {
+            let (channel, theirs) = Channel::pair().unwrap();
+            let view = fake_view(theirs, answer);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !channel.view_listening() {
+                assert!(Instant::now() < deadline, "the view never said ready");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let wine = Path::new("/opt/proton/files/bin/wine");
+            assert_eq!(channel.ask(wine, Duration::from_secs(5)), Some(expected));
+            assert_eq!(view.join().unwrap(), b"close /opt/proton/files/bin/wine");
+        }
+    }
+
+    /// A launch with no image view never reads its end. Stop must not wait on
+    /// it: the request is not even sent, and the title is ended at once when
+    /// nothing else was asked.
+    #[test]
+    fn no_view_listening_means_nothing_is_asked_and_nothing_is_waited_for() {
+        let (channel, theirs) = Channel::pair().unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            channel.ask(Path::new("/bin/wine"), Duration::from_secs(30)),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        theirs.set_nonblocking(true).unwrap();
+        let mut sent = [0u8; 16];
+        assert!(
+            (&theirs).read(&mut sent).is_err(),
+            "a request was sent to nobody"
+        );
+    }
+
+    /// A view that says it is listening and then never answers, or goes
+    /// away, has asked nothing.
+    #[test]
+    fn a_view_that_does_not_answer_has_asked_nothing() {
+        let (channel, theirs) = Channel::pair().unwrap();
+        (&theirs).write_all(b"ready\n").unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            channel.ask(Path::new("/bin/wine"), Duration::from_millis(300)),
+            None
+        );
+        assert!(started.elapsed() >= Duration::from_millis(300));
+
+        let (channel, theirs) = Channel::pair().unwrap();
+        (&theirs).write_all(b"ready\n").unwrap();
+        drop(theirs);
+        assert_eq!(
+            channel.ask(Path::new("/bin/wine"), Duration::from_secs(5)),
+            None
+        );
+        // A path the line protocol cannot carry is not sent at all.
+        let (channel, theirs) = Channel::pair().unwrap();
+        (&theirs).write_all(b"ready\n").unwrap();
+        assert_eq!(
+            channel.ask(Path::new("/bin/wi\nne"), Duration::from_secs(5)),
+            None
+        );
+    }
+
+    /// The launch inherits its end, under the number in [`CHANNEL_FD`], and
+    /// nothing else the window starts does.
+    #[test]
+    fn the_launch_inherits_its_end_of_the_channel_and_nothing_else_does() {
+        let mut launch = Command::new("python3");
+        launch.args([
+            "-c",
+            "import os, socket\n\
+             s = socket.socket(fileno=int(os.environ['FERESTRE_STOP_FD']))\n\
+             s.sendall(b'ready\\n')\n\
+             line = s.makefile('rb').readline()\n\
+             s.sendall(b'asked\\n' if line == b'close /usr/bin/wine\\n' else b'none\\n')\n",
+        ]);
+        let channel = Channel::attach(&mut launch).unwrap();
+        let fd: i32 = launch
+            .get_envs()
+            .find(|(key, _)| *key == CHANNEL_FD)
+            .and_then(|(_, value)| value?.to_str()?.parse().ok())
+            .unwrap();
+        let mut child = launch.spawn().unwrap();
+
+        // Started while the launch's end is still open here.
+        let other = Command::new("python3")
+            .args(["-c", &format!("import os, sys\ntry:\n    os.fstat({fd})\nexcept OSError:\n    sys.exit(0)\nsys.exit(1)")])
+            .status()
+            .unwrap();
+        assert!(other.success(), "another child inherited the launch's end");
+        drop(launch);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !channel.view_listening() {
+            assert!(Instant::now() < deadline, "the launch never said ready");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            channel.ask(Path::new("/usr/bin/wine"), Duration::from_secs(10)),
+            Some(true)
+        );
+        assert!(child.wait().unwrap().success());
+    }
+
+    /// The image view keeps its own copy of what is asked and what is left
+    /// alone; the two must not drift apart.
+    #[test]
+    fn the_image_view_skips_the_same_images_and_variables() {
+        let script = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/real-path-image-view.py"),
+        )
+        .unwrap();
+        let listed = |name: &str| -> Vec<String> {
+            let start = script
+                .find(&format!("\n{name} = ("))
+                .unwrap_or_else(|| panic!("{name} is not in the script"));
+            let block = &script[start..];
+            let block = &block[..block.find(')').unwrap()];
+            let mut names: Vec<String> = block
+                .split('"')
+                .skip(1)
+                .step_by(2)
+                .map(str::to_string)
+                .collect();
+            names.sort();
+            names
+        };
+        let sorted = |list: &[&str]| {
+            let mut list: Vec<String> = list.iter().map(|s| s.to_string()).collect();
+            list.sort();
+            list
+        };
+        assert_eq!(listed("SYSTEM_IMAGES"), sorted(SYSTEM_IMAGES));
+        assert_eq!(listed("LOADER_PRIVATE"), sorted(LOADER_PRIVATE));
+        assert!(script.contains(&format!("CHANNEL_FD = \"{CHANNEL_FD}\"")));
     }
 
     /// Whether this machine lets an unprivileged user make user and mount
@@ -674,11 +745,12 @@ mod tests {
 
     /// A title started through the real image-view script, as Halo Infinite
     /// is: Wine runs as the caller in a user namespace nested in the view's,
-    /// with a private Wine server folder over /tmp/.wine-<uid>. The close
-    /// request joins those namespaces and runs as the title's own user id
-    /// beside the title's own server folder; from out here that folder is not
-    /// there at all. A fake `wine` stands in for Wine's taskkill and writes
-    /// down what it saw.
+    /// with a private Wine server folder over /tmp/.wine-<uid>. Stop finds
+    /// nothing to ask from out here, and asks the view through the launch's
+    /// channel; the view runs the request as the title's own user id beside
+    /// the title's own server folder, which from out here is not there at
+    /// all. A fake `wine` stands in for Wine's taskkill and writes down what
+    /// it saw.
     #[test]
     fn the_close_request_reaches_a_title_in_the_image_views_namespaces() {
         if !user_namespaces() {
@@ -700,11 +772,14 @@ mod tests {
         assert!(fd >= 0, "{}", std::io::Error::last_os_error());
         // Safety: just created, owned only here. Not close-on-exec: the
         // view reads it through the launch, as it does the client's.
-        let plaintext = unsafe { OwnedFd::from_raw_fd(fd) };
+        let plaintext = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
         let mut licensed = b"MZ".to_vec();
         licensed.extend(b"licensed fixture image".repeat(50));
-        std::io::Write::write_all(&mut File::from(plaintext.try_clone().unwrap()), &licensed)
-            .unwrap();
+        std::io::Write::write_all(
+            &mut std::fs::File::from(plaintext.try_clone().unwrap()),
+            &licensed,
+        )
+        .unwrap();
         let mapping = format!(
             "{}:\\??\\Z:{}",
             plaintext.as_raw_fd(),
@@ -723,7 +798,8 @@ mod tests {
         );
         let view =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/real-path-image-view.py");
-        let mut helper = Command::new("python3")
+        let mut launch = Command::new("python3");
+        launch
             .arg(&view)
             .args(["--", "bash", "-c", &title])
             .current_dir(&root)
@@ -731,9 +807,10 @@ mod tests {
             .env("FERESTRE_IMAGE_VIEW", "real-path")
             .env("WINEPREFIX", &prefix)
             .env_remove("STEAM_COMPAT_DATA_PATH")
-            .stdin(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stdin(Stdio::null());
+        let channel = Channel::attach(&mut launch).unwrap();
+        let mut helper = launch.spawn().unwrap();
+        drop(launch);
         drop(plaintext);
         let cleanup = |helper: &mut std::process::Child| {
             // Safety: a signal to the helper this test started.
@@ -741,13 +818,13 @@ mod tests {
             let _ = helper.wait();
         };
         let deadline = Instant::now() + Duration::from_secs(15);
-        while !ready.exists() {
+        while !ready.exists() || !channel.view_listening() {
             if let Ok(Some(status)) = helper.try_wait() {
                 panic!("the image view exited {status} before the title started");
             }
             if Instant::now() > deadline {
                 cleanup(&mut helper);
-                panic!("the title never started");
+                panic!("the title never started, or the view never said it listens");
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -755,10 +832,11 @@ mod tests {
         let result = std::panic::catch_unwind(|| {
             // Safety: getuid cannot fail.
             let uid = unsafe { libc::getuid() };
-            let found = processes_in(Path::new("/proc"), uid, &prefix);
-            assert_eq!(found.len(), 1, "{found:?}");
-            assert_eq!(found[0].image, "HaloInfinite.exe");
-            assert!(found[0].namespaces.is_some(), "{found:?}");
+            assert_eq!(
+                processes_in(Path::new("/proc"), uid, &prefix),
+                [],
+                "nothing in the view is asked from out here"
+            );
             assert!(
                 !Path::new(&format!("/tmp/.wine-{uid}/{server_folder}/marker")).exists(),
                 "the title's server folder is private to its namespaces"
@@ -771,7 +849,7 @@ mod tests {
                 &wine,
                 format!(
                     "#!/bin/sh\n{{ id -u; cat /tmp/.wine-$(id -u)/{server_folder}/marker; \
-                     echo \"$@\"; }} > {}\n",
+                     echo \"$@\"; echo \"${{{CHANNEL_FD}:-unset}}\"; }} > {}\n",
                     seen.display()
                 ),
             )
@@ -780,11 +858,15 @@ mod tests {
                 .unwrap();
             std::fs::write(root.join("bin/wineserver"), "").unwrap();
 
-            assert!(ask_to_close(&root.join("bin/wineserver"), &prefix));
+            assert!(ask_to_close(
+                &root.join("bin/wineserver"),
+                &prefix,
+                Some(&channel)
+            ));
             let seen = std::fs::read_to_string(&seen).unwrap();
             assert_eq!(
                 seen,
-                format!("{uid}\ninside\ntaskkill /IM HaloInfinite.exe\n"),
+                format!("{uid}\ninside\ntaskkill /IM HaloInfinite.exe\nunset\n"),
                 "taskkill ran as the title's user, beside its server folder"
             );
         });
@@ -801,7 +883,6 @@ mod tests {
             pid,
             image: image.into(),
             env: vec![],
-            namespaces: None,
         };
         let found = [
             process(1, "Game.exe"),
@@ -833,7 +914,7 @@ mod tests {
             "nothing is running in {}",
             prefix.display()
         );
-        assert!(ask_to_close(&server, &prefix), "nothing was asked");
+        assert!(ask_to_close(&server, &prefix, None), "nothing was asked");
         let deadline = Instant::now() + CLOSE_WAIT;
         while !processes_in(Path::new("/proc"), uid, &prefix).is_empty() {
             let left: Vec<_> = processes_in(Path::new("/proc"), uid, &prefix)
