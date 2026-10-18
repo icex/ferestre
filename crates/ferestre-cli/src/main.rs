@@ -159,10 +159,17 @@ enum Cmd {
         /// Forget the record but leave the files where they are.
         #[arg(long)]
         keep_files: bool,
-        /// Also remove the title's Wine prefix. Saved games usually live there,
-        /// so it is kept unless this is passed.
+        /// Also remove the title's Wine prefix, and every Player's copy of it.
+        /// Saved games usually live there, so they are kept unless this is
+        /// passed.
         #[arg(long)]
         prefix: bool,
+        /// With --prefix, remove only this one of the title's prefixes; give
+        /// it once for each. Each must be the title's prefix or a Player's
+        /// copy of it, or nothing is removed, and the others are kept. The
+        /// window passes the ones its Remove dialog listed.
+        #[arg(long = "prefix-path", value_name = "DIR", requires = "prefix")]
+        prefix_paths: Vec<PathBuf>,
         /// Do not ask. Required when there is no terminal to ask at.
         #[arg(long, short = 'y')]
         yes: bool,
@@ -246,8 +253,18 @@ fn dispatch(cli: &Cli) -> Result<ExitCode> {
             product_id,
             keep_files,
             prefix,
+            prefix_paths,
             yes,
-        } => cmd_uninstall(cli, product_id, *keep_files, *prefix, *yes),
+        } => cmd_uninstall(
+            cli,
+            product_id,
+            Removal {
+                keep_files: *keep_files,
+                remove_prefix: *prefix,
+                listed: (!prefix_paths.is_empty()).then_some(prefix_paths.as_slice()),
+                yes: *yes,
+            },
+        ),
         Cmd::InstallRuntime { allow_downgrade } => cmd_install_runtime(cli, *allow_downgrade),
         Cmd::InspectPackage { path } => cmd_inspect_package(cli, path),
         Cmd::Env => cmd_env(cli),
@@ -1149,34 +1166,62 @@ fn unfinished_update(dest: &Path, before: Option<&ContainerState>) -> Option<&'s
 /// to launch nothing, which is exactly the state that made this command
 /// necessary -- an install failed while the client exited zero, and there was
 /// no way to say so.
-fn cmd_uninstall(
-    cli: &Cli,
-    product_id: &str,
-    keep_files: bool,
-    remove_prefix: bool,
-    yes: bool,
-) -> Result<ExitCode> {
+fn cmd_uninstall(cli: &Cli, product_id: &str, removal: Removal) -> Result<ExitCode> {
     let paths = Paths::from_env()?;
     let mut stdin = std::io::stdin().lock();
-    uninstall_title(
-        cli,
-        &paths,
-        product_id,
-        Removal {
-            keep_files,
-            remove_prefix,
-            yes,
-        },
-        &mut stdin,
-    )
+    uninstall_title(cli, &paths, product_id, removal, &mut stdin)
 }
 
 /// What `uninstall` was asked to do.
 #[derive(Debug, Clone, Copy)]
-struct Removal {
+struct Removal<'a> {
     keep_files: bool,
     remove_prefix: bool,
+    /// With `remove_prefix`, the only prefixes to remove (`--prefix-path`):
+    /// what the window's dialog listed. `None` is every one the title has.
+    listed: Option<&'a [PathBuf]>,
     yes: bool,
+}
+
+/// The prefixes `uninstall --prefix` removes: all of the title's, or exactly
+/// the listed ones. A listed path that is not one of the title's prefixes is
+/// refused, so nothing a caller names can take anything else with it; one
+/// that is already gone is passed over.
+fn prefixes_to_remove(
+    prefixes: &[PathBuf],
+    removal: &Removal,
+    product_id: &str,
+) -> Result<Vec<PathBuf>> {
+    if !removal.remove_prefix {
+        return Ok(Vec::new());
+    }
+    let Some(listed) = removal.listed else {
+        return Ok(prefixes.to_vec());
+    };
+    let same = |a: &Path, b: &Path| {
+        a.components().eq(b.components())
+            || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+    };
+    let mut chosen = Vec::new();
+    for path in listed {
+        match prefixes.iter().find(|prefix| same(prefix, path)) {
+            Some(prefix) => {
+                if !chosen.contains(prefix) {
+                    chosen.push(prefix.clone());
+                }
+            }
+            None if !path.exists() && path.is_absolute() => {
+                eprintln!(":: the Wine prefix {} is already gone", path.display());
+            }
+            None => bail!(
+                "{} is not one of {product_id}'s Wine prefixes; nothing was removed",
+                path.display()
+            ),
+        }
+    }
+    // In the order they are listed everywhere else.
+    chosen.sort_by_key(|prefix| prefixes.iter().position(|p| p == prefix));
+    Ok(chosen)
 }
 
 fn uninstall_title(
@@ -1236,8 +1281,9 @@ fn uninstall_title(
     // saves are in `players/<namespace>/<prefix>`, not in the shared one.
     let prefixes = recipe
         .and_then(|r| paths.prefix_dir(r).ok())
-        .map(|base| title_prefixes(&base))
+        .map(|base| accounts::title_prefixes(&base))
         .unwrap_or_default();
+    let doomed_prefixes = prefixes_to_remove(&prefixes, &removal, &product_id)?;
 
     if cli.json {
         print_json(&json!({
@@ -1248,7 +1294,11 @@ fn uninstall_title(
             "had_record": record.is_some(),
             "prefix": prefixes.first().map(|p| p.display().to_string()),
             "prefixes": prefixes.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-            "removing_prefix": removal.remove_prefix && !prefixes.is_empty(),
+            "removing_prefix": !doomed_prefixes.is_empty(),
+            "removing_prefixes": doomed_prefixes
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
         }));
         return Ok(ExitCode::SUCCESS);
     }
@@ -1258,10 +1308,8 @@ fn uninstall_title(
     if removing {
         check_removable(&dir, paths, &product_id, Removable::Install)?;
     }
-    if removal.remove_prefix {
-        for prefix in &prefixes {
-            check_removable(prefix, paths, &product_id, Removable::Prefix)?;
-        }
+    for prefix in &doomed_prefixes {
+        check_removable(prefix, paths, &product_id, Removable::Prefix)?;
     }
     // Not while it runs, and not while something else is installing it.
     let _lock = TitleLock::take(paths, &product_id, LockMode::Change)?;
@@ -1272,9 +1320,7 @@ fn uninstall_title(
     if removing {
         doomed.push(&dir);
     }
-    if removal.remove_prefix {
-        doomed.extend(prefixes.iter().map(PathBuf::as_path));
-    }
+    doomed.extend(doomed_prefixes.iter().map(PathBuf::as_path));
     for (i, path) in doomed.iter().enumerate() {
         eprintln!(
             ":: removing {}{} ({})",
@@ -1311,7 +1357,7 @@ fn uninstall_title(
     }
 
     for prefix in &prefixes {
-        if removal.remove_prefix {
+        if doomed_prefixes.contains(prefix) {
             std::fs::remove_dir_all(prefix)
                 .with_context(|| format!("removing {}", prefix.display()))?;
             eprintln!("-- removed the Wine prefix {}", prefix.display());
@@ -1333,28 +1379,6 @@ fn uninstall_title(
         eprintln!("   the files are still in {}", dir.display());
     }
     Ok(ExitCode::SUCCESS)
-}
-
-/// A title's Wine prefixes that are on disk: the shared one, then each
-/// Player's own (`players/<namespace>/<prefix name>` beside it), sorted.
-fn title_prefixes(base: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    if base.is_dir() {
-        found.push(base.to_path_buf());
-    }
-    let (Some(parent), Some(name)) = (base.parent(), base.file_name()) else {
-        return found;
-    };
-    let mut players: Vec<PathBuf> = std::fs::read_dir(parent.join("players"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|namespace| namespace.path().join(name))
-        .filter(|prefix| prefix.is_dir() && !prefix.is_symlink())
-        .collect();
-    players.sort();
-    found.extend(players);
-    found
 }
 
 // ---------------------------------------------------------------------------
@@ -5202,6 +5226,40 @@ summary = "Runs."
         );
     }
 
+    /// `--prefix-path` narrows `--prefix`; on its own it would read as a
+    /// request to delete a prefix without having asked for prefixes at all.
+    #[test]
+    fn prefix_paths_go_with_prefix() {
+        assert!(
+            Cli::try_parse_from(["ferestre", "uninstall", "9ZZ", "--prefix-path", "/a"]).is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "ferestre",
+            "uninstall",
+            "9ZZ",
+            "--prefix",
+            "--prefix-path",
+            "/a",
+            "--prefix-path",
+            "/b",
+        ])
+        .unwrap();
+        match cli.command {
+            Cmd::Uninstall { prefix_paths, .. } => {
+                assert_eq!(prefix_paths, [PathBuf::from("/a"), PathBuf::from("/b")]);
+            }
+            _ => panic!("not uninstall"),
+        }
+        let cli =
+            Cli::try_parse_from(["ferestre", "install-runtime", "--allow-downgrade"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Cmd::InstallRuntime {
+                allow_downgrade: true
+            }
+        ));
+    }
+
     #[test]
     fn a_titles_arguments_are_never_parsed_as_ours() {
         let cli =
@@ -5909,9 +5967,10 @@ summary = "Runs."
         uninstall_title(&cli(), paths, title, removal, &mut std::io::empty())
     }
 
-    const YES: Removal = Removal {
+    const YES: Removal<'static> = Removal {
         keep_files: false,
         remove_prefix: false,
+        listed: None,
         yes: true,
     };
 
@@ -6014,7 +6073,10 @@ summary = "Runs."
         for dir in [&base, &player, &unrelated] {
             std::fs::create_dir_all(dir.join("pfx")).unwrap();
         }
-        assert_eq!(title_prefixes(&base), vec![base.clone(), player.clone()]);
+        assert_eq!(
+            accounts::title_prefixes(&base),
+            vec![base.clone(), player.clone()]
+        );
 
         // Kept unless asked.
         uninstall(&paths, GAME, YES).unwrap();
@@ -6034,6 +6096,63 @@ summary = "Runs."
         assert!(unrelated.exists());
     }
 
+    /// The window lists the prefixes it will delete, and passes exactly those:
+    /// one created after the dialog was drawn is kept, a path that is not one
+    /// of the title's prefixes is refused before anything goes, and one that
+    /// went away in the meantime is passed over.
+    #[test]
+    fn uninstall_removes_exactly_the_listed_prefixes() {
+        let home = Home::new("uninstall-listed");
+        home.recipe("titles", "game.toml", &game_recipe(""));
+        let paths = home.paths();
+        let games = home.games();
+        let base = games.join("testgame-proton");
+        let player = |n: &str| {
+            games
+                .join("players")
+                .join(n.repeat(64))
+                .join("testgame-proton")
+        };
+        let (listed, unlisted) = (player("a"), player("b"));
+        let other = games
+            .join("players")
+            .join("c".repeat(64))
+            .join("other-proton");
+        let gone = player("d");
+        for dir in [&base, &listed, &unlisted, &other] {
+            std::fs::create_dir_all(dir.join("pfx")).unwrap();
+        }
+        let removing = |list: &[PathBuf]| {
+            installed_package(&games.join("testgame"), GAME);
+            uninstall(
+                &paths,
+                GAME,
+                Removal {
+                    remove_prefix: true,
+                    listed: Some(list),
+                    ..YES
+                },
+            )
+        };
+
+        for wrong in [other.clone(), games.clone(), games.join("players")] {
+            let error = format!("{:#}", removing(&[base.clone(), wrong]).unwrap_err());
+            assert!(error.contains("is not one of"), "{error}");
+            assert!(base.exists() && games.join("testgame").exists());
+        }
+        // The same prefix spelled with a trailing slash is that prefix.
+        let spelled = PathBuf::from(format!("{}/", listed.display()));
+        removing(&[base.clone(), spelled, gone.clone()]).unwrap();
+        assert!(!base.exists());
+        assert!(!listed.exists());
+        assert!(
+            unlisted.exists(),
+            "a prefix the dialog did not list is kept"
+        );
+        assert!(other.exists());
+        assert!(!games.join("testgame").exists());
+    }
+
     /// Asked once for everything, and a "no" leaves everything.
     #[test]
     fn uninstall_asks_before_deleting_the_prefix_too() {
@@ -6046,6 +6165,7 @@ summary = "Runs."
         let removal = Removal {
             keep_files: false,
             remove_prefix: true,
+            listed: None,
             yes: false,
         };
         let mut no = std::io::Cursor::new(b"n\n".to_vec());

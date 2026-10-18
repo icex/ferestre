@@ -601,7 +601,7 @@ impl Model {
         else {
             return Vec::new();
         };
-        player_prefixes(&base)
+        accounts::title_prefixes(&base)
     }
 
     /// Where installing this product puts it by default: where it is already
@@ -849,28 +849,6 @@ fn installed_products(games_dir: &Path) -> BTreeMap<String, PathBuf> {
             }
         }
     }
-    found
-}
-
-/// A title's base Wine prefix and every Player's copy of it that exists:
-/// `<parent>/players/<namespace>/<name>`, as `accounts::player_prefix` makes.
-fn player_prefixes(base: &Path) -> Vec<PathBuf> {
-    let mut found: Vec<PathBuf> = Vec::new();
-    if base.is_dir() {
-        found.push(base.to_path_buf());
-    }
-    let (Some(parent), Some(name)) = (base.parent(), base.file_name()) else {
-        return found;
-    };
-    let mut players: Vec<PathBuf> = std::fs::read_dir(parent.join("players"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path().join(name))
-        .filter(|path| path.is_dir() && !path.is_symlink())
-        .collect();
-    players.sort();
-    found.extend(players);
     found
 }
 

@@ -1293,6 +1293,27 @@ pub fn account_sharing_refusal(has_recipe: bool, runtime_shares: bool) -> Option
     )
 }
 
+/// The `ferestre uninstall` arguments for what the Remove dialog said would
+/// go: the title's files, and, when the box was ticked, exactly the Wine
+/// prefixes it listed. Each prefix is named, so a Player's prefix that
+/// appeared after the dialog was drawn is not removed unseen. `None` when a
+/// prefix's path cannot be passed as text.
+pub fn uninstall_args(product_id: &str, prefixes: Option<&[PathBuf]>) -> Option<Vec<String>> {
+    let mut args = vec![
+        "uninstall".to_string(),
+        product_id.to_string(),
+        "--yes".into(),
+    ];
+    if let Some(prefixes) = prefixes.filter(|p| !p.is_empty()) {
+        args.push("--prefix".into());
+        for prefix in prefixes {
+            args.push("--prefix-path".into());
+            args.push(prefix.to_str()?.to_string());
+        }
+    }
+    Some(args)
+}
+
 /// What is in a folder named as an install destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Folder {
@@ -1413,6 +1434,40 @@ pub fn unasked(wanted: Vec<String>, asked: &mut BTreeSet<String>) -> Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Remove passes the prefixes its dialog listed, each by name, and none
+    /// when the box was not ticked.
+    #[test]
+    fn remove_names_each_listed_prefix() {
+        let prefixes = [
+            PathBuf::from("/g/game-proton"),
+            PathBuf::from("/g/players/aa/game-proton"),
+        ];
+        assert_eq!(
+            uninstall_args("9ZZA", None).unwrap(),
+            ["uninstall", "9ZZA", "--yes"]
+        );
+        assert_eq!(
+            uninstall_args("9ZZA", Some(&[])).unwrap(),
+            ["uninstall", "9ZZA", "--yes"]
+        );
+        assert_eq!(
+            uninstall_args("9ZZA", Some(&prefixes)).unwrap(),
+            [
+                "uninstall",
+                "9ZZA",
+                "--yes",
+                "--prefix",
+                "--prefix-path",
+                "/g/game-proton",
+                "--prefix-path",
+                "/g/players/aa/game-proton",
+            ]
+        );
+        use std::os::unix::ffi::OsStrExt;
+        let odd = PathBuf::from(std::ffi::OsStr::from_bytes(b"/g/\xff-proton"));
+        assert_eq!(uninstall_args("9ZZA", Some(&[odd])), None);
+    }
     use ferestre_core::runtime::CapabilitySource;
     use std::collections::BTreeSet;
 

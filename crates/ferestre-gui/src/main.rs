@@ -3080,13 +3080,18 @@ fn confirm_remove(ui: &Ui, product_id: &str, name: &str) {
                 .add_toast(toast(format!("Stop {name} before removing it")));
             return;
         }
-        let mut args = vec!["uninstall", &product_id, "--yes"];
-        if also_prefix
+        let with_prefixes = also_prefix
             .as_ref()
-            .is_some_and(gtk::prelude::CheckButtonExt::is_active)
-        {
-            args.push("--prefix");
-        }
+            .is_some_and(gtk::prelude::CheckButtonExt::is_active);
+        let Some(args) =
+            model::uninstall_args(&product_id, with_prefixes.then_some(prefixes.as_slice()))
+        else {
+            ui.toasts.add_toast(toast(format!(
+                "Cannot remove {name}: a Wine prefix's folder name is not valid text"
+            )));
+            return;
+        };
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
         spawn_cli_tracked(&ui, &args, &format!("Removing {name}"));
     });
     dialog.present(Some(&window));
