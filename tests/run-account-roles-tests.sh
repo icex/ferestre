@@ -33,4 +33,14 @@ printf '%s\n' '{"store":1,"player":1,"same":0,"licensed":1,"broken":0}' > "$WORK
 python3 "$REPO_DIR/tests/account_roles_fixture.py" "$XODUS_RUNTIME_DIR" "$WORK/account-control.json" &
 FIXTURE=$!
 for ((i=0;i<100;i++)); do [ -S "$XODUS_RUNTIME_DIR/xodus.sock" ] && break; sleep 0.05; done
-(cd "$WORK" && timeout 120 "$WINE" "$WORK/account_roles.exe")
+(cd "$WORK" && timeout 300 "$WINE" "$WORK/account_roles.exe")
+# Credentials a title hands the runtime, and the tokens the service hands
+# back, must not reach a debug log even with tracing on; their presence and
+# length may.
+printf '%s\n' '{"store":1,"player":1,"same":1,"licensed":1,"broken":0}' > "$WORK/account-control.json"
+(cd "$WORK" && WINEDEBUG=+gdkc,+storetrace timeout 120 "$WINE" "$WORK/account_roles.exe" --log-probe) 2> "$WORK/trace.log"
+grep -q 'serviceTicket present' "$WORK/trace.log" || { echo "FAIL: the trace did not record the Store ID calls"; exit 1; }
+if grep -aqE 'SYNTHETIC_(TICKET|PUBLISHER|TOKEN)_DO_NOT_LOG' "$WORK/trace.log"; then
+    echo "FAIL: a credential reached the debug log"; exit 1
+fi
+echo "ok: credentials stay out of the debug log"

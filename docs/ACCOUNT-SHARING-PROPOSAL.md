@@ -77,13 +77,18 @@ with the selected player; Ferestre does not create an entitlement for the player
   Store content-licence check. Installed files do not imply ownership. Unrelated
   package licensing and unsupported purchase APIs stay unsupported.
 - Store queries (product, game licence, acquire / can-acquire) run on the async
-  work queue. `XStoreIsLicenseValid` and game-licence registration revalidate
-  synchronously and are served from the service cache when it is fresh: successful
-  checks for up to 60 seconds, denials for 10. A verified grant survives failed
-  refreshes (network errors look the same as denials) for 30 minutes; local
-  sign-out is checked before any cached grant. Player and licence state is polled on the Work port once per second,
-  then change/lost callbacks are delivered on the caller's Completion port.
-  Unregister suppresses queued callbacks and can wait for active delivery.
+  work queue. The service caches its answers: successful checks for up to 60
+  seconds, denials for 10. A verified grant survives failed refreshes (network
+  errors look the same as denials) for 30 minutes; local sign-out is checked
+  before any cached grant. Since `patches/xgameruntime/0032-keep-service-requests-off-title-threads.patch`
+  the runtime keeps the last definitive player and licence state itself, refreshed
+  once per second by a private thread while something watches it or a title asked
+  in the last 30 seconds. `XStoreIsLicenseValid`, `XUserGetState`,
+  `XUserIsStoreUser` and registration read that state and never make a request
+  on the title's thread; a failed exchange with the service leaves it unchanged,
+  and an answer in an unsupported protocol version fails closed. Change/lost
+  callbacks are delivered on the caller's Completion port; nothing runs on its
+  Work port. Unregister suppresses queued callbacks and can wait for active delivery.
 - Local saves use a stable hash of the verified Player MSA for an independent
   Wine prefix. The imported account keeps its existing prefix. Reauthenticating
   the same identity reuses its profile and save namespace. The optional Windows

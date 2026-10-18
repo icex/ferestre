@@ -228,6 +228,9 @@ static void test_xuser(void)
                 hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Async( u6, user, 0, L"GET",
                         L"https://fixture.invalid/", 0, NULL, 0, NULL, &token_async );
                 CHECK( hr == S_OK, "UTF-16 token request starts" );
+                /* The request runs on the queue, not inside the *Async call. */
+                hr = IXThreadingImpl_XAsyncGetStatus( threading, &token_async, TRUE );
+                CHECK( hr == S_OK, "UTF-16 token request completes (0x%08lx)", hr );
                 hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16ResultSize( u6, &token_async, &size );
                 CHECK( hr == S_OK && size == expected, "UTF-16 result size includes wide strings (%Iu)", size );
                 memset(buffer, 0x5a, 512);
@@ -246,11 +249,19 @@ static void test_xuser(void)
                         !memcmp(wide->signature, L"fixture-signature", sizeof(L"fixture-signature")),
                         "UTF-16 signature is a terminated wide string with a byte count" );
                 CHECK( buffer[expected] == 0x5a, "UTF-16 result leaves the tail untouched" );
-                /* Retrieving the Unicode form must not corrupt the cached UTF-8 payload. */
-                hr = IXUserImpl6_XUserGetTokenAndSignatureResult( u6, &token_async, 512,
+                /* A result is handed over once: the runtime releases the token
+                 * once the title has its copy, rather than leaking it. */
+                hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Result( u6, &token_async, 512,
+                        buffer, &wide, &used );
+                CHECK( hr != S_OK, "a token result is not handed over twice" );
+                memset( &token_async, 0, sizeof(token_async) );
+                hr = IXUserImpl6_XUserGetTokenAndSignatureAsync( u6, user, 0, "GET",
+                        "https://fixture.invalid/", 0, NULL, 0, NULL, &token_async );
+                if (hr == S_OK) hr = IXThreadingImpl_XAsyncGetStatus( threading, &token_async, TRUE );
+                if (hr == S_OK) hr = IXUserImpl6_XUserGetTokenAndSignatureResult( u6, &token_async, 512,
                         buffer, &narrow, &used );
                 CHECK( hr == S_OK && narrow && !strcmp(narrow->token, "fixture-auth") &&
-                        !strcmp(narrow->signature, "fixture-signature"), "UTF-8 payload remains intact" );
+                        !strcmp(narrow->signature, "fixture-signature"), "UTF-8 token and signature are intact" );
                 {
                     BYTE *large = malloc(100000);
                     unsigned int n;
@@ -259,6 +270,7 @@ static void test_xuser(void)
                     hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Async(u6, user, 0, L"POST",
                             L"https://fixture.invalid/large", 0, NULL, 100000, large, &token_async);
                     CHECK(hr == S_OK, "100 KB signing request crosses the extended IPC frame intact");
+                    if (hr == S_OK) hr = IXThreadingImpl_XAsyncGetStatus(threading, &token_async, TRUE);
                     hr = IXUserImpl6_XUserGetTokenAndSignatureUtf16Result(u6, &token_async, 512, buffer, &wide, &used);
                     CHECK(hr == S_OK && wide && !wcscmp(wide->signature, L"fixture-signature"),
                           "extended signing request returns the service signature");
