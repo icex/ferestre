@@ -19,7 +19,7 @@ schema = 1
 [title]
 product-id = "9NBLGGH2JHXJ"
 name = {name}
-slug = "example"
+slug = "{slug}"
 {install}
 [launch]
 executable = 'Example.exe'
@@ -34,13 +34,14 @@ last-verified = 2026-01-01
 """
 
 
-def check(top="", name='"Example"', install="", launch="", summary='"Starts."'):
+def check(top="", name='"Example"', install="", launch="", summary='"Starts."',
+          slug="example"):
     known, problems = validate.load_capabilities(HERE / "capabilities.toml")
     assert not problems, problems
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "9NBLGGH2JHXJ.toml"
         path.write_text(MINIMAL.format(top=top, name=name, install=install,
-                                       launch=launch, summary=summary))
+                                       launch=launch, summary=summary, slug=slug))
         return validate.check_recipe(path, known)
 
 
@@ -51,9 +52,13 @@ class Recipes(unittest.TestCase):
         self.assertIsNotNone(data)
 
     def test_a_titles_own_directory_variables_are_accepted(self):
-        for name in ("BEDROCK_DIR", "FH5_PREFIX", "HALO_INFINITE_DIR"):
-            _, problems = check(install=f'[install]\ndir-env = "{name}"\n')
-            self.assertEqual(problems, [], name)
+        for slug, dir_env, prefix_env in (("bedrock", "BEDROCK_DIR", "BEDROCK_PREFIX"),
+                                          ("fh5", "FH5_DIR", "FH5_PREFIX"),
+                                          ("halo-infinite", "HALO_INFINITE_DIR",
+                                           "HALO_INFINITE_PREFIX")):
+            _, problems = check(slug=slug, install=f'[install]\ndir-env = "{dir_env}"\n'
+                                                   f'prefix-env = "{prefix_env}"\n')
+            self.assertEqual(problems, [], slug)
 
     def test_the_launchers_own_variables_are_refused(self):
         for name in ("XODUS_GAMES_DIR", "XDG_RUNTIME_DIR", "HOME", "FERESTRE_TITLES",
@@ -61,6 +66,16 @@ class Recipes(unittest.TestCase):
             for key in ("dir-env", "prefix-env"):
                 _, problems = check(install=f'[install]\n{key} = "{name}"\n')
                 self.assertTrue(any(key in p for p in problems), (key, name, problems))
+
+    def test_only_the_slugs_own_variable_is_accepted(self):
+        for name in ("CARGO_TARGET_DIR", "PULSE_RUNTIME_DIR", "BEDROCK_DIR", "EXAMPLE_PREFIX"):
+            _, problems = check(install=f'[install]\ndir-env = "{name}"\n')
+            self.assertTrue(any("EXAMPLE_DIR" in p for p in problems), (name, problems))
+        _, problems = check(install='[install]\nprefix-env = "EXAMPLE_DIR"\n')
+        self.assertTrue(any("EXAMPLE_PREFIX" in p for p in problems), problems)
+        _, problems = check(slug="xdg-runtime",
+                            install='[install]\ndir-env = "XDG_RUNTIME_DIR"\n')
+        self.assertTrue(any("dir-env" in p for p in problems), problems)
 
     def test_arguments_are_not_a_key_the_launcher_reads(self):
         _, problems = check(launch='arguments = ["-windowed"]')

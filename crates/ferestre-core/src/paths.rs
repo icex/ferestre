@@ -497,7 +497,7 @@ impl Paths {
     ///
     /// Only then the recipe's own directory, or the slug.
     pub fn install_dir(&self, recipe: &Recipe) -> Result<PathBuf> {
-        if let Some(dir) = self.recipe_env(recipe.install.dir_env.as_deref(), recipe)? {
+        if let Some(dir) = self.recipe_env(recipe.install.dir_env.as_deref(), "_DIR", recipe)? {
             return Ok(dir);
         }
         if let Some(record) = crate::install::load(&self.state, &recipe.title.product_id) {
@@ -519,7 +519,9 @@ impl Paths {
     /// yet. The two usually have different slugs, and the prefix is where the
     /// saves are: following the new slug would start the title with none.
     pub fn prefix_dir(&self, recipe: &Recipe) -> Result<PathBuf> {
-        if let Some(dir) = self.recipe_env(recipe.install.prefix_env.as_deref(), recipe)? {
+        if let Some(dir) =
+            self.recipe_env(recipe.install.prefix_env.as_deref(), "_PREFIX", recipe)?
+        {
             return Ok(dir);
         }
         let prefix = self.under_games(&recipe.prefix_dir(), "prefix", recipe)?;
@@ -542,21 +544,27 @@ impl Paths {
     }
 
     /// A recipe's `dir-env` or `prefix-env`. The name is data from a file
-    /// that may not be ours, so it has to be one of the variables that exist
-    /// to name a title's directory (`BEDROCK_DIR`, `FH5_PREFIX`): pointing it
-    /// at `XODUS_GAMES_DIR` or `XDG_RUNTIME_DIR` would hand the whole games
-    /// directory, or the session's runtime directory, to an uninstall. The
-    /// value is the user's own and may be anywhere, but it is made absolute,
-    /// since the launch changes directory before anything reads it.
-    fn recipe_env(&self, name: Option<&str>, recipe: &Recipe) -> Result<Option<PathBuf>> {
+    /// that may not be ours, so it has to be the variable named after this
+    /// title (`BEDROCK_DIR`, `FH5_PREFIX`): pointing it at `XODUS_GAMES_DIR`,
+    /// `XDG_RUNTIME_DIR` or anything else that happens to end in `_DIR` would
+    /// hand that directory to an uninstall. The value is the user's own and
+    /// may be anywhere, but it is made absolute, since the launch changes
+    /// directory before anything reads it.
+    fn recipe_env(
+        &self,
+        name: Option<&str>,
+        suffix: &str,
+        recipe: &Recipe,
+    ) -> Result<Option<PathBuf>> {
         let Some(name) = name else {
             return Ok(None);
         };
-        if !crate::recipe::is_location_variable(name) {
+        if !crate::recipe::is_location_variable(name, &recipe.title.slug, suffix) {
             bail!(
-                "{}: \"{name}\" is not a variable a recipe may take a directory from \
-                 (it must end in _DIR or _PREFIX, and not be one of the launcher's own)",
-                recipe.title.product_id
+                "{}: \"{name}\" is not a variable this recipe may take a directory from \
+                 (it must be {}, and not one of the launcher's or the system's own)",
+                recipe.title.product_id,
+                crate::recipe::location_variable(&recipe.title.slug, suffix)
             );
         }
         Ok(self
@@ -704,13 +712,22 @@ mod tests {
     }
 
     fn recipe(extra: &str) -> Recipe {
+        titled("example", extra)
+    }
+
+    /// As [`recipe`], with the slug the `BEDROCK_*` variables belong to.
+    fn bedrock(extra: &str) -> Recipe {
+        titled("bedrock", extra)
+    }
+
+    fn titled(slug: &str, extra: &str) -> Recipe {
         let text = format!(
             r#"
 schema = 1
 [title]
 product-id = "9NBLGGH2JHXJ"
 name = "Example"
-slug = "example"
+slug = "{slug}"
 [launch]
 executable = 'Example.exe'
 [status]
@@ -1129,6 +1146,9 @@ summary = "Runs."
             "HOME",
             "FERESTRE_TITLES",
             "STEAM_COMPAT_DATA_PATH",
+            "CARGO_TARGET_DIR",
+            "PULSE_RUNTIME_DIR",
+            "BEDROCK_DIR",
         ] {
             let p = paths(&[(name, "/home/tester/xbox-games")]);
             let mut r = recipe("");
@@ -1209,7 +1229,7 @@ summary = "Runs."
             ("BEDROCK_DIR", "/run/media/user/Games/bedrock"),
             ("BEDROCK_PREFIX", "/run/media/user/Games/bedrock-proton"),
         ]);
-        let r = recipe(
+        let r = bedrock(
             "[install]\ndir = \"bedrock/game\"\ndir-env = \"BEDROCK_DIR\"\n\
              prefix = \"bedrock-proton\"\nprefix-env = \"BEDROCK_PREFIX\"",
         );
@@ -1226,7 +1246,7 @@ summary = "Runs."
     #[test]
     fn an_unset_or_empty_env_override_falls_back_to_the_recipe() {
         let p = paths(&[("BEDROCK_DIR", "")]);
-        let r = recipe("[install]\ndir = \"bedrock/game\"\ndir-env = \"BEDROCK_DIR\"");
+        let r = bedrock("[install]\ndir = \"bedrock/game\"\ndir-env = \"BEDROCK_DIR\"");
         assert_eq!(
             p.install_dir(&r).unwrap(),
             Path::new("/home/tester/xbox-games/bedrock/game")

@@ -58,9 +58,9 @@ Where the title and its prefix live, relative to `XODUS_GAMES_DIR`.
 | key | type | | meaning |
 |---|---|---|---|
 | `dir` | string | optional | Default: the slug. Forward slashes, must stay inside the games directory. Where the launcher recorded installing the title wins over it while that directory still holds the title. |
-| `dir-env` | string | optional | An environment variable that overrides `dir`, for compatibility with the existing scripts. Must end in `_DIR` or `_PREFIX` and must not be one of the launcher's or the system's own (`XODUS_*`, `FERESTRE_*`, `XDG_*`, `STEAM_*`, `PROTON_*`, `WINE*`): such a variable would make, say, the whole games directory the title's folder, which is what an uninstall deletes. |
+| `dir-env` | string | optional | An environment variable that overrides `dir`, for compatibility with the existing scripts. Must be the slug's own variable: the slug uppercased with dashes as underscores, then `_DIR` (`halo-infinite` gives `HALO_INFINITE_DIR`), and not one of the launcher's or the system's own (`XODUS_*`, `FERESTRE_*`, `XDG_*`, `STEAM_*`, `PROTON_*`, `WINE*`) even when a slug spells one. Any other variable would make whatever it names, say the whole games directory, the title's folder, which is what an uninstall deletes. |
 | `prefix` | string | optional | Default: `<slug>-proton`. |
-| `prefix-env` | string | optional | As `dir-env`, for the prefix, with the same rule for the name. |
+| `prefix-env` | string | optional | As `dir-env`, for the prefix: the slug's own variable ending in `_PREFIX` (`HALO_INFINITE_PREFIX`). |
 
 ### `[launch]` — required
 

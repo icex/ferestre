@@ -219,16 +219,27 @@ impl std::fmt::Display for LoadProblem {
     }
 }
 
-/// Whether `name` is a variable a recipe may take a directory from
-/// (`install.dir-env`, `install.prefix-env`).
+/// The one variable a recipe with this slug may take a directory from:
+/// `<SLUG>_DIR` for `install.dir-env`, `<SLUG>_PREFIX` for
+/// `install.prefix-env`, with the slug uppercased and its dashes made
+/// underscores (`halo-infinite` gives `HALO_INFINITE_DIR`).
+pub fn location_variable(slug: &str, suffix: &str) -> String {
+    format!("{}{suffix}", slug.to_ascii_uppercase().replace('-', "_"))
+}
+
+/// Whether `name` is a variable a recipe with this slug may take a directory
+/// from, `suffix` being `_DIR` (`install.dir-env`) or `_PREFIX`
+/// (`install.prefix-env`).
 ///
 /// Those exist so an install the shell scripts made keeps working, and every
-/// one of them is named after its title: `BEDROCK_DIR`, `FH5_PREFIX`. The
-/// launcher's own variables and the system's are excluded, because a recipe
-/// pointing at `XODUS_GAMES_DIR` or `XDG_RUNTIME_DIR` would make the whole
-/// games directory, or the session's runtime directory, the title's folder --
-/// the thing an uninstall deletes. `titles/validate.py` applies the same rule.
-pub fn is_location_variable(name: &str) -> bool {
+/// one of them is named after its title: `BEDROCK_DIR`, `FH5_PREFIX`. So the
+/// name has to be exactly the title's own, [`location_variable`]. A pattern
+/// with a list of exceptions would still let a recipe name `CARGO_TARGET_DIR`
+/// or `PULSE_RUNTIME_DIR`, and whatever that holds would become the title's
+/// folder -- the thing an uninstall deletes. The launcher's own variables and
+/// the system's are refused even when a slug spells one (`xdg-runtime`), for
+/// the same reason. `titles/validate.py` applies the same rule.
+pub fn is_location_variable(name: &str, slug: &str, suffix: &str) -> bool {
     const RESERVED: [&str; 7] = [
         "XODUS_",
         "FERESTRE_",
@@ -241,8 +252,8 @@ pub fn is_location_variable(name: &str) -> bool {
     let mut bytes = name.bytes();
     bytes.next().is_some_and(|b| b.is_ascii_uppercase())
         && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
-        && (name.ends_with("_DIR") || name.ends_with("_PREFIX"))
-        && name.len() > "_DIR".len()
+        && matches!(suffix, "_DIR" | "_PREFIX")
+        && name == location_variable(slug, suffix)
         && !RESERVED.iter().any(|reserved| name.starts_with(reserved))
 }
 
@@ -278,17 +289,18 @@ impl Recipe {
                 recipe.title.slug
             );
         }
-        for (key, name) in [
-            ("dir-env", &recipe.install.dir_env),
-            ("prefix-env", &recipe.install.prefix_env),
+        for (key, name, suffix) in [
+            ("dir-env", &recipe.install.dir_env, "_DIR"),
+            ("prefix-env", &recipe.install.prefix_env, "_PREFIX"),
         ] {
             if let Some(name) = name {
-                if !is_location_variable(name) {
+                if !is_location_variable(name, &recipe.title.slug, suffix) {
                     anyhow::bail!(
-                        "[install].{key} \"{name}\" is not a variable a recipe may take a \
-                         directory from: it must end in _DIR or _PREFIX and must not be one \
-                         of the launcher's own (XODUS_*, FERESTRE_*, XDG_*, STEAM_*, PROTON_*, \
-                         WINE*)"
+                        "[install].{key} \"{name}\" is not a variable this recipe may take a \
+                         directory from: it must be {}, named after the slug, and not one of \
+                         the launcher's or the system's own (XODUS_*, FERESTRE_*, XDG_*, \
+                         STEAM_*, PROTON_*, WINE*)",
+                        location_variable(&recipe.title.slug, suffix)
                     );
                 }
             }
@@ -878,14 +890,20 @@ mod tests {
 
     #[test]
     fn only_a_titles_own_directory_variables_may_be_named() {
-        for name in [
-            "BEDROCK_DIR",
-            "FH5_PREFIX",
-            "EXP33_DIR",
-            "HALO_INFINITE_DIR",
-            "HALO_INFINITE_PREFIX",
+        for (slug, dir, prefix) in [
+            ("bedrock", "BEDROCK_DIR", "BEDROCK_PREFIX"),
+            ("fh5", "FH5_DIR", "FH5_PREFIX"),
+            ("exp33", "EXP33_DIR", "EXP33_PREFIX"),
+            ("halo-infinite", "HALO_INFINITE_DIR", "HALO_INFINITE_PREFIX"),
         ] {
-            assert!(is_location_variable(name), "{name}");
+            assert!(is_location_variable(dir, slug, "_DIR"), "{dir}");
+            assert!(is_location_variable(prefix, slug, "_PREFIX"), "{prefix}");
+            // Each key takes its own one, not the other's.
+            assert!(!is_location_variable(prefix, slug, "_DIR"), "{prefix}");
+            assert!(!is_location_variable(dir, slug, "_PREFIX"), "{dir}");
+            let text = MINIMAL.replace("slug = \"example\"", &format!("slug = {slug:?}"));
+            let text = format!("{text}\n[install]\ndir-env = {dir:?}\nprefix-env = {prefix:?}\n");
+            assert!(Recipe::parse(&text).is_ok(), "{slug}");
         }
         for name in [
             "XODUS_GAMES_DIR",
@@ -901,12 +919,28 @@ mod tests {
             "_DIR",
             "lower_dir",
             "A-B_DIR",
+            // Shaped like a title's variable, but somebody else's.
+            "CARGO_TARGET_DIR",
+            "PULSE_RUNTIME_DIR",
+            "PIPEWIRE_RUNTIME_DIR",
+            "BEDROCK_DIR",
+            "EXAMPLE_PREFIX",
         ] {
-            assert!(!is_location_variable(name), "{name}");
-            for key in ["dir-env", "prefix-env"] {
+            for (key, suffix) in [("dir-env", "_DIR"), ("prefix-env", "_PREFIX")] {
+                if name == location_variable("example", suffix) {
+                    continue;
+                }
+                assert!(!is_location_variable(name, "example", suffix), "{name}");
                 let text = format!("{MINIMAL}\n[install]\n{key} = {name:?}\n");
-                assert!(Recipe::parse(&text).is_err(), "{key} = {name}");
+                let err = Recipe::parse(&text).expect_err(name).to_string();
+                assert!(err.contains(&location_variable("example", suffix)), "{err}");
             }
+        }
+        // A slug that spells one of the launcher's or the system's own
+        // variables does not make it the title's.
+        for slug in ["xdg-runtime", "xodus-games", "steam", "proton"] {
+            let name = location_variable(slug, "_DIR");
+            assert!(!is_location_variable(&name, slug, "_DIR"), "{name}");
         }
     }
 
@@ -953,7 +987,8 @@ mod tests {
                 };
                 let value = match (table.as_str(), key) {
                     ("[title]", "slug") => "\"example\"",
-                    ("[install]", "dir-env" | "prefix-env") => "\"EXAMPLE_DIR\"",
+                    ("[install]", "dir-env") => "\"EXAMPLE_DIR\"",
+                    ("[install]", "prefix-env") => "\"EXAMPLE_PREFIX\"",
                     ("[status]", "state") => "\"broken\"",
                     _ => value,
                 };

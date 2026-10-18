@@ -39,15 +39,24 @@ SETUP_WHEN = {"after-install", "every-launch"}
 SAVE_KINDS = {"wgs", "files"}
 RECIPE_NAME = re.compile(r"[0-9A-Z]{12}\.toml")
 # dir-env and prefix-env name a title's own directory, as the shell scripts
-# did (BEDROCK_DIR, FH5_PREFIX). The launcher's and the system's variables are
-# out: XODUS_GAMES_DIR or XDG_RUNTIME_DIR as a title's folder is what an
-# uninstall would delete. crates/ferestre-core/src/recipe.rs has the same rule.
+# did (BEDROCK_DIR, FH5_PREFIX), so each has to be exactly the slug's own
+# variable: <SLUG>_DIR and <SLUG>_PREFIX, uppercased, dashes as underscores.
+# Anything else that ends in _DIR (CARGO_TARGET_DIR, XDG_RUNTIME_DIR,
+# XODUS_GAMES_DIR) as a title's folder is what an uninstall would delete, and
+# the launcher's and the system's own stay out even when a slug spells one.
+# crates/ferestre-core/src/recipe.rs has the same rule.
 LOCATION_VARIABLE = re.compile(r"[A-Z][A-Z0-9_]*_(DIR|PREFIX)")
 RESERVED_VARIABLES = ("XODUS_", "FERESTRE_", "XDG_", "STEAM_", "PROTON_", "WINE", "APPDIR")
 
 NUM = (int, float)
 TYPE_NAMES = {str: "a string", int: "an integer", float: "a number", bool: "a boolean",
               list: "an array", dict: "a table", datetime.date: "a date (YYYY-MM-DD)"}
+
+
+def location_variable(slug, suffix):
+    """The one variable a recipe with this slug may name for dir-env (_DIR) or
+    prefix-env (_PREFIX)."""
+    return slug.upper().replace("-", "_") + suffix
 
 
 def type_name(kind):
@@ -222,14 +231,17 @@ def check_recipe(path, known):
         check_relative_path(err, "[install].dir", install["dir"])
     if "prefix" in install:
         check_relative_path(err, "[install].prefix", install["prefix"])
-    for key in ("dir-env", "prefix-env"):
+    for key, suffix in (("dir-env", "_DIR"), ("prefix-env", "_PREFIX")):
         if key not in install:
             continue
         name = install[key]
-        if not LOCATION_VARIABLE.fullmatch(name) or name.startswith(RESERVED_VARIABLES):
-            err(f"[install].{key}: '{name}' is not a variable a recipe may take a directory "
-                "from: it must end in _DIR or _PREFIX and must not be one of the launcher's "
-                "own (XODUS_*, FERESTRE_*, XDG_*, STEAM_*, PROTON_*, WINE*)")
+        expected = location_variable(slug, suffix)
+        if (name != expected or not LOCATION_VARIABLE.fullmatch(name)
+                or name.startswith(RESERVED_VARIABLES)):
+            err(f"[install].{key}: '{name}' is not a variable this recipe may take a directory "
+                f"from: it must be {expected}, named after the slug, and not one of the "
+                "launcher's or the system's own (XODUS_*, FERESTRE_*, XDG_*, STEAM_*, "
+                "PROTON_*, WINE*)")
 
     launch = data["launch"]
     fields(err, "[launch]", launch, required={"executable": str},
