@@ -33,7 +33,7 @@ fail() {
 [ "$#" -gt 0 ] || fail "usage: $0 <file>..."
 
 if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
-    [ "$require" = 1 ] && fail "no signing key: set the MINISIGN_SECRET_L1b secret"
+    [ "$require" = 1 ] && fail "no signing key: set the MINISIGN_SECRET_KEY secret"
     echo "sign-release: no signing key; artefacts are left unsigned" >&2
     exit 0
 fi

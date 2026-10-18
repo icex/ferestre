@@ -241,8 +241,10 @@ pub fn download_large_cancellable(
     dest: &Path,
     cancelled: impl Fn() -> bool,
 ) -> Result<()> {
+    let signature_url = format!("{url}{}", crate::signing::SIGNATURE_SUFFIX);
     download_release(
         url,
+        &signature_url,
         dest,
         &cancelled,
         &LARGE,
@@ -250,8 +252,23 @@ pub fn download_large_cancellable(
     )
 }
 
+/// [`download_large_cancellable`] with the signature's URL and the public key
+/// given: the signature the release lists beside the artefact (a runtime
+/// release's `<asset>.minisig`), and normally
+/// [`crate::signing::RELEASE_PUBLIC_KEY`]. Tests pass a throwaway key.
+pub fn download_signed(
+    url: &str,
+    signature_url: &str,
+    dest: &Path,
+    cancelled: impl Fn() -> bool,
+    public_key: &str,
+) -> Result<()> {
+    download_release(url, signature_url, dest, &cancelled, &LARGE, public_key)
+}
+
 fn download_release(
     url: &str,
+    signature_url: &str,
     dest: &Path,
     cancelled: &dyn Fn() -> bool,
     patience: &Patience,
@@ -261,7 +278,7 @@ fn download_release(
     // Refuse before a 300 MB download, not after it.
     crate::signing::check_public_key(public_key)?;
     let name = published_name(url)?;
-    let signature = fetch_signature(&format!("{url}{}", crate::signing::SIGNATURE_SUFFIX))?;
+    let signature = fetch_signature(signature_url)?;
     crate::signing::check_signature(&signature, name)?;
     if dest.is_file() {
         if crate::signing::verify_file_with_key(public_key, &signature, name, dest).is_ok() {
@@ -539,9 +556,21 @@ fn content_range_start(value: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
-    use crate::signing::tests::TestKey;
+    use crate::signing::testing::TestKey;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+
+    /// A release artefact with its signature at `<url>.minisig`.
+    fn signed_release(
+        url: &str,
+        dest: &Path,
+        cancelled: &dyn Fn() -> bool,
+        patience: &Patience,
+        public_key: &str,
+    ) -> Result<()> {
+        let signature_url = format!("{url}{}", crate::signing::SIGNATURE_SUFFIX);
+        download_release(url, &signature_url, dest, cancelled, patience, public_key)
+    }
 
     /// What the test server answers for one path.
     #[derive(Clone)]
@@ -720,7 +749,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join(NAME);
         let started = std::time::Instant::now();
-        download_release(
+        signed_release(
             &format!("{base}/{NAME}"),
             &dest,
             &|| false,
@@ -748,7 +777,7 @@ mod tests {
         let (base, log) = serve(routes(&list));
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join(NAME);
-        download_release(
+        signed_release(
             &format!("{base}/{NAME}"),
             &dest,
             &|| false,
@@ -776,7 +805,7 @@ mod tests {
         let (base, _) = serve(routes(&list));
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join(NAME);
-        download_release(
+        signed_release(
             &format!("{base}/{NAME}"),
             &dest,
             &|| false,
@@ -800,7 +829,7 @@ mod tests {
         let (base, log) = serve(routes(&list));
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join(NAME);
-        let error = download_release(
+        let error = signed_release(
             &format!("{base}/{NAME}"),
             &dest,
             &|| false,
@@ -831,7 +860,7 @@ mod tests {
         let (base, log) = serve(routes(&list));
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join(NAME);
-        let error = download_release(
+        let error = signed_release(
             &format!("{base}/{NAME}"),
             &dest,
             &|| false,
@@ -859,7 +888,7 @@ mod tests {
         let (base, _) = serve(routes(&list));
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join(NAME);
-        let error = download_release(
+        let error = signed_release(
             &format!("{base}/{NAME}"),
             &dest,
             &|| false,
@@ -875,7 +904,7 @@ mod tests {
 
         // No signature published at all is a refusal too, before any download.
         let (base, log) = serve(vec![(&format!("/{NAME}")[..], Served::file(&data))]);
-        assert!(download_release(
+        assert!(signed_release(
             &format!("{base}/{NAME}"),
             &dest,
             &|| false,
@@ -899,9 +928,9 @@ mod tests {
         let dest = dir.path().join(NAME);
         std::fs::write(&dest, b"half an archive").unwrap();
         let url = format!("{base}/{NAME}");
-        download_release(&url, &dest, &|| false, &QUICK, &key.public()).unwrap();
+        signed_release(&url, &dest, &|| false, &QUICK, &key.public()).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), data);
-        download_release(&url, &dest, &|| false, &QUICK, &key.public()).unwrap();
+        signed_release(&url, &dest, &|| false, &QUICK, &key.public()).unwrap();
         let fetched = log
             .lock()
             .unwrap()
@@ -923,7 +952,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join(NAME);
         let checks = std::cell::Cell::new(0);
-        let result = download_release(
+        let result = signed_release(
             &format!("{base}/{NAME}"),
             &dest,
             &|| {
@@ -944,7 +973,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result =
             download_large_cancellable("http://127.0.0.1:9/never", &dir.path().join("x"), || false);
-        if crate::signing::RELEASE_PUBLIC_KEY == "FERESTRE_RELEASE_PUBLIC_KEY_PLACEHOLDER" {
+        if !crate::signing::has_release_key() {
             let error = result.unwrap_err().to_string();
             assert!(error.contains("no release signing key"), "{error}");
         }

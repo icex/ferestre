@@ -18,3 +18,7 @@ serde_json.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 libc.workspace = true
+
+[dev-dependencies]
+# Signs fixture runtime archives with a throwaway key.
+ferestre-core = { path = "../ferestre-core", features = ["test-signing"] }
