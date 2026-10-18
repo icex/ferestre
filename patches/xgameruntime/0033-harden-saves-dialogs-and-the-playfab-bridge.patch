@@ -264,7 +264,7 @@ index d0adbaa..d409a2a 100644
  }
  
 diff --git a/private.h b/private.h
-index f6a06c5..b54fd04 100644
+index 786de8e..1ca3f68 100644
 --- a/private.h
 +++ b/private.h
 @@ -151,6 +151,10 @@ void xgr_title_identity( char *title_id, SIZE_T title_id_len, char *client_id, S

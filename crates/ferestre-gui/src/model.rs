@@ -1314,6 +1314,15 @@ pub fn uninstall_args(product_id: &str, prefixes: Option<&[PathBuf]>) -> Option<
     Some(args)
 }
 
+/// `ferestre uninstall` arguments that forget a title's record and touch no
+/// file: for a record that names a library rather than the title's own
+/// folder, which nothing may delete as one title.
+pub fn forget_args(product_id: &str) -> Vec<String> {
+    ["uninstall", product_id, "--yes", "--keep-files"]
+        .map(String::from)
+        .to_vec()
+}
+
 /// What is in a folder named as an install destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Folder {
@@ -1467,6 +1476,10 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         let odd = PathBuf::from(std::ffi::OsStr::from_bytes(b"/g/\xff-proton"));
         assert_eq!(uninstall_args("9ZZA", Some(&[odd])), None);
+        assert_eq!(
+            forget_args("9ZZA"),
+            ["uninstall", "9ZZA", "--yes", "--keep-files"]
+        );
     }
     use ferestre_core::runtime::CapabilitySource;
     use std::collections::BTreeSet;

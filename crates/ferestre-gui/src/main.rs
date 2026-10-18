@@ -2728,6 +2728,7 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
             .as_ref()
             .is_some_and(|c| c.requested());
         finish(&ui);
+        let mut asked = false;
         match result {
             Ok(Ok(status)) if status.success() => {
                 // The record was written by the child, so the window has to
@@ -2745,6 +2746,7 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
                         == Some(i32::from(ferestre_core::runtime::EXIT_DOWNGRADE_REFUSED)) =>
             {
                 confirm_runtime_downgrade(&ui);
+                asked = true;
             }
             Ok(Ok(status)) => {
                 ui.model.borrow_mut().reload();
@@ -2759,8 +2761,11 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
         }
         // On a first run the runtime download is started instead of the
         // account refresh, which then never happened: Play stayed refused
-        // with "identities are still loading" for the whole session.
-        if runtime_install {
+        // with "identities are still loading" for the whole session. Not
+        // while the downgrade question is open, though: the refresh holds
+        // the window busy for up to a minute, and an answer of "install"
+        // in that time was refused as busy. The dialog refreshes instead.
+        if runtime_install && !asked {
             refresh_account(&ui);
         }
     });
@@ -2788,12 +2793,18 @@ fn confirm_runtime_downgrade(ui: &Ui) {
     let window = ui.window.clone();
     let ui = ui.clone();
     dialog.connect_response(None, move |_, response| {
+        // The account refresh the first try skipped: the install refreshes
+        // when it finishes, and otherwise it is started (or owed) here.
+        let busy = ui.busy.borrow().is_some();
         if response == "install" {
             spawn_cli_tracked(
                 &ui,
                 &["install-runtime", "--allow-downgrade"],
                 "Downloading the runtime",
             );
+        }
+        if response != "install" || busy {
+            refresh_account(&ui);
         }
     });
     dialog.present(Some(&window));
@@ -2875,7 +2886,6 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
     let resolve: Resolve = {
         let ui = ui.clone();
         let product_id = product_id.to_string();
-        let folder = folder.clone();
         Rc::new(move |text: &str| {
             let model = ui.model.borrow();
             model::install_destination(text, home.as_deref(), &folder, &|dir| {
@@ -2918,16 +2928,14 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
                 // `ferestre install` takes the folder as the library, as the
                 // field does, and finds the title's folder in it by the same
                 // rule. Only a folder that is already this title's -- its
-                // install, or its stopped download -- goes as it is, since
-                // its name need not be the one a fresh install would get.
-                let own = matches!(
-                    ui.model.borrow().inspect_folder(&product_id, &dir),
-                    model::Folder::This | model::Folder::Download
-                );
-                let library = model::library_of(&dir, &folder);
-                let argument = if own { Some(dir.as_path()) } else { library };
+                // install, its stopped download, or its default folder --
+                // goes as it is, since its name need not be the one a fresh
+                // install would get.
+                let argument = ui.model.borrow().install_argument(&product_id, &dir);
                 match argument {
-                    Some(argument) => spawn_install(&ui, &product_id, &name, Some(argument), what),
+                    Some(argument) => {
+                        spawn_install(&ui, &product_id, &name, Some(argument.as_path()), what)
+                    }
                     None => ui
                         .toasts
                         .add_toast(toast("Cannot work out where to put it")),
@@ -2974,6 +2982,14 @@ fn confirm_remove(ui: &Ui, product_id: &str, name: &str) {
             .add_toast(toast(format!("Nothing of {name} is on disk to remove")));
         return;
     };
+    // A library recorded as the title's folder is never offered for
+    // deletion: `ferestre uninstall` would refuse it anyway, after the person
+    // had agreed to lose the whole library.
+    let library = ui.model.borrow().removal_library(product_id, &dir);
+    if let Some(why) = library {
+        confirm_forget_library(ui, product_id, name, &dir, &why);
+        return;
+    }
 
     let body =
         {
@@ -3093,6 +3109,45 @@ fn confirm_remove(ui: &Ui, product_id: &str, name: &str) {
         };
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         spawn_cli_tracked(&ui, &args, &format!("Removing {name}"));
+    });
+    dialog.present(Some(&window));
+}
+
+/// Remove for a title whose record names a library of games rather than a
+/// folder of its own: nothing is deleted, and the only thing offered is to
+/// forget the record and leave every file where it is.
+fn confirm_forget_library(ui: &Ui, product_id: &str, name: &str, dir: &Path, why: &str) {
+    let dialog = adw::AlertDialog::new(
+        Some(&format!("Forget {name}?")),
+        Some(&format!(
+            "{name} is recorded in {}, but {why}, so it is a library of games rather \
+             than {name}'s own folder. It cannot be removed as one title.\n\n\
+             Forgetting {name} deletes nothing: its files stay where they are, for \
+             you to delete yourself. Installing it again puts it in a folder of its own.",
+            dir.display()
+        )),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("forget", "Forget");
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let window = ui.window.clone();
+    let ui = ui.clone();
+    let key = product_id.to_ascii_uppercase();
+    let product_id = product_id.to_string();
+    let name = name.to_string();
+    dialog.connect_response(None, move |_, response| {
+        if response != "forget" {
+            return;
+        }
+        if ui.running.borrow().contains_key(&key) {
+            ui.toasts
+                .add_toast(toast(format!("Stop {name} before forgetting it")));
+            return;
+        }
+        let args = model::forget_args(&product_id);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        spawn_cli_tracked(&ui, &args, &format!("Forgetting {name}"));
     });
     dialog.present(Some(&window));
 }

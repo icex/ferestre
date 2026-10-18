@@ -452,9 +452,12 @@ fn protected_dirs(paths: &crate::paths::Paths) -> Vec<(&'static str, PathBuf)> {
 /// its recorded directory, or a folder whose package names this product --
 /// which is used as it is, so a repair or an update lands on the existing
 /// files rather than in a new copy one level down. A download that was
-/// cancelled before it named its product counts as this title's too, chosen
-/// directly or found at `<chosen>/<folder>`: a first download has no record
-/// yet, and Resume has to continue it rather than be refused.
+/// cancelled before it named its product counts as this title's too, found
+/// at `<chosen>/<folder>` or chosen as that folder itself (the chosen path
+/// ends in `folder`): a first download has no record yet, and Resume has to
+/// continue it rather than be refused. A download file anywhere else, such
+/// as one left in a library by the old "Install to", does not make the
+/// chosen folder the title's.
 ///
 /// `<chosen>/<folder>` may already exist only if it is empty, this title's,
 /// or such a download. Anything else in it is somebody's files, and they
@@ -503,12 +506,19 @@ pub fn resolve_destination(
     let owner = |dir: &Path| owner_of(dir, product_id, paths);
 
     let destination = match owner(&chosen) {
-        Owner::This | Owner::Unknown => chosen,
+        Owner::This => chosen,
+        // A stopped first download is resumed in place only when it is in
+        // the folder a first download gets, `<library>/<folder>`, which is
+        // what the window passes to resume one. Anywhere else a stray
+        // download file says nothing about whose folder this is: the old
+        // "Install to" left them in libraries, and taking the library as the
+        // title's folder would make all of it what Remove deletes.
+        Owner::Unknown if chosen.ends_with(folder_path) => chosen,
         Owner::Other(other) => bail!(
             "{} is the folder of {other}; choose the folder your games go in",
             chosen.display()
         ),
-        Owner::Nobody => chosen.join(folder_path),
+        Owner::Unknown | Owner::Nobody => chosen.join(folder_path),
     };
 
     match owner(&destination) {
@@ -610,6 +620,7 @@ fn owner_of(dir: &Path, product_id: &str, paths: &crate::paths::Paths) -> Owner 
         Some(_) if library() => Owner::Nobody,
         Some(id) if id.eq_ignore_ascii_case(product_id) => Owner::This,
         Some(id) => Owner::Other(id),
+        None if partial && library() => Owner::Nobody,
         None if partial => Owner::Unknown,
         None => Owner::Other("a title the launcher cannot name".into()),
     }
@@ -1589,6 +1600,48 @@ mod tests {
                 .to_string();
             assert!(err.contains("9ZZOTHERGAME"), "{err}");
         }
+        // A download file in a folder that is not where a first download
+        // goes says nothing about whose folder it is: the title still gets a
+        // folder of its own inside, whether the folder holds other games or
+        // only somebody's own files.
+        let stray = home.root.join("stray");
+        partial(&stray);
+        std::fs::create_dir_all(stray.join("Other Game")).unwrap();
+        std::fs::write(
+            stray.join("Other Game/MicrosoftGame.config"),
+            "<Game><StoreId>9ZZOTHERGAME</StoreId></Game>",
+        )
+        .unwrap();
+        assert!(library_evidence(&stray, "9NNX1VVR3KNQ", p).is_some());
+        assert_eq!(
+            resolve_destination(stray.to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p).unwrap(),
+            stray.join("fh5")
+        );
+        let mine = home.root.join("mine");
+        partial(&mine);
+        std::fs::write(mine.join("notes.txt"), b"mine").unwrap();
+        assert_eq!(library_evidence(&mine, "9NNX1VVR3KNQ", p), None);
+        assert_eq!(
+            resolve_destination(mine.to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p).unwrap(),
+            mine.join("fh5")
+        );
+        // A first download one level down in such a folder is still resumed.
+        partial(&stray.join("fh5"));
+        assert_eq!(
+            resolve_destination(stray.to_str().unwrap(), "fh5", "9NNX1VVR3KNQ", p).unwrap(),
+            stray.join("fh5")
+        );
+        assert_eq!(
+            resolve_destination(
+                stray.join("fh5").to_str().unwrap(),
+                "fh5",
+                "9NNX1VVR3KNQ",
+                p
+            )
+            .unwrap(),
+            stray.join("fh5")
+        );
+
         let games_fh5 = home.games().join("fh5");
         let mut other = record(&[]);
         other.product_id = "9ZZOTHERGAME".into();

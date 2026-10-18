@@ -544,6 +544,36 @@ impl Model {
         Some((library, folder, default))
     }
 
+    /// What to pass `ferestre install` for a destination the "Install to"
+    /// dialog resolved: the folder itself when it already is the title's --
+    /// its install, its stopped download, or the default folder `ferestre
+    /// install` uses as it is -- and otherwise the library it is in, where
+    /// `ferestre install` finds the title's folder by the same rule.
+    ///
+    /// The default folder has to go as it is: a recipe's directory variable
+    /// (`FH5_DIR=/mnt/games/FH5`) need not end in the folder name a library
+    /// install gets (`fh5`), so passing its parent would install somewhere
+    /// the launch never looks.
+    pub fn install_argument(&self, product_id: &str, dir: &Path) -> Option<PathBuf> {
+        use crate::model::Folder;
+        let (_, folder, target) = self.install_target(product_id)?;
+        if matches!(
+            self.inspect_folder(product_id, dir),
+            Folder::This | Folder::Download
+        ) {
+            return Some(dir.to_path_buf());
+        }
+        // Only the default `ferestre install` itself would choose; a recorded
+        // library's inside folder is not that, and goes as its library.
+        let default = self
+            .install_destination(product_id)
+            .filter(|default| *default == target);
+        if default.is_some_and(|default| same_folder(&default, dir)) {
+            return Some(dir.to_path_buf());
+        }
+        crate::model::library_of(dir, &folder).map(Path::to_path_buf)
+    }
+
     /// What is in `dir`, as a destination for installing `product_id`.
     pub fn inspect_folder(&self, product_id: &str, dir: &Path) -> crate::model::Folder {
         use crate::model::Folder;
@@ -610,6 +640,16 @@ impl Model {
                 guess.is_dir().then_some(guess)
             })
             .filter(|dir| dir.is_dir())
+    }
+
+    /// Why the folder Remove would delete is not the title's own folder but
+    /// a library of games ([`install::library_evidence`]): what the old
+    /// "Install to" recorded when it put a title straight into the library
+    /// chosen. `ferestre uninstall` refuses to delete such a folder, so the
+    /// Remove dialog must not offer to.
+    pub fn removal_library(&self, product_id: &str, dir: &Path) -> Option<String> {
+        let paths = self.paths.as_ref()?;
+        install::library_evidence(dir, &product_id.to_ascii_uppercase(), paths)
     }
 
     /// The title's Wine prefixes on disk: the one every launch used before
@@ -1231,6 +1271,100 @@ mod tests {
             })
             .unwrap();
         assert_eq!(resolved, library.join("bedrock/game"));
+    }
+
+    /// A recipe's directory variable can name a folder whose last
+    /// component is not the folder a library install gets. While it is
+    /// missing or empty the dialog shows it as the destination, and that is
+    /// what has to reach `ferestre install`, not its parent.
+    #[test]
+    fn install_to_passes_a_dir_env_default_as_it_is() {
+        let scratch = Scratch::new("dir-env");
+        let root = scratch.0.display().to_string();
+        let target = scratch.0.join("mnt/games/FH5");
+        let mut model = model_at(&scratch.0);
+        model.paths = Some(
+            Paths::resolve(&Env::from_map([
+                ("HOME", format!("{root}/home")),
+                ("XODUS_GAMES_DIR", format!("{root}/games")),
+                ("XDG_STATE_HOME", format!("{root}/state")),
+                ("XDG_CONFIG_HOME", format!("{root}/config")),
+                ("XDG_CACHE_HOME", format!("{root}/cache")),
+                ("TEST_DIR", target.display().to_string()),
+            ]))
+            .unwrap(),
+        );
+        let mut fh5 = recipe("9NNX1VVR3KNQ", Some("fh5"));
+        fh5.install.dir_env = Some("TEST_DIR".into());
+        model.recipes = vec![fh5];
+        let id = "9NNX1VVR3KNQ";
+        let (library, folder, default) = model.install_target(id).unwrap();
+        assert_eq!(
+            (library.as_path(), folder.as_path(), default.as_path()),
+            (target.parent().unwrap(), Path::new("FH5"), target.as_path())
+        );
+        let resolve = |typed: &Path| {
+            crate::model::install_destination(typed.to_str().unwrap(), None, &folder, &|dir| {
+                model.inspect_folder(id, dir)
+            })
+            .unwrap()
+        };
+        // Missing, then empty: the dialog says FH5, and FH5 is passed.
+        for make in [false, true] {
+            if make {
+                std::fs::create_dir_all(&target).unwrap();
+            }
+            let dir = resolve(&library);
+            assert_eq!(dir, target);
+            assert_eq!(model.install_argument(id, &dir), Some(target.clone()));
+        }
+    }
+
+    /// Remove deletes only a title's own folder. A library recorded as the
+    /// title's folder is named as one, so the dialog never offers to delete
+    /// it.
+    #[test]
+    fn remove_does_not_offer_a_recorded_library() {
+        let scratch = Scratch::new("remove-library");
+        let mut model = model_at(&scratch.0);
+        let id = "9NBLGGH2JHXJ";
+        let library = scratch.0.join("mnt/games");
+        installed(&library, id);
+        installed(&library.join("Other Game"), "9ZZB");
+        model.records.insert(id.into(), record(id, &library));
+        let dir = model.removal_dir(id).unwrap();
+        assert_eq!(dir, library);
+        let why = model.removal_library(id, &dir).unwrap();
+        assert!(why.contains("Other Game"), "{why}");
+        // The title's own folder is offered as it is.
+        let own = scratch.0.join("games/bedrock");
+        installed(&own, id);
+        model.records.insert(id.into(), record(id, &own));
+        assert_eq!(
+            model.removal_library(id, &model.removal_dir(id).unwrap()),
+            None
+        );
+    }
+
+    /// A library recorded as the title's folder: the folder inside it is not
+    /// a default `ferestre install` takes as it is, so the library goes.
+    #[test]
+    fn install_to_passes_a_recorded_library_as_the_library() {
+        let scratch = Scratch::new("argument-library");
+        let mut model = model_at(&scratch.0);
+        let library = scratch.0.join("mnt/games");
+        installed(&library, "9NBLGGH2JHXJ");
+        installed(&library.join("Other Game"), "9ZZB");
+        model.recipes = vec![recipe("9NBLGGH2JHXJ", Some("bedrock/game"))];
+        model
+            .records
+            .insert("9NBLGGH2JHXJ".into(), record("9NBLGGH2JHXJ", &library));
+        let (_, _, inside) = model.install_target("9NBLGGH2JHXJ").unwrap();
+        assert_eq!(inside, library.join("bedrock/game"));
+        assert_eq!(
+            model.install_argument("9NBLGGH2JHXJ", &inside),
+            Some(library.clone())
+        );
     }
 
     #[test]

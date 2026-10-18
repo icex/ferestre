@@ -108,6 +108,28 @@ keys, or let one process read what it should not:
   welcome, but the fix belongs there.
 - Missing hardening with no attack behind it. Say what an attacker gains.
 
+## Known limitations
+
+These are known and not yet fixed. A report that finds a way to make one of
+them worse, or a fix, is welcome.
+
+- **Package downloads over plain http can be rewritten in transit.** The
+  package service usually lists only plain `http://` CDN roots, and the
+  client uses them, with a note on stderr. Every page the client installs is
+  checked against the package's hash tree, and the hash tree against the top
+  hash in the package header (client patch 0022). But the header's own
+  signature is not checked, so the header is only as trustworthy as the
+  connection it came over. Someone who can change traffic between you and
+  the CDN (an untrusted network, a hostile proxy) can rewrite the header,
+  the hash tree and the package's file table together, consistently, and so
+  install files of their choosing into a title's folder. Those files run
+  when the title starts. Accidental corruption is caught; a deliberate
+  rewrite of a plain http download is not. To refuse plain http CDN roots
+  and fail instead, set `XODUS_REQUIRE_HTTPS_CDN=1` for `ferestre install`
+  (and the client). Closing this needs the header checked against something
+  that did not arrive over http: Microsoft's XVD signing key, or a digest from
+  the authenticated package service.
+
 ## What this project stores
 
 Nothing in this repository, ever: no content, no packages, no licences, no

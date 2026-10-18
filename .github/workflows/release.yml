@@ -26,18 +26,18 @@
 # A workflow_dispatch run builds and uploads the same artefacts without
 # publishing anything, which is how to find out whether a release would build
 # before committing to a tag. Those artefacts are UNSIGNED: nothing is signed
-# outside a tag, the run says so in its summary, and the launcher refuses an
-# unsigned runtime.
+# outside a tag push (a manual run started on a tag ref is still a manual run),
+# the run says so in its summary, and the launcher refuses an unsigned runtime.
 #
 # Two jobs, because building runs a great deal of code nobody here wrote: the
 # build scripts and proc-macros of every crate in two dependency trees, and the
 # actions that set the toolchain up. `build` does all of that with a read-only
-# token that is not even written to the checkout. `publish` runs only on a tag,
-# after `build` has succeeded, and does nothing but check, sign and upload the
-# artefacts it is handed -- it is the one job that holds a token able to write
-# releases, and the only one that sees the signing key.
+# token that is not even written to the checkout. `publish` runs only on a tag
+# push, after `build` has succeeded, and does nothing but check, sign and
+# upload the artefacts it is handed -- it is the one job that holds a token able
+# to write releases, and the only one that sees the signing key.
 #
-# Signing uses minisign, and happens only on a tag. The secrets live in the
+# Signing uses minisign, and happens only on a tag push. The secrets live in the
 # GitHub Environment named `release`, not in the repository: MINISIGN_SECRET_KEY
 # holds the whole secret key file, and MINISIGN_PASSWORD its password (unset for
 # a key made with -W). `publish` is the only job that names that environment,
@@ -85,7 +85,7 @@ jobs:
       # publish work that never reached main. Now that there are two branches
       # this is worth one fetch to be sure of.
       - name: The tag must be on main
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: |
           set -euo pipefail
           git -C "." fetch --quiet --depth=100 origin main
@@ -138,7 +138,7 @@ jobs:
       # The publish job uses these as the release text, and finding out they
       # are missing after an hour of building helps nobody.
       - name: Release notes
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -260,7 +260,7 @@ jobs:
       # Said out loud, because an artefact from a manual run looks exactly
       # like a release's except for the missing .minisig files.
       - name: Unsigned build
-        if: github.ref_type != 'tag'
+        if: github.event_name != 'push' || github.ref_type != 'tag'
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -275,18 +275,18 @@ jobs:
           if-no-files-found: error
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         with:
           name: release-notes
           path: notes/*
           if-no-files-found: error
 
-  # Only a tag publishes. A manual run has produced the same artefacts and
+  # Only a tag push publishes. A manual run, even on a tag ref, has produced the same artefacts and
   # attached them to the run, unsigned, which is the point of being able to
   # try.
   publish:
     needs: build
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     # The signing secrets are environment secrets of `release`. Restrict that
     # environment to v* and runtime-* tags and give it a required reviewer
@@ -325,7 +325,7 @@ jobs:
       # The version in the trusted comment is the tag's, and the artefacts
       # must carry the same one.
       - name: Sign
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}

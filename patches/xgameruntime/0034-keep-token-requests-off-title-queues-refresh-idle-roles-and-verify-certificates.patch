@@ -301,7 +301,7 @@ index b4a2189..cfd6d88 100644
      /* Legacy mode has no live Store state. */
      if (token) token->token = 1;
 diff --git a/xthreading.c b/xthreading.c
-index 5a52da0..5a91d8e 100644
+index edcc8da..f665a59 100644
 --- a/xthreading.c
 +++ b/xthreading.c
 @@ -1043,6 +1043,61 @@ static void queue_finish( struct x_task_queue *queue )

@@ -15,12 +15,13 @@ runtime that is unsigned or signed by any other key.
 ## How signing is wired
 
 - Each workflow has two jobs. `build` compiles everything with a read-only
-  token and never sees the key. `publish` runs only for a tag, after `build`
+  token and never sees the key. `publish` runs only for a tag push
+  (`github.event_name == 'push' && github.ref_type == 'tag'`), after `build`
   succeeded. It is the only job with `contents: write` and the only job that
   names the `release` environment, so it is the only job that can read the
   signing secrets. It runs no build and no third-party action apart from
   checkout and download-artifact. All actions are pinned to a commit.
-- The `Sign` step also has `if: github.ref_type == 'tag'`, and
+- The `Sign` step has the same condition, and
   `packaging/sign-release.sh` checks that every file matches `SHA256SUMS`
   before it signs anything.
 - Each signature's trusted comment is exactly
@@ -39,9 +40,12 @@ runtime that is unsigned or signed by any other key.
   checks `signing.rs` at the tagged commit. If the key does not match, or
   `signing.rs` still has the placeholder, the release stops at `Sign` and
   nothing is published.
-- **Manual runs (`workflow_dispatch`) are never signed.** They build the same
-  artefacts and attach them to the run so you can check that a release would
-  build. Their summary says they are **UNSIGNED**, and `ferestre
+- **Manual runs (`workflow_dispatch`) are never signed**, even when started
+  on a tag ref: the condition asks for a push event, not just a tag. They
+  build the same artefacts and attach them to the run so you can check that a
+  release would build. Only a manual run from a branch can build another
+  Proton commit (`proton_ref`); one started on a tag builds the pinned commit
+  or stops. Their summary says they are **UNSIGNED**, and `ferestre
   install-runtime` refuses such a runtime.
 
 ## One-time setup
@@ -172,19 +176,35 @@ key.
    it. On a trusted machine, with the new secret key:
 
    ```sh
+   (
+   set -euo pipefail
    tag=runtime-11.0.20260907; version=${tag#runtime-}
+   old_key='RW...old...'                  # the old public key, as signing.rs had it
+   new_key=$PWD/ferestre-release.key       # the new secret key
    mkdir "$tag" && cd "$tag"
    gh release download "$tag" --pattern '*.tar.xz' --pattern SHA256SUMS
-   sha256sum -c SHA256SUMS
-   # Check the files against the OLD public key first, so that only what was
-   # really released gets the new signature:
+   sha256sum -c SHA256SUMS || { echo "SHA256SUMS does not match"; exit 1; }
+   # Check every file against the OLD public key, and its trusted comment
+   # against this file and release, before anything gets a new signature:
+   # only what was really released may be signed again.
    for f in *.tar.xz SHA256SUMS; do
        gh release download "$tag" --pattern "$f.minisig"
-       minisign -Vm "$f" -P 'RW...old...'
-       minisign -S -s ferestre-release.key -m "$f" -t "file:$f version:$version"
+       comment=$(minisign -V -Q -m "$f" -P "$old_key") ||
+           { echo "$f does not verify against the old key"; exit 1; }
+       [ "$comment" = "file:$f version:$version" ] ||
+           { echo "$f is signed as '$comment', not file:$f version:$version"; exit 1; }
+   done
+   # Only now, and only once all of them passed, sign with the new key.
+   for f in *.tar.xz SHA256SUMS; do
+       minisign -S -s "$new_key" -m "$f" -t "file:$f version:$version"
    done
    gh release upload "$tag" ./*.minisig --clobber
+   )
    ```
+
+   The subshell stops at the first failure without closing your terminal, and
+   nothing has been uploaded when it does. Find out why the release does not
+   match what was signed before trying again.
 
    Launchers from before the rotation will refuse this runtime from then on,
    and their users have to update the launcher. Wait until the new launcher

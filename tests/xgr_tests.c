@@ -1537,6 +1537,114 @@ static HRESULT CALLBACK x1_slow_run( XAsyncBlock *async )
     return S_OK;
 }
 
+/* Strict manual mode (XGR_STRICT_MANUAL_QUEUES=1, as Halo runs): work on a
+ * Manual port runs inside the title's own XTaskQueueDispatch. A callback a
+ * title thread is inside when another thread terminates the queue is still
+ * the queue's, and the terminated callback -- after which the title frees what
+ * that callback is using -- has to wait for it. */
+static XTaskQueueHandle x1_dispatch_queue;
+
+static DWORD WINAPI x1_dispatch_thread( void *arg )
+{
+    IXThreadingImpl_XTaskQueueDispatch( threading, x1_dispatch_queue, XTaskQueuePort_Work, 0 );
+    return 0;
+}
+
+static void CALLBACK x1_blocking_finish_cb( void *context, BOOLEAN canceled )
+{
+    SetEvent( x1_started );
+    WaitForSingleObject( x1_release, 5000 );
+    InterlockedExchange( (LONG *)&x1_finished, 1 );
+    InterlockedExchange( (LONG *)&x1_cb_seq, InterlockedIncrement( (LONG *)&x1_seq ) );
+}
+
+static DWORD WINAPI x1_terminate_and_wait_thread( void *arg )
+{
+    IXThreadingImpl_XTaskQueueTerminate( threading, arg, TRUE, NULL, x1_terminated );
+    InterlockedExchange( (LONG *)&x1_done_seq, InterlockedIncrement( (LONG *)&x1_seq ) );
+    return 0;
+}
+
+static void test_strict_manual_termination(void)
+{
+    XTaskQueueHandle queue;
+    HANDLE dispatcher, terminator;
+    HRESULT hr;
+    int wait;
+
+    printf( "# Strict manual queues: termination waits for a dispatched callback\n" );
+    if (!x1_started) x1_started = CreateEventW( NULL, FALSE, FALSE, NULL );
+    if (!x1_release) x1_release = CreateEventW( NULL, TRUE, FALSE, NULL );
+
+    for (wait = 0; wait < 2; ++wait)
+    {
+        x1_reset();
+        InterlockedExchange( (LONG *)&x1_done_seq, 0 );
+        ResetEvent( x1_release );
+        hr = IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_Manual,
+                                               XTaskQueueDispatchMode_Manual, &queue );
+        CHECK( hr == S_OK && queue, "create a manual queue (0x%08lx)", hr );
+        if (!queue) return;
+        x1_dispatch_queue = queue;
+        hr = IXThreadingImpl_XTaskQueueSubmitCallback( threading, queue, XTaskQueuePort_Work,
+                                                       NULL, x1_blocking_finish_cb );
+        CHECK( hr == S_OK, "queue manual work (0x%08lx)", hr );
+        dispatcher = CreateThread( NULL, 0, x1_dispatch_thread, NULL, 0, NULL );
+        CHECK( WaitForSingleObject( x1_started, 2000 ) == WAIT_OBJECT_0,
+               "a title thread dispatches the work and is inside it" );
+        if (wait)
+            terminator = CreateThread( NULL, 0, x1_terminate_and_wait_thread, queue, 0, NULL );
+        else
+        {
+            terminator = NULL;
+            hr = IXThreadingImpl_XTaskQueueTerminate( threading, queue, FALSE, NULL, x1_terminated );
+            CHECK( hr == S_OK, "terminate without wait (0x%08lx)", hr );
+        }
+        Sleep( 300 );
+        CHECK( !x1_term_runs && !x1_done_seq,
+               "%s: nothing reports termination while the callback runs (terminated %ld, returned %ld)",
+               wait ? "wait" : "no wait", x1_term_runs, x1_done_seq );
+        SetEvent( x1_release );
+        WaitForSingleObject( dispatcher, 5000 );
+        CloseHandle( dispatcher );
+        if (terminator)
+        {
+            CHECK( WaitForSingleObject( terminator, 5000 ) == WAIT_OBJECT_0,
+                   "terminate with wait returns once the callback has" );
+            CloseHandle( terminator );
+        }
+        x1_wait_for( &x1_term_runs, 1, 3000 );
+        CHECK( x1_term_runs == 1 && x1_finished_seen == 1 && x1_cb_seq < x1_term_seq,
+               "%s: the terminated callback follows the dispatched one (runs %ld, saw finished %ld, %ld < %ld)",
+               wait ? "wait" : "no wait", x1_term_runs, x1_finished_seen, x1_cb_seq, x1_term_seq );
+        if (wait) CHECK( x1_cb_seq < x1_done_seq, "terminate with wait returns after the callback (%ld < %ld)",
+                         x1_cb_seq, x1_done_seq );
+        IXThreadingImpl_XTaskQueueCloseHandle( threading, queue );
+    }
+
+    /* A manual callback that terminates its own queue and asks to wait is not
+     * left waiting for itself. */
+    x1_reset();
+    InterlockedExchange( (LONG *)&x1_done_seq, 0 );
+    InterlockedExchange( (LONG *)&x1_inner_terminate_hr, -1 );
+    hr = IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_Manual,
+                                           XTaskQueueDispatchMode_Manual, &x1_self_queue );
+    CHECK( hr == S_OK && x1_self_queue, "create a manual queue to terminate from inside (0x%08lx)", hr );
+    if (!x1_self_queue) return;
+    IXThreadingImpl_XTaskQueueSubmitCallback( threading, x1_self_queue, XTaskQueuePort_Work, NULL, x1_self_terminate_cb );
+    x1_dispatch_queue = x1_self_queue;
+    dispatcher = CreateThread( NULL, 0, x1_dispatch_thread, NULL, 0, NULL );
+    CHECK( WaitForSingleObject( dispatcher, 5000 ) == WAIT_OBJECT_0,
+           "a manual callback terminating its own queue with wait returns" );
+    CloseHandle( dispatcher );
+    x1_wait_for( &x1_term_runs, 1, 3000 );
+    CHECK( x1_inner_terminate_hr == S_OK && x1_term_runs == 1 && x1_done_seq < x1_term_seq,
+           "its terminated callback follows its return (hr 0x%08lx, runs %ld, %ld < %ld)",
+           x1_inner_terminate_hr, x1_term_runs, x1_done_seq, x1_term_seq );
+    IXThreadingImpl_XTaskQueueCloseHandle( threading, x1_self_queue );
+    x1_self_queue = NULL;
+}
+
 static void test_queue_termination(void)
 {
     XTaskQueueHandle queue;
@@ -2495,6 +2603,7 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "--manual-queues"))
     {
         test_manual_queues();
+        test_strict_manual_termination();
         test_async_wait_under_load();
         printf( "%s: %d checks, %d failed\n", g_failed ? "FAILED" : "PASSED", g_run, g_failed );
         return g_failed;

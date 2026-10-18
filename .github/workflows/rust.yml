@@ -59,6 +59,10 @@ on:
       - 'tests/test_build_appimage.py'
       - 'tests/test_release_signing.py'
       - 'tests/test_workflows.py'
+      # The native harnesses and fixtures: the shell syntax step and the
+      # `patches` job check these.
+      - 'tests/*.sh'
+      - 'tests/license_token_fixture.py'
       - '.github/workflows/**'
   pull_request:
     paths:
@@ -93,6 +97,10 @@ on:
       - 'tests/test_build_appimage.py'
       - 'tests/test_release_signing.py'
       - 'tests/test_workflows.py'
+      # The native harnesses and fixtures: the shell syntax step and the
+      # `patches` job check these.
+      - 'tests/*.sh'
+      - 'tests/license_token_fixture.py'
       - '.github/workflows/**'
   workflow_dispatch:
 
@@ -132,23 +140,27 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
-      - name: Test
-        run: cargo test --locked --workspace
-
-      - name: Download cancellation (offline)
-        run: cargo build --locked -p ferestre-cli && python3 tests/test_download_cancel.py && python3 tests/test_media_dependencies.py && python3 tests/test_client_dependencies.py
-
       # Ubuntu's runners restrict unprivileged user namespaces through
       # AppArmor, and the image-view tests skip themselves where the namespace
       # probe fails -- which would leave the code that keeps decrypted game
-      # files private untested behind a green tick. Lift the restriction for
-      # this runner, and tell the tests a skip is a failure here.
+      # files private, and the graceful Stop of a title inside the image
+      # view's namespaces (stop.rs), untested behind a green tick. Lift the
+      # restriction for this runner before any test runs, and tell the tests
+      # a skip is a failure here.
       - name: Allow unprivileged user namespaces
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
               sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           unshare --user --map-root-user --mount true
+
+      - name: Test
+        env:
+          FERESTRE_REQUIRE_USERNS: '1'
+        run: cargo test --locked --workspace
+
+      - name: Download cancellation (offline)
+        run: cargo build --locked -p ferestre-cli && python3 tests/test_download_cancel.py && python3 tests/test_media_dependencies.py && python3 tests/test_client_dependencies.py
 
       - name: Launch helper tests
         env:
@@ -215,9 +227,19 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # As in `test`: the namespace tests must run, not skip.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user --mount true
+
       # Named explicitly, so a runner image with a different default compiler
       # cannot make this job test something else.
       - name: Test with the minimum supported Rust
+        env:
+          FERESTRE_REQUIRE_USERNS: '1'
         run: |
           rustc +1.88 --version
           cargo +1.88 test --locked --workspace
@@ -263,16 +285,25 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Service test dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev libdbus-1-dev protobuf-compiler
+      # WebKitGTK, GTK 3 and libsoup because xodus-cli links wry for the
+      # sign-in window, and its tests link the binary's crate.
+      - name: Client test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libdbus-1-dev protobuf-compiler \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev
 
       - name: Fixture script syntax
         run: |
           bash -n tests/run-tests.sh tests/build-license-service-fixture.sh
           python3 -m py_compile tests/license_token_fixture.py
 
-      - name: Apply the client series and test the service offline
+      # Offline, loopback only: the service, the download integrity checks
+      # (msixvc's hash tree and retries, the CLI's path and commit rules),
+      # the profile store and the file-backed key chain.
+      - name: Apply the client series and test it offline
         run: |
+          set -euo pipefail
           for patch in "$GITHUB_WORKSPACE"/patches/xodus-cli/*.patch; do
             case "$(basename "$patch")" in 0001-*) continue ;; esac
             git -C third_party/xodus-cli apply "$patch"
@@ -280,6 +311,9 @@ jobs:
           cd third_party/xodus-cli
           cargo test --locked -p xodus-service
           cargo test --locked -p xodus profile
+          cargo test --locked -p msixvc
+          cargo test --locked -p xodus-cli
+          cargo test --locked -p xodus --features key-chain-file --test key_chain_file
 
   gui:
     runs-on: ubuntu-latest

@@ -35,7 +35,8 @@
 # built into ferestre-core.
 #
 # A workflow_dispatch run builds the same tarball and attaches it to the run
-# UNSIGNED, and says so; the launcher will not install it. See
+# UNSIGNED, and says so; the launcher will not install it. That holds for a
+# manual run started on a tag ref too: signing and publishing ask for a push. See
 # docs/RELEASING.md.
 #
 # Cutting a runtime release:
@@ -100,7 +101,7 @@ jobs:
       # publish work that never reached main. Now that there are two branches
       # this is worth one fetch to be sure of.
       - name: The tag must be on main
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: |
           set -euo pipefail
           git -C "ferestre" fetch --quiet --depth=100 origin main
@@ -110,14 +111,27 @@ jobs:
           fi
           echo ":: $GITHUB_REF_NAME is on main"
 
+      # Only a manual run from a branch may build another Proton commit. A tag
+      # push always builds the pin, and a manual run started on a tag ref is
+      # refused another ref: its tarball would carry the tag's version.
       - name: Resolve the Proton ref
         id: ref
         env:
+          PINNED_REF: '7c0b4354'
           INPUT_REF: ${{ inputs.proton_ref }}
         run: |
+          set -euo pipefail
           # Through the environment, not interpolated: a dispatch input is text
           # somebody typed.
-          ref=${INPUT_REF:-7c0b4354}
+          ref=$PINNED_REF
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ -n "$INPUT_REF" ]; then
+              if [ "$GITHUB_REF_TYPE" != tag ]; then
+                  ref=$INPUT_REF
+              elif [ "$INPUT_REF" != "$PINNED_REF" ]; then
+                  echo "::error::a manual run on the tag $GITHUB_REF_NAME builds only the pinned Proton $PINNED_REF; start it from a branch to build $INPUT_REF"
+                  exit 1
+              fi
+          fi
           echo "proton=$ref" >> "$GITHUB_OUTPUT"
 
       - name: Clone Proton, Wine and the GDK runtime
@@ -248,7 +262,7 @@ jobs:
           ls -lh
 
       - name: Unsigned build
-        if: github.ref_type != 'tag'
+        if: github.event_name != 'push' || github.ref_type != 'tag'
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -267,7 +281,7 @@ jobs:
 
   publish:
     needs: build
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     # Where the signing secrets live; see release.yml and docs/RELEASING.md.
     environment: release
@@ -298,7 +312,7 @@ jobs:
       # every launcher would refuse this runtime; a placeholder there stops
       # the release here.
       - name: Sign
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
