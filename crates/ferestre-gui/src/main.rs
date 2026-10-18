@@ -2676,7 +2676,7 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
     *ui.wait_on_close.borrow_mut() = args.first() == Some(&"uninstall");
     let program = cli_binary();
     let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-    let runtime_install = owned == ["install-runtime"];
+    let runtime_install = owned.first().map(String::as_str) == Some("install-runtime");
     let control = runtime_install.then(cancel::DownloadControl::default);
     *ui.download_control.borrow_mut() = control.clone();
     show_activity(ui);
@@ -2739,6 +2739,13 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
             _ if stopped => {
                 ui.toasts.add_toast(toast("Runtime download stopped"));
             }
+            Ok(Ok(status))
+                if runtime_install
+                    && status.code()
+                        == Some(i32::from(ferestre_core::runtime::EXIT_DOWNGRADE_REFUSED)) =>
+            {
+                confirm_runtime_downgrade(&ui);
+            }
             Ok(Ok(status)) => {
                 ui.model.borrow_mut().reload();
                 render(&ui);
@@ -2757,6 +2764,39 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
             refresh_account(&ui);
         }
     });
+}
+
+/// `install-runtime` refused because the newest published runtime is older
+/// than one already installed. That is only ever installed when the person
+/// says so: an older release passed off as the newest is how a fixed bug
+/// would come back.
+fn confirm_runtime_downgrade(ui: &Ui) {
+    let dialog = adw::AlertDialog::new(
+        Some("Install an older runtime?"),
+        Some(
+            "The newest published runtime is older than one already installed. \
+             The installed runtimes are kept either way, and new launches keep \
+             using the newest one unless a title is set to another.\n\n\
+             Only install it if you meant to go back to that release.",
+        ),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("install", "Install Older Runtime");
+    dialog.set_response_appearance("install", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let window = ui.window.clone();
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response == "install" {
+            spawn_cli_tracked(
+                &ui,
+                &["install-runtime", "--allow-downgrade"],
+                "Downloading the runtime",
+            );
+        }
+    });
+    dialog.present(Some(&window));
 }
 
 /// Ask before downloading, and say where it is going.
@@ -3040,13 +3080,18 @@ fn confirm_remove(ui: &Ui, product_id: &str, name: &str) {
                 .add_toast(toast(format!("Stop {name} before removing it")));
             return;
         }
-        let mut args = vec!["uninstall", &product_id, "--yes"];
-        if also_prefix
+        let with_prefixes = also_prefix
             .as_ref()
-            .is_some_and(gtk::prelude::CheckButtonExt::is_active)
-        {
-            args.push("--prefix");
-        }
+            .is_some_and(gtk::prelude::CheckButtonExt::is_active);
+        let Some(args) =
+            model::uninstall_args(&product_id, with_prefixes.then_some(prefixes.as_slice()))
+        else {
+            ui.toasts.add_toast(toast(format!(
+                "Cannot remove {name}: a Wine prefix's folder name is not valid text"
+            )));
+            return;
+        };
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
         spawn_cli_tracked(&ui, &args, &format!("Removing {name}"));
     });
     dialog.present(Some(&window));

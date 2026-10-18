@@ -159,17 +159,30 @@ enum Cmd {
         /// Forget the record but leave the files where they are.
         #[arg(long)]
         keep_files: bool,
-        /// Also remove the title's Wine prefix. Saved games usually live there,
-        /// so it is kept unless this is passed.
+        /// Also remove the title's Wine prefix, and every Player's copy of it.
+        /// Saved games usually live there, so they are kept unless this is
+        /// passed.
         #[arg(long)]
         prefix: bool,
+        /// With --prefix, remove only this one of the title's prefixes; give
+        /// it once for each. Each must be the title's prefix or a Player's
+        /// copy of it, or nothing is removed, and the others are kept. The
+        /// window passes the ones its Remove dialog listed.
+        #[arg(long = "prefix-path", value_name = "DIR", requires = "prefix")]
+        prefix_paths: Vec<PathBuf>,
         /// Do not ask. Required when there is no terminal to ask at.
         #[arg(long, short = 'y')]
         yes: bool,
     },
 
     /// Build and install the patched Proton runtime.
-    InstallRuntime,
+    InstallRuntime {
+        /// Install the newest published runtime even when it is older than
+        /// one already installed. Without this, that is refused: an older
+        /// release served as the newest is how a fixed bug gets brought back.
+        #[arg(long)]
+        allow_downgrade: bool,
+    },
 
     /// Inspect an Appx or Msix archive without extracting or launching it.
     InspectPackage {
@@ -240,9 +253,19 @@ fn dispatch(cli: &Cli) -> Result<ExitCode> {
             product_id,
             keep_files,
             prefix,
+            prefix_paths,
             yes,
-        } => cmd_uninstall(cli, product_id, *keep_files, *prefix, *yes),
-        Cmd::InstallRuntime => cmd_install_runtime(cli),
+        } => cmd_uninstall(
+            cli,
+            product_id,
+            Removal {
+                keep_files: *keep_files,
+                remove_prefix: *prefix,
+                listed: (!prefix_paths.is_empty()).then_some(prefix_paths.as_slice()),
+                yes: *yes,
+            },
+        ),
+        Cmd::InstallRuntime { allow_downgrade } => cmd_install_runtime(cli, *allow_downgrade),
         Cmd::InspectPackage { path } => cmd_inspect_package(cli, path),
         Cmd::Env => cmd_env(cli),
         Cmd::Version => cmd_version(cli),
@@ -1143,34 +1166,62 @@ fn unfinished_update(dest: &Path, before: Option<&ContainerState>) -> Option<&'s
 /// to launch nothing, which is exactly the state that made this command
 /// necessary -- an install failed while the client exited zero, and there was
 /// no way to say so.
-fn cmd_uninstall(
-    cli: &Cli,
-    product_id: &str,
-    keep_files: bool,
-    remove_prefix: bool,
-    yes: bool,
-) -> Result<ExitCode> {
+fn cmd_uninstall(cli: &Cli, product_id: &str, removal: Removal) -> Result<ExitCode> {
     let paths = Paths::from_env()?;
     let mut stdin = std::io::stdin().lock();
-    uninstall_title(
-        cli,
-        &paths,
-        product_id,
-        Removal {
-            keep_files,
-            remove_prefix,
-            yes,
-        },
-        &mut stdin,
-    )
+    uninstall_title(cli, &paths, product_id, removal, &mut stdin)
 }
 
 /// What `uninstall` was asked to do.
 #[derive(Debug, Clone, Copy)]
-struct Removal {
+struct Removal<'a> {
     keep_files: bool,
     remove_prefix: bool,
+    /// With `remove_prefix`, the only prefixes to remove (`--prefix-path`):
+    /// what the window's dialog listed. `None` is every one the title has.
+    listed: Option<&'a [PathBuf]>,
     yes: bool,
+}
+
+/// The prefixes `uninstall --prefix` removes: all of the title's, or exactly
+/// the listed ones. A listed path that is not one of the title's prefixes is
+/// refused, so nothing a caller names can take anything else with it; one
+/// that is already gone is passed over.
+fn prefixes_to_remove(
+    prefixes: &[PathBuf],
+    removal: &Removal,
+    product_id: &str,
+) -> Result<Vec<PathBuf>> {
+    if !removal.remove_prefix {
+        return Ok(Vec::new());
+    }
+    let Some(listed) = removal.listed else {
+        return Ok(prefixes.to_vec());
+    };
+    let same = |a: &Path, b: &Path| {
+        a.components().eq(b.components())
+            || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+    };
+    let mut chosen = Vec::new();
+    for path in listed {
+        match prefixes.iter().find(|prefix| same(prefix, path)) {
+            Some(prefix) => {
+                if !chosen.contains(prefix) {
+                    chosen.push(prefix.clone());
+                }
+            }
+            None if !path.exists() && path.is_absolute() => {
+                eprintln!(":: the Wine prefix {} is already gone", path.display());
+            }
+            None => bail!(
+                "{} is not one of {product_id}'s Wine prefixes; nothing was removed",
+                path.display()
+            ),
+        }
+    }
+    // In the order they are listed everywhere else.
+    chosen.sort_by_key(|prefix| prefixes.iter().position(|p| p == prefix));
+    Ok(chosen)
 }
 
 fn uninstall_title(
@@ -1230,8 +1281,9 @@ fn uninstall_title(
     // saves are in `players/<namespace>/<prefix>`, not in the shared one.
     let prefixes = recipe
         .and_then(|r| paths.prefix_dir(r).ok())
-        .map(|base| title_prefixes(&base))
+        .map(|base| accounts::title_prefixes(&base))
         .unwrap_or_default();
+    let doomed_prefixes = prefixes_to_remove(&prefixes, &removal, &product_id)?;
 
     if cli.json {
         print_json(&json!({
@@ -1242,7 +1294,11 @@ fn uninstall_title(
             "had_record": record.is_some(),
             "prefix": prefixes.first().map(|p| p.display().to_string()),
             "prefixes": prefixes.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-            "removing_prefix": removal.remove_prefix && !prefixes.is_empty(),
+            "removing_prefix": !doomed_prefixes.is_empty(),
+            "removing_prefixes": doomed_prefixes
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
         }));
         return Ok(ExitCode::SUCCESS);
     }
@@ -1252,10 +1308,8 @@ fn uninstall_title(
     if removing {
         check_removable(&dir, paths, &product_id, Removable::Install)?;
     }
-    if removal.remove_prefix {
-        for prefix in &prefixes {
-            check_removable(prefix, paths, &product_id, Removable::Prefix)?;
-        }
+    for prefix in &doomed_prefixes {
+        check_removable(prefix, paths, &product_id, Removable::Prefix)?;
     }
     // Not while it runs, and not while something else is installing it.
     let _lock = TitleLock::take(paths, &product_id, LockMode::Change)?;
@@ -1266,9 +1320,7 @@ fn uninstall_title(
     if removing {
         doomed.push(&dir);
     }
-    if removal.remove_prefix {
-        doomed.extend(prefixes.iter().map(PathBuf::as_path));
-    }
+    doomed.extend(doomed_prefixes.iter().map(PathBuf::as_path));
     for (i, path) in doomed.iter().enumerate() {
         eprintln!(
             ":: removing {}{} ({})",
@@ -1305,7 +1357,7 @@ fn uninstall_title(
     }
 
     for prefix in &prefixes {
-        if removal.remove_prefix {
+        if doomed_prefixes.contains(prefix) {
             std::fs::remove_dir_all(prefix)
                 .with_context(|| format!("removing {}", prefix.display()))?;
             eprintln!("-- removed the Wine prefix {}", prefix.display());
@@ -1327,28 +1379,6 @@ fn uninstall_title(
         eprintln!("   the files are still in {}", dir.display());
     }
     Ok(ExitCode::SUCCESS)
-}
-
-/// A title's Wine prefixes that are on disk: the shared one, then each
-/// Player's own (`players/<namespace>/<prefix name>` beside it), sorted.
-fn title_prefixes(base: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    if base.is_dir() {
-        found.push(base.to_path_buf());
-    }
-    let (Some(parent), Some(name)) = (base.parent(), base.file_name()) else {
-        return found;
-    };
-    let mut players: Vec<PathBuf> = std::fs::read_dir(parent.join("players"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|namespace| namespace.path().join(name))
-        .filter(|prefix| prefix.is_dir() && !prefix.is_symlink())
-        .collect();
-    players.sort();
-    found.extend(players);
-    found
 }
 
 // ---------------------------------------------------------------------------
@@ -1401,13 +1431,18 @@ fn install_destination(
                     .map_err(|e| usage(&format!("{e:#}")))?
             }
         }
-        (None, Some(recipe)) => paths.install_dir(recipe)?,
+        (None, Some(recipe)) => {
+            own_folder_or_inside(paths, product_id, Some(recipe), paths.install_dir(recipe)?)?
+        }
         // An update of a title with no recipe goes where it was installed,
         // not into a second copy under the games directory.
-        (None, None) => install::load(paths.state_dir(), product_id)
+        (None, None) => match install::load(paths.state_dir(), product_id)
             .map(|record| record.dir)
             .filter(|dir| dir.is_absolute() && dir.is_dir())
-            .unwrap_or_else(|| paths.games_dir().join(product_id.to_ascii_lowercase())),
+        {
+            Some(dir) => own_folder_or_inside(paths, product_id, None, dir)?,
+            None => paths.games_dir().join(product_id.to_ascii_lowercase()),
+        },
     };
     if let Some(reason) = protected_reason(&dest, paths) {
         return Err(usage(&format!(
@@ -1422,6 +1457,42 @@ fn install_destination(
         )));
     }
     Ok(dest)
+}
+
+/// `dir`, where the title is recorded or set to be, unless that looks like a
+/// library of games ([`install::library_evidence`]) -- what the old "Install
+/// to" recorded when it put a title straight into the library chosen. Then
+/// the title goes into a folder of its own inside it, by the library rules,
+/// rather than being installed into the library again.
+fn own_folder_or_inside(
+    paths: &Paths,
+    product_id: &str,
+    recipe: Option<&Recipe>,
+    dir: PathBuf,
+) -> Result<PathBuf> {
+    let Some(why) = install::library_evidence(&dir, product_id, paths) else {
+        return Ok(dir);
+    };
+    let typed = dir.to_str().ok_or_else(|| {
+        usage(&format!(
+            "{}: the install folder has to be valid UTF-8",
+            dir.display()
+        ))
+    })?;
+    let folder = game_folder(recipe, product_id)?;
+    let inside = install::resolve_destination(
+        typed,
+        folder.to_str().unwrap_or_default(),
+        product_id,
+        paths,
+    )
+    .map_err(|e| usage(&format!("{e:#}")))?;
+    eprintln!(
+        ":: {} is recorded as {product_id}'s folder, but {why}; installing into {} instead",
+        dir.display(),
+        inside.display()
+    );
+    Ok(inside)
 }
 
 /// The folder a title gets inside a library: the recipe's install directory
@@ -1498,7 +1569,12 @@ fn is_default_folder(
     dir: &Path,
 ) -> Result<bool> {
     let mut defaults = vec![paths.games_dir().join(game_folder(recipe, product_id)?)];
-    if let Some(dir) = recipe.and_then(|recipe| paths.install_dir(recipe).ok()) {
+    // Where it is recorded, unless that is a library the old "Install to"
+    // recorded as the title's folder: chosen again, it is a library now.
+    if let Some(dir) = recipe
+        .and_then(|recipe| paths.install_dir(recipe).ok())
+        .filter(|dir| install::library_evidence(dir, product_id, paths).is_none())
+    {
         defaults.push(dir);
     }
     Ok(defaults
@@ -2090,7 +2166,7 @@ const RELEASES_API: &str = "https://api.github.com/repos/icex/ferestre/releases"
 const RELEASE_PAGES: u32 = 10;
 const RELEASES_PER_PAGE: usize = 100;
 
-fn cmd_install_runtime(cli: &Cli) -> Result<ExitCode> {
+fn cmd_install_runtime(cli: &Cli, allow_downgrade: bool) -> Result<ExitCode> {
     let cancellation = cancel::Cancellation::from_gui();
     let paths = Paths::from_env()?;
     install_runtime(
@@ -2099,6 +2175,7 @@ fn cmd_install_runtime(cli: &Cli) -> Result<ExitCode> {
         RELEASES_API,
         ferestre_core::signing::RELEASE_PUBLIC_KEY,
         &cancellation,
+        allow_downgrade,
     )
 }
 
@@ -2108,6 +2185,7 @@ fn install_runtime(
     releases_api: &str,
     public_key: &str,
     cancellation: &cancel::Cancellation,
+    allow_downgrade: bool,
 ) -> Result<ExitCode> {
     eprintln!("-- checking for the latest Ferestre runtime");
     let release = newest_runtime_release(|page| {
@@ -2116,26 +2194,24 @@ fn install_runtime(
         ))
     })?;
     cancellation.check()?;
-    let version = release
-        .tag
-        .strip_prefix("runtime-")
-        .filter(|version| {
-            !version.is_empty()
-                && version
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-        })
-        .ok_or_else(|| anyhow!("runtime release has an unsafe version: {}", release.tag))?;
+    // Both were checked to be one plain path component when the feed was
+    // read (runtime::latest_release): the archive is exactly
+    // ferestre-runtime-<version>.tar.xz, and nothing else is joined or
+    // removed below.
+    let version = release.version.as_str();
     let destination = paths.runtimes_dir().join(version);
     let installed = InstalledRuntime::at(&destination).is_ok();
+    let newer = runtime::newer_installed(&paths.runtimes_dir(), version);
     // The document and nothing else on stdout, whatever the answer.
     if cli.json {
         print_json(&json!({
             "schema": JSON_SCHEMA,
             "release": release.tag,
+            "version": version,
             "asset": release.asset_name,
             "destination": destination,
             "installed": installed,
+            "newer_installed": newer,
         }));
         return Ok(ExitCode::SUCCESS);
     }
@@ -2145,6 +2221,20 @@ fn install_runtime(
             destination.display()
         );
         return Ok(ExitCode::SUCCESS);
+    }
+    if let Some(newer) = &newer {
+        if !allow_downgrade {
+            eprintln!(
+                "!! the newest published runtime, {version}, is older than runtime {newer}, \
+                 which is installed"
+            );
+            eprintln!(
+                "   nothing was downloaded; to install the older one anyway, run: \
+                 ferestre install-runtime --allow-downgrade"
+            );
+            return Ok(ExitCode::from(runtime::EXIT_DOWNGRADE_REFUSED));
+        }
+        eprintln!("-- installing runtime {version} beside the newer {newer}, as asked");
     }
 
     let cache = paths.cache_dir().join("runtime");
@@ -2173,6 +2263,7 @@ fn install_runtime(
     let downloaded = http::download_signed(
         &release.url,
         signature_url,
+        release.artefact(),
         &archive,
         || cancellation.requested(),
         public_key,
@@ -2246,7 +2337,9 @@ fn newest_runtime_release(fetch: impl Fn(u32) -> Result<String>) -> Result<runti
         let text = fetch(page)?;
         let releases: Vec<Value> =
             serde_json::from_str(&text).context("the release feed is not a JSON list")?;
-        if let Ok(release) = runtime::latest_release(&text) {
+        // The newest runtime release that cannot be used is an error, not a
+        // reason to look further back for an older one.
+        if let Some(release) = runtime::find_release(&text)? {
             return Ok(release);
         }
         if releases.len() < RELEASES_PER_PAGE {
@@ -5179,6 +5272,40 @@ summary = "Runs."
         );
     }
 
+    /// `--prefix-path` narrows `--prefix`; on its own it would read as a
+    /// request to delete a prefix without having asked for prefixes at all.
+    #[test]
+    fn prefix_paths_go_with_prefix() {
+        assert!(
+            Cli::try_parse_from(["ferestre", "uninstall", "9ZZ", "--prefix-path", "/a"]).is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "ferestre",
+            "uninstall",
+            "9ZZ",
+            "--prefix",
+            "--prefix-path",
+            "/a",
+            "--prefix-path",
+            "/b",
+        ])
+        .unwrap();
+        match cli.command {
+            Cmd::Uninstall { prefix_paths, .. } => {
+                assert_eq!(prefix_paths, [PathBuf::from("/a"), PathBuf::from("/b")]);
+            }
+            _ => panic!("not uninstall"),
+        }
+        let cli =
+            Cli::try_parse_from(["ferestre", "install-runtime", "--allow-downgrade"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Cmd::InstallRuntime {
+                allow_downgrade: true
+            }
+        ));
+    }
+
     #[test]
     fn a_titles_arguments_are_never_parsed_as_ours() {
         let cli =
@@ -5886,9 +6013,10 @@ summary = "Runs."
         uninstall_title(&cli(), paths, title, removal, &mut std::io::empty())
     }
 
-    const YES: Removal = Removal {
+    const YES: Removal<'static> = Removal {
         keep_files: false,
         remove_prefix: false,
+        listed: None,
         yes: true,
     };
 
@@ -5991,7 +6119,10 @@ summary = "Runs."
         for dir in [&base, &player, &unrelated] {
             std::fs::create_dir_all(dir.join("pfx")).unwrap();
         }
-        assert_eq!(title_prefixes(&base), vec![base.clone(), player.clone()]);
+        assert_eq!(
+            accounts::title_prefixes(&base),
+            vec![base.clone(), player.clone()]
+        );
 
         // Kept unless asked.
         uninstall(&paths, GAME, YES).unwrap();
@@ -6011,6 +6142,63 @@ summary = "Runs."
         assert!(unrelated.exists());
     }
 
+    /// The window lists the prefixes it will delete, and passes exactly those:
+    /// one created after the dialog was drawn is kept, a path that is not one
+    /// of the title's prefixes is refused before anything goes, and one that
+    /// went away in the meantime is passed over.
+    #[test]
+    fn uninstall_removes_exactly_the_listed_prefixes() {
+        let home = Home::new("uninstall-listed");
+        home.recipe("titles", "game.toml", &game_recipe(""));
+        let paths = home.paths();
+        let games = home.games();
+        let base = games.join("testgame-proton");
+        let player = |n: &str| {
+            games
+                .join("players")
+                .join(n.repeat(64))
+                .join("testgame-proton")
+        };
+        let (listed, unlisted) = (player("a"), player("b"));
+        let other = games
+            .join("players")
+            .join("c".repeat(64))
+            .join("other-proton");
+        let gone = player("d");
+        for dir in [&base, &listed, &unlisted, &other] {
+            std::fs::create_dir_all(dir.join("pfx")).unwrap();
+        }
+        let removing = |list: &[PathBuf]| {
+            installed_package(&games.join("testgame"), GAME);
+            uninstall(
+                &paths,
+                GAME,
+                Removal {
+                    remove_prefix: true,
+                    listed: Some(list),
+                    ..YES
+                },
+            )
+        };
+
+        for wrong in [other.clone(), games.clone(), games.join("players")] {
+            let error = format!("{:#}", removing(&[base.clone(), wrong]).unwrap_err());
+            assert!(error.contains("is not one of"), "{error}");
+            assert!(base.exists() && games.join("testgame").exists());
+        }
+        // The same prefix spelled with a trailing slash is that prefix.
+        let spelled = PathBuf::from(format!("{}/", listed.display()));
+        removing(&[base.clone(), spelled, gone.clone()]).unwrap();
+        assert!(!base.exists());
+        assert!(!listed.exists());
+        assert!(
+            unlisted.exists(),
+            "a prefix the dialog did not list is kept"
+        );
+        assert!(other.exists());
+        assert!(!games.join("testgame").exists());
+    }
+
     /// Asked once for everything, and a "no" leaves everything.
     #[test]
     fn uninstall_asks_before_deleting_the_prefix_too() {
@@ -6023,6 +6211,7 @@ summary = "Runs."
         let removal = Removal {
             keep_files: false,
             remove_prefix: true,
+            listed: None,
             yes: false,
         };
         let mut no = std::io::Cursor::new(b"n\n".to_vec());
@@ -6113,6 +6302,42 @@ summary = "Runs."
         assert_eq!(
             install_destination(&paths, "9ZZPARTIAL01", None, Some(&library)).unwrap(),
             partial
+        );
+    }
+
+    /// The old "Install to" installed a title straight into the library
+    /// chosen and recorded the library. Neither the record, nor the window
+    /// passing that folder back, makes the library the title's folder again:
+    /// the next install goes into a folder of the title's own inside it.
+    #[test]
+    fn a_library_recorded_as_the_titles_folder_gets_a_folder_for_it() {
+        let home = Home::new("recorded-library");
+        let recipe = Recipe::parse(&game_recipe("[install]\ndir = \"testgame/package\"")).unwrap();
+        let paths = home.paths();
+        let library = home.root().join("mnt/games");
+        installed_package(&library, GAME);
+        installed_package(&library.join("Other Game"), "9ZZOTHERGAME");
+        record(&paths, GAME, &library);
+        assert_eq!(
+            paths.install_dir(&recipe).unwrap(),
+            library,
+            "it runs from there"
+        );
+
+        let inside = library.join("testgame/package");
+        for chosen in [None, Some(library.as_path())] {
+            assert_eq!(
+                install_destination(&paths, GAME, Some(&recipe), chosen).unwrap(),
+                inside,
+                "{chosen:?}"
+            );
+        }
+        // A title with no recipe, recorded the same way.
+        let id = "9ZZNORECIPE1";
+        record(&paths, id, &library);
+        assert_eq!(
+            install_destination(&paths, id, None, None).unwrap(),
+            library.join("9zznorecipe1")
         );
     }
 
@@ -6781,7 +7006,7 @@ summary = "Runs."
             routes.insert(
                 format!("/download/{name}.minisig"),
                 stranger
-                    .sign_with_comment(&format!("file:{name}"), &archive)
+                    .sign_with_comment(&format!("file:{name} version:{version}"), &archive)
                     .into_bytes(),
             );
         }
@@ -6793,6 +7018,7 @@ summary = "Runs."
                 &api,
                 &key.public(),
                 &cancel::Cancellation::default(),
+                false,
             )
         };
         let runtimes = paths.runtimes_dir();
@@ -6823,10 +7049,27 @@ summary = "Runs."
         assert!(!cached.exists(), "a bad download stays in the cache");
         assert!(!runtimes.join(version).exists());
 
+        // Signed with the release key, but for another release's version:
+        // the archive of one release served as another's.
         routes.lock().unwrap().insert(
             format!("/download/{name}.minisig"),
-            key.sign_with_comment(&format!("timestamp:1 file:{name}"), &archive)
+            key.sign_with_comment(&format!("file:{name} version:11.0.2"), &archive)
                 .into_bytes(),
+        );
+        let error = format!("{:#}", run(&cli()).unwrap_err());
+        assert!(
+            error.contains("version 11.0.2, not version 11.0.3"),
+            "{error}"
+        );
+        assert!(!runtimes.join(version).exists());
+
+        routes.lock().unwrap().insert(
+            format!("/download/{name}.minisig"),
+            key.sign_with_comment(
+                &format!("timestamp:1 file:{name} version:{version}"),
+                &archive,
+            )
+            .into_bytes(),
         );
         // A corrupt archive already in the cache is replaced, not reused.
         std::fs::write(&cached, b"corrupt").unwrap();
@@ -6845,6 +7088,72 @@ summary = "Runs."
         // Installed already: said so, and nothing fetched.
         routes.lock().unwrap().remove(&format!("/download/{name}"));
         assert_eq!(code(run(&cli()).unwrap()), code(ExitCode::SUCCESS));
+    }
+
+    /// An older release served as the newest is refused unless asked for, and
+    /// nothing is downloaded before the refusal.
+    #[test]
+    fn install_runtime_refuses_a_downgrade_unless_asked() {
+        use ferestre_core::signing::{testing::TestKey, Artefact};
+        let home = Home::new("install-runtime-downgrade");
+        let paths = home.paths();
+        let newer = paths.runtimes_dir().join("11.0.10");
+        std::fs::create_dir_all(&newer).unwrap();
+        std::fs::write(newer.join("proton"), "#!/bin/sh\n").unwrap();
+
+        let version = "11.0.9";
+        let name = format!("ferestre-runtime-{version}.tar.xz");
+        let archive = runtime_archive(home.root(), version);
+        let key = TestKey::new();
+        let routes = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let base = serve(Arc::clone(&routes));
+        let feed = json!([
+            { "tag_name": format!("runtime-{version}"), "assets": [
+                { "name": name, "browser_download_url": format!("{base}/download/{name}") },
+                {
+                    "name": format!("{name}.minisig"),
+                    "browser_download_url": format!("{base}/download/{name}.minisig"),
+                },
+            ]},
+        ]);
+        {
+            let mut routes = routes.lock().unwrap();
+            routes.insert("/releases".to_string(), feed.to_string().into_bytes());
+            routes.insert(
+                format!("/download/{name}.minisig"),
+                key.sign_as(Artefact::new(&name, version), &archive)
+                    .into_bytes(),
+            );
+        }
+        let api = format!("{base}/releases");
+        let run = |allow_downgrade: bool| {
+            install_runtime(
+                &cli(),
+                &paths,
+                &api,
+                &key.public(),
+                &cancel::Cancellation::default(),
+                allow_downgrade,
+            )
+        };
+        // The archive is not even served: a refusal must not need it.
+        assert_eq!(
+            code(run(false).unwrap()),
+            code(ExitCode::from(runtime::EXIT_DOWNGRADE_REFUSED))
+        );
+        assert!(!paths.runtimes_dir().join(version).exists());
+        assert!(!paths.cache_dir().join("runtime").join(&name).exists());
+
+        routes
+            .lock()
+            .unwrap()
+            .insert(format!("/download/{name}"), archive.clone());
+        assert_eq!(code(run(true).unwrap()), code(ExitCode::SUCCESS));
+        assert!(InstalledRuntime::at(&paths.runtimes_dir().join(version)).is_ok());
+        assert!(
+            InstalledRuntime::at(&newer).is_ok(),
+            "the newer one is kept"
+        );
     }
 
     /// Launcher releases are many and runtime releases few, so the newest

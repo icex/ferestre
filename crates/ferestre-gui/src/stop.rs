@@ -14,9 +14,23 @@
 //! which is the image name `taskkill /IM` matches. The `taskkill` itself runs
 //! with the environment of one of those processes, so it joins the running
 //! wineserver with the same synchronisation settings and paths as the title.
+//!
+//! A title launched through the real-path image view
+//! (`scripts/real-path-image-view.py`, Halo Infinite) runs in user and mount
+//! namespaces of its own, with a private Wine server folder mounted over
+//! `/tmp/.wine-<uid>`. A `taskkill` started out here would not find that
+//! server and would start a second one, and a second Wine session, on the
+//! live prefix. So the `taskkill` for such a title first joins the title's
+//! namespaces ([`Join`]): the window's user owns them, so no privilege is
+//! needed, and inside them it sees the title's server folder and the same
+//! user id the title has.
 
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -82,6 +96,9 @@ pub struct WineProcess {
     /// The executable's file name, as `taskkill /IM` matches it.
     pub image: String,
     pub env: Vec<(OsString, OsString)>,
+    /// The user and mount namespaces it runs in, when they are not the
+    /// window's own: a `taskkill` for it has to [`Join`] them.
+    pub namespaces: Option<String>,
 }
 
 /// Wine's own processes, and Proton's launcher, which own no window a person
@@ -155,22 +172,31 @@ fn owner(status: &str) -> Option<u32> {
         .ok()
 }
 
-/// Whether the process at `dir` shares the window's user and mount
-/// namespaces. A title launched through the real-path image view runs Wine in
-/// a namespace of its own, with a private Wine server folder: a `taskkill`
-/// started out here cannot reach its server, and would start a second server
-/// and Wine session on the live prefix instead. Such a title is ended, not
-/// asked.
-fn shares_namespaces(proc_root: &Path, dir: &Path) -> bool {
-    ["ns/user", "ns/mnt"].iter().all(|ns| {
-        std::fs::read_link(proc_root.join("self").join(ns)).ok()
-            == std::fs::read_link(dir.join(ns)).ok()
+/// The user and mount namespaces of the process at `dir`, when they are not
+/// the window's own. A title launched through the real-path image view runs
+/// Wine in namespaces of its own, with a private Wine server folder: a
+/// `taskkill` started out here cannot reach its server, and would start a
+/// second server and Wine session on the live prefix instead. It has to
+/// [`Join`] them first.
+fn foreign_namespaces(proc_root: &Path, dir: &Path) -> Option<String> {
+    let links = |at: &Path| {
+        ["ns/user", "ns/mnt"].map(|ns| {
+            std::fs::read_link(at.join(ns))
+                .map(|link| link.to_string_lossy().into_owned())
+                .ok()
+        })
+    };
+    let (own, theirs) = (links(&proc_root.join("self")), links(dir));
+    (own != theirs).then(|| {
+        theirs
+            .map(|link| link.unwrap_or_else(|| "?".into()))
+            .join(" ")
     })
 }
 
 /// Every Windows process of `uid` running in `prefix`, read from `proc_root`
-/// (`/proc`, or a fixture in a test), that a `taskkill` from the window can
-/// reach.
+/// (`/proc`, or a fixture in a test). Those in namespaces of their own say
+/// so, in [`WineProcess::namespaces`].
 pub fn processes_in(proc_root: &Path, uid: u32, prefix: &Path) -> Vec<WineProcess> {
     let Ok(entries) = std::fs::read_dir(proc_root) else {
         return Vec::new();
@@ -187,11 +213,17 @@ pub fn processes_in(proc_root: &Path, uid: u32, prefix: &Path) -> Vec<WineProces
             let in_prefix = env
                 .iter()
                 .any(|(key, value)| key == "WINEPREFIX" && same_dir(Path::new(value), prefix));
-            if !in_prefix || !shares_namespaces(proc_root, &dir) {
+            if !in_prefix {
                 return None;
             }
             let image = image_name(&std::fs::read(dir.join("cmdline")).ok()?)?;
-            Some(WineProcess { pid, image, env })
+            let namespaces = foreign_namespaces(proc_root, &dir);
+            Some(WineProcess {
+                pid,
+                image,
+                env,
+                namespaces,
+            })
         })
         .collect();
     found.sort_by_key(|p| p.pid);
@@ -222,12 +254,172 @@ pub fn close_command(wine: &Path, found: &[WineProcess]) -> Option<Command> {
     Some(command)
 }
 
+/// The namespaces to join, in order, to run a command where a process in
+/// namespaces of its own runs: every user namespace from the window's own
+/// down to the process's, each entered from its parent, and the process's
+/// mount namespace right after the user namespace that owns it.
+///
+/// No privilege is needed when the window's user made them, as the image
+/// view does with `unshare`: the creator of a user namespace has every
+/// capability in it and in the namespaces it owns. Entered that way, without
+/// changing ids, the command keeps the window's user, which inside the
+/// namespaces is the same user id the title has, and so finds the same Wine
+/// server folder. A process whose namespaces cannot be entered like that --
+/// somebody else's, or a mount namespace of the window's own user namespace
+/// -- has no `Join`.
+pub struct Join {
+    steps: Vec<(File, libc::c_int)>,
+}
+
+/// A namespace's identity, as `stat` gives it on its nsfs file.
+fn namespace_id(file: &File) -> std::io::Result<(u64, u64)> {
+    let meta = file.metadata()?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+/// The namespace an `NS_GET_*` request on `file` names.
+fn namespace_of(file: &File, request: libc::Ioctl) -> std::io::Result<File> {
+    // Safety: an ioctl on a descriptor owned here; on success it returns a
+    // new descriptor, owned by the caller from then on.
+    let fd = unsafe { libc::ioctl(file.as_raw_fd(), request) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Safety: just returned by the kernel, and nothing else owns it.
+    Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+/// Whether `uid`, as the window sees it, has an id inside the user namespace
+/// whose `uid_map` is `map` -- read from outside, so each line's second
+/// column is in the window's terms.
+fn maps_uid(map: &str, uid: u32) -> bool {
+    map.lines().any(|line| {
+        let numbers: Vec<u64> = line
+            .split_whitespace()
+            .filter_map(|n| n.parse().ok())
+            .collect();
+        matches!(numbers[..], [_, outside, count] if (outside..outside + count).contains(&u64::from(uid)))
+    })
+}
+
+impl Join {
+    /// How to join the namespaces of process `pid`, read from `proc_root`
+    /// (`/proc`). `None` when they cannot be joined from here.
+    pub fn to(proc_root: &Path, pid: u32, uid: u32) -> std::io::Result<Option<Join>> {
+        let process = proc_root.join(pid.to_string());
+        if !maps_uid(&std::fs::read_to_string(process.join("uid_map"))?, uid) {
+            return Ok(None);
+        }
+        let own_user = namespace_id(&File::open(proc_root.join("self/ns/user"))?)?;
+        let own_mount = namespace_id(&File::open(proc_root.join("self/ns/mnt"))?)?;
+        let mount = File::open(process.join("ns/mnt"))?;
+
+        // Up from the process's user namespace to the window's. Asking past
+        // the window's own fails (EPERM), and that is a namespace this
+        // window's user did not make.
+        let mut users = Vec::new();
+        let mut user = File::open(process.join("ns/user"))?;
+        while namespace_id(&user)? != own_user {
+            if users.len() >= 32 {
+                return Ok(None);
+            }
+            let Ok(parent) = namespace_of(&user, libc::NS_GET_PARENT) else {
+                return Ok(None);
+            };
+            users.push(std::mem::replace(&mut user, parent));
+        }
+        users.reverse();
+
+        // Joined right after the user namespace that owns it, which has to
+        // be one of those being entered: one the window's own user namespace
+        // owns, or one outside it, would need privileges the window lacks.
+        let mount_after = if namespace_id(&mount)? == own_mount {
+            None
+        } else {
+            let owner = namespace_id(&namespace_of(&mount, libc::NS_GET_USERNS)?)?;
+            let mut position = None;
+            for (i, user) in users.iter().enumerate() {
+                if namespace_id(user)? == owner {
+                    position = Some(i);
+                }
+            }
+            if position.is_none() {
+                return Ok(None);
+            }
+            position
+        };
+        let mut mount = Some(mount);
+        let mut steps = Vec::new();
+        for (i, user) in users.into_iter().enumerate() {
+            steps.push((user, libc::CLONE_NEWUSER));
+            if mount_after == Some(i) {
+                if let Some(mount) = mount.take() {
+                    steps.push((mount, libc::CLONE_NEWNS));
+                }
+            }
+        }
+        Ok(Some(Join { steps }))
+    }
+
+    /// Make `command` join the namespaces before it runs. The descriptors go
+    /// with the command, and close when it is dropped.
+    pub fn apply(self, command: &mut Command) {
+        let steps = self.steps;
+        // Safety: setns is async-signal-safe, and runs in the forked child,
+        // which has a single thread, as entering a user namespace requires.
+        unsafe {
+            command.pre_exec(move || {
+                for (namespace, kind) in &steps {
+                    if libc::setns(namespace.as_raw_fd(), *kind) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
 /// The `wine` beside a runtime's `wineserver`.
 fn wine_beside(server: &Path) -> Option<PathBuf> {
     ["wine", "wine64"]
         .iter()
         .map(|name| server.with_file_name(name))
         .find(|path| path.is_file())
+}
+
+/// The `taskkill`s that ask every one of `found` to close: one for the
+/// processes in the window's own namespaces, and one for each set of
+/// namespaces of their own, run inside them. A set that cannot be joined is
+/// left out: asking it from out here would start a second Wine session on
+/// its prefix.
+pub fn close_commands(
+    proc_root: &Path,
+    uid: u32,
+    wine: &Path,
+    found: &[WineProcess],
+) -> Vec<Command> {
+    let mut groups: Vec<(Option<&str>, Vec<WineProcess>)> = Vec::new();
+    for process in found {
+        let key = process.namespaces.as_deref();
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, group)) => group.push(process.clone()),
+            None => groups.push((key, vec![process.clone()])),
+        }
+    }
+    groups
+        .into_iter()
+        .filter_map(|(key, group)| {
+            let mut command = close_command(wine, &group)?;
+            if key.is_some() {
+                Join::to(proc_root, group[0].pid, uid)
+                    .ok()
+                    .flatten()?
+                    .apply(&mut command);
+            }
+            Some(command)
+        })
+        .collect()
 }
 
 /// Ask the title running in `prefix` to close. Blocking; returns whether
@@ -238,13 +430,15 @@ pub fn ask_to_close(server: &Path, prefix: &Path) -> bool {
     };
     // Safety: getuid cannot fail.
     let uid = unsafe { libc::getuid() };
-    let found = processes_in(Path::new("/proc"), uid, prefix);
-    let Some(mut command) = close_command(&wine, &found) else {
-        return false;
-    };
-    // taskkill exits non-zero when one of the images has no window to close,
-    // which is common and says nothing about the ones that did.
-    crate::deadline::status(&mut command, ASK_LIMIT).is_ok()
+    let proc_root = Path::new("/proc");
+    let found = processes_in(proc_root, uid, prefix);
+    let mut asked = false;
+    for mut command in close_commands(proc_root, uid, &wine, &found) {
+        // taskkill exits non-zero when one of the images has no window to
+        // close, which is common and says nothing about the ones that did.
+        asked |= crate::deadline::status(&mut command, ASK_LIMIT).is_ok();
+    }
+    asked
 }
 
 /// End the title now: the launcher's process group, then every process in
@@ -404,10 +598,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A title in the real-path view's namespace is not asked from outside
-    /// it: there is nothing to ask, so Stop ends it.
+    /// A title in the real-path view's namespaces is found from out here,
+    /// and marked: its `taskkill` has to run inside them. One whose
+    /// namespaces cannot be joined is not asked at all -- from out here the
+    /// request would start a second Wine session on its prefix -- so Stop
+    /// ends it.
     #[test]
-    fn a_title_in_another_namespace_is_not_asked() {
+    fn a_title_in_another_namespace_is_asked_only_from_inside_it() {
         let root =
             std::env::temp_dir().join(format!("ferestre-gui-proc-ns-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -417,20 +614,185 @@ mod tests {
         std::os::unix::fs::symlink("user:[4026531837]", root.join("self/ns/user")).unwrap();
         std::os::unix::fs::symlink("mnt:[4026531841]", root.join("self/ns/mnt")).unwrap();
         let env = format!("WINEPREFIX={}\0", prefix.display()).into_bytes();
-        for (pid, user) in [(300, "user:[4026533000]"), (400, "user:[4026531837]")] {
+        for (pid, user, mnt) in [
+            (300, "user:[4026533000]", "mnt:[4026533001]"),
+            (400, "user:[4026531837]", "mnt:[4026531841]"),
+        ] {
             fake_process(&root, pid, 1000, b"C:\\Game\\HaloInfinite.exe\0", &env);
             let ns = root.join(pid.to_string()).join("ns");
             std::fs::create_dir_all(&ns).unwrap();
             std::os::unix::fs::symlink(user, ns.join("user")).unwrap();
-            std::os::unix::fs::symlink("mnt:[4026531841]", ns.join("mnt")).unwrap();
+            std::os::unix::fs::symlink(mnt, ns.join("mnt")).unwrap();
         }
         let found = processes_in(&root, 1000, &prefix);
         assert_eq!(
-            found.iter().map(|p| p.pid).collect::<Vec<_>>(),
-            [400],
-            "only the process a taskkill from here can reach"
+            found
+                .iter()
+                .map(|p| (p.pid, p.namespaces.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (300, Some("user:[4026533000] mnt:[4026533001]")),
+                (400, None)
+            ]
         );
+        // The fixture's namespaces are only names: there is nothing to join,
+        // so only the process in the window's own namespaces is asked.
+        let commands = close_commands(&root, 1000, Path::new("wine"), &found);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].get_args().collect::<Vec<_>>(),
+            ["taskkill", "/IM", "HaloInfinite.exe"]
+        );
+        assert!(close_commands(&root, 1000, Path::new("wine"), &found[..1]).is_empty());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_uid_map_read_from_outside_says_whether_the_window_user_is_in_it() {
+        assert!(maps_uid("         0       1000          1\n", 1000));
+        assert!(maps_uid("      1000       1000          1\n", 1000));
+        assert!(maps_uid("         0     100000      65536\n", 100_500));
+        assert!(!maps_uid("         0       1001          1\n", 1000));
+        assert!(!maps_uid("", 1000));
+    }
+
+    /// Whether this machine lets an unprivileged user make user and mount
+    /// namespaces, which the real-path image view needs. Where it is meant
+    /// to (FERESTRE_REQUIRE_USERNS=1), not being able to is a failure.
+    fn user_namespaces() -> bool {
+        let works = Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "true"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !works && std::env::var_os("FERESTRE_REQUIRE_USERNS").is_some_and(|v| v == "1") {
+            panic!("unprivileged user namespaces are required (FERESTRE_REQUIRE_USERNS=1)");
+        }
+        works
+    }
+
+    /// A title started through the real image-view script, as Halo Infinite
+    /// is: Wine runs as the caller in a user namespace nested in the view's,
+    /// with a private Wine server folder over /tmp/.wine-<uid>. The close
+    /// request joins those namespaces and runs as the title's own user id
+    /// beside the title's own server folder; from out here that folder is not
+    /// there at all. A fake `wine` stands in for Wine's taskkill and writes
+    /// down what it saw.
+    #[test]
+    fn the_close_request_reaches_a_title_in_the_image_views_namespaces() {
+        if !user_namespaces() {
+            eprintln!("skipped: unprivileged user namespaces are not available");
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("ferestre-gui-stop-view-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let prefix = root.join("halo-proton/pfx");
+        std::fs::create_dir_all(&prefix).unwrap();
+        // The encrypted image on disk, and its licensed plaintext, which the
+        // view binds over it inside its namespace.
+        let image = root.join("HaloInfinite.exe");
+        std::fs::write(&image, b"encrypted package bytes").unwrap();
+        // Safety: a plain memfd_create; the descriptor is owned below.
+        let fd = unsafe { libc::memfd_create(c"HaloInfinite.exe".as_ptr(), 0) };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        // Safety: just created, owned only here. Not close-on-exec: the
+        // view reads it through the launch, as it does the client's.
+        let plaintext = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut licensed = b"MZ".to_vec();
+        licensed.extend(b"licensed fixture image".repeat(50));
+        std::io::Write::write_all(&mut File::from(plaintext.try_clone().unwrap()), &licensed)
+            .unwrap();
+        let mapping = format!(
+            "{}:\\??\\Z:{}",
+            plaintext.as_raw_fd(),
+            image.display().to_string().replace('/', "\\")
+        );
+
+        let server_folder = format!("server-stop-test-{}", std::process::id());
+        let ready = root.join("ready");
+        // What the title does: leave a mark in its private server folder,
+        // say it is up, and run under its Windows image name, as Wine does.
+        let title = format!(
+            "mkdir -p /tmp/.wine-$(id -u)/{server_folder} && \
+             echo inside > /tmp/.wine-$(id -u)/{server_folder}/marker && \
+             touch {ready} && exec -a 'C:\\Games\\Halo\\HaloInfinite.exe' sleep 60",
+            ready = ready.display()
+        );
+        let view =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/real-path-image-view.py");
+        let mut helper = Command::new("python3")
+            .arg(&view)
+            .args(["--", "bash", "-c", &title])
+            .current_dir(&root)
+            .env("WINE_DLL_FILE_MAP", &mapping)
+            .env("FERESTRE_IMAGE_VIEW", "real-path")
+            .env("WINEPREFIX", &prefix)
+            .env_remove("STEAM_COMPAT_DATA_PATH")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        drop(plaintext);
+        let cleanup = |helper: &mut std::process::Child| {
+            // Safety: a signal to the helper this test started.
+            unsafe { libc::kill(helper.id() as i32, libc::SIGTERM) };
+            let _ = helper.wait();
+        };
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !ready.exists() {
+            if let Ok(Some(status)) = helper.try_wait() {
+                panic!("the image view exited {status} before the title started");
+            }
+            if Instant::now() > deadline {
+                cleanup(&mut helper);
+                panic!("the title never started");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            // Safety: getuid cannot fail.
+            let uid = unsafe { libc::getuid() };
+            let found = processes_in(Path::new("/proc"), uid, &prefix);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].image, "HaloInfinite.exe");
+            assert!(found[0].namespaces.is_some(), "{found:?}");
+            assert!(
+                !Path::new(&format!("/tmp/.wine-{uid}/{server_folder}/marker")).exists(),
+                "the title's server folder is private to its namespaces"
+            );
+
+            // A `wine` that writes down where it ran and what it was asked.
+            let seen = root.join("seen");
+            let wine = root.join("bin/wine");
+            std::fs::write(
+                &wine,
+                format!(
+                    "#!/bin/sh\n{{ id -u; cat /tmp/.wine-$(id -u)/{server_folder}/marker; \
+                     echo \"$@\"; }} > {}\n",
+                    seen.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wine, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+            std::fs::write(root.join("bin/wineserver"), "").unwrap();
+
+            assert!(ask_to_close(&root.join("bin/wineserver"), &prefix));
+            let seen = std::fs::read_to_string(&seen).unwrap();
+            assert_eq!(
+                seen,
+                format!("{uid}\ninside\ntaskkill /IM HaloInfinite.exe\n"),
+                "taskkill ran as the title's user, beside its server folder"
+            );
+        });
+        cleanup(&mut helper);
+        let _ = std::fs::remove_dir_all(&root);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[test]
@@ -439,6 +801,7 @@ mod tests {
             pid,
             image: image.into(),
             env: vec![],
+            namespaces: None,
         };
         let found = [
             process(1, "Game.exe"),

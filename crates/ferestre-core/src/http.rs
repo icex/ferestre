@@ -218,57 +218,44 @@ fn starts_like_an_image(path: &Path) -> bool {
         || (head.len() == 12 && head.starts_with(b"RIFF") && &head[8..12] == b"WEBP")
 }
 
-/// Fetch a signed release artefact, such as a runtime archive, and keep it
-/// only if its signature verifies against the release key built into this
-/// launcher. See [`download_large_cancellable`].
-pub fn download_large(url: &str, dest: &Path) -> Result<()> {
-    download_large_cancellable(url, dest, || false)
-}
-
 /// Fetch a signed release artefact, such as a runtime archive, to `dest`.
 ///
-/// The detached minisign signature is fetched from `<url>.minisig` first and
-/// checked against [`crate::signing::RELEASE_PUBLIC_KEY`]. The artefact is
-/// renamed into place only after it verifies, so nothing unverified is ever at
-/// `dest`. A copy already at `dest` is verified again rather than trusted, and
-/// is fetched afresh when it does not match: a bad cached archive used to fail
-/// every later install the same way until someone found and deleted it.
+/// The detached minisign signature is fetched from `signature_url` (the
+/// `<asset>.minisig` the release lists beside the artefact) first and checked
+/// against `public_key`, normally [`crate::signing::RELEASE_PUBLIC_KEY`];
+/// tests pass a throwaway key. It must have been made for `artefact`: its
+/// trusted comment names the artefact's file name and release version. The
+/// artefact is renamed into place only after it verifies, so nothing
+/// unverified is ever at `dest`. A copy already at `dest` is verified again
+/// rather than trusted, and is fetched afresh when it does not match: a bad
+/// cached archive used to fail every later install the same way until
+/// someone found and deleted it.
 ///
 /// The transfer has no total time limit. See [`Patience`] for how a slow link
 /// is told apart from a dead one.
-pub fn download_large_cancellable(
-    url: &str,
-    dest: &Path,
-    cancelled: impl Fn() -> bool,
-) -> Result<()> {
-    let signature_url = format!("{url}{}", crate::signing::SIGNATURE_SUFFIX);
-    download_release(
-        url,
-        &signature_url,
-        dest,
-        &cancelled,
-        &LARGE,
-        crate::signing::RELEASE_PUBLIC_KEY,
-    )
-}
-
-/// [`download_large_cancellable`] with the signature's URL and the public key
-/// given: the signature the release lists beside the artefact (a runtime
-/// release's `<asset>.minisig`), and normally
-/// [`crate::signing::RELEASE_PUBLIC_KEY`]. Tests pass a throwaway key.
 pub fn download_signed(
     url: &str,
     signature_url: &str,
+    artefact: crate::signing::Artefact,
     dest: &Path,
     cancelled: impl Fn() -> bool,
     public_key: &str,
 ) -> Result<()> {
-    download_release(url, signature_url, dest, &cancelled, &LARGE, public_key)
+    download_release(
+        url,
+        signature_url,
+        artefact,
+        dest,
+        &cancelled,
+        &LARGE,
+        public_key,
+    )
 }
 
 fn download_release(
     url: &str,
     signature_url: &str,
+    artefact: crate::signing::Artefact,
     dest: &Path,
     cancelled: &dyn Fn() -> bool,
     patience: &Patience,
@@ -277,11 +264,10 @@ fn download_release(
     anyhow::ensure!(!cancelled(), "Download stopped");
     // Refuse before a 300 MB download, not after it.
     crate::signing::check_public_key(public_key)?;
-    let name = published_name(url)?;
     let signature = fetch_signature(signature_url)?;
-    crate::signing::check_signature(&signature, name)?;
+    crate::signing::check_signature(&signature, artefact)?;
     if dest.is_file() {
-        if crate::signing::verify_file_with_key(public_key, &signature, name, dest).is_ok() {
+        if crate::signing::verify_file_with_key(public_key, &signature, artefact, dest).is_ok() {
             return Ok(());
         }
         std::fs::remove_file(dest)
@@ -296,7 +282,7 @@ fn download_release(
         fetch_resumable(url, &mut file, MAX_LARGE_DOWNLOAD, cancelled, patience)?;
         file.sync_all()?;
         anyhow::ensure!(!cancelled(), "Download stopped");
-        crate::signing::verify_file_with_key(public_key, &signature, name, &temporary)?;
+        crate::signing::verify_file_with_key(public_key, &signature, artefact, &temporary)?;
         std::fs::rename(&temporary, dest)?;
         if let Some(parent) = dest.parent() {
             crate::cache::sync_directory(parent);
@@ -309,16 +295,6 @@ fn download_release(
         return Err(anyhow!("{url}: {e}"));
     }
     Ok(())
-}
-
-/// The file name the release published, which is what the signature's
-/// trusted comment names.
-fn published_name(url: &str) -> Result<&str> {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    path.rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| anyhow!("{url}: no file name to check a signature against"))
 }
 
 fn fetch_signature(url: &str) -> Result<String> {
@@ -560,7 +536,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    /// A release artefact with its signature at `<url>.minisig`.
+    /// The runtime release artefact, with its signature at `<url>.minisig`.
     fn signed_release(
         url: &str,
         dest: &Path,
@@ -569,7 +545,15 @@ mod tests {
         public_key: &str,
     ) -> Result<()> {
         let signature_url = format!("{url}{}", crate::signing::SIGNATURE_SUFFIX);
-        download_release(url, &signature_url, dest, cancelled, patience, public_key)
+        download_release(
+            url,
+            &signature_url,
+            ARTEFACT,
+            dest,
+            cancelled,
+            patience,
+            public_key,
+        )
     }
 
     /// What the test server answers for one path.
@@ -705,13 +689,17 @@ mod tests {
     };
 
     const NAME: &str = "ferestre-runtime-11.0.1.tar.xz";
+    const ARTEFACT: crate::signing::Artefact<'static> = crate::signing::Artefact {
+        file: NAME,
+        version: "11.0.1",
+    };
 
     fn runtime_bytes() -> Vec<u8> {
         (0..96 * 1024u32).map(|i| (i % 251) as u8).collect()
     }
 
     fn signed(key: &TestKey, served: Served) -> Vec<(String, Served)> {
-        let signature = key.sign_as(NAME, &served.body);
+        let signature = key.sign_as(ARTEFACT, &served.body);
         vec![
             (format!("/{NAME}"), served),
             (
@@ -971,8 +959,14 @@ mod tests {
     #[test]
     fn the_release_key_is_checked_before_any_request() {
         let dir = tempfile::tempdir().unwrap();
-        let result =
-            download_large_cancellable("http://127.0.0.1:9/never", &dir.path().join("x"), || false);
+        let result = download_signed(
+            "http://127.0.0.1:9/never",
+            "http://127.0.0.1:9/never.minisig",
+            ARTEFACT,
+            &dir.path().join("x"),
+            || false,
+            crate::signing::RELEASE_PUBLIC_KEY,
+        );
         if !crate::signing::has_release_key() {
             let error = result.unwrap_err().to_string();
             assert!(error.contains("no release signing key"), "{error}");
@@ -1045,19 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn the_published_name_is_the_last_path_segment() {
-        assert_eq!(
-            published_name(
-                "https://github.com/o/r/releases/download/runtime-1/ferestre-runtime-1.tar.xz"
-            )
-            .unwrap(),
-            "ferestre-runtime-1.tar.xz"
-        );
-        assert_eq!(
-            published_name("https://h/a/b.tar.xz?x=1#y").unwrap(),
-            "b.tar.xz"
-        );
-        assert!(published_name("https://h/a/").is_err());
+    fn a_content_range_gives_its_first_byte() {
         assert_eq!(content_range_start("bytes 100-199/200"), Some(100));
         assert_eq!(content_range_start("bytes */200"), None);
     }

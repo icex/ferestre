@@ -232,6 +232,34 @@ pub fn player_prefix(original: &Path, player: &Profile) -> Result<PathBuf> {
         .join(name))
 }
 
+/// Every Wine prefix a title has on disk, `base` being the one
+/// [`crate::paths::Paths::prefix_dir`] gives it: `base` itself, which every
+/// launch used before accounts had roles, then each Player's own copy beside
+/// it, `players/<namespace>/<base's name>`, sorted. A Player's copy that is a
+/// symlink is not one of them.
+///
+/// The window's Remove dialog lists exactly these, and `ferestre uninstall
+/// --prefix` removes exactly what it is given from them.
+pub fn title_prefixes(base: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if base.is_dir() {
+        found.push(base.to_path_buf());
+    }
+    let (Some(parent), Some(name)) = (base.parent(), base.file_name()) else {
+        return found;
+    };
+    let mut players: Vec<PathBuf> = std::fs::read_dir(parent.join("players"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|namespace| namespace.path().join(name))
+        .filter(|prefix| prefix.is_dir() && !prefix.is_symlink())
+        .collect();
+    players.sort();
+    found.extend(players);
+    found
+}
+
 pub fn require_service(binary: &Path) -> Result<()> {
     // Old services ignore argv and would start instead of answering a probe.
     // Inspect the new protocol marker before executing --capabilities.

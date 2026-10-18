@@ -3,9 +3,9 @@
 //! This is the one place release signatures are checked. Every artefact the
 //! launcher downloads and then runs -- today the runtime, a 300 MB Proton
 //! build, fetched by `ferestre install-runtime`, which the window also runs for
-//! its first-run download -- goes through [`crate::http::download_signed`] or
-//! [`crate::http::download_large_cancellable`], which verify against
-//! [`RELEASE_PUBLIC_KEY`] before anything is renamed into place.
+//! its first-run download -- goes through [`crate::http::download_signed`],
+//! which verifies against [`RELEASE_PUBLIC_KEY`] before anything is renamed
+//! into place.
 //!
 //! TLS says the bytes came from GitHub; it says nothing about whether they are
 //! the bytes the release train built, and a checksum file published beside the
@@ -15,13 +15,15 @@
 //! when the key has one) and nowhere else, and the public half is compiled
 //! into the launcher below. `packaging/sign-release.sh` makes the signatures.
 //!
-//! The format is minisign's, made with `minisign -S -s <key> -m <file>`, which
-//! publishes `<file>.minisig` beside the artefact. Only pre-hashed signatures
-//! (the default since minisign 0.10) are accepted. The signed "trusted comment"
-//! must name the artefact (`file:<name>`, as a tab- or space-separated field;
-//! minisign writes it by default), so a genuine signature for one artefact
-//! cannot be replayed for another -- an older runtime served under a newer
-//! name, say.
+//! The format is minisign's, made with `minisign -S -s <key> -m <file> -t
+//! <comment>`, which publishes `<file>.minisig` beside the artefact. Only
+//! pre-hashed signatures (the default since minisign 0.10) are accepted. The
+//! signed "trusted comment" must be `file:<name> version:<version>`: the
+//! artefact's published file name and the release version it belongs to (the
+//! tag without its `runtime-` or `v` prefix). Both are checked ([`Artefact`]),
+//! so a genuine signature for one artefact cannot be replayed for another --
+//! an older runtime served under a newer name, or under a newer release's tag.
+//! A comment that names a second, different file or version is refused too.
 
 use anyhow::{anyhow, bail, Context, Result};
 use minisign_verify::{PublicKey, Signature};
@@ -65,43 +67,88 @@ pub fn check_public_key(base64: &str) -> Result<()> {
     public_key(base64).map(|_| ())
 }
 
-fn signature(text: &str, name: &str) -> Result<Signature> {
-    if name.is_empty() {
+/// What a release signature has to say it was made for: the artefact's
+/// published file name and the version of the release it belongs to, as the
+/// trusted comment's `file:` and `version:` fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Artefact<'a> {
+    pub file: &'a str,
+    pub version: &'a str,
+}
+
+impl<'a> Artefact<'a> {
+    pub fn new(file: &'a str, version: &'a str) -> Self {
+        Artefact { file, version }
+    }
+
+    /// The trusted comment release CI writes for this artefact.
+    pub fn trusted_comment(&self) -> String {
+        format!("file:{} version:{}", self.file, self.version)
+    }
+}
+
+fn signature(text: &str, artefact: Artefact) -> Result<Signature> {
+    let Artefact { file, version } = artefact;
+    if file.is_empty() {
         bail!("no file name to check the release signature against");
     }
+    if version.is_empty() {
+        bail!("{file}: no release version to check the signature against");
+    }
     let signature = Signature::decode(text.trim_start())
-        .map_err(|e| anyhow!("{name}: the release signature is not readable: {e}"))?;
-    let names_it = signature
-        .trusted_comment()
+        .map_err(|e| anyhow!("{file}: the release signature is not readable: {e}"))?;
+    let comment = signature.trusted_comment();
+    let fields: Vec<&str> = comment
         .split(['\t', ' '])
-        .any(|field| field.strip_prefix("file:") == Some(name));
-    if !names_it {
-        bail!("{name}: the release signature was made for a different file");
+        .filter(|field| !field.is_empty())
+        .collect();
+    // Every field of a kind has to agree: a comment naming two files would
+    // otherwise vouch for both.
+    let named = |key: &str| -> Vec<&str> {
+        fields
+            .iter()
+            .filter_map(|field| field.strip_prefix(key))
+            .collect()
+    };
+    let files = named("file:");
+    if files.is_empty() || files.iter().any(|named| *named != file) {
+        bail!("{file}: the release signature was made for a different file");
+    }
+    let versions = named("version:");
+    if versions.is_empty() {
+        bail!(
+            "{file}: the release signature does not say which release it belongs to, so it \
+             cannot vouch for version {version}"
+        );
+    }
+    if let Some(other) = versions.iter().find(|named| **named != version) {
+        bail!("{file}: the release signature was made for version {other}, not version {version}");
     }
     Ok(signature)
 }
 
-/// Check that a signature reads and was made for the artefact named `name`.
-/// Says nothing about whether it is genuine; [`verify_release_file`] does that.
-pub fn check_signature(text: &str, name: &str) -> Result<()> {
-    signature(text, name).map(|_| ())
+/// Check that a signature reads and was made for `artefact`. Says nothing
+/// about whether it is genuine; [`verify_release_file`] does that.
+pub fn check_signature(text: &str, artefact: Artefact) -> Result<()> {
+    signature(text, artefact).map(|_| ())
 }
 
-/// Verify the file at `path`, published as `name`, against a minisign
+/// Verify the file at `path`, published as `artefact`, against a minisign
 /// signature and the release key built into this launcher.
-pub fn verify_release_file(signature_text: &str, name: &str, path: &Path) -> Result<()> {
-    verify_file_with_key(RELEASE_PUBLIC_KEY, signature_text, name, path)
+pub fn verify_release_file(signature_text: &str, artefact: Artefact, path: &Path) -> Result<()> {
+    verify_file_with_key(RELEASE_PUBLIC_KEY, signature_text, artefact, path)
 }
 
 /// [`verify_release_file`] with an explicit public key.
 pub fn verify_file_with_key(
     public_key_base64: &str,
     signature_text: &str,
-    name: &str,
+    artefact: Artefact,
     path: &Path,
 ) -> Result<()> {
+    let name = artefact.file;
     let key = public_key(public_key_base64)?;
-    let signature = signature(signature_text, name)?;
+    let signature = signature(signature_text, artefact)?;
     let mut verifier = key
         .verify_stream(&signature)
         .map_err(|e| anyhow!("{name}: {e}; it was not signed by the Ferestre release key"))?;
@@ -174,9 +221,9 @@ pub mod testing {
             base64(&bytes)
         }
 
-        /// What `minisign -S -m <name>` writes, trusted comment included.
-        pub fn sign_as(&self, name: &str, data: &[u8]) -> String {
-            self.sign_with_comment(&format!("timestamp:1700000000\tfile:{name}\thashed"), data)
+        /// What release CI writes for `artefact`, trusted comment included.
+        pub fn sign_as(&self, artefact: super::Artefact, data: &[u8]) -> String {
+            self.sign_with_comment(&artefact.trusted_comment(), data)
         }
 
         /// A pre-hashed signature of `data`, as `minisign -S -t <comment>`
@@ -312,6 +359,13 @@ mod tests {
     use super::testing::TestKey;
     use super::*;
 
+    const VERSION: &str = "11.0.1";
+    const NAME: &str = "ferestre-runtime-11.0.1.tar.xz";
+    const RUNTIME: Artefact<'static> = Artefact {
+        file: NAME,
+        version: VERSION,
+    };
+
     fn written(dir: &Path, name: &str, data: &[u8]) -> std::path::PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, data).unwrap();
@@ -322,23 +376,23 @@ mod tests {
     fn a_genuine_artefact_verifies() {
         let key = TestKey::new();
         let dir = tempfile::tempdir().unwrap();
-        let name = "ferestre-runtime-11.0.1.tar.xz";
         let data = b"runtime archive bytes".repeat(10_000);
-        let path = written(dir.path(), name, &data);
-        let signature = key.sign_as(name, &data);
-        verify_file_with_key(&key.public(), &signature, name, &path).unwrap();
+        let path = written(dir.path(), NAME, &data);
+        let signature = key.sign_as(RUNTIME, &data);
+        assert!(signature
+            .contains("trusted comment: file:ferestre-runtime-11.0.1.tar.xz version:11.0.1\n"));
+        verify_file_with_key(&key.public(), &signature, RUNTIME, &path).unwrap();
     }
 
     #[test]
     fn a_changed_byte_is_refused() {
         let key = TestKey::new();
         let dir = tempfile::tempdir().unwrap();
-        let name = "ferestre-runtime-11.0.1.tar.xz";
         let mut data = b"runtime archive bytes".repeat(1_000);
-        let signature = key.sign_as(name, &data);
+        let signature = key.sign_as(RUNTIME, &data);
         data[500] ^= 1;
-        let path = written(dir.path(), name, &data);
-        let error = verify_file_with_key(&key.public(), &signature, name, &path)
+        let path = written(dir.path(), NAME, &data);
+        let error = verify_file_with_key(&key.public(), &signature, RUNTIME, &path)
             .unwrap_err()
             .to_string();
         assert!(error.contains("does not match"), "{error}");
@@ -349,10 +403,9 @@ mod tests {
         let ours = TestKey::new();
         let theirs = TestKey::new();
         let dir = tempfile::tempdir().unwrap();
-        let name = "ferestre-runtime-11.0.1.tar.xz";
-        let path = written(dir.path(), name, b"data");
-        let signature = theirs.sign_as(name, b"data");
-        assert!(verify_file_with_key(&ours.public(), &signature, name, &path).is_err());
+        let path = written(dir.path(), NAME, b"data");
+        let signature = theirs.sign_as(RUNTIME, b"data");
+        assert!(verify_file_with_key(&ours.public(), &signature, RUNTIME, &path).is_err());
     }
 
     /// A genuine signature for one release must not vouch for another file
@@ -361,35 +414,86 @@ mod tests {
     fn a_signature_for_another_file_is_refused() {
         let key = TestKey::new();
         let dir = tempfile::tempdir().unwrap();
-        let old = "ferestre-runtime-10.0.1.tar.xz";
-        let new = "ferestre-runtime-11.0.1.tar.xz";
-        let path = written(dir.path(), new, b"old runtime");
+        let old = Artefact::new("ferestre-runtime-10.0.1.tar.xz", "10.0.1");
+        let path = written(dir.path(), NAME, b"old runtime");
         let signature = key.sign_as(old, b"old runtime");
-        let error = verify_file_with_key(&key.public(), &signature, new, &path)
+        let error = verify_file_with_key(&key.public(), &signature, RUNTIME, &path)
             .unwrap_err()
             .to_string();
         assert!(error.contains("different file"), "{error}");
         // A name that merely contains the expected one is not it either.
-        let signature = key.sign_with_comment(&format!("file:x{new}"), b"old runtime");
-        assert!(verify_file_with_key(&key.public(), &signature, new, &path).is_err());
+        let signature =
+            key.sign_with_comment(&format!("file:x{NAME} version:{VERSION}"), b"old runtime");
+        assert!(verify_file_with_key(&key.public(), &signature, RUNTIME, &path).is_err());
         let signature = key.sign_with_comment("timestamp:1", b"old runtime");
-        assert!(verify_file_with_key(&key.public(), &signature, new, &path).is_err());
+        assert!(verify_file_with_key(&key.public(), &signature, RUNTIME, &path).is_err());
+        // Nor does a comment that names this file and another one.
+        let signature = key.sign_with_comment(
+            &format!("file:{NAME} file:{} version:{VERSION}", old.file),
+            b"old runtime",
+        );
+        let error = verify_file_with_key(&key.public(), &signature, RUNTIME, &path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("different file"), "{error}");
+    }
+
+    /// The release version is part of what is signed: the right file name
+    /// under another release's version, or under none, is refused.
+    #[test]
+    fn a_signature_for_another_release_version_is_refused() {
+        let key = TestKey::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = written(dir.path(), NAME, b"data");
+        let other = key.sign_as(Artefact::new(NAME, "11.0.0"), b"data");
+        let error = verify_file_with_key(&key.public(), &other, RUNTIME, &path)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("version 11.0.0, not version 11.0.1"),
+            "{error}"
+        );
+        // minisign's own default comment names the file and no release.
+        let unversioned =
+            key.sign_with_comment(&format!("timestamp:1\tfile:{NAME}\thashed"), b"data");
+        let error = verify_file_with_key(&key.public(), &unversioned, RUNTIME, &path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("which release"), "{error}");
+        // The old CI comment carried the tag as `release:`; that is not it.
+        let tagged =
+            key.sign_with_comment(&format!("file:{NAME} release:runtime-{VERSION}"), b"data");
+        assert!(verify_file_with_key(&key.public(), &tagged, RUNTIME, &path).is_err());
+        // Two versions, one of them right, is still not one release.
+        let both = key.sign_with_comment(
+            &format!("file:{NAME} version:{VERSION} version:12.0.0"),
+            b"data",
+        );
+        assert!(verify_file_with_key(&key.public(), &both, RUNTIME, &path).is_err());
+        // A version that merely starts with the expected one is not it.
+        let longer = key.sign_with_comment(&format!("file:{NAME} version:{VERSION}.1"), b"data");
+        assert!(verify_file_with_key(&key.public(), &longer, RUNTIME, &path).is_err());
+        // No version to check against is a refusal, not a match.
+        let good = key.sign_as(RUNTIME, b"data");
+        assert!(
+            verify_file_with_key(&key.public(), &good, Artefact::new(NAME, ""), &path).is_err()
+        );
     }
 
     /// The comment is covered by the global signature, so editing it to name
-    /// a different file breaks the signature rather than redirecting it.
+    /// a different file or version breaks the signature rather than
+    /// redirecting it.
     #[test]
     fn an_edited_trusted_comment_is_refused() {
         let key = TestKey::new();
         let dir = tempfile::tempdir().unwrap();
-        let old = "ferestre-runtime-10.0.1.tar.xz";
-        let new = "ferestre-runtime-11.0.1.tar.xz";
-        let path = written(dir.path(), new, b"old runtime");
+        let old = Artefact::new("ferestre-runtime-10.0.1.tar.xz", "10.0.1");
+        let path = written(dir.path(), NAME, b"old runtime");
         let forged = key
             .sign_as(old, b"old runtime")
-            .replace(&format!("file:{old}"), &format!("file:{new}"));
-        assert!(forged.contains(new));
-        assert!(verify_file_with_key(&key.public(), &forged, new, &path).is_err());
+            .replace(&old.trusted_comment(), &RUNTIME.trusted_comment());
+        assert!(forged.contains(NAME));
+        assert!(verify_file_with_key(&key.public(), &forged, RUNTIME, &path).is_err());
     }
 
     #[test]
@@ -413,12 +517,15 @@ mod tests {
         let theirs = TestKey::new().claiming_the_id_of(&ours);
         assert_ne!(ours.public(), theirs.public(), "two different keys");
         let dir = tempfile::tempdir().unwrap();
-        let name = "ferestre-runtime-11.0.1.tar.xz";
-        let path = written(dir.path(), name, b"data");
-        let error =
-            verify_file_with_key(&ours.public(), &theirs.sign_as(name, b"data"), name, &path)
-                .unwrap_err()
-                .to_string();
+        let path = written(dir.path(), NAME, b"data");
+        let error = verify_file_with_key(
+            &ours.public(),
+            &theirs.sign_as(RUNTIME, b"data"),
+            RUNTIME,
+            &path,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("does not match"), "{error}");
     }
 
@@ -427,32 +534,34 @@ mod tests {
     fn a_large_artefact_is_checked_as_it_streams() {
         let key = TestKey::new();
         let dir = tempfile::tempdir().unwrap();
-        let name = "ferestre-runtime-11.0.1.tar.xz";
         let mut data: Vec<u8> = (0..700_000u32).map(|i| (i % 251) as u8).collect();
-        let signature = key.sign_as(name, &data);
-        let path = written(dir.path(), name, &data);
-        verify_file_with_key(&key.public(), &signature, name, &path).unwrap();
+        let signature = key.sign_as(RUNTIME, &data);
+        let path = written(dir.path(), NAME, &data);
+        verify_file_with_key(&key.public(), &signature, RUNTIME, &path).unwrap();
         data[650_000] ^= 1;
-        let path = written(dir.path(), name, &data);
-        assert!(verify_file_with_key(&key.public(), &signature, name, &path).is_err());
+        let path = written(dir.path(), NAME, &data);
+        assert!(verify_file_with_key(&key.public(), &signature, RUNTIME, &path).is_err());
         // No name to check the comment against is a refusal, not a match.
-        assert!(verify_file_with_key(&key.public(), &signature, "", &path).is_err());
+        assert!(
+            verify_file_with_key(&key.public(), &signature, Artefact::new("", VERSION), &path)
+                .is_err()
+        );
     }
 
-    /// Release CI writes `file:<name> release:<tag>`; minisign's default is
-    /// tab-separated. Both name the file.
+    /// Release CI writes `file:<name> version:<version>`, space-separated;
+    /// tabs, as minisign's own default comment has, separate fields too.
     #[test]
-    fn the_file_field_is_found_however_the_comment_separates_it() {
+    fn the_fields_are_found_however_the_comment_separates_them() {
         let key = TestKey::new();
         let dir = tempfile::tempdir().unwrap();
-        let name = "ferestre-runtime-11.0.1.tar.xz";
-        let path = written(dir.path(), name, b"data");
+        let path = written(dir.path(), NAME, b"data");
         for comment in [
-            format!("file:{name} release:runtime-11.0.1"),
-            format!("timestamp:1\tfile:{name}\thashed"),
+            format!("file:{NAME} version:{VERSION}"),
+            format!("version:{VERSION}  file:{NAME}"),
+            format!("timestamp:1\tfile:{NAME}\tversion:{VERSION}\thashed"),
         ] {
             let signature = key.sign_with_comment(&comment, b"data");
-            verify_file_with_key(&key.public(), &signature, name, &path).unwrap();
+            verify_file_with_key(&key.public(), &signature, RUNTIME, &path).unwrap();
         }
     }
 
@@ -466,6 +575,6 @@ mod tests {
             error.expect("the built-in release key decodes");
         }
         assert!(check_public_key("not base64 at all !").is_err());
-        assert!(check_signature("garbage", "x.tar.xz").is_err());
+        assert!(check_signature("garbage", Artefact::new("x.tar.xz", "1")).is_err());
     }
 }
