@@ -20,5 +20,5 @@ requires = ["loader.memfd-main-image"]
 
 [status]
 state   = "playable"
-summary = "Plays."
-last-verified = 2026-09-06
+summary = "Plays. From a Steam shortcut, the shortcut's Steam Input controller layout applies, and Steam sees the game exit."
+last-verified = 2026-10-18

@@ -35,10 +35,11 @@ real contribution even — especially — when the answer is that it does not ru
 **Before you paste anything: a session log contains your gamertag, your XUID and
 your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 
-Current release qualification: [0.1.8](RELEASE-0.1.8.md). Retro Classics and
-Goat Simulator 3 are playable (player-confirmed); Goat saves and reloads progress
-on runtime 11.0.20261010.2, offline and, from launcher 0.1.7, online. Halo is
-playable, with an intermittent offline indicator still unresolved.
+Current release qualification: [0.1.13](RELEASE-0.1.13.md), with runtime
+11.0.20261018.1. Forza Horizon 6 and Minecraft for Windows play with separate
+Store and Player accounts; Minecraft Dungeons II takes a DualShock 4 without
+Steam; Steam Input layouts apply from Steam shortcuts. Halo is playable, with
+an intermittent offline indicator still unresolved.
 
 ## The matrix
 
@@ -52,15 +53,15 @@ playable, with an intermittent offline indicator still unresolved.
 | DREDGE | `9MSVVM5NS9L6` | Playable | Plays. | 2026-09-06 |
 | Dune: Awakening | `9PJ6FV3130QZ` | Playable | Gameplay confirmed by the player. | 2026-10-13 |
 | Forza Horizon 5 | `9NNX1VVR3KNQ` | Playable | Plays with a restored Windows career; title services and the live Festival Playlist load after generic authentication and endpoint-discovery fixes. Player confirmed the online fix. | 2026-09-07 |
-| Forza Horizon 6 | `9NR1R1XWLCNB` | Playable | Gameplay and Continue with saved progress confirmed by the player. The in-game marketplace is currently unavailable. | 2026-10-13 |
+| Forza Horizon 6 | `9NR1R1XWLCNB` | Playable | Gameplay and Continue with saved progress confirmed by the player. Also plays with separate Store and Player accounts: the Store account's Game Pass licence, the Player account's gamertag, profile and saves. The in-game marketplace is currently unavailable. | 2026-10-17 |
 | Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable | Playable, confirmed by the player offline and online. New games save and resume across relaunches, and Quit Game exits. Peer joining and voice are untested. | 2026-10-11 |
 | Halo Infinite | `9PP5G1F0C2B6` | Playable | Campaign, Academy training and multiplayer run; campaign save restoration was confirmed locally. Intermittent offline display remains under investigation. | 2026-10-10 |
 | Hollow Knight: Silksong | `9N116V0599HB` | Playable | Playable, confirmed by the player on the local Game Pass installation. | 2026-10-10 |
-| Minecraft Dungeons II | `9P5786PJB9RP` | Playable | Account sign-in, Store licence verification and Squid Coast gameplay work with the matching updated runtime. Long-session, multiplayer and cloud-save behavior are untested. | 2026-10-10 |
-| Minecraft for Windows | `9NBLGGH2JHXJ` | Playable | Signs in to Xbox Live, loads the profile, plays, and joins third-party servers from the in-game list. | 2026-09-06 |
+| Minecraft Dungeons II | `9P5786PJB9RP` | Playable | Account sign-in, Store licence verification and Squid Coast gameplay work with the matching updated runtime. A DualShock 4 over USB or Bluetooth drives it without Steam, and Steam Input pads work from a Steam shortcut. Long-session, multiplayer and cloud-save behavior are untested. | 2026-10-18 |
+| Minecraft for Windows | `9NBLGGH2JHXJ` | Playable | Signs in to Xbox Live, loads the profile, plays, and joins third-party servers from the in-game list. Also signs in as a separate Player account using the Store account's licence. | 2026-10-17 |
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
 | Retro Classics | `9MTVJ3HHTQGS` | Playable | Playable, confirmed by the player. Signs in, loads the catalogue and streams Tennis; broader game, controller and save-restore coverage is not separately qualified. | 2026-10-10 |
-| Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. | 2026-09-06 |
+| Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. From a Steam shortcut, the shortcut's Steam Input controller layout applies, and Steam sees the game exit. | 2026-10-18 |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.
 

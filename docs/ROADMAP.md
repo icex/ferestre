@@ -6,6 +6,12 @@ for Bedrock on Android, for Microsoft Store titles on Linux.
 
 ## Current qualification
 
+Release 0.1.13 pairs with runtime 11.0.20261018.1. It adds separate Store and
+Player accounts (#9), controllers in GDK titles -- PlayStation pads through
+SDL, Steam Input layouts from Steam shortcuts, GameInput gamepads (#10) -- and
+an offer to install WebKitGTK when the client's sign-in cannot start (#8). See
+[release qualification](RELEASE-0.1.13.md).
+
 Release 0.1.8 keeps runtime 11.0.20261010.2. A recipe that names no install
 directory now uses the one the launcher recorded at install time, so titles
 downloaded under their product id no longer need a personal recipe copy, which
@@ -311,6 +317,19 @@ honestly marked as unproven rather than planned.
       The path is checked rather than trusted before anything is deleted -- a
       record is a JSON file anybody can edit, and `remove_dir_all` on a bad path
       is the one thing here that cannot be undone.
+
+- [x] **Separate Store and Player accounts.** The account that owns a game or
+      Game Pass is chosen separately from the Xbox account that plays it, each
+      Player gets its own save prefix, and a running game keeps its pair.
+      Needs the 11.0.20261018.1 runtime; older runtimes refuse a split pair.
+
+- [x] **Controllers.** PlayStation pads reach XInput through SDL rather than
+      raw HID, Steam Input layouts apply from Steam shortcuts, GameInput v2
+      reports XInput pads, and Steam sees a game exit because the Xbox service
+      no longer holds the AppImage open.
+
+- [x] **Sign-in without WebKitGTK.** The window notices that the client cannot
+      load WebKitGTK and installs it through PackageKit, or shows the command.
 
 - [ ] **Appx and Msix packages.** This runtime opens MSIXVC, the container Xbox
       GDK titles ship in. The rest of a Store library is `Appx`, `AppxBundle`,

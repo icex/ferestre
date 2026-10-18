@@ -38,9 +38,9 @@ note = "Local XGameSave settings and authentication containers. Online hero data
 
 [status]
 state = "playable"
-summary = "Account sign-in, Store licence verification and Squid Coast gameplay work with the matching updated runtime. Long-session, multiplayer and cloud-save behavior are untested."
-last-verified = 2026-10-10
-verified-with = "Game Pass Ultimate, package 1.1.2.0, service licence IPC and upstream WinHTTP option 140 backport"
+summary = "Account sign-in, Store licence verification and Squid Coast gameplay work with the matching updated runtime. A DualShock 4 over USB or Bluetooth drives it without Steam, and Steam Input pads work from a Steam shortcut. Long-session, multiplayer and cloud-save behavior are untested."
+last-verified = 2026-10-18
+verified-with = "Game Pass Ultimate, package 1.1.2.0, service licence IPC and upstream WinHTTP option 140 backport; 0.1.13 launcher and GameInput patches with an emulated DualShock 4 (uhid, USB and Bluetooth) reaching the main menu"
 
 [[issues]]
 symptom = "login fails with error 0063 before a Store licence request"

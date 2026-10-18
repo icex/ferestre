@@ -61,9 +61,9 @@ note    = "worlds in minecraftWorlds/, settings in minecraftpe/options.txt"
 
 [status]
 state         = "playable"
-summary       = "Signs in to Xbox Live, loads the profile, plays, and joins third-party servers from the in-game list."
-last-verified = 2026-09-06
-verified-with = "tools/auto-join.py: launch, navigate the menus, join a server from the featured list"
+summary       = "Signs in to Xbox Live, loads the profile, plays, and joins third-party servers from the in-game list. Also signs in as a separate Player account using the Store account's licence."
+last-verified = 2026-10-17
+verified-with = "tools/auto-join.py: launch, navigate the menus, join a server from the featured list; local 0.1.13 accounts build: Xbox Live, PlayFab, achievements and presence as the Player account"
 
 [[issues]]
 symptom = "sign-in, marketplace and profile hang; the game opens no TCP connections at all"

@@ -61,31 +61,34 @@ Pronounced roughly *feh-RESS-treh*.
 
 ## Status
 
-Release **0.1.12** pairs with runtime **11.0.20261017.1**. Forza Horizon 6
-is playable, with shader startup, native PlayFab saves and Continue confirmed.
-Its marketplace is still under qualification. Dune: Awakening is marked
-playable from player confirmation. Game Pass tiers refresh independently of
-the catalog, and searches and paging include the full PC catalog.
-See [the release qualification](docs/RELEASE-0.1.12.md) for tested scope.
+Release **0.1.13** pairs with runtime **11.0.20261018.1**. It adds separate
+Store and Player accounts, PlayStation and Steam Input controllers in GDK
+titles, and an offer to install WebKitGTK when sign-in cannot start. Forza
+Horizon 6 is playable, with shader startup, native PlayFab saves and Continue
+confirmed. Its marketplace is still under qualification. Dune: Awakening is
+marked playable from player confirmation.
+See [the release qualification](docs/RELEASE-0.1.13.md) for tested scope.
 
 Honest version, because this is early. Every row here was run on a real machine,
 not inferred from the fact that it downloaded:
 
 | Title | Source | State |
 |---|---|---|
-| **Minecraft for Windows** (Bedrock) | Store | Playable. Signs in to Xbox Live, loads the profile, and **joins third-party servers from the in-game list** |
+| **Minecraft for Windows** (Bedrock) | Store | Playable. Signs in to Xbox Live, loads the profile, and **joins third-party servers from the in-game list**; also plays as a separate Player account on the Store account's licence |
 | **Clair Obscur: Expedition 33** | Store / Game Pass | Playable — saves, video, full game |
 | **Retro Classics** | Game Pass | Playable — player-confirmed; needs a runtime with the allocator-lifetime and save-interface fixes |
 | **Hollow Knight: Silksong** | Game Pass | Playable — player-confirmed |
 | **DREDGE** | Game Pass | Playable |
-| **Stardew Valley** | Game Pass | Playable |
+| **Stardew Valley** | Game Pass | Playable — Steam Input controller layout applies from a Steam shortcut |
 | **DOOM 64** | Game Pass | Playable |
 | **Overthrown** | Game Pass | Playable |
-| **Minecraft Dungeons II** | Game Pass Ultimate | Playable — sign-in and gameplay work; saving confirmed after finishing the tutorial |
+| **Minecraft Dungeons II** | Game Pass Ultimate | Playable — sign-in and gameplay work; saving confirmed after finishing the tutorial; a DualShock 4 (USB or Bluetooth) and Steam Input pads drive it |
 | **Halo Infinite** | Store / Game Pass Ultimate | Playable — campaign, training and multiplayer; intermittent offline display under investigation |
 | **Goat Simulator 3** | Game Pass | Playable — player-confirmed offline and online; saves resume; peer joining and voice untested |
 | **Age of Empires Definitive Edition** | Game Pass | Playable — boots, starts a custom game, and plays |
 | **Forza Horizon 5** | Store | Playable with restored Windows saves; Forza Online and the live Festival Playlist work |
+| **Forza Horizon 6** | Store / Game Pass | Playable — gameplay and Continue with saves; also plays with separate Store and Player accounts; in-game marketplace unavailable |
+| **Dune: Awakening** | Store | Playable — player-confirmed |
 
 Notes worth having before you try your own library:
 
@@ -120,6 +123,28 @@ run. And a title being in the Game Pass catalogue is not the same as your
 account being entitled to it: the window says what the catalogue includes and
 which subscriptions the account holds, and lets the licence request at install
 time be the thing that decides.
+
+## Accounts, controllers and sign-in
+
+**Store and Player accounts.** Accounts settings choose the account whose
+purchases and Game Pass are used (Store) separately from the Xbox account that
+plays (Player: gamertag, achievements, saves). Both are shown before launch,
+each Player gets its own save prefix, and a running game keeps the pair it
+started with. Splitting them needs runtime 11.0.20261018.1 or newer; older
+runtimes refuse instead of launching with the wrong account. Microsoft's and
+publishers' own account-sharing rules still apply. See
+[docs/ACCOUNT-SHARING-PROPOSAL.md](docs/ACCOUNT-SHARING-PROPOSAL.md).
+
+**Controllers.** Xbox pads, DualShock 4 and DualSense pads reach GDK titles
+through Wine's XInput and GameInput. PlayStation pads go through SDL, which
+needs the host's SDL2 (`sdl2-compat` on Arch and Fedora). From a Steam
+shortcut, the shortcut's Steam Input layout applies without `--steam`, and
+Steam sees the game exit when it quits.
+
+**Sign-in needs WebKitGTK 4.1.** The Xbox client's sign-in window is a
+WebKitGTK view. If it is missing, the window says so and offers to install it
+through your system's package manager, or shows the command.
+[docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) lists what each part needs.
 
 ## How it fits together
 
@@ -190,6 +215,10 @@ directory. Close Steam before adding or updating a shortcut.
 - [docs/RECIPES.md](docs/RECIPES.md) — build the runtime, sign in, download a
   title, launch it. Machine-independent; every script takes its paths from
   `XODUS_*` environment variables.
+- [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) — every title that has been
+  run, generated from the recipes, and how to report one.
+- [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) — host libraries for video,
+  controllers and sign-in, per distribution.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — the plan for turning this into a launcher.
 - [notes/](notes/) — the debugging write-ups. Worth reading if you want to know
   *why* something is the way it is; several were genuinely hard to find.

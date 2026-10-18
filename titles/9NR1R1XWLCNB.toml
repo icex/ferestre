@@ -31,9 +31,9 @@ wants = ["appmodel.package-identity", "xgameruntime.store-catalog"]
 
 [status]
 state = "playable"
-summary = "Gameplay and Continue with saved progress confirmed by the player. The in-game marketplace is currently unavailable."
-last-verified = 2026-10-13
-verified-with = "Ferestre 0.1.8, package 3.461.691.0, runtime 11.0.20261013.2-local; player-confirmed gameplay and Continue after normal exit. Native PlayFab cloud synchronization and byte-identical save reopen also passed."
+summary = "Gameplay and Continue with saved progress confirmed by the player. Also plays with separate Store and Player accounts: the Store account's Game Pass licence, the Player account's gamertag, profile and saves. The in-game marketplace is currently unavailable."
+last-verified = 2026-10-17
+verified-with = "Ferestre 0.1.8, package 3.461.691.0, runtime 11.0.20261013.2-local; player-confirmed gameplay and Continue after normal exit. Native PlayFab cloud synchronization and byte-identical save reopen also passed. Local 0.1.13 accounts build and runtime 11.0.20261017.2-accounts (the patches in runtime 11.0.20261018.1): a Game Pass Store account with a separate Player account created and played the Player's own profile and saves."
 
 [[issues]]
 symptom = "The in-game store reports failed to download marketplace data."
