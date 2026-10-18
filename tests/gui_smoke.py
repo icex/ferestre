@@ -1352,7 +1352,7 @@ print(":: done", flush=True)
         check(struct.unpack("<I", shortcut_bytes.split(b"\x02appid\0", 1)[1][:4])[0] == stored_id,
               "updating preserves the Steam app id and controller configuration identity", frame)
         check(os.path.isfile(shortcut_string("icon")), "re-adding fills the missing game icon", frame)
-        click(edit[0])
+        row_action(app, frame, "Edit launch settings", edit[0])
         labels = wait_for(
             frame,
             lambda root: texts(root) if any("Executable" in t for t in texts(root)) else None,
