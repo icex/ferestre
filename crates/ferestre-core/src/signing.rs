@@ -38,7 +38,7 @@ use std::path::Path;
 /// download is refused, which is the safe way for a build without a key to
 /// fail, and release CI refuses to publish a launcher that does not carry the
 /// key it signs with.
-pub const RELEASE_PUBLIC_KEY: &str = "FERESTRE_RELEASE_PUBLIC_KEY_PLACEHOLDER";
+pub const RELEASE_PUBLIC_KEY: &str = "RWQhHyR/MHoTJtPui/l2Xbhp3ETYauN4ErUGb6wYrjpw/rzt+874RvOb";
 
 /// What [`RELEASE_PUBLIC_KEY`] holds until the real key is put in.
 pub const RELEASE_PUBLIC_KEY_PLACEHOLDER: &str = "FERESTRE_RELEASE_PUBLIC_KEY_PLACEHOLDER";
