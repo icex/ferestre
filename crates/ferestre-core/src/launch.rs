@@ -150,10 +150,11 @@ pub struct Options {
     /// Keep the environment Steam started us with.
     ///
     /// Off by default, which is what `launch-gdk.sh` does and what an isolated
-    /// launch needs. On is for a non-Steam shortcut, where the whole point is
-    /// that the overlay, the controller configuration and Remote Play keep
-    /// working -- all of which are driven by exactly the variables the default
-    /// strips. This is a per-title toggle rather than a policy because both
+    /// launch needs. The default still keeps [`STEAM_IDENTITY`], so a non-Steam
+    /// shortcut's Steam Input layout applies without this. On is for a shortcut
+    /// that also wants the overlay and Remote Play, which ride on what the
+    /// default strips: the overlay library in `LD_PRELOAD` and Steam's Vulkan
+    /// layers. This is a per-title toggle rather than a policy because both
     /// answers are legitimate and the launcher is not in a position to guess.
     ///
     /// Turning it on brings back Steam's Fossilize capture, which has been seen
@@ -449,20 +450,49 @@ summary = "Runs."
     }
 
     /// Steam lists the physical pads it wraps in SDL_GAMECONTROLLER_IGNORE_DEVICES
-    /// (every Sony pad among them) and describes its virtual pads in
-    /// SteamVirtualGamepadInfo. Wine's input bus reads both; stripped, a
+    /// (every Sony pad among them). Wine's input bus honours that list, and its
+    /// `_EXCEPT` counterpart, in both its SDL and evdev buses; stripped, a
     /// DualShock under Steam Input would reach the title twice -- once through
     /// Steam's virtual pad and once through SDL, which the proton shim now
-    /// prefers for Sony pads.
+    /// prefers for Sony pads. Steam's own 28de:11ff virtual pad needs no hint:
+    /// winebus always skips it in SDL and takes it through evdev.
+    ///
+    /// SteamVirtualGamepadInfo is not one Wine uses -- winebus clears it before
+    /// starting SDL -- and is checked only so that the launcher keeps passing
+    /// Steam's controller variables through as one set.
     #[test]
     fn steams_controller_hints_reach_the_title() {
-        for name in [
+        let hints = [
             "SDL_GAMECONTROLLER_IGNORE_DEVICES",
+            "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT",
             "SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD",
             "SteamVirtualGamepadInfo",
-        ] {
+        ];
+        for name in hints {
             assert!(!STEAM_ENVIRONMENT.contains(&name), "{name} is stripped");
         }
+        // And nothing else in a plan touches them: not unset, not replaced.
+        let plan = plan(&recipe(""), &dirs(), &Options::default());
+        for name in hints {
+            assert!(!plan.is_unset(name), "{name} is unset");
+            assert_eq!(plan.get(name), None, "{name} is overridden");
+        }
+    }
+
+    #[test]
+    fn the_shell_launcher_strips_the_same_names_in_the_same_order() {
+        // STEAM_ENVIRONMENT promises to be launch-gdk.sh's unset list, in its
+        // order, so the two can be diffed. Keep the promise checked.
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/launch-gdk.sh");
+        let Ok(text) = std::fs::read_to_string(&script) else {
+            return; // packaged crate without the repository around it
+        };
+        let unset: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("unset "))
+            .flat_map(str::split_whitespace)
+            .collect();
+        assert_eq!(unset, STEAM_ENVIRONMENT);
     }
 
     #[test]
@@ -494,9 +524,10 @@ summary = "Runs."
 
     #[test]
     fn steam_integration_leaves_steams_environment_alone() {
-        // A non-Steam shortcut wants the overlay, the controller configuration
-        // and Remote Play, and all of those ride on the variables the default
-        // strips.
+        // A non-Steam shortcut that wants the overlay and Remote Play needs
+        // the variables the default strips: LD_PRELOAD and Steam's Vulkan
+        // layers. Its controller layout needs only STEAM_IDENTITY, which the
+        // default already keeps.
         let options = Options {
             steam_integration: true,
             ..Options::default()

@@ -123,7 +123,8 @@ enum Cmd {
         #[arg(long)]
         force: bool,
         /// Keep the environment Steam started us with, for a non-Steam shortcut
-        /// that wants the overlay, controller config and Remote Play.
+        /// that wants the overlay and Remote Play. Not needed for its Steam
+        /// Input controller layout, which works without it.
         #[arg(long)]
         steam: bool,
         /// Arguments for the title. Not supported yet; see the error.
