@@ -33,8 +33,9 @@ on your machine before starting.
   games are *not* Steam games and are launched by these scripts.
 - **Docker or Podman** with the ability to run containers as your user (the
   Proton fork is built inside Valve's SteamRT SDK image, so the build is
-  identical on every distro). `newgrp docker` is used in the scripts; on
-  Podman set `alias docker=podman`.
+  identical on every distro). For Podman, configure the build with
+  `--container-engine=podman`; `install-xodus-proton.sh` uses `newgrp docker`
+  only when docker is the engine and this session lacks the group.
 - **Rust toolchain** (`rustup`) for `xodus-cli`, **git + git-lfs**, **python3**,
   **rsync**, **x86_64-w64-mingw32-gcc** is *not* needed on the host (it lives in
   the container).
