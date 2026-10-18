@@ -1,0 +1,148 @@
+Subject: [PATCH] concrt140: fix concurrent_vector segment addresses and sizes
+
+The inline code in Microsoft's <concurrent_vector.h> never asks the runtime
+where element i is: operator[] reads segment[k] from the table and adds
+(i - base(k)) * sizeof(T) itself, and the allocator callback it installs takes
+a count of elements. This copy of the vector base, unlike the one in msvcp90,
+got both wrong:
+
+  - Segments below first_block were derived from segment 0 with BYTE**
+    arithmetic, so they were placed sizeof(void*) times too far in. The same
+    mistake put the appended elements of _Internal_grow_by() and
+    _Internal_grow_to_at_least_with_result(), and the tail handled by
+    _Internal_assign() and _Internal_resize(), at the wrong address.
+  - The allocator was given element_size * count, so every block was
+    element_size times too large.
+
+For a small element the first one overflows the heap: reserve(64) or a first
+grow_by(64) of a concurrent_vector<int> places segment 5 1024 bytes into a
+1024-byte block, and elements 32..63 are written past its end. For larger
+elements the oversized block hid the misplacement, but grow_by() on a vector
+built by push_back still constructed its new elements outside every segment.
+
+Two older mistakes in the same functions, shared with msvcp90, are fixed with
+them, because the corrected addresses made them reachable:
+
+  - _Internal_resize() shrinking within one segment destroyed that segment
+    from its start, including elements the vector keeps, then destroyed the
+    tail again.
+  - _Internal_assign() between two vectors whose ends fall in the same
+    segment destroyed, or copied from, elements past the end of the vector.
+
+Validated with tests/concrt_vector_segments.c, which drives the exported ABI
+the way the header does and checks every address it is given against the
+blocks it allocated, against this implementation and against Microsoft's
+concrt140.dll 14.16, 14.40, 14.44 and 14.51: all pass, for element sizes 1 to
+24. Before this change the builtin failed 16,322 of 77,735 checks.
+
+diff --git a/dlls/concrt140/details.c b/dlls/concrt140/details.c
+index 699df24..c8ab0f7 100644
+--- a/dlls/concrt140/details.c
++++ b/dlls/concrt140/details.c
+@@ -568,12 +568,12 @@ static void concurrent_vector_alloc_segment(_Concurrent_vector_base_v4 *this,
+             __TRY
+             {
+                 if(seg == 0)
+-                    this->segment[seg] = this->allocator(this, element_size * (1 << this->first_block));
++                    this->segment[seg] = this->allocator(this, 1 << this->first_block);
+                 else if(seg < this->first_block)
+-                    this->segment[seg] = (BYTE**)this->segment[0]
++                    this->segment[seg] = (BYTE*)this->segment[0]
+                         + element_size * (1 << seg);
+                 else
+-                    this->segment[seg] = this->allocator(this, element_size * (1 << seg));
++                    this->segment[seg] = this->allocator(this, 1 << seg);
+             }
+             __EXCEPT_ALL
+             {
+@@ -786,7 +786,7 @@ void __thiscall _Concurrent_vector_base_v4__Internal_assign(
+         void (__cdecl *assign)(void*, const void*, size_t),
+         void (__cdecl *copy)(void*, const void*, size_t))
+ {
+-    size_t v_size, seg_no, v_seg_no, remain_element;
++    size_t v_size, seg_no, v_seg_no, remain_element, count;
+     int i;
+ 
+     TRACE("(%p %p %Iu %p %p %p)\n", this, v, element_size, clear, assign, copy);
+@@ -809,11 +809,16 @@ void __thiscall _Concurrent_vector_base_v4__Internal_assign(
+     if(remain_element != 0)
+         assign(this->segment[i], v->segment[i], remain_element);
+ 
++    /* Segment i is where the shorter of the two vectors ends. When the longer
++     * one ends there too, only the elements up to its own end exist: the rest
++     * of the segment was never constructed, so it must be neither destroyed
++     * nor copied from. Counting to the end of the segment destroyed elements
++     * that were never built, and copied ones the source does not have. */
+     if(this->early_size > v_size)
+     {
+-        if((i ? 1 << i : 2) - remain_element > 0)
+-            clear((BYTE**)this->segment[i] + element_size * remain_element,
+-                    (i ? 1 << i : 2) - remain_element);
++        count = min(this->early_size, 1 << (i + 1)) - v_size;
++        if(count > 0)
++            clear((BYTE*)this->segment[i] + element_size * remain_element, count);
+         if(i < seg_no)
+         {
+             for(i++; i < seg_no; i++)
+@@ -823,10 +828,10 @@ void __thiscall _Concurrent_vector_base_v4__Internal_assign(
+     }
+     else if(this->early_size < v_size)
+     {
+-        if((i ? 1 << i : 2) - remain_element > 0)
+-            copy((BYTE**)this->segment[i] + element_size * remain_element,
+-                    (BYTE**)v->segment[i] + element_size * remain_element,
+-                    (i ? 1 << i : 2) - remain_element);
++        count = min(v_size, 1 << (i + 1)) - this->early_size;
++        if(count > 0)
++            copy((BYTE*)this->segment[i] + element_size * remain_element,
++                    (BYTE*)v->segment[i] + element_size * remain_element, count);
+         if(i < v_seg_no)
+         {
+             _Concurrent_vector_base_v4__Internal_reserve(this, v_size,
+@@ -861,7 +866,7 @@ size_t __thiscall _Concurrent_vector_base_v4__Internal_grow_by(
+     last_seg_no = _vector_base_v4__Segment_index_of(size + count - 1);
+     remain_size = min(size + count, 1 << (seg_no + 1)) - size;
+     if(remain_size > 0)
+-        copy(((BYTE**)this->segment[seg_no] + element_size * (size - ((1 << seg_no) & ~1))), v,
++        copy(((BYTE*)this->segment[seg_no] + element_size * (size - ((1 << seg_no) & ~1))), v,
+             remain_size);
+     if(seg_no != last_seg_no)
+     {
+@@ -894,7 +899,7 @@ size_t __thiscall _Concurrent_vector_base_v4__Internal_grow_to_at_least_with_res
+     last_seg_no = _vector_base_v4__Segment_index_of(count - 1);
+     remain_size = min(count, 1 << (seg_no + 1)) - size;
+     if(remain_size > 0)
+-        copy(((BYTE**)this->segment[seg_no] + element_size * (size - ((1 << seg_no) & ~1))), v,
++        copy(((BYTE*)this->segment[seg_no] + element_size * (size - ((1 << seg_no) & ~1))), v,
+             remain_size);
+     if(seg_no != last_seg_no)
+     {
+@@ -969,15 +974,20 @@ void __thiscall _Concurrent_vector_base_v4__Internal_resize(
+     {
+         seg_no = _vector_base_v4__Segment_index_of(size - 1);
+         end_seg_no = _vector_base_v4__Segment_index_of(resize - 1);
+-        clear_element = size - (seg_no ? 1 << seg_no : 2);
+-        if(clear_element > 0)
+-            clear(this->segment[seg_no], clear_element);
+-        if(seg_no) seg_no--;
+-        for(; seg_no > end_seg_no; seg_no--)
+-            clear(this->segment[seg_no], 1 << seg_no);
+-        clear_element = (1 << (end_seg_no + 1)) - resize;
++        /* Every segment after the one the new end falls in goes: the last of
++         * them up to the old end, the others whole. When both ends fall in
++         * the same segment there are none. Clearing that segment from its
++         * start, as this used to, destroyed elements the vector keeps and
++         * then destroyed its tail a second time. */
++        if(seg_no > end_seg_no)
++        {
++            clear(this->segment[seg_no], size - (1 << seg_no));
++            for(seg_no--; seg_no > end_seg_no; seg_no--)
++                clear(this->segment[seg_no], 1 << seg_no);
++        }
++        clear_element = min(size, 1 << (end_seg_no + 1)) - resize;
+         if(clear_element > 0)
+-            clear((BYTE**)this->segment[end_seg_no] + element_size * (resize - ((1 << end_seg_no) & ~1)),
++            clear((BYTE*)this->segment[end_seg_no] + element_size * (resize - ((1 << end_seg_no) & ~1)),
+                     clear_element);
+         this->early_size = resize;
+     }
