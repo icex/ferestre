@@ -11,15 +11,16 @@ stream, NUL or `.`/`..` component is refused, and the whole install with
 it, before anything is fetched. `run` and `download` apply the same rule.
 An NTFS name holding a separator is refused where it is read.
 
-Integrity: the package is fetched over https; a plain http CDN root from the
-package service is asked for over https instead (XODUS_ALLOW_HTTP_CDN=1
-keeps it). `XvdFile::parse_verified` checks the hash tree against the
+Integrity: an https CDN root from the package service is preferred; a
+plain http root is used as listed, since the Xbox CDN hosts do not answer
+https for their own names, with a note on stderr (XODUS_REQUIRE_HTTPS_CDN=1
+refuses it instead). `XvdFile::parse_verified` checks the hash tree against the
 header's top hash level by level, then the metadata pages (file table,
 segment metadata, region table) against the tree; the NTFS pages are
 checked as they are read, and every page of every file before it is
 decrypted or written. A damaged page is fetched again, three times at most,
 then the file fails. The header signature is not checked, so the header is
-as trustworthy as the TLS connection it came over. The installed container
+as trustworthy as the connection it came over. The installed container
 and `run` keep the unchecked `XvdFile::parse`.
 
 Retries: a dropped connection is retried with a doubling wait (1 s to 30 s)
@@ -3250,69 +3251,76 @@ index 77d94e2..6c10a7d 100644
 +    }
  }
 diff --git a/crates/xodus-cli/src/package.rs b/crates/xodus-cli/src/package.rs
-index 1a32e59..07e8aae 100644
+index 1a32e59..568caca 100644
 --- a/crates/xodus-cli/src/package.rs
 +++ b/crates/xodus-cli/src/package.rs
-@@ -19,6 +19,58 @@ pub fn available_version(package: &PackageDetails) -> Option<&str> {
+@@ -19,6 +19,65 @@ pub fn available_version(package: &PackageDetails) -> Option<&str> {
      Some(&version[..prefix_len])
  }
  
-+/// Set to `1` to let a download go over a plain http CDN root the package
-+/// service lists, instead of asking for the same path over https.
-+pub const ALLOW_HTTP_CDN_ENV: &str = "XODUS_ALLOW_HTTP_CDN";
++/// Set to `1` to refuse a download when the package service lists only plain
++/// http CDN roots for it.
++pub const REQUIRE_HTTPS_CDN_ENV: &str = "XODUS_REQUIRE_HTTPS_CDN";
 +
-+/// Where to download a package file from: over https, whatever the package
-+/// service says.
++/// Where to download a package file from, out of the CDN roots the package
++/// service lists.
 +///
-+/// The service lists CDN roots, and they have been plain `http://` -- which
-+/// lets anybody on the path rewrite the package, header and all, and nothing
-+/// downstream could tell. An https root is taken if there is one; otherwise the
-+/// first root is asked for over https. A root in any other scheme is refused.
-+/// `XODUS_ALLOW_HTTP_CDN=1` keeps a plain http root as it is, for the day a CDN
-+/// host does not answer https: the pages are still checked against the
-+/// package's hash tree, but the header that vouches for that tree is not.
++/// An https root is taken if there is one. Otherwise the first root is used as
++/// it is, and so far that has meant plain `http://`: the Xbox package CDN hosts
++/// answer https with a certificate for other names, so asking them for the
++/// same path over https fails every time. Over http the pages are still
++/// checked against the package's hash tree, but the header that vouches for
++/// that tree is not, so a note says so. `XODUS_REQUIRE_HTTPS_CDN=1` refuses
++/// such a package instead. A root in any other scheme is refused.
 +pub fn package_url(cdn_roots: &[String], relative_url: &str) -> Result<String, String> {
-+    package_url_with(
++    let url = package_url_with(
 +        cdn_roots,
 +        relative_url,
-+        std::env::var(ALLOW_HTTP_CDN_ENV).is_ok_and(|v| v == "1"),
-+    )
++        std::env::var(REQUIRE_HTTPS_CDN_ENV).is_ok_and(|v| v == "1"),
++    )?;
++    if !has_scheme(&url, "https://") {
++        eprintln!(
++            "note: the package service lists only plain http for this package; its pages \
++             are checked against its hash tree, but nothing vouches for its header"
++        );
++    }
++    Ok(url)
++}
++
++fn has_scheme(url: &str, scheme: &str) -> bool {
++    url.get(..scheme.len())
++        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
 +}
 +
 +fn package_url_with(
 +    cdn_roots: &[String],
 +    relative_url: &str,
-+    allow_http: bool,
++    require_https: bool,
 +) -> Result<String, String> {
-+    if let Some(root) = cdn_roots
-+        .iter()
-+        .find(|root| root.to_ascii_lowercase().starts_with("https://"))
-+    {
++    if let Some(root) = cdn_roots.iter().find(|root| has_scheme(root, "https://")) {
 +        return Ok(format!("{root}{relative_url}"));
 +    }
 +    let Some(root) = cdn_roots.first() else {
 +        return Err("the package service listed no download location for this package".into());
 +    };
-+    let Some(rest) = root
-+        .get(..7)
-+        .filter(|scheme| scheme.eq_ignore_ascii_case("http://"))
-+        .map(|_| &root[7..])
-+    else {
++    if !has_scheme(root, "http://") {
 +        return Err(format!(
-+            "refusing the download location {root}: only https is used"
++            "refusing the download location {root}: only http and https are used"
 +        ));
-+    };
-+    if allow_http {
-+        eprintln!("warning: downloading over plain http ({ALLOW_HTTP_CDN_ENV}=1)");
-+        return Ok(format!("{root}{relative_url}"));
 +    }
-+    Ok(format!("https://{rest}{relative_url}"))
++    if require_https {
++        return Err(format!(
++            "refusing the download location {root}: it is plain http and \
++             {REQUIRE_HTTPS_CDN_ENV}=1 asks for https"
++        ));
++    }
++    Ok(format!("{root}{relative_url}"))
 +}
 +
  pub async fn get_content_id(
      client: &reqwest::Client,
      product: String,
-@@ -110,17 +162,30 @@ pub async fn get_packages(
+@@ -110,17 +169,30 @@ pub async fn get_packages(
      tokens: &TokenManager,
      content_id: String,
  ) -> Result<PackageDetails, Box<dyn std::error::Error>> {
@@ -3347,7 +3355,7 @@ index 1a32e59..07e8aae 100644
  
      let response = client
          .get(format!(
-@@ -133,9 +198,12 @@ pub async fn get_packages(
+@@ -133,9 +205,12 @@ pub async fn get_packages(
          )
          .send()
          .await
@@ -3362,41 +3370,40 @@ index 1a32e59..07e8aae 100644
  
      let PackageResponse::Found(package) = res else {
          return Err(Box::new(std::io::Error::other(
-@@ -168,4 +236,37 @@ mod tests {
+@@ -168,4 +243,36 @@ mod tests {
          with_build_id.version = "3.688.109.0.3b6b700a-992b-45fc-b16b-4ea65141d98c".into();
          assert_eq!(available_version(&with_build_id), Some("3.688.109.0"));
      }
 +
 +    #[test]
-+    fn packages_are_fetched_over_https() {
++    fn packages_are_fetched_from_the_roots_the_service_lists() {
 +        let roots = |r: &[&str]| r.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 +        let rel = "/8/abc/package.msixvc";
 +
-+        // A plain http root is asked for over https.
++        // A plain http root is used as it is: the CDN hosts do not answer
++        // https for their own names, so rewriting it would fail every install.
 +        assert_eq!(
 +            package_url_with(&roots(&["http://assets1.xboxlive.com"]), rel, false).unwrap(),
-+            "https://assets1.xboxlive.com/8/abc/package.msixvc"
++            "http://assets1.xboxlive.com/8/abc/package.msixvc"
 +        );
 +        // An https root, wherever it is in the list, is preferred.
 +        assert_eq!(
 +            package_url_with(
 +                &roots(&[
 +                    "http://assets1.xboxlive.com",
-+                    "https://assets2.xboxlive.com"
++                    "HTTPS://assets2.xboxlive.com"
 +                ]),
 +                rel,
-+                false
++                true
 +            )
 +            .unwrap(),
-+            "https://assets2.xboxlive.com/8/abc/package.msixvc"
++            "HTTPS://assets2.xboxlive.com/8/abc/package.msixvc"
 +        );
-+        // Only when asked for is plain http kept.
-+        assert_eq!(
-+            package_url_with(&roots(&["http://assets1.xboxlive.com"]), rel, true).unwrap(),
-+            "http://assets1.xboxlive.com/8/abc/package.msixvc"
-+        );
++        // Only when asked for is a plain http list refused.
++        assert!(package_url_with(&roots(&["http://assets1.xboxlive.com"]), rel, true).is_err());
 +        // No roots, or one in another scheme, is an error rather than a panic.
 +        assert!(package_url_with(&[], rel, false).is_err());
-+        assert!(package_url_with(&roots(&["ftp://x"]), rel, true).is_err());
++        assert!(package_url_with(&roots(&["ftp://x"]), rel, false).is_err());
++        assert!(package_url_with(&roots(&["h"]), rel, false).is_err());
 +    }
  }
