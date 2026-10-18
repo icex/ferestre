@@ -10,7 +10,7 @@ index 4d766e7..629352a 100644
  
  EXTRADLLFLAGS = -Wb,--prefer-native
 diff --git a/dlls/gameinput/gameinput.c b/dlls/gameinput/gameinput.c
-index f928648..06fb5d1 100644
+index f928648..36b0eb9 100644
 --- a/dlls/gameinput/gameinput.c
 +++ b/dlls/gameinput/gameinput.c
 @@ -354,12 +354,25 @@ static HRESULT device_callback_create( IGameInputDevice_v0 *device, GameInputKin
@@ -76,7 +76,7 @@ index f928648..06fb5d1 100644
          CloseHandle( impl->initialized );
          free( impl );
      }
-@@ -611,6 +638,812 @@ static const IGameInput_v0Vtbl game_input_v0_vtbl =
+@@ -611,6 +638,894 @@ static const IGameInput_v0Vtbl game_input_v0_vtbl =
      game_input_v0_SetFocusPolicy,
  };
  
@@ -454,11 +454,14 @@ index f928648..06fb5d1 100644
 +    return 0;
 +}
 +
++/* The message-only window raw input is delivered to, once its thread is up. */
++static HWND raw_input_hwnd;
++
 +static DWORD WINAPI raw_input_thread( void *arg )
 +{
 +    static const WCHAR class_name[] = L"xodus_gameinput_raw";
 +    WNDCLASSEXW cls = { .cbSize = sizeof(cls) };
-+    RAWINPUTDEVICE device;
++    HANDLE ready = arg;
 +    HWND hwnd;
 +    MSG msg;
 +
@@ -467,24 +470,11 @@ index f928648..06fb5d1 100644
 +    cls.hInstance = GetModuleHandleW( NULL );
 +    RegisterClassExW( &cls );
 +
-+    if (!(hwnd = CreateWindowExW( 0, class_name, NULL, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, cls.hInstance, NULL )))
-+    {
-+        WARN( "could not create the raw input window; mouse motion will be limited.\n" );
-+        return 0;
-+    }
-+
-+    device.usUsagePage = HID_USAGE_PAGE_GENERIC;
-+    device.usUsage = HID_USAGE_GENERIC_MOUSE;
-+    /* INPUTSINK: keep receiving motion even when the game window is not the
-+     * foreground one, so a reading is never silently starved. */
-+    device.dwFlags = RIDEV_INPUTSINK;
-+    device.hwndTarget = hwnd;
-+    if (!RegisterRawInputDevices( &device, 1, sizeof(device) ))
-+    {
-+        WARN( "RegisterRawInputDevices failed (%lu).\n", GetLastError() );
-+        DestroyWindow( hwnd );
-+        return 0;
-+    }
++    hwnd = CreateWindowExW( 0, class_name, NULL, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, cls.hInstance, NULL );
++    if (!hwnd) WARN( "could not create the raw input window; mouse motion will be limited.\n" );
++    raw_input_hwnd = hwnd;
++    SetEvent( ready );
++    if (!hwnd) return 0;
 +
 +    while (GetMessageW( &msg, NULL, 0, 0 ) > 0)
 +    {
@@ -496,9 +486,22 @@ index f928648..06fb5d1 100644
 +
 +static BOOL WINAPI start_raw_input( INIT_ONCE *once, void *param, void **ctx )
 +{
-+    HANDLE thread = CreateThread( NULL, 0, raw_input_thread, NULL, 0, NULL );
-+    if (thread) CloseHandle( thread );
++    HANDLE ready, thread;
++
++    if (!(ready = CreateEventW( NULL, TRUE, FALSE, NULL )))
++    {
++        WARN( "could not start the raw input thread.\n" );
++        return TRUE;
++    }
++    /* Wait for the window, so the first reading can already register it. The
++     * thread signals whether or not it managed to create one. */
++    if ((thread = CreateThread( NULL, 0, raw_input_thread, ready, 0, NULL )))
++    {
++        WaitForSingleObject( ready, INFINITE );
++        CloseHandle( thread );
++    }
 +    else WARN( "could not start the raw input thread.\n" );
++    CloseHandle( ready );
 +    return TRUE;
 +}
 +
@@ -506,6 +509,62 @@ index f928648..06fb5d1 100644
 +{
 +    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
 +    InitOnceExecuteOnce( &once, start_raw_input, NULL, NULL );
++}
++
++/* Whether the process's raw mouse registration is currently ours, taking it
++ * first if nobody holds it.
++ *
++ * Raw input is registered per process, with one target per kind of device, so
++ * GameInput shares the mouse registration with the title and with dinput.
++ * Registering replaces whoever held it, and dinput takes it while it has a
++ * mouse acquired and removes it (RIDEV_REMOVE) when it lets go. Taking it
++ * unconditionally silenced a title's own WM_INPUT, and taking it only once left
++ * GameInput's counters frozen for the rest of the session after dinput let go.
++ * So it is taken only while nobody else holds it, and checked again on every
++ * reading; while someone else does, GetMouseState falls back to cursor motion.
++ * The check and the registration are two calls, so a title registering between
++ * them can still lose to us once, until it registers again. */
++static BOOL raw_input_claim( void )
++{
++    RAWINPUTDEVICE buffer[32], *devices = buffer, mouse;
++    UINT count = ARRAY_SIZE(buffer), found, i;
++    BOOL ours = FALSE, held = FALSE;
++
++    ensure_raw_input();
++    if (!raw_input_hwnd) return FALSE;
++
++    found = GetRegisteredRawInputDevices( devices, &count, sizeof(*devices) );
++    if (found == (UINT)-1 && GetLastError() == ERROR_INSUFFICIENT_BUFFER &&
++        (devices = malloc( count * sizeof(*devices) )))
++        found = GetRegisteredRawInputDevices( devices, &count, sizeof(*devices) );
++    if (found == (UINT)-1)
++    {
++        if (devices != buffer) free( devices );
++        return FALSE;
++    }
++
++    for (i = 0; i < found; i++)
++    {
++        if (devices[i].usUsagePage != HID_USAGE_PAGE_GENERIC || devices[i].usUsage != HID_USAGE_GENERIC_MOUSE) continue;
++        held = TRUE;
++        ours = devices[i].hwndTarget == raw_input_hwnd;
++        break;
++    }
++    if (devices != buffer) free( devices );
++
++    if (!held)
++    {
++        mouse.usUsagePage = HID_USAGE_PAGE_GENERIC;
++        mouse.usUsage = HID_USAGE_GENERIC_MOUSE;
++        /* INPUTSINK: keep receiving motion even when the game window is not the
++         * foreground one, so a reading is never silently starved. */
++        mouse.dwFlags = RIDEV_INPUTSINK;
++        mouse.hwndTarget = raw_input_hwnd;
++        if (!(ours = RegisterRawInputDevices( &mouse, 1, sizeof(mouse) )))
++            WARN( "RegisterRawInputDevices failed (%lu).\n", GetLastError() );
++        else TRACE( "registered the raw mouse to %p\n", raw_input_hwnd );
++    }
++    return ours;
 +}
 +
 +/* Keys currently down, as virtual-key codes. A title reads the count first and
@@ -557,26 +616,49 @@ index f928648..06fb5d1 100644
 + * matches the real movement -- that was the erratic look-around. So these
 + * counters only ever grow, and are never cleared.
 + *
-+ * The movement has to come from raw input rather than from the cursor. Once a
-+ * title pins the pointer to look around GetCursorPos stops changing, and its
-+ * deltas are accelerated screen pixels rather than device counts in any case.
-+ * absolutePositionX/Y is the field that genuinely wants a screen coordinate. */
++ * The movement comes from raw input rather than from the cursor whenever it
++ * can (see raw_input_claim). Once a title pins the pointer to look around
++ * GetCursorPos stops changing, and its deltas are accelerated screen pixels
++ * rather than device counts in any case. absolutePositionX/Y is the field that
++ * genuinely wants a screen coordinate. */
++static SRWLOCK cursor_lock = SRWLOCK_INIT;
++static POINT last_cursor;
++static BOOL have_last_cursor;
++
 +static bool WINAPI virtual_reading_GetMouseState( IGameInputReading_v2 *iface, GameInputMouseState_v2 *state )
 +{
 +    struct virtual_reading *reading = impl_from_IGameInputReading_v2( iface );
++    BOOL raw, have_pos;
 +    POINT pos;
 +
 +    if (!state || reading->device->kind != GameInputKindMouse) return FALSE;
 +    memset( state, 0, sizeof(*state) );
 +
-+    ensure_raw_input();
++    raw = raw_input_claim();
++    if ((have_pos = GetCursorPos( &pos )))
++    {
++        /* While someone else holds the raw mouse registration no raw motion
++         * arrives, so feed the same counters from the cursor instead. That
++         * stops working once the pointer is held in place, but a title (or
++         * dinput) holding raw input is reading its own motion from it. The
++         * position is tracked either way, so switching over adds no jump. */
++        AcquireSRWLockExclusive( &cursor_lock );
++        if (!raw && have_last_cursor)
++        {
++            InterlockedExchangeAdd64( &raw_dx, pos.x - last_cursor.x );
++            InterlockedExchangeAdd64( &raw_dy, pos.y - last_cursor.y );
++        }
++        last_cursor = pos;
++        have_last_cursor = TRUE;
++        ReleaseSRWLockExclusive( &cursor_lock );
++    }
 +
 +    state->positions = GameInputMouseRelativePosition;
 +    state->positionX = InterlockedCompareExchange64( &raw_dx, 0, 0 );
 +    state->positionY = InterlockedCompareExchange64( &raw_dy, 0, 0 );
 +    state->wheelY = InterlockedCompareExchange64( &raw_wheel, 0, 0 );
 +
-+    if (GetCursorPos( &pos ))
++    if (have_pos)
 +    {
 +        state->positions |= GameInputMouseAbsolutePosition;
 +        state->absolutePositionX = pos.x;
@@ -889,7 +971,7 @@ index f928648..06fb5d1 100644
  static struct device *find_device( struct list *devices, const DEV_OBJECT *object )
  {
      struct device *device;
-@@ -678,26 +1511,39 @@ static void WINAPI device_query_cb( HDEVQUERY devquery, void *context, const DEV
+@@ -678,26 +1593,39 @@ static void WINAPI device_query_cb( HDEVQUERY devquery, void *context, const DEV
      }
  }
  
@@ -935,7 +1017,7 @@ index f928648..06fb5d1 100644
      TRACE( "created GameInput %p\n", impl );
      return impl;
  }
-@@ -705,20 +1551,39 @@ static struct game_input *game_input_create(void)
+@@ -705,20 +1633,39 @@ static struct game_input *game_input_create(void)
  HRESULT WINAPI GameInputCreate( IGameInput_v0 **out )
  {
      struct game_input *impl;

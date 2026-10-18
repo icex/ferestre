@@ -1,5 +1,5 @@
 diff --git a/dlls/gameinput/gameinput.c b/dlls/gameinput/gameinput.c
-index e0a8083..d104c33 100644
+index 3b3e495..499c66f 100644
 --- a/dlls/gameinput/gameinput.c
 +++ b/dlls/gameinput/gameinput.c
 @@ -749,6 +749,16 @@ struct virtual_device
@@ -259,7 +259,7 @@ index e0a8083..d104c33 100644
      done = TRUE;
  }
  
-@@ -1474,6 +1696,7 @@ static HRESULT WINAPI game_input_v2_GetCurrentReading( IGameInput_v2 *iface, Gam
+@@ -1556,6 +1778,7 @@ static HRESULT WINAPI game_input_v2_GetCurrentReading( IGameInput_v2 *iface, Gam
      struct virtual_reading *r;
  
      TRACE( "impl %p, kind %#x, device %p, reading %p.\n", impl_from_v2_IGameInput( iface ), kind, device, reading );
@@ -267,7 +267,7 @@ index e0a8083..d104c33 100644
  
      if (!reading) return E_POINTER;
      *reading = NULL;
-@@ -1496,6 +1719,7 @@ static HRESULT WINAPI game_input_v2_GetNextReading( IGameInput_v2 *iface, IGameI
+@@ -1578,6 +1801,7 @@ static HRESULT WINAPI game_input_v2_GetNextReading( IGameInput_v2 *iface, IGameI
                                                      GameInputKind kind, IGameInputDevice_v2 *device, IGameInputReading_v2 **reading )
  {
      TRACE( "impl %p, reference %p, kind %#x, device %p, reading %p.\n", impl_from_v2_IGameInput( iface ), reference, kind, device, reading );
@@ -275,7 +275,7 @@ index e0a8083..d104c33 100644
  
      if (!reading) return E_POINTER;
      *reading = NULL;
-@@ -1530,6 +1754,7 @@ static HRESULT WINAPI game_input_v2_RegisterDeviceCallback( IGameInput_v2 *iface
+@@ -1612,6 +1836,7 @@ static HRESULT WINAPI game_input_v2_RegisterDeviceCallback( IGameInput_v2 *iface
  
      TRACE( "impl %p, device %p, kind %#x, filter %#x, enum_kind %#x, context %p, callback %p, token %p.\n",
             impl, device, kind, filter, enum_kind, context, callback, token );

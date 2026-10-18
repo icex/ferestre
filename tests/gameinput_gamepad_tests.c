@@ -9,7 +9,7 @@
 
 static unsigned int failures, count;
 static IGameInputDevice_v2 *devices[4];
-#define OK(c, s) do { printf("%s - %s\n", (c) ? "ok  " : "FAIL", s); if (!(c)) failures++; } while (0)
+#define OK(c, ...) do { printf("%s - ", (c) ? "ok  " : "FAIL"); printf(__VA_ARGS__); printf("\n"); if (!(c)) failures++; } while (0)
 
 /* The pad a reading came from, without keeping a reference to it. */
 static IGameInputDevice_v2 *reading_device(IGameInputReading_v2 *reading)
@@ -34,6 +34,131 @@ static void WINAPI callback(GameInputCallbackToken token, void *context, IGameIn
 {
     if (count < 4) devices[count] = device;
     count++;
+}
+
+/* Run this thread's messages for a while. */
+static void pump(DWORD ms)
+{
+    DWORD start = GetTickCount();
+    MSG msg;
+
+    while (GetTickCount() - start < ms)
+    {
+        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
+        Sleep(5);
+    }
+}
+
+/* Where the process's raw mouse input goes, if anywhere. Raw input has one
+ * registration per process for each kind of device. */
+static BOOL mouse_registration(HWND *target)
+{
+    RAWINPUTDEVICE list[32];
+    UINT size = sizeof(list) / sizeof(list[0]), found, i;
+
+    *target = NULL;
+    if ((found = GetRegisteredRawInputDevices(list, &size, sizeof(*list))) == (UINT)-1) return FALSE;
+    for (i = 0; i < found; i++)
+    {
+        if (list[i].usUsagePage != 0x01 || list[i].usUsage != 0x02) continue; /* generic desktop mouse */
+        *target = list[i].hwndTarget;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL set_mouse_registration(HWND target, DWORD flags)
+{
+    RAWINPUTDEVICE mouse = {0x01, 0x02, flags, target};
+    return RegisterRawInputDevices(&mouse, 1, sizeof(mouse));
+}
+
+/* GameInput reads mouse motion through raw input, which it shares with the
+ * title and with dinput: a title's own registration must survive a GameInput
+ * mouse reading, and GameInput must pick the mouse back up once whoever held it
+ * lets go, as dinput does when it unacquires. */
+static void test_mouse_registration(IGameInput_v2 *input)
+{
+    IGameInputReading_v2 *reading = NULL;
+    GameInputMouseState_v2 s0, s1;
+    HWND title, target, foreground;
+    char flag[8] = "";
+    BOOL pointer;
+    INPUT in;
+    HRESULT hr;
+
+    /* Moving the pointer is only safe on a private display (Xvfb), since on a
+     * real one it moves the user's pointer, and Wine's null driver never moves
+     * it at all. So those checks run only when asked for. */
+    pointer = GetEnvironmentVariableA("GAMEINPUT_TEST_POINTER", flag, sizeof(flag)) && flag[0] == '1';
+    title = CreateWindowExA(0, "STATIC", "title", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, NULL, NULL);
+    OK(title && set_mouse_registration(title, 0), "the title registers its own raw mouse");
+    hr = IGameInput_v2_GetCurrentReading(input, GameInputKindMouse, NULL, &reading);
+    OK(hr == S_OK && reading, "mouse reading");
+    if (!reading) goto done;
+
+    IGameInputReading_v2_GetMouseState(reading, &s0);
+    Sleep(200); /* long enough for a registration from GameInput's own thread to land */
+    IGameInputReading_v2_GetMouseState(reading, &s0);
+    OK(mouse_registration(&target) && target == title, "a mouse reading leaves the title's raw mouse registration alone");
+
+    if (pointer)
+    {
+        SetCursorPos(100, 100);
+        IGameInputReading_v2_GetMouseState(reading, &s0);
+        SetCursorPos(130, 120);
+        IGameInputReading_v2_GetMouseState(reading, &s1);
+        OK(s1.positionX - s0.positionX == 30 && s1.positionY - s0.positionY == 20,
+           "while the title holds raw input, motion comes from the cursor (%lld,%lld)",
+           (long long)(s1.positionX - s0.positionX), (long long)(s1.positionY - s0.positionY));
+    }
+    else printf("ok   - # SKIP cursor fallback (set GAMEINPUT_TEST_POINTER=1 on a private display)\n");
+
+    set_mouse_registration(NULL, RIDEV_REMOVE);
+    OK(!mouse_registration(&target), "nothing holds the raw mouse after RIDEV_REMOVE");
+    IGameInputReading_v2_GetMouseState(reading, &s0);
+    OK(mouse_registration(&target) && target && target != title, "GameInput takes the raw mouse once it is free again");
+
+    if (pointer)
+    {
+        SetCursorPos(150, 150);
+        IGameInputReading_v2_GetMouseState(reading, &s0);
+        SetCursorPos(170, 175);
+        IGameInputReading_v2_GetMouseState(reading, &s1);
+        OK(s1.positionX == s0.positionX && s1.positionY == s0.positionY,
+           "with raw input its own, cursor motion is not counted a second time");
+
+        /* And raw motion reaches it again, as after dinput unacquires. Wine
+         * delivers raw input only while the process owns the foreground
+         * window, and the display may scale the motion, so only its direction
+         * is checked. */
+        foreground = CreateWindowExA(0, "STATIC", "gameinput_gamepad_tests", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                     0, 0, 320, 240, NULL, NULL, NULL, NULL);
+        SetForegroundWindow(foreground);
+        pump(300);
+        IGameInputReading_v2_GetMouseState(reading, &s0);
+        memset(&in, 0, sizeof(in));
+        in.type = INPUT_MOUSE;
+        in.mi.dx = 30;
+        in.mi.dy = 20;
+        in.mi.dwFlags = MOUSEEVENTF_MOVE;
+        SendInput(1, &in, sizeof(in));
+        pump(300);
+        IGameInputReading_v2_GetMouseState(reading, &s1);
+        OK(s1.positionX > s0.positionX && s1.positionY > s0.positionY,
+           "raw motion reaches GameInput again once it holds the mouse (%lld,%lld)",
+           (long long)(s1.positionX - s0.positionX), (long long)(s1.positionY - s0.positionY));
+        DestroyWindow(foreground);
+    }
+
+    set_mouse_registration(title, 0);
+    IGameInputReading_v2_GetMouseState(reading, &s0);
+    OK(mouse_registration(&target) && target == title, "a title registering again keeps its registration");
+    set_mouse_registration(NULL, RIDEV_REMOVE);
+
+done:
+    if (reading) IGameInputReading_v2_Release(reading);
+    if (title) DestroyWindow(title);
 }
 
 int main(void)
@@ -195,6 +320,8 @@ int main(void)
     hr = IGameInput_v2_GetCurrentReading(input, GameInputKindGamepad, devices[0], &next);
     OK(hr == GAMEINPUT_E_READING_NOT_FOUND && !next, "disconnected pad supplies no reading");
     IGameInput_v2_UnregisterCallback(input, token);
+
+    test_mouse_registration(input);
 
 done:
     if (reading) IGameInputReading_v2_Release(reading);

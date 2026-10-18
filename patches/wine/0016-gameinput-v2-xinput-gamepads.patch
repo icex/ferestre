@@ -1,5 +1,5 @@
 diff --git a/dlls/gameinput/gameinput.c b/dlls/gameinput/gameinput.c
-index 06fb5d1..e0a8083 100644
+index 36b0eb9..3b3e495 100644
 --- a/dlls/gameinput/gameinput.c
 +++ b/dlls/gameinput/gameinput.c
 @@ -27,6 +27,7 @@
@@ -187,7 +187,7 @@ index 06fb5d1..e0a8083 100644
  }
  
  static void WINAPI virtual_reading_GetDevice( IGameInputReading_v2 *iface, IGameInputDevice_v2 **device )
-@@ -1151,7 +1238,41 @@ static bool WINAPI virtual_reading_GetMouseState( IGameInputReading_v2 *iface, G
+@@ -1233,7 +1320,41 @@ static bool WINAPI virtual_reading_GetMouseState( IGameInputReading_v2 *iface, G
  static bool WINAPI virtual_reading_GetSensorsState( IGameInputReading_v2 *iface, GameInputSensorsState *state ) { return FALSE; }
  static bool WINAPI virtual_reading_GetArcadeStickState( IGameInputReading_v2 *iface, GameInputArcadeStickState *state ) { return FALSE; }
  static bool WINAPI virtual_reading_GetFlightStickState( IGameInputReading_v2 *iface, GameInputFlightStickState *state ) { return FALSE; }
@@ -230,7 +230,7 @@ index 06fb5d1..e0a8083 100644
  static bool WINAPI virtual_reading_GetRacingWheelState( IGameInputReading_v2 *iface, GameInputRacingWheelState *state ) { return FALSE; }
  static bool WINAPI virtual_reading_GetUiNavigationState( IGameInputReading_v2 *iface, GameInputUiNavigationState *state ) { return FALSE; }
  
-@@ -1199,12 +1320,105 @@ static struct virtual_reading *virtual_reading_for( GameInputKind kind, IGameInp
+@@ -1281,12 +1402,105 @@ static struct virtual_reading *virtual_reading_for( GameInputKind kind, IGameInp
      return NULL;
  }
  
@@ -340,7 +340,7 @@ index 06fb5d1..e0a8083 100644
  
  static struct game_input *impl_from_v2_IGameInput( IGameInput_v2 *iface )
  {
-@@ -1251,8 +1465,7 @@ static ULONG WINAPI game_input_v2_Release( IGameInput_v2 *iface )
+@@ -1333,8 +1547,7 @@ static ULONG WINAPI game_input_v2_Release( IGameInput_v2 *iface )
  
  static uint64_t WINAPI game_input_v2_GetCurrentTimestamp( IGameInput_v2 *iface )
  {
@@ -350,7 +350,7 @@ index 06fb5d1..e0a8083 100644
  }
  
  static HRESULT WINAPI game_input_v2_GetCurrentReading( IGameInput_v2 *iface, GameInputKind kind,
-@@ -1263,6 +1476,12 @@ static HRESULT WINAPI game_input_v2_GetCurrentReading( IGameInput_v2 *iface, Gam
+@@ -1345,6 +1558,12 @@ static HRESULT WINAPI game_input_v2_GetCurrentReading( IGameInput_v2 *iface, Gam
      TRACE( "impl %p, kind %#x, device %p, reading %p.\n", impl_from_v2_IGameInput( iface ), kind, device, reading );
  
      if (!reading) return E_POINTER;
@@ -363,7 +363,7 @@ index 06fb5d1..e0a8083 100644
      if (!(r = virtual_reading_for( kind, device )))
      {
          *reading = NULL;
-@@ -1278,11 +1497,9 @@ static HRESULT WINAPI game_input_v2_GetNextReading( IGameInput_v2 *iface, IGameI
+@@ -1360,11 +1579,9 @@ static HRESULT WINAPI game_input_v2_GetNextReading( IGameInput_v2 *iface, IGameI
  {
      TRACE( "impl %p, reference %p, kind %#x, device %p, reading %p.\n", impl_from_v2_IGameInput( iface ), reference, kind, device, reading );
  
@@ -376,7 +376,7 @@ index 06fb5d1..e0a8083 100644
  }
  
  static HRESULT WINAPI game_input_v2_GetPreviousReading( IGameInput_v2 *iface, IGameInputReading_v2 *reference,
-@@ -1336,9 +1553,10 @@ static HRESULT WINAPI game_input_v2_RegisterDeviceCallback( IGameInput_v2 *iface
+@@ -1418,9 +1635,10 @@ static HRESULT WINAPI game_input_v2_RegisterDeviceCallback( IGameInput_v2 *iface
          {
              struct virtual_device *vd = virtual_devices[i];
              if (!(vd->kind & kind)) continue;
