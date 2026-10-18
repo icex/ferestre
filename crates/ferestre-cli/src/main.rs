@@ -3317,7 +3317,7 @@ fn remove_other_versions(services: &Path, keep: &str, running: &[PathBuf]) {
         let name = entry.file_name();
         if name
             .to_str()
-            .map_or(true, |name| name == keep || !is_service_id(name))
+            .is_none_or(|name| name == keep || !is_service_id(name))
         {
             continue;
         }
@@ -5711,8 +5711,7 @@ summary = "Runs."
 
     // -- fixtures for whole commands ---------------------------------------
 
-    /// An exit code, comparable: `ExitCode` has no `PartialEq` before Rust
-    /// 1.79, and the launcher builds with 1.77.
+    /// An exit code as text, so a failed comparison prints which code it was.
     fn code(code: ExitCode) -> String {
         format!("{code:?}")
     }
@@ -6445,7 +6444,7 @@ summary = "Runs."
         use std::os::fd::FromRawFd;
         let closed = unsafe { std::fs::File::from_raw_fd(fds[1]) };
         let mut input = b"first line\n\xff\xfe code page \x80\n".to_vec();
-        input.extend(std::iter::repeat(b'x').take(200_000));
+        input.extend(std::iter::repeat_n(b'x', 200_000));
         input.extend_from_slice(b"\nlast line\n");
         tee(std::io::Cursor::new(input.clone()), log, closed)
             .join()

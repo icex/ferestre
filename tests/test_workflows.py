@@ -99,6 +99,16 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn('out/*', texts[publish], wf)
             self.assertFalse(can_write(workflow['jobs']['build'], workflow), wf)
 
+    def test_the_msrv_job_builds_with_the_declared_rust_version(self):
+        declared = re.search(r'^rust-version = "([0-9.]+)"$',
+                             (REPO / 'Cargo.toml').read_text(), re.M).group(1)
+        job = load(REPO / '.github/workflows/rust.yml')['jobs']['msrv']
+        toolchains = [s['with']['toolchain'] for s in job['steps']
+                      if str(s.get('uses', '')).startswith('dtolnay/rust-toolchain@')]
+        self.assertEqual(toolchains, [declared])
+        self.assertTrue(any(f'cargo +{declared} test --locked --workspace' in t
+                            for t in runs(job)))
+
     def test_the_published_launcher_must_trust_the_signing_key(self):
         job = load(REPO / '.github/workflows/release.yml')['jobs']['publish']
         self.assertTrue(any('FERESTRE_EXPECT_PUBKEY_IN=' in t and 'usr/bin/ferestre' in t

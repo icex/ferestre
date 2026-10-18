@@ -1,8 +1,12 @@
-# The launcher's own tests. Two jobs, because they need different things.
+# The launcher's own tests. Separate jobs, because they need different things.
 #
 # `test` is the fast one: everything decided in `ferestre-core` and in the GUI's
 # `model` is pure, so it runs anywhere with a Rust toolchain -- no display, no
 # runtime, no Microsoft account, no game.
+#
+# `msrv` builds and tests the same workspace with the oldest compiler it claims
+# to support, the `rust-version` in Cargo.toml, so that claim cannot quietly go
+# stale when Cargo.lock moves a dependency onto a newer one.
 #
 # `gui` drives the real window through AT-SPI, which needs a display server and
 # the accessibility bus. It is the only thing that can catch a row that renders
@@ -187,6 +191,36 @@ jobs:
 
       - name: Developer tool tests (offline)
         run: python3 -m unittest discover -s tools -p 'test_*.py'
+
+  # The oldest compiler the workspace says it builds with. 1.88 is not a
+  # preference: it is what the dependency versions in Cargo.lock require
+  # (zopfli, under zip's deflate feature, is the newest at 1.88). Raise this
+  # together with `rust-version` in Cargo.toml, in the commit that moves the
+  # lock; tests/test_workflows.py checks the two agree.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: '1.88'
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Named explicitly, so a runner image with a different default compiler
+      # cannot make this job test something else.
+      - name: Test with the minimum supported Rust
+        run: |
+          rustc +1.88 --version
+          cargo +1.88 test --locked --workspace
 
   # The cheap half of testing the runtime. Building it needs a 26 GB tree and an
   # hour, so `tests/run-*.sh` cannot run per push -- but checking that the

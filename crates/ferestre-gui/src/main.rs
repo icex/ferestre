@@ -3176,7 +3176,7 @@ fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {
                 // Older metadata caches have only the small list icon. Refresh
                 // this one title on demand to learn its larger library assets.
                 let mut product = product.or_else(|| cache.get(&product_id));
-                if product.as_ref().map_or(true, |p| p.artwork.is_empty()) {
+                if product.as_ref().is_none_or(|p| p.artwork.is_empty()) {
                     let (found, errors) =
                         catalog::revalidate(&cache, &[product_id], &market.0, &market.1, true);
                     failures.extend(errors);
@@ -3628,7 +3628,7 @@ fn refresh_account(ui: &Ui) {
                     let changed = model
                         .account
                         .as_ref()
-                        .map_or(true, |old| !account::same_identity(old, &account));
+                        .is_none_or(|old| !account::same_identity(old, &account));
                     if changed {
                         model.ownership = Ownership::Unknown;
                         model.subscriptions.clear();
@@ -3692,7 +3692,7 @@ fn refresh_updates(ui: &Ui, force: bool) {
                 force
                     || state_dir
                         .as_ref()
-                        .map_or(true, |dir| !ferestre_core::updates::is_fresh(dir, record))
+                        .is_none_or(|dir| !ferestre_core::updates::is_fresh(dir, record))
             })
             .cloned()
             .collect::<Vec<_>>();

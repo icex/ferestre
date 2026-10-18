@@ -49,6 +49,23 @@ That is deliberate and load-bearing: a filter naming `main` alone would mean an
 ordinary day's work ran no checks at all, and the checks would come back exactly
 when the work was already finished.
 
+## Building the launcher
+
+```sh
+cargo build --locked --workspace
+cargo test --locked --workspace
+```
+
+The launcher needs **Rust 1.88 or newer**: `rust-version` in `Cargo.toml`.
+That is not a preference. It is the oldest compiler the dependency versions
+in `Cargo.lock` build with; zopfli, under the `zip` crate's deflate feature, is
+the dependency that needs 1.88. CI builds and tests with exactly that version
+as well as with stable, so a change that needs a newer compiler fails there.
+If updating the lock raises the minimum, raise `rust-version` and the `msrv`
+job's toolchain in `.github/workflows/rust.yml` in the same commit;
+`tests/test_workflows.py` checks that the two agree. The GUI crate also needs
+the GTK 4 and libadwaita development files.
+
 ## Running the tests
 
 ```sh
