@@ -81,11 +81,7 @@ _commit=3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
 # in .SRCINFO, and regenerate the sha256sums -- the patch files themselves may
 # have changed too.
 #
-# NOT YET REPINNED: 81f460b has none of 0022, 0023, 0024 or 0025, so their
-# URLs below 404 until this names a published commit that has them (and
-# .SRCINFO with it). The sha256sums already match the patch files in this
-# tree, and pkgrel is already 6 for them.
-_patchrev=81f460b6a713bdc08f21f179e3c05ebc7aa14b33
+_patchrev=8cf4d9156c8406bb816cf0f9c1157ae52b78fcda
 _patchurl="https://raw.githubusercontent.com/icex/ferestre/$_patchrev/patches/xodus-cli"
 
 # Every patch after 0001 is part of one ordered series. Keep the downloaded,
