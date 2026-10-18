@@ -26,13 +26,15 @@ exec > >(tee -a "$LOG") 2>&1
 echo "=== launch $(date) ==="
 
 # Steam starts shortcuts with its own environment: the overlay is injected via
-# LD_PRELOAD, LD_LIBRARY_PATH points into the Steam runtime, and SteamGameId /
-# STEAM_COMPAT_* describe *Steam's* idea of the app. All of that collides with
-# the Proton instance we start ourselves, so drop it and set our own.
+# LD_PRELOAD, LD_LIBRARY_PATH points into the Steam runtime, and STEAM_COMPAT_*
+# describe *Steam's* idea of the app. All of that collides with the Proton
+# instance we start ourselves, so drop it and set our own. SteamAppId,
+# SteamGameId and SteamClientLaunch stay: Steam Input applies the shortcut's
+# controller configuration only to a process carrying them.
 unset LD_PRELOAD LD_LIBRARY_PATH
 unset STEAM_COMPAT_DATA_PATH STEAM_COMPAT_CLIENT_INSTALL_PATH
 unset STEAM_COMPAT_TRANSCODED_MEDIA_PATH STEAM_COMPAT_MEDIA_PATH
-unset SteamAppId SteamGameId SteamAppUser SteamClientLaunch SteamEnv
+unset SteamAppUser SteamEnv
 unset WINEPREFIX WINEDLLPATH WINELOADER WINESERVER
 
 # Steam also attaches its Vulkan layers (overlay + Fossilize pipeline capture)

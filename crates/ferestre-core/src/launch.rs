@@ -52,7 +52,8 @@ use std::path::{Path, PathBuf};
 ///   * `LD_PRELOAD` / `LD_LIBRARY_PATH` -- the Steam overlay is injected this
 ///     way and the library path points into the Steam runtime, not ours.
 ///   * `STEAM_COMPAT_*` / `Steam*` -- these describe *Steam's* idea of the app,
-///     including a prefix belonging to a different appid.
+///     including a prefix belonging to a different appid. The game identity in
+///     [`STEAM_IDENTITY`] is the exception and is kept.
 ///   * `WINE*` -- an inherited prefix or loader would fight the one Proton sets
 ///     up from `STEAM_COMPAT_DATA_PATH`.
 ///   * the Vulkan layer variables -- Steam attaches its overlay and Fossilize
@@ -72,10 +73,7 @@ pub const STEAM_ENVIRONMENT: &[&str] = &[
     "STEAM_COMPAT_CLIENT_INSTALL_PATH",
     "STEAM_COMPAT_TRANSCODED_MEDIA_PATH",
     "STEAM_COMPAT_MEDIA_PATH",
-    "SteamAppId",
-    "SteamGameId",
     "SteamAppUser",
-    "SteamClientLaunch",
     "SteamEnv",
     "WINEPREFIX",
     "WINEDLLPATH",
@@ -89,6 +87,17 @@ pub const STEAM_ENVIRONMENT: &[&str] = &[
     "STEAM_COMPAT_SHADER_PATH",
     "STEAM_FOSSILIZE_DUMP_PATH",
 ];
+
+/// What Steam needs to recognise the title as the shortcut it launched.
+///
+/// Steam applies a shortcut's controller configuration to the window whose
+/// process carries its game id, and the desktop configuration to anything
+/// else. Stripped, a DualShock under Steam Input drove the desktop layout and
+/// Steam's virtual Xbox pad -- the only controller the title sees -- sent
+/// nothing (issue 10). Kept, the pad delivers every press. Nothing here
+/// selects a prefix, a library path or a layer; a shortcut's appid matches no
+/// real Steam app, so Proton applies no per-app settings for it.
+pub const STEAM_IDENTITY: &[&str] = &["SteamAppId", "SteamGameId", "SteamClientLaunch"];
 
 /// The resolved locations a launch needs, as data.
 ///
@@ -421,10 +430,7 @@ summary = "Runs."
             "LD_LIBRARY_PATH",
             "STEAM_COMPAT_MEDIA_PATH",
             "STEAM_COMPAT_TRANSCODED_MEDIA_PATH",
-            "SteamAppId",
-            "SteamGameId",
             "SteamAppUser",
-            "SteamClientLaunch",
             "SteamEnv",
             "WINEPREFIX",
             "WINEDLLPATH",
@@ -439,6 +445,15 @@ summary = "Runs."
             "STEAM_FOSSILIZE_DUMP_PATH",
         ] {
             assert!(plan.is_unset(name), "{name} should be unset");
+        }
+    }
+
+    #[test]
+    fn the_default_plan_keeps_the_game_identity_steam_input_needs() {
+        let plan = plan(&recipe(""), &dirs(), &Options::default());
+        for name in STEAM_IDENTITY {
+            assert!(!plan.is_unset(name), "{name} must reach the title");
+            assert!(!STEAM_ENVIRONMENT.contains(name), "{name} is stripped");
         }
     }
 
