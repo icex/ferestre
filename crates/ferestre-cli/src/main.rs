@@ -2673,7 +2673,19 @@ fn doctor_checks(paths: &Paths) -> Vec<Check> {
 
     match paths.xodus_cli().filter(|p| p.is_file()) {
         Some(path) => {
-            checks.push(Check::ok("client", "xodus-cli").with_detail(path.display().to_string()))
+            checks.push(Check::ok("client", "xodus-cli").with_detail(path.display().to_string()));
+            // A failure: without these the loader refuses the client for
+            // every command, so nothing signs in, lists or launches.
+            checks.push(match ferestre_core::client_deps::check(&path) {
+                Ok(None) => Check::ok("client", "Xbox client libraries available"),
+                Ok(Some(missing)) => {
+                    Check::fail("client", "the Xbox client cannot start: missing libraries")
+                        .with_detail(missing.libraries.join(", "))
+                        .with_hint(missing.hint())
+                }
+                Err(error) => Check::warn("client", "could not check the Xbox client's libraries")
+                    .with_detail(format!("{error:#}")),
+            });
         }
         None => checks.push(Check::fail("client", "no xodus-cli").with_hint(
             "build it (cargo build --release in the xodus-cli checkout), or set XODUS_CLI_DIR",

@@ -89,7 +89,7 @@ fn proton_library_path(
     search
 }
 
-fn missing_from_ldd(output: &str) -> Vec<String> {
+pub(crate) fn missing_from_ldd(output: &str) -> Vec<String> {
     output
         .lines()
         .filter_map(|line| {
