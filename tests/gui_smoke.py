@@ -412,10 +412,15 @@ MENU_PREFIX = "More actions for "
 
 
 def row_menus(root):
-    """Every row's "More actions" button, by the title it names."""
+    """Every row's "More actions" toggle, by the title it names.
+
+    The menu button is two nodes with one name: an outer button with no
+    actions and the toggle inside it that opens the popover. Clicking the
+    outer one climbs to the row and activates that instead.
+    """
     return {
         (node.get_name() or "")[len(MENU_PREFIX):]: node
-        for node in find_all(root, name_contains=MENU_PREFIX)
+        for node in find_all(root, role="toggle button", name_contains=MENU_PREFIX)
         if (node.get_name() or "").startswith(MENU_PREFIX)
     }
 
@@ -427,57 +432,52 @@ def menu_items(app, menu):
     the accessible tree only while it is open -- the reason there is no Edit
     button to count until this has run.
     """
-    targets = [menu] + [
-        node for node, _ in walk(menu) if node is not menu and node.get_role_name() == "toggle button"
-    ]
-    for target in targets:
-        click(target)
-        try:
-            items = wait_for(
-                app,
-                lambda root: {
-                    node.get_name(): node
-                    for node in find_all(root, role="button")
-                    if node.get_name() in MENU_ITEMS
-                }
-                or None,
-                "the row's menu to open",
-                time.monotonic() + 5,
-            )
-            return items
-        except Failure:
-            continue
-    raise Failure("the row's menu would not open")
+    click(menu)
+    return wait_for(
+        app,
+        lambda root: {
+            node.get_name(): node for node in find_all(root, role="button") if node.get_name() in MENU_ITEMS
+        }
+        or None,
+        "the row's menu to open",
+        time.monotonic() + TIMEOUT,
+    )
 
 
-def close_menu(app):
-    """Escape closes the open popover; its items then leave the tree."""
-    for node in find_all(app, role="button"):
-        if node.get_name() in MENU_ITEMS:
-            break
-    else:
+def close_menu(app, menu):
+    """Click the toggle again; its items then leave the tree."""
+    if not any(n.get_name() in MENU_ITEMS for n in find_all(app, role="button")):
         return
-    Atspi.generate_keyboard_event(0xFF1B, None, Atspi.KeySynthType.SYM)
+    click(menu)
     wait_for(
         app,
         lambda root: not any(n.get_name() in MENU_ITEMS for n in find_all(root, role="button")) or None,
         "the row's menu to close",
-        time.monotonic() + 5,
+        time.monotonic() + TIMEOUT,
     )
 
 
 MENU_ITEMS = {"Open Store page", "Choose runtime", "Add to Steam", "Edit launch settings", "Remove from disk"}
 
 
+def row_menu_offers(app, frame, title):
+    """The items `title`'s row menu offers. Looked up afresh each time: the list
+    is redrawn whenever names or art arrive, and an old node is then gone."""
+    menu = wait_for(frame, lambda root: row_menus(root).get(title), f"{title}'s menu", time.monotonic() + TIMEOUT)
+    items = set(menu_items(app, menu))
+    close_menu(app, wait_for(frame, lambda root: row_menus(root).get(title), f"{title}'s menu", time.monotonic() + TIMEOUT))
+    return items
+
+
 def row_action(app, frame, item, title=None):
     """Click `item` in the menu of `title`'s row, or of the first row that has it."""
-    menus = row_menus(frame)
-    for name, menu in ([(title, menus[title])] if title else menus.items()):
+    for name in [title] if title else list(row_menus(frame)):
+        menu = wait_for(frame, lambda root: row_menus(root).get(name), f"{name}'s menu", time.monotonic() + TIMEOUT)
         items = menu_items(app, menu)
         if item in items:
             click(items[item])
             return name
-        close_menu(app)
+        close_menu(app, wait_for(frame, lambda root: row_menus(root).get(name), f"{name}'s menu", time.monotonic() + TIMEOUT))
     raise Failure(f"no row offers {item!r}")
 
 
@@ -1293,10 +1293,7 @@ print(":: done", flush=True)
         # recipe landed -- it then failed on every commit that added a title,
         # which is exactly the commit whose author has least reason to suspect
         # the GUI suite.
-        offered = {}
-        for name, menu in row_menus(frame).items():
-            offered[name] = set(menu_items(app, menu))
-            close_menu(app)
+        offered = {name: row_menu_offers(app, frame, name) for name in list(row_menus(frame))}
         edit = [name for name, items in offered.items() if "Edit launch settings" in items]
         steam = [name for name, items in offered.items() if "Add to Steam" in items]
         check(
