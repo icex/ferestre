@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the shipped CLI's cancellation protocol with an offline downloader."""
+import json
 import os
 from pathlib import Path
 import signal
@@ -43,11 +44,17 @@ sys.exit(3)
                     library = home / "library"
                     dest = library / "9zzcancel001"
                     record = home / "state/ferestre/installed/9ZZCANCEL001.json"
+                    previous_record = None
                     if existing:
+                        # An earlier install of this title, recorded where it
+                        # is: the folder is the title's own, so the update goes
+                        # over it rather than being refused as somebody's files.
                         dest.mkdir(parents=True)
                         (dest / "original-save").write_text("keep me")
                         record.parent.mkdir(parents=True)
-                        record.write_text('{"previous_record":true}')
+                        previous_record = json.dumps({"product_id": "9ZZCANCEL001", "dir": str(dest),
+                                                      "content_ids": [], "previous_record": True})
+                        record.write_text(previous_record)
                     env = dict(os.environ, HOME=tmp, XDG_STATE_HOME=str(home / "state"),
                                XDG_CONFIG_HOME=str(home / "config"), XDG_CACHE_HOME=str(home / "cache"),
                                XODUS_CLI_DIR=str(client), XODUS_GAMES_DIR=str(home / "games"),
@@ -80,7 +87,7 @@ sys.exit(3)
                             os.kill(downloader, 0)
                         if existing:
                             self.assertEqual((dest / "original-save").read_text(), "keep me")
-                            self.assertEqual(record.read_text(), '{"previous_record":true}')
+                            self.assertEqual(record.read_text(), previous_record)
                         else:
                             self.assertFalse(record.exists(), "stopped download was recorded as installed")
                     finally:
