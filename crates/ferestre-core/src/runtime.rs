@@ -462,12 +462,28 @@ pub const RELEASE_PUBLIC_KEY: &str = "REPLACE-WITH-THE-MINISIGN-RELEASE-PUBLIC-K
 /// in memory. A SHA256SUMS file from the same release would only say the
 /// download matches what the release says; a signature says the release is
 /// ours.
-pub fn verify_release_file(path: &Path, signature: &str) -> anyhow::Result<()> {
-    verify_file_with_key(RELEASE_PUBLIC_KEY, path, signature)
+///
+/// `expected_name` is the name of the asset that was asked for. A good
+/// signature only says *some* file was signed with the release key, so the
+/// signed (trusted) comment also has to name this one: `minisign -S` writes
+/// `file:<name>` there by default, and release CI must keep that. Without the
+/// check, whoever can swap a release's assets could serve another signed
+/// file, such as an older runtime, under this one's name.
+pub fn verify_release_file(
+    path: &Path,
+    signature: &str,
+    expected_name: &str,
+) -> anyhow::Result<()> {
+    verify_file_with_key(RELEASE_PUBLIC_KEY, path, signature, expected_name)
 }
 
 /// [`verify_release_file`] with an explicit public key.
-pub fn verify_file_with_key(public_key: &str, path: &Path, signature: &str) -> anyhow::Result<()> {
+pub fn verify_file_with_key(
+    public_key: &str,
+    path: &Path,
+    signature: &str,
+    expected_name: &str,
+) -> anyhow::Result<()> {
     use std::io::Read;
 
     let key = minisign_verify::PublicKey::from_base64(public_key.trim()).map_err(|e| {
@@ -498,7 +514,21 @@ pub fn verify_file_with_key(public_key: &str, path: &Path, signature: &str) -> a
             "{} does not match its signature ({e}); it was not installed",
             path.display()
         )
-    })
+    })?;
+    // Only read now that the global signature has vouched for it.
+    let names_it = signature
+        .trusted_comment()
+        .split('\t')
+        .any(|field| field.strip_prefix("file:") == Some(expected_name));
+    if expected_name.is_empty() || !names_it {
+        anyhow::bail!(
+            "{} is signed, but as a different file (\"{}\") from the {expected_name} that was \
+             asked for; it was not installed",
+            path.display(),
+            signature.trusted_comment()
+        );
+    }
+    Ok(())
 }
 
 fn read_capabilities(dir: &Path) -> anyhow::Result<(BTreeSet<Capability>, CapabilitySource)> {
@@ -1455,13 +1485,15 @@ hangs"""
             base64(&bytes)
         }
 
-        fn sign(&self, data: &[u8]) -> String {
+        /// Signed as `minisign -S -m <name>` signs, with the default
+        /// trusted comment naming the file.
+        fn sign(&self, data: &[u8], name: &str) -> String {
             use ed25519_dalek::Signer;
             let signature = self.key.sign(&blake2b512(data)).to_bytes();
             let mut line = b"ED".to_vec();
             line.extend_from_slice(&self.key_id);
             line.extend_from_slice(&signature);
-            let trusted = "timestamp:0\tfile:test";
+            let trusted = format!("timestamp:0\tfile:{name}\thashed");
             let mut global = signature.to_vec();
             global.extend_from_slice(trusted.as_bytes());
             let global = self.key.sign(&global).to_bytes();
@@ -1592,40 +1624,70 @@ hangs"""
 
     #[test]
     fn a_release_artefact_is_installed_only_with_a_good_signature() {
+        const NAME: &str = "ferestre-runtime-test.tar.xz";
         let dir = TempDir::new("signature");
-        let archive = dir.path().join("ferestre-runtime-test.tar.xz");
+        let archive = dir.path().join(NAME);
         // Larger than one read, so the streaming path is what is checked.
         let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
         std::fs::write(&archive, &data).unwrap();
 
         let signer = TestSigner::generate();
-        let signature = signer.sign(&data);
-        verify_file_with_key(&signer.public_key(), &archive, &signature)
-            .expect("a good signature verifies");
+        let key = signer.public_key();
+        let signature = signer.sign(&data, NAME);
+        verify_file_with_key(&key, &archive, &signature, NAME).expect("a good signature verifies");
 
         // One byte changed.
         let mut tampered = data.clone();
         tampered[123_456] ^= 1;
         std::fs::write(&archive, &tampered).unwrap();
-        let err = verify_file_with_key(&signer.public_key(), &archive, &signature)
+        let err = verify_file_with_key(&key, &archive, &signature, NAME)
             .unwrap_err()
             .to_string();
         assert!(err.contains("does not match"), "{err}");
         std::fs::write(&archive, &data).unwrap();
 
-        // Signed by somebody else's key.
-        let other = TestSigner::generate();
-        let mut other_key = other;
-        other_key.key_id = [9; 8];
-        assert!(
-            verify_file_with_key(&signer.public_key(), &archive, &other_key.sign(&data)).is_err()
+        // Signed by somebody else's key that claims the release key's id, so
+        // what refuses it is the Ed25519 check, not the id comparison.
+        let mut other = TestSigner::generate();
+        assert_ne!(
+            other.key.verifying_key(),
+            signer.key.verifying_key(),
+            "two different keys"
         );
+        other.key_id = signer.key_id;
+        let err = verify_file_with_key(&key, &archive, &other.sign(&data, NAME), NAME)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match"), "{err}");
         // Not a signature at all.
-        assert!(verify_file_with_key(&signer.public_key(), &archive, "garbage").is_err());
+        assert!(verify_file_with_key(&key, &archive, "garbage", NAME).is_err());
+
+        // A genuine signature, for another file of the release: an older
+        // runtime served under this one's name.
+        let older = signer.sign(&data, "ferestre-runtime-older.tar.xz");
+        let err = verify_file_with_key(&key, &archive, &older, NAME)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("different file"), "{err}");
+        // A name that only starts like the expected one is not it.
+        let longer = signer.sign(&data, &format!("{NAME}.old"));
+        assert!(verify_file_with_key(&key, &archive, &longer, NAME).is_err());
+        // Editing the comment to name the right file breaks the global
+        // signature, so the name cannot be relabelled after signing.
+        let relabelled = older.replace(
+            "file:ferestre-runtime-older.tar.xz",
+            &format!("file:{NAME}"),
+        );
+        assert_ne!(relabelled, older);
+        let err = verify_file_with_key(&key, &archive, &relabelled, NAME)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match"), "{err}");
+        assert!(verify_file_with_key(&key, &archive, &signature, "").is_err());
 
         // The placeholder key verifies nothing, so a build that still has it
         // cannot install an archive it did not check.
-        assert!(verify_release_file(&archive, &signature).is_err());
+        assert!(verify_release_file(&archive, &signature, NAME).is_err());
     }
 
     // --- assessment ----------------------------------------------------------
