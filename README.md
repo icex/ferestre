@@ -61,9 +61,12 @@ Pronounced roughly *feh-RESS-treh*.
 
 ## Status
 
-Release **0.1.13** pairs with runtime **11.0.20261018.1**. It adds separate
-Store and Player accounts, PlayStation and Steam Input controllers in GDK
-titles, and an offer to install WebKitGTK when sign-in cannot start. Forza
+Release **0.1.13** pairs with runtime **11.0.20261018.2**. It adds separate
+Store and Player accounts, online status for games started through Ferestre,
+PlayStation and Steam Input controllers in GDK titles, and an offer to install
+WebKitGTK when sign-in cannot start. Releases are now signed, and game package
+headers are checked against Microsoft's signature. It also carries the fixes
+from a review of the whole codebase. Forza
 Horizon 6 is playable, with shader startup, native PlayFab saves and Continue
 confirmed. Its marketplace is still under qualification. Dune: Awakening is
 marked playable from player confirmation.
@@ -115,6 +118,18 @@ current task. Closing during a download or removal asks first: downloads stop
 and keep their game files for resuming, removals finish, and the window waits
 for cleanup before exiting.
 
+**Install to** chooses a library folder: each title gets its own folder inside
+it, and **Remove from disk** only ever deletes that title's folder. **Stop**
+asks a running game to close and gives it 15 seconds to save before ending
+it; a second press ends it at once.
+
+**Signed downloads.** Ferestre's own releases are signed with minisign, and
+the launcher installs only runtimes signed with the project's key
+([docs/RELEASING.md](docs/RELEASING.md)). Game downloads are checked page by
+page against the package's hash tree, and the package header against
+Microsoft's own signature, using a key the client fetches from Microsoft on
+first use ([docs/PACKAGE-SIGNATURES.md](docs/PACKAGE-SIGNATURES.md)).
+
 Two things the window is careful about, because both are easy to get wrong in a
 way that looks like it works. Titles whose package this runtime cannot open --
 Appx and Msix, which is most of a typical Store library -- are held back behind
@@ -139,8 +154,9 @@ publishers' own account-sharing rules still apply. See
 window, a Steam shortcut or `ferestre run`, your Xbox friends see you playing
 it. Ferestre reports it with the game's own identity and reports nothing when no
 game is running. It is on by default after sign-in. To turn it off for a Player
-account, switch off **Show me online** in the account menu. See
-[docs/PRESENCE.md](docs/PRESENCE.md).
+account, switch off **Show me online** in the account menu. The dot by your
+name says Online or Offline, as Xbox reports it; with no game running it says
+Offline. See [docs/PRESENCE.md](docs/PRESENCE.md).
 
 **Controllers.** Xbox pads, DualShock 4 and DualSense pads reach GDK titles
 through Wine's XInput and GameInput. PlayStation pads go through SDL, which
@@ -210,12 +226,15 @@ Game Pass listing. Failed or interrupted refreshes preserve the last complete
 snapshot. Closing during a list/account/update refresh exits immediately;
 downloads still stop with cleanup, and removals finish before closing.
 
-Add to Steam saves the persistent AppImage target and the game's icon, with
+Add to Steam is in each game's menu, and **Add All to Steam** at the top of
+the Installed list adds every installed game at once. A shortcut saves the
+persistent AppImage target and the game's icon, with
 portrait cover, landscape cover, hero banner and title logo when the Store
 provides them. Re-adding updates the existing shortcut by launch identity or
 name and retains its Steam ID, settings, play history and custom artwork.
 Downloads are cached, and copied artwork lives in Steam's own `config/grid`
-directory. Close Steam before adding or updating a shortcut.
+directory. Two games that share a name, such as two editions, get a shortcut
+each. Close Steam before adding or updating a shortcut.
 
 ## Documentation
 

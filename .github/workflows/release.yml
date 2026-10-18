@@ -219,7 +219,7 @@ jobs:
                   "$root/usr/share/icons/hicolor/scalable/apps/$id.svg"
           fi
 
-          for doc in README.md NOTICE docs/RELEASE-0.1.13.md docs/RELEASE-0.1.12.md docs/RELEASE-0.1.11.md docs/RELEASE-0.1.10.md docs/RELEASE-0.1.9.md docs/RECIPES.md docs/ROADMAP.md docs/COMPATIBILITY.md docs/AUTODETECTION.md; do
+          for doc in README.md NOTICE docs/RELEASE-0.1.13.md docs/RELEASE-0.1.12.md docs/RELEASE-0.1.11.md docs/RELEASE-0.1.10.md docs/RELEASE-0.1.9.md docs/RECIPES.md docs/ROADMAP.md docs/COMPATIBILITY.md docs/AUTODETECTION.md docs/PRESENCE.md docs/PACKAGE-SIGNATURES.md; do
               install -Dm644 "$doc" "$root/usr/share/doc/ferestre/$(basename "$doc")"
           done
           for lic in LICENSE LICENSE.LGPL-2.1; do
