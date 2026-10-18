@@ -632,10 +632,17 @@ fn cmd_run(
             }
         }
     }
+    // From here on a signal must not end this process outright: it holds a
+    // claim on the service, released only by finishing.
+    let forwarding = Forwarding::install()?;
     // Before the service is looked for: a launch finishing now must not stop a
     // service this one is about to reuse.
     let _service_use = ServiceUse::begin(service_socket.as_deref())?;
     start_service(&dirs, service_socket.as_deref(), paths.cache_dir())?;
+    if let Some(signal) = forwarding.received() {
+        eprintln!("-- stopped before {} started", recipe.title.name);
+        return Ok(ExitCode::from(exit_code_from(None, Some(signal))));
+    }
 
     if let Ok(missing) = ferestre_core::media::missing_libav_dependencies(&dirs.proton_dir) {
         if !missing.is_empty() {
@@ -646,7 +653,11 @@ fn cmd_run(
             );
         }
     }
-    run_teed(plan.to_command(), &launch::log_path(recipe, &dirs))
+    run_teed(
+        plan.to_command(),
+        &launch::log_path(recipe, &dirs),
+        &forwarding,
+    )
 }
 
 /// The recipe a launch uses once a detected engine's defaults are settled,
@@ -1456,7 +1467,7 @@ fn run_inherited(mut command: Command) -> Result<u8> {
 /// `launch-gdk.sh` does this with `exec > >(tee -a "$LOG")`, and the log is not
 /// decoration: `[[issues]].log-match` in a recipe exists to recognise a failure
 /// in it rather than re-diagnose one.
-fn run_teed(mut command: Command, log: &Path) -> Result<ExitCode> {
+fn run_teed(mut command: Command, log: &Path, forwarding: &Forwarding) -> Result<ExitCode> {
     if let Some(parent) = log.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -1480,7 +1491,9 @@ fn run_teed(mut command: Command, log: &Path) -> Result<ExitCode> {
     let t_out = tee(out, Arc::clone(&file), false);
     let t_err = tee(err, Arc::clone(&file), true);
 
-    let status = child.wait().context("waiting for the title")?;
+    let status = forwarding
+        .wait(&mut child)
+        .context("waiting for the title")?;
     let _ = t_out.join();
     let _ = t_err.join();
 
@@ -1515,6 +1528,135 @@ fn tee<R: std::io::Read + Send + 'static>(
             }
         }
     })
+}
+
+/// The signals that end a launch from outside: the window's Stop (SIGTERM),
+/// Ctrl+C (SIGINT), a terminal closing (SIGHUP), and a plain `kill`.
+const LAUNCH_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
+
+static SIGNAL_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static SIGNAL_RECEIVED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static FORWARDING: std::sync::OnceLock<Arc<Mutex<Option<i32>>>> = std::sync::OnceLock::new();
+
+extern "C" fn on_launch_signal(signal: libc::c_int) {
+    use std::sync::atomic::Ordering;
+    SIGNAL_RECEIVED.store(signal, Ordering::SeqCst);
+    let fd = SIGNAL_PIPE.load(Ordering::SeqCst);
+    if fd >= 0 {
+        // Safety: write is async-signal-safe, and errno is put back for
+        // whatever the signal interrupted.
+        unsafe {
+            let errno = *libc::__errno_location();
+            let byte = signal as u8;
+            libc::write(fd, (&byte as *const u8).cast(), 1);
+            *libc::__errno_location() = errno;
+        }
+    }
+}
+
+/// Signals that would end a launch, passed on to its title instead.
+///
+/// Ended by a signal, this process never unwinds: its claim on the service is
+/// never dropped, and the service is never stopped. Caught, the signal goes to
+/// the title, which ends; the launch then finishes the ordinary way, and the
+/// last title out still stops the service. Handlers do not survive exec, so
+/// every child starts with the default dispositions.
+struct Forwarding {
+    title: Arc<Mutex<Option<i32>>>,
+}
+
+impl Forwarding {
+    fn install() -> Result<Self> {
+        if let Some(title) = FORWARDING.get() {
+            return Ok(Self {
+                title: Arc::clone(title),
+            });
+        }
+        use std::os::fd::FromRawFd;
+        let mut fds = [0; 2];
+        // Safety: pipe2 fills in two new descriptors.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("creating the signal pipe");
+        }
+        // Safety: the read end is ours alone. The write end lives as long as
+        // the process, for the handler; it must never block in one.
+        let mut read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        unsafe { libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK) };
+        SIGNAL_PIPE.store(fds[1], std::sync::atomic::Ordering::SeqCst);
+
+        let title = Arc::new(Mutex::new(None::<i32>));
+        let forwarded = Arc::clone(&title);
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut byte = [0u8];
+            loop {
+                match read.read(&mut byte) {
+                    Ok(1) => {
+                        let pid = *forwarded.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(pid) = pid {
+                            // Safety: the title is not reaped while this
+                            // holds its pid; see `wait`.
+                            unsafe { libc::kill(pid, libc::c_int::from(byte[0])) };
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    _ => break,
+                }
+            }
+        });
+        for signal in LAUNCH_SIGNALS {
+            // Safety: a handler that only stores and writes, installed with a
+            // fully initialised sigaction.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = on_launch_signal as extern "C" fn(libc::c_int) as usize;
+                action.sa_flags = libc::SA_RESTART;
+                libc::sigemptyset(&mut action.sa_mask);
+                if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                    return Err(std::io::Error::last_os_error()).context("handling signals");
+                }
+            }
+        }
+        let _ = FORWARDING.set(Arc::clone(&title));
+        Ok(Self { title })
+    }
+
+    /// The last signal caught, if any.
+    fn received(&self) -> Option<i32> {
+        Some(SIGNAL_RECEIVED.load(std::sync::atomic::Ordering::SeqCst)).filter(|s| *s != 0)
+    }
+
+    /// Wait for the title, passing signals on to it meanwhile.
+    fn wait(&self, child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
+        let pid = child.id() as i32;
+        *self.title.lock().unwrap_or_else(|e| e.into_inner()) = Some(pid);
+        // One that came before there was a title to pass it to.
+        if let Some(signal) = self.received() {
+            // Safety: our own child, not yet reaped.
+            unsafe { libc::kill(pid, signal) };
+        }
+        // Wait without reaping, so the pid cannot be reused while it may
+        // still be signalled.
+        loop {
+            // Safety: waitid only fills in `info`.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let waited = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if waited == 0
+                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                break;
+            }
+        }
+        *self.title.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        child.wait()
+    }
 }
 
 const SERVICE_SOCKET_OVERRIDE: &str = "xgameruntime.service-socket-override";
@@ -1571,6 +1713,50 @@ fn plan_service_socket(
 
 const SERVICE_PID: &str = "xodus-service.pid";
 
+/// Open (creating it) a lock file only this user can read.
+fn open_lock(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))
+}
+
+/// Take a flock, blocking. False, with a warning saying what is lost, where
+/// the filesystem has no flock at all -- NFS without lockd, some FUSE mounts.
+/// `XODUS_RUNTIME_DIR` can point anywhere, and a launch that worked before
+/// the locks existed should not stop working because of them.
+fn flock_or_warn(
+    file: &std::fs::File,
+    operation: libc::c_int,
+    path: &Path,
+    without: &str,
+) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+    loop {
+        // Safety: a plain flock on a descriptor the caller owns.
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOSYS) => {
+                eprintln!(
+                    "-- {} cannot be locked ({error}); {without}",
+                    path.display()
+                );
+                return Ok(false);
+            }
+            _ => return Err(error).with_context(|| format!("locking {}", path.display())),
+        }
+    }
+}
+
 /// A launch's claim on the service its title talks to.
 ///
 /// The service used to outlive every title. Steam runs a shortcut under a
@@ -1579,6 +1765,8 @@ const SERVICE_PID: &str = "xodus-service.pid";
 /// not start it again. Each launch holds a shared lock while its title runs;
 /// the last one to finish stops the service. A launch takes its lock before
 /// looking for a live service, so it never reuses one that is being stopped.
+/// `launch-gdk.sh` takes the same shared lock, so a title it started keeps a
+/// service this launcher started.
 struct ServiceUse {
     lock: std::fs::File,
     directory: PathBuf,
@@ -1586,26 +1774,20 @@ struct ServiceUse {
 
 impl ServiceUse {
     fn begin(socket: Option<&Path>) -> Result<Option<Self>> {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
         let Some(directory) = socket.and_then(Path::parent) else {
             return Ok(None);
         };
         std::fs::create_dir_all(directory)
             .with_context(|| format!("creating {}", directory.display()))?;
         let path = directory.join("users.lock");
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .open(&path)
-            .with_context(|| format!("opening {}", path.display()))?;
-        // Safety: a plain flock on a descriptor this function owns.
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("locking {}", path.display()));
+        let lock = open_lock(&path)?;
+        if !flock_or_warn(
+            &lock,
+            libc::LOCK_SH,
+            &path,
+            "the Xbox service will be left running after the title",
+        )? {
+            return Ok(None);
         }
         Ok(Some(Self {
             lock,
@@ -1625,12 +1807,21 @@ impl Drop for ServiceUse {
         if unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return; // another title still uses it
         }
+        // The exclusive lock is held until `probe` closes, after the service
+        // has gone: a launch waiting to begin then starts a new one.
         stop_service(&self.directory);
     }
 }
 
 /// Stop the service recorded in `directory`, if it is still that service. A
 /// service started by an older launcher left no pid and is left alone.
+///
+/// The pid file can outlive its service -- a service killed some other way
+/// never removes it -- and the pid can then belong to anything, another
+/// directory's service included, since every version is named xodus-service.
+/// A service runs in the directory it was started for, so that is checked
+/// too, and the signal goes through a pidfd where the kernel has them: it
+/// reaches the process that was checked, or nothing.
 fn stop_service(directory: &Path) {
     let pid_file = directory.join(SERVICE_PID);
     let Some(pid) = std::fs::read_to_string(&pid_file)
@@ -1640,29 +1831,94 @@ fn stop_service(directory: &Path) {
     else {
         return;
     };
-    // Still running as the service. An exited one waits as a zombie until its
-    // parent reaps it, under the same name.
-    let ours = || {
-        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-            stat.split_once(" (")
-                .and_then(|(_, rest)| rest.rsplit_once(") "))
-                .is_some_and(|(comm, rest)| comm == "xodus-service" && !rest.starts_with('Z'))
-        })
-    };
-    if ours() {
-        // Safety: kill on a pid just confirmed to be the service.
-        unsafe { libc::kill(pid, libc::SIGTERM) };
-        for _ in 0..30 {
-            if !ours() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
+    let home = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
+    let ours = || service_in(pid, &home);
+    if let Some(process) = Process::open(pid) {
         if ours() {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            process.signal(libc::SIGTERM);
+            if !gone_within(&ours, std::time::Duration::from_secs(3)) {
+                process.signal(libc::SIGKILL);
+                // Not let go of until it has: a launch waiting for the lock
+                // would otherwise find the dying service still listening.
+                gone_within(&ours, std::time::Duration::from_secs(2));
+            }
         }
     }
     let _ = std::fs::remove_file(pid_file);
+}
+
+/// Whether `pid` is a running xodus-service working in `directory`. An exited
+/// one waits as a zombie until its parent reaps it, under the same name, and
+/// does not count.
+fn service_in(pid: i32, directory: &Path) -> bool {
+    let named = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.split_once(" (")
+            .and_then(|(_, rest)| rest.rsplit_once(") "))
+            .is_some_and(|(comm, rest)| comm == "xodus-service" && !rest.starts_with('Z'))
+    });
+    named && std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|cwd| cwd == directory)
+}
+
+fn gone_within(running: &dyn Fn() -> bool, limit: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    while running() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    true
+}
+
+/// A process to signal, held by a pidfd when the kernel offers one (5.3 and
+/// later), and by its pid otherwise.
+struct Process {
+    pid: i32,
+    pidfd: Option<std::os::fd::OwnedFd>,
+}
+
+impl Process {
+    /// `None` when there is no such process any more.
+    fn open(pid: i32) -> Option<Self> {
+        use std::os::fd::FromRawFd;
+        // Safety: pidfd_open takes a pid and flags and returns a new descriptor.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd >= 0 {
+            // Safety: a descriptor just returned to us and owned by nothing else.
+            let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+            return Some(Self {
+                pid,
+                pidfd: Some(pidfd),
+            });
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => None,
+            _ => Some(Self { pid, pidfd: None }),
+        }
+    }
+
+    fn signal(&self, signal: libc::c_int) {
+        use std::os::fd::AsRawFd;
+        // Safety: signals sent to a process just checked to be the service.
+        match &self.pidfd {
+            Some(pidfd) => unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            },
+            None => unsafe {
+                libc::kill(self.pid, signal);
+            },
+        }
+    }
+}
+
+fn is_service_id(id: &str) -> bool {
+    id.len() == 64 && id.bytes().all(|c| c.is_ascii_hexdigit())
 }
 
 /// The service executable to start, outside an AppImage mount.
@@ -1685,26 +1941,170 @@ fn detached_service(
     let Some(id) = std::fs::read_to_string(cli_dir.join("SERVICE_ID"))
         .ok()
         .map(|id| id.trim().to_ascii_lowercase())
-        .filter(|id| id.len() == 64 && id.bytes().all(|c| c.is_ascii_hexdigit()))
+        .filter(|id| is_service_id(id))
     else {
         return Ok(binary.to_path_buf());
     };
-    let directory = cache.join("services").join(&id);
+    let services = cache.join("services");
+    let directory = services.join(&id);
     let copy = directory.join("xodus-service");
     let size = std::fs::metadata(binary)
         .with_context(|| format!("reading {}", binary.display()))?
         .len();
     if std::fs::metadata(&copy).is_ok_and(|m| m.is_file() && m.len() == size) {
+        // Marks the copy as recently used, so another version's cleanup
+        // leaves it alone while this launch starts it.
+        let _ = std::fs::File::open(&directory)
+            .and_then(|d| d.set_modified(std::time::SystemTime::now()));
         return Ok(copy);
     }
     std::fs::create_dir_all(&directory)
         .with_context(|| format!("creating {}", directory.display()))?;
+    remove_abandoned_copies(&directory);
     let partial = directory.join(format!(".xodus-service.{}", std::process::id()));
-    std::fs::copy(binary, &partial).with_context(|| format!("copying {}", binary.display()))?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755))?;
-    std::fs::rename(&partial, &copy).with_context(|| format!("publishing {}", copy.display()))?;
+    let published = (|| {
+        std::fs::copy(binary, &partial).with_context(|| format!("copying {}", binary.display()))?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("making {} executable", partial.display()))?;
+        std::fs::rename(&partial, &copy).with_context(|| format!("publishing {}", copy.display()))
+    })();
+    if let Err(error) = published {
+        let _ = std::fs::remove_file(&partial);
+        return Err(error);
+    }
+    remove_other_versions(&services, &id, &running_executables());
     Ok(copy)
+}
+
+/// Copies left half-written by a launch that died while making them.
+fn remove_abandoned_copies(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".xodus-service."))
+        else {
+            continue;
+        };
+        if pid.parse::<u32>().is_ok() && !Path::new("/proc").join(pid).exists() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Earlier versions' copies, once nothing runs them. Every AppImage update
+/// that changes the service adds a full-size copy, and nothing else removes
+/// them. One used in the last few minutes is kept as well: another version's
+/// launch may be about to start it.
+fn remove_other_versions(services: &Path, keep: &str, running: &[PathBuf]) {
+    const RECENT: std::time::Duration = std::time::Duration::from_secs(600);
+    let Ok(entries) = std::fs::read_dir(services) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .map_or(true, |name| name == keep || !is_service_id(name))
+        {
+            continue;
+        }
+        let recent = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map_or(true, |modified| {
+                !modified.elapsed().is_ok_and(|age| age >= RECENT)
+            });
+        let Ok(path) = std::fs::canonicalize(entry.path()) else {
+            continue;
+        };
+        if recent || running.iter().any(|exe| exe.starts_with(&path)) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+/// The executables of the processes this user can see.
+fn running_executables() -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.parse::<u32>().is_ok())
+        })
+        .filter_map(|entry| std::fs::read_link(entry.path().join("exe")).ok())
+        .collect()
+}
+
+/// How to start the service, detached from this launch.
+///
+/// The service outlives this launch. Anything it inherits stays open as long
+/// as it runs -- the AppImage runtime leaves a descriptor on its own mount --
+/// so only the three standard streams go with it. The rest are marked
+/// close-on-exec rather than closed: one of them is the pipe through which
+/// `spawn` learns that exec failed, and closing it turns a missing or
+/// unrunnable executable into a child that aborts and a spawn that "worked".
+///
+/// It gets its own process group, too. A window stopping one title signals
+/// that title's group, and so does Ctrl+C in a terminal; a service another
+/// title still uses must not go with it.
+fn service_command(
+    executable: &Path,
+    directory: &Path,
+    log: &std::fs::File,
+) -> std::io::Result<Command> {
+    use std::os::unix::process::CommandExt;
+    let mut service = Command::new(executable);
+    service
+        .env("XODUS_RUNTIME_DIR", directory)
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log.try_clone()?))
+        .process_group(0);
+    // Safety: async-signal-safe system calls only, between fork and exec.
+    unsafe {
+        service.pre_exec(|| {
+            let cloexec = libc::CLOSE_RANGE_CLOEXEC as libc::c_uint;
+            if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, cloexec) != 0 {
+                // Before Linux 5.11: one descriptor at a time, up to the limit.
+                let mut limit: libc::rlimit = std::mem::zeroed();
+                let top = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+                    limit.rlim_cur.min(1 << 20) as libc::c_int
+                } else {
+                    1024
+                };
+                for fd in 3..top {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                        libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                    }
+                }
+            }
+            Ok(())
+        });
+    }
+    Ok(service)
+}
+
+/// Write the pid file whole or not at all: a launch finishing reads it.
+fn record_service_pid(directory: &Path, pid: u32) {
+    let temporary = directory.join(format!(".{SERVICE_PID}.{}", std::process::id()));
+    if std::fs::write(&temporary, pid.to_string()).is_err()
+        || std::fs::rename(&temporary, directory.join(SERVICE_PID)).is_err()
+    {
+        let _ = std::fs::remove_file(temporary);
+    }
 }
 
 /// Start the service for this socket, preserving other running versions.
@@ -1726,6 +2126,22 @@ fn start_service(dirs: &launch::Dirs, socket: Option<&Path>, cache: &Path) -> Re
         .context("invalid service socket directory")?;
     std::fs::create_dir_all(directory)
         .with_context(|| format!("creating {}", directory.display()))?;
+    // Two launches can both find no service -- Steam and the window at the
+    // same moment, or a double-click -- and the service takes seconds to bind.
+    // Both would start one, the second would fail to bind, and the pid file
+    // could end up naming the one that exited, so the real one is never
+    // stopped. One launch starts it; the other then finds it listening.
+    let start = directory.join("start.lock");
+    let start_lock = open_lock(&start)?;
+    flock_or_warn(
+        &start_lock,
+        libc::LOCK_EX,
+        &start,
+        "two launches at once may both start a service",
+    )?;
+    if service_socket_live(socket) {
+        return Ok(());
+    }
     // Only remove an unreachable socket. An unrelated regular file is an error.
     if let Ok(metadata) = std::fs::symlink_metadata(socket) {
         use std::os::unix::fs::FileTypeExt;
@@ -1744,9 +2160,6 @@ fn start_service(dirs: &launch::Dirs, socket: Option<&Path>, cache: &Path) -> Re
         .mode(0o600)
         .open(&log)
         .with_context(|| format!("creating {}", log.display()))?;
-    let errs = out
-        .try_clone()
-        .context("duplicating the service log handle")?;
     let appdir = std::env::var_os("APPDIR").filter(|dir| !dir.is_empty());
     let executable = detached_service(
         &binary,
@@ -1754,36 +2167,35 @@ fn start_service(dirs: &launch::Dirs, socket: Option<&Path>, cache: &Path) -> Re
         &dirs.cli_dir,
         cache,
     )?;
-    let mut service = Command::new(&executable);
-    service
-        .env("XODUS_RUNTIME_DIR", directory)
-        .current_dir(directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out))
-        .stderr(Stdio::from(errs));
-    // The service outlives this launch. Anything it inherits stays open as long
-    // as it runs -- the AppImage runtime leaves a descriptor on its own mount --
-    // so only the three standard streams go with it.
-    // Safety: async-signal-safe system calls only, between fork and exec.
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        service.pre_exec(|| {
-            if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) != 0 {
-                for fd in 3..1024 {
-                    libc::close(fd);
-                }
-            }
-            Ok(())
-        });
-    }
-    let mut child = service
-        .spawn()
-        .with_context(|| format!("starting {}", executable.display()))?;
-    // How the last launch using it finds the service to stop.
-    let _ = std::fs::write(directory.join(SERVICE_PID), child.id().to_string());
+    let spawn = |executable: &Path| service_command(executable, directory, &out)?.spawn();
+    let mut child = match spawn(&executable) {
+        // A cache on a noexec mount: the copy cannot run, the packaged binary
+        // can, at the cost the copy exists to avoid.
+        Err(error)
+            if executable != binary
+                && matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) =>
+        {
+            eprintln!(
+                "-- cannot run {} ({error}); starting the packaged service, which keeps the AppImage busy until it stops",
+                executable.display()
+            );
+            spawn(&binary).with_context(|| format!("starting {}", binary.display()))?
+        }
+        spawned => spawned.with_context(|| format!("starting {}", executable.display()))?,
+    };
     for _ in 0..100 {
         if service_socket_live(socket) {
-            eprintln!(":: started xodus-service (log: {})", log.display());
+            // Recorded only now, and only if the process is still there: the
+            // pid file must name the process that owns the socket, and is how
+            // the last launch using it finds the service to stop.
+            if child
+                .try_wait()
+                .context("checking service startup")?
+                .is_none()
+            {
+                record_service_pid(directory, child.id());
+                eprintln!(":: started xodus-service (log: {})", log.display());
+            }
             return Ok(());
         }
         if let Some(status) = child.try_wait().context("checking service startup")? {
@@ -1794,6 +2206,9 @@ fn start_service(dirs: &launch::Dirs, socket: Option<&Path>, cache: &Path) -> Re
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    // Nothing would ever stop it: it was never recorded.
+    let _ = child.kill();
+    let _ = child.wait();
     bail!(
         "Xbox service did not start listening; log: {}",
         log.display()
@@ -2655,50 +3070,242 @@ fn print_json(value: &Value) {
 mod tests {
     use super::*;
 
+    /// A temporary directory and the children a test started in it. Both go
+    /// when the test ends, whether or not an assertion failed first.
+    struct Scratch {
+        root: PathBuf,
+        children: Vec<std::process::Child>,
+    }
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("ferestre-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            Self {
+                root,
+                children: Vec::new(),
+            }
+        }
+
+        /// Start this test binary as a stand-in process the kernel names
+        /// `name`, working in `directory`. It runs `stand_in` and sleeps until
+        /// killed. Nothing on the host is needed: a copy of `sleep` is not
+        /// sleep everywhere -- on a multicall coreutils or busybox, it is a
+        /// binary that dispatches on its own name.
+        fn stand_in(&mut self, name: &str, directory: &Path, ignore_term: bool) -> usize {
+            let bin = self.root.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let link = bin.join(name);
+            if !link.exists() {
+                std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &link).unwrap();
+            }
+            let ready = self.root.join(format!("ready-{}", self.children.len()));
+            let child = Command::new(&link)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "tests::stand_in",
+                    "--test-threads=1",
+                ])
+                .env("FERESTRE_STAND_IN_READY", &ready)
+                .env(
+                    "FERESTRE_STAND_IN",
+                    if ignore_term { "ignore-term" } else { "sleep" },
+                )
+                .current_dir(directory)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            self.children.push(child);
+            // Ready means the stand-in has settled what it does with SIGTERM.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !ready.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "stand-in never started"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            self.children.len() - 1
+        }
+
+        fn pid(&self, child: usize) -> i32 {
+            self.children[child].id() as i32
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            for child in &mut self.children {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Not a test: the process the service tests start in place of the
+    /// service. Run on its own it returns at once.
+    #[test]
+    #[ignore = "started by the service tests as a stand-in process"]
+    fn stand_in() {
+        let Some(mode) = std::env::var_os("FERESTRE_STAND_IN") else {
+            return;
+        };
+        if mode == "ignore-term" {
+            // Safety: ignoring a signal, in a process doing nothing else.
+            unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+        }
+        if let Some(ready) = std::env::var_os("FERESTRE_STAND_IN_READY") {
+            std::fs::write(ready, b"").unwrap();
+        }
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+
     /// Steam shows a shortcut as running until every process it started has
     /// gone, so the service must end with the last title using it -- and not
     /// before.
     #[test]
     fn the_last_title_to_finish_stops_the_service() {
-        let root =
-            std::env::temp_dir().join(format!("ferestre-service-use-{}", std::process::id()));
-        let directory = root.join("service");
+        let mut scratch = Scratch::new("service-use");
+        let directory = scratch.root.join("service");
         std::fs::create_dir_all(&directory).unwrap();
-        // A stand-in that the kernel names "xodus-service".
-        let stand_in = root.join("xodus-service");
-        std::fs::copy("/usr/bin/sleep", &stand_in).unwrap();
-        let mut service = Command::new(&stand_in).arg("60").spawn().unwrap();
-        std::fs::write(directory.join(SERVICE_PID), service.id().to_string()).unwrap();
+        let service = scratch.stand_in("xodus-service", &directory, false);
+        std::fs::write(
+            directory.join(SERVICE_PID),
+            scratch.pid(service).to_string(),
+        )
+        .unwrap();
         let socket = directory.join("xodus.sock");
 
         let first = ServiceUse::begin(Some(&socket)).unwrap().unwrap();
         let second = ServiceUse::begin(Some(&socket)).unwrap().unwrap();
         drop(first);
         assert!(
-            service.try_wait().unwrap().is_none(),
+            scratch.children[service].try_wait().unwrap().is_none(),
             "still in use by the second title"
         );
         drop(second);
-        let status = service.wait().unwrap();
-        assert!(!status.success(), "stopped, not finished: {status}");
+        let status = scratch.children[service].wait().unwrap();
+        assert_eq!(signal_of(&status), Some(libc::SIGTERM), "stopped: {status}");
         assert!(!directory.join(SERVICE_PID).exists());
 
         // An unrelated process behind a stale pid is never signalled.
-        let mut unrelated = Command::new("/usr/bin/sleep").arg("60").spawn().unwrap();
-        std::fs::write(directory.join(SERVICE_PID), unrelated.id().to_string()).unwrap();
+        let unrelated = scratch.stand_in("unrelated", &directory, false);
+        std::fs::write(
+            directory.join(SERVICE_PID),
+            scratch.pid(unrelated).to_string(),
+        )
+        .unwrap();
         drop(ServiceUse::begin(Some(&socket)).unwrap().unwrap());
-        assert!(unrelated.try_wait().unwrap().is_none());
-        unrelated.kill().unwrap();
-        let _ = unrelated.wait();
-        std::fs::remove_dir_all(root).unwrap();
+        assert!(scratch.children[unrelated].try_wait().unwrap().is_none());
+    }
+
+    /// Every version's service is named xodus-service. A stale pid that now
+    /// belongs to another directory's service must not stop it.
+    #[test]
+    fn another_directorys_service_behind_a_stale_pid_is_left_alone() {
+        let mut scratch = Scratch::new("service-other");
+        let directory = scratch.root.join("service");
+        let elsewhere = scratch.root.join("other-version");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let other = scratch.stand_in("xodus-service", &elsewhere, false);
+        std::fs::write(directory.join(SERVICE_PID), scratch.pid(other).to_string()).unwrap();
+        stop_service(&directory);
+        assert!(scratch.children[other].try_wait().unwrap().is_none());
+        assert!(!directory.join(SERVICE_PID).exists());
+    }
+
+    /// A launch waiting for the lock must not find a service that is being
+    /// killed still listening.
+    #[test]
+    fn a_service_that_ignores_sigterm_is_gone_before_the_lock_is_let_go() {
+        let mut scratch = Scratch::new("service-kill");
+        let directory = scratch.root.join("service");
+        std::fs::create_dir_all(&directory).unwrap();
+        let service = scratch.stand_in("xodus-service", &directory, true);
+        let pid = scratch.pid(service);
+        std::fs::write(directory.join(SERVICE_PID), pid.to_string()).unwrap();
+        drop(
+            ServiceUse::begin(Some(&directory.join("xodus.sock")))
+                .unwrap()
+                .unwrap(),
+        );
+        // Exited by the time the lock was dropped: a zombie, waiting for us.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        assert!(
+            stat.is_empty()
+                || stat
+                    .rsplit_once(") ")
+                    .is_some_and(|(_, s)| s.starts_with('Z')),
+            "still running: {stat}"
+        );
+        let status = scratch.children[service].wait().unwrap();
+        assert_eq!(signal_of(&status), Some(libc::SIGKILL), "{status}");
+    }
+
+    /// std learns that exec failed through a pipe the child inherits. Closed
+    /// before exec, a missing service looked like a service that started and
+    /// aborted.
+    #[test]
+    fn a_service_that_cannot_be_executed_reports_why() {
+        let scratch = Scratch::new("service-exec");
+        let log = std::fs::File::create(scratch.root.join("log")).unwrap();
+        let spawn = |executable: &Path| {
+            service_command(executable, &scratch.root, &log)
+                .unwrap()
+                .spawn()
+                .map(|mut child| {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                })
+        };
+        let missing = spawn(&scratch.root.join("absent"));
+        assert_eq!(missing.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        let inert = scratch.root.join("xodus-service");
+        std::fs::write(&inert, b"not a program").unwrap();
+        assert_eq!(
+            spawn(&inert).unwrap_err().raw_os_error(),
+            Some(libc::EACCES)
+        );
+    }
+
+    /// A window stopping a title signals its process group; a shared service
+    /// must not be in it.
+    #[test]
+    fn the_service_runs_in_its_own_process_group() {
+        let mut scratch = Scratch::new("service-group");
+        let log = std::fs::File::create(scratch.root.join("log")).unwrap();
+        let bin = scratch.root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let link = bin.join("xodus-service");
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &link).unwrap();
+        let child = service_command(&link, &scratch.root, &log)
+            .unwrap()
+            .args(["--ignored", "--exact", "tests::stand_in"])
+            .env("FERESTRE_STAND_IN", "sleep")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        scratch.children.push(child);
+        // Safety: getpgid only reads.
+        assert_eq!(unsafe { libc::getpgid(pid) }, pid);
+        assert_ne!(unsafe { libc::getpgid(0) }, pid);
     }
 
     /// A service started from the AppImage pinned its mount, so the AppImage
     /// Steam launched never exited. It runs from a copy keyed by SERVICE_ID.
     #[test]
     fn a_service_inside_an_appimage_runs_from_a_copy_outside_it() {
-        let root =
-            std::env::temp_dir().join(format!("ferestre-service-copy-{}", std::process::id()));
+        use std::os::unix::fs::MetadataExt;
+        let scratch = Scratch::new("service-copy");
+        let root = &scratch.root;
         let appdir = root.join("mount");
         let cli = appdir.join("usr/lib/ferestre/client");
         let cache = root.join("cache");
@@ -2716,24 +3323,169 @@ mod tests {
             std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
             0o755
         );
-        // Reused, not copied again, while it matches.
+
+        // Reused, not copied again, while it matches: the same file, with
+        // bytes the package never had.
+        std::fs::write(&copy, b"fixture SERVICE").unwrap();
+        let before = std::fs::metadata(&copy).unwrap();
         assert_eq!(
             detached_service(&binary, Some(&appdir), &cli, &cache).unwrap(),
             copy
         );
+        let after = std::fs::metadata(&copy).unwrap();
+        assert_eq!(
+            (after.ino(), after.mtime(), after.mtime_nsec()),
+            (before.ino(), before.mtime(), before.mtime_nsec())
+        );
+        assert_eq!(std::fs::read(&copy).unwrap(), b"fixture SERVICE");
+        // One that does not match is replaced.
+        std::fs::write(&copy, b"truncated").unwrap();
+        assert_eq!(
+            detached_service(&binary, Some(&appdir), &cli, &cache).unwrap(),
+            copy
+        );
+        assert_eq!(std::fs::read(&copy).unwrap(), b"fixture service");
 
-        // Native installs, and packages without an id, keep the packaged binary.
+        // Native installs keep the packaged binary.
         assert_eq!(
             detached_service(&binary, None, &cli, &cache).unwrap(),
             binary
         );
+        // So do packages with no id, or one that is not a SHA-256, and they
+        // leave nothing in the cache.
+        let untouched = root.join("untouched-cache");
         std::fs::remove_file(cli.join("SERVICE_ID")).unwrap();
-        let other = root.join("elsewhere");
+        for id in [None, Some("zz".to_string()), Some("d".repeat(63))] {
+            if let Some(id) = &id {
+                std::fs::write(cli.join("SERVICE_ID"), id).unwrap();
+            }
+            assert_eq!(
+                detached_service(&binary, Some(&appdir), &cli, &untouched).unwrap(),
+                binary,
+                "{id:?}"
+            );
+            assert!(!untouched.exists(), "{id:?}");
+        }
+    }
+
+    /// Each update that changes the service leaves a full-size copy behind.
+    #[test]
+    fn copies_of_other_versions_go_once_nothing_runs_them() {
+        let mut scratch = Scratch::new("service-cleanup");
+        let services = scratch.root.join("services");
+        let make = |id: &str, age: u64| {
+            let directory = services.join(id);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("xodus-service"), b"old").unwrap();
+            let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+            std::fs::File::open(&directory)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+            std::fs::canonicalize(directory).unwrap()
+        };
+        let current = "c".repeat(64);
+        let kept = make(&current, 3600);
+        let stale = make(&"a".repeat(64), 3600);
+        let fresh = make(&"b".repeat(64), 0);
+        let running = make(&"e".repeat(64), 3600);
+        let unknown = make("not-a-service", 3600);
+        remove_other_versions(&services, &current, &[running.join("xodus-service")]);
+        assert!(!stale.exists());
+        for directory in [&kept, &fresh, &running, &unknown] {
+            assert!(directory.exists(), "{}", directory.display());
+        }
+
+        // And half-written copies whose launch has gone.
+        let live = scratch.stand_in("copying", &scratch.root.clone(), false);
+        let live = kept.join(format!(".xodus-service.{}", scratch.pid(live)));
+        let dead = kept.join(".xodus-service.4000000000");
+        std::fs::write(&live, b"").unwrap();
+        std::fs::write(&dead, b"").unwrap();
+        remove_abandoned_copies(&kept);
+        assert!(live.exists());
+        assert!(!dead.exists());
+
+        // What is running is found by its executable.
+        let me = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        assert!(running_executables().contains(&me));
+    }
+
+    /// `wineserver -w` waits for every process in the session. One that was
+    /// there before the launch may be the title itself, still running.
+    #[test]
+    fn a_running_wineserver_is_seen_by_its_lock() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let scratch = Scratch::new("wineserver");
+        let base = scratch.root.join("wine");
+        let prefix = scratch.root.join("pfx");
+        std::fs::create_dir_all(&prefix).unwrap();
+        assert_eq!(wineserver_running_in(&base, &prefix), Some(false));
+
+        let metadata = std::fs::metadata(&prefix).unwrap();
+        let server = base.join(format!("server-{:x}-{:x}", metadata.dev(), metadata.ino()));
+        std::fs::create_dir_all(&server).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(server.join("lock"))
+            .unwrap();
+        assert_eq!(wineserver_running_in(&base, &prefix), Some(false));
+        // Held the way wineserver holds it, but as an open file description
+        // lock: a process never conflicts with its own ordinary locks.
+        let mut held: libc::flock = unsafe { std::mem::zeroed() };
+        held.l_type = libc::F_WRLCK as _;
+        held.l_whence = libc::SEEK_SET as _;
+        held.l_len = 1;
         assert_eq!(
-            detached_service(&binary, Some(&other), &cli, &cache).unwrap(),
-            binary
+            unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_OFD_SETLK, &held) },
+            0
         );
-        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(wineserver_running_in(&base, &prefix), Some(true));
+        assert_eq!(
+            wineserver_running_in(&base, &scratch.root.join("gone")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_wait_that_takes_too_long_is_abandoned_and_its_child_reaped() {
+        let mut scratch = Scratch::new("bounded-wait");
+        let child = scratch.stand_in("waiter", &scratch.root.clone(), false);
+        let started = std::time::Instant::now();
+        assert!(!wait_at_most(
+            &mut scratch.children[child],
+            std::time::Duration::from_millis(300)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // Already reaped: there is nothing left to wait for.
+        assert!(scratch.children[child]
+            .try_wait()
+            .is_ok_and(|s| s.is_some()));
+    }
+
+    /// Stopped from the window or with Ctrl+C, the launch passes the signal to
+    /// its title and finishes normally, so its claim on the service drops.
+    #[test]
+    fn a_signal_to_the_launch_goes_to_the_title() {
+        let mut scratch = Scratch::new("forwarding");
+        let forwarding = Forwarding::install().unwrap();
+        let title = scratch.stand_in("title", &scratch.root.clone(), false);
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // Safety: SIGTERM to ourselves, which the handler now catches.
+            unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        });
+        let status = forwarding.wait(&mut scratch.children[title]).unwrap();
+        assert_eq!(signal_of(&status), Some(libc::SIGTERM));
+        assert_eq!(forwarding.received(), Some(libc::SIGTERM));
+        // Ctrl+C should still stop the rest of the test run.
+        for signal in LAUNCH_SIGNALS {
+            // Safety: restoring the default disposition.
+            unsafe { libc::signal(signal, libc::SIG_DFL) };
+        }
     }
 
     #[test]
@@ -2789,7 +3541,14 @@ mod tests {
         assert!(service_socket_live(&first));
         assert!(!service_socket_live(&other));
         drop(listener);
-        assert!(!service_socket_live(&first)); // A stale path is not a running service.
+        // A stale path is not a running service. Other tests start children
+        // meanwhile, and one forked but not yet exec'd still holds a copy of
+        // the listener for a moment, so give it that moment.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while service_socket_live(&first) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!service_socket_live(&first));
         std::fs::remove_dir_all(directory).unwrap();
     }
 
