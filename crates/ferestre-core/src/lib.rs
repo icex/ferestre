@@ -29,6 +29,7 @@ pub mod library;
 pub mod media;
 pub mod paths;
 pub mod playfab;
+pub mod presence;
 pub mod recipe;
 pub mod runtime;
 pub mod sdl;
