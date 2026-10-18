@@ -418,12 +418,64 @@ fn matching_entry(entries: &[(String, Value)], shortcut: &Shortcut) -> Option<us
         .iter()
         .position(|(_, entry)| same_launch(entry, shortcut))
         .or_else(|| {
+            // Never an entry that runs another product: two titles can share
+            // a name, and each keeps its own shortcut.
+            let product = launched_product(&shortcut.launch_options);
             entries.iter().position(|(_, entry)| {
                 is_ferestre_entry(entry)
                     && entry.get("AppName").and_then(Value::as_str)
                         == Some(shortcut.app_name.as_str())
+                    && entry
+                        .get("LaunchOptions")
+                        .and_then(Value::as_str)
+                        .and_then(launched_product)
+                        .is_none_or(|id| product.is_none_or(|own| id.eq_ignore_ascii_case(own)))
             })
         })
+}
+
+/// `shortcut`, renamed if it is new and its id is already another entry's.
+///
+/// Steam derives a shortcut's id from its executable and name, so two titles
+/// sharing a name, for example two editions, would share an id and overwrite
+/// each other's artwork. The one added later is named after its product id
+/// too, "Name (9NXXXXXXXXXX)".
+pub fn distinct(document: &Value, shortcut: &Shortcut) -> Shortcut {
+    let mut shortcut = shortcut.clone();
+    let Some(entries) = document.get("shortcuts").and_then(Value::as_map) else {
+        return shortcut;
+    };
+    let Some(product) = launched_product(&shortcut.launch_options).map(str::to_string) else {
+        return shortcut;
+    };
+    let renamed = format!("{} ({product})", shortcut.app_name);
+    if let Some(at) = matching_entry(entries, &shortcut) {
+        // Told apart before: it stays told apart.
+        if entries[at].1.get("AppName").and_then(Value::as_str) == Some(&renamed) {
+            shortcut.app_name = renamed;
+        }
+        return shortcut;
+    }
+    let taken = |shortcut: &Shortcut| {
+        let id = shortcut.app_id() as i32;
+        entries.iter().any(|(_, entry)| {
+            entry.get("appid") == Some(&Value::Int(id))
+                || entry.get("AppName").and_then(Value::as_str) == Some(&shortcut.app_name)
+                    && entry.get("Exe").and_then(Value::as_str) == Some(&shortcut.exe)
+        })
+    };
+    if taken(&shortcut) {
+        shortcut.app_name = renamed;
+    }
+    shortcut
+}
+
+/// The product id in launch options of the form `run <id> ...`.
+fn launched_product(options: &str) -> Option<&str> {
+    let mut words = options.split_whitespace();
+    (words.next() == Some("run"))
+        .then(|| words.next())
+        .flatten()
 }
 
 /// Whether an entry was written by Ferestre: it starts the launcher (`Exe` is
@@ -1175,7 +1227,6 @@ mod tests {
         for (exe, options) in [
             ("\"/home/a/Apps/Ferestre-0.1.2-x86_64.AppImage\"", ""),
             ("\"/usr/bin/ferestre\"", "--verbose run 9ZZTESTGAME1"),
-            ("\"/somewhere/renamed\"", "run 9ZZTESTGAME2"),
         ] {
             let mut document = empty_document();
             let Value::Map(root) = &mut document else {
@@ -1207,6 +1258,59 @@ mod tests {
                 1
             );
         }
+    }
+
+    /// Two products can share a display name, for example two editions.
+    /// Each keeps its own shortcut, whichever is added first.
+    #[test]
+    fn titles_sharing_a_name_keep_their_own_shortcuts() {
+        let mut document = empty_document();
+        let shortcut = |id: &str| {
+            Shortcut::new(
+                "Same Name",
+                Path::new("/usr/bin/ferestre"),
+                Path::new("/usr/bin"),
+                format!("run {id}"),
+            )
+        };
+        let (first, second) = (shortcut("9ZZTESTGAME1"), shortcut("9ZZTESTGAME2"));
+        assert_eq!(
+            distinct(&document, &first),
+            first,
+            "nothing to tell apart yet"
+        );
+        assert!(!upsert(&mut document, &first).expect("adds"));
+        assert!(existing_shortcut(&document, &second).is_none());
+        let second = distinct(&document, &second);
+        assert_eq!(second.app_name, "Same Name (9ZZTESTGAME2)");
+        assert_ne!(
+            second.app_id(),
+            first.app_id(),
+            "its own id, so its own art"
+        );
+        assert!(
+            !upsert(&mut document, &second).expect("adds"),
+            "the second is added, not written over the first"
+        );
+        assert_eq!(
+            distinct(&document, &first),
+            first,
+            "an update keeps its name"
+        );
+        assert_eq!(distinct(&document, &second), second);
+        assert_eq!(
+            distinct(&document, &shortcut("9ZZTESTGAME2")),
+            second,
+            "added again under its plain name, it keeps the one it was given"
+        );
+        assert!(upsert(&mut document, &first).expect("updates"));
+        assert!(upsert(&mut document, &second).expect("updates"));
+        let entries = document.get("shortcuts").unwrap().as_map().unwrap();
+        let launched: Vec<_> = entries
+            .iter()
+            .filter_map(|(_, entry)| entry.get("LaunchOptions").and_then(Value::as_str))
+            .collect();
+        assert_eq!(launched, ["run 9ZZTESTGAME1", "run 9ZZTESTGAME2"]);
     }
 
     /// A shortcut whose path is not UTF-8 used to be written back with

@@ -1476,6 +1476,62 @@ print(":: done", flush=True)
         check(struct.unpack("<I", shortcut_bytes.split(b"\x02appid\0", 1)[1][:4])[0] == stored_id,
               "updating preserves the Steam app id and controller configuration identity", frame)
         check(os.path.isfile(shortcut_string("icon")), "re-adding fills the missing game icon", frame)
+
+        # Installed's header adds every installed title at once, and doing it
+        # again updates them in place. A second title goes on disk for this,
+        # so the bulk path really runs over more than one.
+        def launch_targets():
+            data = open(shortcuts, "rb").read()
+            return [part.split(b"\0", 1)[0].decode() for part in data.split(b"\x01LaunchOptions\0")[1:]]
+
+        def add_all(heading, summary):
+            # A refresh's follow-up work (update check, disk usage) keeps the
+            # window busy for a moment, and a busy window says so instead of
+            # asking. Ask again until it asks back.
+            until = time.monotonic() + TIMEOUT
+            while True:
+                click_named(frame, "Add All to Steam")
+                try:
+                    wait_for(frame, lambda root: any(t == f"Add {heading} to Steam?" for t in texts(root)),
+                             "the add-all confirmation", min(until, time.monotonic() + 3))
+                    break
+                except Failure:
+                    if time.monotonic() >= until:
+                        raise
+            click_named(frame, "Add All")
+            # The summary is drawn once the work is done and the window is
+            # free again, so the next click is never refused as busy.
+            wait_for(frame, lambda root: any(t.startswith(summary) and "Restart Steam to see them." in t
+                                             for t in texts(root)),
+                     f"the summary {summary!r}", time.monotonic() + TIMEOUT)
+
+        stardew = os.path.join(home, "games", "stardew-valley")
+        os.makedirs(stardew, exist_ok=True)
+        with open(os.path.join(stardew, "appxmanifest.xml"), "w") as f:
+            f.write('<Package><Identity Name="ConcernedApe.StardewValleyPC" Version="1.6.15.0" /></Package>')
+        click_named(frame, "Refresh library, subscriptions and catalogue")
+        select_in_list(frame, "Installed")
+        wait_for(frame, lambda root: "2 games" in texts(root), "two installed games", time.monotonic() + TIMEOUT)
+        wait_for(frame, lambda root: not any("Checking for game updates" in t for t in texts(root)),
+                 "the automatic update check to finish", time.monotonic() + TIMEOUT)
+        before = launch_targets()
+        installed = {"run 9NBLGGH2JHXJ", "run 9MWR1NC6VQ6L"}
+        new = len(installed - set(before))
+        first = (f"Added {new} games to Steam." if new == 2
+                 else f"Added 1 game and updated 1 in Steam.")
+        add_all("2 games", first)
+        after = launch_targets()
+        check(installed <= set(after), "Add All gives every installed title a shortcut", frame)
+        check(len(after) == len(set(after)), "Add All never duplicates a shortcut", frame)
+        check(set(after) - set(before) == installed - set(before), "Add All adds only installed titles", frame)
+        add_all("2 games", "Updated 2 games in Steam.")
+        check(launch_targets() == after, "Add All again updates in place", frame)
+        shutil.rmtree(stardew)
+        click_named(frame, "Refresh library, subscriptions and catalogue")
+        wait_for(frame, lambda root: "1 game" in texts(root), "one installed game again", time.monotonic() + TIMEOUT)
+        select_in_list(frame, "Library")
+        wait_for(frame, lambda root: any("Minecraft" in t for t in texts(root)),
+                 "the library after Add All", time.monotonic() + TIMEOUT)
         row_action(app, frame, "Edit launch settings", edit[0])
         labels = wait_for(
             frame,
