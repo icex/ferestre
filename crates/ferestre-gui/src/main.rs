@@ -9,6 +9,7 @@
 //!
 //! The client is never linked: Xodus is GPL-3.0-only, and the decrypted
 //! executable has to stay a child of the process that opened it.
+mod accounts_ui;
 mod cancel;
 mod editor;
 mod model;
@@ -24,11 +25,41 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use ferestre_core::recipe::Recipe;
-use ferestre_core::{account, catalog, gamepass, library, steam};
+use ferestre_core::{account, accounts, catalog, gamepass, library, steam};
 use model::{Action, Inputs, LibraryRow, Ownership};
 use state::{Model, Section, AVATAR_PX, ICON_PX, PER_PAGE};
 
 const APP_ID: &str = "io.github.icex.ferestre";
+
+/// Only what Adwaita's own classes do not cover. Colours are Adwaita's named
+/// ones, so dark mode and accent changes follow without a second stylesheet.
+const STYLE: &str = "
+.access-chip {
+  padding: 4px 10px;
+  border-radius: 999px;
+  color: @warning_color;
+  background-color: alpha(@warning_color, 0.12);
+}
+row.library-row {
+  padding-top: 8px;
+  padding-bottom: 8px;
+}
+row.library-row label.title {
+  font-weight: bold;
+}
+.role-badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: smaller;
+  font-weight: bold;
+  color: @accent_color;
+  background-color: alpha(@accent_color, 0.12);
+}
+.role-badge.player {
+  color: @success_color;
+  background-color: alpha(@success_color, 0.12);
+}
+";
 
 /// Everything a callback needs to redraw the window, in one place so it can
 /// hold one clone instead of nine.
@@ -77,10 +108,17 @@ struct Ui {
     /// mapped to the process group to signal. Deliberately not the `busy` flag:
     /// a game runs for hours and must not hold the window's other work.
     running: Rc<RefCell<BTreeMap<String, u32>>>,
+    running_servers: Rc<RefCell<BTreeMap<String, (PathBuf, PathBuf)>>>,
 }
 
 fn main() -> glib::ExitCode {
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    let application_id = std::env::var("FERESTRE_APPLICATION_ID")
+        .ok()
+        .filter(|id| gio::Application::id_is_valid(id))
+        .unwrap_or_else(|| APP_ID.into());
+    let app = adw::Application::builder()
+        .application_id(&application_id)
+        .build();
     app.connect_activate(build_ui);
     app.run()
 }
@@ -118,6 +156,13 @@ fn build_ui(app: &adw::Application) {
 
     if let Some(display) = gdk::Display::default() {
         add_source_icon_path(&display);
+        let css = gtk::CssProvider::new();
+        css.load_from_data(STYLE);
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
     }
     // Without this the shell has no icon to draw and falls back to a generated
     // letter tile. The name is the application id, which is what the packaging
@@ -271,6 +316,7 @@ fn build_ui(app: &adw::Application) {
         close_dialog_open: Rc::new(RefCell::new(false)),
         download_control: Rc::new(RefCell::new(None)),
         running: Rc::new(RefCell::new(BTreeMap::new())),
+        running_servers: Rc::new(RefCell::new(BTreeMap::new())),
         asked_names: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
         fetching_gamepass: Rc::new(RefCell::new(false)),
         fetching_names: Rc::new(Cell::new(false)),
@@ -469,25 +515,29 @@ fn render(ui: &Ui) {
                 &page,
                 move |row| show_all || !row.known_uninstallable(),
                 "Nothing here yet.",
-            )
+            );
         }
         Section::GamePass => {
             // A missing catalogue is fetched when this section opens too.
             fetch_gamepass(ui, false);
             render_gamepass(ui, &page)
         }
-        Section::Installed => render_rows(
-            ui,
-            &page,
-            |row| row.installed,
-            "Nothing is installed yet. Find a title in the library and install it.",
-        ),
-        Section::Updates => render_rows(
-            ui,
-            &page,
-            |row| row.update == Some(true),
-            "Everything installed is up to date.",
-        ),
+        Section::Installed => {
+            render_rows(
+                ui,
+                &page,
+                |row| row.installed,
+                "Nothing is installed yet. Find a title in the library and install it.",
+            );
+        }
+        Section::Updates => {
+            render_rows(
+                ui,
+                &page,
+                |row| row.update == Some(true),
+                "Everything installed is up to date.",
+            );
+        }
     }
 }
 
@@ -589,6 +639,9 @@ struct Drawn {
     /// currently being shown.
     unsupported: usize,
     outside_tier: usize,
+    /// Rows the list holds after the filter and before a search narrows it:
+    /// what a heading counting this list should say.
+    listed: usize,
     /// Rows in the whole list still waiting for a name while a search is
     /// running. A search cannot match what has not been fetched, and saying
     /// "nothing matches" during that is telling somebody something untrue.
@@ -650,14 +703,27 @@ fn draw_list(
             } else {
                 Vec::new()
             };
-            model::gamepass(&inputs, &model.gamepass, &model.tiers, &held)
+            model::gamepass(
+                &inputs,
+                &model.gamepass,
+                // Empty is "not known", not "nothing is merchandised".
+                Some(&model.gamepass_merchandised).filter(|m| !m.is_empty()),
+                &model.tiers,
+                &held,
+            )
         }
         _ => model::library(&inputs),
     };
     // Bundle rows install a child product. They still need to show the active
     // download on their own row, regardless of which model branch built it.
     for row in &mut rows {
-        let source = model::access_source(
+        // An installed title says when the selected Store account cannot play
+        // it, before Play fails at the licence step.
+        let store = model
+            .account
+            .as_ref()
+            .map_or("this Store account", |a| a.label());
+        let gap = model::subscription_gap(
             &row.product_id,
             &model.ownership,
             &model.catalog,
@@ -665,19 +731,47 @@ fn draw_list(
             &model.tiers,
             &model.subscriptions,
         );
+        let installed_here = installed_product(&row.product_id);
+        let source =
+            if installed_here && model.refused.contains(&row.product_id.to_ascii_uppercase()) {
+                format!("Not available to {store}: licence refused")
+            } else if installed_here && gap == Some(model::SubscriptionGap::NoSubscription) {
+                format!("Not available to {store}: needs Game Pass")
+            } else if installed_here && gap == Some(model::SubscriptionGap::OutsideTier) {
+                format!("Not available to {store}: outside its Game Pass tier")
+            } else {
+                model::access_source(
+                    &row.product_id,
+                    &model.ownership,
+                    &model.catalog,
+                    &model.gamepass,
+                    &model.tiers,
+                    &model.subscriptions,
+                )
+                .to_string()
+            };
+        // The chip beside Play says this; the subtitle need not say it twice.
+        let (source, unavailable) = if source.starts_with("Not available to ") {
+            (String::new(), Some(source))
+        } else {
+            (source, None)
+        };
+        row.unavailable = unavailable;
         let details = row
             .subtitle
             .split("  ·  ")
             .filter(|part| *part != "Included with PC Game Pass")
             .collect::<Vec<_>>()
             .join("  ·  ");
-        row.subtitle = if details.starts_with("Version ") {
+        row.subtitle = if source.is_empty() {
+            details
+        } else if details.starts_with("Version ") {
             match details.split_once("  ·  ") {
                 Some((version, rest)) => format!("{version}  ·  {source}  ·  {rest}"),
                 None => format!("{details}  ·  {source}"),
             }
         } else if details.is_empty() {
-            source.into()
+            source
         } else {
             format!("{source}  ·  {details}")
         };
@@ -704,6 +798,7 @@ fn draw_list(
     // Revalidation must include named, cached rows, including off-page ones.
     let metadata_ids: Vec<String> = rows.iter().map(|row| row.product_id.clone()).collect();
     let rows: Vec<LibraryRow> = rows.into_iter().filter(|row| keep(row)).collect();
+    let listed = rows.len();
 
     let matching = model::search(&rows, &model.query);
     let view = model::paginate(&matching, model.page, PER_PAGE);
@@ -713,6 +808,7 @@ fn draw_list(
     // until you happened to page past the row, and then worked ever after.
     Drawn {
         page: view.page,
+        listed,
         pending_names: unnamed_off_page.len(),
         want_names: metadata_ids
             .into_iter()
@@ -759,52 +855,76 @@ fn draw_list(
 /// leaving that unsaid would make every licence refusal look like a bug in the
 /// launcher.
 fn render_gamepass(ui: &Ui, page: &gtk::Box) {
-    let (held, listing, market) = {
+    let (held, fetched, market, store, checked) = {
         let model = ui.model.borrow();
         (
             model.subscriptions.clone(),
-            model.gamepass.len(),
+            !model.gamepass.is_empty(),
             model.market().0,
+            model.account.as_ref().map(|a| a.label().to_string()),
+            model.entitlements_checked,
         )
     };
 
+    // Drawn first, filled in after the list: the count is what the list below
+    // actually holds -- games only, in this market, that this account's tier
+    // and this runtime can install -- not the size of the feed it came from.
     let group = adw::PreferencesGroup::builder().build();
-    let (title, subtitle) = match (listing, held.as_slice()) {
-        (0, _) => (
-            "The Game Pass catalogue has not been fetched yet".to_string(),
-            "Reload to fetch it. It is a public listing -- no account needed.".to_string(),
-        ),
-        (n, []) => (
-            format!("{n} titles are included with PC Game Pass in {market}"),
-            "No active subscription was found on this account, so installing one \
-             will be refused at the licence step."
-                .to_string(),
-        ),
-        (n, subs) => (
-            format!("{n} titles are included with PC Game Pass in {market}"),
-            format!(
-                "This account holds {}. Whether a tier covers a given title is decided \
-                 when it is installed, not here.",
-                subs.join(" and ")
-            ),
-        ),
-    };
-    let row = adw::ActionRow::builder()
-        .title(&title)
-        .subtitle(&subtitle)
-        .subtitle_lines(3)
-        .build();
-    row.add_css_class("dim-label");
-    group.add(&row);
+    let banner = adw::ActionRow::builder().subtitle_lines(3).build();
+    banner.set_use_markup(false);
+    banner.add_prefix(&gtk::Image::from_icon_name("starred-symbolic"));
+    group.add(&banner);
     page.append(&group);
 
     let show_all = ui.model.borrow().show_unsupported;
-    render_rows(
+    let listed = render_rows(
         ui,
         page,
         move |row| show_all || !row.known_uninstallable(),
         "Nothing here yet.",
     );
+
+    let games = |n: usize| format!("{n} {}", if n == 1 { "game" } else { "games" });
+    let in_market = format!("{} in PC Game Pass for the {market} Store", games(listed));
+    let (title, subtitle) = match (fetched, store, checked, held.as_slice()) {
+        (false, ..) => (
+            "The Game Pass catalogue has not been fetched yet".to_string(),
+            "Reload to fetch it. It is a public listing -- no account needed.".to_string(),
+        ),
+        (true, None, ..) => (
+            in_market,
+            "Sign in to see which of these your Store account can play.".to_string(),
+        ),
+        (true, Some(store), false, _) => (
+            in_market,
+            format!("Load the library to see which of these {store} can play."),
+        ),
+        (true, Some(store), true, []) => (
+            in_market,
+            format!(
+                "{store} has no Game Pass subscription, so it cannot play these. Choose an \
+                 account with Game Pass as the Store account in Accounts."
+            ),
+        ),
+        (true, Some(store), true, subs) => (
+            if show_all {
+                in_market
+            } else {
+                format!(
+                    "{} {store} can install with {}",
+                    games(listed),
+                    subs.join(" and ")
+                )
+            },
+            format!(
+                "From the PC Game Pass catalogue for the {market} Store. Add-ons are not \
+                 counted, and titles outside the tier or in packages this runtime cannot \
+                 open are left out unless you choose to show them."
+            ),
+        ),
+    };
+    banner.set_title(&title);
+    banner.set_subtitle(&subtitle);
 }
 
 /// The saved measurement for a title, if it still matches the install the
@@ -925,7 +1045,13 @@ fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
     });
 }
 
-fn render_rows(ui: &Ui, page: &gtk::Box, keep: impl Fn(&LibraryRow) -> bool, empty_message: &str) {
+/// Draws the list and returns how many rows it holds before a search.
+fn render_rows(
+    ui: &Ui,
+    page: &gtk::Box,
+    keep: impl Fn(&LibraryRow) -> bool,
+    empty_message: &str,
+) -> usize {
     let section = ui.model.borrow().section;
     let downloading = ui
         .download
@@ -940,6 +1066,7 @@ fn render_rows(ui: &Ui, page: &gtk::Box, keep: impl Fn(&LibraryRow) -> bool, emp
         section,
         keep,
     );
+    let listed = drawn.listed;
     // Persist the clamped page. Otherwise Previous decrements a stale page
     // number and keeps showing the last page after the list shrinks.
     ui.model.borrow_mut().page = drawn.page;
@@ -1081,6 +1208,7 @@ fn render_rows(ui: &Ui, page: &gtk::Box, keep: impl Fn(&LibraryRow) -> bool, emp
     if !drawn.want_icons.is_empty() {
         fetch_icons(ui, drawn.want_icons);
     }
+    listed
 }
 
 fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
@@ -1177,7 +1305,8 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
     // subtitle that names a title, which the bundle rows do.
     let action_row = adw::ActionRow::builder()
         .title_lines(1)
-        .subtitle_lines(1)
+        .subtitle_lines(2)
+        .css_classes(["library-row"])
         .tooltip_text(&row.product_id)
         .build();
     action_row.set_use_markup(false);
@@ -1246,6 +1375,36 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
         row.name, details, row.product_id
     )));
 
+    // Said where the Play button is, not only in a dimmed subtitle the eye
+    // skips: pressing Play would end at the licence step.
+    if let Some(reason) = &row.unavailable {
+        let why = reason
+            .split_once(": ")
+            .map_or("Not available", |(_, why)| why);
+        let mut why = why.chars();
+        let why: String = why
+            .next()
+            .map(|c| c.to_uppercase().chain(why).collect())
+            .unwrap_or_default();
+        let chip = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(6)
+                .valign(gtk::Align::Center)
+                .css_classes(["access-chip"])
+                .tooltip_text(format!(
+                    "{reason}. Choose an account that owns it or has Game Pass as the Store account in Accounts."
+                ))
+                .build();
+        chip.append(&gtk::Image::from_icon_name("dialog-warning-symbolic"));
+        chip.append(
+            &gtk::Label::builder()
+                .label(&why)
+                .css_classes(["caption-heading"])
+                .build(),
+        );
+        action_row.add_suffix(&chip);
+    }
+
     let actions = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(4)
@@ -1254,85 +1413,84 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
         .build();
     action_row.add_suffix(&actions);
 
-    let store = gtk::Button::builder()
-        .icon_name("web-browser-symbolic")
+    // Secondary actions live behind one menu button: five icon buttons on
+    // every row left the title three characters wide.
+    let menu = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    let popover = gtk::Popover::builder().child(&menu).build();
+    let more = gtk::MenuButton::builder()
+        .icon_name("view-more-symbolic")
         .valign(gtk::Align::Center)
         .css_classes(["flat"])
-        .tooltip_text("Open this title's Microsoft Store page")
+        .tooltip_text("More actions")
+        .popover(&popover)
         .build();
-    let store_url = format!("{STORE_PAGE}{}", row.product_id);
-    store.connect_clicked(move |button| open_link(button, &store_url));
-    actions.append(&store);
-
-    // Anything on disk can be removed, recipe or not -- and the rows that most
-    // need it are the ones with no recipe, because a failed install leaves
-    // exactly that and there was previously no way to say so.
-    if row.installed {
-        let remove = gtk::Button::builder()
-            .icon_name("user-trash-symbolic")
-            .valign(gtk::Align::Center)
+    more.update_property(&[gtk::accessible::Property::Label(&format!(
+        "More actions for {}",
+        row.name
+    ))]);
+    let item = |icon: &str, label: &str, run: Box<dyn Fn()>| {
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        content.append(&gtk::Image::from_icon_name(icon));
+        content.append(&gtk::Label::builder().label(label).xalign(0.0).build());
+        let button = gtk::Button::builder()
+            .child(&content)
             .css_classes(["flat"])
-            .tooltip_text("Remove this title from disk")
             .build();
-        let product_id = row.product_id.clone();
-        let name = row.name.clone();
-        remove.connect_clicked(glib::clone!(
-            #[strong]
-            ui,
-            move |_| confirm_remove(&ui, &product_id, &name)
-        ));
-        actions.append(&remove);
-    }
-
+        button.update_property(&[gtk::accessible::Property::Label(label)]);
+        let popover = popover.clone();
+        button.connect_clicked(move |_| {
+            popover.popdown();
+            run();
+        });
+        menu.append(&button);
+    };
+    let store_url = format!("{STORE_PAGE}{}", row.product_id);
+    let anchor = action_row.clone();
+    item(
+        "web-browser-symbolic",
+        "Open Store page",
+        Box::new(move || open_link(&anchor, &store_url)),
+    );
     // A shortcut needs something that will launch. A recipe is one; a title on
     // disk is another, because `run` writes a recipe from the package manifest
     // on its way past.
     if row.has_recipe || row.installed {
-        let runtime = gtk::Button::builder()
-            .icon_name("applications-engineering-symbolic")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat"])
-            .tooltip_text("Choose the Proton runtime for this title")
-            .build();
-        let product_id = row.product_id.clone();
-        let name = row.name.clone();
-        runtime.connect_clicked(glib::clone!(
-            #[strong]
-            ui,
-            move |_| choose_runtime(&ui, &product_id, &name)
-        ));
-        actions.append(&runtime);
-
-        let to_steam = gtk::Button::builder()
-            .icon_name("list-add-symbolic")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat"])
-            .tooltip_text("Add to Steam as a non-Steam shortcut")
-            .build();
-        let product_id = row.product_id.clone();
-        let name = row.name.clone();
-        to_steam.connect_clicked(glib::clone!(
-            #[strong]
-            ui,
-            move |_| add_to_steam(&ui, &product_id, &name)
-        ));
-        actions.append(&to_steam);
-
-        let edit = gtk::Button::builder()
-            .icon_name("document-edit-symbolic")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat"])
-            .tooltip_text("Edit how this title launches")
-            .build();
-        let product_id = row.product_id.clone();
-        let name = row.name.clone();
-        edit.connect_clicked(glib::clone!(
-            #[strong]
-            ui,
-            move |_| open_editor(&ui, &product_id, &name)
-        ));
-        actions.append(&edit);
+        for (icon, label, run) in [
+            (
+                "applications-engineering-symbolic",
+                "Choose runtime",
+                choose_runtime as fn(&Ui, &str, &str),
+            ),
+            ("list-add-symbolic", "Add to Steam", add_to_steam),
+            (
+                "document-edit-symbolic",
+                "Edit launch settings",
+                open_editor,
+            ),
+        ] {
+            let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
+            item(icon, label, Box::new(move || run(&ui, &product_id, &name)));
+        }
     }
+    // Anything on disk can be removed, recipe or not -- and the rows that most
+    // need it are the ones with no recipe, because a failed install leaves
+    // exactly that and there was previously no way to say so.
+    if row.installed {
+        let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
+        item(
+            "user-trash-symbolic",
+            "Remove from disk",
+            Box::new(move || confirm_remove(&ui, &product_id, &name)),
+        );
+    }
+    actions.append(&more);
 
     // A greyed-out "Play" is a button that says a title might work if you found
     // the right thing to click. It never will: the reason is in the subtitle
@@ -1350,6 +1508,9 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
         .build();
     let downloading = ui.download.current.borrow().is_some();
     button.set_sensitive(row.action.is_enabled_during_download(downloading));
+    if row.unavailable.is_some() {
+        button.remove_css_class("suggested-action");
+    }
 
     match &row.action {
         Action::Blocked(reason) => button.set_tooltip_text(Some(reason)),
@@ -1433,27 +1594,61 @@ fn render_account_button(ui: &Ui) {
     }
     content.append(&avatar);
 
+    let (primary, secondary) = if let Some(roles) = &model.roles {
+        let player = model
+            .profiles
+            .as_ref()
+            .and_then(|p| p.profiles.iter().find(|p| p.id == roles.player))
+            .map(|p| {
+                format!(
+                    "{}{}",
+                    p.label,
+                    if p.signed_in { "" } else { " (signed out)" }
+                )
+            })
+            .unwrap_or_else(|| "not checked".into());
+        (
+            format!(
+                "Store: {}",
+                model
+                    .account
+                    .as_ref()
+                    .map(|a| a.label())
+                    .unwrap_or("signed out")
+            ),
+            format!("Player: {player}"),
+        )
+    } else {
+        (
+            model
+                .account
+                .as_ref()
+                .map(|a| a.label())
+                .unwrap_or("Not signed in")
+                .to_string(),
+            if model.ownership.is_known() {
+                "Library loaded"
+            } else if model.account.is_some() {
+                "Load library"
+            } else {
+                "Sign in"
+            }
+            .into(),
+        )
+    };
     let labels = gtk::Box::new(gtk::Orientation::Vertical, 0);
     labels.append(
         &gtk::Label::builder()
-            .label(match &model.account {
-                Some(account) => account.label(),
-                None => "Not signed in",
-            })
+            .label(&primary)
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build(),
     );
     labels.append(
         &gtk::Label::builder()
-            .label(if model.ownership.is_known() {
-                "Library loaded"
-            } else if model.account.is_some() {
-                "Load library"
-            } else {
-                "Sign in"
-            })
+            .label(&secondary)
             .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["caption", "dim-label"])
             .build(),
     );
@@ -1507,6 +1702,22 @@ fn account_menu(ui: &Ui) {
         button
     };
 
+    let accounts = entry(
+        "Accounts",
+        "Choose the Store owner and Xbox player separately",
+    );
+    accounts.connect_clicked(glib::clone!(
+        #[strong]
+        ui,
+        #[strong]
+        popover,
+        move |_| {
+            popover.popdown();
+            accounts_ui::open(&ui);
+        }
+    ));
+    items.append(&accounts);
+
     let reload = entry(
         "Reload library",
         "Ask the service again what this account owns",
@@ -1547,7 +1758,10 @@ fn account_menu(ui: &Ui) {
 
     items.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
-    let out = entry("Sign out", "Forget this machine's tokens");
+    let out = entry(
+        "Sign out",
+        "Remove the Store account's sign-in from this computer",
+    );
     out.add_css_class("destructive-action");
     out.connect_clicked(glib::clone!(
         #[strong]
@@ -1620,6 +1834,7 @@ fn sign_out(ui: &Ui) {
         report_busy(ui);
         return;
     }
+    let roles = ui.model.borrow().roles.clone();
     // The saved account is removed just below, before the client runs, and
     // the client is its own process, which a closed window does not stop.
     note_close(
@@ -1630,14 +1845,13 @@ fn sign_out(ui: &Ui) {
     // never reaches the code below, and the next one would open showing the
     // old account and its library from these files. If sign-out then fails,
     // the next account refresh writes them again.
-    if let Some(paths) = ui.model.borrow().paths.as_ref() {
-        state::forget_saved_account(paths.state_dir());
+    if let Some(state) = ui.model.borrow().private_state_dir() {
+        state::forget_saved_account(&state);
     }
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = gio::spawn_blocking(move || {
-            std::process::Command::new(&client)
-                .arg("logout")
+            scope_store(account::logout_command(&client), roles.as_ref())
                 .stdin(std::process::Stdio::null())
                 .status()
                 .map_err(|e| format!("{}: {e}", client.display()))
@@ -1721,12 +1935,78 @@ fn warn_about_media(ui: &Ui, product_id: &str) {
 }
 
 fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
+    let (roles, server) = {
+        let model = ui.model.borrow();
+        if let Some(roles) = &model.roles {
+            let result = model
+                .profiles
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Account identities are still loading. Open Accounts to check them."
+                    )
+                })
+                .and_then(|profiles| roles.selected(profiles));
+            if let Err(error) = result {
+                ui.toasts.add_toast(
+                    adw::Toast::builder()
+                        .title(error.to_string())
+                        .priority(adw::ToastPriority::High)
+                        .timeout(15)
+                        .build(),
+                );
+                return;
+            }
+            if roles.split() {
+                let supported = model
+                    .paths
+                    .as_ref()
+                    .zip(model.recipe_for(product_id))
+                    .and_then(|(paths, recipe)| {
+                        let inferred = ferestre_core::autofix::infer(
+                            recipe,
+                            model.game_dir(recipe).as_deref(),
+                        );
+                        let selected =
+                            ferestre_core::runtime::selected(paths.config_dir(), product_id);
+                        ferestre_core::runtime::select(
+                            &inferred.recipe,
+                            &model.runtimes,
+                            selected.as_deref(),
+                            model.registry.as_ref(),
+                        )
+                        .ok()
+                    })
+                    .is_some_and(|runtime| runtime.provides(accounts::CAPABILITY));
+                if !supported {
+                    ui.toasts.add_toast(adw::Toast::builder()
+                        .title("Select an account-sharing runtime for this game using its runtime button, then try again.")
+                        .priority(adw::ToastPriority::High).timeout(15).build());
+                    return;
+                }
+            }
+        }
+        (
+            model.roles.clone(),
+            model
+                .recipe_for(product_id)
+                .and_then(|r| model.wineserver(r)),
+        )
+    };
     warn_about_media(ui, product_id);
     use std::os::unix::process::CommandExt;
 
     let program = cli_binary();
     let mut command = std::process::Command::new(&program);
     command.arg("run").arg(product_id);
+    if let Some(roles) = &roles {
+        command.env(
+            "FERESTRE_ACCOUNT_ROLES",
+            serde_json::to_string(roles).unwrap(),
+        );
+    } else {
+        command.env_remove("FERESTRE_ACCOUNT_ROLES");
+    }
     // Safety: setsid in the child between fork and exec. Async-signal-safe, and
     // the only thing this closure does.
     unsafe {
@@ -1738,7 +2018,11 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
         });
     }
 
-    let child = match command.spawn() {
+    // The reason a launch failed is on the launcher's stderr ("not entitled to
+    // this content", "Player account is signed out"), not in its exit status.
+    // Keep a short tail for the toast and pass every line on as before.
+    command.stderr(std::process::Stdio::piped());
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
             ui.toasts
@@ -1746,10 +2030,35 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
             return;
         }
     };
+    let (tail_sender, tail) = std::sync::mpsc::channel();
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let mut kept = std::collections::VecDeque::with_capacity(64);
+            let mut reader = std::io::BufReader::new(stderr);
+            let mut line = Vec::new();
+            while matches!(reader.read_until(b'\n', &mut line), Ok(n) if n > 0) {
+                let _ = std::io::stderr().write_all(&line);
+                if kept.len() == 64 {
+                    kept.pop_front();
+                }
+                kept.push_back(
+                    String::from_utf8_lossy(&line[..line.len().min(512)])
+                        .trim_end()
+                        .to_string(),
+                );
+                line.clear();
+            }
+            let _ = tail_sender.send(Vec::from(kept));
+        });
+    }
 
     let key = product_id.to_ascii_uppercase();
     // setsid makes the child its own group leader, so the group id is its pid.
     ui.running.borrow_mut().insert(key.clone(), child.id());
+    if let Some(server) = server {
+        ui.running_servers.borrow_mut().insert(key.clone(), server);
+    }
     render(ui);
     ui.toasts
         .add_toast(adw::Toast::new(&format!("Starting {name}")));
@@ -1760,14 +2069,44 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
     let name = name.to_string();
     glib::spawn_future_local(async move {
         let mut child = child;
-        let status = gio::spawn_blocking(move || child.wait()).await;
+        let status = gio::spawn_blocking(move || {
+            let status = child.wait();
+            // The launcher has exited, so its stderr is at EOF unless something
+            // it started kept the pipe. Do not wait on that for long.
+            let reason = tail
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .ok()
+                .and_then(|lines| model::launch_failure(&lines));
+            (status, reason)
+        })
+        .await;
         ui.running.borrow_mut().remove(&key);
+        ui.running_servers.borrow_mut().remove(&key);
         render(&ui);
         match status {
-            Ok(Ok(status)) if status.success() => {}
-            Ok(Ok(status)) => ui
-                .toasts
-                .add_toast(adw::Toast::new(&format!("{name} exited {status}"))),
+            Ok((Ok(status), _)) if status.success() => {}
+            Ok((Ok(status), reason)) => {
+                if reason.as_deref().is_some_and(model::is_licence_refusal) {
+                    ui.model.borrow_mut().refused.insert(key.clone());
+                    render(&ui);
+                }
+                let code = status
+                    .code()
+                    .map_or_else(|| status.to_string(), |c| format!("with code {c}"));
+                ui.toasts.add_toast(
+                    adw::Toast::builder()
+                        .title(match reason {
+                            Some(reason) => format!("{name} stopped: {reason}"),
+                            None => format!("{name} exited {code}"),
+                        })
+                        // The reason is a program's text, not markup: "<DIR>"
+                        // in it made the toast fail to draw at all.
+                        .use_markup(false)
+                        .priority(adw::ToastPriority::High)
+                        .timeout(20)
+                        .build(),
+                )
+            }
             _ => ui
                 .toasts
                 .add_toast(adw::Toast::new(&format!("{name}: could not be waited on"))),
@@ -1799,12 +2138,7 @@ fn stop_title(ui: &Ui, product_id: &str, name: &str) {
     // wineserver detaches, so the title is reparented out of the group this
     // window created and survives it -- measured, with the row saying stopped
     // while Minecraft was still running. `wineserver -k` ends the prefix.
-    let server = {
-        let model = ui.model.borrow();
-        model
-            .recipe_for(product_id)
-            .and_then(|recipe| model.wineserver(recipe))
-    };
+    let server = ui.running_servers.borrow().get(&key).cloned();
     if let Some((server, prefix)) = server {
         if let Ok(child) = std::process::Command::new(server)
             .env("WINEPREFIX", prefix)
@@ -2492,6 +2826,8 @@ fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {
 fn account_pressed(ui: &Ui) {
     if ui.model.borrow().account.is_some() {
         account_menu(ui);
+    } else if ui.model.borrow().roles.is_some() {
+        accounts_ui::open(ui);
     } else {
         sign_in(ui);
     }
@@ -2649,21 +2985,28 @@ fn sign_in(ui: &Ui) {
         return;
     }
     ui.toasts
-        .add_toast(adw::Toast::new("Signing in — the client opens a browser"));
+        .add_toast(adw::Toast::new("Loading sign-in options"));
 
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = gio::spawn_blocking(move || {
+            // A signed-out default profile must be reauthenticated through Add
+            // account, which verifies and reuses its existing save namespace.
+            if accounts::fetch(&client).is_ok() {
+                return Ok(None);
+            }
             account::login_command(&client)
                 .stdin(std::process::Stdio::null())
                 .status()
+                .map(Some)
                 .map_err(|e| format!("{}: {e}", client.display()))
         })
         .await;
         finish(&ui);
         match result {
-            Ok(Ok(status)) if status.success() => refresh_account(&ui),
-            Ok(Ok(status)) => ui
+            Ok(Ok(None)) => accounts_ui::open(&ui),
+            Ok(Ok(Some(status))) if status.success() => refresh_account(&ui),
+            Ok(Ok(Some(status))) => ui
                 .toasts
                 .add_toast(adw::Toast::new(&format!("Sign-in exited {status}"))),
             Ok(Err(e)) => ui.toasts.add_toast(adw::Toast::new(&e)),
@@ -2673,9 +3016,13 @@ fn sign_in(ui: &Ui) {
 }
 
 fn refresh_account(ui: &Ui) {
-    let (client, cache_dir) = {
+    let (client, cache_dir, roles) = {
         let model = ui.model.borrow();
-        (model.xodus_cli(), model.cache_dir().map(Path::to_owned))
+        (
+            model.xodus_cli(),
+            model.account_cache_dir(),
+            model.roles.clone(),
+        )
     };
     let (Some(client), Some(cache_dir)) = (client, cache_dir) else {
         return;
@@ -2695,77 +3042,109 @@ fn refresh_account(ui: &Ui) {
 
     let ui = ui.clone();
     glib::spawn_future_local(async move {
+        let expected = roles.clone();
         let result = gio::spawn_blocking(move || {
-            let Ok(output) = account::command(&client).output() else {
-                return Answer::Unknown;
+            let profiles = if roles.is_some() {
+                accounts::fetch(&client).ok()
+            } else {
+                None
             };
-            if !output.status.success() {
-                return if model::client_reports_signed_out(&String::from_utf8_lossy(&output.stderr))
-                {
-                    Answer::SignedOut
-                } else {
-                    Answer::Unknown
+            let answer = (|| {
+                let mut command = scope_store(account::command(&client), roles.as_ref());
+                let Ok(output) = command.output() else {
+                    return Answer::Unknown;
                 };
-            }
-            let Ok(account) = account::parse(&String::from_utf8_lossy(&output.stdout)) else {
-                return Answer::Unknown;
-            };
-            // Best effort: an account with no picture is still an account.
-            let avatar = account::avatar(&cache_dir, &account, AVATAR_PX).ok();
-            Answer::SignedIn(account, avatar)
+                if !output.status.success() {
+                    return if model::client_reports_signed_out(&String::from_utf8_lossy(
+                        &output.stderr,
+                    )) {
+                        Answer::SignedOut
+                    } else {
+                        Answer::Unknown
+                    };
+                }
+                let Ok(account) = account::parse(&String::from_utf8_lossy(&output.stdout)) else {
+                    return Answer::Unknown;
+                };
+                // Best effort: an account with no picture is still an account.
+                let avatar = account::avatar(&cache_dir, &account, AVATAR_PX).ok();
+                Answer::SignedIn(account, avatar)
+            })();
+            (answer, profiles)
         })
         .await
-        .unwrap_or(Answer::Unknown);
+        .unwrap_or((Answer::Unknown, None));
         finish(&ui);
-        match result {
-            Answer::SignedIn(account, avatar) => {
-                {
-                    let mut model = ui.model.borrow_mut();
+        if ui.model.borrow().roles != expected {
+            return;
+        }
+        let (answer, profiles) = result;
+        {
+            let mut model = ui.model.borrow_mut();
+            if let Some(profiles) = profiles {
+                model.profiles = Some(profiles);
+            }
+            // The selected Store account is listed as signed out, even if the
+            // client could not be asked about it directly.
+            let store_signed_out = model
+                .roles
+                .as_ref()
+                .zip(model.profiles.as_ref())
+                .is_some_and(|(roles, profiles)| {
+                    !profiles
+                        .profiles
+                        .iter()
+                        .any(|p| p.id == roles.store && p.signed_in)
+                });
+            match answer {
+                Answer::SignedIn(account, avatar) => {
                     let changed = model
                         .account
                         .as_ref()
-                        .map_or(true, |previous| !account::same_identity(previous, &account));
+                        .map_or(true, |old| !account::same_identity(old, &account));
                     if changed {
                         model.ownership = Ownership::Unknown;
                         model.subscriptions.clear();
+                        model.refused.clear();
                         model.entitlements_checked = false;
-                        if let Some(paths) = model.paths.as_ref() {
-                            let _ = std::fs::remove_file(library::cache_path(paths.state_dir()));
+                        if let Some(state) = model.private_state_dir() {
+                            let _ = std::fs::remove_file(library::cache_path(&state));
                         }
                     }
-                    if let Some(paths) = model.paths.as_ref() {
-                        let _ = account::save_cache(paths.state_dir(), &account);
+                    if let Some(state) = model.private_state_dir() {
+                        let _ = account::save_cache(&state, &account);
                     }
                     model.account = Some(account);
                     model.avatar = avatar;
                 }
-                render(&ui);
-                refresh_entitlements(&ui, false);
+                // Signed out somewhere else -- `xodus-cli logout` in a terminal,
+                // or a window closed mid sign-out -- while this window still
+                // remembered the account from account.json.
+                Answer::SignedOut => model.forget_account(),
+                Answer::Unknown if store_signed_out => model.forget_account(),
+                Answer::Unknown => {}
             }
-            // Signed out somewhere else -- `xodus-cli logout` in a terminal,
-            // or a window closed mid sign-out -- while this window still
-            // remembered the account from account.json.
-            Answer::SignedOut => {
-                let had_account = {
-                    let mut model = ui.model.borrow_mut();
-                    let had_account = model.account.is_some() || model.ownership.is_known();
-                    model.forget_account();
-                    had_account
-                };
-                if had_account {
-                    render(&ui);
-                }
-            }
-            Answer::Unknown => {}
         }
+        render(&ui);
+        refresh_entitlements(&ui, false);
         refresh_updates(&ui, false);
     });
+}
+
+fn scope_store(
+    mut command: std::process::Command,
+    roles: Option<&accounts::Selection>,
+) -> std::process::Command {
+    if let Some(roles) = roles {
+        roles.apply(&mut command);
+    }
+    command
 }
 
 fn refresh_updates(ui: &Ui, force: bool) {
     let (client, state_dir, records) = {
         let model = ui.model.borrow();
-        let state_dir = model.paths.as_ref().map(|p| p.state_dir().to_path_buf());
+        let state_dir = model.private_state_dir();
         let records = model
             .records
             .values()
@@ -2793,14 +3172,17 @@ fn refresh_updates(ui: &Ui, force: bool) {
         return;
     }
     note_close(ui, REFRESH_CLOSE_NOTE);
+    let roles = ui.model.borrow().roles.clone();
     let ui = ui.clone();
     glib::spawn_future_local(async move {
+        let expected = roles.clone();
         let checked = gio::spawn_blocking(move || {
             let mut available = Vec::new();
             for record in records {
                 let content_id = &record.content_ids[0];
-                let version = std::process::Command::new(&client)
-                    .args(["update", content_id, "--json"])
+                let mut command = std::process::Command::new(&client);
+                command.args(["update", content_id, "--json"]);
+                let version = scope_store(command, roles.as_ref())
                     .stderr(std::process::Stdio::null())
                     .output()
                     .ok()
@@ -2824,6 +3206,9 @@ fn refresh_updates(ui: &Ui, force: bool) {
         })
         .await;
         finish(&ui);
+        if ui.model.borrow().roles != expected {
+            return;
+        }
         if let Ok(available) = checked {
             let mut model = ui.model.borrow_mut();
             for (record, version) in available {
@@ -2849,9 +3234,9 @@ fn refresh_entitlements(ui: &Ui, force: bool) {
     if !force {
         let model = ui.model.borrow();
         if model.entitlements_checked
-            && model.paths.as_ref().is_some_and(|p| {
+            && model.private_state_dir().is_some_and(|p| {
                 ferestre_core::cache::is_fresh(
-                    &library::cache_path(p.state_dir()),
+                    &library::cache_path(&p),
                     ferestre_core::cache::LIBRARY_MAX_AGE,
                 )
             })
@@ -2877,7 +3262,7 @@ fn refresh_entitlements(ui: &Ui, force: bool) {
         let model = ui.model.borrow();
         (
             model.xodus_cli(),
-            model.paths.as_ref().map(|p| p.state_dir().to_path_buf()),
+            model.private_state_dir(),
             model.account.clone(),
         )
     };
@@ -2885,13 +3270,18 @@ fn refresh_entitlements(ui: &Ui, force: bool) {
         return;
     };
     ui.fetching_entitlements.replace(true);
+    let roles = ui.model.borrow().roles.clone();
     let ui = ui.clone();
     glib::spawn_future_local(async move {
+        let expected = roles.clone();
         let result = gio::spawn_blocking(move || {
-            let output = ferestre_core::library::library_command(&client, &Default::default())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .ok()?;
+            let output = scope_store(
+                ferestre_core::library::library_command(&client, &Default::default()),
+                roles.as_ref(),
+            )
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
             if !output.status.success() {
                 return None;
             }
@@ -2902,6 +3292,10 @@ fn refresh_entitlements(ui: &Ui, force: bool) {
         if let Ok(Some(entries)) = result {
             // Ignore a response for an account that signed out or changed
             // while the query was in flight.
+            if ui.model.borrow().roles != expected {
+                refresh_entitlements(&ui, false);
+                return;
+            }
             if ui.model.borrow().account != account {
                 return;
             }
@@ -2948,13 +3342,18 @@ fn refresh_library(ui: &Ui) {
     ui.toasts
         .add_toast(adw::Toast::new("Asking what this account owns"));
 
+    let roles = ui.model.borrow().roles.clone();
     let ui = ui.clone();
     glib::spawn_future_local(async move {
+        let expected = roles.clone();
         let result = gio::spawn_blocking(move || {
-            let output = ferestre_core::library::library_command(&client, &Default::default())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .map_err(|e| format!("{}: {e}", client.display()))?;
+            let output = scope_store(
+                ferestre_core::library::library_command(&client, &Default::default()),
+                roles.as_ref(),
+            )
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("{}: {e}", client.display()))?;
             if !output.status.success() {
                 return Err(format!("{} exited {}", client.display(), output.status));
             }
@@ -2979,19 +3378,16 @@ fn refresh_library(ui: &Ui) {
         .await;
         finish(&ui);
 
+        if ui.model.borrow().roles != expected {
+            return;
+        }
         match result {
             Ok(Ok((entries, products, failures))) => {
                 let owned = entries.iter().filter(|e| e.is_title()).count();
                 {
                     // Written before it is drawn, so the next launch opens on a
                     // library rather than on a button.
-                    if let Some(state_dir) = ui
-                        .model
-                        .borrow()
-                        .paths
-                        .as_ref()
-                        .map(|p| p.state_dir().to_owned())
-                    {
+                    if let Some(state_dir) = ui.model.borrow().private_state_dir() {
                         let _ = ferestre_core::library::save_cache(&state_dir, &entries);
                     }
                     let mut model = ui.model.borrow_mut();
@@ -3066,13 +3462,12 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
                 move || {
                     let listing = gamepass::fetch(&market, &language)?;
                     let tiers = gamepass::fetch_tiers(&market, &language)?;
-                    let ids = gamepass::complete_listing(&listing, &tiers);
-                    Ok::<_, anyhow::Error>((ids, tiers))
+                    Ok::<_, anyhow::Error>((listing, tiers))
                 }
             })
             .await;
             ui.fetching_gamepass.replace(false);
-            let Ok(Ok((ids, tiers))) = fetched else {
+            let Ok(Ok((listing, tiers))) = fetched else {
                 // Silent on purpose when there is already a listing: a failed
                 // refresh of a public list is not worth a toast over the top of
                 // whatever someone is doing.
@@ -3082,12 +3477,16 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
                 }
                 return;
             };
+            // The merchandised list is what is kept: which ids the tier feed
+            // added is worth knowing again on the next start.
             if let Some(dir) = paths {
-                let _ = gamepass::save_cache(&dir, &market, &ids, &tiers);
+                let _ = gamepass::save_cache(&dir, &market, &listing, &tiers);
             }
             {
                 let mut model = ui.model.borrow_mut();
-                model.gamepass = ids;
+                model.gamepass = gamepass::complete_listing(&listing, &tiers);
+                model.gamepass_merchandised =
+                    listing.iter().map(|id| id.to_ascii_uppercase()).collect();
                 model.tiers = tiers;
             }
             if ui.model.borrow().section == Section::GamePass {
@@ -3210,6 +3609,9 @@ mod catalog_regressions {
 
     fn fixture() -> Model {
         Model {
+            roles: None,
+            profiles: None,
+            refused: Default::default(),
             paths: None,
             recipes: Vec::new(),
             runtime: None,
@@ -3227,6 +3629,7 @@ mod catalog_regressions {
             account: None,
             avatar: None,
             gamepass: vec!["9NR1R1XWLCNB".into()],
+            gamepass_merchandised: Default::default(),
             subscriptions: Vec::new(),
             entitlements_checked: false,
             tiers: gamepass::parse_tiers(r#"{"9NR1R1XWLCNB":{"PCSubMetadata":{"Included":true}}}"#)

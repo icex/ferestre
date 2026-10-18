@@ -651,3 +651,11 @@ provided-by = ["patches/xgameruntime/0029-bridge-live-store-catalog.patch", "pat
 symptom-if-missing = "Forza Horizon 6 receives empty marketplace product listings"
 note = "Enable XGR_STORE_CATALOG=1 per title. Catalog data does not grant DLC ownership; purchasing remains unsupported."
 verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "catalog snapshot:" }, { file = "files/lib/wine/x86_64-unix/xgameruntime.so", contains = "CSDX" }]
+
+[[capability]]
+name = "xgameruntime.store-player-accounts"
+summary = "Separate Store entitlement and Xbox player contexts with authenticated account and licence change notifications."
+provided-by = ["patches/xgameruntime/0030-separate-store-and-player-accounts.patch", "patches/xodus-cli/0020-separate-store-and-player-accounts.patch"]
+symptom-if-missing = "A Store owner cannot be selected independently from the Xbox player"
+note = "Requires the matching profile-aware service. Microsoft still decides content access; separate Player prefixes retain independent local saves."
+verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "XGR_ACCOUNT_ROLES_V1" }, { file = "files/lib/wine/x86_64-unix/xgameruntime.so", contains = "Ferestre account roles v1:" }]

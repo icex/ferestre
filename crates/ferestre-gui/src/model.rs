@@ -9,7 +9,7 @@
 //! The rules themselves come from `ferestre-core`, the same code the CLI runs, so
 //! the window and the terminal cannot disagree about what a recipe says.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use ferestre_core::autofix;
@@ -367,15 +367,30 @@ fn package_note(inputs: &Inputs, product: Option<&Product>) -> Option<String> {
 /// Titles already owned outright are dropped: they are in the library, with
 /// their real state, and listing them twice under a heading that implies a
 /// subscription is needed would be worse than not listing them.
+/// `merchandised` is the "All PC Games" list itself. Ids the tier feed adds to
+/// it (see [`gamepass::complete_listing`]) are listed only once the catalog
+/// confirms a PC package -- add-ons are dropped above by their kind -- and
+/// until then stay behind the "cannot install" switch. `None` treats every id
+/// as merchandised.
 pub fn gamepass(
     inputs: &Inputs,
     product_ids: &[String],
+    merchandised: Option<&BTreeSet<String>>,
     tiers: &gamepass::Tiers,
     held: &[&str],
 ) -> Vec<LibraryRow> {
     let mut rows: Vec<LibraryRow> = product_ids
         .iter()
         .filter(|id| inputs.ownership.owns(id) != Some(true))
+        // The tier feed marks add-ons as included as well; an expansion is not
+        // a Game Pass game. Unknown kinds (older cache entries) stay listed.
+        .filter(|id| {
+            inputs
+                .catalog
+                .get(&id.to_ascii_uppercase())
+                .and_then(|p| p.product_kind.as_deref())
+                .map_or(true, |kind| kind.eq_ignore_ascii_case("Game"))
+        })
         .map(|product_id| {
             let key = product_id.to_ascii_uppercase();
             let product = inputs.catalog.get(&key);
@@ -470,8 +485,15 @@ pub fn gamepass(
                 has_recipe: recipe.is_some(),
                 installed,
                 update: None,
-                unsupported: runnable == Some(false),
+                // Not installable from the Store here: no PC package and not a
+                // bundle of one (EA app titles), or a tier-feed addition the
+                // catalog has not confirmed as a game with a PC package.
+                unsupported: runnable == Some(false)
+                    || product.is_some_and(|p| !p.has_pc_package && p.bundled_ids.is_empty())
+                    || (merchandised.is_some_and(|m| !m.contains(&key))
+                        && !product.is_some_and(|p| p.has_pc_package)),
                 outside_tier: covered == Some(false),
+                unavailable: None,
                 install_as: bundle_child(inputs, product)
                     .map(|c| (c.product_id.clone(), c.name.clone())),
                 action,
@@ -566,9 +588,97 @@ pub fn access_source(
         }
     }
     if gamepass_ids.iter().any(|id| related(id)) {
-        return "Game Pass catalogue";
+        return GAME_PASS_CATALOGUE;
     }
-    "Access not checked"
+    ACCESS_NOT_CHECKED
+}
+
+const GAME_PASS_CATALOGUE: &str = "Game Pass catalogue";
+const ACCESS_NOT_CHECKED: &str = "Access not checked";
+
+/// Why the Store account cannot be expected to license a title it reached
+/// through Game Pass. Absence from the collections listing is deliberately not
+/// one of these: that listing is not exhaustive (see
+/// `missing_purchase_entries_do_not_claim_that_access_is_missing`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionGap {
+    /// A Game Pass title, and the account holds no subscription at all.
+    NoSubscription,
+    /// The account subscribes, but no tier it holds includes the title.
+    OutsideTier,
+}
+
+/// Only said once the account's library was read: an unread library holds no
+/// subscriptions, which is not the same as holding none.
+pub fn subscription_gap(
+    product_id: &str,
+    ownership: &Ownership,
+    catalog: &BTreeMap<String, Product>,
+    gamepass_ids: &[String],
+    tiers: &gamepass::Tiers,
+    held: &[&str],
+) -> Option<SubscriptionGap> {
+    if !matches!(ownership, Ownership::Known(_))
+        || access_source(product_id, ownership, catalog, gamepass_ids, tiers, held)
+            != GAME_PASS_CATALOGUE
+    {
+        return None;
+    }
+    if held.is_empty() {
+        return Some(SubscriptionGap::NoSubscription);
+    }
+    std::iter::once(product_id)
+        .chain(gamepass_ids.iter().map(String::as_str))
+        .filter(|id| {
+            id.eq_ignore_ascii_case(product_id)
+                || catalog.get(&id.to_ascii_uppercase()).is_some_and(|p| {
+                    p.bundled_ids
+                        .iter()
+                        .any(|child| child.eq_ignore_ascii_case(product_id))
+                })
+        })
+        .all(|id| tiers.covered(id, held) == Some(false))
+        .then_some(SubscriptionGap::OutsideTier)
+}
+
+/// The licence step's own refusal, as `xodus-cli` reports it.
+pub fn is_licence_refusal(reason: &str) -> bool {
+    reason.starts_with("not entitled to this content")
+}
+
+/// Why `ferestre run` failed, from the tail of what it wrote to stderr. The
+/// launcher's own refusals are `!! message`. A title stopped before it starts
+/// -- at the licence step, for instance -- prints its reason last, before the
+/// launcher's `-- the title exited` summary. Wine, Proton, driver and package
+/// listing chatter is not a reason.
+pub fn launch_failure(lines: &[String]) -> Option<String> {
+    if let Some(refusal) = lines.iter().rev().find_map(|l| l.strip_prefix("!! ")) {
+        return Some(refusal.trim().to_string());
+    }
+    lines
+        .iter()
+        .rev()
+        .map(|line| line.trim())
+        .find(|line| !launch_noise(line))
+        .map(str::to_string)
+}
+
+fn launch_noise(line: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "::", "-- ", "=== ", "WARNING:", "ntsync:", "Proton:", "wine:", "fsync:", "esync:",
+    ];
+    const WINE_DEBUG: &[&str] = &[":trace:", ":fixme:", ":err:", ":warn:"];
+    // The client lists the package files it maps: `Logo.png: 1097007104 46926`.
+    let listing = line.rsplit_once(": ").is_some_and(|(_, sizes)| {
+        let mut sizes = sizes.split(' ');
+        sizes.next().is_some_and(|s| s.parse::<u64>().is_ok())
+            && sizes.next().is_some_and(|s| s.parse::<u64>().is_ok())
+            && sizes.next().is_none()
+    });
+    line.is_empty()
+        || listing
+        || PREFIXES.iter().any(|p| line.starts_with(p))
+        || WINE_DEBUG.iter().any(|d| line.contains(d))
 }
 
 /// One row of the library: something owned, something described, or both.
@@ -601,6 +711,11 @@ pub struct LibraryRow {
     /// says `None` for everything it does not actually know, and a row hidden
     /// on a guess is the same mistake as a row refused on one.
     pub outside_tier: bool,
+    /// Installed, and the selected Store account cannot license it: its launch
+    /// was refused this session, or it is a Game Pass title outside what the
+    /// account subscribes to. Set by the view, which knows the account, to
+    /// the sentence that says so.
+    pub unavailable: Option<String>,
     /// The product to install for this row, when that is not the row itself,
     /// with its name. Only a bundle sets it.
     ///
@@ -752,6 +867,7 @@ fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
         // says the container is.
         unsupported: false,
         outside_tier: false,
+        unavailable: None,
         install_as: None,
         action,
     }
@@ -819,6 +935,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
         update: None,
         unsupported: true,
         outside_tier: false,
+        unavailable: None,
         install_as: None,
         action: Action::Blocked(reason),
     };
@@ -848,6 +965,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
                 update: None,
                 unsupported: false,
                 outside_tier: false,
+                unavailable: None,
                 install_as: Some((child.product_id.clone(), child.name.clone())),
                 action: Action::Install,
             },
@@ -890,6 +1008,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
             update: None,
             unsupported: true,
             outside_tier: false,
+            unavailable: None,
             install_as: None,
             action: Action::Blocked(format!(
                 "this is a {container} package; the runtime here opens MSIXVC packages"
@@ -940,6 +1059,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
         update: None,
         unsupported: false,
         outside_tier: false,
+        unavailable: None,
         install_as: None,
         // Install, unless it is already here -- and then Play, not "set up",
         // whenever the package names its own entry point. That is the common
@@ -1221,6 +1341,7 @@ mod tests {
             wu_category_id: None,
             has_pc_package: true,
             bundled_ids: Vec::new(),
+            product_kind: None,
         }
     }
 
@@ -1550,6 +1671,74 @@ mod tests {
     }
 
     #[test]
+    fn installed_titles_say_when_the_store_account_has_no_access() {
+        let id = "9ZZTESTGAME1";
+        let ids = vec![id.to_string()];
+        let tiers =
+            gamepass::parse_tiers(r#"{"9ZZTESTGAME1":{"PCSubMetadata":{"Included":true}}}"#)
+                .unwrap();
+        let cat = BTreeMap::new();
+        let empty = Ownership::Known(Vec::new());
+        let gap = |ownership, ids: &[String], tiers, held: &[&str]| {
+            subscription_gap(id, ownership, &cat, ids, tiers, held)
+        };
+        assert_eq!(
+            gap(&empty, &ids, &tiers, &[]),
+            Some(SubscriptionGap::NoSubscription)
+        );
+        let console =
+            gamepass::parse_tiers(r#"{"9ZZTESTGAME1":{"ConsoleSubMetadata":{"Included":true}}}"#)
+                .unwrap();
+        assert_eq!(
+            gap(&empty, &ids, &console, &["PC Game Pass"]),
+            Some(SubscriptionGap::OutsideTier)
+        );
+        // Covered, purchased, unread, or merely absent from the listing.
+        assert_eq!(gap(&empty, &ids, &tiers, &["PC Game Pass"]), None);
+        let owned = Ownership::Known(entries(&[id]));
+        assert_eq!(gap(&owned, &ids, &tiers, &[]), None);
+        assert_eq!(gap(&Ownership::Unknown, &ids, &tiers, &[]), None);
+        assert_eq!(gap(&empty, &[], &tiers, &[]), None);
+        // A subscriber whose tier data has not arrived may still be covered.
+        let unknown = gamepass::Tiers::default();
+        assert_eq!(gap(&empty, &ids, &unknown, &["PC Game Pass"]), None);
+        assert!(is_licence_refusal(
+            "not entitled to this content: Users do not possess any satisfying entitlements"
+        ));
+        assert!(!is_licence_refusal("Player account is signed out"));
+    }
+
+    #[test]
+    fn launch_failures_report_the_reason_not_the_chatter() {
+        let lines = |text: &str| text.lines().map(str::to_string).collect::<Vec<_>>();
+        let refused = lines(
+            ":: using the selected Store and Player accounts\n\
+             Logo.png: 1097007104 46926\n\
+             not entitled to this content: Users do not possess any satisfying entitlements for the content id in question.\n\
+             -- the title exited 1; the log is at /games/fixture-launch.log",
+        );
+        assert_eq!(
+            launch_failure(&refused).as_deref(),
+            Some("not entitled to this content: Users do not possess any satisfying entitlements for the content id in question.")
+        );
+        let launcher = lines(
+            ":: using the selected Store and Player accounts\n\
+             !! Player account is signed out or unavailable. Open Accounts and sign in again.\n   caused by",
+        );
+        assert_eq!(
+            launch_failure(&launcher).as_deref(),
+            Some("Player account is signed out or unavailable. Open Accounts and sign in again.")
+        );
+        let chatter = lines(
+            "Proton: Error while copying to \"C:/x.dll\": No such file or directory\n\
+             WARNING: radv is not a conformant Vulkan implementation, testing use only.\n\
+             00e4:err:openxr:get_vulkan_extensions Could not create key, status 0x2.\n\
+             -- the title exited 3; the log is at /games/fixture-launch.log",
+        );
+        assert_eq!(launch_failure(&chatter), None);
+    }
+
+    #[test]
     fn a_probed_runtime_says_its_list_may_be_incomplete() {
         let probed = runtime_with(&["a"], CapabilitySource::Probed);
         let (_, subtitle) = runtime_summary(Some(&probed));
@@ -1779,6 +1968,7 @@ mod tests {
             package_format: None,
             download_bytes: None,
             bundled_ids: vec!["9ZZTESTCHLD".into(), "9ZZTESTOTHR".into()],
+            product_kind: None,
             ..product("9ZZTESTBNDL", "A Bundle", &[])
         };
         let child = product("9ZZTESTCHLD", "The Playable One", &["cid"]);
@@ -1840,6 +2030,7 @@ mod tests {
             package_format: None,
             download_bytes: None,
             bundled_ids: vec!["9ZZTESTCHLD".into()],
+            product_kind: None,
             ..product("9ZZTESTBNDL", "A Bundle", &[])
         };
         let own = Ownership::Known(entries(&["9ZZTESTBNDL"]));
@@ -1910,6 +2101,7 @@ mod tests {
                 game_dir: NO_GAME_DIR,
             },
             &listing,
+            None,
             &gamepass::Tiers::default(),
             &[],
         );
@@ -2052,6 +2244,7 @@ mod tests {
                 "9ZZTESTGAME2".into(),
                 "9ZZTESTGAME3".into(),
             ],
+            None,
             &gamepass::Tiers::default(),
             &[],
         );
@@ -2061,6 +2254,65 @@ mod tests {
         assert_eq!(by_id("9ZZTESTGAME3").badge.unwrap().0, "Untested");
         assert!(by_id("9ZZTESTGAME1").subtitle.contains("a summary"));
         assert_eq!(search(&rows, "game1")[0].badge.unwrap().0, "Playable");
+    }
+
+    /// The count above the Game Pass list is the rows it shows, so the rows
+    /// must be games this launcher can install: an add-on, an EA app title
+    /// and an unconfirmed tier-feed addition are not.
+    #[test]
+    fn the_gamepass_list_holds_installable_games_only() {
+        let mut addon = product("9ZZTESTADDON", "Expansion", &["cid-a"]);
+        addon.product_kind = Some("Durable".into());
+        let mut ea = product("9ZZTESTEAAPP", "EA App Title", &[]);
+        ea.has_packages = false;
+        ea.has_pc_package = false;
+        ea.package_format = None;
+        let mut supplement = product("9ZZTESTSUPPL", "Tier Feed Game", &["cid-s"]);
+        supplement.product_kind = Some("Game".into());
+        let cat = catalog(vec![
+            product("9ZZTESTGAME1", "Listed Game", &["cid-1"]),
+            addon,
+            ea,
+            supplement,
+        ]);
+        let ids: Vec<String> = [
+            "9ZZTESTGAME1",
+            "9ZZTESTADDON",
+            "9ZZTESTEAAPP",
+            "9ZZTESTSUPPL",
+            "9ZZTESTUNSEEN",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let merchandised: BTreeSet<String> = ["9ZZTESTGAME1", "9ZZTESTADDON", "9ZZTESTEAAPP"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut fixture = inputs(&[], None, &Ownership::Unknown, NOTHING_INSTALLED);
+        fixture.catalog = &cat;
+        let rows = gamepass(
+            &fixture,
+            &ids,
+            Some(&merchandised),
+            &gamepass::Tiers::default(),
+            &[],
+        );
+        let listed: Vec<&str> = rows
+            .iter()
+            .filter(|row| !row.known_uninstallable())
+            .map(|row| row.product_id.as_str())
+            .collect();
+        assert_eq!(listed, vec!["9ZZTESTGAME1", "9ZZTESTSUPPL"]);
+        assert!(
+            !rows.iter().any(|row| row.product_id == "9ZZTESTADDON"),
+            "an add-on is not a Game Pass game at all"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.product_id == "9ZZTESTUNSEEN" && row.unsupported),
+            "an unconfirmed addition waits behind the switch, still asked about"
+        );
     }
 
     #[test]
@@ -2096,6 +2348,7 @@ mod tests {
                 game_dir: NO_GAME_DIR,
             },
             &listing,
+            None,
             &tiers,
             &["Game Pass Premium"],
         );
@@ -2404,6 +2657,7 @@ mod tests {
                 update: None,
                 unsupported: false,
                 outside_tier: false,
+                unavailable: None,
                 install_as: None,
                 action: Action::Adopt,
             })

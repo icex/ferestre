@@ -14,6 +14,7 @@
 //! has to stay a child of the process that opened it.
 
 pub mod account;
+pub mod accounts;
 pub mod appx;
 pub mod autofix;
 pub mod cache;

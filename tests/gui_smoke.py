@@ -408,6 +408,78 @@ def row_button(root, title, label):
     return None
 
 
+MENU_PREFIX = "More actions for "
+
+
+def row_menus(root):
+    """Every row's "More actions" toggle, by the title it names.
+
+    The menu button is two nodes with one name: an outer button with no
+    actions and the toggle inside it that opens the popover. Clicking the
+    outer one climbs to the row and activates that instead.
+    """
+    return {
+        (node.get_name() or "")[len(MENU_PREFIX):]: node
+        for node in find_all(root, role="toggle button", name_contains=MENU_PREFIX)
+        if (node.get_name() or "").startswith(MENU_PREFIX)
+    }
+
+
+def open_menu_items(root):
+    return {node.get_name(): node for node in find_all(root, role="button") if node.get_name() in MENU_ITEMS}
+
+
+def toggle_row_menu(app, frame, title, want_open):
+    """Open or close `title`'s row menu and return its items when opening.
+
+    The popover's contents are in the accessible tree only while it is open,
+    so there is no Edit button to find until this has run. The toggle is
+    looked up afresh on every attempt: the list is redrawn whenever names or
+    art arrive, and a node from before that is gone. Older GTK (CI's 4.14)
+    can also swallow the first activation that follows a popover closing;
+    a toggle that did not change is simply clicked again.
+    """
+    for _ in range(6):
+        if bool(open_menu_items(app)) == want_open:
+            return open_menu_items(app)
+        menu = wait_for(frame, lambda root: row_menus(root).get(title), f"{title}'s menu", time.monotonic() + TIMEOUT)
+        try:
+            click(menu)
+        except GLib.GError:
+            continue
+        try:
+            return wait_for(
+                app,
+                lambda root: (open_menu_items(root) if want_open else not open_menu_items(root)) or None,
+                "the row's menu to " + ("open" if want_open else "close"),
+                time.monotonic() + 5,
+            )
+        except Failure:
+            continue
+    raise Failure(f"timed out waiting for {title}'s menu to " + ("open" if want_open else "close"))
+
+
+MENU_ITEMS = {"Open Store page", "Choose runtime", "Add to Steam", "Edit launch settings", "Remove from disk"}
+
+
+def row_menu_offers(app, frame, title):
+    """The items `title`'s row menu offers, leaving it closed."""
+    items = set(toggle_row_menu(app, frame, title, True))
+    toggle_row_menu(app, frame, title, False)
+    return items
+
+
+def row_action(app, frame, item, title=None):
+    """Click `item` in the menu of `title`'s row, or of the first row that has it."""
+    for name in [title] if title else list(row_menus(frame)):
+        items = toggle_row_menu(app, frame, name, True)
+        if item in items:
+            click(items[item])
+            return name
+        toggle_row_menu(app, frame, name, False)
+    raise Failure(f"no row offers {item!r}")
+
+
 def check_game_row_layout(root, title, size, action):
     button = row_button(root, title, action)
     check(button is not None, f"{title} keeps its {action} action", root)
@@ -711,6 +783,9 @@ last-verified = 2026-10-10
     threading.Thread(target=art_server.serve_forever, daemon=True).start()
     art_url = f"http://127.0.0.1:{art_server.server_port}/art.png"
     env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost"
+    # The seeded Game Pass listing is the US one; the market otherwise follows
+    # the locale, which is not this test's to choose.
+    env["FERESTRE_MARKET"] = "US"
     for filename in glob.glob(os.path.join(recipes_dir, "*.toml")):
         with open(filename, "rb") as f:
             title = tomllib.load(f).get("title", {})
@@ -1100,17 +1175,18 @@ print(":: done", flush=True)
             "the Game Pass section",
             time.monotonic() + TIMEOUT,
         )
+        # Counted from the rows below it: the AppxBundle is held back, so two.
         check(
-            any("3 titles are included with PC Game Pass" in t for t in labels),
-            "the section says what the list is and how long it is",
+            any("2 games in PC Game Pass for the US Store" in t for t in labels),
+            "the section says what the list is, where, and how long it is",
             frame,
         )
         # The distinction the whole section rests on: what the catalogue
         # includes is not the same as what this account may install, and saying
         # so is what stops a licence refusal from reading as a bug.
         check(
-            any("No active subscription was found" in t for t in labels),
-            "and says plainly that no subscription was found on this account",
+            any("Sign in to see which of these your Store account can play" in t for t in labels),
+            "and says that nobody signed in means nothing is known about access",
             frame,
         )
         check(
@@ -1214,24 +1290,30 @@ print(":: done", flush=True)
             "the library to come back",
             time.monotonic() + TIMEOUT,
         )
-        edit = find_all(frame, role="button", name_contains="Edit how this title launches")
         # One per recipe, counted from titles/ rather than written down here.
         # This used to assert a literal 3 and went stale the moment a fourth
         # recipe landed -- it then failed on every commit that added a title,
         # which is exactly the commit whose author has least reason to suspect
         # the GUI suite.
+        offered = {name: row_menu_offers(app, frame, name) for name in list(row_menus(frame))}
+        edit = [name for name, items in offered.items() if "Edit launch settings" in items]
+        steam = [name for name, items in offered.items() if "Add to Steam" in items]
         check(
             len(edit) == recipe_count,
-            f"every recipe offers an edit ({len(edit)} buttons for {recipe_count} recipes)",
+            f"every recipe offers an edit ({len(edit)} menus for {recipe_count} recipes)",
             frame,
         )
-        steam = find_all(frame, role="button", name_contains="Add to Steam")
         check(
             len(steam) == recipe_count,
             f"and an Add to Steam ({len(steam)} for {recipe_count} recipes)",
             frame,
         )
-        click(steam[0])
+        check(
+            all("Open Store page" in items for items in offered.values()),
+            "every row's menu links its Store page",
+            frame,
+        )
+        row_action(app, frame, "Add to Steam", steam[0])
         wait_for(frame, lambda root: os.path.isfile(shortcuts),
                  "the saved Steam shortcut", time.monotonic() + TIMEOUT)
         with open(shortcuts, "rb") as f:
@@ -1263,7 +1345,7 @@ print(":: done", flush=True)
             f.write(legacy)
         os.unlink(icon_path)
         previous_mtime = os.stat(shortcuts).st_mtime_ns
-        click(find_all(frame, role="button", name_contains="Add to Steam")[0])
+        row_action(app, frame, "Add to Steam")
         wait_for(frame, lambda root: os.stat(shortcuts).st_mtime_ns != previous_mtime,
                  "the existing Steam shortcut to update", time.monotonic() + TIMEOUT)
         shortcut_bytes = open(shortcuts, "rb").read()
@@ -1273,7 +1355,7 @@ print(":: done", flush=True)
         check(struct.unpack("<I", shortcut_bytes.split(b"\x02appid\0", 1)[1][:4])[0] == stored_id,
               "updating preserves the Steam app id and controller configuration identity", frame)
         check(os.path.isfile(shortcut_string("icon")), "re-adding fills the missing game icon", frame)
-        click(edit[0])
+        row_action(app, frame, "Edit launch settings", edit[0])
         labels = wait_for(
             frame,
             lambda root: texts(root) if any("Executable" in t for t in texts(root)) else None,
@@ -1317,7 +1399,7 @@ print(":: done", flush=True)
             not glob.glob(os.path.join(user_titles, "*.toml")),
             "nothing has been written yet",
         )
-        click(find_all(frame, role="button", name_contains="Edit how this title launches")[0])
+        row_action(app, frame, "Edit launch settings")
         wait_for(
             frame,
             lambda root: any("Executable" in t for t in texts(root)),
@@ -1380,11 +1462,9 @@ print(":: done", flush=True)
               "Installed never confuses purchase-list absence with missing access", frame)
         wait_for(frame, lambda root: not any("Checking for game updates" in t for t in texts(root)),
                  "the automatic update check to finish", time.monotonic() + TIMEOUT)
-        remove = wait_for(
-            frame, lambda root: next(iter(find_all(root, role="button", name="Remove this title from disk")), None),
-            "the installed game's Remove button", time.monotonic() + TIMEOUT,
-        )
-        click(remove)
+        wait_for(frame, lambda root: row_menus(root) or None,
+                 "the installed game's row menu", time.monotonic() + TIMEOUT)
+        row_action(app, frame, "Remove from disk")
         wait_for(frame, lambda root: any("Remove Minecraft for Windows?" in t for t in texts(root)),
                  "the removal confirmation", time.monotonic() + TIMEOUT)
         click_named(frame, "Remove")
