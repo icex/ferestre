@@ -1384,8 +1384,10 @@ const STREAMING_CONTAINER: &str = ".xodus-streaming.msixvc";
 /// in its own folder inside it, named as it would be in the games directory.
 /// Installing straight into the chosen folder mixed the package into
 /// whatever was there, recorded the whole folder as the title, and a later
-/// Remove deleted all of it. The one exception is the title's own folder,
-/// chosen again to repair or update it.
+/// Remove deleted all of it. The exception is the title's own folder: the
+/// one it is installed in, chosen again to repair or update it, or the one it
+/// gets in the games directory, which is what a window that still offers the
+/// title's folder rather than a library passes for a first install.
 fn install_destination(
     paths: &Paths,
     product_id: &str,
@@ -1395,7 +1397,9 @@ fn install_destination(
     let dest = match (chosen, recipe) {
         (Some(chosen), _) => {
             let chosen = absolute_dir(paths, chosen)?;
-            if is_own_install(paths, product_id, &chosen) {
+            if is_own_install(paths, product_id, &chosen)
+                || is_default_folder(paths, product_id, recipe, &chosen)?
+            {
                 chosen
             } else {
                 chosen.join(game_folder(recipe, product_id)?)
@@ -1494,6 +1498,24 @@ fn is_own_install(paths: &Paths, product_id: &str, dir: &Path) -> bool {
     let recorded = install::load(paths.state_dir(), product_id)
         .is_some_and(|record| same_dir(&record.dir, dir));
     recorded || package_store_id(dir).as_deref() == Some(product_id)
+}
+
+/// Whether `dir` is the folder the title gets when no folder is chosen: the
+/// one `ferestre install` with no folder would use, or its place in the
+/// games directory.
+fn is_default_folder(
+    paths: &Paths,
+    product_id: &str,
+    recipe: Option<&Recipe>,
+    dir: &Path,
+) -> Result<bool> {
+    let mut defaults = vec![paths.games_dir().join(game_folder(recipe, product_id)?)];
+    if let Some(dir) = recipe.and_then(|recipe| paths.install_dir(recipe).ok()) {
+        defaults.push(dir);
+    }
+    Ok(defaults
+        .iter()
+        .any(|default| default == dir || same_dir(default, dir)))
 }
 
 fn same_dir(a: &Path, b: &Path) -> bool {
@@ -2160,7 +2182,8 @@ fn install_runtime(
         if let Err(error) = verify(&archive) {
             let _ = std::fs::remove_file(&archive);
             return Err(error.context(format!(
-                "the downloaded runtime {version} was not signed by the Ferestre release key;                  it was deleted, and nothing was installed"
+                "the downloaded runtime {version} was not signed by the Ferestre release key; \
+                 it was deleted, and nothing was installed"
             )));
         }
     }
@@ -2618,15 +2641,15 @@ impl PrefixSession {
 
     /// Ask the title's windows to close. `taskkill` without `/F` posts
     /// WM_CLOSE, which is what the close button does: a game saves or asks.
-    fn request_close(&self) {
+    /// Not waited for here, so the grace period and a second signal both run
+    /// from the moment of the first.
+    fn request_close(&self) -> Option<std::process::Child> {
         if self.executable.is_empty() {
-            return;
+            return None;
         }
         let mut close = self.command(&self.wine);
         close.args(["taskkill", "/IM", &self.executable]);
-        if let Ok(mut child) = close.spawn() {
-            wait_at_most(&mut child, std::time::Duration::from_secs(10));
-        }
+        close.spawn().ok()
     }
 
     /// End every process in the prefix.
@@ -2651,7 +2674,8 @@ struct ForwardState {
     signals: u32,
     last: i32,
     session: Option<Arc<PrefixSession>>,
-    stopper: Option<std::thread::JoinHandle<()>>,
+    /// The thread stopping the session; it returns whether there was one.
+    stopper: Option<std::thread::JoinHandle<bool>>,
 }
 
 impl Shared {
@@ -2678,10 +2702,15 @@ impl Shared {
             // Safety: an unreaped child of ours while the lock is held.
             unsafe { libc::kill(pid, signal) };
         }
-        if state.signals == 1 {
+        // A stop under way takes this signal as the second one, and ends the
+        // prefix at once. Otherwise this one starts a stop: the first, or one
+        // after an earlier stop found no Wine session to end.
+        let stopping = state.stopper.as_ref().is_some_and(|s| !s.is_finished());
+        if !stopping {
             if let Some(session) = state.session.clone() {
                 let shared = Arc::clone(self);
-                state.stopper = Some(std::thread::spawn(move || shared.stop(&session)));
+                let start = state.signals;
+                state.stopper = Some(std::thread::spawn(move || shared.stop(&session, start)));
             }
         }
         drop(state);
@@ -2689,15 +2718,28 @@ impl Shared {
     }
 
     /// Ask the title to close, give it its grace period, then end the prefix.
-    /// Cut short by a second signal.
-    fn stop(&self, session: &PrefixSession) {
-        session.request_close();
+    /// Cut short by any signal after the one numbered `start`.
+    ///
+    /// Nothing is done when the prefix has no Wine session: a signal that came
+    /// before Wine was up, or while Proton was still making the prefix, would
+    /// otherwise start a session of its own there, outside Proton, and then
+    /// wait the whole grace period for it.
+    fn stop(&self, session: &PrefixSession, start: u32) -> bool {
+        if !(session.running)() {
+            return false;
+        }
         let deadline = std::time::Instant::now() + session.grace;
+        let mut close = session.request_close();
         let mut state = self.lock();
-        while state.signals < 2 && (session.running)() {
+        while state.signals <= start && (session.running)() {
             let now = std::time::Instant::now();
             if now >= deadline {
                 break;
+            }
+            if let Some(child) = &mut close {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    close = None;
+                }
             }
             let wait = (deadline - now).min(std::time::Duration::from_millis(200));
             state = self
@@ -2707,9 +2749,14 @@ impl Shared {
                 .0;
         }
         drop(state);
+        if let Some(mut child) = close {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         if (session.running)() {
             session.kill();
         }
+        true
     }
 }
 
@@ -2844,10 +2891,26 @@ impl Forwarding {
         let deadline = std::time::Instant::now() + limit;
         let mut state = self.shared.lock();
         loop {
-            if let Some(stopper) = state.stopper.take() {
-                drop(state);
-                let _ = stopper.join();
-                return;
+            // A stop under way is waited for whatever `limit` says: it is
+            // bounded by its own grace period, and a signal meanwhile has to
+            // find it still there to cut it short.
+            if let Some(stopper) = &state.stopper {
+                if !stopper.is_finished() {
+                    state = self
+                        .shared
+                        .changed
+                        .wait_timeout(state, std::time::Duration::from_millis(100))
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                    continue;
+                }
+                // One that ended a session is the end of the launch; one that
+                // found none leaves the wait for a session to go on.
+                if let Some(stopper) = state.stopper.take() {
+                    if stopper.join().unwrap_or(true) {
+                        return;
+                    }
+                }
             }
             let Some(session) = state.session.clone() else {
                 return;
@@ -6011,6 +6074,18 @@ summary = "Runs."
             install_destination(&paths, GAME, Some(&recipe), Some(&recorded)).unwrap(),
             recorded
         );
+        // The folder the title gets in the games directory, which the window
+        // offers, is its own folder too, not a library to nest it in.
+        let default = home.games().join("testgame/package");
+        assert_eq!(
+            install_destination(&paths, GAME, Some(&recipe), Some(&default)).unwrap(),
+            default
+        );
+        let default = home.games().join("9zznorecipe1");
+        assert_eq!(
+            install_destination(&paths, "9ZZNORECIPE1", None, Some(&default)).unwrap(),
+            default
+        );
         // Another title's package is not overwritten.
         installed_package(&library.join("9zzotherone1"), "9ZZOTHERGAME");
         let error = install_destination(&paths, "9ZZOTHERONE1", None, Some(&library)).unwrap_err();
@@ -6288,6 +6363,28 @@ summary = "Runs."
         assert!(!home.games().join("testgame-proton").exists());
     }
 
+    /// `run` itself takes the title's lock: a launch while an install or
+    /// removal of the title is under way is refused before anything starts.
+    #[test]
+    fn a_title_being_installed_is_not_launched() {
+        let home = Home::new("run-locked");
+        home.recipe("titles", "game.toml", &game_recipe(""));
+        home.runtime("ferestre-11.0.2", Some(&["loader.memfd-main-image"]));
+        let paths = home.paths();
+        let dir = home.games().join("testgame");
+        installed_package(&dir, GAME);
+        // Without the lock, the launch would stop here instead, still before
+        // anything is started.
+        std::fs::write(dir.join(STREAMING_TEMPORARY), b"").unwrap();
+        let prepared =
+            prepare_launch(&cli(), &paths, "testgame", LaunchRequest::default()).unwrap();
+        let change = TitleLock::take(&paths, GAME, LockMode::Change).unwrap();
+        let error = launch_prepared(&paths, prepared, false).expect_err("refused");
+        assert!(error.to_string().contains("being installed"), "{error}");
+        assert!(!home.games().join("testgame-proton").exists());
+        drop(change);
+    }
+
     /// The launch log is named by the recipe's slug, which is data: it goes
     /// through the games directory's containment check, not around it.
     #[test]
@@ -6466,6 +6563,79 @@ summary = "Runs."
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
+    /// A signal before Wine is up, or while Proton is still making the
+    /// prefix, starts nothing in the prefix: `wine taskkill` there would
+    /// start a session of its own. A later signal, once Wine is up, still
+    /// stops it.
+    #[test]
+    fn a_stop_with_no_wine_session_runs_nothing_in_the_prefix() {
+        let wine = FakeWine::new("stop-nothing");
+        wine.running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let forwarding = wine.detached(std::time::Duration::from_millis(100));
+        assert!(!forwarding
+            .shared
+            .stop(&wine.session(std::time::Duration::from_millis(100)), 0));
+        forwarding.shared.deliver(libc::SIGINT);
+        forwarding.finish(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(wine.calls().is_empty(), "{}", wine.calls());
+
+        wine.running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        forwarding.shared.deliver(libc::SIGINT);
+        forwarding.finish(std::time::Duration::from_secs(30));
+        let calls = wine.calls();
+        assert!(calls.contains("wine taskkill /IM Game.exe"), "{calls}");
+        assert!(calls.contains("wineserver -k"), "{calls}");
+    }
+
+    /// A second signal kills at once, even while the request to close is
+    /// itself still running, and the grace period starts with the first.
+    #[test]
+    fn a_second_signal_does_not_wait_for_the_request_to_close() {
+        let wine = FakeWine::new("stop-slow-close");
+        // A `wine taskkill` that takes its time, as it can while the game is
+        // busy.
+        let slow = wine.scratch.root.join("wine");
+        std::fs::write(
+            &slow,
+            "#!/bin/sh\necho \"wine $* $WINEPREFIX\" >> \"$(dirname \"$0\")/calls\"\nexec sleep 30\n",
+        )
+        .unwrap();
+        make_executable(&slow);
+        let forwarding = wine.detached(std::time::Duration::from_secs(60));
+        let started = std::time::Instant::now();
+        forwarding.shared.deliver(libc::SIGTERM);
+        let shared = Arc::clone(&forwarding.shared);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            shared.deliver(libc::SIGTERM);
+        });
+        forwarding.finish(std::time::Duration::from_secs(60));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(wine.calls().contains("wineserver -k"), "{}", wine.calls());
+
+        // With no second signal, the kill comes at the end of the grace
+        // period from the first, not after the request to close returns.
+        let wine2 = FakeWine::new("stop-slow-grace");
+        std::fs::copy(&slow, wine2.scratch.root.join("wine")).unwrap();
+        let forwarding = wine2.detached(std::time::Duration::from_millis(500));
+        let started = std::time::Instant::now();
+        forwarding.shared.deliver(libc::SIGTERM);
+        forwarding.finish(std::time::Duration::from_secs(60));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(wine2.calls().contains("wineserver -k"), "{}", wine2.calls());
+    }
+
     /// The signal still reaches the title, before the session is ended.
     #[test]
     fn a_stopped_launch_still_signals_its_title() {
@@ -6483,6 +6653,8 @@ summary = "Runs."
         let status = forwarding.wait(&mut wine.scratch.children[title]).unwrap();
         assert_eq!(signal_of(&status), Some(libc::SIGTERM));
         forwarding.finish(std::time::Duration::from_secs(5));
+        // No Wine session: nothing was started in the prefix.
+        assert!(wine.calls().is_empty(), "{}", wine.calls());
     }
 
     // -- the runtime download -------------------------------------------------
@@ -6596,7 +6768,10 @@ summary = "Runs."
         std::fs::create_dir_all(&abandoned).unwrap();
 
         let error = run(&cli()).unwrap_err();
-        assert!(format!("{error:#}").contains("not signed"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("release key; it was deleted"),
+            "{error:#}"
+        );
         assert!(!cached.exists(), "a bad download stays in the cache");
         assert!(!runtimes.join(version).exists());
 
