@@ -654,7 +654,9 @@ fn prepare_launch(
     // that exits 1 with an empty log and someone guessing which of eleven
     // patches is missing.
     let runtimes = runtime::all(paths);
-    let requested_runtime = runtime::selected(paths.config_dir(), &recipe.title.product_id);
+    // The title's own choice, else XODUS_PROTON_DIR, which is a choice made
+    // for every title at once.
+    let requested_runtime = runtime::requested(paths, &recipe.title.product_id)?;
     let registry = registry_for(paths);
     let runtime = choose_runtime(
         &inferred.recipe,
@@ -784,7 +786,7 @@ fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Resu
     }
     // A download that stopped partway leaves the client's working container;
     // the tree beside it is part old build, part new, and part missing.
-    if game_dir.join(STREAMING_TEMPORARY).exists() {
+    if install::is_partial(&game_dir) {
         if !force {
             bail!(
                 "{} did not finish downloading at {} -- finish it: ferestre install {} \
@@ -866,26 +868,7 @@ fn choose_runtime<'a>(
     requested: Option<&Path>,
     registry: Option<&Registry>,
 ) -> Result<&'a InstalledRuntime> {
-    if let Some(path) = requested {
-        return runtimes.iter().find(|rt| rt.path == path).ok_or_else(|| {
-            anyhow!(
-                "{}: the runtime chosen for {} is not installed any more; choose another, \
-                 or install one (ferestre install-runtime)",
-                path.display(),
-                recipe.title.name
-            )
-        });
-    }
-    runtimes
-        .iter()
-        .find(|rt| runtime::assess(recipe, rt, registry).is_satisfied())
-        .or_else(|| runtimes.first())
-        .ok_or_else(|| {
-            anyhow!(
-                "no patched Proton runtime is installed; run: ferestre install-runtime \
-                 (or set XODUS_PROTON_DIR)"
-            )
-        })
+    runtime::choose(recipe, runtimes, requested, registry).map(|choice| choice.runtime)
 }
 
 /// The recipe a launch uses once a detected engine's defaults are settled,
@@ -1144,7 +1127,7 @@ fn install_title(
 
 /// Why an update that exited zero did not install anything, if it did not.
 fn unfinished_update(dest: &Path, before: Option<&ContainerState>) -> Option<&'static str> {
-    if dest.join(STREAMING_TEMPORARY).exists() {
+    if install::is_partial(dest) {
         return Some("the client stopped before every file was written");
     }
     if before.is_some() && container_state(dest).as_ref() == before {
@@ -1372,10 +1355,9 @@ fn title_prefixes(base: &Path) -> Vec<PathBuf> {
 // install destinations, removal and per-title locks
 // ---------------------------------------------------------------------------
 
-/// The client's working container. It is created when a download starts and
-/// renamed over [`STREAMING_CONTAINER`] only once every file is written, so
-/// one still there means a download that did not finish.
-const STREAMING_TEMPORARY: &str = ".xodus-streaming-tmp.msixvc";
+/// The client keeps its container here once a download has finished. Until
+/// then it writes [`install::PARTIAL_CONTAINER`] and renames it over this one
+/// only once every file is written ([`install::is_partial`]).
 const STREAMING_CONTAINER: &str = ".xodus-streaming.msixvc";
 
 /// Where `install` puts a title.
@@ -1397,12 +1379,26 @@ fn install_destination(
     let dest = match (chosen, recipe) {
         (Some(chosen), _) => {
             let chosen = absolute_dir(paths, chosen)?;
-            if is_own_install(paths, product_id, &chosen)
-                || is_default_folder(paths, product_id, recipe, &chosen)?
-            {
+            if is_default_folder(paths, product_id, recipe, &chosen)? {
+                // What the window fills in: the title's own folder in the
+                // games directory, not a library to put it in.
                 chosen
             } else {
-                chosen.join(game_folder(recipe, product_id)?)
+                let typed = chosen.to_str().ok_or_else(|| {
+                    usage(&format!(
+                        "{}: the install folder has to be valid UTF-8",
+                        chosen.display()
+                    ))
+                })?;
+                let folder = game_folder(recipe, product_id)?;
+                let folder = folder.to_str().unwrap_or_default();
+                // The library rules: the title gets its own folder inside, a
+                // folder that is already this title's (its record, its
+                // package, or its unfinished first download) is used as it
+                // is, and another title's folder, somebody's own files and
+                // the launcher's own directories are refused.
+                install::resolve_destination(typed, folder, product_id, paths)
+                    .map_err(|e| usage(&format!("{e:#}")))?
             }
         }
         (None, Some(recipe)) => paths.install_dir(recipe)?,
@@ -1490,14 +1486,6 @@ fn absolute_dir(paths: &Paths, typed: &Path) -> Result<PathBuf> {
             typed.display()
         ))
     })
-}
-
-/// Whether `dir` is this title's own install -- recorded there, or holding
-/// its package -- rather than a library to put it in.
-fn is_own_install(paths: &Paths, product_id: &str, dir: &Path) -> bool {
-    let recorded = install::load(paths.state_dir(), product_id)
-        .is_some_and(|record| same_dir(&record.dir, dir));
-    recorded || package_store_id(dir).as_deref() == Some(product_id)
 }
 
 /// Whether `dir` is the folder the title gets when no folder is chosen: the
@@ -1628,6 +1616,9 @@ enum Removable {
 /// Wine prefixes -- that is a games library, not a title.
 fn check_removable(dir: &Path, paths: &Paths, product_id: &str, kind: Removable) -> Result<()> {
     install::safe_to_remove(dir)?;
+    // The core's rules for the directories this command was given, which
+    // `safe_to_remove` can only apply for the ones the environment names.
+    install::check_removable(dir, paths)?;
     if dir
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -1968,17 +1959,20 @@ fn write_detected_recipe(paths: &Paths, product_id: &str, dest: &Path) -> Result
 /// is somebody's -- an edit, or a recipe this build could not read -- and a
 /// guess must not replace it.
 fn save_detected_recipe(paths: &Paths, recipe: &Recipe) -> Result<PathBuf> {
-    let existing = paths.user_titles_dir().join(format!(
-        "{}.toml",
-        recipe.title.product_id.to_ascii_uppercase()
-    ));
-    if existing.exists() {
-        bail!(
+    let dir = paths.user_titles_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    // Only if absent, in one step: no gap between a check and the write.
+    match recipe.save_new_to(&dir)? {
+        Some(path) => Ok(path),
+        None => bail!(
             "{} already exists and was left as it is",
-            existing.display()
-        );
+            dir.join(format!(
+                "{}.toml",
+                recipe.title.product_id.to_ascii_uppercase()
+            ))
+            .display()
+        ),
     }
-    recipe.save_to(&paths.user_titles_dir())
 }
 
 fn detected_recipe(paths: &Paths, product_id: &str, dest: &Path) -> Option<Recipe> {
@@ -2005,6 +1999,9 @@ fn detected_recipe(paths: &Paths, product_id: &str, dest: &Path) -> Option<Recip
     if let Ok(relative) = dest.strip_prefix(paths.games_dir()) {
         recipe.install.dir = Some(relative.to_string_lossy().into_owned());
     }
+    // Written by the launcher, not reviewed: a recipe shipped for the title
+    // later outranks it, and an edit in the window clears the mark.
+    recipe.generated = true;
     detected_requirements(&mut recipe, dest);
     Some(recipe)
 }
@@ -6102,7 +6099,21 @@ summary = "Runs."
         // Another title's package is not overwritten.
         installed_package(&library.join("9zzotherone1"), "9ZZOTHERGAME");
         let error = install_destination(&paths, "9ZZOTHERONE1", None, Some(&library)).unwrap_err();
-        assert!(error.to_string().contains("another title"), "{error}");
+        assert!(error.to_string().contains("9ZZOTHERGAME"), "{error}");
+        // Nor are somebody's own files that happen to be where the title's
+        // folder would go: removing the title would remove them too.
+        std::fs::create_dir_all(library.join("9zznotes0001")).unwrap();
+        std::fs::write(library.join("9zznotes0001/notes.txt"), "mine").unwrap();
+        assert!(install_destination(&paths, "9ZZNOTES0001", None, Some(&library)).is_err());
+        // A first download that was stopped before its package said whose it
+        // is carries on where it is.
+        let partial = library.join("9zzpartial01");
+        std::fs::create_dir_all(&partial).unwrap();
+        std::fs::write(partial.join(install::PARTIAL_CONTAINER), b"").unwrap();
+        assert_eq!(
+            install_destination(&paths, "9ZZPARTIAL01", None, Some(&library)).unwrap(),
+            partial
+        );
     }
 
     /// An update of a title with no recipe goes where it was installed.
@@ -6145,7 +6156,7 @@ summary = "Runs."
         home.client("touch \"$3/.xodus-streaming-tmp.msixvc\"");
         assert_eq!(code(install(&home, None).unwrap()), code(ExitCode::FAILURE));
         assert_eq!(install::load(paths.state_dir(), GAME).unwrap(), before);
-        std::fs::remove_file(dir.join(STREAMING_TEMPORARY)).unwrap();
+        std::fs::remove_file(dir.join(install::PARTIAL_CONTAINER)).unwrap();
 
         // Did nothing at all.
         home.client("exit 0");
@@ -6365,7 +6376,7 @@ summary = "Runs."
         let paths = home.paths();
         let dir = home.games().join("testgame");
         installed_package(&dir, GAME);
-        std::fs::write(dir.join(STREAMING_TEMPORARY), b"").unwrap();
+        std::fs::write(dir.join(install::PARTIAL_CONTAINER), b"").unwrap();
         let prepared =
             prepare_launch(&cli(), &paths, "testgame", LaunchRequest::default()).unwrap();
         let error = launch_prepared(&paths, prepared, false).expect_err("refused");
@@ -6388,7 +6399,7 @@ summary = "Runs."
         installed_package(&dir, GAME);
         // Without the lock, the launch would stop here instead, still before
         // anything is started.
-        std::fs::write(dir.join(STREAMING_TEMPORARY), b"").unwrap();
+        std::fs::write(dir.join(install::PARTIAL_CONTAINER), b"").unwrap();
         let prepared =
             prepare_launch(&cli(), &paths, "testgame", LaunchRequest::default()).unwrap();
         let change = TitleLock::take(&paths, GAME, LockMode::Change).unwrap();
