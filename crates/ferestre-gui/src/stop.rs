@@ -113,6 +113,12 @@ fn image_name(cmdline: &[u8]) -> Option<String> {
     (lower.ends_with(".exe") && !SYSTEM_IMAGES.contains(&lower.as_str())).then(|| name.to_string())
 }
 
+/// What Wine's loader hands one process of its own when it starts it: the
+/// file descriptor of that process's connection to the wineserver, and where
+/// its preloader reserved memory. Copied into another process they point at
+/// nothing, and that process cannot reach the server at all.
+const LOADER_PRIVATE: &[&str] = &["WINESERVERSOCKET", "WINEPRELOADRESERVE", "WINELOADERNOEXEC"];
+
 fn environment(bytes: &[u8]) -> Vec<(OsString, OsString)> {
     bytes
         .split(|b| *b == 0)
@@ -123,6 +129,7 @@ fn environment(bytes: &[u8]) -> Vec<(OsString, OsString)> {
                 OsStr::from_bytes(&pair[at + 1..]).to_os_string(),
             ))
         })
+        .filter(|(key, _)| !LOADER_PRIVATE.iter().any(|private| key == private))
         .collect()
 }
 
@@ -293,7 +300,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let prefix = root.join("games/fh5-proton/pfx");
         std::fs::create_dir_all(&prefix).unwrap();
-        let env = |pfx: &str| format!("HOME=/home/u\0WINEPREFIX={pfx}\0WINEFSYNC=1\0").into_bytes();
+        let env = |pfx: &str| {
+            format!(
+                "HOME=/home/u\0WINEPREFIX={pfx}\0WINEFSYNC=1\0WINESERVERSOCKET=16\0\
+                 WINEPRELOADRESERVE=140000000-140043000\0WINELOADERNOEXEC=1\0"
+            )
+            .into_bytes()
+        };
         let ours = format!("{}/", prefix.display());
         fake_process(
             &root,
@@ -352,6 +365,15 @@ mod tests {
         assert!(found[0]
             .env
             .contains(&(OsString::from("WINEFSYNC"), OsString::from("1"))));
+        // The loader's own per-process variables are not passed on: with the
+        // title's server socket number in it, taskkill could not reach the
+        // server at all.
+        for private in LOADER_PRIVATE {
+            assert!(
+                !found[0].env.iter().any(|(key, _)| key == private),
+                "{private} was copied"
+            );
+        }
 
         let command = close_command(Path::new("/opt/proton/files/bin/wine"), &found).unwrap();
         let args: Vec<_> = command
@@ -387,5 +409,36 @@ mod tests {
             .collect();
         assert_eq!(args, ["taskkill", "/IM", "Game.exe", "/IM", "Helper.exe"]);
         assert!(close_command(Path::new("wine"), &[]).is_none());
+    }
+
+    /// Against a real Wine, opt-in: `FERESTRE_STOP_WINESERVER` names a
+    /// runtime's wineserver and `FERESTRE_STOP_PREFIX` a prefix in which a
+    /// windowed program that closes on WM_CLOSE (notepad) is running.
+    #[test]
+    #[ignore]
+    fn a_running_wine_program_closes_when_asked() {
+        let var = |name: &str| PathBuf::from(std::env::var_os(name).expect(name));
+        let (server, prefix) = (var("FERESTRE_STOP_WINESERVER"), var("FERESTRE_STOP_PREFIX"));
+        // Safety: getuid cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let before = processes_in(Path::new("/proc"), uid, &prefix);
+        assert!(
+            !before.is_empty(),
+            "nothing is running in {}",
+            prefix.display()
+        );
+        assert!(ask_to_close(&server, &prefix), "nothing was asked");
+        let deadline = Instant::now() + CLOSE_WAIT;
+        while !processes_in(Path::new("/proc"), uid, &prefix).is_empty() {
+            let left: Vec<_> = processes_in(Path::new("/proc"), uid, &prefix)
+                .into_iter()
+                .map(|p| (p.pid, p.image))
+                .collect();
+            assert!(
+                Instant::now() < deadline,
+                "still running after being asked: {left:?}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 }
