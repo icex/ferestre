@@ -1,7 +1,7 @@
 diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
 --- a/dlls/ntdll/unix/file.c
 +++ b/dlls/ntdll/unix/file.c
-@@ -5523,13 +5523,49 @@
+@@ -5523,13 +5523,44 @@
          break;
  
      case FileAllocationInformation:
@@ -36,18 +36,13 @@ diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
 +                }
 +                SERVER_END_REQ;
 +            }
-+#if defined(__linux__) && defined(FALLOC_FL_KEEP_SIZE)
-+            else if (info->AllocationSize.QuadPart > st.st_size)
-+            {
-+                /* Reserve the blocks without moving end of file, which is what
-+                 * this class is for. posix_fallocate() is the wrong call here:
-+                 * it extends the file. A filesystem that cannot reserve is not
-+                 * an error -- the allocation size is a hint on Windows too. */
-+                if (fallocate( fd, FALLOC_FL_KEEP_SIZE, 0, (off_t)info->AllocationSize.QuadPart ) == -1)
-+                    WARN( "could not reserve %s bytes: %s\n",
-+                          wine_dbgstr_longlong( info->AllocationSize.QuadPart ), strerror( errno ) );
-+            }
-+#endif
++            /* Growing the allocation is a hint, and is answered with success
++             * and nothing else. Reserving the blocks for real would need
++             * fallocate(FALLOC_FL_KEEP_SIZE), and nothing would ever give
++             * them back: NTFS trims allocation past end of file when the last
++             * handle is closed, Linux filesystems keep it until the file is
++             * truncated or deleted. A downloader that reserves 50 GB and is
++             * cancelled would leave all of it in use and invisible to ls. */
 +            if (needs_close) close( fd );
 +        }
 +        else status = STATUS_INVALID_PARAMETER_3;

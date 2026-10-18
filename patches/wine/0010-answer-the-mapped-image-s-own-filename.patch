@@ -1,7 +1,7 @@
 diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
 --- a/dlls/ntdll/unix/virtual.c
 +++ b/dlls/ntdll/unix/virtual.c
-@@ -6521,6 +6521,63 @@
+@@ -6521,6 +6521,94 @@
      }
      SERVER_END_REQ;
  
@@ -19,45 +19,76 @@ diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
 +     * -- so every other view is reported exactly as it was before.
 +     *
 +     * Sibling of the ProcessImageFileName fallback in unix/process.c. Same
-+     * cause, different question. */
-+    if (process == NtCurrentProcess() && (status || !info->SectionFileName.Length) &&
-+        peb->ProcessParameters && peb->ProcessParameters->ImagePathName.Length)
++     * cause, different question.
++     *
++     * Only the "no name" answers qualify: STATUS_FILE_INVALID is what the
++     * server says for a view whose file has no name, STATUS_INVALID_ADDRESS
++     * for one it has no file for at all. STATUS_BUFFER_OVERFLOW means there
++     * is a name and the caller's buffer is too small for it, which is an
++     * answer about a real file and has to reach the caller unchanged -- the
++     * main image of every process would otherwise be reported from the PEB.
++     *
++     * The PEB and the process parameters it points to are the application's
++     * to write, so the path is copied with a read that cannot fault: a
++     * pointer the title has scribbled over means no fallback, not a crash in
++     * the Unix side of ntdll. */
++    if (process == NtCurrentProcess() &&
++        (status == STATUS_FILE_INVALID || status == STATUS_INVALID_ADDRESS ||
++         (!status && !info->SectionFileName.Length)))
 +    {
 +        /* Declarations first, all of them: Wine builds with
 +         * -Werror=declaration-after-statement whenever it is built from a git
 +         * checkout, so a declaration below a statement compiles here and fails
 +         * for anyone building from a clone. */
 +        static const WCHAR ntprefix[] = { '\\','?','?','\\' };
-+        const UNICODE_STRING *image = &peb->ProcessParameters->ImagePathName;
-+        SIZE_T needed = sizeof(*info) + sizeof(ntprefix) + image->Length + sizeof(WCHAR);
++        RTL_USER_PROCESS_PARAMETERS *params = peb->ProcessParameters;
++        UNICODE_STRING image = { 0 };
++        SIZE_T needed;
 +        void *view_base = NULL;
 +
-+        SERVER_START_REQ( get_image_view_info )
++        if (params && virtual_uninterrupted_read_memory( &params->ImagePathName, &image,
++                                                         sizeof(image) ) != sizeof(image))
++            image.Length = 0;
++        image.Length &= ~1;
++        needed = sizeof(*info) + sizeof(ntprefix) + image.Length + sizeof(WCHAR);
++
++        if (image.Length)
 +        {
-+            req->process = wine_server_obj_handle( process );
-+            req->addr = wine_server_client_ptr( addr );
-+            if (!wine_server_call( req )) view_base = wine_server_get_ptr( reply->base );
++            SERVER_START_REQ( get_image_view_info )
++            {
++                req->process = wine_server_obj_handle( process );
++                req->addr = wine_server_client_ptr( addr );
++                if (!wine_server_call( req )) view_base = wine_server_get_ptr( reply->base );
++            }
++            SERVER_END_REQ;
 +        }
-+        SERVER_END_REQ;
 +
 +        if (view_base && view_base == peb->ImageBaseAddress)
 +        {
-+            if (ret_len) *ret_len = needed;
-+            if (len < needed) status = STATUS_INFO_LENGTH_MISMATCH;
++            if (len < needed)
++            {
++                if (ret_len) *ret_len = needed;
++                status = STATUS_INFO_LENGTH_MISMATCH;
++            }
 +            else
 +            {
 +                WCHAR *buf = (WCHAR *)(info + 1);
 +
-+                memcpy( buf, ntprefix, sizeof(ntprefix) );
-+                memcpy( buf + ARRAY_SIZE(ntprefix), image->Buffer, image->Length );
-+                info->SectionFileName.Buffer = buf;
-+                info->SectionFileName.Length = sizeof(ntprefix) + image->Length;
-+                info->SectionFileName.MaximumLength = info->SectionFileName.Length + sizeof(WCHAR);
-+                buf[info->SectionFileName.Length / sizeof(WCHAR)] = 0;
-+                status = STATUS_SUCCESS;
-+                TRACE( "%p is the main image and has no section name; "
-+                       "answering from the PEB: %s\n",
-+                       addr, debugstr_us(&info->SectionFileName) );
++                if (virtual_uninterrupted_read_memory( image.Buffer, buf + ARRAY_SIZE(ntprefix),
++                                                       image.Length ) == image.Length)
++                {
++                    memcpy( buf, ntprefix, sizeof(ntprefix) );
++                    info->SectionFileName.Buffer = buf;
++                    info->SectionFileName.Length = sizeof(ntprefix) + image.Length;
++                    info->SectionFileName.MaximumLength = info->SectionFileName.Length + sizeof(WCHAR);
++                    buf[info->SectionFileName.Length / sizeof(WCHAR)] = 0;
++                    if (ret_len) *ret_len = needed;
++                    status = STATUS_SUCCESS;
++                    TRACE( "%p is the main image and has no section name; "
++                           "answering from the PEB: %s\n",
++                           addr, debugstr_us(&info->SectionFileName) );
++                }
++                else WARN( "%p: the PEB's image path is not readable; no fallback\n", addr );
 +            }
 +        }
 +    }

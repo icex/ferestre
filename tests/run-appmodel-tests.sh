@@ -49,18 +49,23 @@ say "compiling the test binary"
 mkdir -p "$WORK/pkg"
 cp "$REPO_DIR/tests/fixtures/AppxManifest.xml" "$WORK/pkg/"
 
-# Compute the identity strings the DLL should derive, straight from the fixture.
-read -r EXPECT_FAMILY EXPECT_FULL EXPECT_AUMID < <(python3 - "$WORK/pkg/AppxManifest.xml" <<'PY'
-import hashlib, re, sys
-xml = open(sys.argv[1]).read()
-def attr(a):
-    m = re.search(r'<Identity[^>]*\b%s="([^"]+)"' % a, xml, re.S)
-    return m.group(1) if m else None
-name = attr("Name"); pub = attr("Publisher")
-ver  = attr("Version") or "1.0.0.0"
-arch = attr("ProcessorArchitecture") or "x64"
-appm = re.search(r'<Application[^>]*\bId="([^"]+)"', xml, re.S)
-app = appm.group(1) if appm else "App"
+# Compute the identity strings the DLL should derive, straight from a manifest.
+# An XML parser rather than a pattern: it decodes escapes in attribute values
+# and tells <Application> from <Applications>, the two things a hand-rolled
+# reading gets wrong, so the expectation cannot share the DLL's mistakes.
+expected_identity() {
+    python3 - "$1" <<'PY'
+import hashlib, sys
+import xml.etree.ElementTree as ET
+root = ET.parse(sys.argv[1]).getroot()
+def first(tag):
+    return next((e for e in root.iter() if e.tag.rsplit('}', 1)[-1] == tag), None)
+ident = first("Identity")
+name = ident.get("Name"); pub = ident.get("Publisher")
+ver  = ident.get("Version") or "1.0.0.0"
+arch = ident.get("ProcessorArchitecture") or "x64"
+appel = first("Application")
+app = appel.get("Id") if appel is not None and appel.get("Id") else "App"
 h = hashlib.sha256(pub.encode('utf-16-le')).digest()[:8]
 alpha = "0123456789abcdefghjkmnpqrstvwxyz"
 v = int.from_bytes(h, 'big')
@@ -70,7 +75,8 @@ full = f"{name}_{ver}_{arch}__{pubid}"
 aumid = f"{family}!{app}"
 print(family, full, aumid)
 PY
-)
+}
+read -r EXPECT_FAMILY EXPECT_FULL EXPECT_AUMID < <(expected_identity "$WORK/pkg/AppxManifest.xml")
 say "expected family: $EXPECT_FAMILY"
 say "expected full:   $EXPECT_FULL"
 
@@ -108,9 +114,28 @@ run "$WORK/appmodel_tests.exe" bare | tee "$WORK/bare.txt"
 ba=${PIPESTATUS[0]}
 
 echo
-if grep -q "^PASSED" "$WORK/packaged.txt" && grep -q "^PASSED" "$WORK/bare.txt"; then
+# A manifest whose Publisher is written with XML escapes, under a directory
+# whose DOS path is longer than MAX_PATH: the family name has to come from the
+# decoded publisher, and an overlong WINE_PACKAGE_MANIFEST has to be read, not
+# left in an uninitialised buffer.
+LONG_DIR=$WORK/pkg-long
+for i in 1 2 3 4 5 6 7 8 9; do LONG_DIR=$LONG_DIR/a-directory-name-that-is-long-$i; done
+mkdir -p "$LONG_DIR"
+cp "$REPO_DIR/tests/fixtures/AppxManifest-escaped.xml" "$LONG_DIR/AppxManifest.xml"
+LONG_DOS_DIR="Z:$(echo "$LONG_DIR" | sed 's#/#\\#g')"
+[ ${#LONG_DOS_DIR} -gt 280 ] || fail "the long path is only ${#LONG_DOS_DIR} characters"
+read -r ESC_FAMILY ESC_FULL ESC_AUMID < <(expected_identity "$LONG_DIR/AppxManifest.xml")
+say "running escaped-publisher tests from a ${#LONG_DOS_DIR}-character path (family $ESC_FAMILY)"
+WINE_PACKAGE_MANIFEST="$LONG_DOS_DIR\\AppxManifest.xml" EXPECT_PATH="$LONG_DOS_DIR" \
+EXPECT_FAMILY="$ESC_FAMILY" EXPECT_FULL="$ESC_FULL" EXPECT_AUMID="$ESC_AUMID" \
+    run "$WORK/appmodel_tests.exe" packaged-other | tee "$WORK/escaped.txt"
+es=${PIPESTATUS[0]}
+
+echo
+if grep -q "^PASSED" "$WORK/packaged.txt" && grep -q "^PASSED" "$WORK/bare.txt" &&
+   grep -q "^PASSED" "$WORK/escaped.txt"; then
     printf '\033[32m==> ALL APPMODEL TESTS PASSED\033[0m\n'
     exit 0
 fi
-printf '\033[31m==> APPMODEL TESTS FAILED (packaged rc=%s bare rc=%s)\033[0m\n' "$pk" "$ba"
+printf '\033[31m==> APPMODEL TESTS FAILED (packaged rc=%s bare rc=%s escaped rc=%s)\033[0m\n' "$pk" "$ba" "$es"
 exit 1
