@@ -1663,37 +1663,129 @@ static void test_queue_termination(void)
     CloseHandle( x1_release );
 }
 
+/* A provider that answers Cancel the way libHttpClient's HTTP provider does:
+ * it starts winding its own work down and completes the operation later, from
+ * that work, reading the context its Cleanup frees. */
+static volatile LONG x1_cleaned_at_completion;
+static XAsyncBlock x1_async_cancel_block;
+
+static DWORD WINAPI x1_finish_cancel_later( void *arg )
+{
+    Sleep( 200 );
+    InterlockedExchange( (LONG *)&x1_cleaned_at_completion, x1_cleanups );
+    IXThreadingImpl_XAsyncComplete( threading, &x1_async_cancel_block, E_ABORT, 0 );
+    return 0;
+}
+
+static HRESULT CALLBACK x1_cancels_asynchronously( XAsyncOp op, const XAsyncProviderData *data )
+{
+    if (op == XAsyncOp_Cancel)
+    {
+        HANDLE thread;
+
+        InterlockedIncrement( (LONG *)&x1_cancels );
+        if ((thread = CreateThread( NULL, 0, x1_finish_cancel_later, NULL, 0, NULL ))) CloseHandle( thread );
+    }
+    if (op == XAsyncOp_Cleanup) InterlockedIncrement( (LONG *)&x1_cleanups );
+    return op == XAsyncOp_Begin ? E_PENDING : S_OK;
+}
+
+/* Completes with a payload from inside Cancel, then keeps using its context
+ * until it is let go. */
+static HANDLE x1_in_cancel, x1_cancel_release;
+static volatile LONG x1_cleaned_at_cancel_return;
+
+static HRESULT CALLBACK x1_completes_inside_cancel( XAsyncOp op, const XAsyncProviderData *data )
+{
+    switch (op)
+    {
+    case XAsyncOp_Begin:
+        return E_PENDING;
+    case XAsyncOp_Cancel:
+        InterlockedIncrement( (LONG *)&x1_cancels );
+        IXThreadingImpl_XAsyncComplete( threading, data->async, S_OK, sizeof(UINT32) );
+        SetEvent( x1_in_cancel );
+        WaitForSingleObject( x1_cancel_release, 5000 );
+        InterlockedExchange( (LONG *)&x1_cleaned_at_cancel_return, x1_cleanups );
+        return S_OK;
+    case XAsyncOp_GetResult:
+        *(UINT32 *)data->buffer = 9;
+        return S_OK;
+    case XAsyncOp_Cleanup:
+        InterlockedIncrement( (LONG *)&x1_cleanups );
+        return S_OK;
+    default:
+        return S_OK;
+    }
+}
+
+static DWORD WINAPI x1_cancel_thread( void *arg )
+{
+    IXThreadingImpl_XAsyncCancel( threading, arg );
+    return 0;
+}
+
+static void x1_reset_cancel_counts(void)
+{
+    InterlockedExchange( (LONG *)&x1_cancels, 0 );
+    InterlockedExchange( (LONG *)&x1_cleanups, 0 );
+    InterlockedExchange( (LONG *)&x1_completions, 0 );
+    InterlockedExchange( (LONG *)&x1_completion_status, 0 );
+}
+
 static void test_async_cancel(void)
 {
     static XAsyncBlock block, run_block;
+    UINT32 value = 0;
+    HANDLE thread;
     HRESULT hr;
 
     printf( "# XAsyncCancel\n" );
 
-    /* A provider that never finishes on its own still completes, with
-     * E_ABORT, once cancelled. */
-    InterlockedExchange( (LONG *)&x1_cancels, 0 );
-    InterlockedExchange( (LONG *)&x1_cleanups, 0 );
-    InterlockedExchange( (LONG *)&x1_completions, 0 );
+    /* Cancel reaches the provider, and that is all: the operation stays the
+     * provider's to finish, as in the GDK's AsyncLib. */
+    x1_reset_cancel_counts();
     memset( &block, 0, sizeof(block) );
     block.callback = x1_completion_record;
     IXThreadingImpl_XAsyncBegin( threading, &block, NULL, x1_pending_provider, "x1-cancel", x1_pending_provider );
     IXThreadingImpl_XAsyncCancel( threading, &block );
     CHECK( x1_cancels == 1, "the provider is asked to cancel (%ld)", x1_cancels );
+    Sleep( 100 );
     hr = IXThreadingImpl_XAsyncGetStatus( threading, &block, FALSE );
-    CHECK( hr == E_ABORT, "a cancelled operation completes with E_ABORT (0x%08lx)", hr );
+    CHECK( hr == E_PENDING && !x1_completions && !x1_cleanups,
+           "cancelling does not complete the operation for the provider (0x%08lx, completions %ld, cleanups %ld)",
+           hr, x1_completions, x1_cleanups );
+    IXThreadingImpl_XAsyncComplete( threading, &block, E_ABORT, 0 );
     x1_wait_for( &x1_cleanups, 1, 2000 );
-    CHECK( x1_completions == 1 && x1_completion_status == E_ABORT,
-           "its completion callback runs once with E_ABORT (%ld, 0x%08lx)", x1_completions, x1_completion_status );
-    CHECK( x1_cleanups == 1, "the cancelled provider is cleaned up once (%ld)", x1_cleanups );
+    hr = IXThreadingImpl_XAsyncGetStatus( threading, &block, FALSE );
+    CHECK( hr == E_ABORT && x1_completions == 1 && x1_completion_status == E_ABORT && x1_cleanups == 1,
+           "the provider's own E_ABORT completes it once and cleans it up once (0x%08lx, %ld, %ld)",
+           hr, x1_completions, x1_cleanups );
     IXThreadingImpl_XAsyncCancel( threading, &block );
     CHECK( x1_cancels == 1 && x1_completions == 1, "cancelling a finished operation does nothing" );
 
-    /* A provider that completes the operation itself when cancelled is not
+    /* A provider that finishes cancelling on its own thread is not cleaned up
+     * underneath that thread. */
+    x1_reset_cancel_counts();
+    InterlockedExchange( (LONG *)&x1_cleaned_at_completion, -1 );
+    memset( &x1_async_cancel_block, 0, sizeof(x1_async_cancel_block) );
+    x1_async_cancel_block.callback = x1_completion_record;
+    IXThreadingImpl_XAsyncBegin( threading, &x1_async_cancel_block, NULL, x1_cancels_asynchronously,
+                                 "x1-async-cancel", x1_cancels_asynchronously );
+    IXThreadingImpl_XAsyncCancel( threading, &x1_async_cancel_block );
+    hr = IXThreadingImpl_XAsyncGetStatus( threading, &x1_async_cancel_block, FALSE );
+    CHECK( hr == E_PENDING, "the operation is still running once Cancel returns (0x%08lx)", hr );
+    x1_wait_for( &x1_cleanups, 1, 3000 );
+    CHECK( x1_cleaned_at_completion == 0,
+           "Cleanup does not run before the provider completes its cancelled operation (cleaned=%ld at completion)",
+           x1_cleaned_at_completion );
+    hr = IXThreadingImpl_XAsyncGetStatus( threading, &x1_async_cancel_block, TRUE );
+    CHECK( hr == E_ABORT && x1_completions == 1 && x1_cleanups == 1,
+           "its E_ABORT is the only completion (0x%08lx, %ld, %ld)", hr, x1_completions, x1_cleanups );
+
+    /* A provider that completes the operation itself inside Cancel is not
      * completed a second time. */
-    InterlockedExchange( (LONG *)&x1_cancels, 0 );
-    InterlockedExchange( (LONG *)&x1_cleanups, 0 );
-    InterlockedExchange( (LONG *)&x1_completions, 0 );
+    x1_reset_cancel_counts();
     memset( &block, 0, sizeof(block) );
     block.callback = x1_completion_record;
     IXThreadingImpl_XAsyncBegin( threading, &block, NULL, x1_completes_on_cancel, "x1-self-cancel", x1_completes_on_cancel );
@@ -1704,8 +1796,29 @@ static void test_async_cancel(void)
     CHECK( hr == E_ABORT && x1_cancels == 1 && x1_completions == 1 && x1_cleanups == 1,
            "a provider's own E_ABORT is the only completion (0x%08lx, %ld, %ld)", hr, x1_completions, x1_cleanups );
 
-    /* XAsyncRun: cancelling while the work function runs ends the operation
-     * now; the work's own result afterwards is ignored. */
+    /* A result taken while the provider is still inside Cancel: Cleanup waits
+     * for Cancel to return. */
+    x1_reset_cancel_counts();
+    InterlockedExchange( (LONG *)&x1_cleaned_at_cancel_return, -1 );
+    x1_in_cancel = CreateEventW( NULL, FALSE, FALSE, NULL );
+    x1_cancel_release = CreateEventW( NULL, TRUE, FALSE, NULL );
+    memset( &block, 0, sizeof(block) );
+    IXThreadingImpl_XAsyncBegin( threading, &block, NULL, x1_completes_inside_cancel, "x1-result-in-cancel",
+                                 x1_completes_inside_cancel );
+    thread = CreateThread( NULL, 0, x1_cancel_thread, &block, 0, NULL );
+    CHECK( WaitForSingleObject( x1_in_cancel, 2000 ) == WAIT_OBJECT_0, "the provider is inside Cancel" );
+    hr = IXThreadingImpl_XAsyncGetResult( threading, &block, x1_completes_inside_cancel, sizeof(value), &value, NULL );
+    CHECK( hr == S_OK && value == 9, "the result can be taken meanwhile (0x%08lx, %u)", hr, value );
+    CHECK( !x1_cleanups, "but the provider is not cleaned up while its Cancel runs (%ld)", x1_cleanups );
+    SetEvent( x1_cancel_release );
+    WaitForSingleObject( thread, 5000 );
+    CloseHandle( thread );
+    CHECK( x1_cleaned_at_cancel_return == 0 && x1_cleanups == 1,
+           "it is cleaned up once, after Cancel returns (%ld at return, %ld)", x1_cleaned_at_cancel_return, x1_cleanups );
+    CloseHandle( x1_in_cancel );
+    CloseHandle( x1_cancel_release );
+
+    /* XAsyncRun has no provider to cancel: the work function finishes it. */
     InterlockedExchange( (LONG *)&x1_dowork, 0 );
     memset( &run_block, 0, sizeof(run_block) );
     hr = IXThreadingImpl_XAsyncRun( threading, &run_block, x1_slow_run );
@@ -1713,11 +1826,105 @@ static void test_async_cancel(void)
     Sleep( 50 );
     IXThreadingImpl_XAsyncCancel( threading, &run_block );
     hr = IXThreadingImpl_XAsyncGetStatus( threading, &run_block, FALSE );
-    CHECK( hr == E_ABORT, "a cancelled XAsyncRun reports E_ABORT at once (0x%08lx)", hr );
-    x1_wait_for( &x1_dowork, 1, 2000 );
+    CHECK( hr == E_PENDING, "a cancelled XAsyncRun keeps running (0x%08lx)", hr );
+    hr = IXThreadingImpl_XAsyncGetStatus( threading, &run_block, TRUE );
+    CHECK( hr == S_OK && x1_dowork == 1, "and reports its work function's result (0x%08lx, %ld)", hr, x1_dowork );
+}
+
+/* Termination with wait on an XSAPI-shaped queue: thread-pool work, Manual
+ * completions, pumped by the thread that terminates it. */
+static HANDLE x1_work_started;
+
+static HRESULT CALLBACK x1_slow_dowork( XAsyncOp op, const XAsyncProviderData *data )
+{
+    if (op == XAsyncOp_Begin) return IXThreadingImpl_XAsyncSchedule( threading, data->async, 0 );
+    if (op == XAsyncOp_DoWork)
+    {
+        SetEvent( x1_work_started );
+        Sleep( 300 );
+        IXThreadingImpl_XAsyncComplete( threading, data->async, S_OK, 0 );
+    }
+    return S_OK;
+}
+
+static DWORD WINAPI x1_terminate_waiting( void *arg )
+{
+    return IXThreadingImpl_XTaskQueueTerminate( threading, arg, TRUE, NULL, x1_terminated );
+}
+
+static void test_terminate_manual_completions(void)
+{
+    static XAsyncBlock block;
+    XTaskQueueHandle queue;
+    HANDLE thread;
+    DWORD wait;
+    HRESULT hr;
+
+    printf( "# XTaskQueueTerminate(wait) delivers completions parked while it waits\n" );
+    x1_reset_cancel_counts();
+    x1_reset();
+    x1_work_started = CreateEventW( NULL, TRUE, FALSE, NULL );
+    hr = IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_ThreadPool,
+                                           XTaskQueueDispatchMode_Manual, &queue );
+    CHECK( hr == S_OK, "create a queue with Manual completions (0x%08lx)", hr );
+    /* The title has shown it pumps the queue, so completions are parked. */
+    IXThreadingImpl_XTaskQueueDispatch( threading, queue, XTaskQueuePort_Completion, 0 );
+    memset( &block, 0, sizeof(block) );
+    block.queue = queue;
+    block.callback = x1_completion_record;
+    IXThreadingImpl_XAsyncBegin( threading, &block, NULL, x1_slow_dowork, "x1-manual-terminate", x1_slow_dowork );
+    CHECK( WaitForSingleObject( x1_work_started, 2000 ) == WAIT_OBJECT_0, "DoWork starts" );
+    thread = CreateThread( NULL, 0, x1_terminate_waiting, queue, 0, NULL );
+    wait = WaitForSingleObject( thread, 5000 );
+    CHECK( wait == WAIT_OBJECT_0, "terminate with wait returns once DoWork has completed (wait %lu)", wait );
+    CHECK( x1_completions == 1 && x1_completion_status == S_OK && x1_term_runs == 1,
+           "the parked completion is delivered before the terminated callback (%ld, 0x%08lx, terminated %ld)",
+           x1_completions, x1_completion_status, x1_term_runs );
+    if (wait == WAIT_OBJECT_0)
+    {
+        CloseHandle( thread );
+        IXThreadingImpl_XTaskQueueCloseHandle( threading, queue );
+    }
+    CloseHandle( x1_work_started );
+}
+
+/* XAsyncRun refused by a terminated queue leaves the block saying so. */
+static XAsyncBlock x1_refused_block;
+
+static DWORD WINAPI x1_wait_on_refused( void *arg )
+{
+    return IXThreadingImpl_XAsyncGetStatus( threading, &x1_refused_block, TRUE );
+}
+
+static void test_refused_run_status(void)
+{
+    XTaskQueueHandle queue;
+    HANDLE thread;
+    DWORD wait, code = 0;
+    HRESULT hr;
+
+    printf( "# A refused XAsyncRun does not leave XAsyncGetStatus(wait) waiting\n" );
+    IXThreadingImpl_XTaskQueueCreate( threading, XTaskQueueDispatchMode_ThreadPool,
+                                      XTaskQueueDispatchMode_ThreadPool, &queue );
+    IXThreadingImpl_XTaskQueueTerminate( threading, queue, TRUE, NULL, NULL );
+    memset( &x1_refused_block, 0, sizeof(x1_refused_block) );
+    x1_refused_block.queue = queue;
+    x1_refused_block.callback = x1_wrong_callback;
+    InterlockedExchange( (LONG *)&x1_bad_callback, 0 );
+    hr = IXThreadingImpl_XAsyncRun( threading, &x1_refused_block, x1_slow_run );
+    CHECK( hr == E_ABORT, "XAsyncRun on a terminated queue fails (0x%08lx)", hr );
+    thread = CreateThread( NULL, 0, x1_wait_on_refused, NULL, 0, NULL );
+    wait = WaitForSingleObject( thread, 3000 );
+    if (wait == WAIT_OBJECT_0) GetExitCodeThread( thread, &code );
+    CHECK( wait == WAIT_OBJECT_0 && code == (DWORD)E_ABORT,
+           "XAsyncGetStatus(wait) on its block returns the refusal (wait %lu, 0x%08lx)", wait, code );
     Sleep( 50 );
-    hr = IXThreadingImpl_XAsyncGetStatus( threading, &run_block, FALSE );
-    CHECK( hr == E_ABORT, "the work's later success does not overwrite the cancellation (0x%08lx)", hr );
+    CHECK( !x1_bad_callback, "and no completion callback follows a refused call (%ld)", x1_bad_callback );
+    if (wait == WAIT_OBJECT_0)
+    {
+        CloseHandle( thread );
+        IXThreadingImpl_XTaskQueueCloseHandle( threading, queue );
+    }
 }
 
 static void test_async_work_identity(void)
@@ -1748,7 +1955,9 @@ static void test_async_work_identity(void)
     IXThreadingImpl_XAsyncBegin( threading, &block, NULL, x1_pending_provider, "x1-reuser", x1_pending_provider );
     Sleep( 400 );
     CHECK( !x1_dowork, "a stale DoWork does not reach the next operation on the block (%ld)", x1_dowork );
+    /* Cancel only asks; the provider finishes the operation itself. */
     IXThreadingImpl_XAsyncCancel( threading, &block );
+    IXThreadingImpl_XAsyncComplete( threading, &block, E_ABORT, 0 );
 }
 
 static void test_async_route_snapshot(void)
@@ -2272,6 +2481,8 @@ int main(int argc, char **argv)
     test_xthreading();
     test_queue_termination();
     test_async_cancel();
+    test_terminate_manual_completions();
+    test_refused_run_status();
     test_async_work_identity();
     test_async_route_snapshot();
     test_threadpool_dispatch();

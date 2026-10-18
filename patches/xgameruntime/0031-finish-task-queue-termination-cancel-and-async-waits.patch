@@ -2,7 +2,7 @@ From: Ferestre contributors
 Subject: Finish queue termination, cancellation and waits on what is still owed
 
 diff --git a/xthreading.c b/xthreading.c
-index ef7abf2..9050445 100644
+index ef7abf2..5a52da0 100644
 --- a/xthreading.c
 +++ b/xthreading.c
 @@ -72,12 +72,72 @@ static ULONG WINAPI x_threading_Release( IXThreadingImpl *iface )
@@ -318,7 +318,7 @@ index ef7abf2..9050445 100644
  
      if (!(thread = CreateThread( NULL, 0, offpool_thread, w, 0, NULL )))
      {
-@@ -463,63 +535,15 @@ static HRESULT run_off_pool( PTP_SIMPLE_CALLBACK callback, void *context, UINT32
+@@ -463,63 +535,17 @@ static HRESULT run_off_pool( PTP_SIMPLE_CALLBACK callback, void *context, UINT32
      return S_OK;
  }
  
@@ -377,8 +377,6 @@ index ef7abf2..9050445 100644
 -    async_op_do_work( op );
 -    release_async_op( op );
 -}
--
--static void CALLBACK manual_async_work( void *context, BOOLEAN canceled )
 +/* One pass of provider work, scheduled by XAsyncSchedule or XAsyncRun.
 + *
 + * The work item carries the operation itself, with a reference taken when it
@@ -387,17 +385,33 @@ index ef7abf2..9050445 100644
 + * completed, which DoWork could start over, or a later operation reusing the
 + * block, which received DoWork before it had scheduled any. Work for an
 + * operation that is no longer the block's live one is simply dropped. */
++static void cancel_async_op( struct x_async_op *op );
+ 
+-static void CALLBACK manual_async_work( void *context, BOOLEAN canceled )
 +static void CALLBACK async_work_callback( void *context, BOOLEAN canceled )
  {
      struct x_async_op *op = context;
      BOOL active;
-@@ -529,31 +553,37 @@ static void CALLBACK manual_async_work( void *context, BOOLEAN canceled )
+@@ -529,31 +555,50 @@ static void CALLBACK manual_async_work( void *context, BOOLEAN canceled )
      LeaveCriticalSection( &async_ops_cs );
      if (active)
      {
 -        if (canceled) x_threading_XAsyncComplete_helper( op->async, E_ABORT, 0 );
-+        /* Its queue was terminated before the work ran. */
-+        if (canceled) complete_op_without_result( op, E_ABORT );
++        /* Its queue was terminated before the work ran, so no more work will
++         * be scheduled for it. Tell the provider, as XAsyncCancel would, and
++         * if that did not finish the operation, finish it here: nothing else
++         * will. This is the one place the runtime itself completes an
++         * operation with E_ABORT. */
++        if (canceled)
++        {
++            BOOL done;
++
++            cancel_async_op( op );
++            EnterCriticalSection( &async_ops_cs );
++            done = op->completed;
++            LeaveCriticalSection( &async_ops_cs );
++            if (!done) complete_op_without_result( op, E_ABORT );
++        }
          else async_op_do_work( op );
      }
 +    else TRACE( "dropping work for operation %p, which is no longer running.\n", op );
@@ -441,19 +455,19 @@ index ef7abf2..9050445 100644
  
      TRACE( "iface %p, asyncBlock %p, work %p.\n", iface, asyncBlock, work );
  
-@@ -561,7 +591,10 @@ static HRESULT WINAPI x_threading_XAsyncRun( IXThreadingImpl *iface, XAsyncBlock
+@@ -561,7 +606,10 @@ static HRESULT WINAPI x_threading_XAsyncRun( IXThreadingImpl *iface, XAsyncBlock
      if (!(op = calloc( 1, sizeof(*op) ))) return E_OUTOFMEMORY;
      op->async = asyncBlock;
      op->work = work;
 -    op->ref = 1;
-+    /* The list's reference, and this frame's: once listed, the operation can
-+     * be cancelled -- completed and freed -- by another thread. */
++    /* The list's reference, and this frame's: once scheduled, the work can
++     * complete the operation -- and free it -- on another thread. */
 +    op->ref = 2;
 +    capture_completion_route( asyncBlock, &op->route );
      memset( asyncBlock->internal, 0, sizeof(asyncBlock->internal) );
  
      EnterCriticalSection( &async_ops_cs );
-@@ -569,7 +602,23 @@ static HRESULT WINAPI x_threading_XAsyncRun( IXThreadingImpl *iface, XAsyncBlock
+@@ -569,7 +617,30 @@ static HRESULT WINAPI x_threading_XAsyncRun( IXThreadingImpl *iface, XAsyncBlock
      LeaveCriticalSection( &async_ops_cs );
      TRACE( "operation %p registered for block %p (run).\n", op, asyncBlock );
  
@@ -461,7 +475,10 @@ index ef7abf2..9050445 100644
 +    if (FAILED(hr = schedule_async_work( op, 0 )))
 +    {
 +        /* The caller hears about this failure from the call itself, so the
-+         * operation must not stay listed against its block. */
++         * operation must not stay listed against its block, and no callback
++         * follows. The block records the failure, as the GDK's does when it
++         * refuses a call: XAsyncGetStatus on it, even with wait, returns the
++         * failure rather than waiting for an operation that does not exist. */
 +        BOOL withdraw;
 +
 +        EnterCriticalSection( &async_ops_cs );
@@ -471,14 +488,18 @@ index ef7abf2..9050445 100644
 +            list_remove( &op->entry );
 +        }
 +        LeaveCriticalSection( &async_ops_cs );
-+        if (withdraw) release_async_op( op );
++        if (withdraw)
++        {
++            store_async_result( asyncBlock, hr, NULL, 0 );
++            release_async_op( op );
++        }
 +    }
 +    release_async_op( op );
 +    return hr;
  }
  
  static HRESULT WINAPI x_threading_XAsyncBegin( IXThreadingImpl *iface, XAsyncBlock *asyncBlock, void *context, const void *identity, const char *identityName, XAsyncProvider *provider )
-@@ -593,6 +642,7 @@ static HRESULT WINAPI x_threading_XAsyncBegin( IXThreadingImpl *iface, XAsyncBlo
+@@ -593,6 +664,7 @@ static HRESULT WINAPI x_threading_XAsyncBegin( IXThreadingImpl *iface, XAsyncBlo
      op->ref = 2;
  
      op->begin_running = TRUE;
@@ -486,7 +507,7 @@ index ef7abf2..9050445 100644
      memset( asyncBlock->internal, 0, sizeof(asyncBlock->internal) );
  
      EnterCriticalSection( &async_ops_cs );
-@@ -625,7 +675,7 @@ static HRESULT WINAPI x_threading_XAsyncBegin( IXThreadingImpl *iface, XAsyncBlo
+@@ -625,7 +697,7 @@ static HRESULT WINAPI x_threading_XAsyncBegin( IXThreadingImpl *iface, XAsyncBlo
      if (deliver)
      {
          TRACE( "delivering the held completion for block %p.\n", asyncBlock );
@@ -495,7 +516,7 @@ index ef7abf2..9050445 100644
      }
      release_async_op( op );
      return S_OK;
-@@ -640,15 +690,16 @@ static HRESULT WINAPI __PADDING__( IXThreadingImpl *iface )
+@@ -640,15 +712,16 @@ static HRESULT WINAPI __PADDING__( IXThreadingImpl *iface )
  static HRESULT WINAPI x_threading_XAsyncSchedule( IXThreadingImpl *iface, XAsyncBlock *asyncBlock, UINT32 delayInMs )
  {
      struct x_async_op *op;
@@ -514,43 +535,51 @@ index ef7abf2..9050445 100644
  }
  
  static void WINAPI x_threading_XAsyncComplete( IXThreadingImpl *iface, XAsyncBlock *asyncBlock, HRESULT result, SIZE_T requiredBufferSize )
-@@ -661,9 +712,46 @@ static void WINAPI x_threading_XAsyncComplete( IXThreadingImpl *iface, XAsyncBlo
+@@ -661,9 +734,55 @@ static void WINAPI x_threading_XAsyncComplete( IXThreadingImpl *iface, XAsyncBlo
      x_threading_XAsyncComplete_helper( asyncBlock, result, requiredBufferSize );
  }
  
-+/* Ask the provider to stop, then make sure the operation finishes either way.
++/* Ask the provider to stop. That is all XAsyncCancel does, as in the GDK's
++ * own AsyncLib: finishing the operation stays the provider's job, and it
++ * reports the cancellation by completing with E_ABORT once its own work has
++ * wound down. libHttpClient's HTTP provider answers Cancel by terminating its
++ * private work queue, and completes the outer call later from the cancelled
++ * request's callback, which still reads the context that its Cleanup frees.
++ * Completing the operation here ran that Cleanup -- and delivered the title's
++ * callback -- while the provider's cancelled work was still running.
 + *
-+ * This was a stub, so a cancelled operation only ended when its work did on
-+ * its own -- possibly never, for a websocket or a long poll -- and a title
-+ * backing out of a menu or shutting down waited for a completion callback that
-+ * did not come. The GDK completes a cancelled operation with E_ABORT unless
-+ * the provider has already completed it; a completion the provider makes
-+ * afterwards is ignored, like any second one. */
++ * This used to be a stub, so the provider never heard about a cancellation at
++ * all. An XAsyncRun operation has no provider, and cancelling one does
++ * nothing: its work function finishes it. */
++static void cancel_async_op( struct x_async_op *op )
++{
++    BOOL cancel;
++
++    /* One Cancel at a time. While it runs the operation may complete and its
++     * result be taken; Cleanup then waits for Cancel to return (see
++     * XAsyncGetResult and release_async_op). */
++    EnterCriticalSection( &async_ops_cs );
++    cancel = !op->completed && !op->canceling && op->provider;
++    if (cancel) op->canceling = TRUE;
++    LeaveCriticalSection( &async_ops_cs );
++    if (!cancel) return;
++
++    TRACE( "cancelling operation %p for block %p.\n", op, op->async );
++    async_op_invoke( op, XAsyncOp_Cancel, 0, NULL );
++
++    EnterCriticalSection( &async_ops_cs );
++    op->canceling = FALSE;
++    LeaveCriticalSection( &async_ops_cs );
++}
++
 +static void WINAPI x_threading_XAsyncCancel( IXThreadingImpl *iface, XAsyncBlock *asyncBlock )
 +{
 +    struct x_async_op *op;
-+    BOOL cancel;
 +
 +    TRACE( "iface %p, asyncBlock %p.\n", iface, asyncBlock );
 +
 +    if (!asyncBlock || !(op = acquire_async_op( asyncBlock ))) return;
-+
-+    EnterCriticalSection( &async_ops_cs );
-+    cancel = !op->completed && !op->canceling;
-+    op->canceling = TRUE;
-+    LeaveCriticalSection( &async_ops_cs );
-+
-+    if (cancel)
-+    {
-+        BOOL done;
-+
-+        TRACE( "cancelling operation %p for block %p.\n", op, asyncBlock );
-+        async_op_invoke( op, XAsyncOp_Cancel, 0, NULL );
-+        EnterCriticalSection( &async_ops_cs );
-+        done = op->completed;
-+        LeaveCriticalSection( &async_ops_cs );
-+        if (!done) complete_op_without_result( op, E_ABORT );
-+    }
++    cancel_async_op( op );
 +    release_async_op( op );
 +}
 +
@@ -558,10 +587,11 @@ index ef7abf2..9050445 100644
  {
      struct x_async_op *op;
 +    void *payload = NULL;
++    BOOL defer_cleanup;
      HRESULT hr;
  
      TRACE( "iface %p asyncBlock %p, identity %p, bufferSize %Iu, buffer %p, bufferUsed %p.\n",
-@@ -674,10 +762,8 @@ static HRESULT WINAPI x_threading_XAsyncGetResult( IXThreadingImpl *iface, XAsyn
+@@ -674,10 +793,8 @@ static HRESULT WINAPI x_threading_XAsyncGetResult( IXThreadingImpl *iface, XAsyn
      EnterCriticalSection( &async_ops_cs );
      /* Outcomes without a payload are detached after completion. Return the
       * block's current status without finding an older operation at its address. */
@@ -573,7 +603,7 @@ index ef7abf2..9050445 100644
          if (bufferUsed) *bufferUsed = 0;
          LeaveCriticalSection( &async_ops_cs );
          return hr;
-@@ -685,7 +771,6 @@ static HRESULT WINAPI x_threading_XAsyncGetResult( IXThreadingImpl *iface, XAsyn
+@@ -685,7 +802,6 @@ static HRESULT WINAPI x_threading_XAsyncGetResult( IXThreadingImpl *iface, XAsyn
      op = find_async_op( asyncBlock );
      if (!op)
      {
@@ -581,7 +611,7 @@ index ef7abf2..9050445 100644
          SIZE_T size;
  
          LeaveCriticalSection( &async_ops_cs );
-@@ -702,7 +787,7 @@ static HRESULT WINAPI x_threading_XAsyncGetResult( IXThreadingImpl *iface, XAsyn
+@@ -702,7 +818,7 @@ static HRESULT WINAPI x_threading_XAsyncGetResult( IXThreadingImpl *iface, XAsyn
           * method on it: `mov rbx,[rcx+0x38]` with rcx = 0xFFFFFFFFFFFFFFFF.
           * Same shape as the empty image name and the NULL struct return -- a
           * call that "succeeded" without leaving memory as promised. */
@@ -590,7 +620,7 @@ index ef7abf2..9050445 100644
          if (FAILED(hr)) return hr;
  
          size = (SIZE_T)(ULONG_PTR)asyncBlock->internal[3];
-@@ -729,7 +814,10 @@ static HRESULT WINAPI x_threading_XAsyncGetResult( IXThreadingImpl *iface, XAsyn
+@@ -729,7 +845,10 @@ static HRESULT WINAPI x_threading_XAsyncGetResult( IXThreadingImpl *iface, XAsyn
          }
          return hr;
      }
@@ -602,7 +632,31 @@ index ef7abf2..9050445 100644
      {
          LeaveCriticalSection( &async_ops_cs );
          return E_PENDING;
-@@ -777,9 +865,12 @@ struct x_task_queue
+@@ -746,6 +865,14 @@ static HRESULT WINAPI x_threading_XAsyncGetResult( IXThreadingImpl *iface, XAsyn
+         return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
+     }
+     list_remove( &op->entry );
++    /* The provider may still be inside its Cancel, which can complete the
++     * operation before it returns. Cleanup frees what that Cancel is using, so
++     * it waits for whoever called Cancel to let go of the operation. */
++    if ((defer_cleanup = op->canceling))
++    {
++        op->cleanup_async = *asyncBlock;
++        op->cleanup_on_release = TRUE;
++    }
+     LeaveCriticalSection( &async_ops_cs );
+     TRACE( "operation %p withdrawn: its result is being taken from block %p.\n", op, asyncBlock );
+ 
+@@ -757,7 +884,7 @@ static HRESULT WINAPI x_threading_XAsyncGetResult( IXThreadingImpl *iface, XAsyn
+     }
+     if (bufferUsed) *bufferUsed = op->required_size;
+ 
+-    async_op_invoke( op, XAsyncOp_Cleanup, 0, NULL );
++    if (!defer_cleanup) async_op_invoke( op, XAsyncOp_Cleanup, 0, NULL );
+     release_async_op( op );
+     return hr;
+ }
+@@ -777,9 +904,12 @@ struct x_task_queue
      XTaskQueueDispatchMode work_mode;
      XTaskQueueDispatchMode completion_mode;
      struct list pending;        /* callbacks submitted but not run yet */
@@ -616,7 +670,7 @@ index ef7abf2..9050445 100644
  };
  
  /* The GDK keeps a process-wide default task queue. Passing a null handle to an
-@@ -790,6 +881,18 @@ struct x_task_queue
+@@ -790,6 +920,18 @@ struct x_task_queue
   * load followed by an orderly shutdown. */
  static struct x_task_queue *process_queue;
  
@@ -635,7 +689,7 @@ index ef7abf2..9050445 100644
  static void init_queue_ports( struct x_task_queue *queue )
  {
      unsigned int i;
-@@ -799,6 +902,10 @@ static void init_queue_ports( struct x_task_queue *queue )
+@@ -799,6 +941,10 @@ static void init_queue_ports( struct x_task_queue *queue )
          queue->owned_ports[i].kind = i;
          queue->ports[i] = &queue->owned_ports[i];
      }
@@ -646,7 +700,7 @@ index ef7abf2..9050445 100644
  }
  
  
-@@ -838,6 +945,127 @@ static XTaskQueueDispatchMode work_mode_for( XTaskQueueHandle queue )
+@@ -838,6 +984,147 @@ static XTaskQueueDispatchMode work_mode_for( XTaskQueueHandle queue )
      return port->kind == XTaskQueuePort_Work ? port->owner->work_mode : port->owner->completion_mode;
  }
  
@@ -709,12 +763,32 @@ index ef7abf2..9050445 100644
 +    }
 +}
 +
++/* Block until everything the queue owes has returned.
++ *
++ * Work still running can complete an operation on this queue while we wait,
++ * and on a Manual completion port that completion is parked for whoever pumps
++ * the queue -- usually the very thread waiting here, which XSAPI's shape
++ * (thread-pool work, Manual completions) makes the common case. The parked
++ * completion is part of the count, so it has to be delivered from here, the
++ * way XAsyncGetStatus(wait) does, or the wait never ends. */
 +static void wait_until_quiet( struct x_task_queue *queue )
 +{
++    XTaskQueueHandle handle = (XTaskQueueHandle)queue;
++
 +    EnterCriticalSection( &wait_cs );
 +    InterlockedIncrement( &waiters );
 +    while (InterlockedCompareExchange( &queue->inflight, 0, 0 ))
++    {
++        BOOL delivered;
++
++        LeaveCriticalSection( &wait_cs );
++        delivered = deliver_one_completion( handle, XTaskQueuePort_Completion, TRUE ) ||
++                    deliver_one_completion( handle, XTaskQueuePort_Work, TRUE );
++        EnterCriticalSection( &wait_cs );
++        if (delivered) continue;
++        /* Woken when the count reaches zero or a completion is parked. */
 +        SleepConditionVariableCS( &wait_cv, &wait_cs, 1000 );
++    }
 +    InterlockedDecrement( &waiters );
 +    LeaveCriticalSection( &wait_cs );
 +}
@@ -774,7 +848,7 @@ index ef7abf2..9050445 100644
  /* Completions waiting to be handed to whoever pumps the queue. */
  struct x_pending_completion
  {
-@@ -847,6 +1075,7 @@ struct x_pending_completion
+@@ -847,6 +1134,7 @@ struct x_pending_completion
      struct x_async_op *keep_alive;
      struct x_queue_port *port;
      XTaskQueueHandle origin;
@@ -782,7 +856,7 @@ index ef7abf2..9050445 100644
  };
  
  /* Set once a title actually pumps a queue. Until then a Manual completion has
-@@ -887,11 +1116,27 @@ static XTaskQueueDispatchMode completion_mode_for( const XAsyncBlock *async )
+@@ -887,11 +1175,27 @@ static XTaskQueueDispatchMode completion_mode_for( const XAsyncBlock *async )
      return obj->completion_mode;
  }
  
@@ -810,7 +884,7 @@ index ef7abf2..9050445 100644
  }
  
  static void CALLBACK async_completion_work( TP_CALLBACK_INSTANCE *instance, void *context )
-@@ -909,29 +1154,44 @@ static DWORD WINAPI async_completion_thread( void *context )
+@@ -909,29 +1213,44 @@ static DWORD WINAPI async_completion_thread( void *context )
      return 0;
  }
  
@@ -864,7 +938,7 @@ index ef7abf2..9050445 100644
  
      /* A Manual queue is the title's to pump. Bedrock, though, creates Manual
       * queues, hands them to XSAPI and never calls XTaskQueueDispatch even once,
-@@ -946,7 +1206,7 @@ static void deliver_async_completion( XAsyncBlock *async, struct x_async_op *kee
+@@ -946,7 +1265,7 @@ static void deliver_async_completion( XAsyncBlock *async, struct x_async_op *kee
       * game licence on such a queue and shuts down cleanly when it times out).
       * Hand those to the thread pool rather than running them inline, which
       * would re-enter the caller's own *Async() frame. */
@@ -873,7 +947,7 @@ index ef7abf2..9050445 100644
          (!strict_manual_dispatch() && !InterlockedCompareExchange( &queue_ever_dispatched, 0, 0 )))
      {
          HANDLE thread;
-@@ -962,7 +1222,7 @@ static void deliver_async_completion( XAsyncBlock *async, struct x_async_op *kee
+@@ -962,7 +1281,7 @@ static void deliver_async_completion( XAsyncBlock *async, struct x_async_op *kee
              CloseHandle( thread );
              return;
          }
@@ -882,7 +956,7 @@ index ef7abf2..9050445 100644
      }
  
      EnterCriticalSection( &pending_cs );
-@@ -971,13 +1231,18 @@ static void deliver_async_completion( XAsyncBlock *async, struct x_async_op *kee
+@@ -971,13 +1290,18 @@ static void deliver_async_completion( XAsyncBlock *async, struct x_async_op *kee
      if (!pending_event) pending_event = CreateEventW( NULL, TRUE, FALSE, NULL );
      if (pending_event) SetEvent( pending_event );
      LeaveCriticalSection( &pending_cs );
@@ -902,7 +976,7 @@ index ef7abf2..9050445 100644
  }
  
  void xgr_async_complete( XAsyncBlock *async, HRESULT hr, void *payload )
-@@ -1236,26 +1501,58 @@ static void cancel_manual_callbacks( struct x_task_queue *queue )
+@@ -1236,26 +1560,58 @@ static void cancel_manual_callbacks( struct x_task_queue *queue )
   * {"users":[]}, still holding a second mutex that the game's main thread then
   * waited on. That is the multiplayer join freeze.
   *
@@ -971,7 +1045,7 @@ index ef7abf2..9050445 100644
  
  /* Runs one queue's callbacks, one at a time, until it runs dry. */
  static void CALLBACK queue_runner( TP_CALLBACK_INSTANCE *instance, void *context )
-@@ -1270,7 +1567,7 @@ static void CALLBACK queue_runner( TP_CALLBACK_INSTANCE *instance, void *context
+@@ -1270,7 +1626,7 @@ static void CALLBACK queue_runner( TP_CALLBACK_INSTANCE *instance, void *context
  
          EnterCriticalSection( &queue_work_cs );
          canceled = queue->terminated;
@@ -980,7 +1054,7 @@ index ef7abf2..9050445 100644
          {
              item = LIST_ENTRY( head, struct x_queue_work, entry );
              list_remove( &item->entry );
-@@ -1279,12 +1576,7 @@ static void CALLBACK queue_runner( TP_CALLBACK_INSTANCE *instance, void *context
+@@ -1279,12 +1635,7 @@ static void CALLBACK queue_runner( TP_CALLBACK_INSTANCE *instance, void *context
          LeaveCriticalSection( &queue_work_cs );
  
          if (!item) return;
@@ -994,7 +1068,7 @@ index ef7abf2..9050445 100644
      }
  }
  
-@@ -1304,7 +1596,7 @@ static void kick_queue_runner( struct x_task_queue *queue )
+@@ -1304,7 +1655,7 @@ static void kick_queue_runner( struct x_task_queue *queue )
      BOOL start = FALSE;
  
      EnterCriticalSection( &queue_work_cs );
@@ -1003,7 +1077,7 @@ index ef7abf2..9050445 100644
          start = queue->running = TRUE;
      LeaveCriticalSection( &queue_work_cs );
  
-@@ -1331,46 +1623,137 @@ static void kick_queue_runner( struct x_task_queue *queue )
+@@ -1331,46 +1682,137 @@ static void kick_queue_runner( struct x_task_queue *queue )
      }
  }
  
@@ -1166,7 +1240,7 @@ index ef7abf2..9050445 100644
  }
  
  static HRESULT WINAPI x_threading_XTaskQueueSubmitCallback( IXThreadingImpl *iface, XTaskQueueHandle queue, XTaskQueuePort port, void *callbackContext, XTaskQueueCallback *callback )
-@@ -1382,9 +1765,7 @@ static HRESULT WINAPI x_threading_XTaskQueueSubmitCallback( IXThreadingImpl *ifa
+@@ -1382,9 +1824,7 @@ static HRESULT WINAPI x_threading_XTaskQueueSubmitCallback( IXThreadingImpl *ifa
      if (!callback || (port != XTaskQueuePort_Work && port != XTaskQueuePort_Completion)) return E_INVALIDARG;
      if (!obj) obj = default_task_queue();
      if (!obj) return E_OUTOFMEMORY;
@@ -1177,7 +1251,7 @@ index ef7abf2..9050445 100644
  
      /* Immediate means "run it on the thread that submitted it". */
      if ((port == XTaskQueuePort_Completion ? obj->completion_mode : obj->work_mode) == XTaskQueueDispatchMode_Immediate)
-@@ -1392,7 +1773,7 @@ static HRESULT WINAPI x_threading_XTaskQueueSubmitCallback( IXThreadingImpl *ifa
+@@ -1392,7 +1832,7 @@ static HRESULT WINAPI x_threading_XTaskQueueSubmitCallback( IXThreadingImpl *ifa
          callback( callbackContext, FALSE );
          return S_OK;
      }
@@ -1186,7 +1260,7 @@ index ef7abf2..9050445 100644
  }
  
  /* A delayed callback is how callers implement retry backoff (libHttpClient
-@@ -1401,32 +1782,14 @@ static HRESULT WINAPI x_threading_XTaskQueueSubmitCallback( IXThreadingImpl *ifa
+@@ -1401,32 +1841,14 @@ static HRESULT WINAPI x_threading_XTaskQueueSubmitCallback( IXThreadingImpl *ifa
  static HRESULT WINAPI x_threading_XTaskQueueSubmitDelayedCallback( IXThreadingImpl *iface, XTaskQueueHandle queue, XTaskQueuePort port, UINT32 delayMs, void *callbackContext, XTaskQueueCallback *callback )
  {
      struct x_task_queue *obj = (struct x_task_queue *)queue;
@@ -1221,7 +1295,7 @@ index ef7abf2..9050445 100644
  }
  
  /* A waiter fires a task-queue callback when a wait handle becomes signalled.
-@@ -1483,50 +1846,117 @@ static void WINAPI x_threading_XTaskQueueUnregisterWaiter( IXThreadingImpl *ifac
+@@ -1483,50 +1905,117 @@ static void WINAPI x_threading_XTaskQueueUnregisterWaiter( IXThreadingImpl *ifac
      }
  }
  
@@ -1311,7 +1385,7 @@ index ef7abf2..9050445 100644
 +    InterlockedIncrement( &obj->inflight );
 +    if (request) list_add_tail( &obj->terminate_requests, &request->entry );
 +    LeaveCriticalSection( &queue_work_cs );
-+
+ 
 +    /* Delayed callbacks are cancelled now rather than when their timers would
 +     * have fired. A timer that has fired already finds its item claimed and
 +     * leaves it alone; waiting for it means it has stopped looking. */
@@ -1322,7 +1396,7 @@ index ef7abf2..9050445 100644
 +        list_remove( &item->entry );
 +        list_add_tail( &drained, &item->entry );
 +    }
- 
++
 +    if (block)
 +    {
          /* Outside the lock: a cancelled callback may submit, close handles, or
