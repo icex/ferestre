@@ -425,59 +425,58 @@ def row_menus(root):
     }
 
 
-def menu_items(app, menu):
-    """Open a row's menu and return {item name: button}; close_menu() shuts it.
+def open_menu_items(root):
+    return {node.get_name(): node for node in find_all(root, role="button") if node.get_name() in MENU_ITEMS}
 
-    The secondary actions live in a popover, and a popover's contents are in
-    the accessible tree only while it is open -- the reason there is no Edit
-    button to count until this has run.
+
+def toggle_row_menu(app, frame, title, want_open):
+    """Open or close `title`'s row menu and return its items when opening.
+
+    The popover's contents are in the accessible tree only while it is open,
+    so there is no Edit button to find until this has run. The toggle is
+    looked up afresh on every attempt: the list is redrawn whenever names or
+    art arrive, and a node from before that is gone. Older GTK (CI's 4.14)
+    can also swallow the first activation that follows a popover closing;
+    a toggle that did not change is simply clicked again.
     """
-    click(menu)
-    return wait_for(
-        app,
-        lambda root: {
-            node.get_name(): node for node in find_all(root, role="button") if node.get_name() in MENU_ITEMS
-        }
-        or None,
-        "the row's menu to open",
-        time.monotonic() + TIMEOUT,
-    )
-
-
-def close_menu(app, menu):
-    """Click the toggle again; its items then leave the tree."""
-    if not any(n.get_name() in MENU_ITEMS for n in find_all(app, role="button")):
-        return
-    click(menu)
-    wait_for(
-        app,
-        lambda root: not any(n.get_name() in MENU_ITEMS for n in find_all(root, role="button")) or None,
-        "the row's menu to close",
-        time.monotonic() + TIMEOUT,
-    )
+    for _ in range(6):
+        if bool(open_menu_items(app)) == want_open:
+            return open_menu_items(app)
+        menu = wait_for(frame, lambda root: row_menus(root).get(title), f"{title}'s menu", time.monotonic() + TIMEOUT)
+        try:
+            click(menu)
+        except GLib.GError:
+            continue
+        try:
+            return wait_for(
+                app,
+                lambda root: (open_menu_items(root) if want_open else not open_menu_items(root)) or None,
+                "the row's menu to " + ("open" if want_open else "close"),
+                time.monotonic() + 5,
+            )
+        except Failure:
+            continue
+    raise Failure(f"timed out waiting for {title}'s menu to " + ("open" if want_open else "close"))
 
 
 MENU_ITEMS = {"Open Store page", "Choose runtime", "Add to Steam", "Edit launch settings", "Remove from disk"}
 
 
 def row_menu_offers(app, frame, title):
-    """The items `title`'s row menu offers. Looked up afresh each time: the list
-    is redrawn whenever names or art arrive, and an old node is then gone."""
-    menu = wait_for(frame, lambda root: row_menus(root).get(title), f"{title}'s menu", time.monotonic() + TIMEOUT)
-    items = set(menu_items(app, menu))
-    close_menu(app, wait_for(frame, lambda root: row_menus(root).get(title), f"{title}'s menu", time.monotonic() + TIMEOUT))
+    """The items `title`'s row menu offers, leaving it closed."""
+    items = set(toggle_row_menu(app, frame, title, True))
+    toggle_row_menu(app, frame, title, False)
     return items
 
 
 def row_action(app, frame, item, title=None):
     """Click `item` in the menu of `title`'s row, or of the first row that has it."""
     for name in [title] if title else list(row_menus(frame)):
-        menu = wait_for(frame, lambda root: row_menus(root).get(name), f"{name}'s menu", time.monotonic() + TIMEOUT)
-        items = menu_items(app, menu)
+        items = toggle_row_menu(app, frame, name, True)
         if item in items:
             click(items[item])
             return name
-        close_menu(app, wait_for(frame, lambda root: row_menus(root).get(name), f"{name}'s menu", time.monotonic() + TIMEOUT))
+        toggle_row_menu(app, frame, name, False)
     raise Failure(f"no row offers {item!r}")
 
 
