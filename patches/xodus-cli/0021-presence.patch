@@ -1,6 +1,29 @@
 From: Ferestre contributors
 Subject: Report a launched game's presence under its own title identity
 
+diff --git a/Cargo.lock b/Cargo.lock
+index df6d4db..a3cb5ba 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7187,6 +7187,7 @@ dependencies = [
+  "inquire",
+  "msixvc",
+  "nix",
++ "p256",
+  "reqwest 0.13.4",
+  "rustix",
+  "serde_json",
+diff --git a/crates/xodus-cli/Cargo.toml b/crates/xodus-cli/Cargo.toml
+index 7b71cb7..35bfbaa 100644
+--- a/crates/xodus-cli/Cargo.toml
++++ b/crates/xodus-cli/Cargo.toml
+@@ -32,3 +32,6 @@ nix = "0.31.3"
+ 
+ [features]
+ tokio_console = ["dep:console-subscriber"]
++
++[dev-dependencies]
++p256 = { version = "0.13", features = ["ecdsa"] }
 diff --git a/crates/xodus-cli/src/commands.rs b/crates/xodus-cli/src/commands.rs
 index 2f3559e..18f5740 100644
 --- a/crates/xodus-cli/src/commands.rs
@@ -15,10 +38,10 @@ index 2f3559e..18f5740 100644
  pub mod run;
 diff --git a/crates/xodus-cli/src/commands/presence.rs b/crates/xodus-cli/src/commands/presence.rs
 new file mode 100644
-index 0000000..9e54da4
+index 0000000..d892d09
 --- /dev/null
 +++ b/crates/xodus-cli/src/commands/presence.rs
-@@ -0,0 +1,1031 @@
+@@ -0,0 +1,1103 @@
 +//! Show the player as playing the game a launcher started, and read back what
 +//! friends see.
 +//!
@@ -99,6 +122,10 @@ index 0000000..9e54da4
 +const RETRY_AFTER_MAX: u64 = 3600;
 +/// Mint again once the credentials have less than this left.
 +const REMINT_MARGIN: i64 = 600;
++/// A wait between heartbeats looks at the sign-in this often, so a sign-out
++/// from anywhere takes the record down within a minute rather than a whole
++/// heartbeat later.
++const SIGN_IN_POLL: u64 = 60;
 +/// The final delete gets this long before the run gives up on it.
 +const DELETE_TIMEOUT: u64 = 5;
 +const REQUEST_TIMEOUT: u64 = 30;
@@ -138,6 +165,14 @@ index 0000000..9e54da4
 +    pub expires_at: i64,
 +}
 +
++impl Credentials {
++    /// Whether the service still takes these. A record they wrote can be
++    /// deleted with them until then.
++    fn usable(&self) -> bool {
++        self.expires_at > chrono::Utc::now().timestamp()
++    }
++}
++
 +impl fmt::Debug for Credentials {
 +    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 +        f.debug_struct("Credentials")
@@ -161,6 +196,13 @@ index 0000000..9e54da4
 +#[async_trait]
 +pub trait TokenProvider: Send {
 +    async fn mint(&mut self) -> Result<Credentials, MintError>;
++
++    /// Whether the account is still signed in. Credentials already minted
++    /// keep working after a sign-out, so the loop asks this before every
++    /// heartbeat and during the waits between them. Only a sign-in that is
++    /// gone answers false; a store that cannot be read right now does not end
++    /// a game's presence.
++    fn signed_in(&mut self) -> bool;
 +}
 +
 +/// The game's own identity: SISU with its MSAAppId and TitleId, then an XSTS
@@ -269,6 +311,20 @@ index 0000000..9e54da4
 +            xuid,
 +            expires_at,
 +        })
++    }
++
++    /// The same read `mint` starts with. It goes to the store every time, so
++    /// `logout` run anywhere else, or the launcher signing the Player out,
++    /// shows up here.
++    fn signed_in(&mut self) -> bool {
++        match self.tokens.get_user_sts_token() {
++            Err(TokenStoreError::NotFound) => false,
++            Err(error) => {
++                diag(&format!("could not read the sign-in: {error}"));
++                true
++            }
++            Ok(_) => true,
++        }
 +    }
 +}
 +
@@ -511,6 +567,9 @@ index 0000000..9e54da4
 +        let mut reminted = false;
 +
 +        loop {
++            if !self.provider.signed_in() {
++                return self.signed_out(out, credentials.as_ref()).await;
++            }
 +            let stale = credentials
 +                .as_ref()
 +                .is_none_or(|c| c.expires_at - chrono::Utc::now().timestamp() < REMINT_MARGIN);
@@ -520,9 +579,18 @@ index 0000000..9e54da4
 +                    _ = &mut stop => return self.finish(out, credentials.as_ref()).await,
 +                };
 +                match minted {
-+                    Ok(fresh) => credentials = Some(fresh),
++                    Ok(fresh) => {
++                        // Every mint is a new SISU device. The record the
++                        // old one wrote would otherwise stay up next to the
++                        // new one until it expired, so friends would see the
++                        // game twice. A 401 leaves nothing to delete with.
++                        if let Some(old) = credentials.take().filter(Credentials::usable) {
++                            self.withdraw(&old).await;
++                        }
++                        credentials = Some(fresh);
++                    }
 +                    Err(MintError::SignedOut) => {
-+                        return self.fatal(out, SIGNED_OUT);
++                        return self.signed_out(out, credentials.as_ref()).await;
 +                    }
 +                    Err(MintError::Failed(message)) => {
 +                        diag(&format!("could not mint the title's token: {message}"));
@@ -530,10 +598,7 @@ index 0000000..9e54da4
 +                        // work. Keep the title up with them and try the mint
 +                        // again after the next heartbeat; the launcher has
 +                        // nothing to be told yet.
-+                        let usable = credentials
-+                            .as_ref()
-+                            .is_some_and(|c| c.expires_at > chrono::Utc::now().timestamp());
-+                        if !usable {
++                        if !credentials.as_ref().is_some_and(Credentials::usable) {
 +                            credentials = None;
 +                            let after = backoff(failures);
 +                            failures += 1;
@@ -669,41 +734,67 @@ index 0000000..9e54da4
 +        1
 +    }
 +
-+    async fn wait(&self, seconds: u64, stop: &mut std::pin::Pin<&mut impl Future>) -> Wait {
-+        tokio::select! {
-+            _ = tokio::time::sleep(self.timing.of(seconds)) => Wait::Elapsed,
-+            _ = stop.as_mut() => Wait::Stopped,
++    /// Sleep for `seconds`, unless a stop comes first. The sign-in is looked
++    /// at every minute on the way; once it is gone the wait ends early, and
++    /// the top of the loop takes the record down.
++    async fn wait(&mut self, seconds: u64, stop: &mut std::pin::Pin<&mut impl Future>) -> Wait {
++        let mut left = seconds;
++        loop {
++            let step = left.min(SIGN_IN_POLL);
++            tokio::select! {
++                _ = tokio::time::sleep(self.timing.of(step)) => {}
++                _ = stop.as_mut() => return Wait::Stopped,
++            }
++            left -= step;
++            if left == 0 || !self.provider.signed_in() {
++                return Wait::Elapsed;
++            }
 +        }
 +    }
 +
-+    /// Take the record down, then say so. The delete is bounded: a launcher
-+    /// waiting on this before signing out must not wait on a dead network,
-+    /// and a record that is not deleted expires on its own.
++    /// Delete the record these credentials wrote. Bounded: a launcher waiting
++    /// on this before signing out must not wait on a dead network, and a
++    /// record that is not deleted expires on its own.
++    async fn withdraw(&self, credentials: &Credentials) {
++        let url = title_url(&self.base, &credentials.xuid);
++        match send(
++            self.client,
++            reqwest::Method::DELETE,
++            &url,
++            credentials,
++            &[],
++            self.timing.of(DELETE_TIMEOUT),
++        )
++        .await
++        {
++            Ok(response) if response.status().is_success() => {}
++            Ok(response) => diag(&format!(
++                "delete answered HTTP {}; the record will expire on its own",
++                response.status()
++            )),
++            Err(error) => diag(&format!(
++                "delete failed ({error}); the record will expire on its own"
++            )),
++        }
++    }
++
++    /// Take the record down, then say so.
 +    async fn finish(&self, out: &mut dyn Write, credentials: Option<&Credentials>) -> u8 {
 +        if let Some(credentials) = credentials {
-+            let url = title_url(&self.base, &credentials.xuid);
-+            match send(
-+                self.client,
-+                reqwest::Method::DELETE,
-+                &url,
-+                credentials,
-+                &[],
-+                self.timing.of(DELETE_TIMEOUT),
-+            )
-+            .await
-+            {
-+                Ok(response) if response.status().is_success() => {}
-+                Ok(response) => diag(&format!(
-+                    "delete answered HTTP {}; the record will expire on its own",
-+                    response.status()
-+                )),
-+                Err(error) => diag(&format!(
-+                    "delete failed ({error}); the record will expire on its own"
-+                )),
-+            }
++            self.withdraw(credentials).await;
 +        }
 +        self.say(out, &Event::Offline);
 +        0
++    }
++
++    /// The account was signed out under a running game. Its credentials still
++    /// work until they expire, so the record goes now rather than when the
++    /// service gives up on it, and then the run ends.
++    async fn signed_out(&self, out: &mut dyn Write, credentials: Option<&Credentials>) -> u8 {
++        if let Some(credentials) = credentials.filter(|c| c.usable()) {
++            self.withdraw(credentials).await;
++        }
++        self.fatal(out, SIGNED_OUT)
 +    }
 +}
 +
@@ -815,6 +906,10 @@ index 0000000..9e54da4
 +}
 +
 +/// Which title to report, from the command line.
++///
++/// As in `xbl-check`, the ids are used only as a pair. Half of one is not
++/// mixed with half of the game directory's, which could name two different
++/// titles; the directory supplies the whole identity instead.
 +pub fn resolve_identity(
 +    game_dir: Option<&Path>,
 +    title_id: Option<i64>,
@@ -822,10 +917,10 @@ index 0000000..9e54da4
 +) -> Result<(TitleIdentity, String), String> {
 +    let config = game_dir
 +        .and_then(|dir| std::fs::read_to_string(super::xblcheck::game_config_path(dir)).ok());
-+    let identity = match (title_id, game_dir) {
-+        (Some(title_id), _) => TitleIdentity {
++    let identity = match (title_id.zip(title_client_id), game_dir) {
++        (Some((title_id, client_id)), _) => TitleIdentity {
 +            title_id,
-+            client_id: title_client_id.unwrap_or_default(),
++            client_id,
 +        },
 +        (None, Some(dir)) => super::xblcheck::identity_from_game_dir(dir)?,
 +        (None, None) => {
@@ -1052,17 +1147,17 @@ index 0000000..9e54da4
 +mod tests;
 diff --git a/crates/xodus-cli/src/commands/presence/tests.rs b/crates/xodus-cli/src/commands/presence/tests.rs
 new file mode 100644
-index 0000000..eb2075c
+index 0000000..96e9ad3
 --- /dev/null
 +++ b/crates/xodus-cli/src/commands/presence/tests.rs
-@@ -0,0 +1,952 @@
+@@ -0,0 +1,1161 @@
 +//! The heartbeat loop against a local server, with credentials from a fake
 +//! provider. Nothing here signs in or reaches the network: the server is a
 +//! listener on 127.0.0.1 that answers from a script and records what it saw.
 +
 +use super::*;
 +use std::collections::HashMap;
-+use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 +use std::sync::{Arc, Mutex};
 +use std::time::Instant;
 +use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1259,11 +1354,18 @@ index 0000000..eb2075c
 +    mints: Arc<AtomicUsize>,
 +    /// Seconds from now the credentials expire.
 +    lifetime: i64,
-+    signed_out: bool,
++    /// The store's sign-in. A test can flip it while the loop runs.
++    signed_out: Arc<AtomicBool>,
++    /// Mints after this many find the account signed out, though the
++    /// sign-in check before them did not: a sign-out landing in between.
++    signed_out_after: Option<usize>,
 +    /// Mints that fail before one succeeds.
 +    failing: usize,
 +    /// Never finish minting.
 +    hang: bool,
++    /// Every signer handed out, in mint order, so a test can check a
++    /// signature against the key that should have made it.
++    signers: Arc<Mutex<Vec<RequestSigner>>>,
 +}
 +
 +impl Fake {
@@ -1273,9 +1375,11 @@ index 0000000..eb2075c
 +            Fake {
 +                mints: mints.clone(),
 +                lifetime: 3600 * 16,
-+                signed_out: false,
++                signed_out: Arc::default(),
++                signed_out_after: None,
 +                failing: 0,
 +                hang: false,
++                signers: Arc::default(),
 +            },
 +            mints,
 +        )
@@ -1288,21 +1392,75 @@ index 0000000..eb2075c
 +        if self.hang {
 +            std::future::pending::<()>().await;
 +        }
-+        if self.signed_out {
++        if self.signed_out.load(Ordering::SeqCst) {
++            return Err(MintError::SignedOut);
++        }
++        if self
++            .signed_out_after
++            .is_some_and(|limit| self.mints.load(Ordering::SeqCst) >= limit)
++        {
 +            return Err(MintError::SignedOut);
 +        }
 +        let n = self.mints.fetch_add(1, Ordering::SeqCst) + 1;
 +        if n <= self.failing {
 +            return Err(MintError::Failed(format!("refused {SECRET}")));
 +        }
++        let signer = RequestSigner::generate();
++        self.signers.lock().unwrap().push(signer.clone());
 +        Ok(Credentials {
 +            authorization: format!("XBL3.0 x=1234;{SECRET}-{n}"),
-+            signer: RequestSigner::generate(),
++            signer,
 +            policy: Some((1, 8192)),
 +            xuid: XUID.to_string(),
 +            expires_at: chrono::Utc::now().timestamp() + self.lifetime,
 +        })
 +    }
++
++    fn signed_in(&mut self) -> bool {
++        !self.signed_out.load(Ordering::SeqCst)
++    }
++}
++
++/// Check a request's `Signature` header the way the service does: rebuild
++/// the message from the request as received and verify it against the
++/// public half of `signer`. The version and timestamp come from the header
++/// itself, which is what lets a server rebuild the message at all.
++fn verify_signature(seen: &Seen, signer: &RequestSigner) -> Result<(), String> {
++    use base64::Engine;
++    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
++    use p256::ecdsa::signature::Verifier;
++
++    let header = STANDARD
++        .decode(seen.headers.get("signature").ok_or("no Signature header")?)
++        .map_err(|e| format!("Signature is not base64: {e}"))?;
++    if header.len() != 4 + 8 + 64 {
++        return Err(format!("Signature is {} bytes", header.len()));
++    }
++    let mut message = Vec::new();
++    for part in [
++        &header[..4],
++        &header[4..12],
++        seen.method.as_bytes(),
++        seen.path.as_bytes(),
++        seen.headers["authorization"].as_bytes(),
++        seen.body.as_bytes(),
++    ] {
++        message.extend_from_slice(part);
++        message.push(0);
++    }
++    let proof = signer.proof_key();
++    let coordinate = |text: &str| URL_SAFE_NO_PAD.decode(text).expect("proof key coordinate");
++    let (x, y) = (coordinate(&proof.x), coordinate(&proof.y));
++    let point = p256::EncodedPoint::from_affine_coordinates(
++        p256::FieldBytes::from_slice(&x),
++        p256::FieldBytes::from_slice(&y),
++        false,
++    );
++    let key = p256::ecdsa::VerifyingKey::from_encoded_point(&point).expect("a P-256 key");
++    let signature =
++        p256::ecdsa::Signature::from_slice(&header[12..]).map_err(|e| format!("r||s: {e}"))?;
++    key.verify(&message, &signature)
++        .map_err(|_| "the signature does not cover this request".to_string())
 +}
 +
 +/// Run the loop until `stop`, returning its exit status and stdout lines.
@@ -1439,6 +1597,45 @@ index 0000000..eb2075c
 +}
 +
 +#[tokio::test]
++async fn the_signature_covers_the_method_path_authorization_and_body() {
++    let server = Server::start(vec![ok(Some("60"))]).await;
++    let (fake, _) = Fake::new();
++    let signers = fake.signers.clone();
++    let (code, _, _) = drive(&server, fake, server.after("POST", 2)).await;
++    assert_eq!(code, 0);
++    let signer = signers.lock().unwrap()[0].clone();
++    let seen = server.seen();
++    let post = seen.iter().find(|s| s.method == "POST").expect("a POST");
++    let delete = seen
++        .iter()
++        .find(|s| s.method == "DELETE")
++        .expect("a DELETE");
++    assert_eq!(post.body, ACTIVE_BODY);
++    assert!(delete.body.is_empty());
++    verify_signature(post, &signer).expect("the POST verifies");
++    verify_signature(delete, &signer).expect("the DELETE verifies");
++
++    // The check itself has to tell a wrong input from a right one, or the
++    // two lines above prove nothing.
++    let other = RequestSigner::generate();
++    assert!(verify_signature(post, &other).is_err(), "another key");
++    let mut changed = post.clone();
++    changed.path = format!("{}{}", server.base, post.path);
++    assert!(verify_signature(&changed, &signer).is_err(), "the full URL");
++    let mut changed = post.clone();
++    changed.method = "PUT".into();
++    assert!(verify_signature(&changed, &signer).is_err(), "the method");
++    let mut changed = post.clone();
++    changed.body = r#"{"state":"active","id":"1"}"#.into();
++    assert!(verify_signature(&changed, &signer).is_err(), "the body");
++    let mut changed = post.clone();
++    changed
++        .headers
++        .insert("authorization".into(), "XBL3.0 x=1234;other".into());
++    assert!(verify_signature(&changed, &signer).is_err(), "the token");
++}
++
++#[tokio::test]
 +async fn a_route_without_a_signature_policy_is_sent_unsigned() {
 +    struct Unsigned(Fake);
 +    #[async_trait]
@@ -1447,6 +1644,10 @@ index 0000000..eb2075c
 +            let mut credentials = self.0.mint().await?;
 +            credentials.policy = None;
 +            Ok(credentials)
++        }
++
++        fn signed_in(&mut self) -> bool {
++            self.0.signed_in()
 +        }
 +    }
 +    let server = Server::start(vec![ok(None)]).await;
@@ -1585,8 +1786,8 @@ index 0000000..eb2075c
 +    assert_eq!((code, events[0]["code"].as_str()), (1, Some("forbidden")));
 +
 +    let server = Server::start(vec![ok(None)]).await;
-+    let (mut fake, _) = Fake::new();
-+    fake.signed_out = true;
++    let (fake, _) = Fake::new();
++    fake.signed_out.store(true, Ordering::SeqCst);
 +    let (code, events, _) = drive(&server, fake, std::future::pending()).await;
 +    assert_eq!(code, 1);
 +    assert_eq!(
@@ -1661,6 +1862,99 @@ index 0000000..eb2075c
 +    let (code, _, _) = drive(&server, fake, server.after("POST", 3)).await;
 +    assert_eq!(code, 0);
 +    assert!(mints.load(Ordering::SeqCst) >= 3);
++}
++
++#[tokio::test]
++async fn a_sign_out_mid_run_takes_the_record_down_within_a_minute() {
++    // A long heartbeat, so a sign-out noticed only at the next one would
++    // come fifteen minutes late.
++    let server = Server::start(vec![ok(Some("900"))]).await;
++    let (fake, mints) = Fake::new();
++    let signed_out = fake.signed_out.clone();
++    let posted = server.after("POST", 1);
++    tokio::spawn(async move {
++        posted.await;
++        signed_out.store(true, Ordering::SeqCst);
++    });
++    let (code, events, _) = drive(&server, fake, std::future::pending()).await;
++    assert_eq!(code, 1);
++    assert_eq!(names(&events), ["online", "error"]);
++    assert_eq!(
++        events[1],
++        serde_json::json!({"event":"error","fatal":true,"code":"signed-out"})
++    );
++    assert_eq!(mints.load(Ordering::SeqCst), 1);
++    let seen = server.seen();
++    let methods: Vec<&str> = seen.iter().map(|s| s.method.as_str()).collect();
++    assert_eq!(
++        methods,
++        ["POST", "DELETE"],
++        "deleted, and nothing posted after"
++    );
++    let delete = &seen[1];
++    assert_eq!(delete.path, post_path());
++    assert!(delete.headers["authorization"].ends_with("-1"));
++    let gap = delete.at - seen[0].at;
++    assert!(gap < SECOND * 600, "noticed after {gap:?}");
++}
++
++#[tokio::test]
++async fn a_sign_out_found_by_a_re_mint_still_deletes_with_the_old_credentials() {
++    let server = Server::start(vec![ok(Some("60"))]).await;
++    let (mut fake, mints) = Fake::new();
++    fake.lifetime = 300; // inside the margin, so the next round mints again
++    fake.signed_out_after = Some(1);
++    let (code, events, _) = drive(&server, fake, std::future::pending()).await;
++    assert_eq!(code, 1);
++    assert_eq!(names(&events), ["online", "error"]);
++    assert_eq!(events[1]["code"], "signed-out");
++    assert_eq!(mints.load(Ordering::SeqCst), 1);
++    let seen = server.seen();
++    let methods: Vec<&str> = seen.iter().map(|s| s.method.as_str()).collect();
++    assert_eq!(methods, ["POST", "DELETE"]);
++    assert!(seen[1].headers["authorization"].ends_with("-1"));
++}
++
++#[tokio::test]
++async fn a_re_mint_before_expiry_deletes_the_old_devices_record_first() {
++    let server = Server::start(vec![ok(Some("60"))]).await;
++    let (mut fake, _) = Fake::new();
++    fake.lifetime = 300; // inside the margin: every round is a new device
++    let (code, _, _) = drive(&server, fake, server.after("POST", 3)).await;
++    assert_eq!(code, 0);
++    let seen = server.seen();
++    let by = |method: &str, n: usize| -> Vec<usize> {
++        let suffix = format!("-{n}");
++        seen.iter()
++            .enumerate()
++            .filter(|(_, s)| s.method == method && s.headers["authorization"].ends_with(&suffix))
++            .map(|(at, _)| at)
++            .collect()
++    };
++    for n in 1..=2 {
++        let deletes = by("DELETE", n);
++        assert_eq!(deletes.len(), 1, "one delete for device {n}");
++        let next_post = by("POST", n + 1)[0];
++        assert!(
++            deletes[0] < next_post,
++            "device {n}'s record goes before device {} posts",
++            n + 1
++        );
++        assert_eq!(seen[deletes[0]].path, post_path());
++    }
++    // The last device's record goes when the run stops.
++    assert_eq!(by("DELETE", 3).len(), 1);
++    assert_eq!(seen.last().unwrap().method, "DELETE");
++}
++
++#[tokio::test]
++async fn a_401_leaves_nothing_to_delete_before_the_re_mint() {
++    let server = Server::start(vec![status(401), ok(Some("60"))]).await;
++    let (fake, _) = Fake::new();
++    let (code, _, _) = drive(&server, fake, server.after("POST", 3)).await;
++    assert_eq!(code, 0);
++    let methods: Vec<String> = server.seen().into_iter().map(|s| s.method).collect();
++    assert_eq!(methods, ["POST", "POST", "POST", "DELETE"]);
 +}
 +
 +#[tokio::test]
@@ -1871,6 +2165,16 @@ index 0000000..eb2075c
 +
 +    let (_, name) = resolve_identity(None, Some(42), Some("explicit".into())).expect("ids only");
 +    assert_eq!(name, "42");
++
++    // Half a pair is not mixed with the directory's other half; the
++    // directory supplies the whole identity, as in xbl-check.
++    let (identity, _) =
++        resolve_identity(Some(dir.path()), Some(42), None).expect("the directory's identity");
++    assert_eq!(identity.title_id, 0x69C7_AA31);
++    assert_eq!(identity.client_id, "cb41e2e1-503c-48ac-98b6-55b194b4ab66");
++    let (identity, _) = resolve_identity(Some(dir.path()), None, Some("explicit".into()))
++        .expect("the directory's identity");
++    assert_eq!(identity.client_id, "cb41e2e1-503c-48ac-98b6-55b194b4ab66");
 +}
 +
 +#[test]
