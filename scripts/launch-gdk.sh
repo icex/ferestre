@@ -78,9 +78,16 @@ fi
 close_lock() { if [ -n "$lock_fd" ]; then "$@" {lock_fd}>&-; else "$@"; fi; }
 
 # The service backs xgameruntime's Xbox-side calls; start it if it isn't up.
+# Background the command itself, not `close_lock`: a backgrounded function
+# runs in a forked subshell that would keep the descriptor open for as long as
+# the service lives.
 if ! pgrep -x xodus-service >/dev/null; then
     rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/xodus.sock"
-    close_lock nohup "$XODUS_CLI_DIR/xodus-service" >"${TMPDIR:-/tmp}/xodus-service.log" 2>&1 &
+    if [ -n "$lock_fd" ]; then
+        nohup "$XODUS_CLI_DIR/xodus-service" {lock_fd}>&- >"${TMPDIR:-/tmp}/xodus-service.log" 2>&1 &
+    else
+        nohup "$XODUS_CLI_DIR/xodus-service" >"${TMPDIR:-/tmp}/xodus-service.log" 2>&1 &
+    fi
     sleep 2
 fi
 

@@ -1592,12 +1592,16 @@ impl Forwarding {
             loop {
                 match read.read(&mut byte) {
                     Ok(1) => {
-                        let pid = *forwarded.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(pid) = pid {
-                            // Safety: the title is not reaped while this
-                            // holds its pid; see `wait`.
+                        // Keep the guard across the kill: `wait` clears the
+                        // pid under the same lock before it reaps the title,
+                        // so the pid cannot be reaped and reused in between.
+                        let guard = forwarded.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(pid) = *guard {
+                            // Safety: an unreaped child of ours while the
+                            // guard is held; see `wait`.
                             unsafe { libc::kill(pid, libc::c_int::from(byte[0])) };
                         }
+                        drop(guard);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     _ => break,
