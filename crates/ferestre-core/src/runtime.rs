@@ -155,9 +155,17 @@ impl InstalledRuntime {
 }
 
 /// A published runtime archive, found from the normal GitHub release feed.
+///
+/// Everything here has been checked to be safe to use as a path component:
+/// [`Release::version`] names the runtime's directory and
+/// [`Release::asset_name`] the cached archive, so neither may climb out of
+/// the directory it is joined to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
     pub tag: String,
+    /// The tag without its `runtime-` prefix ([`release_version`]).
+    pub version: String,
+    /// Always exactly [`archive_name`] of the version.
     pub asset_name: String,
     pub url: String,
     /// The minisign signature published beside the archive
@@ -165,6 +173,13 @@ pub struct Release {
     /// an archive that has none; see [`crate::signing`] and
     /// [`crate::http::download_signed`].
     pub signature_url: Option<String>,
+}
+
+impl Release {
+    /// What the archive's signature has to have been made for.
+    pub fn artefact(&self) -> crate::signing::Artefact<'_> {
+        crate::signing::Artefact::new(&self.asset_name, &self.version)
+    }
 }
 
 #[derive(Deserialize)]
@@ -179,32 +194,138 @@ struct GithubAsset {
     browser_download_url: String,
 }
 
+/// Whether `name` is one ordinary path component: joined to a directory, it
+/// names something directly inside it and nothing else.
+fn one_component(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(only)), None) if only == std::ffi::OsStr::new(name)
+    )
+}
+
+/// The version a runtime release tag names: `runtime-11.0.20261018` is
+/// `11.0.20261018`. It becomes a directory name, so it must start with a
+/// letter or digit and hold only letters, digits, `.`, `-` and `_`.
+pub fn release_version(tag: &str) -> anyhow::Result<&str> {
+    tag.strip_prefix("runtime-")
+        .filter(|version| {
+            version.starts_with(|c: char| c.is_ascii_alphanumeric())
+                && version
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+                && one_component(version)
+        })
+        .ok_or_else(|| anyhow::anyhow!("runtime release has an unsafe version: {tag}"))
+}
+
+/// The one archive name a runtime release of `version` may publish.
+pub fn archive_name(version: &str) -> String {
+    format!("ferestre-runtime-{version}.tar.xz")
+}
+
 /// Select the newest runtime release in GitHub's reverse-chronological release
 /// feed. It deliberately ignores launcher releases and checksum files.
+///
+/// The archive is taken only under its exact name,
+/// `ferestre-runtime-<version>.tar.xz` for the tag `runtime-<version>`, and
+/// its signature only as that name plus `.minisig`. The newest runtime release
+/// that publishes some other archive-like name, or whose tag is not a usable
+/// version, is an error rather than a reason to fall back to an older one.
 pub fn latest_release(json: &str) -> anyhow::Result<Release> {
+    find_release(json)?
+        .ok_or_else(|| anyhow::anyhow!("no runtime archive was published in the Ferestre releases"))
+}
+
+/// [`latest_release`] for one page of the feed: `None` when the page holds
+/// no runtime release at all, so the caller can look at the next page, and
+/// an error when the newest one it holds cannot be used.
+pub fn find_release(json: &str) -> anyhow::Result<Option<Release>> {
     let releases: Vec<GithubRelease> = serde_json::from_str(json)?;
     for release in releases {
         if !release.tag_name.starts_with("runtime-") {
             continue;
         }
-        if let Some(asset) = release.assets.iter().find(|asset| {
-            asset.name.starts_with("ferestre-runtime-") && asset.name.ends_with(".tar.xz")
-        }) {
-            let signature = format!("{}.minisig", asset.name);
-            let signature_url = release
+        let looks_like_archive =
+            |name: &str| name.starts_with("ferestre-runtime-") && name.ends_with(".tar.xz");
+        if !release
+            .assets
+            .iter()
+            .any(|asset| looks_like_archive(&asset.name))
+        {
+            continue;
+        }
+        let version = release_version(&release.tag_name)?;
+        let expected = archive_name(version);
+        let Some(asset) = release.assets.iter().find(|asset| asset.name == expected) else {
+            let published: Vec<&str> = release
                 .assets
                 .iter()
-                .find(|other| other.name == signature)
-                .map(|other| other.browser_download_url.clone());
-            return Ok(Release {
-                tag: release.tag_name.clone(),
-                asset_name: asset.name.clone(),
-                url: asset.browser_download_url.clone(),
-                signature_url,
-            });
+                .map(|asset| asset.name.as_str())
+                .filter(|name| looks_like_archive(name))
+                .collect();
+            anyhow::bail!(
+                "runtime release {} publishes {} instead of {expected}; it was not used",
+                release.tag_name,
+                published.join(", ")
+            );
+        };
+        if !one_component(&asset.name) {
+            anyhow::bail!(
+                "runtime release {} has an unsafe archive name",
+                release.tag_name
+            );
         }
+        let signature = format!("{}{}", asset.name, crate::signing::SIGNATURE_SUFFIX);
+        let signature_url = release
+            .assets
+            .iter()
+            .find(|other| other.name == signature)
+            .map(|other| other.browser_download_url.clone());
+        return Ok(Some(Release {
+            tag: release.tag_name.clone(),
+            version: version.to_string(),
+            asset_name: asset.name.clone(),
+            url: asset.browser_download_url.clone(),
+            signature_url,
+        }));
     }
-    anyhow::bail!("no runtime archive was published in the Ferestre releases")
+    Ok(None)
+}
+
+/// The exit status of `ferestre install-runtime` when it refused to replace
+/// a newer installed runtime with an older release. The window asks, and runs
+/// it again with `--allow-downgrade` if the person agrees.
+pub const EXIT_DOWNGRADE_REFUSED: u8 = 3;
+
+/// The numbers in a version, in order, for comparing releases: `11.0.10`
+/// is newer than `11.0.9`, and `11.0.1-2` than `11.0.1`.
+fn version_numbers(version: &str) -> Vec<u64> {
+    version
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse().unwrap_or(u64::MAX))
+        .collect()
+}
+
+/// Compare two release versions by their numbers.
+pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    version_numbers(a).cmp(&version_numbers(b))
+}
+
+/// The newest runtime `install-runtime` put in `runtimes_dir` that is newer
+/// than `version`, by the release version it was installed as (its
+/// directory's name). `None` when installing `version` is not a downgrade.
+pub fn newer_installed(runtimes_dir: &Path, version: &str) -> Option<String> {
+    std::fs::read_dir(runtimes_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            (!name.starts_with('.') && InstalledRuntime::at(&entry.path()).is_ok()).then_some(name)
+        })
+        .filter(|name| compare_versions(name, version).is_gt())
+        .max_by(|a, b| compare_versions(a, b).then_with(|| a.cmp(b)))
 }
 
 /// Every valid runtime in a directory of versioned runtime installs. Invalid
@@ -226,15 +347,8 @@ pub fn installed(dir: &Path) -> Vec<InstalledRuntime> {
 /// `ferestre-11.0.20261017.1` must precede `xodus-...20261013.3`, and build 10
 /// must precede build 9. Keep the full name/path as deterministic tie breakers.
 fn runtime_order(a: &InstalledRuntime, b: &InstalledRuntime) -> std::cmp::Ordering {
-    let numbers = |runtime: &InstalledRuntime| -> Vec<u64> {
-        runtime
-            .version
-            .as_deref()
-            .unwrap_or_default()
-            .split(|c: char| !c.is_ascii_digit())
-            .filter(|part| !part.is_empty())
-            .map(|part| part.parse().unwrap_or(u64::MAX))
-            .collect()
+    let numbers = |runtime: &InstalledRuntime| {
+        version_numbers(runtime.version.as_deref().unwrap_or_default())
     };
     numbers(b)
         .cmp(&numbers(a))
@@ -1363,6 +1477,113 @@ hangs"""
         )
         .unwrap();
         assert_eq!(unsigned.signature_url, None);
+    }
+
+    fn feed(tag: &str, assets: &[&str]) -> String {
+        let assets: Vec<serde_json::Value> = assets
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "browser_download_url": format!("https://example.invalid/{tag}/{name}"),
+                })
+            })
+            .collect();
+        serde_json::json!([{ "tag_name": tag, "assets": assets }]).to_string()
+    }
+
+    /// The archive's name and the runtime's directory both come from the
+    /// feed; each is taken only in the one shape that stays inside the
+    /// directory it is joined to.
+    #[test]
+    fn a_release_is_taken_only_under_its_exact_archive_name() {
+        let release = latest_release(&feed(
+            "runtime-11.0.5",
+            &[
+                "ferestre-runtime-11.0.5.tar.xz.minisig",
+                "ferestre-runtime-11.0.5.tar.xz",
+            ],
+        ))
+        .unwrap();
+        assert_eq!(release.version, "11.0.5");
+        assert_eq!(release.asset_name, "ferestre-runtime-11.0.5.tar.xz");
+        assert_eq!(
+            release.artefact(),
+            crate::signing::Artefact::new("ferestre-runtime-11.0.5.tar.xz", "11.0.5")
+        );
+        assert!(release.signature_url.is_some());
+
+        for (tag, asset) in [
+            // Another release's archive under this tag.
+            ("runtime-11.0.5", "ferestre-runtime-11.0.4.tar.xz"),
+            // Names that would leave the cache directory.
+            ("runtime-11.0.5", "ferestre-runtime-11.0.5/../../x.tar.xz"),
+            ("runtime-11.0.5", "ferestre-runtime-/../11.0.5.tar.xz"),
+            // Versions that would leave the runtimes directory, or hide in it.
+            ("runtime-..", "ferestre-runtime-...tar.xz"),
+            ("runtime-../11", "ferestre-runtime-../11.tar.xz"),
+            ("runtime-.11", "ferestre-runtime-.11.tar.xz"),
+            ("runtime-", "ferestre-runtime-.tar.xz"),
+            ("runtime-11/0", "ferestre-runtime-11/0.tar.xz"),
+        ] {
+            let error = latest_release(&feed(tag, &[asset]))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("not used") || error.contains("unsafe"),
+                "{tag} {asset}: {error}"
+            );
+        }
+        // An unusable newest release is an error, not a quiet fall back to
+        // the one before it.
+        let two = format!(
+            "[{},{}]",
+            feed("runtime-11.0.6", &["ferestre-runtime-11.0.6-hotfix.tar.xz"])
+                .trim_matches(|c| c == '[' || c == ']'),
+            feed("runtime-11.0.5", &["ferestre-runtime-11.0.5.tar.xz"])
+                .trim_matches(|c| c == '[' || c == ']'),
+        );
+        assert!(latest_release(&two).is_err());
+        // A signature under any other name is not this archive's.
+        let release = latest_release(&feed(
+            "runtime-11.0.5",
+            &[
+                "ferestre-runtime-11.0.5.tar.xz",
+                "ferestre-runtime-11.0.5.minisig",
+            ],
+        ))
+        .unwrap();
+        assert_eq!(release.signature_url, None);
+    }
+
+    #[test]
+    fn release_versions_compare_by_their_numbers() {
+        use std::cmp::Ordering::*;
+        assert_eq!(compare_versions("11.0.10", "11.0.9"), Greater);
+        assert_eq!(compare_versions("11.0.20261018", "11.0.20261017"), Greater);
+        assert_eq!(compare_versions("11.0.1-2", "11.0.1"), Greater);
+        assert_eq!(compare_versions("10.9", "11.0"), Less);
+        assert_eq!(compare_versions("11.0.1", "11.0.1"), Equal);
+    }
+
+    #[test]
+    fn a_downgrade_is_found_against_the_installed_release_versions() {
+        let root = TempDir::new("runtime-downgrade");
+        for version in ["11.0.9", "11.0.10", ".11.0.99.installing-1", "12.0.0"] {
+            let dir = root.path().join(version);
+            std::fs::create_dir_all(&dir).unwrap();
+            if version != "12.0.0" {
+                // 12.0.0 is a directory a download left, not a runtime.
+                std::fs::write(dir.join("proton"), "#!/bin/sh\n").unwrap();
+            }
+        }
+        assert_eq!(
+            newer_installed(root.path(), "11.0.2").as_deref(),
+            Some("11.0.10")
+        );
+        assert_eq!(newer_installed(root.path(), "11.0.10"), None);
+        assert_eq!(newer_installed(root.path(), "11.0.11"), None);
+        assert_eq!(newer_installed(&root.path().join("none"), "1"), None);
     }
 
     // --- assessment ----------------------------------------------------------

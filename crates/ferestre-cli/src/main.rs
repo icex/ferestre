@@ -169,7 +169,13 @@ enum Cmd {
     },
 
     /// Build and install the patched Proton runtime.
-    InstallRuntime,
+    InstallRuntime {
+        /// Install the newest published runtime even when it is older than
+        /// one already installed. Without this, that is refused: an older
+        /// release served as the newest is how a fixed bug gets brought back.
+        #[arg(long)]
+        allow_downgrade: bool,
+    },
 
     /// Inspect an Appx or Msix archive without extracting or launching it.
     InspectPackage {
@@ -242,7 +248,7 @@ fn dispatch(cli: &Cli) -> Result<ExitCode> {
             prefix,
             yes,
         } => cmd_uninstall(cli, product_id, *keep_files, *prefix, *yes),
-        Cmd::InstallRuntime => cmd_install_runtime(cli),
+        Cmd::InstallRuntime { allow_downgrade } => cmd_install_runtime(cli, *allow_downgrade),
         Cmd::InspectPackage { path } => cmd_inspect_package(cli, path),
         Cmd::Env => cmd_env(cli),
         Cmd::Version => cmd_version(cli),
@@ -2090,7 +2096,7 @@ const RELEASES_API: &str = "https://api.github.com/repos/icex/ferestre/releases"
 const RELEASE_PAGES: u32 = 10;
 const RELEASES_PER_PAGE: usize = 100;
 
-fn cmd_install_runtime(cli: &Cli) -> Result<ExitCode> {
+fn cmd_install_runtime(cli: &Cli, allow_downgrade: bool) -> Result<ExitCode> {
     let cancellation = cancel::Cancellation::from_gui();
     let paths = Paths::from_env()?;
     install_runtime(
@@ -2099,6 +2105,7 @@ fn cmd_install_runtime(cli: &Cli) -> Result<ExitCode> {
         RELEASES_API,
         ferestre_core::signing::RELEASE_PUBLIC_KEY,
         &cancellation,
+        allow_downgrade,
     )
 }
 
@@ -2108,6 +2115,7 @@ fn install_runtime(
     releases_api: &str,
     public_key: &str,
     cancellation: &cancel::Cancellation,
+    allow_downgrade: bool,
 ) -> Result<ExitCode> {
     eprintln!("-- checking for the latest Ferestre runtime");
     let release = newest_runtime_release(|page| {
@@ -2116,26 +2124,24 @@ fn install_runtime(
         ))
     })?;
     cancellation.check()?;
-    let version = release
-        .tag
-        .strip_prefix("runtime-")
-        .filter(|version| {
-            !version.is_empty()
-                && version
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-        })
-        .ok_or_else(|| anyhow!("runtime release has an unsafe version: {}", release.tag))?;
+    // Both were checked to be one plain path component when the feed was
+    // read (runtime::latest_release): the archive is exactly
+    // ferestre-runtime-<version>.tar.xz, and nothing else is joined or
+    // removed below.
+    let version = release.version.as_str();
     let destination = paths.runtimes_dir().join(version);
     let installed = InstalledRuntime::at(&destination).is_ok();
+    let newer = runtime::newer_installed(&paths.runtimes_dir(), version);
     // The document and nothing else on stdout, whatever the answer.
     if cli.json {
         print_json(&json!({
             "schema": JSON_SCHEMA,
             "release": release.tag,
+            "version": version,
             "asset": release.asset_name,
             "destination": destination,
             "installed": installed,
+            "newer_installed": newer,
         }));
         return Ok(ExitCode::SUCCESS);
     }
@@ -2145,6 +2151,20 @@ fn install_runtime(
             destination.display()
         );
         return Ok(ExitCode::SUCCESS);
+    }
+    if let Some(newer) = &newer {
+        if !allow_downgrade {
+            eprintln!(
+                "!! the newest published runtime, {version}, is older than runtime {newer}, \
+                 which is installed"
+            );
+            eprintln!(
+                "   nothing was downloaded; to install the older one anyway, run: \
+                 ferestre install-runtime --allow-downgrade"
+            );
+            return Ok(ExitCode::from(runtime::EXIT_DOWNGRADE_REFUSED));
+        }
+        eprintln!("-- installing runtime {version} beside the newer {newer}, as asked");
     }
 
     let cache = paths.cache_dir().join("runtime");
@@ -2173,6 +2193,7 @@ fn install_runtime(
     let downloaded = http::download_signed(
         &release.url,
         signature_url,
+        release.artefact(),
         &archive,
         || cancellation.requested(),
         public_key,
@@ -2246,7 +2267,9 @@ fn newest_runtime_release(fetch: impl Fn(u32) -> Result<String>) -> Result<runti
         let text = fetch(page)?;
         let releases: Vec<Value> =
             serde_json::from_str(&text).context("the release feed is not a JSON list")?;
-        if let Ok(release) = runtime::latest_release(&text) {
+        // The newest runtime release that cannot be used is an error, not a
+        // reason to look further back for an older one.
+        if let Some(release) = runtime::find_release(&text)? {
             return Ok(release);
         }
         if releases.len() < RELEASES_PER_PAGE {
@@ -6781,7 +6804,7 @@ summary = "Runs."
             routes.insert(
                 format!("/download/{name}.minisig"),
                 stranger
-                    .sign_with_comment(&format!("file:{name}"), &archive)
+                    .sign_with_comment(&format!("file:{name} version:{version}"), &archive)
                     .into_bytes(),
             );
         }
@@ -6793,6 +6816,7 @@ summary = "Runs."
                 &api,
                 &key.public(),
                 &cancel::Cancellation::default(),
+                false,
             )
         };
         let runtimes = paths.runtimes_dir();
@@ -6823,10 +6847,27 @@ summary = "Runs."
         assert!(!cached.exists(), "a bad download stays in the cache");
         assert!(!runtimes.join(version).exists());
 
+        // Signed with the release key, but for another release's version:
+        // the archive of one release served as another's.
         routes.lock().unwrap().insert(
             format!("/download/{name}.minisig"),
-            key.sign_with_comment(&format!("timestamp:1 file:{name}"), &archive)
+            key.sign_with_comment(&format!("file:{name} version:11.0.2"), &archive)
                 .into_bytes(),
+        );
+        let error = format!("{:#}", run(&cli()).unwrap_err());
+        assert!(
+            error.contains("version 11.0.2, not version 11.0.3"),
+            "{error}"
+        );
+        assert!(!runtimes.join(version).exists());
+
+        routes.lock().unwrap().insert(
+            format!("/download/{name}.minisig"),
+            key.sign_with_comment(
+                &format!("timestamp:1 file:{name} version:{version}"),
+                &archive,
+            )
+            .into_bytes(),
         );
         // A corrupt archive already in the cache is replaced, not reused.
         std::fs::write(&cached, b"corrupt").unwrap();
@@ -6845,6 +6886,72 @@ summary = "Runs."
         // Installed already: said so, and nothing fetched.
         routes.lock().unwrap().remove(&format!("/download/{name}"));
         assert_eq!(code(run(&cli()).unwrap()), code(ExitCode::SUCCESS));
+    }
+
+    /// An older release served as the newest is refused unless asked for, and
+    /// nothing is downloaded before the refusal.
+    #[test]
+    fn install_runtime_refuses_a_downgrade_unless_asked() {
+        use ferestre_core::signing::{testing::TestKey, Artefact};
+        let home = Home::new("install-runtime-downgrade");
+        let paths = home.paths();
+        let newer = paths.runtimes_dir().join("11.0.10");
+        std::fs::create_dir_all(&newer).unwrap();
+        std::fs::write(newer.join("proton"), "#!/bin/sh\n").unwrap();
+
+        let version = "11.0.9";
+        let name = format!("ferestre-runtime-{version}.tar.xz");
+        let archive = runtime_archive(home.root(), version);
+        let key = TestKey::new();
+        let routes = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let base = serve(Arc::clone(&routes));
+        let feed = json!([
+            { "tag_name": format!("runtime-{version}"), "assets": [
+                { "name": name, "browser_download_url": format!("{base}/download/{name}") },
+                {
+                    "name": format!("{name}.minisig"),
+                    "browser_download_url": format!("{base}/download/{name}.minisig"),
+                },
+            ]},
+        ]);
+        {
+            let mut routes = routes.lock().unwrap();
+            routes.insert("/releases".to_string(), feed.to_string().into_bytes());
+            routes.insert(
+                format!("/download/{name}.minisig"),
+                key.sign_as(Artefact::new(&name, version), &archive)
+                    .into_bytes(),
+            );
+        }
+        let api = format!("{base}/releases");
+        let run = |allow_downgrade: bool| {
+            install_runtime(
+                &cli(),
+                &paths,
+                &api,
+                &key.public(),
+                &cancel::Cancellation::default(),
+                allow_downgrade,
+            )
+        };
+        // The archive is not even served: a refusal must not need it.
+        assert_eq!(
+            code(run(false).unwrap()),
+            code(ExitCode::from(runtime::EXIT_DOWNGRADE_REFUSED))
+        );
+        assert!(!paths.runtimes_dir().join(version).exists());
+        assert!(!paths.cache_dir().join("runtime").join(&name).exists());
+
+        routes
+            .lock()
+            .unwrap()
+            .insert(format!("/download/{name}"), archive.clone());
+        assert_eq!(code(run(true).unwrap()), code(ExitCode::SUCCESS));
+        assert!(InstalledRuntime::at(&paths.runtimes_dir().join(version)).is_ok());
+        assert!(
+            InstalledRuntime::at(&newer).is_ok(),
+            "the newer one is kept"
+        );
     }
 
     /// Launcher releases are many and runtime releases few, so the newest
