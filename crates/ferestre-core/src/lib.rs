@@ -76,3 +76,5 @@ mod version_tests {
         assert_eq!(package_version(None), env!("CARGO_PKG_VERSION"));
     }
 }
+
+pub mod relocation;

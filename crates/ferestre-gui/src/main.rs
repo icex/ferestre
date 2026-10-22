@@ -432,6 +432,17 @@ fn build_ui(app: &adw::Application) {
         presence: Rc::new(RefCell::new(Default::default())),
     };
 
+    ui.download.cancel.connect_clicked(glib::clone!(
+        #[strong]
+        ui,
+        move |button| {
+            if let Some(control) = ui.download_control.borrow().as_ref() {
+                control.stop();
+            }
+            button.set_sensitive(false);
+            show_activity(&ui);
+        }
+    ));
     window.connect_close_request(glib::clone!(
         #[strong]
         ui,
@@ -1738,6 +1749,14 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
             item(icon, label, Box::new(move || run(&ui, &product_id, &name)));
         }
     }
+    if row.installed && row.action != Action::Stop && row.action != Action::Installing {
+        let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
+        item(
+            "folder-move-symbolic",
+            "Move location",
+            Box::new(move || choose_move(&ui, &product_id, &name)),
+        );
+    }
     // Anything on disk can be removed, recipe or not -- and the rows that most
     // need it are the ones with no recipe, or a download that stopped, because
     // a failed install leaves exactly that. Not while it runs: its files, and
@@ -2646,6 +2665,7 @@ struct DownloadBar {
     title: gtk::Label,
     detail: gtk::Label,
     bar: gtk::ProgressBar,
+    cancel: gtk::Button,
     /// Written by the thread reading the client's output, read by the tick.
     /// A mutex rather than a channel because only the newest number matters --
     /// a queue of stale byte counts would be drained and thrown away.
@@ -2677,11 +2697,17 @@ impl DownloadBar {
         root.append(&title);
         root.append(&bar);
         root.append(&detail);
+        let cancel = gtk::Button::builder()
+            .label("Cancel")
+            .halign(gtk::Align::End)
+            .build();
+        root.append(&cancel);
         DownloadBar {
             root,
             title,
             detail,
             bar,
+            cancel,
             seen: Arc::new(Mutex::new(None)),
             current: Rc::new(RefCell::new(None)),
         }
@@ -2692,6 +2718,12 @@ impl DownloadBar {
         *self.seen.lock().unwrap() = None;
         self.title.set_label(&download.heading());
         *self.current.borrow_mut() = Some(download);
+        self.cancel.set_sensitive(true);
+        self.cancel.set_label(if what == "Moving" {
+            "Cancel Move"
+        } else {
+            "Stop Download"
+        });
         self.detail.set_label("Starting");
         self.bar.set_fraction(0.0);
         self.root.set_visible(true);
@@ -2734,6 +2766,17 @@ impl DownloadBar {
 /// second. A client too old to know about that simply prints nothing this can
 /// read, and the bar stays indeterminate rather than breaking.
 fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&Path>, what: &str) {
+    spawn_transfer(ui, product_id, name, dir, what, "install");
+}
+
+fn spawn_transfer(
+    ui: &Ui,
+    product_id: &str,
+    name: &str,
+    dir: Option<&Path>,
+    what: &str,
+    command_name: &str,
+) {
     if !begin(ui, &format!("{what} {name}")) {
         report_busy(ui);
         return;
@@ -2742,7 +2785,7 @@ fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&Path>, what
     *ui.download_control.borrow_mut() = Some(control.clone());
     show_activity(ui);
     let program = cli_binary();
-    let mut args: Vec<std::ffi::OsString> = vec!["install".into(), product_id.into()];
+    let mut args: Vec<std::ffi::OsString> = vec![command_name.into(), product_id.into()];
     if let Some(dir) = dir {
         args.push(dir.as_os_str().to_owned());
     }
@@ -2765,6 +2808,7 @@ fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&Path>, what
     let ui = ui.clone();
     let what = what.to_string();
     let name = name.to_string();
+    let moving = command_name == "move";
     glib::spawn_future_local(async move {
         let result = gio::spawn_blocking(move || {
             let mut command = std::process::Command::new(&program);
@@ -2811,9 +2855,11 @@ fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&Path>, what
             }
             _ if stopped => {
                 ui.model.borrow_mut().reload();
-                ui.toasts.add_toast(toast(
-                    "Download stopped. Downloaded files kept for resuming.",
-                ));
+                ui.toasts.add_toast(toast(if moving {
+                    "Move stopped. Original installation kept."
+                } else {
+                    "Download stopped. Downloaded files kept for resuming."
+                }));
             }
             Ok(Ok(status)) => {
                 ui.model.borrow_mut().reload();
@@ -3759,7 +3805,10 @@ fn show_activity(ui: &Ui) {
         .borrow()
         .as_ref()
         .is_some_and(|c| c.requested());
-    let detail = if closing && stopping {
+    let moving = what.starts_with("Moving ");
+    let detail = if moving && stopping {
+        "Stopping the move and cleaning up. The original installation is kept."
+    } else if closing && stopping {
         "Stopping the download and cleaning up. Ferestre will close when it is safe."
     } else if stopping {
         "Stopping the download and cleaning up. The window will stay open when cleanup finishes."
@@ -3859,7 +3908,10 @@ fn request_close(ui: &Ui) -> glib::Propagation {
         return glib::Propagation::Stop;
     }
     let downloading = ui.download_control.borrow().is_some();
-    let body = if downloading {
+    let moving = what.starts_with("Moving ");
+    let body = if moving {
+        format!("{what} is still in progress. Closing will stop the move and wait for cleanup. The original installation will be kept.")
+    } else if downloading {
         format!("{what} is still in progress. Closing will stop the download and wait for cleanup. Downloaded game files will be kept so you can resume later.")
     } else {
         format!("{what} is still in progress. Ferestre will finish this operation before closing. Please keep the app open while it finishes.")
@@ -3868,7 +3920,9 @@ fn request_close(ui: &Ui) -> glib::Propagation {
     dialog.add_response("cancel", "Keep Open");
     dialog.add_response(
         "close",
-        if downloading {
+        if moving {
+            "Stop Move and Close"
+        } else if downloading {
             "Stop Download and Close"
         } else {
             "Finish and Close"
@@ -4844,4 +4898,183 @@ mod catalog_regressions {
             }
         }
     }
+}
+
+/// Validate the selected library in the CLI, off the UI thread, before offering
+/// Move. The CLI repeats the check under the title lock when the move starts.
+fn choose_move(ui: &Ui, product_id: &str, name: &str) {
+    if ui.busy.borrow().is_some() {
+        report_busy(ui);
+        return;
+    }
+    let library = ui
+        .model
+        .borrow()
+        .paths
+        .as_ref()
+        .map(|p| p.games_dir().to_path_buf());
+    let Some(library) = library else {
+        return;
+    };
+    let dialog = adw::AlertDialog::new(Some(&format!("Move {name}?")),
+        Some("Choose a library folder. The game gets its own folder inside it. Files are verified before the original is removed. Saves stay in their current location."));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("move", "Move");
+    dialog.set_response_appearance("move", adw::ResponseAppearance::Suggested);
+    dialog.set_close_response("cancel");
+    dialog.set_response_enabled("move", false);
+    let entry = adw::EntryRow::builder()
+        .title("Move to")
+        .text(library.to_string_lossy())
+        .build();
+    let browse = gtk::Button::builder()
+        .icon_name("folder-open-symbolic")
+        .valign(gtk::Align::Center)
+        .tooltip_text("Choose folder")
+        .build();
+    entry.add_suffix(&browse);
+    let group = adw::PreferencesGroup::new();
+    group.add(&entry);
+    let detail = gtk::Label::builder()
+        .label("Choose a destination, then check its space.")
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["caption"])
+        .build();
+    let check = gtk::Button::with_label("Check space");
+    let extra = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    extra.append(&group);
+    extra.append(&detail);
+    extra.append(&check);
+    dialog.set_extra_child(Some(&extra));
+    let chosen = Rc::new(RefCell::new(None::<PathBuf>));
+    let generation = Rc::new(std::cell::Cell::new(0u64));
+    entry.connect_changed(glib::clone!(
+        #[strong]
+        dialog,
+        #[strong]
+        chosen,
+        #[strong]
+        detail,
+        #[strong]
+        generation,
+        move |_| {
+            generation.set(generation.get() + 1);
+            *chosen.borrow_mut() = None;
+            dialog.set_response_enabled("move", false);
+            detail.set_label("Check space for this destination.");
+        }
+    ));
+    let window = ui.window.clone();
+    browse.connect_clicked(glib::clone!(
+        #[strong]
+        entry,
+        #[strong]
+        window,
+        move |_| {
+            let chooser = gtk::FileDialog::builder()
+                .title("Choose library folder")
+                .build();
+            chooser.select_folder(
+                Some(&window),
+                None::<&gio::Cancellable>,
+                glib::clone!(
+                    #[strong]
+                    entry,
+                    move |result| {
+                        if let Ok(folder) = result {
+                            if let Some(path) = folder.path() {
+                                entry.set_text(&path.to_string_lossy());
+                            }
+                        }
+                    }
+                ),
+            );
+        }
+    ));
+    let product = product_id.to_string();
+    check.connect_clicked(glib::clone!(
+        #[strong]
+        entry,
+        #[strong]
+        detail,
+        #[strong]
+        dialog,
+        #[strong]
+        chosen,
+        #[strong]
+        generation,
+        move |button| {
+            let text = entry.text().to_string();
+            let path = if text == "~" {
+                std::env::var_os("HOME").map(PathBuf::from)
+            } else if let Some(rest) = text.strip_prefix("~/") {
+                std::env::var_os("HOME").map(|p| PathBuf::from(p).join(rest))
+            } else {
+                Some(PathBuf::from(text))
+            };
+            let Some(path) = path else {
+                return;
+            };
+            let product = product.clone();
+            let revision = generation.get();
+            let button = button.clone();
+            button.set_sensitive(false);
+            detail.set_label("Checking files and destination space…");
+            let detail = detail.clone();
+            let dialog = dialog.clone();
+            let chosen = chosen.clone();
+            let generation = generation.clone();
+            glib::spawn_future_local(async move {
+                let result = gio::spawn_blocking(move || {
+                    let out = std::process::Command::new(cli_binary())
+                        .args(["--json", "move", &product])
+                        .arg(&path)
+                        .output()
+                        .map_err(|e| e.to_string())?;
+                    if !out.status.success() {
+                        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+                    }
+                    let plan: serde_json::Value =
+                        serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+                    Ok((path, plan))
+                })
+                .await;
+                button.set_sensitive(true);
+                if revision != generation.get() {
+                    return;
+                }
+                match result {
+                    Ok(Ok((path, plan))) => {
+                        detail.set_label(&format!(
+                            "{} → {}. {} free.{}",
+                            ferestre_core::human_bytes(plan["bytes"].as_u64().unwrap_or(0)),
+                            plan["destination"].as_str().unwrap_or(""),
+                            ferestre_core::human_bytes(plan["available"].as_u64().unwrap_or(0)),
+                            if plan["same_filesystem"] == true {
+                                " Same drive: moves immediately."
+                            } else {
+                                " Includes copying and verification."
+                            }
+                        ));
+                        *chosen.borrow_mut() = Some(path);
+                        dialog.set_response_enabled("move", true);
+                    }
+                    Ok(Err(error)) => detail.set_label(&error),
+                    Err(_) => detail.set_label("Could not check destination"),
+                }
+            });
+        }
+    ));
+    let ui = ui.clone();
+    let product = product_id.to_string();
+    let name = name.to_string();
+    dialog.connect_response(None, move |_, response| {
+        if response == "move" {
+            if let Some(path) = chosen.borrow().as_ref() {
+                spawn_transfer(&ui, &product, &name, Some(path), "Moving", "move");
+            }
+        }
+    });
+    dialog.present(Some(&window));
 }

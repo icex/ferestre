@@ -236,6 +236,24 @@ Downloads are cached, and copied artwork lives in Steam's own `config/grid`
 directory. Two games that share a name, such as two editions, get a shortcut
 each. Close Steam before adding or updating a shortcut.
 
+### Move an installed game
+
+In a game's **More actions** menu, choose **Move location**, select an existing
+library folder and choose **Check space**. Ferestre shows the game's size, its
+new folder and the space available before enabling **Move**. The window shows
+progress and offers **Cancel Move**.
+
+The CLI does the same with `ferestre move PRODUCT-ID /path/to/library`.
+`ferestre --json move PRODUCT-ID /path/to/library` checks the plan without
+moving files. An existing destination is never merged or overwritten, and a
+running game cannot be moved.
+
+Across drives, Ferestre copies and verifies the files before updating the
+installation record and removing the original. Cancellation or a copy failure
+keeps the original installation. On one filesystem it stages hard links without
+duplicating the game data. Prefixes and saved games keep their existing paths;
+launches and Steam shortcuts follow the updated installation record.
+
 ## Documentation
 
 - [docs/RECIPES.md](docs/RECIPES.md) — build the runtime, sign in, download a
