@@ -4652,6 +4652,185 @@ fn fetch_icons(ui: &Ui, product_ids: Vec<String>) {
     });
 }
 
+/// Validate the selected library in the CLI, off the UI thread, before offering
+/// Move. The CLI repeats the check under the title lock when the move starts.
+fn choose_move(ui: &Ui, product_id: &str, name: &str) {
+    if ui.busy.borrow().is_some() {
+        report_busy(ui);
+        return;
+    }
+    let library = ui
+        .model
+        .borrow()
+        .paths
+        .as_ref()
+        .map(|p| p.games_dir().to_path_buf());
+    let Some(library) = library else {
+        return;
+    };
+    let dialog = adw::AlertDialog::new(Some(&format!("Move {name}?")),
+        Some("Choose a library folder. The game gets its own folder inside it. Files are verified before the original is removed. Saves stay in their current location."));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("move", "Move");
+    dialog.set_response_appearance("move", adw::ResponseAppearance::Suggested);
+    dialog.set_close_response("cancel");
+    dialog.set_response_enabled("move", false);
+    let entry = adw::EntryRow::builder()
+        .title("Move to")
+        .text(library.to_string_lossy())
+        .build();
+    let browse = gtk::Button::builder()
+        .icon_name("folder-open-symbolic")
+        .valign(gtk::Align::Center)
+        .tooltip_text("Choose folder")
+        .build();
+    entry.add_suffix(&browse);
+    let group = adw::PreferencesGroup::new();
+    group.add(&entry);
+    let detail = gtk::Label::builder()
+        .label("Choose a destination, then check its space.")
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["caption"])
+        .build();
+    let check = gtk::Button::with_label("Check space");
+    let extra = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    extra.append(&group);
+    extra.append(&detail);
+    extra.append(&check);
+    dialog.set_extra_child(Some(&extra));
+    let chosen = Rc::new(RefCell::new(None::<PathBuf>));
+    let generation = Rc::new(std::cell::Cell::new(0u64));
+    entry.connect_changed(glib::clone!(
+        #[strong]
+        dialog,
+        #[strong]
+        chosen,
+        #[strong]
+        detail,
+        #[strong]
+        generation,
+        move |_| {
+            generation.set(generation.get() + 1);
+            *chosen.borrow_mut() = None;
+            dialog.set_response_enabled("move", false);
+            detail.set_label("Check space for this destination.");
+        }
+    ));
+    let window = ui.window.clone();
+    browse.connect_clicked(glib::clone!(
+        #[strong]
+        entry,
+        #[strong]
+        window,
+        move |_| {
+            let chooser = gtk::FileDialog::builder()
+                .title("Choose library folder")
+                .build();
+            chooser.select_folder(
+                Some(&window),
+                None::<&gio::Cancellable>,
+                glib::clone!(
+                    #[strong]
+                    entry,
+                    move |result| {
+                        if let Ok(folder) = result {
+                            if let Some(path) = folder.path() {
+                                entry.set_text(&path.to_string_lossy());
+                            }
+                        }
+                    }
+                ),
+            );
+        }
+    ));
+    let product = product_id.to_string();
+    check.connect_clicked(glib::clone!(
+        #[strong]
+        entry,
+        #[strong]
+        detail,
+        #[strong]
+        dialog,
+        #[strong]
+        chosen,
+        #[strong]
+        generation,
+        move |button| {
+            let text = entry.text().to_string();
+            let path = if text == "~" {
+                std::env::var_os("HOME").map(PathBuf::from)
+            } else if let Some(rest) = text.strip_prefix("~/") {
+                std::env::var_os("HOME").map(|p| PathBuf::from(p).join(rest))
+            } else {
+                Some(PathBuf::from(text))
+            };
+            let Some(path) = path else {
+                return;
+            };
+            let product = product.clone();
+            let revision = generation.get();
+            let button = button.clone();
+            button.set_sensitive(false);
+            detail.set_label("Checking files and destination space…");
+            let detail = detail.clone();
+            let dialog = dialog.clone();
+            let chosen = chosen.clone();
+            let generation = generation.clone();
+            glib::spawn_future_local(async move {
+                let result = gio::spawn_blocking(move || {
+                    let out = std::process::Command::new(cli_binary())
+                        .args(["--json", "move", &product])
+                        .arg(&path)
+                        .output()
+                        .map_err(|e| e.to_string())?;
+                    if !out.status.success() {
+                        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+                    }
+                    let plan: serde_json::Value =
+                        serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+                    Ok((path, plan))
+                })
+                .await;
+                button.set_sensitive(true);
+                if revision != generation.get() {
+                    return;
+                }
+                match result {
+                    Ok(Ok((path, plan))) => {
+                        detail.set_label(&format!(
+                            "{} → {}. {} free.{}",
+                            ferestre_core::human_bytes(plan["bytes"].as_u64().unwrap_or(0)),
+                            plan["destination"].as_str().unwrap_or(""),
+                            ferestre_core::human_bytes(plan["available"].as_u64().unwrap_or(0)),
+                            if plan["same_filesystem"] == true {
+                                " Same drive: moves immediately."
+                            } else {
+                                " Includes copying and verification."
+                            }
+                        ));
+                        *chosen.borrow_mut() = Some(path);
+                        dialog.set_response_enabled("move", true);
+                    }
+                    Ok(Err(error)) => detail.set_label(&error),
+                    Err(_) => detail.set_label("Could not check destination"),
+                }
+            });
+        }
+    ));
+    let ui = ui.clone();
+    let product = product_id.to_string();
+    let name = name.to_string();
+    dialog.connect_response(None, move |_, response| {
+        if response == "move" {
+            if let Some(path) = chosen.borrow().as_ref() {
+                spawn_transfer(&ui, &product, &name, Some(path), "Moving", "move");
+            }
+        }
+    });
+    dialog.present(Some(&window));
+}
+
 #[cfg(test)]
 mod catalog_regressions {
     use super::*;
@@ -4898,183 +5077,4 @@ mod catalog_regressions {
             }
         }
     }
-}
-
-/// Validate the selected library in the CLI, off the UI thread, before offering
-/// Move. The CLI repeats the check under the title lock when the move starts.
-fn choose_move(ui: &Ui, product_id: &str, name: &str) {
-    if ui.busy.borrow().is_some() {
-        report_busy(ui);
-        return;
-    }
-    let library = ui
-        .model
-        .borrow()
-        .paths
-        .as_ref()
-        .map(|p| p.games_dir().to_path_buf());
-    let Some(library) = library else {
-        return;
-    };
-    let dialog = adw::AlertDialog::new(Some(&format!("Move {name}?")),
-        Some("Choose a library folder. The game gets its own folder inside it. Files are verified before the original is removed. Saves stay in their current location."));
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("move", "Move");
-    dialog.set_response_appearance("move", adw::ResponseAppearance::Suggested);
-    dialog.set_close_response("cancel");
-    dialog.set_response_enabled("move", false);
-    let entry = adw::EntryRow::builder()
-        .title("Move to")
-        .text(library.to_string_lossy())
-        .build();
-    let browse = gtk::Button::builder()
-        .icon_name("folder-open-symbolic")
-        .valign(gtk::Align::Center)
-        .tooltip_text("Choose folder")
-        .build();
-    entry.add_suffix(&browse);
-    let group = adw::PreferencesGroup::new();
-    group.add(&entry);
-    let detail = gtk::Label::builder()
-        .label("Choose a destination, then check its space.")
-        .xalign(0.0)
-        .wrap(true)
-        .css_classes(["caption"])
-        .build();
-    let check = gtk::Button::with_label("Check space");
-    let extra = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    extra.append(&group);
-    extra.append(&detail);
-    extra.append(&check);
-    dialog.set_extra_child(Some(&extra));
-    let chosen = Rc::new(RefCell::new(None::<PathBuf>));
-    let generation = Rc::new(std::cell::Cell::new(0u64));
-    entry.connect_changed(glib::clone!(
-        #[strong]
-        dialog,
-        #[strong]
-        chosen,
-        #[strong]
-        detail,
-        #[strong]
-        generation,
-        move |_| {
-            generation.set(generation.get() + 1);
-            *chosen.borrow_mut() = None;
-            dialog.set_response_enabled("move", false);
-            detail.set_label("Check space for this destination.");
-        }
-    ));
-    let window = ui.window.clone();
-    browse.connect_clicked(glib::clone!(
-        #[strong]
-        entry,
-        #[strong]
-        window,
-        move |_| {
-            let chooser = gtk::FileDialog::builder()
-                .title("Choose library folder")
-                .build();
-            chooser.select_folder(
-                Some(&window),
-                None::<&gio::Cancellable>,
-                glib::clone!(
-                    #[strong]
-                    entry,
-                    move |result| {
-                        if let Ok(folder) = result {
-                            if let Some(path) = folder.path() {
-                                entry.set_text(&path.to_string_lossy());
-                            }
-                        }
-                    }
-                ),
-            );
-        }
-    ));
-    let product = product_id.to_string();
-    check.connect_clicked(glib::clone!(
-        #[strong]
-        entry,
-        #[strong]
-        detail,
-        #[strong]
-        dialog,
-        #[strong]
-        chosen,
-        #[strong]
-        generation,
-        move |button| {
-            let text = entry.text().to_string();
-            let path = if text == "~" {
-                std::env::var_os("HOME").map(PathBuf::from)
-            } else if let Some(rest) = text.strip_prefix("~/") {
-                std::env::var_os("HOME").map(|p| PathBuf::from(p).join(rest))
-            } else {
-                Some(PathBuf::from(text))
-            };
-            let Some(path) = path else {
-                return;
-            };
-            let product = product.clone();
-            let revision = generation.get();
-            let button = button.clone();
-            button.set_sensitive(false);
-            detail.set_label("Checking files and destination space…");
-            let detail = detail.clone();
-            let dialog = dialog.clone();
-            let chosen = chosen.clone();
-            let generation = generation.clone();
-            glib::spawn_future_local(async move {
-                let result = gio::spawn_blocking(move || {
-                    let out = std::process::Command::new(cli_binary())
-                        .args(["--json", "move", &product])
-                        .arg(&path)
-                        .output()
-                        .map_err(|e| e.to_string())?;
-                    if !out.status.success() {
-                        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-                    }
-                    let plan: serde_json::Value =
-                        serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
-                    Ok((path, plan))
-                })
-                .await;
-                button.set_sensitive(true);
-                if revision != generation.get() {
-                    return;
-                }
-                match result {
-                    Ok(Ok((path, plan))) => {
-                        detail.set_label(&format!(
-                            "{} → {}. {} free.{}",
-                            ferestre_core::human_bytes(plan["bytes"].as_u64().unwrap_or(0)),
-                            plan["destination"].as_str().unwrap_or(""),
-                            ferestre_core::human_bytes(plan["available"].as_u64().unwrap_or(0)),
-                            if plan["same_filesystem"] == true {
-                                " Same drive: moves immediately."
-                            } else {
-                                " Includes copying and verification."
-                            }
-                        ));
-                        *chosen.borrow_mut() = Some(path);
-                        dialog.set_response_enabled("move", true);
-                    }
-                    Ok(Err(error)) => detail.set_label(&error),
-                    Err(_) => detail.set_label("Could not check destination"),
-                }
-            });
-        }
-    ));
-    let ui = ui.clone();
-    let product = product_id.to_string();
-    let name = name.to_string();
-    dialog.connect_response(None, move |_, response| {
-        if response == "move" {
-            if let Some(path) = chosen.borrow().as_ref() {
-                spawn_transfer(&ui, &product, &name, Some(path), "Moving", "move");
-            }
-        }
-    });
-    dialog.present(Some(&window));
 }

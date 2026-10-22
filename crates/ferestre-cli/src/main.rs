@@ -4716,6 +4716,79 @@ fn print_json(value: &Value) {
 // tests
 // ---------------------------------------------------------------------------
 
+fn cmd_move(cli: &Cli, product_id: &str, library: &Path) -> Result<ExitCode> {
+    use ferestre_core::relocation;
+    if !is_product_id(product_id) {
+        return Err(usage("Not a Store product id (12 letters and digits)"));
+    }
+    let paths = Paths::from_env()?;
+    let product_id = normalise_product_id(product_id);
+    let _lock = TitleLock::take(&paths, &product_id, LockMode::Change)?;
+    let record = install::load(paths.state_dir(), &product_id)
+        .context("No recorded installation to move")?;
+    // Environment directory overrides would keep launching the old location.
+    let recipes = recipes_for_change(cli, &paths)?;
+    if let Some(recipe) = recipes.iter().find(|r| r.matches(&product_id)) {
+        anyhow::ensure!(paths.install_dir(recipe)?.canonicalize()? == record.dir.canonicalize()?,
+            "The install directory is overridden by an environment variable; clear it before moving");
+    }
+    let plan = relocation::plan(&record, library)?;
+    if cli.json {
+        print_json(
+            &json!({"schema":JSON_SCHEMA,"source":plan.source,"destination":plan.destination,
+            "bytes":plan.bytes,"available":plan.available,"same_filesystem":plan.same_filesystem}),
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    eprintln!(
+        ":: Moving {} to {} ({}; {} free)",
+        plan.source.display(),
+        plan.destination.display(),
+        ferestre_core::human_bytes(plan.bytes),
+        ferestre_core::human_bytes(plan.available)
+    );
+    let cancellation = cancel::Cancellation::from_gui();
+    let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let machine = std::env::var("XODUS_PROGRESS").as_deref() == Ok("json");
+    let result = relocation::execute(
+        paths.state_dir(),
+        &record,
+        &plan,
+        || {
+            anyhow::ensure!(!cancellation.requested(), "Move cancelled");
+            Ok(())
+        },
+        |done, total| {
+            if done == total || last.elapsed() >= std::time::Duration::from_millis(250) {
+                if machine {
+                    println!("{}", json!({"progress":{"done":done,"total":total}}));
+                } else {
+                    eprintln!(
+                        ":: Moving and verifying: {} / {}",
+                        ferestre_core::human_bytes(done),
+                        ferestre_core::human_bytes(total)
+                    );
+                }
+                last = std::time::Instant::now();
+            }
+        },
+    );
+    match result {
+        Ok(warning) => {
+            if let Some(warning) = warning {
+                eprintln!("-- {warning}");
+            }
+            eprintln!(":: Moved to {}", plan.destination.display());
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(error) if cancellation.requested() => {
+            eprintln!("-- {error:#}");
+            Ok(ExitCode::from(130))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7445,79 +7518,6 @@ summary = "Runs."
             .as_deref()
             .unwrap_or_default()
             .contains("broken.toml"));
-    }
-}
-
-fn cmd_move(cli: &Cli, product_id: &str, library: &Path) -> Result<ExitCode> {
-    use ferestre_core::relocation;
-    if !is_product_id(product_id) {
-        return Err(usage("Not a Store product id (12 letters and digits)"));
-    }
-    let paths = Paths::from_env()?;
-    let product_id = normalise_product_id(product_id);
-    let _lock = TitleLock::take(&paths, &product_id, LockMode::Change)?;
-    let record = install::load(paths.state_dir(), &product_id)
-        .context("No recorded installation to move")?;
-    // Environment directory overrides would keep launching the old location.
-    let recipes = recipes_for_change(cli, &paths)?;
-    if let Some(recipe) = recipes.iter().find(|r| r.matches(&product_id)) {
-        anyhow::ensure!(paths.install_dir(recipe)?.canonicalize()? == record.dir.canonicalize()?,
-            "The install directory is overridden by an environment variable; clear it before moving");
-    }
-    let plan = relocation::plan(&record, library)?;
-    if cli.json {
-        print_json(
-            &json!({"schema":JSON_SCHEMA,"source":plan.source,"destination":plan.destination,
-            "bytes":plan.bytes,"available":plan.available,"same_filesystem":plan.same_filesystem}),
-        );
-        return Ok(ExitCode::SUCCESS);
-    }
-    eprintln!(
-        ":: Moving {} to {} ({}; {} free)",
-        plan.source.display(),
-        plan.destination.display(),
-        ferestre_core::human_bytes(plan.bytes),
-        ferestre_core::human_bytes(plan.available)
-    );
-    let cancellation = cancel::Cancellation::from_gui();
-    let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
-    let machine = std::env::var("XODUS_PROGRESS").as_deref() == Ok("json");
-    let result = relocation::execute(
-        paths.state_dir(),
-        &record,
-        &plan,
-        || {
-            anyhow::ensure!(!cancellation.requested(), "Move cancelled");
-            Ok(())
-        },
-        |done, total| {
-            if done == total || last.elapsed() >= std::time::Duration::from_millis(250) {
-                if machine {
-                    println!("{}", json!({"progress":{"done":done,"total":total}}));
-                } else {
-                    eprintln!(
-                        ":: Moving and verifying: {} / {}",
-                        ferestre_core::human_bytes(done),
-                        ferestre_core::human_bytes(total)
-                    );
-                }
-                last = std::time::Instant::now();
-            }
-        },
-    );
-    match result {
-        Ok(warning) => {
-            if let Some(warning) = warning {
-                eprintln!("-- {warning}");
-            }
-            eprintln!(":: Moved to {}", plan.destination.display());
-            Ok(ExitCode::SUCCESS)
-        }
-        Err(error) if cancellation.requested() => {
-            eprintln!("-- {error:#}");
-            Ok(ExitCode::from(130))
-        }
-        Err(error) => Err(error),
     }
 }
 
