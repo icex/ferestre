@@ -1,0 +1,666 @@
+diff --git a/private.h b/private.h
+index 6ea3eab..b7240ca 100644
+--- a/private.h
++++ b/private.h
+@@ -183,3 +183,17 @@ void xgr_role_watch_close(enum xgr_role_watch_kind, void *);
+  * status. */
+ BOOL xgr_role_entitlement( UINT32 *active, BOOL fresh );
+ void xgr_role_entitlement_store( LONG status /* NTSTATUS */, UINT32 active );
++
++/* Installed related content, immutable for the lifetime of a launch. */
++struct xgr_related_package
++{
++    XPackageDetails details;
++    char identifier[33], store[64], title[256], description[512], publisher[256], title_id[64];
++    char *path;
++};
++unsigned int xgr_related_packages( const struct xgr_related_package **packages );
++const struct xgr_related_package *xgr_related_by_id( const char *id );
++
++BOOL xgr_role_product_entitlement( const char *, UINT32 *, BOOL );
++void xgr_role_product_entitlement_store( const char *, LONG, UINT32 );
++const char *xgr_store_license_product( void * );
+diff --git a/xpackage.c b/xpackage.c
+index f20977d..77e934d 100644
+--- a/xpackage.c
++++ b/xpackage.c
+@@ -35,7 +35,7 @@
+ #include "private.h"
+ #include <bcrypt.h>
+ 
+-WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
++WINE_DEFAULT_DEBUG_CHANNEL(xpackage);
+ 
+ #ifndef ARRAY_SIZE
+ #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+@@ -519,15 +519,195 @@ static HRESULT WINAPI __PADDING_4__( IXPackageImpl3 *iface )
+ 
+ /* ---- enumeration -------------------------------------------------------- */
+ 
+-static HRESULT enumerate_current( XPackageKind kind, void *context, XPackageEnumerationCallback *callback )
++/* The launcher supplies only installed content related to this game. Recheck
++ * both manifest relationships before exposing any of it. This is installation
++ * discovery, not a grant of ownership or a substitute for Store licensing. */
++static BOOL xml_attr( const char *xml, const char *element, const char *attr, char *out, SIZE_T cap )
++{
++    const char *start, *end, *value;
++    SIZE_T len;
++
++    out[0] = 0;
++    if (!(start = strstr( xml, element )) || !(end = strchr( start, '>' )) ||
++        !(value = strstr( start, attr )) || value > end) return FALSE;
++    value += strlen( attr );
++    len = strcspn( value, "\"" );
++    if (len >= cap) return FALSE;
++    memcpy( out, value, len );
++    out[len] = 0;
++    return TRUE;
++}
++
++static BOOL xml_element( const char *xml, const char *element, char *out, SIZE_T cap )
++{
++    char tag[64];
++    const char *value;
++    SIZE_T len;
++
++    out[0] = 0;
++    snprintf( tag, sizeof(tag), "<%s>", element );
++    if (!(value = strstr( xml, tag ))) return FALSE;
++    value += strlen( tag );
++    len = strcspn( value, "<" );
++    if (len >= cap) return FALSE;
++    memcpy( out, value, len );
++    out[len] = 0;
++    return TRUE;
++}
++
++static struct xgr_related_package related[128];
++static unsigned int related_count;
++
++static BOOL read_related( const WCHAR *unix_path, const char *allowed, const char *dependency )
++{
++    static const char hex[] = "0123456789abcdef";
++    struct xgr_related_package *p = related + related_count;
++    unsigned int i, a = 0, b = 0, c = 0, d = 0;
++    char *xml, *root, version[64];
++    WCHAR *file;
++    HANDLE handle;
++    DWORD size, read;
++    UCHAR random[16];
++
++    size = wcslen( unix_path );
++    if (*unix_path != '/' || size > 32700 || !(file = calloc( size + 32, sizeof(WCHAR) ))) return FALSE;
++    file[0] = 'Z';
++    file[1] = ':';
++    wcscpy( file + 2, unix_path );
++    for (i = 2; file[i]; i++) if (file[i] == '/') file[i] = '\\';
++    root = wide_to_utf8( file );
++    wcscat( file, L"\\MicrosoftGame.config" );
++    handle = CreateFileW( file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    free( file );
++    if (!root || handle == INVALID_HANDLE_VALUE)
++    {
++        if (handle != INVALID_HANDLE_VALUE) CloseHandle( handle );
++        free( root );
++        return FALSE;
++    }
++    size = GetFileSize( handle, NULL );
++    if (!size || size > 1024 * 1024 || !(xml = calloc( size + 1, 1 )))
++    {
++        CloseHandle( handle );
++        free( root );
++        return FALSE;
++    }
++    if (!ReadFile( handle, xml, size, &read, NULL ) || read != size)
++    {
++        CloseHandle( handle );
++        free( xml );
++        free( root );
++        return FALSE;
++    }
++    CloseHandle( handle );
++    if (!strstr( xml, allowed ) || !strstr( xml, dependency )) goto invalid;
++    xml_element( xml, "StoreId", p->store, sizeof(p->store) );
++    if (strlen( p->store ) != 12 || BCryptGenRandom( NULL, random, sizeof(random), BCRYPT_USE_SYSTEM_PREFERRED_RNG ))
++        goto invalid;
++
++    xml_attr( xml, "<ShellVisuals", " DefaultDisplayName=\"", p->title, sizeof(p->title) );
++    xml_attr( xml, "<ShellVisuals", " Description=\"", p->description, sizeof(p->description) );
++    xml_attr( xml, "<ShellVisuals", " PublisherDisplayName=\"", p->publisher, sizeof(p->publisher) );
++    xml_attr( xml, "<Identity", " Version=\"", version, sizeof(version) );
++    sscanf( version, "%u.%u.%u.%u", &a, &b, &c, &d );
++    for (i = 0; i < sizeof(random); i++)
++    {
++        p->identifier[2 * i] = hex[random[i] >> 4];
++        p->identifier[2 * i + 1] = hex[random[i] & 15];
++    }
++    p->path = root;
++    p->details.packageIdentifier = p->identifier;
++    p->details.kind = XPackageKind_Content;
++    p->details.storeId = p->store;
++    p->details.displayName = p->title;
++    p->details.description = p->description;
++    p->details.publisher = p->publisher;
++    p->details.titleID = p->title_id;
++    p->details.count = 1;
++    p->details.version.major = a;
++    p->details.version.minor = b;
++    p->details.version.build = c;
++    p->details.version.revision = d;
++    free( xml );
++    return TRUE;
++
++invalid:
++    free( xml );
++    free( root );
++    memset( p, 0, sizeof(*p) );
++    return FALSE;
++}
++
++static BOOL WINAPI init_related( INIT_ONCE *once, void *param, void **context )
++{
++    WCHAR *paths, *at, *next;
++    char allowed[96], dependency[512], current[64], identity[256];
++    DWORD size;
++
++    size = GetEnvironmentVariableW( L"XGR_RELATED_PACKAGE_PATHS", NULL, 0 );
++    if (!size || size > 65536) return TRUE;
++    if (!(paths = calloc( size, sizeof(WCHAR) ))) return FALSE;
++    if (!GetEnvironmentVariableW( L"XGR_RELATED_PACKAGE_PATHS", paths, size ))
++    {
++        free( paths );
++        return TRUE;
++    }
++    xgr_config_element( "StoreId", current, sizeof(current) );
++    xgr_config_attr( "<Identity", " Name=\"", identity, sizeof(identity) );
++    snprintf( allowed, sizeof(allowed), "<AllowedProduct>%s</AllowedProduct>", current );
++    snprintf( dependency, sizeof(dependency), "<MainPackageDependency Name=\"%s\"", identity );
++    for (at = paths; at && *at && related_count < ARRAY_SIZE(related); at = next)
++    {
++        next = wcschr( at, '\n' );
++        if (next) *next++ = 0;
++        if (read_related( at, allowed, dependency )) related_count++;
++    }
++    free( paths );
++    return TRUE;
++}
++
++unsigned int xgr_related_packages( const struct xgr_related_package **packages )
++{
++    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
++
++    InitOnceExecuteOnce( &once, init_related, NULL, NULL );
++    *packages = related;
++    return related_count;
++}
++
++const struct xgr_related_package *xgr_related_by_id( const char *id )
++{
++    const struct xgr_related_package *packages;
++    unsigned int i, count = xgr_related_packages( &packages );
++
++    for (i = 0; id && i < count; i++)
++        if (!strcmp( id, packages[i].identifier )) return packages + i;
++    return NULL;
++}
++
++static HRESULT enumerate_current( XPackageKind kind, XPackageEnumerationScope scope, void *context, XPackageEnumerationCallback *callback )
+ {
+     XPackageDetails details;
+     const char *identifier;
+     char display[256], description[512], publisher[256], store_id[64], title_id[64];
+ 
+     if (!callback) return E_INVALIDARG;
+-    /* only games are installed here; a Content query finds nothing */
+-    if (kind != XPackageKind_Game) return S_OK;
++    if (kind == XPackageKind_Content)
++    {
++        const struct xgr_related_package *packages;
++        unsigned int i, count;
++
++        if (scope == XPackageEnumerationScope_ThisOnly) return S_OK;
++        count = xgr_related_packages( &packages );
++        for (i = 0; i < count; i++)
++        {
++            TRACE_(xpackage)( "reporting installed related package %s, store %s\n",
++                   debugstr_a( packages[i].identifier ), debugstr_a( packages[i].store ) );
++            if (!callback( context, &packages[i].details )) break;
++        }
++        return S_OK;
++    }
++    if (kind != XPackageKind_Game) return E_INVALIDARG;
+ 
+     if (!(identifier = xgr_current_package_identifier())) return HRESULT_FROM_WIN32( ERROR_INSTALL_FAILURE );
+ 
+@@ -555,7 +735,7 @@ static HRESULT enumerate_current( XPackageKind kind, void *context, XPackageEnum
+ static HRESULT WINAPI x_package_XPackageEnumeratePackages( IXPackageImpl3 *iface, XPackageKind kind, XPackageEnumerationScope scope, void *context, XPackageEnumerationCallback *callback )
+ {
+     TRACE( "iface %p, kind %d, scope %d, context %p, callback %p.\n", iface, kind, scope, context, callback );
+-    return enumerate_current( kind, context, callback );
++    return enumerate_current( kind, scope, context, callback );
+ }
+ 
+ static HRESULT WINAPI x_package_XPackageRegisterPackageInstalled( IXPackageImpl3 *iface, XTaskQueueHandle queue, void *context, XPackageInstalledCallback *callback, XTaskQueueRegistrationToken *token )
+@@ -605,7 +785,7 @@ static BOOLEAN WINAPI x_package_XPackageUninstallPackage( IXPackageImpl3 *iface,
+ static HRESULT WINAPI x_package_XPackageEnumeratePackages2( IXPackageImpl3 *iface, XPackageKind kind, XPackageEnumerationScope scope, void *context, XPackageEnumerationCallback *callback )
+ {
+     TRACE( "iface %p, kind %d, scope %d, context %p, callback %p.\n", iface, kind, scope, context, callback );
+-    return enumerate_current( kind, context, callback );
++    return enumerate_current( kind, scope, context, callback );
+ }
+ 
+ static HRESULT WINAPI x_package_XPackageRegisterPackageInstalled2( IXPackageImpl3 *iface, XTaskQueueHandle queue, void *context, XPackageInstalledCallback *callback, XTaskQueueRegistrationToken *token )
+@@ -627,13 +807,16 @@ static HRESULT WINAPI x_package_XPackageMountWithUiAsync( IXPackageImpl3 *iface,
+         xgr_async_complete( async, E_OUTOFMEMORY, NULL );
+         return S_OK;
+     }
+-    /* only the game's own content is present, so every mount resolves to the
+-     * install root; a title mounting its own package gets a working path */
+-    if (!(mount->path = current_mount_path()))
++    /* Enumerated content mounts its own installation; the current game keeps
++     * the existing install-root mount behavior. */
+     {
+-        free( mount );
+-        xgr_async_complete( async, HRESULT_FROM_WIN32( ERROR_INSTALL_FAILURE ), NULL );
+-        return S_OK;
++        const struct xgr_related_package *p = xgr_related_by_id( packageIdentifier );
++        if (!(mount->path = p ? strdup( p->path ) : current_mount_path()))
++        {
++            free( mount );
++            xgr_async_complete( async, HRESULT_FROM_WIN32( ERROR_INSTALL_FAILURE ), NULL );
++            return S_OK;
++        }
+     }
+     xgr_async_complete( async, S_OK, mount );
+     return S_OK;
+@@ -655,7 +838,7 @@ static HRESULT WINAPI x_package_XPackageMountWithUiResult( IXPackageImpl3 *iface
+ static HRESULT WINAPI x_package_XPackageEnumeratePackages3( IXPackageImpl3 *iface, XPackageKind kind, XPackageEnumerationScope scope, void *context, XPackageEnumerationCallback *callback )
+ {
+     TRACE( "iface %p, kind %d, scope %d, context %p, callback %p.\n", iface, kind, scope, context, callback );
+-    return enumerate_current( kind, context, callback );
++    return enumerate_current( kind, scope, context, callback );
+ }
+ 
+ static HRESULT WINAPI x_package_XPackageRegisterPackageInstalled3( IXPackageImpl3 *iface, XTaskQueueHandle queue, void *context, XPackageInstalledCallback *callback, XTaskQueueRegistrationToken *token )
+diff --git a/xstore.c b/xstore.c
+index cfd6d88..0331b30 100644
+--- a/xstore.c
++++ b/xstore.c
+@@ -25,7 +25,7 @@
+ #include "unixlib.h"
+ #include <math.h>
+ 
+-WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
++WINE_DEFAULT_DEBUG_CHANNEL(xstore);
+ WINE_DECLARE_DEBUG_CHANNEL(storetrace);
+ static char q_empty[] = "";
+ 
+@@ -44,8 +44,15 @@ struct x_store_license
+ {
+     BOOL valid;
+     BOOL verified;
++    char product[13];
+ };
+ 
++const char *xgr_store_license_product( void *handle )
++{
++    struct x_store_license *license = handle;
++    return license ? license->product : NULL;
++}
++
+ /* Legacy current-game data and opt-in immutable catalog snapshots share the
+  * query handle. Pages retain the snapshot independently of earlier handles. */
+ struct x_store_product_query
+@@ -85,8 +92,10 @@ static void store_sku_id( char *out, SIZE_T cap )
+         snprintf( out, cap, "%s", "0000000000000000" );
+ }
+ 
+-enum store_role_kind { ROLE_QUERY, ROLE_GAME_LICENSE, ROLE_ACQUIRE, ROLE_CAN_ACQUIRE };
++enum store_role_kind { ROLE_QUERY, ROLE_ENTITLED, ROLE_GAME_LICENSE, ROLE_ACQUIRE, ROLE_CAN_ACQUIRE };
++static HRESULT role_store_begin_product( XAsyncBlock *, enum store_role_kind, const char * );
+ static HRESULT role_store_begin( XAsyncBlock *async, enum store_role_kind kind );
++static HRESULT role_entitled_begin( XAsyncBlock *, XStoreProductKind, UINT32 );
+ 
+ static BOOL account_roles_enabled(void)
+ {
+@@ -350,6 +359,8 @@ static const char role_game_license_identity, role_acquire_identity, role_can_ac
+ struct role_store_operation
+ {
+     enum store_role_kind kind;
++    XStoreProductKind kinds;
++    UINT32 page_size;
+     struct store_entitlement_params ipc;
+     union
+     {
+@@ -362,11 +373,70 @@ struct role_store_operation
+ 
+ static void role_store_free( struct role_store_operation *op )
+ {
+-    if (op->kind == ROLE_QUERY) free(op->result.query);
++    if ((op->kind == ROLE_QUERY || op->kind == ROLE_ENTITLED) && op->result.query)
++    {
++        store_catalog_release(op->result.query->catalog);
++        free(op->result.query);
++    }
+     if (op->kind == ROLE_ACQUIRE) free(op->result.license);
+     free(op);
+ }
+ 
++/* Entitled content is filtered by the Store account's authenticated content
++ * licences, never by installation alone. Retain an ordinary catalog snapshot
++ * so page handles and callback data have the same lifetime rules. */
++static HRESULT role_entitled_query( struct role_store_operation *op )
++{
++    const struct xgr_related_package *packages;
++    struct x_store_product_query *q;
++    struct store_catalog_snapshot *snapshot;
++    struct store_entitlement_params ipc = {{0}};
++    XStoreProduct *product;
++    unsigned int i, count = xgr_related_packages( &packages );
++    NTSTATUS status;
++
++    if (!(q = calloc(1,sizeof(*q)))) return E_OUTOFMEMORY;
++    op->result.query = q;
++    if (!(snapshot = calloc(1,sizeof(*snapshot)))) return E_OUTOFMEMORY;
++    snapshot->ref = 1;
++    q->catalog = snapshot;
++    q->page_size = op->page_size;
++    if (!(snapshot->products = calloc(count + 1,sizeof(*snapshot->products))) ||
++        !(snapshot->strings = calloc(1,sizeof(q->store_id) + sizeof(q->title) + sizeof(q->description))))
++        return E_OUTOFMEMORY;
++    if (op->ipc.active && (op->kinds & XStoreProductKind_Game))
++    {
++        init_current_product(q);
++        product = snapshot->products + snapshot->count++;
++        *product = q->product;
++        memcpy(snapshot->strings,q->store_id,sizeof(q->store_id));
++        memcpy(snapshot->strings + sizeof(q->store_id),q->title,sizeof(q->title));
++        memcpy(snapshot->strings + sizeof(q->store_id) + sizeof(q->title),q->description,sizeof(q->description));
++        product->storeId = snapshot->strings;
++        product->title = snapshot->strings + sizeof(q->store_id);
++        product->description = snapshot->strings + sizeof(q->store_id) + sizeof(q->title);
++        product->language = "en";
++        product->inAppOfferToken = product->linkUri = product->price.currencyCode = q_empty;
++    }
++    if (op->kinds & XStoreProductKind_Durable) for (i = 0; i < count; i++)
++    {
++        snprintf(ipc.store_id,sizeof(ipc.store_id),"%s",packages[i].store);
++        status = XGR_UNIX_CALL(store_entitlement,&ipc);
++        xgr_role_product_entitlement_store(ipc.store_id,status,ipc.active);
++        if (status || !ipc.active) continue;
++        product = snapshot->products + snapshot->count++;
++        product->storeId = packages[i].store;
++        product->title = packages[i].title;
++        product->description = packages[i].description;
++        product->language = "en";
++        product->inAppOfferToken = product->linkUri = product->price.currencyCode = q_empty;
++        product->productKind = XStoreProductKind_Durable;
++        product->hasDigitalDownload = product->isInUserCollection = TRUE;
++        TRACE("authenticated related entitlement %s\n",debugstr_a(product->storeId));
++    }
++    return S_OK;
++}
++
+ static HRESULT CALLBACK role_store_provider( XAsyncOp operation, const XAsyncProviderData *data )
+ {
+     struct role_store_operation *op = data->context;
+@@ -383,7 +453,7 @@ static HRESULT CALLBACK role_store_provider( XAsyncOp operation, const XAsyncPro
+     case XAsyncOp_DoWork:
+         status = XGR_UNIX_CALL(store_entitlement,&op->ipc);
+         /* Every definitive answer refreshes what the cheap checks report. */
+-        xgr_role_entitlement_store(status,op->ipc.active);
++        xgr_role_product_entitlement_store(op->ipc.store_id,status,op->ipc.active);
+         hr = status == STATUS_IO_TIMEOUT ? HRESULT_FROM_WIN32(ERROR_TIMEOUT) : status ? E_FAIL : S_OK;
+         if (SUCCEEDED(hr)) switch (op->kind)
+         {
+@@ -393,6 +463,10 @@ static HRESULT CALLBACK role_store_provider( XAsyncOp operation, const XAsyncPro
+             if (op->ipc.active) init_current_product(op->result.query);
+             size = sizeof(op->result.query);
+             break;
++        case ROLE_ENTITLED:
++            hr = role_entitled_query(op);
++            size = sizeof(op->result.query);
++            break;
+         case ROLE_GAME_LICENSE:
+             op->result.game.isActive = op->ipc.active;
+             store_sku_id(op->result.game.skuStoreId,sizeof(op->result.game.skuStoreId));
+@@ -406,6 +480,7 @@ static HRESULT CALLBACK role_store_provider( XAsyncOp operation, const XAsyncPro
+             if (!(op->result.license = calloc(1,sizeof(*op->result.license)))) { hr = E_OUTOFMEMORY; break; }
+             op->result.license->valid = TRUE;
+             op->result.license->verified = TRUE;
++            memcpy(op->result.license->product,op->ipc.store_id,13);
+             size = sizeof(op->result.license);
+             break;
+         case ROLE_CAN_ACQUIRE:
+@@ -419,6 +494,7 @@ static HRESULT CALLBACK role_store_provider( XAsyncOp operation, const XAsyncPro
+         switch (op->kind)
+         {
+         case ROLE_QUERY:
++        case ROLE_ENTITLED:
+             memcpy(data->buffer,&op->result.query,sizeof(op->result.query)); op->result.query = NULL; break;
+         case ROLE_GAME_LICENSE:
+             memcpy(data->buffer,&op->result.game,sizeof(op->result.game)); break;
+@@ -435,7 +511,7 @@ static HRESULT CALLBACK role_store_provider( XAsyncOp operation, const XAsyncPro
+     }
+ }
+ 
+-static HRESULT role_store_begin( XAsyncBlock *async, enum store_role_kind kind )
++static HRESULT role_store_start( XAsyncBlock *async, enum store_role_kind kind, const char *product, XStoreProductKind kinds, UINT32 page_size )
+ {
+     struct role_store_operation *op;
+     const void *identity;
+@@ -444,11 +520,15 @@ static HRESULT role_store_begin( XAsyncBlock *async, enum store_role_kind kind )
+     if (!async) return E_INVALIDARG;
+     if (!(op = calloc(1,sizeof(*op)))) return E_OUTOFMEMORY;
+     op->kind = kind;
+-    if (!xgr_config_element("StoreId",op->ipc.store_id,sizeof(op->ipc.store_id)))
++    op->kinds = kinds;
++    op->page_size = page_size;
++    if (product) snprintf(op->ipc.store_id,sizeof(op->ipc.store_id),"%s",product);
++    else if (!xgr_config_element("StoreId",op->ipc.store_id,sizeof(op->ipc.store_id)))
+     { free(op); return E_INVALIDARG; }
+     switch (kind)
+     {
+-    case ROLE_QUERY: identity = &store_catalog_identity; break;
++    case ROLE_QUERY:
++    case ROLE_ENTITLED: identity = &store_catalog_identity; break;
+     case ROLE_GAME_LICENSE: identity = &role_game_license_identity; break;
+     case ROLE_ACQUIRE: identity = &role_acquire_identity; break;
+     default: identity = &role_can_acquire_identity; break;
+@@ -458,6 +538,22 @@ static HRESULT role_store_begin( XAsyncBlock *async, enum store_role_kind kind )
+     return hr;
+ }
+ 
++static HRESULT role_entitled_begin( XAsyncBlock *async, XStoreProductKind kinds, UINT32 page_size )
++{
++    if (!kinds || (kinds & ~31) || !page_size) return E_INVALIDARG;
++    return role_store_start(async,ROLE_ENTITLED,NULL,kinds,page_size);
++}
++
++static HRESULT role_store_begin_product( XAsyncBlock *async, enum store_role_kind kind, const char *product )
++{
++    return role_store_start(async,kind,product,0,0);
++}
++
++static HRESULT role_store_begin( XAsyncBlock *async, enum store_role_kind kind )
++{
++    return role_store_begin_product( async, kind, NULL );
++}
++
+ static BOOL current_package( const char *package )
+ {
+     const char *current = xgr_current_package_identifier();
+@@ -586,6 +682,7 @@ static HRESULT WINAPI x_store_XStoreQueryProductsResult( IXStoreImpl6 *iface, XA
+ static HRESULT WINAPI x_store_XStoreQueryEntitledProductsAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, XStoreProductKind productKinds, UINT32 maxItemsToRetrievePerPage, XAsyncBlock *async )
+ {
+     TRACE( "iface %p, storeContextHandle %p, productKinds %#x, async %p.\n", iface, storeContextHandle, productKinds, async );
++    if (account_roles_enabled()) return role_entitled_begin(async,productKinds,maxItemsToRetrievePerPage);
+     return complete_query( async, !!(productKinds & XStoreProductKind_Game) );
+ }
+ 
+@@ -690,8 +787,9 @@ static HRESULT WINAPI x_store_XStoreAcquireLicenseForPackageAsync( IXStoreImpl6
+     TRACE( "iface %p, productQueryHandle %p, packageIdentifier %s, async %p.\n", iface, productQueryHandle, debugstr_a( packageIdentifier ), async );
+     if (account_roles_enabled())
+     {
+-        if (!current_package(packageIdentifier)) return E_NOTIMPL;
+-        return role_store_begin(async,ROLE_ACQUIRE);
++        const struct xgr_related_package *package = xgr_related_by_id(packageIdentifier);
++        if (!package && !current_package(packageIdentifier)) return E_INVALIDARG;
++        return role_store_begin_product(async,ROLE_ACQUIRE,package ? package->store : NULL);
+     }
+     if (!async) return E_INVALIDARG;
+     if (!(lic = calloc( 1, sizeof(*lic) )))
+@@ -731,7 +829,7 @@ static BOOLEAN WINAPI x_store_XStoreIsLicenseValid( IXStoreImpl6 *iface, const X
+     TRACE( "iface %p, storeLicenseHandle %p.\n", iface, storeLicenseHandle );
+     if (lic && lic->verified)
+     {
+-        if (xgr_role_entitlement(&active, TRUE)) lic->valid = !!active;
++        if (xgr_role_product_entitlement(lic->product,&active, TRUE)) lic->valid = !!active;
+         return lic->valid;
+     }
+     return lic && lic->valid;
+@@ -761,8 +859,9 @@ static HRESULT WINAPI x_store_XStoreCanAcquireLicenseForPackageAsync( IXStoreImp
+     TRACE( "iface %p, storeContextHandle %p, packageIdentifier %s, async %p.\n", iface, storeContextHandle, debugstr_a( packageIdentifier ), async );
+     if (account_roles_enabled())
+     {
+-        if (!current_package(packageIdentifier)) return E_NOTIMPL;
+-        return role_store_begin(async,ROLE_CAN_ACQUIRE);
++        const struct xgr_related_package *package = xgr_related_by_id(packageIdentifier);
++        if (!package && !current_package(packageIdentifier)) return E_INVALIDARG;
++        return role_store_begin_product(async,ROLE_CAN_ACQUIRE,package ? package->store : NULL);
+     }
+     if (!async) return E_INVALIDARG;
+     xgr_async_complete( async, S_OK, NULL );
+diff --git a/xuser.c b/xuser.c
+index 658edbc..f962f77 100644
+--- a/xuser.c
++++ b/xuser.c
+@@ -308,7 +308,7 @@ static BOOL get_live_identity( UINT64 *xuid, char *gamertag, SIZE_T gamertag_siz
+  * not answer in time gets the last state, as during any outage. Freshness
+  * bound, then: while polled, about ROLE_POLL_MS plus one exchange; after a
+  * quiet spell, current unless the service took longer than the wait. */
+-enum role_source { ROLE_SOURCE_ACCOUNTS, ROLE_SOURCE_ENTITLEMENT, ROLE_SOURCE_COUNT };
++enum role_source { ROLE_SOURCE_ACCOUNTS, ROLE_SOURCE_ENTITLEMENT, ROLE_SOURCE_RELATED, ROLE_SOURCE_COUNT = ROLE_SOURCE_RELATED + 128 };
+ #define ROLE_POLL_MS       1000
+ #define ROLE_DEMAND_MS     30000
+ #define ROLE_FRESH_MS      3000
+@@ -321,6 +321,7 @@ enum role_source { ROLE_SOURCE_ACCOUNTS, ROLE_SOURCE_ENTITLEMENT, ROLE_SOURCE_CO
+ static struct role_source_state
+ {
+     BOOL known, seeded, started;
++    char product[13];
+     struct account_roles_params roles;  /* ROLE_SOURCE_ACCOUNTS */
+     UINT32 active;                      /* ROLE_SOURCE_ENTITLEMENT */
+     ULONGLONG wanted_until;
+@@ -373,6 +374,11 @@ static NTSTATUS role_state_fetch( enum role_source source )
+     NTSTATUS status;
+ 
+     if (source == ROLE_SOURCE_ACCOUNTS) status = XGR_UNIX_CALL( account_roles, &roles );
++    else if (source >= ROLE_SOURCE_RELATED)
++    {
++        memcpy( entitlement.store_id, role_state[source].product, 13 );
++        status = XGR_UNIX_CALL( store_entitlement, &entitlement );
++    }
+     else if (!xgr_config_element( "StoreId", entitlement.store_id, sizeof(entitlement.store_id) ))
+         return STATUS_NOT_FOUND;
+     else status = XGR_UNIX_CALL( store_entitlement, &entitlement );
+@@ -493,6 +499,44 @@ void xgr_role_entitlement_store( NTSTATUS status, UINT32 active )
+     role_state_note_checked( ROLE_SOURCE_ENTITLEMENT );
+ }
+ 
++/* Related packages have independent licence state and pollers. A failed or
++ * revoked add-on must never seed or invalidate the base game's cached grant. */
++static enum role_source role_product_source( const char *product )
++{
++    enum role_source source;
++    char current[64];
++    if (!product || !*product) return ROLE_SOURCE_ENTITLEMENT;
++    xgr_config_element( "StoreId", current, sizeof(current) );
++    if (!strcmp( product, current )) return ROLE_SOURCE_ENTITLEMENT;
++    AcquireSRWLockExclusive( &role_state_lock );
++    for (source = ROLE_SOURCE_RELATED; source < ROLE_SOURCE_COUNT; source++)
++    {
++        if (!role_state[source].product[0])
++        {
++            snprintf( role_state[source].product, sizeof(role_state[source].product), "%s", product );
++            break;
++        }
++        if (!strcmp( role_state[source].product, product )) break;
++    }
++    ReleaseSRWLockExclusive( &role_state_lock );
++    return source;
++}
++
++BOOL xgr_role_product_entitlement( const char *product, UINT32 *active, BOOL fresh )
++{
++    enum role_source source = role_product_source( product );
++    if (source == ROLE_SOURCE_COUNT) return FALSE;
++    return role_state_get( source, fresh ? ROLE_GET_FRESH : 0, NULL, active );
++}
++
++void xgr_role_product_entitlement_store( const char *product, NTSTATUS status, UINT32 active )
++{
++    enum role_source source = role_product_source( product );
++    if (source == ROLE_SOURCE_COUNT) return;
++    role_state_store( source, status, NULL, active );
++    role_state_note_checked( source );
++}
++
+ static HRESULT WINAPI x_user_XUserDuplicateHandle( IXUserImpl6 *iface, XUserHandle handle, XUserHandle *duplicatedHandle )
+ {
+     TRACE( "iface %p, handle %p, duplicatedHandle %p.\n", iface, handle, duplicatedHandle );
+@@ -995,6 +1039,7 @@ struct role_watch
+     LONG refs;
+     UINT64 token;
+     enum xgr_role_watch_kind kind;
++    enum role_source source;
+     void *owner, *context;
+     XTaskQueueHandle queue;
+     XUserChangeEventCallback *user_callback;
+@@ -1009,8 +1054,9 @@ static SRWLOCK role_watches_lock = SRWLOCK_INIT;
+ static struct role_watch *role_watches;
+ static UINT64 role_watch_next_token = 0x10000;
+ 
+-static enum role_source role_watch_source( enum xgr_role_watch_kind kind )
++static enum role_source role_watch_source( enum xgr_role_watch_kind kind, void *owner )
+ {
++    if (kind == XGR_ROLE_WATCH_PACKAGE) return role_product_source( xgr_store_license_product( owner ) );
+     return kind == XGR_ROLE_WATCH_USER ? ROLE_SOURCE_ACCOUNTS : ROLE_SOURCE_ENTITLEMENT;
+ }
+ 
+@@ -1089,7 +1135,7 @@ static void role_watches_update( enum role_source source )
+     AcquireSRWLockShared(&role_watches_lock);
+     for (watch = role_watches; watch; watch = watch->next)
+     {
+-        if (role_watch_source(watch->kind) != source) continue;
++        if (watch->source != source) continue;
+         if (count == capacity)
+         {
+             capacity = capacity ? capacity * 2 : 8;
+@@ -1121,6 +1167,8 @@ HRESULT xgr_role_watch_register( enum xgr_role_watch_kind kind, void *owner, XTa
+     InitializeCriticalSection(&watch->lock);
+     InitializeConditionVariable(&watch->idle);
+     watch->refs = 1; /* the registration */
++    watch->source = role_watch_source(kind,owner);
++    if (watch->source == ROLE_SOURCE_COUNT) { role_watch_release(watch); return E_OUTOFMEMORY; }
+     watch->kind = kind; watch->owner = owner; watch->context = context;
+     watch->user_callback = user_callback; watch->store_callback = store_callback;
+     watch->known = initial >= 0; watch->state = initial > 0;
+@@ -1129,7 +1177,7 @@ HRESULT xgr_role_watch_register( enum xgr_role_watch_kind kind, void *owner, XTa
+     watch->next = role_watches; role_watches = watch;
+     token->token = watch->token;
+     ReleaseSRWLockExclusive(&role_watches_lock);
+-    role_source_want(role_watch_source(kind),1,NULL);
++    role_source_want(watch->source,1,NULL);
+     return S_OK;
+ }
+ 
+@@ -1144,7 +1192,7 @@ BOOLEAN xgr_role_watch_unregister( enum xgr_role_watch_kind kind, void *owner,
+         { watch = *link; *link = watch->next; break; }
+     ReleaseSRWLockExclusive(&role_watches_lock);
+     if (!watch) return TRUE;
+-    role_source_want(role_watch_source(kind),-1,NULL);
++    role_source_want(watch->source,-1,NULL);
+     EnterCriticalSection(&watch->lock);
+     watch->stopped = TRUE;
+     while (wait && watch->callback_thread && watch->callback_thread != GetCurrentThreadId())

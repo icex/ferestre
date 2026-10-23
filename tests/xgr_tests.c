@@ -88,6 +88,148 @@ static BOOLEAN __stdcall count_package( void *ctx, const XPackageDetails *d )
     return TRUE;
 }
 
+
+struct related_ctx { unsigned int count; char id[2][33]; };
+static BOOLEAN __stdcall related_package( void *context, const XPackageDetails *d )
+{
+    struct related_ctx *c = context;
+    CHECK(d->kind == XPackageKind_Content && d->storeId && strlen(d->storeId) == 12,
+          "related package has content kind and store identity");
+    CHECK(d->packageIdentifier && strlen(d->packageIdentifier) == 32,"related identifier fits the SDK buffer");
+    if (c->count < 2) lstrcpynA(c->id[c->count],d->packageIdentifier,33);
+    c->count++;
+    return TRUE;
+}
+static BOOLEAN __stdcall first_related_package( void *context, const XPackageDetails *d )
+{
+    unsigned int *count = context; (*count)++; return FALSE;
+}
+static void test_related_packages(void)
+{
+    struct related_ctx c = {0}; unsigned int stopped = 0; HRESULT hr;
+    XAsyncBlock async = {0}; XPackageMountHandle mount = NULL; char path[4096]; SIZE_T size;
+    hr = IXPackageImpl3_XPackageEnumeratePackages(pkg,XPackageKind_Content,XPackageEnumerationScope_ThisOnly,&c,related_package);
+    CHECK(hr == S_OK && !c.count,"ThisOnly does not expose related content");
+    hr = IXPackageImpl3_XPackageEnumeratePackages(pkg,XPackageKind_Content,XPackageEnumerationScope_ThisAndRelated,&c,related_package);
+    CHECK(hr == S_OK && c.count == 2,"ThisAndRelated exposes only two matching installed packages (%u)",c.count);
+    CHECK(strcmp(c.id[0],c.id[1]),"related packages have distinct installation identifiers");
+    (pkg->lpVtbl->XPackageEnumeratePackages)(pkg,XPackageKind_Content,XPackageEnumerationScope_ThisAndRelated,&stopped,first_related_package);
+    CHECK(stopped == 1,"first interface respects callback cancellation");
+    stopped = 0;
+    (pkg->lpVtbl->IXPackageImpl2_XPackageEnumeratePackages)(pkg,XPackageKind_Content,XPackageEnumerationScope_ThisAndRelated,&stopped,first_related_package);
+    CHECK(stopped == 1,"enumeration stops when the callback returns false");
+    stopped = 0;
+    (pkg->lpVtbl->IXPackageImpl3_XPackageEnumeratePackages)(pkg,XPackageKind_Content,XPackageEnumerationScope_ThisAndRelated,&stopped,first_related_package);
+    CHECK(stopped == 1,"third interface respects callback cancellation");
+    IXPackageImpl3_XPackageMountWithUiAsync(pkg,c.id[0],&async);
+    hr = IXPackageImpl3_XPackageMountWithUiResult(pkg,&async,&mount);
+    CHECK(hr == S_OK && mount,"related content can be mounted by its enumerated identifier");
+    if (mount)
+    {
+        hr = IXPackageImpl3_XPackageGetMountPathSize(pkg,mount,&size);
+        CHECK(hr == S_OK && size > 1,"related mount has a path size");
+        hr = IXPackageImpl3_XPackageGetMountPath(pkg,mount,sizeof(path),path);
+        CHECK(hr == S_OK && strstr(path,"related-one"),"mount resolves to the add-on directory, not the base game");
+        IXPackageImpl3_XPackageCloseMountHandle(pkg,mount);
+    }
+}
+
+static BOOLEAN __stdcall count_entitled(const XStoreProduct *product, void *context)
+{
+    unsigned int *count = context;
+    CHECK(product->isInUserCollection && strcmp(product->storeId,"9TESTADDON02"),"entitled query excludes an installed but denied add-on");
+    (*count)++;
+    return TRUE;
+}
+static void test_related_entitled(XStoreContextHandle context)
+{
+    XAsyncBlock block = {0};
+    XStoreProductQueryHandle first = NULL, next = NULL;
+    unsigned int count = 0;
+    HRESULT hr;
+    hr = IXStoreImpl6_XStoreQueryEntitledProductsAsync(store,context,XStoreProductKind_Game | XStoreProductKind_Durable,1,&block);
+    if (SUCCEEDED(hr)) hr = IXThreadingImpl_XAsyncGetStatus(threading,&block,TRUE);
+    if (SUCCEEDED(hr)) hr = IXStoreImpl6_XStoreQueryEntitledProductsResult(store,&block,&first);
+    CHECK(hr == S_OK && first,"entitled query returns a page snapshot");
+    if (!first) return;
+    IXStoreImpl6_XStoreEnumerateProductsQuery(store,first,&count,count_entitled);
+    CHECK(count == 1 && IXStoreImpl6_XStoreProductsQueryHasMorePages(store,first),"first entitlement page has one product and a next page");
+    memset(&block,0,sizeof(block));
+    IXStoreImpl6_XStoreProductsQueryNextPageAsync(store,first,&block);
+    IXStoreImpl6_XStoreProductsQueryNextPageResult(store,&block,&next);
+    IXStoreImpl6_XStoreCloseProductsQueryHandle(store,first);
+    if (next)
+    {
+        IXStoreImpl6_XStoreEnumerateProductsQuery(store,next,&count,count_entitled);
+        CHECK(count == 2 && !IXStoreImpl6_XStoreProductsQueryHasMorePages(store,next),"next page survives closing its predecessor and contains the independently licensed add-on");
+        IXStoreImpl6_XStoreCloseProductsQueryHandle(store,next);
+    }
+    else CHECK(FALSE,"next entitlement page exists");
+    memset(&block,0,sizeof(block));first = NULL;count = 0;
+    hr = IXStoreImpl6_XStoreQueryEntitledProductsAsync(store,context,XStoreProductKind_Durable,10,&block);
+    if (SUCCEEDED(hr)) hr = IXThreadingImpl_XAsyncGetStatus(threading,&block,TRUE);
+    if (SUCCEEDED(hr)) hr = IXStoreImpl6_XStoreQueryEntitledProductsResult(store,&block,&first);
+    if (first) IXStoreImpl6_XStoreEnumerateProductsQuery(store,first,&count,count_entitled);
+    CHECK(hr == S_OK && count == 1,"Durable-only query includes only the granted add-on");
+    if (first) IXStoreImpl6_XStoreCloseProductsQueryHandle(store,first);
+}
+
+static LONG related_lost;
+static void __stdcall related_license_lost(void *context) { InterlockedIncrement(&related_lost); }
+
+static void test_related_licenses(void)
+{
+    struct related_ctx c = {0};
+    XAsyncBlock block = {0};
+    XStoreLicenseHandle granted = NULL, denied = NULL;
+    XStoreContextHandle context = NULL;
+    HRESULT hr;
+    char current[33];
+    IXPackageImpl3_XPackageEnumeratePackages(pkg,XPackageKind_Content,XPackageEnumerationScope_ThisAndRelated,&c,related_package);
+    IXStoreImpl6_XStoreCreateContext(store,NULL,&context);
+    test_related_entitled(context);
+    hr = IXStoreImpl6_XStoreAcquireLicenseForPackageAsync(store,context,c.id[0],&block);
+    if (SUCCEEDED(hr)) hr = IXThreadingImpl_XAsyncGetStatus(threading,&block,TRUE);
+    if (SUCCEEDED(hr)) hr = IXStoreImpl6_XStoreAcquireLicenseForPackageResult(store,&block,&granted);
+    CHECK(hr == S_OK && granted,"related package with authenticated grant can acquire a licence (%#lx)",hr);
+    CHECK(granted && IXStoreImpl6_XStoreIsLicenseValid(store,granted),"related grant is valid");
+    memset(&block,0,sizeof(block));
+    hr = IXStoreImpl6_XStoreAcquireLicenseForPackageAsync(store,context,c.id[1],&block);
+    if (SUCCEEDED(hr)) hr = IXThreadingImpl_XAsyncGetStatus(threading,&block,TRUE);
+    CHECK(FAILED(hr),"installed package without a grant cannot acquire a licence (%#lx)",hr);
+    hr = IXStoreImpl6_XStoreAcquireLicenseForPackageResult(store,&block,&denied);
+    CHECK(FAILED(hr) && !denied,"denied add-on has no licence handle");
+    memset(&block,0,sizeof(block));
+    hr = IXStoreImpl6_XStoreAcquireLicenseForPackageAsync(store,context,"unrelated-identifier",&block);
+    CHECK(hr == E_INVALIDARG,"an identifier outside the installed snapshot is rejected");
+    IXPackageImpl3_XPackageGetCurrentProcessPackageIdentifier(pkg,sizeof(current),current);
+    memset(&block,0,sizeof(block));
+    hr = IXStoreImpl6_XStoreAcquireLicenseForPackageAsync(store,context,current,&block);
+    if (SUCCEEDED(hr)) hr = IXThreadingImpl_XAsyncGetStatus(threading,&block,TRUE);
+    if (SUCCEEDED(hr)) hr = IXStoreImpl6_XStoreAcquireLicenseForPackageResult(store,&block,&denied);
+    CHECK(hr == S_OK && denied,"an add-on refusal does not invalidate the base game (%#lx)",hr);
+    if (granted && denied)
+    {
+        WCHAR revoke[MAX_PATH];
+        XTaskQueueRegistrationToken token = {0};
+        HANDLE file;
+        DWORD deadline;
+        IXStoreImpl6_XStoreRegisterPackageLicenseLost(store,granted,NULL,NULL,related_license_lost,&token);
+        GetEnvironmentVariableW(L"XGR_LICENSE_FIXTURE_REVOKE",revoke,ARRAY_SIZE(revoke));
+        file = CreateFileW(revoke,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+        CHECK(file != INVALID_HANDLE_VALUE,"fixture can revoke only the related licence");
+        if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+        deadline = GetTickCount() + 6000;
+        while (!related_lost && GetTickCount() < deadline) Sleep(100);
+        CHECK(related_lost == 1 && !IXStoreImpl6_XStoreIsLicenseValid(store,granted),"related revocation triggers its licence-lost callback and invalidates its handle");
+        CHECK(IXStoreImpl6_XStoreIsLicenseValid(store,denied),"related revocation leaves the base licence valid");
+        IXStoreImpl6_XStoreUnregisterPackageLicenseLost(store,granted,token,TRUE);
+    }
+    if (denied) IXStoreImpl6_XStoreCloseLicenseHandle(store,denied);
+    if (granted) IXStoreImpl6_XStoreCloseLicenseHandle(store,granted);
+    IXStoreImpl6_XStoreCloseContextHandle(store,context);
+}
+
 static void test_xpackage(void)
 {
     struct enum_ctx ctx = { 0 };
@@ -1573,6 +1715,16 @@ static void test_strict_manual_termination(void)
     int wait;
 
     printf( "# Strict manual queues: termination waits for a dispatched callback\n" );
+    x1_reset();
+    IXThreadingImpl_XTaskQueueCreate(threading,XTaskQueueDispatchMode_ThreadPool,XTaskQueueDispatchMode_Manual,&queue);
+    hr = IXThreadingImpl_XTaskQueueTerminate(threading,queue,FALSE,NULL,x1_terminated);
+    Sleep(50);
+    CHECK(hr == S_OK && !x1_term_runs,"terminating an empty queue never re-enters a Manual completion inline");
+    IXThreadingImpl_XTaskQueueDispatch(threading,queue,XTaskQueuePort_Work,0);
+    CHECK(!x1_term_runs,"Work dispatch does not deliver the terminated callback");
+    IXThreadingImpl_XTaskQueueDispatch(threading,queue,XTaskQueuePort_Completion,0);
+    CHECK(x1_term_runs == 1 && x1_term_thread == GetCurrentThreadId(),"Completion dispatch delivers termination once on the dispatching thread");
+    IXThreadingImpl_XTaskQueueCloseHandle(threading,queue);
     if (!x1_started) x1_started = CreateEventW( NULL, FALSE, FALSE, NULL );
     if (!x1_release) x1_release = CreateEventW( NULL, TRUE, FALSE, NULL );
 
@@ -1613,7 +1765,9 @@ static void test_strict_manual_termination(void)
                    "terminate with wait returns once the callback has" );
             CloseHandle( terminator );
         }
-        x1_wait_for( &x1_term_runs, 1, 3000 );
+        if (!wait) CHECK(!x1_term_runs,"no-wait termination waits for Manual Completion dispatch");
+        for (DWORD until = GetTickCount() + 3000; !x1_term_runs && GetTickCount() < until; Sleep(1))
+            IXThreadingImpl_XTaskQueueDispatch(threading,queue,XTaskQueuePort_Completion,0);
         CHECK( x1_term_runs == 1 && x1_finished_seen == 1 && x1_cb_seq < x1_term_seq,
                "%s: the terminated callback follows the dispatched one (runs %ld, saw finished %ld, %ld < %ld)",
                wait ? "wait" : "no wait", x1_term_runs, x1_finished_seen, x1_cb_seq, x1_term_seq );
@@ -1637,7 +1791,9 @@ static void test_strict_manual_termination(void)
     CHECK( WaitForSingleObject( dispatcher, 5000 ) == WAIT_OBJECT_0,
            "a manual callback terminating its own queue with wait returns" );
     CloseHandle( dispatcher );
-    x1_wait_for( &x1_term_runs, 1, 3000 );
+    CHECK(!x1_term_runs,"self-termination also waits for its Manual Completion port");
+    for (DWORD until = GetTickCount() + 3000; !x1_term_runs && GetTickCount() < until; Sleep(1))
+        IXThreadingImpl_XTaskQueueDispatch(threading,x1_self_queue,XTaskQueuePort_Completion,0);
     CHECK( x1_inner_terminate_hr == S_OK && x1_term_runs == 1 && x1_done_seq < x1_term_seq,
            "its terminated callback follows its return (hr 0x%08lx, runs %ld, %ld < %ld)",
            x1_inner_terminate_hr, x1_term_runs, x1_done_seq, x1_term_seq );
@@ -2552,6 +2708,49 @@ static int exit_after_async_save_child( const char *container_name );
 static void test_pfx_backend_recovery(void);
 static void test_pfx_reused_block(void);
 
+/* A provider may retain its data for an asynchronous callback, as MCC's
+ * queue-cleanup provider does. The native implementation keeps it in state. */
+static const XAsyncProviderData *retained_begin, *retained_work, *retained_cleanup;
+static XAsyncBlock retained_block;
+static HANDLE retained_done;
+static BOOL retained_context_ok;
+static int retained_context;
+static void CALLBACK retained_later(void *context, BOOLEAN canceled)
+{
+    const XAsyncProviderData *data = context;
+    Sleep(100);
+    retained_context_ok = data->context == &retained_context && data->async == &retained_block;
+    IXThreadingImpl_XAsyncComplete(threading,&retained_block,S_OK,0);
+    SetEvent(retained_done);
+}
+static HRESULT CALLBACK retained_provider(XAsyncOp operation, const XAsyncProviderData *data)
+{
+    switch (operation)
+    {
+    case XAsyncOp_Begin:
+        retained_begin = data;
+        return IXThreadingImpl_XAsyncSchedule(threading,data->async,0);
+    case XAsyncOp_DoWork:
+        retained_work = data;
+        IXThreadingImpl_XTaskQueueSubmitCallback(threading,NULL,XTaskQueuePort_Work,(void *)data,retained_later);
+        return E_PENDING;
+    case XAsyncOp_Cleanup: retained_cleanup = data; break;
+    default: break;
+    }
+    return S_OK;
+}
+static void test_retained_provider_data(void)
+{
+    HRESULT hr;
+    retained_done = CreateEventW(NULL,TRUE,FALSE,NULL);
+    hr = IXThreadingImpl_XAsyncBegin(threading,&retained_block,&retained_context,retained_provider,"retained-data",retained_provider);
+    if (SUCCEEDED(hr)) hr = IXThreadingImpl_XAsyncGetStatus(threading,&retained_block,TRUE);
+    CHECK(hr == S_OK && WaitForSingleObject(retained_done,3000) == WAIT_OBJECT_0,"provider can complete through a deferred callback");
+    CHECK(retained_begin == retained_work && retained_work == retained_cleanup,"provider data has an operation lifetime through Begin, DoWork and Cleanup");
+    CHECK(retained_context_ok,"deferred provider data retains its context and async block after DoWork returns");
+    CloseHandle(retained_done);
+}
+
 int main(int argc, char **argv)
 {
     HMODULE mod;
@@ -2615,6 +2814,24 @@ int main(int argc, char **argv)
         test_pfx_backend();
         test_pfx_reused_block();
         printf("%s: %d checks, %d failed\n", g_failed ? "FAILED" : "PASSED", g_run, g_failed);
+        return g_failed;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--related-packages"))
+    {
+        test_related_packages();
+        printf("%s: %d checks, %d failed\n",g_failed ? "FAILED" : "PASSED",g_run,g_failed);
+        return g_failed;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--related-licenses"))
+    {
+        test_related_licenses();
+        printf("%s: %d checks, %d failed\n",g_failed ? "FAILED" : "PASSED",g_run,g_failed);
+        return g_failed;
+    }
+    test_retained_provider_data();
+    if (argc > 1 && !strcmp(argv[1], "--provider-data"))
+    {
+        printf("%s: %d checks, %d failed\n",g_failed ? "FAILED" : "PASSED",g_run,g_failed);
         return g_failed;
     }
     test_xpackage();

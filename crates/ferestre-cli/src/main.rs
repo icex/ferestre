@@ -631,6 +631,7 @@ struct PreparedLaunch {
     /// when it was read for them: the presence runner names the Player.
     roles: Option<accounts::Selection>,
     profiles: Option<accounts::Profiles>,
+    related: Vec<ferestre_core::related::Package>,
 }
 
 /// Everything a launch decides before it starts anything: the recipe, the
@@ -772,6 +773,18 @@ fn prepare_launch(
             &launch::game_dir(&recipe, &dirs, &options),
         )?;
     }
+    let related = ferestre_core::related::installed(
+        paths.state_dir(),
+        &recipe.title.product_id,
+        &launch::game_dir(&recipe, &dirs, &options),
+    );
+    let package_paths = ferestre_core::related::environment(&related);
+    plan.env_set
+        .insert("XGR_RELATED_PACKAGE_PATHS".into(), package_paths);
+    plan.env_set.insert(
+        "XODUS_RELATED_CONTENT".into(),
+        ferestre_core::related::service_binding(&related),
+    );
     let service_socket = plan_service_socket(&mut plan, &dirs, runtime, roles.as_ref())?;
     Ok(PreparedLaunch {
         runtime: runtime.clone(),
@@ -783,6 +796,7 @@ fn prepare_launch(
         service_socket,
         roles,
         profiles,
+        related,
     })
 }
 
@@ -798,10 +812,27 @@ fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Resu
         service_socket,
         roles,
         mut profiles,
+        related,
     } = prepared;
     // Held while the title runs: an install, update or removal of it waits
     // for this, and this does not start while one of those is under way.
     let _lock = TitleLock::take(paths, &recipe.title.product_id, LockMode::Run)?;
+    // Add-ons are part of this running title too: moving or removing one must
+    // not invalidate the immutable inventory or a mount the game is using.
+    let mut related_locks = Vec::new();
+    for package in &related {
+        related_locks.push(TitleLock::take(paths, &package.product, LockMode::Run)?);
+        let record = install::load(paths.state_dir(), &package.product)
+            .context("Related content changed before launch; try again")?;
+        anyhow::ensure!(
+            !record.is_stale()
+                && !install::is_partial(&record.dir)
+                && record.dir.canonicalize()? == package.dir
+                && record.content_ids.first() == package.content.as_ref(),
+            "Related content changed before launch; try again"
+        );
+    }
+    let _related_locks = related_locks;
     // Through the checked path: the slug is recipe data, and the log is
     // created wherever this says.
     let log = paths.log_file(&recipe)?;
@@ -3090,12 +3121,13 @@ fn plan_service_socket(
         // A service started for one title identity is never reused for
         // another: the binding names the product, content and title.
         let binding = format!(
-            "{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}",
             id.trim(),
             plan.get("XODUS_STORE_PRODUCT").unwrap_or_default(),
             plan.get("XODUS_STORE_CONTENT").unwrap_or_default(),
             plan.get("XODUS_TITLE_ID").unwrap_or_default(),
-            plan.get("XODUS_TITLE_CLIENT_ID").unwrap_or_default()
+            plan.get("XODUS_TITLE_CLIENT_ID").unwrap_or_default(),
+            plan.get("XODUS_RELATED_CONTENT").unwrap_or_default()
         );
         let root = std::env::var_os("XODUS_RUNTIME_DIR")
             .filter(|v| !v.is_empty())
@@ -3539,11 +3571,12 @@ fn service_command(
 ///   services then take the title on a request's word as before; a launch with
 ///   account roles needs a service that understands them
 ///   (`accounts::SERVICE_TITLE_SCOPE`).
-const SERVICE_BINDING: [&str; 6] = [
+const SERVICE_BINDING: [&str; 7] = [
     "XODUS_STORE_PROFILE",
     "XODUS_PLAYER_PROFILE",
     "XODUS_STORE_PRODUCT",
     "XODUS_STORE_CONTENT",
+    "XODUS_RELATED_CONTENT",
     "XODUS_TITLE_ID",
     "XODUS_TITLE_CLIENT_ID",
 ];

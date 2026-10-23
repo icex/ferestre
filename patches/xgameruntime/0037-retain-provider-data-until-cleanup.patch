@@ -1,0 +1,77 @@
+diff --git a/xthreading.c b/xthreading.c
+index f8e39db..7ae16c2 100644
+--- a/xthreading.c
++++ b/xthreading.c
+@@ -238,6 +238,7 @@ struct x_async_op
+     LONG ref;               /* the list holds one; each in-flight user holds one */
+     XAsyncBlock *async;
+     XAsyncProvider *provider;
++    XAsyncProviderData provider_data; /* retained through deferred provider callbacks */
+     void *context;
+     const void *identity;
+     XAsyncWork *work;       /* XAsyncRun operations have no provider */
+@@ -309,8 +310,10 @@ static void release_async_op( struct x_async_op *op )
+     {
+         if (op->cleanup_on_release)
+         {
+-            XAsyncProviderData data = { &op->cleanup_async, 0, NULL, op->context };
+-            op->provider( XAsyncOp_Cleanup, &data );
++            op->provider_data.async = &op->cleanup_async;
++            op->provider_data.bufferSize = 0;
++            op->provider_data.buffer = NULL;
++            op->provider( XAsyncOp_Cleanup, &op->provider_data );
+         }
+         free( op );
+     }
+@@ -449,8 +452,14 @@ static void x_threading_XAsyncComplete_helper( XAsyncBlock *async, HRESULT resul
+ 
+ static void async_op_invoke( struct x_async_op *op, XAsyncOp which, SIZE_T buffer_size, void *buffer )
+ {
+-    XAsyncProviderData data = { op->async, buffer_size, buffer, op->context };
+-    if (op->provider) op->provider( which, &data );
++    /* Cancel may still be inside the provider while another thread collects
++     * its result. Only GetResult owns the buffer fields in that interval. */
++    if (which == XAsyncOp_GetResult || which == XAsyncOp_Cleanup)
++    {
++        op->provider_data.bufferSize = buffer_size;
++        op->provider_data.buffer = buffer;
++    }
++    if (op->provider) op->provider( which, &op->provider_data );
+ }
+ 
+ /* Run one DoWork pass (or the XAsyncRun work function). */
+@@ -478,10 +487,7 @@ static void async_op_do_work( struct x_async_op *op )
+         return;
+     }
+ 
+-    {
+-        XAsyncProviderData data = { async, 0, NULL, op->context };
+-        hr = op->provider ? op->provider( XAsyncOp_DoWork, &data ) : E_NOTIMPL;
+-    }
++    hr = op->provider ? op->provider( XAsyncOp_DoWork, &op->provider_data ) : E_NOTIMPL;
+ 
+     /* E_PENDING means the provider will schedule itself again or complete
+      * later; anything else that has not already completed is the result. */
+@@ -658,6 +664,8 @@ static HRESULT WINAPI x_threading_XAsyncBegin( IXThreadingImpl *iface, XAsyncBlo
+     op->async = asyncBlock;
+     op->provider = provider;
+     op->context = context;
++    op->provider_data.async = asyncBlock;
++    op->provider_data.context = context;
+     op->identity = identity;
+     /* The list holds one reference; this frame holds the other until Begin
+      * returns, because a provider may finish the operation -- and another
+@@ -672,11 +680,9 @@ static HRESULT WINAPI x_threading_XAsyncBegin( IXThreadingImpl *iface, XAsyncBlo
+     list_add_tail( &async_ops, &op->entry );
+     LeaveCriticalSection( &async_ops_cs );
+     TRACE( "operation %p registered for block %p (begin).\n", op, asyncBlock );
++    TRACE( "retained provider data %p until Cleanup.\n", &op->provider_data );
+ 
+-    {
+-        XAsyncProviderData data = { asyncBlock, 0, NULL, context };
+-        hr = provider( XAsyncOp_Begin, &data );
+-    }
++    hr = provider( XAsyncOp_Begin, &op->provider_data );
+ 
+     /* Setup succeeded. A provider's Begin result belongs to the async
+      * operation, never to the caller of XAsyncBegin. Returning E_PENDING (or

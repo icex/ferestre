@@ -1,0 +1,84 @@
+diff --git a/xthreading.c b/xthreading.c
+index f665a59..f8e39db 100644
+--- a/xthreading.c
++++ b/xthreading.c
+@@ -24,6 +24,7 @@
+ #include "wine/list.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
++WINE_DECLARE_DEBUG_CHANNEL(xqueue);
+ 
+ struct x_threading
+ {
+@@ -1008,8 +1009,11 @@ struct x_terminate_request
+     struct list entry;
+     void *context;
+     XTaskQueueTerminatedCallback *callback;
++    XAsyncBlock async;
+ };
+ 
++static void deliver_termination( struct x_task_queue *, struct x_terminate_request * );
++
+ /* Count one more thing the queue owes, whether or not it is terminated: a
+  * completion still has to reach its callback after termination. */
+ static void queue_hold( struct x_task_queue *queue )
+@@ -1020,7 +1024,7 @@ static void queue_hold( struct x_task_queue *queue )
+ }
+ 
+ /* One of them has returned. The last one out of a terminated queue owes the
+- * title its terminated callbacks, and runs them on its own thread. */
++ * title its terminated callbacks through the Completion port. */
+ static void queue_finish( struct x_task_queue *queue )
+ {
+     struct x_terminate_request *request, *next;
+@@ -1037,9 +1041,7 @@ static void queue_finish( struct x_task_queue *queue )
+     wake_waiters();
+     LIST_FOR_EACH_ENTRY_SAFE( request, next, &owed, struct x_terminate_request, entry )
+     {
+-        TRACE( "queue %p is quiet; calling its terminated callback %p.\n", queue, request->callback );
+-        request->callback( request->context );
+-        free( request );
++        deliver_termination( queue, request );
+     }
+ }
+ 
+@@ -1349,6 +1351,30 @@ static void deliver_completion( const struct x_completion_route *route, struct x
+     wake_waiters();
+ }
+ 
++static void CALLBACK invoke_termination( XAsyncBlock *async )
++{
++    struct x_terminate_request *request = CONTAINING_RECORD( async, struct x_terminate_request, async );
++    request->callback( request->context );
++    free( request );
++}
++
++/* A no-wait termination is completed on the queue's Completion port, not on
++ * whichever Work callback happened to drain it. In particular, a Manual
++ * completion cannot re-enter a title still setting up its shutdown state. The
++ * terminated notification is not new work counted against the drained queue. */
++static void deliver_termination( struct x_task_queue *queue, struct x_terminate_request *request )
++{
++    struct x_completion_route route = {0};
++    route.async = &request->async;
++    route.callback = invoke_termination;
++    route.port = queue_port( (XTaskQueueHandle)queue, XTaskQueuePort_Completion );
++    route.origin = (XTaskQueueHandle)queue;
++    route.mode = queue->completion_mode;
++    TRACE_(xqueue)( "queuing terminated callback on Completion port: queue %p mode %d context %p.\n",
++                   queue, route.mode, request->context );
++    deliver_completion( &route, NULL );
++}
++
+ void xgr_async_complete_ex( XAsyncBlock *async, HRESULT hr, void *payload, SIZE_T result_size )
+ {
+     struct x_completion_route route;
+@@ -1999,7 +2025,7 @@ static HRESULT WINAPI x_threading_XTaskQueueTerminate( IXThreadingImpl *iface, X
+     struct list drained, timed;
+     BOOL block;
+ 
+-    TRACE( "iface %p, queue %p, wait %d, callbackContext %p, callback %p.\n", iface, queue, wait, callbackContext, callback );
++    TRACE_(xqueue)( "iface %p, queue %p, wait %d, callbackContext %p, callback %p.\n", iface, queue, wait, callbackContext, callback );
+ 
+     if (!obj) obj = default_task_queue();
+     if (!obj)

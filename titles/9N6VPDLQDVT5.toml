@@ -1,0 +1,32 @@
+# Halo MCC uses its official Anti-Cheat Disabled campaign executable.
+schema = 1
+
+[title]
+product-id = "9N6VPDLQDVT5"
+name = "Halo: The Master Chief Collection"
+slug = "halo-the-master-chief-collection"
+publisher = "Microsoft Studios"
+package-identity = "Microsoft.Chelan"
+title-id = "4430A9F8"
+
+[launch]
+executable = 'mcc\binaries\win64\MCCWinStore-Win64-Shipping.exe'
+env = { XGR_STRICT_MANUAL_QUEUES = "1" }
+
+[runtime]
+requires = [
+    "loader.memfd-main-image",
+    "appmodel.package-identity",
+    "xgameruntime.user",
+    "xgameruntime.package",
+    "xgameruntime.related-packages",
+    "xgameruntime.manual-queue-thread-affinity",
+    "xgameruntime.termination-completion-port",
+    "xgameruntime.provider-data-lifetime",
+]
+
+[status]
+state = "playable"
+summary = "Halo CE and Reach campaign content is detected and loads with the official Anti-Cheat Disabled executable. Local Save/Quit and clean game exit tested."
+last-verified = 2026-10-23
+verified-with = "Local Ferestre 0.1.13 candidate and runtime 11.0.20261023.1-issue22; MCC 1.3528.0.0, CE 1.1367.0.0 and Reach 1.1.0.0; a Game Pass Store account and a separate Xbox Player. Pillar of Autumn and Winter Contingency entered with keyboard/mouse input. Save/Quit returned to the front end; the provider-lifetime fix restored normal game exit. Online modes and campaign completion are untested."

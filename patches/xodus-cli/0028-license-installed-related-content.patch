@@ -1,0 +1,163 @@
+diff --git a/crates/xodus-service/src/entitlement.rs b/crates/xodus-service/src/entitlement.rs
+index 2598a8d..bc0fc24 100644
+--- a/crates/xodus-service/src/entitlement.rs
++++ b/crates/xodus-service/src/entitlement.rs
+@@ -8,6 +8,7 @@ use xodus::tokens::TokenManager;
+ pub struct Entitlement {
+     product: String,
+     content: String,
++    related: HashMap<String, Arc<Entitlement>>,
+     cached: tokio::sync::Mutex<Option<Check>>,
+     /// Products the Store catalog was asked about, and whether it ties each
+     /// one to the bound product. Only answers the catalog gave are kept.
+@@ -78,6 +79,9 @@ impl Entitlement {
+                 Ok(Some(Arc::new(Self {
+                     product,
+                     content,
++                    related: Self::related_from_json(
++                        &std::env::var("XODUS_RELATED_CONTENT").unwrap_or_else(|_| "{}".into()),
++                    )?,
+                     cached: Default::default(),
+                     family: Default::default(),
+                 })))
+@@ -86,6 +90,38 @@ impl Entitlement {
+         }
+     }
+ 
++    fn related_from_json(json: &str) -> Result<HashMap<String, Arc<Self>>, String> {
++        let entries: HashMap<String, String> =
++            serde_json::from_str(json).map_err(|_| "invalid related Store content binding")?;
++        if entries.len() > 128 {
++            return Err("too many related Store packages".into());
++        }
++        let mut related = HashMap::new();
++        for (product, content) in entries {
++            if product.len() != 12
++                || !product.bytes().all(|b| b.is_ascii_alphanumeric())
++                || !uuid_valid(&content)
++            {
++                return Err("invalid related Store package identity".into());
++            }
++            let product = product.to_ascii_uppercase();
++            if related.contains_key(&product) {
++                return Err("duplicate related Store package".into());
++            }
++            related.insert(
++                product.clone(),
++                Arc::new(Self {
++                    product,
++                    content,
++                    cached: Default::default(),
++                    family: Default::default(),
++                    related: Default::default(),
++                }),
++            );
++        }
++        Ok(related)
++    }
++
+     #[cfg(test)]
+     pub(crate) fn fixture(product: &str) -> Arc<Self> {
+         Arc::new(Self {
+@@ -93,6 +129,7 @@ impl Entitlement {
+             content: "00000000-0000-0000-0000-000000000001".into(),
+             cached: Default::default(),
+             family: Default::default(),
++            related: Default::default(),
+         })
+     }
+ 
+@@ -177,13 +214,17 @@ impl Entitlement {
+         client: &reqwest::Client,
+         tokens: &TokenManager,
+     ) -> bool {
+-        if !product.eq_ignore_ascii_case(&self.product)
+-            || tokens.get_user().is_err()
+-            || tokens.get_user_sts_token().is_err()
+-        {
++        let binding = if product.eq_ignore_ascii_case(&self.product) {
++            self
++        } else if let Some(related) = self.related.get(&product.to_ascii_uppercase()) {
++            related.as_ref()
++        } else {
++            return false;
++        };
++        if tokens.get_user().is_err() || tokens.get_user_sts_token().is_err() {
+             return false;
+         }
+-        let mut cached = self.cached.lock().await;
++        let mut cached = binding.cached.lock().await;
+         let previous = *cached;
+         if let Some(check) = previous {
+             if check.at.elapsed() < Duration::from_secs(if check.valid { 60 } else { 10 }) {
+@@ -195,7 +236,7 @@ impl Entitlement {
+             xodus::licensing::acquire::get_license(
+                 client,
+                 tokens,
+-                self.content.clone(),
++                binding.content.clone(),
+                 "neutral".into(),
+             ),
+         )
+@@ -213,7 +254,7 @@ impl Entitlement {
+                 _ => "timed out".to_string(),
+             };
+             tracing::warn!(
+-                product = %self.product,
++                product = %binding.product,
+                 within_grace = valid,
+                 "Store account content licence check failed: {cause}"
+             );
+@@ -254,6 +295,7 @@ mod tests {
+                 granted: Some(Instant::now()),
+             })),
+             family: Default::default(),
++            related: Default::default(),
+         };
+         assert!(binding.valid("9TESTROLE0ID", &context.client, &owner).await);
+         assert!(!binding.valid("9OTHERROLE00", &context.client, &owner).await);
+@@ -263,6 +305,36 @@ mod tests {
+         assert!(!binding.valid("9TESTROLE0ID", &context.client, &owner).await);
+     }
+ 
++    #[tokio::test]
++    async fn related_packages_keep_separate_grants_and_refuse_unbound_products() {
++        let context = crate::simple_context::tests::context("related-owner", "related-player");
++        let owner = context.store_context().tokens().clone();
++        let mut binding = Entitlement::fixture("9TESTROLE0ID");
++        let root = Arc::get_mut(&mut binding).unwrap();
++        root.related = Entitlement::related_from_json(r#"{"9TESTADDON01":"00000000-0000-0000-0000-000000000002","9TESTADDON02":"00000000-0000-0000-0000-000000000003"}"#).unwrap();
++        *root.related["9TESTADDON01"].cached.lock().await = Some(Check {
++            at: Instant::now(),
++            valid: true,
++            granted: Some(Instant::now()),
++        });
++        assert!(root.valid("9TESTADDON01", &context.client, &owner).await);
++        assert!(!root.valid("9TESTROLE0ID", &context.client, &owner).await);
++        assert!(!root.valid("9TESTADDON02", &context.client, &owner).await);
++        assert!(!root.valid("9TESTOTHER00", &context.client, &owner).await);
++        context.store_context().tokens().remove_user().unwrap();
++        assert!(!root.valid("9TESTADDON01", &context.client, &owner).await);
++    }
++
++    #[test]
++    fn related_binding_requires_product_and_content_identities() {
++        assert!(
++            Entitlement::related_from_json(r#"{"bad":"00000000-0000-0000-0000-000000000001"}"#)
++                .is_err()
++        );
++        assert!(Entitlement::related_from_json(r#"{"9TESTADDON01":"bad"}"#).is_err());
++        assert!(Entitlement::related_from_json(r#"{"9TESTADDON01":"00000000-0000-0000-0000-000000000001","9testaddon01":"00000000-0000-0000-0000-000000000002"}"#).is_err());
++    }
++
+     /// A refresh that fails -- here because the fixture has no device
+     /// credentials, as a network failure would -- keeps a recent grant, and
+     /// lets one older than the grace period go.
+@@ -281,6 +353,7 @@ mod tests {
+                     granted: Some(now.checked_sub(granted_ago)?),
+                 })),
+                 family: Default::default(),
++                related: Default::default(),
+             })
+         };
+         if let Some(recent) = binding(Duration::from_secs(120)) {

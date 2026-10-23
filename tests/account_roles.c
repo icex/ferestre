@@ -629,7 +629,7 @@ int main(int argc,char **argv)
     CHECK(IXStoreImpl6_XStoreAcquireLicenseForPackageResult(store,&async,&license)==S_OK && license,"package licence handle returned");
     if(license) CHECK(IXStoreImpl6_XStoreIsLicenseValid(store,license),"verified package licence is valid");
     ZeroMemory(&async,sizeof(async));
-    CHECK(IXStoreImpl6_XStoreAcquireLicenseForPackageAsync(store,NULL,"unrelated-package",&async)==E_NOTIMPL,"current licence cannot grant an unrelated package");
+    CHECK(IXStoreImpl6_XStoreAcquireLicenseForPackageAsync(store,NULL,"unrelated-package",&async)==E_INVALIDARG,"current licence cannot grant an unrelated package");
     CHECK(IXThreadingImpl_XTaskQueueCreate(threading,XTaskQueueDispatchMode_ThreadPool,XTaskQueueDispatchMode_Manual,&queue)==S_OK,"notification queue created");
     CHECK(IXUserImpl6_XUserRegisterForChangeEvent(users,queue,NULL,user_changed,&user_token)==S_OK,"player change callback registered");
     CHECK(IXStoreImpl6_XStoreRegisterGameLicenseChanged(store,context,queue,NULL,game_changed,&game_token)==S_OK,"Store game licence callback registered");
