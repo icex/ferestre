@@ -107,7 +107,8 @@ summary="Synthetic move fixture"
             s.wait_for(dialog,lambda r:can_move() and any('free' in t and dest in t for t in s.texts(r)),'automatic valid destination recheck',time.monotonic()+10)
             s.click_named(dialog,'Move')
             s.wait_for(app,lambda r:any('Moving '+TITLE in t for t in s.texts(r)),'progress',time.monotonic()+10)
-            s.wait_for(app,lambda r:json.loads(record.read_text())['dir']!=str(game),'record update',time.monotonic()+30)
+            # CI uses an unoptimized binary for two passes over 1.1 GB.
+            s.wait_for(app,lambda r:json.loads(record.read_text())['dir']!=str(game),'record update',time.monotonic()+120)
             destination=Path(json.loads(record.read_text())['dir'])
             s.wait_for(app,lambda r:not game.exists(),'source cleanup',time.monotonic()+10)
             assert hashlib.file_digest((destination/'payload.bin').open('rb'),'sha256').hexdigest()==expected
