@@ -105,6 +105,24 @@ refused by its related-title lock. Online modes and complete campaign
 playthroughs are untested.
 
 
+The automatic-content candidate was installed at the normal AppImage path.
+With Halo 4's content temporarily preserved outside game discovery, the
+ordinary desktop Play action downloaded it again and launched MCC with six
+related paths and six authenticated content bindings. Every re-created file
+matched the preserved package by SHA256; the temporary backup was then removed.
+Native GUI checks confirmed that the installed companion rows offer Installed
+rather than Set up. The automatic install fixture also covers an unavailable
+companion, reusing complete content without downloading, and an actual JSON
+run preparing missing content.
+
+Halo 2 resumed into The Armory at 3840x2160, camera input responded and
+Save/Quit returned to the front end. CE and Reach retain the earlier retail
+qualification above. Remaining independent Halo 3, ODST and Halo 4 visual
+checks are pending: the desktop locked during the Halo 3 load. The user
+reported that the previously missing campaigns now work; that is separate from
+an independently captured full check. The launcher suite passed 522 checks
+with 2 ignored; Clippy with warnings denied and all 9 validator tests passed.
+
 ## Deferred provider data and queue termination
 
 MCC's queue-cleanup provider retains its `XAsyncProviderData` pointer and hands

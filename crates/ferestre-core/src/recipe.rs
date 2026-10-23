@@ -1171,5 +1171,7 @@ summary = "Runs."
             recipe.install.content = content.into_iter().map(str::to_string).collect();
             assert!(Recipe::parse(&toml::to_string(&recipe).unwrap()).is_err());
         }
+        recipe.install.content = (0..129).map(|i| format!("9{i:011}")).collect();
+        assert!(Recipe::parse(&toml::to_string(&recipe).unwrap()).is_err());
     }
 }

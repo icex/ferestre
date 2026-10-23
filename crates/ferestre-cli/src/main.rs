@@ -1105,11 +1105,14 @@ fn install_package(
         roles.apply(&mut command);
     }
 
-    if cli.json {
+    // Only an explicit install request uses JSON as a plan-only operation.
+    // Missing content prepared by an actual run must still be downloaded.
+    if cli.json && include_content {
         print_json(&json!({
             "schema": JSON_SCHEMA,
             "product_id": product_id,
             "destination": dest.display().to_string(),
+            "content": recipe.map(|r| r.install.content.as_slice()).unwrap_or_default(),
             "plan": { "program": xodus_cli.display().to_string(),
                       "args": ["streaming", product_id, dest.display().to_string()] },
         }));
@@ -7628,16 +7631,19 @@ summary = "Runs."
                 "[install]\ncontent = [\"{addon}\", \"{denied}\"]\n"
             )),
         );
-        home.client(&format!(r#"
+        let script = format!(
+            r#"
 if [ "$2" = "{denied}" ]; then exit 0; fi
 printf '<Package><Identity Name="Fixture.Parent" Version="1.0.0.0"/></Package>' > "$3/appxmanifest.xml"
 if [ "$2" = "{GAME}" ]; then
  printf '<Game><Identity Name="Fixture.Parent"/><StoreId>{GAME}</StoreId></Game>' > "$3/MicrosoftGame.config"
 else
- printf '<Game><StoreId>{addon}</StoreId><AllowedProduct>{GAME}</AllowedProduct><MainPackageDependency Name="Fixture.Parent"/></Game>' > "$3/MicrosoftGame.config"
+ printf '<Game><StoreId>%s</StoreId><AllowedProduct>{GAME}</AllowedProduct><MainPackageDependency Name="Fixture.Parent"/></Game>' "$2" > "$3/MicrosoftGame.config"
 fi
 printf fixture > "$3/.xodus-streaming.msixvc"
-"#));
+"#
+        );
+        home.client(&script);
         let paths = home.paths();
         assert_eq!(
             code(
@@ -7668,6 +7674,22 @@ printf fixture > "$3/.xodus-streaming.msixvc"
         assert!(
             !home.client_ran(),
             "complete companion content is reused without downloading"
+        );
+        home.client(&script);
+        recipe.install.content = vec!["9TESTADDON03".into()];
+        let mut json_run = cli();
+        json_run.json = true;
+        assert!(prepare_content(
+            &json_run,
+            &paths,
+            &recipe,
+            &base.dir,
+            &cancel::Cancellation::default()
+        )
+        .unwrap());
+        assert!(
+            install::load(paths.state_dir(), "9TESTADDON03").is_some(),
+            "actual JSON runs still prepare their missing content"
         );
     }
 }
