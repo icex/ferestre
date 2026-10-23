@@ -65,6 +65,10 @@ pub struct Title {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Install {
+    /// Companion content prepared automatically on install and before Play.
+    /// Each package still requires its own authenticated Store licence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<String>,
     /// Where the package lands, relative to the games directory. Defaults to the
     /// slug; Bedrock is the exception, which is why this is overridable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -288,6 +292,21 @@ impl Recipe {
                 "[title].slug \"{}\" must be lowercase letters, digits and dashes",
                 recipe.title.slug
             );
+        }
+        let mut content = BTreeSet::new();
+        if recipe.install.content.len() > 128 {
+            anyhow::bail!("[install].content has too many packages");
+        }
+        for id in &recipe.install.content {
+            if id.len() != 12
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+                || id.eq_ignore_ascii_case(&recipe.title.product_id)
+                || !content.insert(id)
+            {
+                anyhow::bail!("[install].content must contain unique companion Store product ids");
+            }
         }
         for (key, name, suffix) in [
             ("dir-env", &recipe.install.dir_env, "_DIR"),
@@ -1138,5 +1157,21 @@ summary = "Runs."
             assert!(!r.title.name.is_empty());
             assert!(!r.launch.executable.is_empty());
         }
+    }
+    #[test]
+    fn companion_content_ids_are_unique_bounded_and_not_the_base_title() {
+        let mut recipe = Recipe::blank("9TESTBASE001", "Fixture");
+        recipe.install.content = vec!["9TESTADDON01".into()];
+        assert!(Recipe::parse(&toml::to_string(&recipe).unwrap()).is_ok());
+        for content in [
+            vec!["bad"],
+            vec!["9TESTBASE001"],
+            vec!["9TESTADDON01", "9TESTADDON01"],
+        ] {
+            recipe.install.content = content.into_iter().map(str::to_string).collect();
+            assert!(Recipe::parse(&toml::to_string(&recipe).unwrap()).is_err());
+        }
+        recipe.install.content = (0..129).map(|i| format!("9{i:011}")).collect();
+        assert!(Recipe::parse(&toml::to_string(&recipe).unwrap()).is_err());
     }
 }

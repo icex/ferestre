@@ -158,6 +158,11 @@ account, switch off **Show me online** in the account menu. The dot by your
 name says Online or Offline, as Xbox reports it; with no game running it says
 Offline. See [docs/PRESENCE.md](docs/PRESENCE.md).
 
+**MCC campaign content.** Installing The Master Chief Collection automatically
+prepares its campaign packages. Play also repairs missing content before the
+game starts. Installed add-ons such as Reach show **Installed** and name their
+base game; launch MCC to play them. They need no Set up step or separate prefix.
+
 **Controllers.** Xbox pads, DualShock 4 and DualSense pads reach GDK titles
 through Wine's XInput and GameInput. PlayStation pads go through SDL, which
 needs the host's SDL2 (`sdl2-compat` on Arch and Fedora). From a Steam

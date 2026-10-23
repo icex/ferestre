@@ -660,3 +660,25 @@ provided-by = ["patches/xgameruntime/0030-separate-store-and-player-accounts.pat
 symptom-if-missing = "A Store owner cannot be selected independently from the Xbox player"
 note = "Requires the matching profile-aware service. Microsoft still decides content access; separate Player prefixes retain independent local saves."
 verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "XGR_ACCOUNT_ROLES_V1" }, { file = "files/lib/wine/x86_64-unix/xgameruntime.so", contains = "Ferestre account roles v1:" }]
+
+[[capability]]
+name = "xgameruntime.related-packages"
+summary = "Enumerate and mount installed related content; acquire independent authenticated package licences and page entitled add-ons."
+provided-by = ["patches/xgameruntime/0035-enumerate-installed-related-content.patch", "patches/xodus-cli/0028-license-installed-related-content.patch"]
+symptom-if-missing = "Installed campaign add-ons do not appear in XPackageEnumeratePackages(Content, ThisAndRelated)."
+verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "reporting installed related package" }]
+
+[[capability]]
+name = "xgameruntime.termination-completion-port"
+summary = "Asynchronous queue termination is delivered through the Completion port after accepted work drains."
+provided-by = ["patches/xgameruntime/0036-complete-termination-on-the-completion-port.patch"]
+symptom-if-missing = "An asynchronous termination callback bypasses a Manual Completion port and runs on the last worker."
+note = "Use strict manual dispatch for titles that own their Completion port."
+verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "queuing terminated callback on Completion port" }]
+
+[[capability]]
+name = "xgameruntime.provider-data-lifetime"
+summary = "Provider data remains valid for deferred callbacks until operation Cleanup."
+provided-by = ["patches/xgameruntime/0037-retain-provider-data-until-cleanup.patch"]
+symptom-if-missing = "MCC's deferred queue-cleanup callback reads expired stack provider data and crashes on desktop exit."
+verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "retained provider data" }]

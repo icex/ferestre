@@ -314,7 +314,7 @@ jobs:
       - name: Fixture script syntax
         run: |
           bash -n tests/run-tests.sh tests/build-license-service-fixture.sh
-          python3 -m py_compile tests/license_token_fixture.py
+          python3 -m py_compile tests/license_token_fixture.py tests/related_license_fixture.py
 
       # Offline, loopback only: the service, the download integrity checks
       # (msixvc's hash tree, header signatures with throwaway test keys, and

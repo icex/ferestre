@@ -61,6 +61,7 @@ Where the title and its prefix live, relative to `XODUS_GAMES_DIR`.
 | `dir-env` | string | optional | An environment variable that overrides `dir`, for compatibility with the existing scripts. Must be the slug's own variable: the slug uppercased with dashes as underscores, then `_DIR` (`halo-infinite` gives `HALO_INFINITE_DIR`), and not one of the launcher's or the system's own (`XODUS_*`, `FERESTRE_*`, `XDG_*`, `STEAM_*`, `PROTON_*`, `WINE*`) even when a slug spells one. Any other variable would make whatever it names, say the whole games directory, the title's folder, which is what an uninstall deletes. |
 | `prefix` | string | optional | Default: `<slug>-proton`. |
 | `prefix-env` | string | optional | As `dir-env`, for the prefix: the slug's own variable ending in `_PREFIX` (`HALO_INFINITE_PREFIX`). |
+| `content` | array of strings | optional | Companion Store product ids installed automatically after the game and repaired if missing before Play. Each needs its own Store licence; unavailable content is reported and does not block the other campaigns. No standalone recipe or prefix is made for content packages. |
 
 ### `[launch]` — required
 

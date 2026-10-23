@@ -606,7 +606,7 @@ fn cmd_run(
         force,
         steam,
     };
-    let prepared = prepare_launch(cli, &paths, title, request)?;
+    let mut prepared = prepare_launch(cli, &paths, title, request)?;
     if dry_run {
         // Nothing has been started or written: a dry run prints and stops.
         if cli.json {
@@ -618,6 +618,17 @@ fn cmd_run(
             print!("{}", render_plan(&prepared.plan, cli.show_account));
         }
         return Ok(ExitCode::SUCCESS);
+    }
+    let game = launch::game_dir(&prepared.recipe, &prepared.dirs, &prepared.options);
+    if prepare_content(
+        cli,
+        &paths,
+        &prepared.recipe,
+        &game,
+        &cancel::Cancellation::default(),
+    )? {
+        // New installations must enter the immutable runtime/service inventory.
+        prepared = prepare_launch(cli, &paths, title, request)?;
     }
     launch_prepared(&paths, prepared, force)
 }
@@ -643,6 +654,7 @@ struct PreparedLaunch {
     /// when it was read for them: the presence runner names the Player.
     roles: Option<accounts::Selection>,
     profiles: Option<accounts::Profiles>,
+    related: Vec<ferestre_core::related::Package>,
 }
 
 /// Everything a launch decides before it starts anything: the recipe, the
@@ -784,6 +796,18 @@ fn prepare_launch(
             &launch::game_dir(&recipe, &dirs, &options),
         )?;
     }
+    let related = ferestre_core::related::installed(
+        paths.state_dir(),
+        &recipe.title.product_id,
+        &launch::game_dir(&recipe, &dirs, &options),
+    );
+    let package_paths = ferestre_core::related::environment(&related);
+    plan.env_set
+        .insert("XGR_RELATED_PACKAGE_PATHS".into(), package_paths);
+    plan.env_set.insert(
+        "XODUS_RELATED_CONTENT".into(),
+        ferestre_core::related::service_binding(&related),
+    );
     let service_socket = plan_service_socket(&mut plan, &dirs, runtime, roles.as_ref())?;
     Ok(PreparedLaunch {
         runtime: runtime.clone(),
@@ -795,6 +819,7 @@ fn prepare_launch(
         service_socket,
         roles,
         profiles,
+        related,
     })
 }
 
@@ -810,10 +835,27 @@ fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Resu
         service_socket,
         roles,
         mut profiles,
+        related,
     } = prepared;
     // Held while the title runs: an install, update or removal of it waits
     // for this, and this does not start while one of those is under way.
     let _lock = TitleLock::take(paths, &recipe.title.product_id, LockMode::Run)?;
+    // Add-ons are part of this running title too: moving or removing one must
+    // not invalidate the immutable inventory or a mount the game is using.
+    let mut related_locks = Vec::new();
+    for package in &related {
+        related_locks.push(TitleLock::take(paths, &package.product, LockMode::Run)?);
+        let record = install::load(paths.state_dir(), &package.product)
+            .context("Related content changed before launch; try again")?;
+        anyhow::ensure!(
+            !record.is_stale()
+                && !install::is_partial(&record.dir)
+                && record.dir.canonicalize()? == package.dir
+                && record.content_ids.first() == package.content.as_ref(),
+            "Related content changed before launch; try again"
+        );
+    }
+    let _related_locks = related_locks;
     // Through the checked path: the slug is recipe data, and the log is
     // created wherever this says.
     let log = paths.log_file(&recipe)?;
@@ -999,6 +1041,51 @@ fn install_title(
     dir: Option<&Path>,
     cancellation: &cancel::Cancellation,
 ) -> Result<ExitCode> {
+    install_package(cli, paths, product_id, dir, cancellation, true)
+}
+
+/// Prepare missing companion packages without treating their installation as
+/// ownership. A Store refusal is reported; already licensed campaigns remain
+/// usable. There is deliberately no recursive companion installation.
+fn prepare_content(
+    cli: &Cli,
+    paths: &Paths,
+    recipe: &Recipe,
+    game: &Path,
+    cancellation: &cancel::Cancellation,
+) -> Result<bool> {
+    let installed =
+        ferestre_core::related::installed(paths.state_dir(), &recipe.title.product_id, game);
+    let mut changed = false;
+    for product in &recipe.install.content {
+        cancellation.check()?;
+        if installed
+            .iter()
+            .any(|p| p.product.eq_ignore_ascii_case(product))
+        {
+            continue;
+        }
+        eprintln!(":: Preparing content {product} for {}", recipe.title.name);
+        match install_package(cli, paths, product, None, cancellation, false) {
+            Ok(code) if code == ExitCode::SUCCESS => changed = true,
+            Ok(_) => eprintln!(
+                "-- content {product} is unavailable; other installed content remains usable"
+            ),
+            Err(error) => eprintln!("-- could not prepare content {product}: {error:#}"),
+        }
+        cancellation.check()?;
+    }
+    Ok(changed)
+}
+
+fn install_package(
+    cli: &Cli,
+    paths: &Paths,
+    product_id: &str,
+    dir: Option<&Path>,
+    cancellation: &cancel::Cancellation,
+    include_content: bool,
+) -> Result<ExitCode> {
     let product_id = normalise_product_id(product_id);
     let xodus_cli = paths
         .xodus_cli()
@@ -1018,11 +1105,14 @@ fn install_title(
         roles.apply(&mut command);
     }
 
-    if cli.json {
+    // Only an explicit install request uses JSON as a plan-only operation.
+    // Missing content prepared by an actual run must still be downloaded.
+    if cli.json && include_content {
         print_json(&json!({
             "schema": JSON_SCHEMA,
             "product_id": product_id,
             "destination": dest.display().to_string(),
+            "content": recipe.map(|r| r.install.content.as_slice()).unwrap_or_default(),
             "plan": { "program": xodus_cli.display().to_string(),
                       "args": ["streaming", product_id, dest.display().to_string()] },
         }));
@@ -1164,7 +1254,9 @@ fn install_title(
     // executable, and before the download there was no manifest to read. Doing
     // it here rather than in the window means `ferestre install <anything>`
     // leaves something runnable whichever way it was invoked.
-    if recipe.is_none() {
+    if recipe.is_none() && ferestre_core::related::parent(&dest).is_some() {
+        eprintln!("-- content installed; its base game uses it automatically");
+    } else if recipe.is_none() {
         match write_detected_recipe(paths, &product_id, &dest) {
             Ok(Some(path)) => eprintln!(
                 "-- wrote a recipe from the package manifest: {}\n\
@@ -1177,6 +1269,12 @@ fn install_title(
                  write one by hand: see titles/SCHEMA.md"
             ),
             Err(e) => eprintln!("-- could not write a recipe: {e}"),
+        }
+    }
+    if include_content && !setup_failed {
+        if let Some(recipe) = recipe {
+            // Keep the base title's Change lock through companion preparation.
+            prepare_content(cli, paths, recipe, &dest, cancellation)?;
         }
     }
     Ok(if setup_failed {
@@ -3102,12 +3200,13 @@ fn plan_service_socket(
         // A service started for one title identity is never reused for
         // another: the binding names the product, content and title.
         let binding = format!(
-            "{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}",
             id.trim(),
             plan.get("XODUS_STORE_PRODUCT").unwrap_or_default(),
             plan.get("XODUS_STORE_CONTENT").unwrap_or_default(),
             plan.get("XODUS_TITLE_ID").unwrap_or_default(),
-            plan.get("XODUS_TITLE_CLIENT_ID").unwrap_or_default()
+            plan.get("XODUS_TITLE_CLIENT_ID").unwrap_or_default(),
+            plan.get("XODUS_RELATED_CONTENT").unwrap_or_default()
         );
         let root = std::env::var_os("XODUS_RUNTIME_DIR")
             .filter(|v| !v.is_empty())
@@ -3551,11 +3650,12 @@ fn service_command(
 ///   services then take the title on a request's word as before; a launch with
 ///   account roles needs a service that understands them
 ///   (`accounts::SERVICE_TITLE_SCOPE`).
-const SERVICE_BINDING: [&str; 6] = [
+const SERVICE_BINDING: [&str; 7] = [
     "XODUS_STORE_PROFILE",
     "XODUS_PLAYER_PROFILE",
     "XODUS_STORE_PRODUCT",
     "XODUS_STORE_CONTENT",
+    "XODUS_RELATED_CONTENT",
     "XODUS_TITLE_ID",
     "XODUS_TITLE_CLIENT_ID",
 ];
@@ -7518,6 +7618,79 @@ summary = "Runs."
             .as_deref()
             .unwrap_or_default()
             .contains("broken.toml"));
+    }
+    #[test]
+    fn installing_a_collection_prepares_content_without_a_standalone_recipe() {
+        let home = Home::new("automatic-content");
+        let addon = "9TESTADDON01";
+        let denied = "9TESTADDON02";
+        home.recipe(
+            "titles",
+            "game.toml",
+            &game_recipe(&format!(
+                "[install]\ncontent = [\"{addon}\", \"{denied}\"]\n"
+            )),
+        );
+        let script = format!(
+            r#"
+if [ "$2" = "{denied}" ]; then exit 0; fi
+printf '<Package><Identity Name="Fixture.Parent" Version="1.0.0.0"/></Package>' > "$3/appxmanifest.xml"
+if [ "$2" = "{GAME}" ]; then
+ printf '<Game><Identity Name="Fixture.Parent"/><StoreId>{GAME}</StoreId></Game>' > "$3/MicrosoftGame.config"
+else
+ printf '<Game><StoreId>%s</StoreId><AllowedProduct>{GAME}</AllowedProduct><MainPackageDependency Name="Fixture.Parent"/></Game>' "$2" > "$3/MicrosoftGame.config"
+fi
+printf fixture > "$3/.xodus-streaming.msixvc"
+"#
+        );
+        home.client(&script);
+        let paths = home.paths();
+        assert_eq!(
+            code(
+                install_title(&cli(), &paths, GAME, None, &cancel::Cancellation::default())
+                    .unwrap()
+            ),
+            code(ExitCode::SUCCESS)
+        );
+        let base = install::load(paths.state_dir(), GAME).unwrap();
+        assert!(install::load(paths.state_dir(), addon).is_some());
+        assert!(install::load(paths.state_dir(), denied).is_none());
+        assert!(!paths
+            .user_titles_dir()
+            .join(format!("{addon}.toml"))
+            .exists());
+        let mut recipe = Recipe::parse(&game_recipe(" ")).unwrap();
+        recipe.install.content = vec![addon.into()];
+        std::fs::remove_file(home.root().join("client/calls")).unwrap();
+        home.client("exit 99");
+        assert!(!prepare_content(
+            &cli(),
+            &paths,
+            &recipe,
+            &base.dir,
+            &cancel::Cancellation::default()
+        )
+        .unwrap());
+        assert!(
+            !home.client_ran(),
+            "complete companion content is reused without downloading"
+        );
+        home.client(&script);
+        recipe.install.content = vec!["9TESTADDON03".into()];
+        let mut json_run = cli();
+        json_run.json = true;
+        assert!(prepare_content(
+            &json_run,
+            &paths,
+            &recipe,
+            &base.dir,
+            &cancel::Cancellation::default()
+        )
+        .unwrap());
+        assert!(
+            install::load(paths.state_dir(), "9TESTADDON03").is_some(),
+            "actual JSON runs still prepare their missing content"
+        );
     }
 }
 

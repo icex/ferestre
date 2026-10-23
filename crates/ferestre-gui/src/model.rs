@@ -36,6 +36,8 @@ pub enum Action {
     /// Owned, but nobody has written a recipe. Opens the editor rather than
     /// running anything: the missing piece is a description, not a download.
     Adopt,
+    /// Installed content used automatically by its parent game.
+    Content,
     /// This window started the title and it is still running. Pressing it asks
     /// the title to close, politely -- a game killed outright loses whatever it
     /// had not written yet, and saves are the whole reason people run these
@@ -61,6 +63,7 @@ impl Action {
             Action::Resume => "Resume",
             Action::Update => "Update",
             Action::Adopt => "Set up",
+            Action::Content => "Installed",
             Action::Stop => "Stop",
             Action::Installing => "Installing..",
             Action::Blocked(_) => "Play",
@@ -68,7 +71,10 @@ impl Action {
     }
 
     pub fn is_enabled(&self) -> bool {
-        !matches!(self, Action::Blocked(_) | Action::Installing)
+        !matches!(
+            self,
+            Action::Blocked(_) | Action::Installing | Action::Content
+        )
     }
 
     pub fn is_enabled_during_download(&self, downloading: bool) -> bool {
@@ -87,7 +93,11 @@ impl Action {
             Action::Install | Action::Resume | Action::Update => Some(["install", product_id]),
             // Both are handled by the window rather than by a command: `Adopt`
             // opens the editor, `Stop` signals a process this window started.
-            Action::Adopt | Action::Stop | Action::Installing | Action::Blocked(_) => None,
+            Action::Adopt
+            | Action::Content
+            | Action::Stop
+            | Action::Installing
+            | Action::Blocked(_) => None,
         }
     }
 }
@@ -196,6 +206,7 @@ pub struct Inputs<'a> {
     /// looked. Separate from [`Self::installed_product`] because a package can
     /// be on disk and still not say what to run.
     pub product_describes_itself: &'a dyn Fn(&str) -> bool,
+    pub content_parent: &'a dyn Fn(&str) -> Option<String>,
     /// Whether this window is downloading it at this moment. Only what this
     /// window started, like [`Self::running`]: a download begun elsewhere is
     /// not something it can honestly report on.
@@ -861,6 +872,26 @@ pub fn library(inputs: &Inputs) -> Vec<LibraryRow> {
         }
     }
 
+    for row in rows.values_mut() {
+        if row.installed && matches!(row.action, Action::Adopt) {
+            if let Some(parent) = (inputs.content_parent)(&row.product_id) {
+                let name = inputs
+                    .catalog
+                    .get(&parent)
+                    .map(|p| p.name.as_str())
+                    .or_else(|| {
+                        inputs
+                            .recipes
+                            .iter()
+                            .find(|r| r.matches(&parent))
+                            .map(|r| r.title.name.as_str())
+                    })
+                    .unwrap_or(&parent);
+                row.subtitle.push_str(&format!("  ·  Content for {name}"));
+                row.action = Action::Content;
+            }
+        }
+    }
     let mut rows: Vec<LibraryRow> = rows.into_values().collect();
     rows.sort_by(sort_key);
     rows
@@ -1566,6 +1597,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            content_parent: &|_| None,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
@@ -1846,6 +1878,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            content_parent: &|_| None,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
@@ -2060,6 +2093,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            content_parent: &|_| None,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
@@ -2115,6 +2149,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            content_parent: &|_| None,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
@@ -2162,6 +2197,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            content_parent: &|_| None,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
@@ -2223,6 +2259,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            content_parent: &|_| None,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
@@ -2273,6 +2310,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            content_parent: &|_| None,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
@@ -2336,6 +2374,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            content_parent: &|_| None,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
@@ -2387,6 +2426,7 @@ mod tests {
                 installed_version: NO_VERSION_ON_DISK,
                 installed_product: NOT_ON_DISK,
                 product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+                content_parent: &|_| None,
                 installing: NOTHING_INSTALLING,
                 running: NOTHING_RUNNING,
                 game_dir: NO_GAME_DIR,
@@ -2455,6 +2495,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: on_disk,
             product_describes_itself: describes,
+            content_parent: &|_| None,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
@@ -2493,6 +2534,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: on_disk,
             product_describes_itself: with_manifest,
+            content_parent: &|_| None,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
@@ -2513,6 +2555,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: on_disk,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            content_parent: &|_| None,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
@@ -2642,6 +2685,7 @@ mod tests {
                 installed_version: NO_VERSION_ON_DISK,
                 installed_product: NOT_ON_DISK,
                 product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+                content_parent: &|_| None,
                 installing: NOTHING_INSTALLING,
                 running: NOTHING_RUNNING,
                 game_dir: NO_GAME_DIR,
@@ -2699,6 +2743,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: on_disk,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            content_parent: &|_| None,
             installing: downloading,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
@@ -2741,6 +2786,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            content_parent: &|_| None,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
@@ -2776,6 +2822,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            content_parent: &|_| None,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
@@ -2811,6 +2858,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            content_parent: &|_| None,
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
@@ -2931,6 +2979,7 @@ mod tests {
             installed_version: NO_VERSION_ON_DISK,
             installed_product: NOT_ON_DISK,
             product_describes_itself: NOTHING_DESCRIBES_ITSELF,
+            content_parent: &|_| None,
             installing: NOTHING_INSTALLING,
             running,
             game_dir: NO_GAME_DIR,
@@ -3346,5 +3395,23 @@ mod tests {
         );
         assert!(unasked(vec!["9ABC".into(), "9def".into()], &mut asked).is_empty());
         assert_eq!(unasked(vec!["9GHI".into()], &mut asked), ["9GHI"]);
+    }
+    #[test]
+    fn installed_companion_content_needs_no_manual_setup_or_standalone_launch() {
+        let recs = BTreeMap::from([("9TESTADDON01".into(), record("9TESTADDON01", &[]))]);
+        let cat = catalog(vec![product("9TESTBASE001", "Collection", &[])]);
+        let ownership = Ownership::Unknown;
+        let mut view = inputs(&[], None, &ownership, NOTHING_INSTALLED);
+        view.records = &recs;
+        view.catalog = &cat;
+        view.installed_product = &|_| true;
+        view.content_parent = &|_| Some("9TESTBASE001".into());
+        let rows = library(&view);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action, Action::Content);
+        assert_eq!(rows[0].action.label(), "Installed");
+        assert!(!rows[0].action.is_enabled());
+        assert!(rows[0].action.command("9TESTADDON01").is_none());
+        assert!(rows[0].subtitle.contains("Content for Collection"));
     }
 }

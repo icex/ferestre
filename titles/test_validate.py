@@ -60,6 +60,13 @@ class Recipes(unittest.TestCase):
                                                    f'prefix-env = "{prefix_env}"\n')
             self.assertEqual(problems, [], slug)
 
+    def test_companion_content_ids_are_checked(self):
+        _, problems = check(install='[install]\ncontent = ["9TESTADDON01"]\n')
+        self.assertEqual(problems, [])
+        for content in ('["bad"]', '["9NBLGGH2JHXJ"]', '["9TESTADDON01", "9TESTADDON01"]'):
+            _, problems = check(install=f'[install]\ncontent = {content}\n')
+            self.assertTrue(any("content" in p for p in problems), problems)
+
     def test_the_launchers_own_variables_are_refused(self):
         for name in ("XODUS_GAMES_DIR", "XDG_RUNTIME_DIR", "HOME", "FERESTRE_TITLES",
                      "STEAM_COMPAT_DATA_PATH", "WINEPREFIX", "PROTON_DIR", "TMPDIR"):

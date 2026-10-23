@@ -24,6 +24,7 @@ INCUBE=$REPO_DIR/tools/in-container.sh
 # the compiler's output directory has to live in one of them, not under /tmp.
 WORK=$(mktemp -d "$BUILD_DIR/.xgr-tests.XXXXXX")
 cleanup() {
+    if [ -n "${RELATED_FIXTURE_PID:-}" ]; then kill -TERM "$RELATED_FIXTURE_PID" 2>/dev/null; wait "$RELATED_FIXTURE_PID" 2>/dev/null; fi
     if [ -n "${CATALOG_FIXTURE_PID:-}" ]; then kill -TERM "$CATALOG_FIXTURE_PID" 2>/dev/null; wait "$CATALOG_FIXTURE_PID" 2>/dev/null; fi
     if [ -n "${FIXTURE_PID:-}" ]; then kill -TERM "$FIXTURE_PID" 2>/dev/null; wait "$FIXTURE_PID" 2>/dev/null; fi
     [ -n "${WINE:-}" ] && WINEPREFIX="$WORK/prefix" "$WINE"server -k 2>/dev/null
@@ -132,12 +133,45 @@ say "running tests"
 # directory is set as both below.
 unset XODUS_RUNTIME_DIR XODUS_STORE_PROFILE XODUS_PLAYER_PROFILE XODUS_ACCOUNT_PROFILE \
     FERESTRE_ACCOUNT_ROLES WINE_PACKAGE_MANIFEST WINEDLLOVERRIDES XGR_XUID XGR_STORE_CATALOG \
-    SteamGameId SteamDeck
+    SteamGameId SteamDeck XGR_ACCOUNT_ROLES_V1 XGR_RELATED_PACKAGE_PATHS XODUS_RELATED_CONTENT
 export WINEPREFIX="$WORK/prefix"
 export WINEDEBUG=-all,fixme-all
 export XGR_WGS_ROOT="Z:$(echo "$WORK/wgs" | sed 's#/#\\#g')"
 export XGR_EXPECTED_FAMILY=$EXPECTED_FAMILY
 
+if [ "${PROVIDER_ONLY:-0}" = 1 ]; then
+    ( cd "$WORK" && timeout 30 "$WINE" "$WORK/xgr_tests.exe" --provider-data )
+    exit $?
+fi
+
+# A separate process exercises its immutable related-package snapshot without
+# changing what the existing current-package tests see.
+python3 - "$WORK" <<'PYFIXTURE'
+import pathlib,sys
+root=pathlib.Path(sys.argv[1])
+config=root/'MicrosoftGame.config'
+(root/'base-config.backup').write_bytes(config.read_bytes())
+config.write_text(config.read_text().replace('9TESTSTORE0ID','9TESTPARENT0'))
+for name,store,parent in [('related-one','9TESTADDON01','9TESTPARENT0'),('related-two','9TESTADDON02','9TESTPARENT0'),('unrelated','9TESTOTHER00','9OTHERGAME00')]:
+ d=root/name;d.mkdir()
+ (d/'MicrosoftGame.config').write_text(f'<Game><Identity Name="Fixture.{name}" Version="1.2.3.4"/><StoreId>{store}</StoreId><AllowedProducts><AllowedProduct>{parent}</AllowedProduct></AllowedProducts><DesktopRegistration><MainPackageDependency Name="XodusTest.RegressionGame" /></DesktopRegistration><ShellVisuals DefaultDisplayName="Fixture content" Description="Fixture content" PublisherDisplayName="Fixture"/></Game>')
+PYFIXTURE
+RELATED_PATHS=$(printf '%s\n%s\n%s' "$WORK/related-one" "$WORK/related-two" "$WORK/unrelated")
+( cd "$WORK" && XGR_RELATED_PACKAGE_PATHS="$RELATED_PATHS" timeout 30 "$WINE" "$WORK/xgr_tests.exe" --related-packages ) > "$WORK/related-out.txt" 2>&1
+related_rc=$?
+cat "$WORK/related-out.txt"
+[ "$related_rc" = 0 ] || fail "related-package regression checks failed"
+python3 "$REPO_DIR/tests/related_license_fixture.py" "$WORK/related-rt" &
+RELATED_FIXTURE_PID=$!
+for _ in $(seq 1 50); do [ -f "$WORK/related-rt/ready" ] && break; sleep 0.1; done
+[ -f "$WORK/related-rt/ready" ] || fail "related licence fixture did not start"
+( cd "$WORK" && XODUS_RUNTIME_DIR="$WORK/related-rt" XGR_ACCOUNT_ROLES_V1=1 XGR_LICENSE_FIXTURE_REVOKE="Z:$WORK/related-rt/revoked" XGR_RELATED_PACKAGE_PATHS="$RELATED_PATHS" timeout 30 "$WINE" "$WORK/xgr_tests.exe" --related-licenses ) > "$WORK/related-license-out.txt" 2>&1
+related_rc=$?
+cat "$WORK/related-license-out.txt"
+[ "$related_rc" = 0 ] || fail "related licence regression checks failed"
+kill -TERM "$RELATED_FIXTURE_PID"; wait "$RELATED_FIXTURE_PID" 2>/dev/null; unset RELATED_FIXTURE_PID
+cp "$WORK/base-config.backup" "$WORK/MicrosoftGame.config"
+[ "${RELATED_ONLY:-0}" != 1 ] || exit 0
 
 say "starting the synthetic license service"
 SERVICE_TEST_BIN=${SERVICE_TEST_BIN:-$("$REPO_DIR/tests/build-license-service-fixture.sh")} || fail "service fixture build failed"
@@ -147,6 +181,7 @@ python3 "$REPO_DIR/tests/license_token_fixture.py" "$XDG_RUNTIME_DIR" "$SERVICE_
 FIXTURE_PID=$!
 for _ in $(seq 1 100); do [ -f "$XDG_RUNTIME_DIR/ready" ] && break; sleep 0.1; done
 [ -f "$XDG_RUNTIME_DIR/ready" ] || fail "service fixture did not start"
+
 
 ( cd "$WORK" && timeout 180 "$WINE" "$WORK/xgr_tests.exe" ) 2>/dev/null | \
     grep -avE '^ntsync|radv is not|^wine:|wineserver' | tee "$WORK/out.txt"
