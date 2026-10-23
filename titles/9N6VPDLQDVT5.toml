@@ -9,6 +9,16 @@ publisher = "Microsoft Studios"
 package-identity = "Microsoft.Chelan"
 title-id = "4430A9F8"
 
+[install]
+content = [
+    "9N9RNPBLR7X3", # Reach
+    "9P84QCTDHD04", # CE
+    "9MWMBQ1GNK6K", # Halo 2
+    "9NN5X5KW23VT", # Halo 3
+    "9N007VX9RGXZ", # ODST
+    "9NN6VS9SPW2R", # Halo 4
+]
+
 [launch]
 executable = 'mcc\binaries\win64\MCCWinStore-Win64-Shipping.exe'
 env = { XGR_STRICT_MANUAL_QUEUES = "1" }

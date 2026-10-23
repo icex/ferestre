@@ -226,7 +226,18 @@ def check_recipe(path, known):
 
     install = data.get("install", {})
     fields(err, "[install]", install, required={},
-           optional={"dir": str, "dir-env": str, "prefix": str, "prefix-env": str})
+           optional={"dir": str, "dir-env": str, "prefix": str, "prefix-env": str, "content": list})
+    content = install.get("content", [])
+    if isinstance(content, list):
+        seen_content = set()
+        for item in content:
+            if (not isinstance(item, str) or not re.fullmatch(r"[0-9A-Z]{12}", item)
+                    or item == product_id or item in seen_content):
+                err("[install].content: expected unique companion Store product ids")
+            if isinstance(item, str):
+                seen_content.add(item)
+        if len(content) > 128:
+            err("[install].content: too many packages")
     if "dir" in install:
         check_relative_path(err, "[install].dir", install["dir"])
     if "prefix" in install:

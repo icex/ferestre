@@ -10,6 +10,22 @@ pub struct Package {
     pub content: Option<String>,
 }
 
+/// Content packages declare a parent, not a standalone executable or prefix.
+pub fn parent(game: &Path) -> Option<String> {
+    if install::executable(game).is_some() {
+        return None;
+    }
+    let xml = std::fs::read_to_string(install::game_config(game)?).ok()?;
+    if !xml.contains("<MainPackageDependency ") {
+        return None;
+    }
+    xml.split("<AllowedProduct>")
+        .skip(1)
+        .filter_map(|s| s.split_once("</AllowedProduct>").map(|p| p.0.trim()))
+        .find(|id| id.len() == 12 && id.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .map(str::to_ascii_uppercase)
+}
+
 pub fn installed(state: &Path, product: &str, game: &Path) -> Vec<Package> {
     let Some(identity) = install::package_identity(game) else {
         return vec![];
@@ -125,5 +141,25 @@ mod tests {
         let mut packages = packages;
         packages[0].content = Some("00000000-0000-0000-0000-000000000001".into());
         assert!(service_binding(&packages).contains("9TESTADDON01"));
+    }
+    #[test]
+    fn content_parent_requires_a_dependency_and_no_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("MicrosoftGame.config");
+        std::fs::write(&config, "<Game><AllowedProduct>9TESTBASE001</AllowedProduct><MainPackageDependency Name=\"Fixture.Parent\"/></Game>").unwrap();
+        assert_eq!(parent(root.path()).as_deref(), Some("9TESTBASE001"));
+        std::fs::write(
+            root.path().join("appxmanifest.xml"),
+            "<Package><Application Executable=\"Game.exe\"/></Package>",
+        )
+        .unwrap();
+        assert!(parent(root.path()).is_none());
+        std::fs::remove_file(root.path().join("appxmanifest.xml")).unwrap();
+        std::fs::write(
+            &config,
+            "<Game><AllowedProduct>9TESTBASE001</AllowedProduct></Game>",
+        )
+        .unwrap();
+        assert!(parent(root.path()).is_none());
     }
 }

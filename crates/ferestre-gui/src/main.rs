@@ -905,6 +905,11 @@ fn draw_list(
     let installed_product = |id: &str| model.product_is_installed(id);
     let describes_itself = |id: &str| model.product_executable(id).is_some();
     let game_dir = |r: &Recipe| model.game_dir(r);
+    let content_parent = |id: &str| {
+        model
+            .product_dir(id)
+            .and_then(|dir| ferestre_core::related::parent(&dir))
+    };
     let inputs = Inputs {
         recipes: &model.recipes,
         runtimes: &model.runtimes,
@@ -921,6 +926,7 @@ fn draw_list(
         installed_version: &installed_version,
         installed_product: &installed_product,
         product_describes_itself: &describes_itself,
+        content_parent: &content_parent,
         installing: &installing,
         running: &running,
         game_dir: &game_dir,
@@ -1731,7 +1737,7 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
     // A shortcut needs something that will launch. A recipe is one; a title on
     // disk is another, because `run` writes a recipe from the package manifest
     // on its way past.
-    if row.has_recipe || row.installed {
+    if (row.has_recipe || row.installed) && row.action != Action::Content {
         for (icon, label, run) in [
             (
                 "applications-engineering-symbolic",
@@ -1796,6 +1802,12 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
         Action::Blocked(reason) => button.set_tooltip_text(Some(reason)),
         Action::Installing => {
             button.set_tooltip_text(Some("Downloading — the bar at the bottom has the detail"));
+            button.remove_css_class("suggested-action");
+        }
+        Action::Content => {
+            button.set_tooltip_text(Some(
+                "Installed add-on. Launch its base game to use this content.",
+            ));
             button.remove_css_class("suggested-action");
         }
         Action::Adopt => {

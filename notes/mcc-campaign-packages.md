@@ -66,11 +66,23 @@ package discovery, mounts and installation-monitor calls.
 
 ## Retail procedure
 
-Install MCC (`9N6VPDLQDVT5`) and the desired campaign content packages with
-Ferestre. The base archive's campaign assets do not replace these add-on
-identities: Halo CE is `9P84QCTDHD04`, and Reach is `9N9RNPBLR7X3`.
+Install MCC (`9N6VPDLQDVT5`) with Ferestre. Its recipe prepares the six
+companion campaign packages automatically after installation, and Play repairs
+missing content before building the runtime inventory. Already complete
+packages are reused. Each download still asks Microsoft for its own licence;
+an unavailable add-on is reported and does not prevent other licensed
+campaigns from running. Content preparation is not recursive.
+
+The package ids are Reach `9N9RNPBLR7X3`, CE `9P84QCTDHD04`, Halo 2
+`9MWMBQ1GNK6K`, Halo 3 `9NN5X5KW23VT`, ODST `9N007VX9RGXZ` and Halo 4
+`9NN6VS9SPW2R`. The base archive contains the campaign assets but does not
+replace these content identities. Installed manifests declare a parent and no
+executable: the window now shows **Installed / Content for MCC**, without
+Set up, a standalone launch recipe or a separate prefix.
+
 Keep the Store account that has access selected; the Xbox Player may be a
-different account. Restart MCC after installing an add-on.
+different account. Content installed during an already running game becomes
+visible on the next launch.
 
 The local baseline was package 1.3528.0.0 with runtime
 11.0.20261017.2-accounts. With CE 1.1367.0.0 installed it still displayed

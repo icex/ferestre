@@ -606,7 +606,7 @@ fn cmd_run(
         force,
         steam,
     };
-    let prepared = prepare_launch(cli, &paths, title, request)?;
+    let mut prepared = prepare_launch(cli, &paths, title, request)?;
     if dry_run {
         // Nothing has been started or written: a dry run prints and stops.
         if cli.json {
@@ -618,6 +618,17 @@ fn cmd_run(
             print!("{}", render_plan(&prepared.plan, cli.show_account));
         }
         return Ok(ExitCode::SUCCESS);
+    }
+    let game = launch::game_dir(&prepared.recipe, &prepared.dirs, &prepared.options);
+    if prepare_content(
+        cli,
+        &paths,
+        &prepared.recipe,
+        &game,
+        &cancel::Cancellation::default(),
+    )? {
+        // New installations must enter the immutable runtime/service inventory.
+        prepared = prepare_launch(cli, &paths, title, request)?;
     }
     launch_prepared(&paths, prepared, force)
 }
@@ -1030,6 +1041,51 @@ fn install_title(
     dir: Option<&Path>,
     cancellation: &cancel::Cancellation,
 ) -> Result<ExitCode> {
+    install_package(cli, paths, product_id, dir, cancellation, true)
+}
+
+/// Prepare missing companion packages without treating their installation as
+/// ownership. A Store refusal is reported; already licensed campaigns remain
+/// usable. There is deliberately no recursive companion installation.
+fn prepare_content(
+    cli: &Cli,
+    paths: &Paths,
+    recipe: &Recipe,
+    game: &Path,
+    cancellation: &cancel::Cancellation,
+) -> Result<bool> {
+    let installed =
+        ferestre_core::related::installed(paths.state_dir(), &recipe.title.product_id, game);
+    let mut changed = false;
+    for product in &recipe.install.content {
+        cancellation.check()?;
+        if installed
+            .iter()
+            .any(|p| p.product.eq_ignore_ascii_case(product))
+        {
+            continue;
+        }
+        eprintln!(":: Preparing content {product} for {}", recipe.title.name);
+        match install_package(cli, paths, product, None, cancellation, false) {
+            Ok(code) if code == ExitCode::SUCCESS => changed = true,
+            Ok(_) => eprintln!(
+                "-- content {product} is unavailable; other installed content remains usable"
+            ),
+            Err(error) => eprintln!("-- could not prepare content {product}: {error:#}"),
+        }
+        cancellation.check()?;
+    }
+    Ok(changed)
+}
+
+fn install_package(
+    cli: &Cli,
+    paths: &Paths,
+    product_id: &str,
+    dir: Option<&Path>,
+    cancellation: &cancel::Cancellation,
+    include_content: bool,
+) -> Result<ExitCode> {
     let product_id = normalise_product_id(product_id);
     let xodus_cli = paths
         .xodus_cli()
@@ -1195,7 +1251,9 @@ fn install_title(
     // executable, and before the download there was no manifest to read. Doing
     // it here rather than in the window means `ferestre install <anything>`
     // leaves something runnable whichever way it was invoked.
-    if recipe.is_none() {
+    if recipe.is_none() && ferestre_core::related::parent(&dest).is_some() {
+        eprintln!("-- content installed; its base game uses it automatically");
+    } else if recipe.is_none() {
         match write_detected_recipe(paths, &product_id, &dest) {
             Ok(Some(path)) => eprintln!(
                 "-- wrote a recipe from the package manifest: {}\n\
@@ -1208,6 +1266,12 @@ fn install_title(
                  write one by hand: see titles/SCHEMA.md"
             ),
             Err(e) => eprintln!("-- could not write a recipe: {e}"),
+        }
+    }
+    if include_content && !setup_failed {
+        if let Some(recipe) = recipe {
+            // Keep the base title's Change lock through companion preparation.
+            prepare_content(cli, paths, recipe, &dest, cancellation)?;
         }
     }
     Ok(if setup_failed {
@@ -7551,6 +7615,60 @@ summary = "Runs."
             .as_deref()
             .unwrap_or_default()
             .contains("broken.toml"));
+    }
+    #[test]
+    fn installing_a_collection_prepares_content_without_a_standalone_recipe() {
+        let home = Home::new("automatic-content");
+        let addon = "9TESTADDON01";
+        let denied = "9TESTADDON02";
+        home.recipe(
+            "titles",
+            "game.toml",
+            &game_recipe(&format!(
+                "[install]\ncontent = [\"{addon}\", \"{denied}\"]\n"
+            )),
+        );
+        home.client(&format!(r#"
+if [ "$2" = "{denied}" ]; then exit 0; fi
+printf '<Package><Identity Name="Fixture.Parent" Version="1.0.0.0"/></Package>' > "$3/appxmanifest.xml"
+if [ "$2" = "{GAME}" ]; then
+ printf '<Game><Identity Name="Fixture.Parent"/><StoreId>{GAME}</StoreId></Game>' > "$3/MicrosoftGame.config"
+else
+ printf '<Game><StoreId>{addon}</StoreId><AllowedProduct>{GAME}</AllowedProduct><MainPackageDependency Name="Fixture.Parent"/></Game>' > "$3/MicrosoftGame.config"
+fi
+printf fixture > "$3/.xodus-streaming.msixvc"
+"#));
+        let paths = home.paths();
+        assert_eq!(
+            code(
+                install_title(&cli(), &paths, GAME, None, &cancel::Cancellation::default())
+                    .unwrap()
+            ),
+            code(ExitCode::SUCCESS)
+        );
+        let base = install::load(paths.state_dir(), GAME).unwrap();
+        assert!(install::load(paths.state_dir(), addon).is_some());
+        assert!(install::load(paths.state_dir(), denied).is_none());
+        assert!(!paths
+            .user_titles_dir()
+            .join(format!("{addon}.toml"))
+            .exists());
+        let mut recipe = Recipe::parse(&game_recipe(" ")).unwrap();
+        recipe.install.content = vec![addon.into()];
+        std::fs::remove_file(home.root().join("client/calls")).unwrap();
+        home.client("exit 99");
+        assert!(!prepare_content(
+            &cli(),
+            &paths,
+            &recipe,
+            &base.dir,
+            &cancel::Cancellation::default()
+        )
+        .unwrap());
+        assert!(
+            !home.client_ran(),
+            "complete companion content is reused without downloading"
+        );
     }
 }
 
