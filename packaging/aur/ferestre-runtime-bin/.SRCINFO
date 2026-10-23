@@ -36,6 +36,7 @@ pkgbase = ferestre-runtime-bin
 	depends = libusb
 	depends = libgudev
 	depends = sdl2-compat
+	depends = sdl2-compat
 	depends = gnutls
 	depends = gmp
 	depends = krb5
