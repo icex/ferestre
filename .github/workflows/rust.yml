@@ -372,6 +372,11 @@ jobs:
           xvfb-run -a --server-args='-screen 0 1280x900x24' \
             dbus-run-session -- python3 tests/gui_smoke.py
 
+      - name: Move location and automatic space checks (offline)
+        run: |
+          xvfb-run -a --server-args='-screen 0 1280x900x24' \
+            dbus-run-session -- python3 tests/gui_move.py --binary target/debug/ferestre-gui
+
       - name: Separate Store and Player accounts (offline)
         run: |
           xvfb-run -a --server-args='-screen 0 1280x900x24' \
