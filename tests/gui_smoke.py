@@ -459,7 +459,7 @@ def toggle_row_menu(app, frame, title, want_open):
     raise Failure(f"timed out waiting for {title}'s menu to " + ("open" if want_open else "close"))
 
 
-MENU_ITEMS = {"Open Store page", "Choose runtime", "Add to Steam", "Edit launch settings", "Remove from disk"}
+MENU_ITEMS = {"Move location", "Open Store page", "Choose runtime", "Add to Steam", "Edit launch settings", "Remove from disk"}
 
 
 def row_menu_offers(app, frame, title):

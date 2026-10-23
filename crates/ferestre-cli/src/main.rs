@@ -148,6 +148,14 @@ enum Cmd {
         dir: Option<PathBuf>,
     },
 
+    /// Move an installed game into another library folder, verifying its files.
+    Move {
+        #[arg(value_name = "PRODUCT-ID")]
+        product_id: String,
+        #[arg(value_name = "LIBRARY")]
+        library: PathBuf,
+    },
+
     /// Check installed MSIXVC packages against the authenticated update service.
     Updates,
 
@@ -249,6 +257,10 @@ fn dispatch(cli: &Cli) -> Result<ExitCode> {
             args,
         } => cmd_run(cli, title, *dry_run, *force, *steam, args),
         Cmd::Install { product_id, dir } => cmd_install(cli, product_id, dir.as_deref()),
+        Cmd::Move {
+            product_id,
+            library,
+        } => cmd_move(cli, product_id, library),
         Cmd::Updates => cmd_updates(cli),
         Cmd::Uninstall {
             product_id,
@@ -4737,6 +4749,79 @@ fn print_json(value: &Value) {
 // tests
 // ---------------------------------------------------------------------------
 
+fn cmd_move(cli: &Cli, product_id: &str, library: &Path) -> Result<ExitCode> {
+    use ferestre_core::relocation;
+    if !is_product_id(product_id) {
+        return Err(usage("Not a Store product id (12 letters and digits)"));
+    }
+    let paths = Paths::from_env()?;
+    let product_id = normalise_product_id(product_id);
+    let _lock = TitleLock::take(&paths, &product_id, LockMode::Change)?;
+    let record = install::load(paths.state_dir(), &product_id)
+        .context("No recorded installation to move")?;
+    // Environment directory overrides would keep launching the old location.
+    let recipes = recipes_for_change(cli, &paths)?;
+    if let Some(recipe) = recipes.iter().find(|r| r.matches(&product_id)) {
+        anyhow::ensure!(paths.install_dir(recipe)?.canonicalize()? == record.dir.canonicalize()?,
+            "The install directory is overridden by an environment variable; clear it before moving");
+    }
+    let plan = relocation::plan(&record, library)?;
+    if cli.json {
+        print_json(
+            &json!({"schema":JSON_SCHEMA,"source":plan.source,"destination":plan.destination,
+            "bytes":plan.bytes,"available":plan.available,"same_filesystem":plan.same_filesystem}),
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    eprintln!(
+        ":: Moving {} to {} ({}; {} free)",
+        plan.source.display(),
+        plan.destination.display(),
+        ferestre_core::human_bytes(plan.bytes),
+        ferestre_core::human_bytes(plan.available)
+    );
+    let cancellation = cancel::Cancellation::from_gui();
+    let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let machine = std::env::var("XODUS_PROGRESS").as_deref() == Ok("json");
+    let result = relocation::execute(
+        paths.state_dir(),
+        &record,
+        &plan,
+        || {
+            anyhow::ensure!(!cancellation.requested(), "Move cancelled");
+            Ok(())
+        },
+        |done, total| {
+            if done == total || last.elapsed() >= std::time::Duration::from_millis(250) {
+                if machine {
+                    println!("{}", json!({"progress":{"done":done,"total":total}}));
+                } else {
+                    eprintln!(
+                        ":: Moving and verifying: {} / {}",
+                        ferestre_core::human_bytes(done),
+                        ferestre_core::human_bytes(total)
+                    );
+                }
+                last = std::time::Instant::now();
+            }
+        },
+    );
+    match result {
+        Ok(warning) => {
+            if let Some(warning) = warning {
+                eprintln!("-- {warning}");
+            }
+            eprintln!(":: Moved to {}", plan.destination.display());
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(error) if cancellation.requested() => {
+            eprintln!("-- {error:#}");
+            Ok(ExitCode::from(130))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7466,5 +7551,16 @@ summary = "Runs."
             .as_deref()
             .unwrap_or_default()
             .contains("broken.toml"));
+    }
+}
+
+#[cfg(test)]
+mod move_command_tests {
+    use super::*;
+    #[test]
+    fn invalid_product_ids_are_refused_before_paths_or_locks_are_opened() {
+        let cli = Cli::try_parse_from(["ferestre", "move", "../escape", "/tmp"]).unwrap();
+        let error = cmd_move(&cli, "../escape", Path::new("/tmp")).unwrap_err();
+        assert!(error.to_string().contains("Not a Store product id"));
     }
 }

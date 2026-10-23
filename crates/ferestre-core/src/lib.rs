@@ -32,6 +32,7 @@ pub mod playfab;
 pub mod presence;
 pub mod recipe;
 pub mod related;
+pub mod relocation;
 pub mod runtime;
 pub mod sdl;
 pub mod signing;
