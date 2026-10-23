@@ -72,8 +72,9 @@ summary="Synthetic move fixture"
             s.wait_for(frame,lambda r:s.row_menus(r).get(TITLE),'installed game',time.monotonic()+20)
             time.sleep(1)
             s.row_action(app,frame,'Move location',TITLE)
-            dialog=s.wait_for(app,lambda r:next((n for n,d in s.walk(r) if n.get_name()==f'Move {TITLE}?'),None),'move dialog',time.monotonic()+20)
-            entry=s.wait_for(dialog,lambda r:next((n for n in s.find_all(r,role='text') if n.get_editable_text_iface()),None),'destination entry',time.monotonic()+10)
+            # Older GTK exposes the title on a label rather than the modal.
+            dialog=s.wait_for(app,lambda r:r if f'Move {TITLE}?' in s.texts(r) else None,'move dialog',time.monotonic()+20)
+            entry=s.wait_for(dialog,lambda r:next((n for n in s.find_all(r,role='text',name='Move to') if n.get_editable_text_iface()),None),'destination entry',time.monotonic()+10)
             assert not s.find_all(dialog,role='button',name='Check space')
             def can_move():
                 button=next(iter(s.find_all(dialog,role='button',name='Move')),None)
@@ -119,8 +120,8 @@ summary="Synthetic move fixture"
             library.mkdir()
             s.wait_for(app,lambda r:not any(t.startswith('Moving '+TITLE) for t in s.texts(r)), 'move completion',time.monotonic()+10)
             s.row_action(app,frame,'Move location',TITLE)
-            dialog=s.wait_for(app,lambda r:next((n for n,d in s.walk(r) if n.get_name()==f'Move {TITLE}?'),None),'second move dialog',time.monotonic()+10)
-            entry=next(n for n in s.find_all(dialog,role='text') if n.get_editable_text_iface())
+            dialog=s.wait_for(app,lambda r:r if f'Move {TITLE}?' in s.texts(r) else None,'second move dialog',time.monotonic()+10)
+            entry=next(n for n in s.find_all(dialog,role='text',name='Move to') if n.get_editable_text_iface())
             Atspi.EditableText.set_text_contents(entry.get_editable_text_iface(),str(library))
             s.wait_for(dialog,lambda r:any('free' in t and 'Includes copying' in t for t in s.texts(r)),'second space preflight',time.monotonic()+10)
             s.click_named(dialog,'Move')
@@ -132,6 +133,7 @@ summary="Synthetic move fixture"
             print('PASS: automatic destination checks, insufficient-space disabling, collision refusal, progress, cross-filesystem move, SHA256 readback, source cleanup and Cancel Move')
         except BaseException:
             print((home/'gui.log').read_text(errors='replace'))
+            s.dump(app, 'Move workflow failure')
             print('Install record:', record.read_text())
             raise
         finally:
