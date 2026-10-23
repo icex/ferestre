@@ -23,7 +23,7 @@
 
 pkgname=ferestre-client
 pkgver=0.1.0.r130.g3e75c9f
-pkgrel=7
+pkgrel=8
 pkgdesc='Xodus client for Microsoft Store titles, with the ferestre patches (sign-in, licences, MSIXVC download and decrypt)'
 arch=('x86_64')
 url='https://github.com/xodus-gaming/xodus'
@@ -81,7 +81,7 @@ _commit=3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60
 # in .SRCINFO, and regenerate the sha256sums -- the patch files themselves may
 # have changed too.
 #
-_patchrev=302cf9463b72abcbd02080363c8f88d1a43be848
+_patchrev=601f506681be295e32dd3ee0cc61bc5b4f691ba0
 _patchurl="https://raw.githubusercontent.com/icex/ferestre/$_patchrev/patches/xodus-cli"
 
 # Every patch after 0001 is part of one ordered series. Keep the downloaded,
@@ -113,6 +113,7 @@ _patches=(
   "0025-hold-the-package-header-to-the-package-service-hash.patch"
   "0026-presence.patch"
   "0027-verify-package-header-signatures.patch"
+  "0028-license-installed-related-content.patch"
 )
 source=("xodus::git+https://github.com/xodus-gaming/xodus.git#commit=$_commit")
 for _patch in "${_patches[@]}"; do
@@ -147,6 +148,7 @@ sha256sums=(
   '5d3ad5a6a9ecc898626f3a9f06f47567569377c3491de36f5cd9fe7e779713a5'
   '03ad5fcad598b1f4e2bf410979b3a7955899d2fa0d070436db8990dac7bfe39d'
   '72b5c006fc3c666a52514fdc5d774c7b8f9090f59564da59142a25488b189df3'
+  'bb55049b7ad686494d150b1c75259843d4be90b7535ef16be10659c5877bfe0f'
 )
 
 prepare() {
