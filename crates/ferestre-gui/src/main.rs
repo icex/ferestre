@@ -1752,7 +1752,7 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
     if row.installed && row.action != Action::Stop && row.action != Action::Installing {
         let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
         item(
-            "folder-move-symbolic",
+            "go-jump-symbolic",
             "Move location",
             Box::new(move || choose_move(&ui, &product_id, &name)),
         );
@@ -4688,35 +4688,17 @@ fn choose_move(ui: &Ui, product_id: &str, name: &str) {
     let group = adw::PreferencesGroup::new();
     group.add(&entry);
     let detail = gtk::Label::builder()
-        .label("Choose a destination, then check its space.")
+        .label("Checking files and destination space…")
         .xalign(0.0)
         .wrap(true)
         .css_classes(["caption"])
         .build();
-    let check = gtk::Button::with_label("Check space");
     let extra = gtk::Box::new(gtk::Orientation::Vertical, 8);
     extra.append(&group);
     extra.append(&detail);
-    extra.append(&check);
     dialog.set_extra_child(Some(&extra));
     let chosen = Rc::new(RefCell::new(None::<PathBuf>));
     let generation = Rc::new(std::cell::Cell::new(0u64));
-    entry.connect_changed(glib::clone!(
-        #[strong]
-        dialog,
-        #[strong]
-        chosen,
-        #[strong]
-        detail,
-        #[strong]
-        generation,
-        move |_| {
-            generation.set(generation.get() + 1);
-            *chosen.borrow_mut() = None;
-            dialog.set_response_enabled("move", false);
-            detail.set_label("Check space for this destination.");
-        }
-    ));
     let window = ui.window.clone();
     browse.connect_clicked(glib::clone!(
         #[strong]
@@ -4745,9 +4727,7 @@ fn choose_move(ui: &Ui, product_id: &str, name: &str) {
         }
     ));
     let product = product_id.to_string();
-    check.connect_clicked(glib::clone!(
-        #[strong]
-        entry,
+    entry.connect_changed(glib::clone!(
         #[strong]
         detail,
         #[strong]
@@ -4756,8 +4736,17 @@ fn choose_move(ui: &Ui, product_id: &str, name: &str) {
         chosen,
         #[strong]
         generation,
-        move |button| {
+        move |entry| {
+            generation.set(generation.get() + 1);
+            let revision = generation.get();
+            *chosen.borrow_mut() = None;
+            dialog.set_response_enabled("move", false);
+            detail.set_label("Checking files and destination space…");
             let text = entry.text().to_string();
+            if text.is_empty() {
+                detail.set_label("Choose a destination folder.");
+                return;
+            }
             let path = if text == "~" {
                 std::env::var_os("HOME").map(PathBuf::from)
             } else if let Some(rest) = text.strip_prefix("~/") {
@@ -4769,15 +4758,16 @@ fn choose_move(ui: &Ui, product_id: &str, name: &str) {
                 return;
             };
             let product = product.clone();
-            let revision = generation.get();
-            let button = button.clone();
-            button.set_sensitive(false);
-            detail.set_label("Checking files and destination space…");
             let detail = detail.clone();
             let dialog = dialog.clone();
             let chosen = chosen.clone();
             let generation = generation.clone();
             glib::spawn_future_local(async move {
+                // Wait for typing to settle before walking a large install.
+                glib::timeout_future(std::time::Duration::from_millis(250)).await;
+                if revision != generation.get() {
+                    return;
+                }
                 let result = gio::spawn_blocking(move || {
                     let out = std::process::Command::new(cli_binary())
                         .args(["--json", "move", &product])
@@ -4792,7 +4782,6 @@ fn choose_move(ui: &Ui, product_id: &str, name: &str) {
                     Ok((path, plan))
                 })
                 .await;
-                button.set_sensitive(true);
                 if revision != generation.get() {
                     return;
                 }
@@ -4822,12 +4811,14 @@ fn choose_move(ui: &Ui, product_id: &str, name: &str) {
     let product = product_id.to_string();
     let name = name.to_string();
     dialog.connect_response(None, move |_, response| {
+        generation.set(generation.get() + 1);
         if response == "move" {
             if let Some(path) = chosen.borrow().as_ref() {
                 spawn_transfer(&ui, &product, &name, Some(path), "Moving", "move");
             }
         }
     });
+    entry.emit_by_name::<()>("changed", &[]);
     dialog.present(Some(&window));
 }
 

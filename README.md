@@ -239,8 +239,9 @@ each. Close Steam before adding or updating a shortcut.
 ### Move an installed game
 
 In a game's **More actions** menu, choose **Move location**, select an existing
-library folder and choose **Check space**. Ferestre shows the game's size, its
-new folder and the space available before enabling **Move**. The window shows
+library folder. Ferestre automatically shows the game's size, its new folder
+and the space available. **Move** stays disabled while checking or if there
+isn't enough space. The window shows
 progress and offers **Cancel Move**.
 
 The CLI does the same with `ferestre move PRODUCT-ID /path/to/library`.
