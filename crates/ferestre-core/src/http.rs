@@ -27,7 +27,12 @@ const MAX_LARGE_DOWNLOAD: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_SIGNATURE: u64 = 16 * 1024;
 
 fn agent(timeout: Duration) -> ureq::Agent {
+    agent_with_scheme(timeout, false)
+}
+
+fn agent_with_scheme(timeout: Duration, https_only: bool) -> ureq::Agent {
     ureq::Agent::config_builder()
+        .https_only(https_only)
         .timeout_global(Some(timeout))
         .user_agent(concat!("ferestre/", env!("CARGO_PKG_VERSION")))
         .build()
@@ -51,6 +56,7 @@ fn agent(timeout: Duration) -> ureq::Agent {
 /// that ended early is resumed, so both behave.
 #[derive(Clone, Copy, Debug)]
 struct Patience {
+    https_only: bool,
     connect: Duration,
     response: Duration,
     attempt: Duration,
@@ -63,6 +69,7 @@ struct Patience {
 }
 
 const LARGE: Patience = Patience {
+    https_only: false,
     connect: Duration::from_secs(30),
     response: Duration::from_secs(60),
     attempt: Duration::from_secs(120),
@@ -73,6 +80,7 @@ const LARGE: Patience = Patience {
 
 fn large_agent(patience: &Patience, body: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
+        .https_only(patience.https_only)
         .timeout_resolve(Some(patience.connect))
         .timeout_connect(Some(patience.connect))
         .timeout_send_request(Some(patience.connect))
@@ -147,6 +155,23 @@ pub fn get_text(url: &str) -> Result<String> {
         .body_mut()
         .read_to_string()
         .map_err(|e| anyhow!("{url}: {e}"))
+}
+
+/// Bounded metadata over HTTPS, including every redirect.
+pub fn get_release_text(url: &str, limit: u64) -> Result<String> {
+    let mut text = String::new();
+    agent_with_scheme(TIMEOUT, true)
+        .get(url)
+        .call()?
+        .into_body()
+        .into_reader()
+        .take(limit + 1)
+        .read_to_string(&mut text)?;
+    anyhow::ensure!(
+        text.len() as u64 <= limit,
+        "release metadata exceeds its size limit"
+    );
+    Ok(text)
 }
 
 /// Fetch an image to `dest`, atomically. An existing image is left alone.
@@ -252,6 +277,28 @@ pub fn download_signed(
     )
 }
 
+/// Signed downloads for the updater also refuse plaintext redirects.
+pub fn download_signed_https(
+    url: &str,
+    signature_url: &str,
+    artefact: crate::signing::Artefact,
+    dest: &Path,
+    cancelled: impl Fn() -> bool,
+) -> Result<()> {
+    download_release(
+        url,
+        signature_url,
+        artefact,
+        dest,
+        &cancelled,
+        &Patience {
+            https_only: true,
+            ..LARGE
+        },
+        crate::signing::RELEASE_PUBLIC_KEY,
+    )
+}
+
 fn download_release(
     url: &str,
     signature_url: &str,
@@ -264,7 +311,7 @@ fn download_release(
     anyhow::ensure!(!cancelled(), "Download stopped");
     // Refuse before a 300 MB download, not after it.
     crate::signing::check_public_key(public_key)?;
-    let signature = fetch_signature(signature_url)?;
+    let signature = fetch_signature(signature_url, patience.https_only)?;
     crate::signing::check_signature(&signature, artefact)?;
     if dest.is_file() {
         if crate::signing::verify_file_with_key(public_key, &signature, artefact, dest).is_ok() {
@@ -297,9 +344,9 @@ fn download_release(
     Ok(())
 }
 
-fn fetch_signature(url: &str) -> Result<String> {
+fn fetch_signature(url: &str, https_only: bool) -> Result<String> {
     let mut text = String::new();
-    agent(TIMEOUT)
+    agent_with_scheme(TIMEOUT, https_only)
         .get(url)
         .call()
         .map_err(|e| anyhow!("{url}: cannot fetch the release signature: {e}"))?
@@ -680,6 +727,7 @@ mod tests {
     }
 
     const QUICK: Patience = Patience {
+        https_only: false,
         connect: Duration::from_secs(5),
         response: Duration::from_secs(5),
         attempt: Duration::from_millis(300),

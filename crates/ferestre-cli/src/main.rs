@@ -23,6 +23,7 @@
 
 mod cancel;
 mod presence;
+mod self_update;
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
@@ -159,6 +160,24 @@ enum Cmd {
     /// Check installed MSIXVC packages against the authenticated update service.
     Updates,
 
+    /// Check signed Ferestre application and runtime releases.
+    CheckAppUpdates,
+
+    /// Install signed Ferestre and runtime updates, keeping the previous AppImage.
+    SelfUpdate {
+        /// Refuse a release older than the one the update banner offered.
+        #[arg(long)]
+        minimum_launcher: Option<String>,
+        #[arg(long)]
+        minimum_runtime: Option<String>,
+        /// Refuse replacement if this window's original AppImage was changed.
+        #[arg(long)]
+        expected_appimage_sha256: Option<String>,
+    },
+
+    /// Restore the previous AppImage kept by the last application update.
+    RollbackAppUpdate,
+
     /// Remove an installed title: its files and the launcher's record of it.
     #[command(alias = "remove")]
     Uninstall {
@@ -262,6 +281,18 @@ fn dispatch(cli: &Cli) -> Result<ExitCode> {
             library,
         } => cmd_move(cli, product_id, library),
         Cmd::Updates => cmd_updates(cli),
+        Cmd::CheckAppUpdates => self_update::check(cli),
+        Cmd::SelfUpdate {
+            minimum_launcher,
+            minimum_runtime,
+            expected_appimage_sha256,
+        } => self_update::apply(
+            cli,
+            minimum_launcher.as_deref(),
+            minimum_runtime.as_deref(),
+            expected_appimage_sha256.as_deref(),
+        ),
+        Cmd::RollbackAppUpdate => self_update::rollback(cli),
         Cmd::Uninstall {
             product_id,
             keep_files,
@@ -2329,6 +2360,26 @@ fn install_runtime(
             "{releases_api}?per_page={RELEASES_PER_PAGE}&page={page}"
         ))
     })?;
+    install_runtime_release(
+        cli.json,
+        paths,
+        release,
+        public_key,
+        cancellation,
+        allow_downgrade,
+        None,
+    )
+}
+
+fn install_runtime_release(
+    plan_only: bool,
+    paths: &Paths,
+    release: runtime::Release,
+    public_key: &str,
+    cancellation: &cancel::Cancellation,
+    allow_downgrade: bool,
+    expected_checksum: Option<&str>,
+) -> Result<ExitCode> {
     cancellation.check()?;
     // Both were checked to be one plain path component when the feed was
     // read (runtime::latest_release): the archive is exactly
@@ -2339,7 +2390,7 @@ fn install_runtime(
     let installed = InstalledRuntime::at(&destination).is_ok();
     let newer = runtime::newer_installed(&paths.runtimes_dir(), version);
     // The document and nothing else on stdout, whatever the answer.
-    if cli.json {
+    if plan_only {
         print_json(&json!({
             "schema": JSON_SCHEMA,
             "release": release.tag,
@@ -2396,14 +2447,24 @@ fn install_runtime(
     // Checked against the release key before it is renamed into place; a
     // cached archive is checked like a fresh one and fetched again when it
     // does not verify, rather than reused by every later attempt.
-    let downloaded = http::download_signed(
-        &release.url,
-        signature_url,
-        release.artefact(),
-        &archive,
-        || cancellation.requested(),
-        public_key,
-    );
+    let downloaded = if expected_checksum.is_some() {
+        http::download_signed_https(
+            &release.url,
+            signature_url,
+            release.artefact(),
+            &archive,
+            || cancellation.requested(),
+        )
+    } else {
+        http::download_signed(
+            &release.url,
+            signature_url,
+            release.artefact(),
+            &archive,
+            || cancellation.requested(),
+            public_key,
+        )
+    };
     cancellation.check()?;
     downloaded.with_context(|| {
         format!(
@@ -2412,6 +2473,9 @@ fn install_runtime(
         )
     })?;
     eprintln!("-- verified the signature of {}", release.asset_name);
+    if let Some(expected) = expected_checksum {
+        ferestre_core::updater::verify_checksum(&archive, expected)?;
+    }
 
     eprintln!("-- unpacking runtime {version}");
     let temporary = paths

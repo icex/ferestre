@@ -10,6 +10,7 @@
 //! The client is never linked: Xodus is GPL-3.0-only, and the decrypted
 //! executable has to stay a child of the process that opened it.
 mod accounts_ui;
+mod app_updates;
 mod cancel;
 mod client_check;
 mod deadline;
@@ -173,6 +174,8 @@ struct Ui {
     running_channels: Rc<RefCell<BTreeMap<String, std::sync::Arc<stop::Channel>>>>,
     /// Says the Xbox client cannot start, for as long as that is true.
     banner: adw::Banner,
+    update_banner: adw::Banner,
+    app_updates: Rc<RefCell<app_updates::State>>,
     /// Why the client cannot start, when the last check found it could not.
     client_blocked: Rc<RefCell<Option<client_check::Blocked>>>,
     /// A PackageKit install asked for while another task held the window, and
@@ -360,9 +363,17 @@ fn build_ui(app: &adw::Application) {
         .visible(false)
         .build();
 
+    let update_banner = adw::Banner::builder()
+        .button_label("Update")
+        .use_markup(false)
+        .revealed(false)
+        .visible(false)
+        .build();
+
     let content_view = adw::ToolbarView::new();
     content_view.add_top_bar(&content_header);
     content_view.add_top_bar(&banner);
+    content_view.add_top_bar(&update_banner);
     content_view.add_bottom_bar(&activity);
     content_view.add_bottom_bar(&download.root);
     content_view.set_content(Some(&toasts));
@@ -425,6 +436,8 @@ fn build_ui(app: &adw::Application) {
         account_owed: Rc::new(Cell::new(false)),
         download: download.clone(),
         banner: banner.clone(),
+        update_banner: update_banner.clone(),
+        app_updates: Rc::new(RefCell::new(app_updates::State::capture())),
         client_blocked: Rc::new(RefCell::new(None)),
         install_owed: Rc::new(Cell::new(None)),
         package_cancel: Rc::new(RefCell::new(None)),
@@ -534,6 +547,7 @@ fn build_ui(app: &adw::Application) {
             refresh_entitlements(&ui, true);
             refresh_updates(&ui, true);
             client_check::check(&ui, None, false);
+            app_updates::refresh(&ui, true);
         }
     ));
 
@@ -547,6 +561,12 @@ fn build_ui(app: &adw::Application) {
         ui,
         move |_| client_check::banner_pressed(&ui)
     ));
+    update_banner.connect_button_clicked(glib::clone!(
+        #[strong]
+        ui,
+        move |_| app_updates::update(&ui)
+    ));
+
     // Coming back from a terminal or a software centre is when the library
     // most likely appeared.
     window.connect_is_active_notify(glib::clone!(
@@ -575,6 +595,12 @@ fn build_ui(app: &adw::Application) {
     }
 
     window.present();
+    app_updates::refresh(&ui, false);
+    let update_checks = ui.clone();
+    glib::timeout_add_seconds_local(60, move || {
+        app_updates::refresh(&update_checks, false);
+        glib::ControlFlow::Continue
+    });
     client_check::check(&ui, None, false);
     refresh_entitlements(&ui, false);
     fetch_gamepass(&ui, false);
@@ -610,6 +636,7 @@ fn build_ui(app: &adw::Application) {
 // --- rendering ------------------------------------------------------------
 
 fn render(ui: &Ui) {
+    app_updates::render(ui);
     // A clicked button keeps the focus, and every title action redraws the
     // row it sits on. Destroying the focused widget makes GTK hand the focus to
     // the first widget left in the rebuilt list after the next paint, and the
@@ -757,10 +784,21 @@ fn reset_account_roles(ui: &Ui) {
 fn render_runtime(ui: &Ui, page: &gtk::Box) {
     let packaged = std::env::var("FERESTRE_PACKAGE_VERSION").ok();
     let release = adw::PreferencesGroup::new();
-    release.add(&plain_row(
+    let release_row = plain_row(
         "Ferestre release",
         Some(ferestre_core::package_version(packaged.as_deref())),
+    );
+    let check = gtk::Button::builder()
+        .label("Check for Updates")
+        .valign(gtk::Align::Center)
+        .build();
+    check.connect_clicked(glib::clone!(
+        #[strong]
+        ui,
+        move |_| app_updates::refresh(&ui, true)
     ));
+    release_row.add_suffix(&check);
+    release.add(&release_row);
     page.append(&release);
 
     let model = ui.model.borrow();
@@ -2985,6 +3023,7 @@ fn spawn_cli_tracked(ui: &Ui, args: &[&str], what: &str) {
         // the window busy for up to a minute, and an answer of "install"
         // in that time was refused as busy. The dialog refreshes instead.
         if runtime_install && !asked {
+            app_updates::invalidate(&ui);
             refresh_account(&ui);
         }
     });

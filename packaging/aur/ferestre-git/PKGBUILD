@@ -138,6 +138,7 @@ package() {
   install -Dm644 NOTICE           "$pkgdir/usr/share/doc/ferestre/NOTICE"
   install -Dm644 docs/RECIPES.md  "$pkgdir/usr/share/doc/ferestre/RECIPES.md"
   install -Dm644 docs/ROADMAP.md  "$pkgdir/usr/share/doc/ferestre/ROADMAP.md"
+  install -Dm644 docs/UPDATES.md  "$pkgdir/usr/share/doc/ferestre/UPDATES.md"
 
   install -Dm644 LICENSE            "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 LICENSE.LGPL-2.1   "$pkgdir/usr/share/licenses/$pkgname/LICENSE.LGPL-2.1"
