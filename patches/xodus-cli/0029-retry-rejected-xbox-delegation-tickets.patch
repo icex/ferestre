@@ -1,0 +1,261 @@
+From: Ferestre contributors
+Subject: Retry Xbox user authentication after a rejected delegation ticket
+
+Xbox user authentication can reject a delegation ticket with the d= prefix
+(HTTP 400, empty response) while accepting the same ticket as t=. Reproduced
+on 2026-11-02 with the installed 0.1.14 client and its existing credentials.
+
+Try the original request first. Only a 400 for a nonempty d= ticket retries,
+once, with t=. Regenerate the proof signature for the new request body.
+Stored credentials and other token consumers keep their original form.
+
+Local HTTP tests cover successful original requests, signed retries, retry
+limits, unchanged non-delegation tickets and other HTTP failures. Live user
+authentication accepted both the unprefixed ticket and the t= representation.
+
+--- a/crates/xodus/src/api/xbox/auth.rs
++++ b/crates/xodus/src/api/xbox/auth.rs
+@@ -8,20 +8,62 @@
+     rps_ticket: String,
+     signer: Option<&crate::api::xbox::signing::RequestSigner>,
+ ) -> reqwest::Result<XstsResponse> {
++    authenticate_xbox_user_at(
++        client,
++        rps_ticket,
++        signer,
++        "https://user.auth.xboxlive.com/user/authenticate",
++    )
++    .await
++}
++
++async fn authenticate_xbox_user_at(
++    client: &reqwest::Client,
++    rps_ticket: String,
++    signer: Option<&crate::api::xbox::signing::RequestSigner>,
++    endpoint: &str,
++) -> reqwest::Result<XstsResponse> {
++    // Some delegation tickets are now rejected as d= but accepted as t=.
++    // Keep the original exchange first and retry only that specific rejection.
++    // The stored ticket and other MSA consumers must keep their original form.
++    let fallback = rps_ticket
++        .strip_prefix("d=")
++        .filter(|t| !t.is_empty())
++        .map(|t| format!("t={t}"));
++    let response = xbox_user_request(client, &rps_ticket, signer, endpoint)
++        .send()
++        .await?;
++    let response = match fallback {
++        Some(ticket) if response.status() == reqwest::StatusCode::BAD_REQUEST => {
++            // Rebuild the request: a proof-bound exchange must sign its new body.
++            xbox_user_request(client, &ticket, signer, endpoint)
++                .send()
++                .await?
++        }
++        _ => response,
++    };
++    response.error_for_status()?.json().await
++}
++
++fn xbox_user_request(
++    client: &reqwest::Client,
++    rps_ticket: &str,
++    signer: Option<&crate::api::xbox::signing::RequestSigner>,
++    endpoint: &str,
++) -> reqwest::RequestBuilder {
+     let body = UserAuthRequest {
+         relying_party: "http://auth.xboxlive.com".to_string(),
+         token_type: "JWT".to_string(),
+         properties: UserAuthProperties {
+             auth_method: "RPS".to_string(),
+             site_name: "user.auth.xboxlive.com".to_string(),
+-            rps_ticket,
++            rps_ticket: rps_ticket.to_string(),
+             proof_key: signer.map(|s| s.proof_key()),
+         },
+     };
+-
+     let payload = serde_json::to_vec(&body).expect("user auth request serialises");
+     let mut request = client
+-        .post("https://user.auth.xboxlive.com/user/authenticate")
++        .post(endpoint)
+         .header("Content-Type", "application/json")
+         .header("x-xbl-contract-version", "1");
+     if let Some(signer) = signer {
+@@ -30,9 +72,7 @@
+             signer.sign(1, "POST", "/user/authenticate", "", &payload, 8192),
+         );
+     }
+-    let resp = request.body(payload).send().await?.error_for_status()?;
+-
+-    resp.json().await
++    request.body(payload)
+ }
+ 
+ /// Authenticate this machine as a device.
+@@ -372,3 +412,166 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod ticket_retry_tests {
++    use super::*;
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++
++    async fn server(
++        statuses: Vec<u16>,
++    ) -> (String, tokio::task::JoinHandle<Vec<(String, Vec<u8>)>>) {
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let url = format!(
++            "http://{}/user/authenticate",
++            listener.local_addr().unwrap()
++        );
++        let task = tokio::spawn(async move {
++            let mut requests = Vec::new();
++            for status in statuses {
++                let (mut socket, _) = listener.accept().await.unwrap();
++                let mut bytes = Vec::new();
++                let header_end = loop {
++                    let mut buf = [0; 2048];
++                    let n = socket.read(&mut buf).await.unwrap();
++                    assert!(n > 0);
++                    bytes.extend_from_slice(&buf[..n]);
++                    if let Some(i) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
++                        break i + 4;
++                    }
++                };
++                let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
++                let length: usize = headers
++                    .lines()
++                    .find_map(|line| {
++                        let (name, value) = line.split_once(':')?;
++                        name.eq_ignore_ascii_case("content-length")
++                            .then(|| value.trim().parse().unwrap())
++                    })
++                    .unwrap();
++                while bytes.len() < header_end + length {
++                    let mut buf = [0; 2048];
++                    let n = socket.read(&mut buf).await.unwrap();
++                    assert!(n > 0);
++                    bytes.extend_from_slice(&buf[..n]);
++                }
++                requests.push((headers, bytes[header_end..header_end + length].to_vec()));
++                let body = if status == 200 {
++                    r#"{"NotAfter":"2030-01-01T00:00:00Z","Token":"synthetic","DisplayClaims":{"xui":[]}}"#
++                } else {
++                    ""
++                };
++                let response = format!(
++                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
++                    body.len()
++                );
++                socket.write_all(response.as_bytes()).await.unwrap();
++            }
++            requests
++        });
++        (url, task)
++    }
++
++    async fn exchange(
++        ticket: &str,
++        statuses: Vec<u16>,
++        signed: bool,
++    ) -> (
++        reqwest::Result<XstsResponse>,
++        Vec<(String, Vec<u8>)>,
++        crate::api::xbox::RequestSigner,
++    ) {
++        let (url, task) = server(statuses).await;
++        let signer = crate::api::xbox::RequestSigner::generate();
++        let result = tokio::time::timeout(
++            std::time::Duration::from_secs(5),
++            authenticate_xbox_user_at(
++                &reqwest::Client::new(),
++                ticket.into(),
++                signed.then_some(&signer),
++                &url,
++            ),
++        )
++        .await
++        .unwrap();
++        (result, task.await.unwrap(), signer)
++    }
++
++    #[tokio::test]
++    async fn successful_original_ticket_is_never_rewritten() {
++        let (result, requests, _) = exchange("d=synthetic-ticket", vec![200], false).await;
++        assert_eq!(result.unwrap().token, "synthetic");
++        assert_eq!(requests.len(), 1);
++        let body: serde_json::Value = serde_json::from_slice(&requests[0].1).unwrap();
++        assert_eq!(body["Properties"]["RpsTicket"], "d=synthetic-ticket");
++        assert!(!requests[0].0.to_lowercase().contains("signature:"));
++    }
++
++    #[tokio::test]
++    async fn rejected_delegation_ticket_retries_once_and_resigns_both_bodies() {
++        use base64::Engine;
++        use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
++        use p256::pkcs8::DecodePrivateKey;
++        let (result, requests, signer) = exchange("d=synthetic-ticket", vec![400, 200], true).await;
++        assert!(result.is_ok());
++        assert_eq!(requests.len(), 2);
++        let key = p256::SecretKey::from_pkcs8_der(&signer.to_pkcs8().unwrap()).unwrap();
++        let verifier = VerifyingKey::from(key.public_key());
++        for ((headers, body), ticket) in requests
++            .iter()
++            .zip(["d=synthetic-ticket", "t=synthetic-ticket"])
++        {
++            let value: serde_json::Value = serde_json::from_slice(body).unwrap();
++            assert_eq!(value["Properties"]["RpsTicket"], ticket);
++            assert!(value["Properties"]["ProofKey"].is_object());
++            let encoded = headers
++                .lines()
++                .find_map(|line| {
++                    let (name, value) = line.split_once(':')?;
++                    name.eq_ignore_ascii_case("signature")
++                        .then_some(value.trim())
++                })
++                .unwrap();
++            let signature = base64::engine::general_purpose::STANDARD
++                .decode(encoded)
++                .unwrap();
++            let mut message = Vec::new();
++            for part in [
++                &signature[..4],
++                &signature[4..12],
++                b"POST",
++                b"/user/authenticate",
++                b"",
++                body.as_slice(),
++            ] {
++                message.extend_from_slice(part);
++                message.push(0);
++            }
++            verifier
++                .verify(&message, &Signature::from_slice(&signature[12..]).unwrap())
++                .unwrap();
++        }
++    }
++
++    #[tokio::test]
++    async fn other_errors_and_ticket_forms_do_not_retry() {
++        for (ticket, status) in [
++            ("d=synthetic", 401),
++            ("d=synthetic", 403),
++            ("d=synthetic", 500),
++            ("t=synthetic", 400),
++            ("synthetic", 400),
++            ("d=", 400),
++        ] {
++            let (result, requests, _) = exchange(ticket, vec![status], false).await;
++            assert_eq!(result.unwrap_err().status().unwrap().as_u16(), status);
++            assert_eq!(requests.len(), 1);
++        }
++        let (result, requests, _) = exchange("d=synthetic", vec![400, 400], false).await;
++        assert_eq!(
++            result.unwrap_err().status(),
++            Some(reqwest::StatusCode::BAD_REQUEST)
++        );
++        assert_eq!(requests.len(), 2);
++    }
++}
