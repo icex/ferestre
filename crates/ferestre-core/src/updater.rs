@@ -15,6 +15,33 @@ const DOWNLOAD: &str = "https://github.com/icex/ferestre/releases/download";
 const FEED_LIMIT: u64 = 8 * 1024 * 1024;
 const MANIFEST_LIMIT: u64 = 64 * 1024;
 
+/// AppImage launchers export these variables to their descendants too. Only
+/// use the image when Ferestre itself is executing from the matching AppDir.
+pub fn current_image() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    associated_image(
+        std::env::var_os("APPIMAGE").as_deref(),
+        std::env::var_os("APPDIR").as_deref(),
+        &executable,
+    )
+}
+
+fn associated_image(
+    image: Option<&std::ffi::OsStr>,
+    appdir: Option<&std::ffi::OsStr>,
+    executable: &Path,
+) -> Option<PathBuf> {
+    let program = crate::steam::shortcut_program(image, appdir, executable);
+    if program == executable {
+        return None;
+    }
+    let appdir = Path::new(appdir?);
+    let relative = executable.strip_prefix(appdir).ok()?;
+    let ours =
+        relative == Path::new("usr/bin/ferestre") || relative == Path::new("usr/bin/ferestre-gui");
+    (ours && appdir.join("usr/lib/ferestre/VERSION").is_file()).then_some(program)
+}
+
 /// AppRun honours explicit locator overrides. An updated image must find its
 /// own binaries and VERSION rather than inherit the old mount's locators.
 pub fn image_command(image: &Path) -> std::process::Command {
@@ -1090,6 +1117,40 @@ mod tests {
         assert_eq!(
             runtime::installed_version(&runtime, managed),
             runtime.version
+        );
+    }
+
+    #[test]
+    fn an_inherited_appimage_cannot_replace_another_application() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = image(dir.path(), "Other.AppImage", b"another application");
+        let foreign_root = dir.path().join("AppDir");
+        std::fs::create_dir_all(foreign_root.join("usr/lib/ferestre")).unwrap();
+        std::fs::write(foreign_root.join("usr/lib/ferestre/VERSION"), b"0.1.15\n").unwrap();
+        let foreign_mount = foreign_root.as_path();
+        let native = Path::new("/usr/bin/ferestre");
+        assert!(associated_image(
+            Some(other.as_os_str()),
+            Some(foreign_mount.as_os_str()),
+            native
+        )
+        .is_none());
+        assert!(associated_image(Some(other.as_os_str()), None, native).is_none());
+        let embedded_helper = foreign_mount.join("usr/share/editor/ferestre");
+        assert!(associated_image(
+            Some(other.as_os_str()),
+            Some(foreign_mount.as_os_str()),
+            &embedded_helper
+        )
+        .is_none());
+        let ours = foreign_mount.join("usr/bin/ferestre");
+        assert_eq!(
+            associated_image(
+                Some(other.as_os_str()),
+                Some(foreign_mount.as_os_str()),
+                &ours
+            ),
+            Some(other)
         );
     }
 

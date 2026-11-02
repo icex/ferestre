@@ -70,11 +70,12 @@ class Window:
     def __init__(self, binary, home, mode):
         self.home = home
         home.mkdir(parents=True, mode=0o700)
-        self.binary = home / 'bin/ferestre-gui'
-        self.binary.parent.mkdir()
+        self.binary = home / 'usr/bin/ferestre-gui'
+        self.binary.parent.mkdir(parents=True)
         shutil.copy2(binary, self.binary)
-        write(home / 'bin/ferestre', CLI, True)
+        write(home / 'usr/bin/ferestre', CLI, True)
         write(home / 'mode', mode)
+        write(home / 'usr/lib/ferestre/VERSION', '0.1.15\n')
         write(home / 'config/gtk-4.0/settings.ini', '[Settings]\ngtk-enable-animations=false\n')
         write(home / 'runtime/proton', '#!/bin/sh\nexit 0\n', True)
         write(home / 'runtime/version', '11.0.20261023.1\n')
@@ -106,7 +107,7 @@ class Window:
         env = dict(os.environ)
         for name in ('APPIMAGE', 'APPDIR', 'FERESTRE_PACKAGE_VERSION', 'FERESTRE_SCRIPTS_DIR'):
             env.pop(name, None)
-        env.update(APPIMAGE=str(home / 'fixture.AppImage'), HOME=str(home), XDG_CONFIG_HOME=str(home / 'config'), XDG_CACHE_HOME=str(home / 'cache'), XDG_STATE_HOME=str(home / 'state'), XDG_DATA_HOME=str(home / 'data'), XODUS_CLI_DIR=str(home / 'client'), XODUS_GAMES_DIR=str(home / 'games'), XODUS_STEAM_DIR=str(home / 'steam'), XODUS_PROTON_DIR=str(home / 'runtime'), FERESTRE_TITLES=str(home / 'recipes'), GTK_A11Y='atspi', FERESTRE_APPLICATION_ID='io.github.icex.ferestre.Update' + mode.replace('-', ''))
+        env.update(APPDIR=str(home), APPIMAGE=str(home / 'fixture.AppImage'), HOME=str(home), XDG_CONFIG_HOME=str(home / 'config'), XDG_CACHE_HOME=str(home / 'cache'), XDG_STATE_HOME=str(home / 'state'), XDG_DATA_HOME=str(home / 'data'), XODUS_CLI_DIR=str(home / 'client'), XODUS_GAMES_DIR=str(home / 'games'), XODUS_STEAM_DIR=str(home / 'steam'), XODUS_PROTON_DIR=str(home / 'runtime'), FERESTRE_TITLES=str(home / 'recipes'), GTK_A11Y='atspi', FERESTRE_APPLICATION_ID='io.github.icex.ferestre.Update' + mode.replace('-', ''))
         for name in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'):
             env[name] = 'http://127.0.0.1:9'
         env['NO_PROXY'] = env['no_proxy'] = ''

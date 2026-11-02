@@ -16,7 +16,7 @@ The application-update button waits while the window is busy or a game it starte
 
 ## Supported installations
 
-One-click application replacement supports executable, user-owned type-2 AppImages in a user-owned writable directory without group/world write permissions. Root execution, symlink targets and shared-writable executables are refused. System packages, source checkouts and portable archives remain managed by their original installer; their banner identifies an available release without overwriting that installation. Managed runtime updates remain available independently.
+An inherited `APPIMAGE` from another launcher is ignored unless Ferestre itself runs inside its matching AppDir. One-click application replacement supports executable, user-owned type-2 AppImages in a user-owned writable directory without group/world write permissions. Root execution, symlink targets and shared-writable executables are refused. System packages, source checkouts and portable archives remain managed by their original installer; their banner identifies an available release without overwriting that installation. Managed runtime updates remain available independently.
 
 A new public release containing the updater must be installed before subsequent launcher releases can be installed through this banner.
 

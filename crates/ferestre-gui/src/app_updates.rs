@@ -19,8 +19,8 @@ pub struct State {
 
 impl State {
     pub fn capture() -> Self {
-        let original_image = std::env::var_os("APPIMAGE")
-            .and_then(|p| updater::image_fingerprint(Path::new(&p)).ok());
+        let original_image =
+            updater::current_image().and_then(|p| updater::image_fingerprint(&p).ok());
         Self {
             original_image,
             ..Self::default()

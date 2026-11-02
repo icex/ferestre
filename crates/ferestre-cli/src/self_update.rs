@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 fn status(paths: &Paths, cancelled: impl Fn() -> bool) -> Result<updater::Status> {
     let packaged = std::env::var("FERESTRE_PACKAGE_VERSION").ok();
     let current = ferestre_core::package_version(packaged.as_deref());
-    let image = std::env::var_os("APPIMAGE").map(std::path::PathBuf::from);
+    let image = updater::current_image();
     updater::check_cancellable(paths, current, image.as_deref(), cancelled)
 }
 
@@ -51,11 +51,11 @@ pub fn apply(
     let cancellation = cancel::Cancellation::from_gui();
     let paths = Paths::from_env()?;
     if let Some(expected) = expected_image {
-        let image = std::env::var_os("APPIMAGE").ok_or_else(|| {
+        let image = updater::current_image().ok_or_else(|| {
             anyhow!("the original AppImage is unavailable; restart Ferestre before updating")
         })?;
         anyhow::ensure!(
-            updater::image_fingerprint(Path::new(&image))? == expected,
+            updater::image_fingerprint(&image)? == expected,
             "the AppImage was replaced since this window opened; restart Ferestre before updating"
         );
     }
