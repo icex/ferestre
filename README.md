@@ -59,6 +59,10 @@ for the same reason: a four-pane rectangle is somebody else's trademark.
 
 Pronounced roughly *feh-RESS-treh*.
 
+## Application updates
+
+The app checks for newer Ferestre and runtime releases and shows an **Update** banner. One click verifies the release signatures, updates a writable AppImage and its bundled Xbox components, installs a newer runtime beside existing versions, and restarts when current work finishes. **Runtime → Check for Updates** checks manually. See [signed updates and recovery](docs/UPDATES.md) for supported installations and rollback.
+
 ## Status
 
 Release **0.1.13** pairs with runtime **11.0.20261018.2**. It adds separate

@@ -339,21 +339,46 @@ pub fn installed(dir: &Path) -> Vec<InstalledRuntime> {
         .flatten()
         .filter_map(|entry| InstalledRuntime::at(&entry.path()).ok())
         .collect();
-    runtimes.sort_by(runtime_order);
+    runtimes.sort_by(|a, b| runtime_order(a, b, dir));
     runtimes
 }
 
 /// Compare the numeric release, independent of the tool's branding. A newer
 /// `ferestre-11.0.20261017.1` must precede `xodus-...20261013.3`, and build 10
 /// must precede build 9. Keep the full name/path as deterministic tie breakers.
-fn runtime_order(a: &InstalledRuntime, b: &InstalledRuntime) -> std::cmp::Ordering {
+fn runtime_order(a: &InstalledRuntime, b: &InstalledRuntime, managed: &Path) -> std::cmp::Ordering {
     let numbers = |runtime: &InstalledRuntime| {
-        version_numbers(runtime.version.as_deref().unwrap_or_default())
+        version_numbers(
+            installed_version(runtime, managed)
+                .as_deref()
+                .unwrap_or_default(),
+        )
     };
     numbers(b)
         .cmp(&numbers(a))
         .then_with(|| b.version.cmp(&a.version))
         .then_with(|| a.path.cmp(&b.path))
+}
+
+/// A managed install is identified by its release directory. Proton's own
+/// version file can retain an older upstream build identifier across releases.
+/// Legacy and explicitly configured tools retain their reported versions.
+pub fn installed_version(runtime: &InstalledRuntime, managed: &Path) -> Option<String> {
+    if runtime.path.parent() == Some(managed) {
+        if let Some(name) = runtime.path.file_name().and_then(|s| s.to_str()) {
+            let parts: Vec<_> = name.split('.').collect();
+            if (3..=5).contains(&parts.len())
+                && parts.iter().all(|p| {
+                    !p.is_empty()
+                        && p.bytes().all(|b| b.is_ascii_digit())
+                        && p.parse::<u64>().is_ok()
+                })
+            {
+                return Some(name.to_owned());
+            }
+        }
+    }
+    runtime.version.clone()
 }
 
 /// All usable runtimes known on this machine. A legacy configured runtime
@@ -368,7 +393,7 @@ pub fn all(paths: &Paths) -> Vec<InstalledRuntime> {
             }
         }
     }
-    runtimes.sort_by(runtime_order);
+    runtimes.sort_by(|a, b| runtime_order(a, b, &paths.runtimes_dir()));
     runtimes
 }
 
@@ -1328,6 +1353,23 @@ hangs"""
         );
     }
 
+    #[test]
+    fn managed_releases_sort_by_release_identity_before_upstream_build_names() {
+        let dir = tempfile::tempdir().unwrap();
+        for version in ["11.0.20261018.2", "11.0.20261023.1"] {
+            let root = dir.path().join(version);
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("proton"), b"#!/bin/sh\n").unwrap();
+            std::fs::write(
+                root.join("version"),
+                b"1792752337 xodus-bleeding-edge-11.0-20260803-3-g7c0b4354\n",
+            )
+            .unwrap();
+        }
+        let runtimes = installed(dir.path());
+        assert_eq!(runtimes[0].path.file_name().unwrap(), "11.0.20261023.1");
+    }
+
     /// The gate after the choice decides whether to launch; the choice itself
     /// must hand it a runtime and the reasons, not refuse first.
     #[test]
@@ -1349,7 +1391,7 @@ hangs"""
             InstalledRuntime::at(lacking.path()).unwrap(),
             InstalledRuntime::at(complete.path()).unwrap(),
         ];
-        runtimes.sort_by(runtime_order);
+        runtimes.sort_by(|a, b| runtime_order(a, b, Path::new("/no-managed-runtimes")));
 
         // The newest one that satisfies the recipe, even if older.
         let choice = choose(&recipe, &runtimes, None, None).unwrap();

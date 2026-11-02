@@ -139,6 +139,34 @@ pub fn verify_release_file(signature_text: &str, artefact: Artefact, path: &Path
     verify_file_with_key(RELEASE_PUBLIC_KEY, signature_text, artefact, path)
 }
 
+/// Verify bounded release metadata before using any of its contents.
+pub fn verify_release_bytes(signature_text: &str, artefact: Artefact, bytes: &[u8]) -> Result<()> {
+    verify_bytes_with_key(RELEASE_PUBLIC_KEY, signature_text, artefact, bytes)
+}
+
+pub fn verify_bytes_with_key(
+    public_key_base64: &str,
+    signature_text: &str,
+    artefact: Artefact,
+    bytes: &[u8],
+) -> Result<()> {
+    let key = public_key(public_key_base64)?;
+    let signature = signature(signature_text, artefact)?;
+    let mut verifier = key.verify_stream(&signature).map_err(|e| {
+        anyhow!(
+            "{}: {e}; it was not signed by the Ferestre release key",
+            artefact.file
+        )
+    })?;
+    verifier.update(bytes);
+    verifier.finalize().map_err(|_| {
+        anyhow!(
+            "{}: the signature does not match; the download is damaged or not genuine",
+            artefact.file
+        )
+    })
+}
+
 /// [`verify_release_file`] with an explicit public key.
 pub fn verify_file_with_key(
     public_key_base64: &str,

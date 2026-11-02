@@ -37,6 +37,7 @@ pub mod runtime;
 pub mod sdl;
 pub mod signing;
 pub mod steam;
+pub mod updater;
 pub mod updates;
 pub mod winrt;
 pub mod xvd_key;
