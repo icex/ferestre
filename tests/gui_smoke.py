@@ -389,8 +389,8 @@ def select_in_list(root, name, what=None):
         select_in_list(root, "My Library")
         until = time.monotonic() + TIMEOUT
         while True:
-            click_named(root, "Install queue" if name == "Downloads" else name)
             try:
+                click_named(root, "Install queue" if name == "Downloads" else name)
                 wait_for(root, lambda r: find_all(r, name=name + " page"),
                          name + " page", min(until, time.monotonic() + 2))
                 return
@@ -399,8 +399,8 @@ def select_in_list(root, name, what=None):
                     raise
     if name == "Settings":
         return settled(click_named(root, "Settings"))
-    if name == "My Library" and find_all(root, role="button", name="My games"):
-        return settled(click_named(root, "My games"))
+    if name == "My Library" and find_all(root, name="My Library page"):
+        return root
     for node, _ in walk(root):
         if node.get_role_name() != "list":
             continue
@@ -410,6 +410,11 @@ def select_in_list(root, name, what=None):
         for index in range(node.get_child_count()):
             child = node.get_child_at_index(index)
             if child is not None and child.get_name() == name:
+                # A selected Library row can currently display Installed or
+                # Updates. Use the visible sidebar rather than an offscreen
+                # tab, whose action GTK 4.14 may omit from AT-SPI.
+                if name == "My Library":
+                    selection.clear_selection()
                 selection.select_child(index)
                 return settled(child)
     dump(root, f"looking for a selectable {name!r}")
