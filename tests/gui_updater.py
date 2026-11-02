@@ -136,10 +136,7 @@ class Window:
             print('UI text:', s.texts(self.frame), flush=True)
             print('UI buttons:', [(n.get_name(), n.get_state_set().get_states()) for n in s.find_all(self.frame, role='button')], flush=True)
             raise
-        if (self.home / 'mode').read_text() == 'success':
-            s.press(button, self.gui.pid)
-        else:
-            s.click(button)
+        s.click(button)
 
     def close(self):
         if self.gui.poll() is None:
