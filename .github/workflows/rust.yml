@@ -333,6 +333,7 @@ jobs:
           cd third_party/xodus-cli
           cargo test --locked -p xodus-service
           cargo test --locked -p xodus profile
+          cargo test --locked -p xodus api::xbox::auth
           cargo test --locked -p msixvc
           cargo test --locked -p xodus-cli
           cargo test --locked -p xodus --features key-chain-file --test key_chain_file
