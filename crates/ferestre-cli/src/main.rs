@@ -97,6 +97,9 @@ enum Cmd {
     /// Check this machine for everything a launch needs.
     Doctor,
 
+    /// Show recent local download reason codes (no tokens or raw child output).
+    Diagnostics,
+
     /// List the titles that have a launch recipe.
     Titles,
 
@@ -262,6 +265,18 @@ fn exit_code_for(err: &anyhow::Error) -> u8 {
 fn dispatch(cli: &Cli) -> Result<ExitCode> {
     match &cli.command {
         Cmd::Doctor => cmd_doctor(cli),
+        Cmd::Diagnostics => {
+            let paths = Paths::from_env()?;
+            let entries = ferestre_core::diagnostics::read(paths.state_dir())?;
+            if cli.json {
+                print_json(&json!({"schema":1,"entries":entries}));
+            } else {
+                for entry in entries {
+                    println!("{}  {}", entry.unix_seconds, entry.diagnostic.message());
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Cmd::Titles => cmd_titles(cli),
         Cmd::Library {
             all,

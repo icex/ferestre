@@ -36,6 +36,10 @@ on:
       - 'tests/gui_presence.py'
       - 'tests/gui_client_deps.py'
       - 'tests/gui_updater.py'
+      - 'tests/gui_transfers.py'
+      - 'tests/gui_artwork.py'
+      - 'tests/gui_controller.py'
+      - 'tests/test_transfer_controls.py'
       - 'tests/fake_packagekit.py'
       - 'tests/test_download_cancel.py'
       - 'tests/test_media_dependencies.py'
@@ -76,6 +80,10 @@ on:
       - 'tests/gui_presence.py'
       - 'tests/gui_client_deps.py'
       - 'tests/gui_updater.py'
+      - 'tests/gui_transfers.py'
+      - 'tests/gui_artwork.py'
+      - 'tests/gui_controller.py'
+      - 'tests/test_transfer_controls.py'
       - 'tests/fake_packagekit.py'
       - 'tests/test_download_cancel.py'
       - 'tests/test_media_dependencies.py'
@@ -169,7 +177,7 @@ jobs:
         run: cargo test --locked --workspace
 
       - name: Download cancellation (offline)
-        run: cargo build --locked -p ferestre-cli && python3 tests/test_download_cancel.py && python3 tests/test_media_dependencies.py && python3 tests/test_client_dependencies.py
+        run: cargo build --locked -p ferestre-cli && python3 tests/test_download_cancel.py && python3 tests/test_transfer_controls.py && python3 tests/test_media_dependencies.py && python3 tests/test_client_dependencies.py
 
       - name: Launch helper tests
         env:
@@ -352,7 +360,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libgtk-4-dev libadwaita-1-dev \
-            at-spi2-core gir1.2-atspi-2.0 python3-gi \
+            at-spi2-core gir1.2-atspi-2.0 python3-gi openbox \
             xvfb dbus-x11
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
@@ -398,6 +406,20 @@ jobs:
         run: |
           xvfb-run -a --server-args='-screen 0 1280x900x24' \
             dbus-run-session -- python3 tests/gui_updater.py
+
+      - name: Game Pass artwork and handheld fullscreen (loopback)
+        run: |
+          xvfb-run -a --server-args='-screen 0 1280x720x24' \
+            dbus-run-session -- python3 tests/gui_artwork.py --fullscreen
+      - name: Controller adapter, button glyphs and focus indicator (offline)
+        run: |
+          xvfb-run -a --server-args='-screen 0 1280x900x24' \
+            dbus-run-session -- python3 tests/gui_controller.py
+
+      - name: Persistent install queue and pause controls (offline)
+        run: |
+          xvfb-run -a --server-args='-screen 0 1280x900x24' \
+            dbus-run-session -- python3 tests/gui_transfers.py
 
       - name: Missing WebKitGTK offered for install (offline)
         run: |

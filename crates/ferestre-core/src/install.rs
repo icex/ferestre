@@ -934,7 +934,16 @@ fn attribute(element: &str, name: &str) -> Option<String> {
 /// whatever order they arrive, so the manifest can be there long before the
 /// rest, and the *temporary* container is exactly what a half-finished
 /// download leaves. [`is_partial`] says which titles are in that state.
+pub const UPDATE_INCOMPLETE: &str = ".ferestre-update-incomplete-v1";
+
+pub fn update_incomplete(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join(UPDATE_INCOMPLETE)).is_ok()
+}
+
 pub fn looks_installed(dir: &Path) -> bool {
+    if update_incomplete(dir) {
+        return false;
+    }
     dir.join(CONTAINER).is_file()
         || (["appxmanifest.xml", "AppxManifest.xml"]
             .iter()
@@ -945,7 +954,7 @@ pub fn looks_installed(dir: &Path) -> bool {
 /// Whether a download into this directory started and has not finished: the
 /// state to offer Resume or Remove for, rather than Play.
 pub fn is_partial(dir: &Path) -> bool {
-    dir.join(PARTIAL_CONTAINER).exists()
+    dir.join(PARTIAL_CONTAINER).exists() || update_incomplete(dir)
 }
 
 /// Product ids named by installed packages below a games directory.
@@ -1137,6 +1146,22 @@ pub fn all(state_dir: &Path) -> Vec<Record> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_interrupted_update_is_incomplete_even_with_old_completed_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(CONTAINER), b"previous metadata").unwrap();
+        assert!(looks_installed(root.path()));
+        std::fs::write(root.path().join(UPDATE_INCOMPLETE), b"pending").unwrap();
+        assert!(!looks_installed(root.path()));
+        assert!(is_partial(root.path()));
+        std::fs::remove_file(root.path().join(UPDATE_INCOMPLETE)).unwrap();
+        std::os::unix::fs::symlink("missing", root.path().join(UPDATE_INCOMPLETE)).unwrap();
+        assert!(
+            !looks_installed(root.path()),
+            "a malformed barrier cannot enable a launch"
+        );
+    }
 
     /// The guard on the one irreversible thing here. A record is a JSON file
     /// anybody can edit, so the path in it is checked rather than trusted.

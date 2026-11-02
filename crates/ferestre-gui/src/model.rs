@@ -88,8 +88,8 @@ impl Action {
     pub fn command<'a>(&self, product_id: &'a str) -> Option<[&'a str; 2]> {
         match self {
             Action::Play => Some(["run", product_id]),
-            // Updating is a reinstall today. Fetching only what changed is a
-            // separate piece of work and this is the honest version of it.
+            // The client chooses verified resume or incremental reuse from the
+            // existing destination; both use the same install entry point.
             Action::Install | Action::Resume | Action::Update => Some(["install", product_id]),
             // Both are handled by the window rather than by a command: `Adopt`
             // opens the editor, `Stop` signals a process this window started.

@@ -694,6 +694,22 @@ impl Cache {
         (hits, misses)
     }
 
+    /// Full cover artwork has its own cache, distinct from small launcher icons.
+    pub fn cover_path(&self, product_id: &str) -> Option<PathBuf> {
+        let base = self.entry_path(product_id)?;
+        Some(self.dir.join("images").join(format!(
+            "{}-cover-600.png",
+            base.file_stem()?.to_string_lossy()
+        )))
+    }
+    pub fn hero_path(&self, product_id: &str) -> Option<PathBuf> {
+        let base = self.entry_path(product_id)?;
+        Some(self.dir.join("images").join(format!(
+            "{}-hero-960.png",
+            base.file_stem()?.to_string_lossy()
+        )))
+    }
+
     /// Where a title's icon is kept once fetched.
     pub fn image_path(&self, product_id: &str, px: u32) -> Option<PathBuf> {
         let base = self.entry_path(product_id)?;
@@ -1412,5 +1428,56 @@ pub fn icon(cache: &Cache, product: &Product, px: u32) -> Result<PathBuf> {
         .as_deref()
         .ok_or_else(|| anyhow!("{} has no art in the catalog", product.product_id))?;
     crate::http::download(&image_url(base, px), &dest)?;
+    Ok(dest)
+}
+
+/// Fetch portrait artwork without cropping or stretching a launcher icon.
+pub fn cover(cache: &Cache, product: &Product) -> Result<PathBuf> {
+    let dest = cache
+        .cover_path(&product.product_id)
+        .ok_or_else(|| anyhow!("invalid product id"))?;
+    let base = product
+        .artwork
+        .portrait
+        .as_deref()
+        .or(product.image.as_deref())
+        .ok_or_else(|| anyhow!("no cover artwork"))?;
+    let (width, height) = if product.artwork.portrait.is_some() {
+        (600, 900)
+    } else {
+        (600, 600)
+    };
+    let url = crate::http::with_params(
+        base,
+        &[
+            ("q", "95".into()),
+            ("format", "png".into()),
+            ("w", width.to_string()),
+            ("h", height.to_string()),
+        ],
+    );
+    crate::http::download(&url, &dest)?;
+    Ok(dest)
+}
+pub fn hero(cache: &Cache, product: &Product) -> Result<PathBuf> {
+    let dest = cache
+        .hero_path(&product.product_id)
+        .ok_or_else(|| anyhow!("invalid product id"))?;
+    let base = product
+        .artwork
+        .landscape
+        .as_deref()
+        .or(product.artwork.hero.as_deref())
+        .ok_or_else(|| anyhow!("no landscape artwork"))?;
+    let url = crate::http::with_params(
+        base,
+        &[
+            ("q", "95".into()),
+            ("format", "png".into()),
+            ("w", "960".into()),
+            ("h", "540".into()),
+        ],
+    );
+    crate::http::download(&url, &dest)?;
     Ok(dest)
 }

@@ -61,7 +61,7 @@ Pronounced roughly *feh-RESS-treh*.
 
 ## Application updates
 
-The app checks for newer Ferestre and runtime releases and shows an **Update** banner. One click verifies the release signatures, updates a writable AppImage and its bundled Xbox components, installs a newer runtime beside existing versions, and restarts when current work finishes. **Runtime → Check for Updates** checks manually. See [signed updates and recovery](docs/UPDATES.md) for supported installations and rollback.
+The app checks for newer Ferestre and runtime releases and shows an **Update** banner. One click verifies the release signatures, updates a writable AppImage and its bundled Xbox components, installs a newer runtime beside existing versions, and restarts when current work finishes. **Settings → Check for Updates** checks manually. See [signed updates and recovery](docs/UPDATES.md) for supported installations and rollback.
 
 ## Status
 
@@ -116,6 +116,11 @@ sizes, lists what a Game Pass subscription includes, installs with a progress
 bar and a time remaining, detects updates, and launches. See
 [docs/ROADMAP.md](docs/ROADMAP.md) for what is still missing and
 [docs/RECIPES.md](docs/RECIPES.md) for doing any of it by hand.
+
+Install Queue saves downloads across restarts, with one active transfer at a time.
+Pause and Resume keep verified progress; game updates can reuse authenticated
+local pages. Touch targets and optional SDL2 controller navigation support
+handheld use. See [downloads and controls](docs/DOWNLOADS.md) for details.
 
 Active operations stay visible, and the top-right spinner's tooltip names the
 current task. Closing during a download or removal asks first: downloads stop
@@ -213,9 +218,10 @@ directly. Everything has to go through the client's `run` path.
 
 ## Library sizes and cached lists
 
-Library, Game Pass, Installed and Updates use the same two-line game rows:
-icon and title, then version/size/status details, with actions centered on the
-right. Sizes appear once. Every game row shows either measured disk usage for its game directory or the
+Home uses featured artwork and recent games. My Library, Game Pass and Installed
+use large cover cards with a primary action and an always-visible More menu.
+Updates keeps compact version rows. More → Game details shows full metadata.
+Cards show either measured disk usage for the game directory or the
 Store's PC download size. Wine prefixes and cached downloads are separate from
 the installed game total; unavailable sizes are labelled explicitly. Disk usage
 measurements persist across restarts and list refreshes for 24 hours. Install
