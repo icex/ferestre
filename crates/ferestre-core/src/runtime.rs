@@ -38,7 +38,7 @@ pub const LIST_PATH: &str = "ferestre-capabilities.txt";
 pub const XGAMERUNTIME_DLL: &str = "files/lib/wine/x86_64-windows/xgameruntime.dll";
 
 /// The whole of `xgameruntime.dll` comes from one patch
-/// (`patches/xgameruntime/0001-taskqueue-user-networking-gamesave-package.patch`),
+/// (`https://github.com/icex/xgameruntime/commit/d0450c0216f11207012d1381300d17ad2c839381`),
 /// so the file carries all five of these or is not our build at all. That is
 /// why the probe can turn one file into five names without guessing per
 /// function. It cannot tell a stale build from a current one, which is the
@@ -994,7 +994,7 @@ schema = 1
 [[capability]]
 name = "gameinput.v2"
 summary = "gameinput.dll exposes IGameInput_v2 and its dispatcher."
-provided-by = ["patches/wine/0003-gameinput-v2-dispatcher-opt-in.patch"]
+provided-by = ["https://github.com/icex/wine/commit/ec1446d9a595191a52d59fec554ddc7cf64337e9"]
 symptom-if-missing = "Critical Failure: GameInput Runtime could not be loaded"
 
 [[capability]]

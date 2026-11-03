@@ -105,14 +105,12 @@ PY
 )
 say "expected package family: $EXPECTED_FAMILY"
 
-# Wine resolves a builtin DLL by name and loads its own installed copy,
-# ignoring WINEDLLPATH and any path we pass -- so to test the freshly built
-# xgameruntime.dll we make a hardlinked copy of the Proton files (cheap, same
-# filesystem) and swap our DLL into its builtin location. The installed Proton
-# is untouched: rm+cp breaks the hardlink for that one file only.
+# Wine resolves builtins from its own runtime. Stage an independent tree so
+# replacing test DLLs cannot modify the installed runtime. Reflinks/copies
+# also work across Btrfs subvolumes and separate filesystems.
 [ -x "$TOOL_DIR/files/bin/wine" ] || fail "no installed Proton wine at $TOOL_DIR"
-say "staging a wine copy with the freshly built DLL"
-cp -al "$TOOL_DIR/files" "$WORK/wine" || fail "could not hardlink-copy the wine tree"
+say "staging an independent wine copy with the test DLL"
+"$REPO_DIR/tests/stage-runtime.sh" "$TOOL_DIR/files" "$WORK/wine" || fail "could not stage the wine tree"
 BUILTIN=$WORK/wine/lib/wine/x86_64-windows/xgameruntime.dll
 rm -f "$BUILTIN"
 cp "$DLL" "$BUILTIN"

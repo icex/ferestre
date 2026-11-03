@@ -28,7 +28,8 @@ while not (h/('ready-'+id)).exists():
  if (h/('fail-'+id)).exists():
   print('!! Fixture startup failed',file=sys.stderr);sys.exit(1)
  time.sleep(.03)
-child=subprocess.Popen(['bash','-c','exec -a Game.exe sleep 120'])
+child=subprocess.Popen(['Game.exe',str(h/'game.py'),id],executable=sys.executable) if (h/'real-game-window').exists() else subprocess.Popen(['bash','-c','exec -a Game.exe sleep 120'])
+(h/('game-pid-'+id)).write_text(str(child.pid))
 try:
  while not (h/('end-'+id)).exists(): time.sleep(.03)
 finally:
@@ -37,6 +38,9 @@ finally:
 
 
 def active_pid():
+    if os.environ.get('FERESTRE_TEST_NATIVE_WAYLAND')=='1':
+        from wayland_focus import active_pid as query
+        return query()
     x=ctypes.CDLL(ctypes.util.find_library('X11'));ptr=ctypes.c_void_p;ulong=ctypes.c_ulong
     x.XOpenDisplay.argtypes=[ctypes.c_char_p];x.XOpenDisplay.restype=ptr
     x.XDefaultRootWindow.argtypes=[ptr];x.XDefaultRootWindow.restype=ulong
@@ -78,43 +82,63 @@ def spinner_animates(pid, node):
     finally:x.XCloseDisplay(d)
 
 
+GAME = r'''import gi,os,sys
+from pathlib import Path
+gi.require_version('Gtk','4.0')
+from gi.repository import Gtk,Gio
+app=Gtk.Application(application_id='io.github.icex.ferestre.ControlledGame',flags=Gio.ApplicationFlags.NON_UNIQUE)
+def activate(a):
+ window=Gtk.ApplicationWindow(application=a,title='Controlled game '+sys.argv[1],default_width=360,default_height=240)
+ window.set_child(Gtk.Label(label='Controller Resume test game'))
+ window.present()
+app.connect('activate',activate)
+app.run([])
+'''
+
+def prepare(h, binary):
+    h=Path(h);(h/'bin').mkdir();shutil.copy2(Path(binary).resolve(),h/'bin/ferestre-gui')
+    write(h/'bin/ferestre',CLI,True);write(h/'client/xodus-cli','#!/bin/sh\nexit 1\n',True)
+    write(h/'runtime/proton','#!/bin/sh\nexit 0\n',True);write(h/'runtime/version','launch-fixture\n')
+    write(h/'config/gtk-4.0/settings.ini','[Settings]\ngtk-enable-animations=true\n')
+    write(h/'sdl.c',SDL);(h/'lib').mkdir();subprocess.run(['cc','-shared','-fPIC',str(h/'sdl.c'),'-o',str(h/'lib/libSDL2-2.0.so.0')],check=True)
+    ids=['9ZZLAUNCH001','9ZZLAUNCH002','9ZZLAUNCH003']
+    schema=int(re.search(r'const CACHE_SCHEMA: u32 = (\d+);',Path('crates/ferestre-core/src/catalog.rs').read_text())[1])
+    for n,id in enumerate(ids):
+        write(h/f'titles/{id}.toml',f'''schema=1
+    [title]
+    product-id="{id}"
+    name="Launch Game {n}"
+    slug="launch-{n}"
+    [launch]
+    executable="Game.exe"
+    [status]
+    state="untested"
+    summary="Private launch fixture"
+    ''')
+        write(h/f'games/launch-{n}/appxmanifest.xml','<Package><Identity Name="Launch.Fixture" Version="1.0.0.0" /></Package>')
+        write(h/f'state/ferestre/installed/{id}.json',json.dumps({'product_id':id,'dir':str(h/f'games/launch-{n}')}))
+        write(h/f'cache/ferestre/catalog/{id}.json',json.dumps({'schema':schema,'market':'US','language':'en-us','product':{'product_id':id,'name':f'Launch Game {n}','has_packages':True,'has_pc_package':True,'package_format':'MSIXVC'}}))
+    update_record={'product_id':ids[2],'dir':str(h/'games/launch-2'),'content_ids':['fixture-content'],'package_version':'1.0.0.0'}
+    write(h/f'state/ferestre/installed/{ids[2]}.json',json.dumps(update_record))
+    write(h/f'state/ferestre/updates/{ids[2]}.json',json.dumps({'schema':1,'record':update_record,'available':'2.0.0.0'}))
+    write(h/'state/ferestre/library.json',json.dumps({'items':[{'productId':id,'productType':'Game','status':'Active'} for id in ids]}))
+    def pad(buttons=0,kind=7):
+        (h/'pad-next').write_bytes(struct.pack('<Hhhhh2xii',buttons,0,0,0,0,kind,1));(h/'pad-next').replace(h/'pad')
+    pad()
+    env=dict(os.environ,HOME=str(h),XDG_CONFIG_HOME=str(h/'config'),XDG_STATE_HOME=str(h/'state'),XDG_CACHE_HOME=str(h/'cache'),XDG_DATA_HOME=str(h/'data'),XODUS_CLI_DIR=str(h/'client'),XODUS_GAMES_DIR=str(h/'games'),XODUS_STEAM_DIR=str(h/'steam'),XODUS_PROTON_DIR=str(h/'runtime'),FERESTRE_TITLES=str(h/'titles'),GTK_A11Y='atspi',FERESTRE_APPLICATION_ID='io.github.icex.ferestre.LaunchTest',LD_LIBRARY_PATH=str(h/'lib'),FERESTRE_TEST_PAD_FILE=str(h/'pad'))
+    for k in ('APPDIR','APPIMAGE','FERESTRE_PACKAGE_VERSION','FERESTRE_SCRIPTS_DIR'):env.pop(k,None)
+    for k in ('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy'):env[k]='http://127.0.0.1:9'
+    env['NO_PROXY']=env['no_proxy']=''
+    write(h/'game.py', GAME)
+    return ids, update_record, pad, env
+
+
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--binary',default='target/debug/ferestre-gui');args=parser.parse_args()
     s.Atspi.init();process=other=wm=None;frame=None
     with tempfile.TemporaryDirectory(prefix='ferestre-launch-ui-') as tmp:
-        h=Path(tmp);(h/'bin').mkdir();shutil.copy2(Path(args.binary).resolve(),h/'bin/ferestre-gui')
-        write(h/'bin/ferestre',CLI,True);write(h/'client/xodus-cli','#!/bin/sh\nexit 1\n',True)
-        write(h/'runtime/proton','#!/bin/sh\nexit 0\n',True);write(h/'runtime/version','launch-fixture\n')
-        write(h/'config/gtk-4.0/settings.ini','[Settings]\ngtk-enable-animations=true\n')
-        write(h/'sdl.c',SDL);(h/'lib').mkdir();subprocess.run(['cc','-shared','-fPIC',str(h/'sdl.c'),'-o',str(h/'lib/libSDL2-2.0.so.0')],check=True)
-        ids=['9ZZLAUNCH001','9ZZLAUNCH002','9ZZLAUNCH003']
-        schema=int(re.search(r'const CACHE_SCHEMA: u32 = (\d+);',Path('crates/ferestre-core/src/catalog.rs').read_text())[1])
-        for n,id in enumerate(ids):
-            write(h/f'titles/{id}.toml',f'''schema=1
-[title]
-product-id="{id}"
-name="Launch Game {n}"
-slug="launch-{n}"
-[launch]
-executable="Game.exe"
-[status]
-state="untested"
-summary="Private launch fixture"
-''')
-            write(h/f'games/launch-{n}/appxmanifest.xml','<Package><Identity Name="Launch.Fixture" Version="1.0.0.0" /></Package>')
-            write(h/f'state/ferestre/installed/{id}.json',json.dumps({'product_id':id,'dir':str(h/f'games/launch-{n}')}))
-            write(h/f'cache/ferestre/catalog/{id}.json',json.dumps({'schema':schema,'market':'US','language':'en-us','product':{'product_id':id,'name':f'Launch Game {n}','has_packages':True,'has_pc_package':True,'package_format':'MSIXVC'}}))
-        update_record={'product_id':ids[2],'dir':str(h/'games/launch-2'),'content_ids':['fixture-content'],'package_version':'1.0.0.0'}
-        write(h/f'state/ferestre/installed/{ids[2]}.json',json.dumps(update_record))
-        write(h/f'state/ferestre/updates/{ids[2]}.json',json.dumps({'schema':1,'record':update_record,'available':'2.0.0.0'}))
-        write(h/'state/ferestre/library.json',json.dumps({'items':[{'productId':id,'productType':'Game','status':'Active'} for id in ids]}))
-        def pad(buttons=0,kind=7):
-            (h/'pad-next').write_bytes(struct.pack('<Hhhhh2xii',buttons,0,0,0,0,kind,1));(h/'pad-next').replace(h/'pad')
-        pad()
-        env=dict(os.environ,HOME=tmp,XDG_CONFIG_HOME=str(h/'config'),XDG_STATE_HOME=str(h/'state'),XDG_CACHE_HOME=str(h/'cache'),XDG_DATA_HOME=str(h/'data'),XODUS_CLI_DIR=str(h/'client'),XODUS_GAMES_DIR=str(h/'games'),XODUS_STEAM_DIR=str(h/'steam'),XODUS_PROTON_DIR=str(h/'runtime'),FERESTRE_TITLES=str(h/'titles'),GTK_A11Y='atspi',FERESTRE_APPLICATION_ID='io.github.icex.ferestre.LaunchTest',LD_LIBRARY_PATH=str(h/'lib'),FERESTRE_TEST_PAD_FILE=str(h/'pad'))
-        for k in ('APPDIR','APPIMAGE','FERESTRE_PACKAGE_VERSION','FERESTRE_SCRIPTS_DIR'):env.pop(k,None)
-        for k in ('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy'):env[k]='http://127.0.0.1:9'
-        env['NO_PROXY']=env['no_proxy']=''
+        h=Path(tmp)
+        ids,update_record,pad,env=prepare(h,args.binary)
         if os.environ.get('FERESTRE_TEST_WM')!='1':
             wm=subprocess.Popen(['openbox','--sm-disable'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);time.sleep(.3)
         try:
@@ -123,8 +147,9 @@ summary="Private launch fixture"
             def wait(test,what):return s.wait_for(frame,test,what,deadline())
             s.select_in_list(frame,'My Library')
             def button(n,action):return s.row_button(frame,f'Launch Game {n}',action)
+            def card(n):return next(iter(s.find_all(frame,name=f'Launch Game {n} · Game card')),None)
             def caption(n,text):
-                node=button(n,'Stop');return node and any(text in t for t in s.texts(node))
+                node=card(n);return node and any(text in t for t in s.texts(node))
             wait(lambda _:button(0,'Play'),'first Play')
             wait(lambda _:button(2,'Update'),'cached update detected')
             badges=wait(lambda _:s.find_all(frame,role='label',name='Update available'),'update badge')
@@ -146,27 +171,27 @@ summary="Private launch fixture"
 
             s.click_named(frame,'Launch Game 0 · Play')
             wait(lambda _:caption(0,'starting'),'starting caption')
-            spinner=wait(lambda _: (node:=button(0,'Stop')) and next(iter(s.find_all(node,name='Starting game')),None),'starting spinner is exported to accessibility')
+            spinner=wait(lambda _: (node:=card(0)) and next(iter(s.find_all(node,name='Starting game')),None),'starting spinner is exported to accessibility')
             wait(lambda _:spinner.get_component_iface().get_extents(s.Atspi.CoordType.WINDOW).width>=48,'spinner layout')
             s.check(True,'starting tile contains the animated spinner')
             s.check(spinner_animates(process.pid,spinner),'launch spinner paints contrasting pixels and animates on the actual grid tile')
-            tile=button(0,'Stop').get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
-            layer=wait(lambda _: (node:=button(0,'Stop')) and next(iter(s.find_all(node,name='Starting overlay')),None),'full-card starting layer').get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
+            tile=card(0).get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
+            layer=wait(lambda _: (node:=card(0)) and next(iter(s.find_all(node,name='Starting overlay')),None),'full-card starting layer').get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
             spin=spinner.get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
             s.check(abs(layer.width-tile.width)<=4 and abs(layer.height-tile.height)<=4,'starting overlay covers the entire card')
             s.check(spin.width>=48 and spin.height>=48 and tile.y+tile.height*.2<spin.y+spin.height/2<tile.y+tile.height*.7,'large spinner occupies the center of the card')
             s.click_named(frame,'Launch Game 1 · Play');wait(lambda _:caption(1,'starting'),'second starting caption')
             (h/f'ready-{ids[0]}').touch();wait(lambda _:caption(0,'running'),'observed game becomes running')
-            s.check(not any('Starting game' in t for t in s.texts(button(0,'Stop'))),'running tile removes its spinner')
-            tile=button(0,'Stop').get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
-            layer=wait(lambda _: (node:=button(0,'Stop')) and next(iter(s.find_all(node,name='Running overlay')),None),'full-card running layer').get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
-            s.check(abs(layer.width-tile.width)<=4 and abs(layer.height-tile.height)<=4 and bool(s.find_all(button(0,'Stop'),role='label',name='Stop')),'running card has a full-card Stop overlay')
+            s.check(not any('Starting game' in t for t in s.texts(card(0))),'running tile removes its spinner')
+            tile=card(0).get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
+            layer=wait(lambda _: (node:=card(0)) and next(iter(s.find_all(node,name='Running overlay')),None),'full-card running layer').get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
+            s.check(abs(layer.width-tile.width)<=4 and abs(layer.height-tile.height)<=4 and bool(button(0,'Resume') and button(0,'Stop')),'running card has a full-card overlay with separate Resume and Stop controls')
             s.check(caption(1,'starting'),'another game remains starting independently')
             (h/f'fail-{ids[1]}').touch();wait(lambda _:button(1,'Play'),'failed launch returns to Play')
             s.check(caption(0,'running'),'one launch failing does not reset another game')
             (h/f'fail-{ids[1]}').unlink()
             s.click_named(frame,'Launch Game 1 · Play');wait(lambda _:caption(1,'starting'),'retry starts a fresh loading state')
-            time.sleep(1.6);s.click_named(frame,'Launch Game 1 · Stop')
+            time.sleep(1.6);s.click_named(frame,'Launch Game 1 · Stop');s.click_named(frame,'Stop Game')
             wait(lambda _:button(1,'Play'),'startup can be cancelled')
             s.check(caption(0,'running'),'cancelling startup leaves the other game running')
             # A separate GTK application represents the focused game window.
@@ -189,6 +214,7 @@ summary="Private launch fixture"
             s.click_named(frame,'Launch Game 0 · Play');wait(lambda _:caption(0,'running'),'a new launch has its own readiness observation')
             time.sleep(1.6)
             s.press(button(0,'Stop'),process.pid)
+            s.click_named(frame,'Stop Game')
             wait(lambda _:button(0,'Play'),'Stop returns the tile to Play')
             s.check(not any('Starting game' in t for t in s.texts(frame)),'exit clears per-game loading state')
             s.click_named(frame,'Close');s.check(process.wait(timeout=10)==0,'launch fixture closes cleanly')

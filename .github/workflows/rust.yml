@@ -40,6 +40,15 @@ on:
       - 'tests/gui_artwork.py'
       - 'tests/gui_controller.py'
       - 'tests/gui_launch.py'
+      - 'tests/gui_running.py'
+      - 'tests/gui_controller_install.py'
+      - 'tests/gui_accounts_controller.py'
+      - 'tests/controller_driver.py'
+      - 'tests/test_gui_actions.py'
+      - 'tests/run_wayland_gui.py'
+      - 'tests/wayland_focus.py'
+      - 'tests/test_source_pins.py'
+      - 'tests/test_runtime_staging.py'
       - 'tests/test_transfer_controls.py'
       - 'tests/fake_packagekit.py'
       - 'tests/test_download_cancel.py'
@@ -48,9 +57,9 @@ on:
       - 'tools/**'
       - 'tests/endpoint_suite.py'
       - 'titles/**'
-      # The `patches` job below is the only thing that checks these, and a
-      # patch-only commit is exactly the kind that breaks them.
-      - 'patches/**'
+      # The source job checks source pins and their packaging consumers.
+      - 'sources.lock.json'
+      - '.gitmodules'
       # All of scripts/, not a list: the shim sources xodus-env.sh on every
       # launch, launch-core tests read launch-gdk.sh, and the shell syntax step
       # covers the rest. A list left out exactly the files a change to one
@@ -67,7 +76,7 @@ on:
       - 'tests/test_release_signing.py'
       - 'tests/test_workflows.py'
       # The native harnesses and fixtures: the shell syntax step and the
-      # `patches` job check these.
+      # `sources` job check these.
       - 'tests/*.sh'
       - 'tests/license_token_fixture.py'
       - '.github/workflows/**'
@@ -85,6 +94,15 @@ on:
       - 'tests/gui_artwork.py'
       - 'tests/gui_controller.py'
       - 'tests/gui_launch.py'
+      - 'tests/gui_running.py'
+      - 'tests/gui_controller_install.py'
+      - 'tests/gui_accounts_controller.py'
+      - 'tests/controller_driver.py'
+      - 'tests/test_gui_actions.py'
+      - 'tests/run_wayland_gui.py'
+      - 'tests/wayland_focus.py'
+      - 'tests/test_source_pins.py'
+      - 'tests/test_runtime_staging.py'
       - 'tests/test_transfer_controls.py'
       - 'tests/fake_packagekit.py'
       - 'tests/test_download_cancel.py'
@@ -93,9 +111,9 @@ on:
       - 'tools/**'
       - 'tests/endpoint_suite.py'
       - 'titles/**'
-      # The `patches` job below is the only thing that checks these, and a
-      # patch-only commit is exactly the kind that breaks them.
-      - 'patches/**'
+      # The source job checks source pins and their packaging consumers.
+      - 'sources.lock.json'
+      - '.gitmodules'
       # All of scripts/, not a list: the shim sources xodus-env.sh on every
       # launch, launch-core tests read launch-gdk.sh, and the shell syntax step
       # covers the rest. A list left out exactly the files a change to one
@@ -112,7 +130,7 @@ on:
       - 'tests/test_release_signing.py'
       - 'tests/test_workflows.py'
       # The native harnesses and fixtures: the shell syntax step and the
-      # `patches` job check these.
+      # `sources` job check these.
       - 'tests/*.sh'
       - 'tests/license_token_fixture.py'
       - '.github/workflows/**'
@@ -217,6 +235,8 @@ jobs:
           FERESTRE_REQUIRE_MINISIGN: '1'
         run: |
           python3 tests/test_workflows.py
+          python3 tests/test_source_pins.py
+          python3 tests/test_runtime_staging.py
           python3 tests/test_release_signing.py
           python3 tests/test_build_appimage.py
 
@@ -268,42 +288,20 @@ jobs:
           rustc +1.88 --version
           cargo +1.88 test --locked --workspace
 
-  # The cheap half of testing the runtime. Building it needs a 26 GB tree and an
-  # hour, so `tests/run-*.sh` cannot run per push -- but checking that the
-  # patches still apply takes a minute, and it is the check that has actually
-  # caught things: a patch exported from a dirty tree carrying its predecessor's
-  # changes (twice), and a rename leaking into a third-party project's source.
-  #
-  # Only the series whose repositories are small enough to clone here. The wine
-  # series needs the Wine tree and stays a local check; the script skips what it
-  # cannot find rather than failing.
-  patches:
+  # Verify all five immutable fork commits and their nested gitlinks without
+  # checking out the complete Wine tree, then run the client’s offline tests.
+  sources:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
-      # The client is a submodule pinned at the commit the series targets.
-      # The Proton submodule's own submodules are not initialised: its Wine
-      # tree is too large to clone per push, and the wine series stays a
-      # local check. Proton itself is cloned without blobs, for the proton
-      # patch; the xgameruntime and vkd3d-proton trees are small enough, so
-      # they are cloned into the places the submodules would put them.
-      - name: Fetch the repositories the patches target
-        run: |
-          git submodule update --init --quiet third_party/xodus-cli
-          git clone --quiet --filter=blob:none https://github.com/xodus-gaming/Proton.git \
-            third_party/xodus-proton
-          git clone --quiet https://github.com/xodus-gaming/xgameruntime \
-            third_party/xodus-proton/wine/dlls/xgameruntime
-          # Without blobs: the history is needed to find the pinned base, but
-          # only that commit's files are ever read, and they arrive on demand.
-          git clone --quiet --filter=blob:none https://github.com/HansKristian-Work/vkd3d-proton \
-            third_party/xodus-proton/vkd3d-proton
+      - name: Check out the pinned client fork
+        run: git submodule update --init --quiet third_party/xodus-cli
 
-      - name: Patches apply
-        run: scripts/check-patches.sh
+      - name: Verify public fork commits and nested pins
+        run: scripts/check-sources.sh --remote
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
@@ -335,13 +333,10 @@ jobs:
       # ignored),
       # the presence runner (a local server and a fake token provider; it
       # never signs in), the profile store and the file-backed key chain.
-      - name: Apply the client series and test it offline
+      - name: Test the pinned client fork offline
         run: |
           set -euo pipefail
-          for patch in "$GITHUB_WORKSPACE"/patches/xodus-cli/*.patch; do
-            case "$(basename "$patch")" in 0001-*) continue ;; esac
-            git -C third_party/xodus-cli apply "$patch"
-          done
+          python3 scripts/source-pins.py verify xodus --directory third_party/xodus-cli
           cd third_party/xodus-cli
           cargo test --locked -p xodus-service
           cargo test --locked -p xodus profile
@@ -377,6 +372,9 @@ jobs:
 
       - name: Build the window
         run: cargo build --locked -p ferestre-gui -p ferestre-cli
+
+      - name: Accessibility action-export unit tests
+        run: python3 tests/test_gui_actions.py
 
       # A session bus for the accessibility bus to live on, a display for the
       # window to map into, and then the test drives it by pressing things.
@@ -423,6 +421,21 @@ jobs:
         run: |
           xvfb-run -a --server-num=117 --server-args='-screen 0 1280x720x24' \
             dbus-run-session -- python3 tests/gui_launch.py
+
+      - name: Controller Resume and confirmed Stop (offline)
+        run: |
+          xvfb-run -a --server-num=120 --server-args='-screen 0 1280x720x24' \
+            dbus-run-session -- python3 tests/gui_running.py
+
+      - name: Controller keyboard, install destination and queue (offline)
+        run: |
+          xvfb-run -a --server-num=121 --server-args='-screen 0 1280x720x24' \
+            dbus-run-session -- python3 tests/gui_controller_install.py
+
+      - name: Controller account selection (offline)
+        run: |
+          xvfb-run -a --server-num=122 --server-args='-screen 0 1280x720x24' \
+            dbus-run-session -- python3 tests/gui_accounts_controller.py
 
       - name: Persistent install queue and pause controls (offline)
         run: |

@@ -51,7 +51,6 @@ optdepends=(
   # container engine plus the tools install-xodus-proton.sh drives.
   'docker: building the patched Proton runtime yourself (ferestre install-runtime)'
   'podman: building the patched Proton runtime yourself, instead of docker'
-  'patch: re-applying the proton patch after a self-built runtime install'
   'binutils: the runtime build checks the installed xgameruntime.dll with strings(1)'
   'rsync: rebuilding a single DLL against the runtime build tree'
 )
@@ -96,11 +95,9 @@ package() {
 
   # The scripts are the launch path, not documentation: launch-gdk.sh strips
   # the environment Steam injects and proton-wine-shim.sh is what xodus-cli
-  # execs as its "wine" binary. patches/ comes with them because
-  # install-xodus-proton.sh reads patches/proton out of the repository root,
-  # which for an installed copy is /usr/lib/ferestre.
+  # execs as its "wine" binary. The source lock records component provenance.
   cp -a scripts  "$pkgdir/usr/lib/ferestre/scripts"
-  cp -a patches  "$pkgdir/usr/lib/ferestre/patches"
+  install -Dm644 sources.lock.json "$pkgdir/usr/lib/ferestre/sources.lock.json"
   # The recipes, without which an installed copy knows about no titles at all:
   # paths.rs resolves titles/ relative to the repository root, which for a
   # packaged install is /usr/lib/ferestre. They are data the launcher reads at

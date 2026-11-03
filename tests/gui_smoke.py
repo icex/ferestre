@@ -353,23 +353,18 @@ def press_actions(node):
 
 
 def click_named(root, name, what=None):
-    """Click the first thing carrying this name that can actually be clicked."""
-    for candidate in find_all(root, name=name):
-        action, useful = press_actions(candidate)
-        if useful:
-            action.do_action(
-                next(
-                    (
-                        i
-                        for i in range(action.get_n_actions())
-                        if action.get_action_name(i) == useful[0]
-                    ),
-                    0,
-                )
-            )
-            return candidate
-    dump(root, f"looking for {name!r}")
-    raise Failure(f"nothing clickable called {what or name!r}")
+    """Wait for action export, then click once; GTK can export the name first."""
+    def ready(root):
+        for candidate in find_all(root, name=name):
+            action, useful = press_actions(candidate)
+            if useful:
+                index = next(i for i in range(action.get_n_actions())
+                             if action.get_action_name(i) == useful[0])
+                return candidate, action, index
+        return None
+    candidate, action, index = wait_for(root, ready, what or f"clickable {name!r}", time.monotonic()+TIMEOUT)
+    action.do_action(index)
+    return candidate
 
 
 def select_in_list(root, name, what=None):

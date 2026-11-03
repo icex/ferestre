@@ -346,19 +346,15 @@ printf '%s\n' "$VERSION" > "$APPDIR/usr/lib/ferestre/VERSION"
 
 # The scripts are the launch path, not documentation: launch-gdk.sh assembles
 # the environment and proton-wine-shim.sh is what xodus-cli execs as its "wine"
-# binary. patches/ comes along because install-xodus-proton.sh reads
-# patches/proton out of it, and because someone holding only the AppImage should
-# still be able to follow docs/RECIPES.md.
+# binary. The source lock records exactly which component forks were built.
 cp -a "$REPO/scripts"  "$APPDIR/usr/lib/ferestre/scripts"
-cp -a "$REPO/patches"  "$APPDIR/usr/lib/ferestre/patches"
+cp "$REPO/sources.lock.json" "$APPDIR/usr/lib/ferestre/sources.lock.json"
 # The recipes are the canonical per-title data; the launch scripts are the
 # fallback until the real launcher reads them directly.
 cp -a "$REPO/titles"   "$APPDIR/usr/lib/ferestre/titles"
 find "$APPDIR/usr/lib/ferestre/scripts" -name '*.sh' -exec chmod 0755 {} +
 
-# Ship the licences with the thing they cover. patches/wine and
-# patches/xgameruntime are LGPL-2.1-or-later and patches/xodus-cli is GPL-3.0;
-# they travel as source diffs, and NOTICE is the map that says which is which.
+# Ship component provenance and the existing licensing map with the launcher.
 for d in NOTICE LICENSE LICENSE.LGPL-2.1 README.md; do
     if [ -f "$REPO/$d" ]; then cp "$REPO/$d" "$APPDIR/usr/share/doc/ferestre/"; fi
 done

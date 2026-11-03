@@ -29,3 +29,4 @@ futures-channel = "0.3"
 # To read a channel of runner events on the main loop. Also in the tree
 # through glib.
 futures-util = { version = "0.3", default-features = false }
+x11-dl = "2.21.0"

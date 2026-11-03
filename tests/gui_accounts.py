@@ -74,6 +74,51 @@ def write(path, text, executable=False):
         path.chmod(0o755)
 
 
+def prepare(home,binary):
+    write(home/"profiles.json",json.dumps({"schema":1,"capabilities":["store-player-accounts"],"default_profile":OWNER,
+        "profiles":[{"id":OWNER,"label":"Owner Fixture","signed_in":True,"legacy_saves":True,"save_namespace":"a"*64}]}))
+    write(home/"client/xodus-cli",CLIENT,True)
+    write(home/"client/xodus-service",SERVICE,True)
+    write(home/"client/SERVICE_ID",hashlib.sha256(SERVICE.encode()).hexdigest())
+    write(home/"runtime/proton","#!/bin/sh\n# close_fds=False\nexit 0\n",True)
+    write(home/"runtime/version","0 ferestre-account-fixture\n")
+    write(home/"runtime/files/share/ferestre/capabilities.json",json.dumps({"schema":1,"capabilities":[
+        "xgameruntime.service-socket-override"]}))
+    write(home/"runtime/files/bin/wineserver", "#!/bin/sh\nprintf '%s\\n' \"$WINEPREFIX\" > \"$HOME/stopped-prefix\"\n", True)
+    write(home/"titles/role-test.toml",f'''schema=1
+[title]
+product-id="{PRODUCT}"
+name="Account Test Game"
+slug="account-test"
+[launch]
+executable="Game.exe"
+[status]
+state="playable"
+summary="Synthetic account fixture"
+''')
+    game=home/"games/account-test"
+    write(game/"MicrosoftGame.config",f'<Game><Identity Name="Fixture.AccountGame" Publisher="CN=Fixture" Version="1.0.0.0"/><ExecutableList><Executable Name="Game.exe"/></ExecutableList><StoreId>{PRODUCT}</StoreId></Game>')
+    write(game/"Game.exe","fixture")
+    # The package header a finished install leaves: a folder with no header
+    # and no manifest is a download that has not finished, not an install.
+    write(game/".xodus-streaming.msixvc","")
+    state=home/"state/ferestre"
+    write(state/f"installed/{PRODUCT}.json",json.dumps({"product_id":PRODUCT,"dir":str(game),"content_ids":["00000000-0000-0000-0000-000000000003"],"package_version":"1.0.0.0"}))
+    write(home/"cache/ferestre/catalog"/f"{PRODUCT}.json",json.dumps({"schema":1,"market":"US","language":"en-us","product":{"product_id":PRODUCT,"name":"Account Test Game","has_packages":True,"has_pc_package":True,"package_format":"MSIXVC"}}))
+    (home/"bin").mkdir()
+    shutil.copy2(binary,home/"bin/ferestre-gui")
+    (home/"bin/ferestre").symlink_to(binary.with_name("ferestre"))
+    env=dict(os.environ,HOME=str(home),XDG_CONFIG_HOME=str(home/"config"),XDG_STATE_HOME=str(home/"state"),XDG_CACHE_HOME=str(home/"cache"),
+        XODUS_CLI_DIR=str(home/"client"),XODUS_GAMES_DIR=str(home/"games"),XODUS_PROTON_DIR=str(home/"runtime"),XODUS_RUNTIME_DIR=str(home/"s"),
+        FERESTRE_TITLES=str(home/"titles"),GTK_A11Y="atspi",HTTPS_PROXY="http://127.0.0.1:9",HTTP_PROXY="http://127.0.0.1:9",ALL_PROXY="http://127.0.0.1:9")
+    for key in ("APPIMAGE","FERESTRE_ACCOUNT_ROLES"):
+        env.pop(key,None)
+    # Its own application id, so a Ferestre already open on this desktop
+    # is not the instance that receives the activation.
+    env["FERESTRE_APPLICATION_ID"]="io.github.icex.ferestre.AccountTest"
+    return env
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument("--binary", default="target/debug/ferestre-gui")
@@ -87,47 +132,7 @@ def main():
     passed=False
     try:
         s.check_panic_detection(str(home))
-        write(home/"profiles.json",json.dumps({"schema":1,"capabilities":["store-player-accounts"],"default_profile":OWNER,
-            "profiles":[{"id":OWNER,"label":"Owner Fixture","signed_in":True,"legacy_saves":True,"save_namespace":"a"*64}]}))
-        write(home/"client/xodus-cli",CLIENT,True)
-        write(home/"client/xodus-service",SERVICE,True)
-        write(home/"client/SERVICE_ID",hashlib.sha256(SERVICE.encode()).hexdigest())
-        write(home/"runtime/proton","#!/bin/sh\n# close_fds=False\nexit 0\n",True)
-        write(home/"runtime/version","0 ferestre-account-fixture\n")
-        write(home/"runtime/files/share/ferestre/capabilities.json",json.dumps({"schema":1,"capabilities":[
-            "xgameruntime.service-socket-override"]}))
-        write(home/"runtime/files/bin/wineserver", "#!/bin/sh\nprintf '%s\\n' \"$WINEPREFIX\" > \"$HOME/stopped-prefix\"\n", True)
-        write(home/"titles/role-test.toml",f'''schema=1
-[title]
-product-id="{PRODUCT}"
-name="Account Test Game"
-slug="account-test"
-[launch]
-executable="Game.exe"
-[status]
-state="playable"
-summary="Synthetic account fixture"
-''')
-        game=home/"games/account-test"
-        write(game/"MicrosoftGame.config",f'<Game><Identity Name="Fixture.AccountGame" Publisher="CN=Fixture" Version="1.0.0.0"/><ExecutableList><Executable Name="Game.exe"/></ExecutableList><StoreId>{PRODUCT}</StoreId></Game>')
-        write(game/"Game.exe","fixture")
-        # The package header a finished install leaves: a folder with no header
-        # and no manifest is a download that has not finished, not an install.
-        write(game/".xodus-streaming.msixvc","")
-        state=home/"state/ferestre"
-        write(state/f"installed/{PRODUCT}.json",json.dumps({"product_id":PRODUCT,"dir":str(game),"content_ids":["00000000-0000-0000-0000-000000000003"],"package_version":"1.0.0.0"}))
-        write(home/"cache/ferestre/catalog"/f"{PRODUCT}.json",json.dumps({"schema":1,"market":"US","language":"en-us","product":{"product_id":PRODUCT,"name":"Account Test Game","has_packages":True,"has_pc_package":True,"package_format":"MSIXVC"}}))
-        (home/"bin").mkdir()
-        shutil.copy2(binary,home/"bin/ferestre-gui")
-        (home/"bin/ferestre").symlink_to(binary.with_name("ferestre"))
-        env=dict(os.environ,HOME=str(home),XDG_CONFIG_HOME=str(home/"config"),XDG_STATE_HOME=str(home/"state"),XDG_CACHE_HOME=str(home/"cache"),
-            XODUS_CLI_DIR=str(home/"client"),XODUS_GAMES_DIR=str(home/"games"),XODUS_PROTON_DIR=str(home/"runtime"),XODUS_RUNTIME_DIR=str(home/"s"),
-            FERESTRE_TITLES=str(home/"titles"),GTK_A11Y="atspi",HTTPS_PROXY="http://127.0.0.1:9",HTTP_PROXY="http://127.0.0.1:9",ALL_PROXY="http://127.0.0.1:9")
-        for key in ("APPIMAGE","FERESTRE_ACCOUNT_ROLES"):
-            env.pop(key,None)
-        # Its own application id, so a Ferestre already open on this desktop
-        # is not the instance that receives the activation.
-        env["FERESTRE_APPLICATION_ID"]="io.github.icex.ferestre.AccountTest"
+        env=prepare(home,binary)
         gui=windows.start([home/"bin/ferestre-gui"],env,"first",stdout=None)
         s.Atspi.init()
         app=s.find_app(gui.pid,time.monotonic()+20)
@@ -201,6 +206,7 @@ summary="Synthetic account fixture"
         s.check(json.loads((home/"launched.json").read_text())["XODUS_PLAYER_PROFILE"]==PLAYER,"changing selection preserves the running game's player")
         stop=s.wait_for(frame,lambda root:s.row_button(root,"Account Test Game","Stop"),"Stop",time.monotonic()+20)
         s.click(stop)
+        s.click_named(frame,"Stop Game")
         s.wait_for(frame,lambda root:(home/"stopped-prefix").exists(),"prefix-specific shutdown",time.monotonic()+20)
         s.check((home/"stopped-prefix").read_text().strip()==launched['STEAM_COMPAT_DATA_PATH']+'/pfx',"Stop uses the launched player's prefix")
         dialog=open_accounts()

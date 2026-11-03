@@ -1,7 +1,7 @@
 Licensing map
 =============
 
-This repository mixes original work with modifications to four other projects,
+This repository mixes original work with modifications to five other projects,
 each under its own licence. Which applies depends on the directory.
 
 MIT (see LICENSE)
@@ -18,24 +18,24 @@ MIT (see LICENSE)
 
 LGPL-2.1-or-later (see LICENSE.LGPL-2.1)
 ----------------------------------------
-  patches/wine/      patches/xgameruntime/      patches/vkd3d-proton/
+  https://github.com/icex/wine
+  https://github.com/icex/xgameruntime
+  https://github.com/icex/vkd3d-proton
 
-  Modifications to Wine and to vkd3d-proton, distributed as plain git diffs.
-  Both are LGPL-2.1-or-later, so a modification of either is too, and it stays
-  that way however it is redistributed. Ship binaries built from these and you
-  must make the corresponding source available.
+  Modifications to Wine, xgameruntime and vkd3d-proton remain under their
+  upstream licences. The exact source commits are in sources.lock.json;
+  corresponding source is available from the fork repositories.
 
 GPL-3.0-only
 ------------
-  patches/xodus-cli/
+  https://github.com/icex/xodus
 
   Modifications to Xodus, which ships a bare GPLv3 with no "or any later
-  version" grant and no per-file headers, so it is GPL-3.0-only. These patches
-  are derivative works of it and carry that licence.
+  version" grant and no per-file headers, so it is GPL-3.0-only. The modified client retains that licence.
 
 BSD-3-Clause (Valve)
 --------------------
-  patches/proton/
+  https://github.com/icex/Proton-UWP (ferestre branch)
 
   A modification to Proton's top-level `proton` script, which is covered by
   Valve's licence (see LICENSE.proton in the Proton tree).
@@ -66,11 +66,11 @@ Upstream projects
                   inside it remains LGPL-2.1-or-later.
   vkd3d-proton    https://github.com/HansKristian-Work/vkd3d-proton
                   LGPL-2.1-or-later. The Direct3D 12 implementation inside
-                  Proton; the series targets the commit Proton pins.
+                  Proton; the fork commit is pinned by Proton.
   Xodus           https://github.com/xodus-gaming    GPL-3.0-only
                   The client that signs in, fetches a licence, and downloads
                   and decrypts a package. Not affiliated with this project.
-                  These patches are not submitted upstream: Xodus operates a
+                  These changes are not submitted upstream: Xodus operates a
                   clean-room policy that excludes AI-assisted contributions.
 
 Trademarks

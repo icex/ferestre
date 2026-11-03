@@ -17,6 +17,7 @@ mod client_check;
 mod controller;
 mod deadline;
 mod editor;
+mod folder_picker;
 mod handheld;
 mod launch_state;
 mod model;
@@ -26,6 +27,7 @@ mod progress;
 mod queue_ui;
 mod state;
 mod stop;
+mod text_input;
 mod window_activation;
 
 use adw::prelude::*;
@@ -77,6 +79,7 @@ window.ferestre-window, .ferestre-content, .ferestre-content > contents {
 .ferestre-window entry, .ferestre-window searchentry { background-color: #292c32; color: #f4f4f5; border: 1px solid #565b66; border-radius: 24px; }
 .ferestre-window button { color: #f4f4f5; }
 .ferestre-window button.suggested-action { background-color: #107c10; color: #ffffff; }
+.game-tile { background-color: #25282d; border-radius: 7px; }
 button.game-tile { padding: 0; border: 0; background-color: #25282d; color: #f4f4f5; box-shadow: none; border-radius: 7px; }
 button.game-tile:hover { background-color: #30343b; }
 button.game-tile:focus-visible { outline: 3px solid white; outline-offset: 4px; }
@@ -295,6 +298,15 @@ struct Ui {
 }
 
 fn main() -> glib::ExitCode {
+    let args: Vec<_> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a == "--resume-x11") {
+        let pids: Result<Vec<u32>, _> = args[2..].iter().map(|s| s.parse()).collect();
+        return if pids.is_ok_and(|pids| !pids.is_empty() && window_activation::x11_resume(&pids)) {
+            glib::ExitCode::SUCCESS
+        } else {
+            glib::ExitCode::FAILURE
+        };
+    }
     let application_id = std::env::var("FERESTRE_APPLICATION_ID")
         .ok()
         .filter(|id| gio::Application::id_is_valid(id))
@@ -1161,6 +1173,13 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
         move |_| app_updates::refresh(&ui, true)
     ));
     release_row.add_suffix(&check);
+    let quit = gtk::Button::builder()
+        .label("Quit Ferestre")
+        .valign(gtk::Align::Center)
+        .build();
+    let quit_window = ui.window.clone();
+    quit.connect_clicked(move |_| quit_window.close());
+    release_row.add_suffix(&quit);
     release.add(&release_row);
     page.append(&release);
 
@@ -1978,6 +1997,7 @@ fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
         )
     };
     let dialog = gtk::Window::builder()
+        .application(ui.window.application().as_ref().unwrap())
         .transient_for(&ui.window)
         .modal(true)
         .title(format!("Runtime for {title}"))
@@ -2231,6 +2251,10 @@ fn render_featured(ui: &Ui, page: &gtk::Box, rows: &[LibraryRow]) {
     page.append(&strip);
     let features = gtk::Box::new(gtk::Orientation::Horizontal, 18);
     for row in rows.iter().take(3) {
+        if row.action == Action::Stop {
+            features.append(&game_card(ui, row));
+            continue;
+        }
         let overlay = gtk::Overlay::builder()
             .width_request(420)
             .height_request(260)
@@ -2523,7 +2547,6 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
             .halign(gtk::Align::Fill)
             .valign(gtk::Align::Fill)
             .css_classes(["game-launch-overlay"])
-            .can_target(false)
             .build();
         layer.set_accessible_role(gtk::AccessibleRole::Group);
         layer.update_property(&[gtk::accessible::Property::Label(if launching {
@@ -2556,17 +2579,38 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
                 .css_classes(["game-overlay-state"])
                 .build(),
         );
-        center.append(
-            &gtk::Label::builder()
-                .label(if stopping { "Stop now" } else { "Stop" })
-                .css_classes(["game-overlay-action"])
-                .build(),
-        );
+        // These are separate controls, never buttons nested inside a button.
+        let mut control = actions.first_child();
+        while let Some(widget) = control {
+            control = widget.next_sibling();
+            if widget.is::<gtk::Button>() {
+                actions.remove(&widget);
+                widget.set_size_request(144, 48);
+                widget.add_css_class("pill");
+                widget.reset_relation(gtk::AccessibleRelation::LabelledBy);
+                if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+                    widget.update_property(&[gtk::accessible::Property::Label(&format!(
+                        "{} · {}",
+                        row.name,
+                        button.label().unwrap_or_default()
+                    ))]);
+                }
+                center.append(&widget);
+            }
+        }
         layer.append(&center);
         surface.add_overlay(&layer);
     }
     let overlay = gtk::Overlay::new();
-    if let Some(primary) = primary {
+    if row.action == Action::Stop {
+        surface.add_css_class("game-tile");
+        surface.set_accessible_role(gtk::AccessibleRole::Group);
+        surface.update_property(&[gtk::accessible::Property::Label(&format!(
+            "{} · Game card",
+            row.name
+        ))]);
+        overlay.set_child(Some(&surface));
+    } else if let Some(primary) = primary {
         actions.remove(&primary);
         primary.set_child(Some(&surface));
         primary.set_tooltip_text(description.tooltip_text().as_deref());
@@ -2906,11 +2950,34 @@ fn library_components(ui: &Ui, row: &LibraryRow) -> (adw::ActionRow, gtk::Box) {
                 .borrow()
                 .get(&running_id.to_ascii_uppercase())
                 .is_some_and(|launch| launch.asked.is_some());
-            button.set_tooltip_text(Some(if asked {
-                "Asked to close. Press again to end it now"
-            } else {
-                "Ask the title to close. It is ended if it has not closed in 15 seconds"
-            }));
+            let ready = ui
+                .running
+                .borrow()
+                .get(&running_id.to_ascii_uppercase())
+                .is_some_and(|launch| launch.ready);
+            if ready {
+                let resume = gtk::Button::with_label("Resume");
+                resume.set_widget_name(&format!("game-{}-primary", row.product_id));
+                resume.update_property(&[gtk::accessible::Property::Label(&format!(
+                    "{} · Resume",
+                    row.name
+                ))]);
+                resume.add_css_class("suggested-action");
+                resume.set_tooltip_text(Some("Return to the running game's window"));
+                let (resume_ui, id, name) = (ui.clone(), running_id.clone(), row.name.clone());
+                resume.connect_clicked(move |_| window_activation::resume(&resume_ui, &id, &name));
+                actions.append(&resume);
+                ui.game_actions
+                    .borrow_mut()
+                    .insert(row.product_id.clone(), "Resume".into());
+                button.set_widget_name(&format!("game-{}-stop", row.product_id));
+            }
+            button.set_label(if asked { "Force Stop" } else { "Stop" });
+            button.set_tooltip_text(Some("Choose Stop to confirm before closing the game"));
+            button.update_property(&[gtk::accessible::Property::Label(&format!(
+                "{} · Stop",
+                row.name
+            ))]);
             button.remove_css_class("suggested-action");
             button.add_css_class("destructive-action");
             let product_id = running_id;
@@ -2918,7 +2985,7 @@ fn library_components(ui: &Ui, row: &LibraryRow) -> (adw::ActionRow, gtk::Box) {
             button.connect_clicked(glib::clone!(
                 #[strong]
                 ui,
-                move |_| stop_title(&ui, &product_id, &name)
+                move |_| confirm_stop_title(&ui, &product_id, &name)
             ));
         }
         action => {
@@ -3491,7 +3558,10 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
     let pgid = child.id();
     ui.running.borrow_mut().insert(
         key.clone(),
-        stop::Launch::new(pgid, std::time::Instant::now()),
+        stop::Launch {
+            tag: launch_tag.clone(),
+            ..stop::Launch::new(pgid, std::time::Instant::now())
+        },
     );
     if let Some(server) = server {
         ui.running_servers.borrow_mut().insert(key.clone(), server);
@@ -3614,24 +3684,49 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
     });
 }
 
-/// Stop a title this window started: ask it to close, then end it.
-///
-/// The first press asks, the way closing the game's window would, so it can
-/// save -- ending it outright loses whatever it had not written, and a save
-/// being written at that moment can be left torn. If it has not exited within
-/// [`stop::CLOSE_WAIT`], or Stop is pressed again, the prefix is ended. A
-/// press that is the second click of the double-click that started it, or of
-/// the one that asked, does nothing.
-fn stop_title(ui: &Ui, product_id: &str, name: &str) {
+/// Confirm the exact launch, so an old dialog cannot stop a replacement game.
+fn confirm_stop_title(ui: &Ui, product_id: &str, name: &str) {
     let key = product_id.to_ascii_uppercase();
     let Some(launch) = ui.running.borrow().get(&key).cloned() else {
         return;
     };
-    match stop::press(&launch, std::time::Instant::now()) {
-        stop::Press::Ignore => {}
-        stop::Press::End => end_title(ui, &key, launch.pgid, name),
-        stop::Press::Ask => ask_title_to_close(ui, &key, launch.pgid, name),
+    if ui.window.visible_dialog().is_some()
+        || stop::press(&launch, std::time::Instant::now()) == stop::Press::Ignore
+    {
+        return;
     }
+    let force = launch.asked.is_some();
+    let dialog = adw::AlertDialog::new(
+        Some(&format!(
+            "{} {name}?",
+            if force { "Force stop" } else { "Stop" }
+        )),
+        Some(if force {
+            "The game has not closed yet. Force stopping can lose unsaved progress."
+        } else {
+            "Unsaved progress may be lost. Ferestre will ask the game to close before ending it."
+        }),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("stop", if force { "Force Stop" } else { "Stop Game" });
+    dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let window = ui.window.clone();
+    let ui = ui.clone();
+    let name = name.to_string();
+    dialog.connect_response(None, move |_, response| {
+        if response != "stop" {
+            return;
+        }
+        let action = stop::confirmed(ui.running.borrow().get(&key), &launch);
+        match action {
+            Some(stop::Press::Ask) => ask_title_to_close(&ui, &key, launch.pgid, &name),
+            Some(stop::Press::End) => end_title(&ui, &key, launch.pgid, &name),
+            _ => (),
+        }
+    });
+    dialog.present(Some(&window));
 }
 
 /// The wineserver and prefix of a running title. Worked out again when the
@@ -4258,6 +4353,17 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
         .margin_top(6)
         .css_classes(["caption", "dim-label"])
         .build();
+    let browse = gtk::Button::builder()
+        .icon_name("folder-open-symbolic")
+        .tooltip_text("Choose install folder")
+        .valign(gtk::Align::Center)
+        .build();
+    browse.update_property(&[gtk::accessible::Property::Label("Choose install folder")]);
+    where_to.add_suffix(&browse);
+    {
+        let (ui, entry) = (ui.clone(), where_to.clone());
+        browse.connect_clicked(move |_| folder_picker::open(&ui, entry.upcast_ref()));
+    }
     let group = adw::PreferencesGroup::new();
     group.add(&where_to);
     let extra = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -5846,32 +5952,10 @@ fn choose_move(ui: &Ui, product_id: &str, name: &str) {
     let chosen = Rc::new(RefCell::new(None::<PathBuf>));
     let generation = Rc::new(std::cell::Cell::new(0u64));
     let window = ui.window.clone();
-    browse.connect_clicked(glib::clone!(
-        #[strong]
-        entry,
-        #[strong]
-        window,
-        move |_| {
-            let chooser = gtk::FileDialog::builder()
-                .title("Choose library folder")
-                .build();
-            chooser.select_folder(
-                Some(&window),
-                None::<&gio::Cancellable>,
-                glib::clone!(
-                    #[strong]
-                    entry,
-                    move |result| {
-                        if let Ok(folder) = result {
-                            if let Some(path) = folder.path() {
-                                entry.set_text(&path.to_string_lossy());
-                            }
-                        }
-                    }
-                ),
-            );
-        }
-    ));
+    {
+        let (ui, entry) = (ui.clone(), entry.clone());
+        browse.connect_clicked(move |_| folder_picker::open(&ui, entry.upcast_ref()));
+    }
     let product = product_id.to_string();
     entry.connect_changed(glib::clone!(
         #[strong]

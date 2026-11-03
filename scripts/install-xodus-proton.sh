@@ -1,35 +1,38 @@
 #!/bin/bash
-# Build and install the Xodus Proton fork, re-apply the local patch, and write
-# down what the result can do.
-#
-# Two things make this more than "make install":
-#
-#  - The build works from its own copies of the Wine and vkd3d-proton trees
-#    ($BUILD_DIR/src-wine, $BUILD_DIR/src-vkd3d-proton), refreshed from the
-#    submodules only when their source stamps are missing. Editing a submodule
-#    alone therefore changes nothing, and the stamps for the stages that
-#    consume it have to go too or the install silently ships the previous
-#    build.
-#  - `make install` rsyncs dist/ over the compatibility tool with --delete,
-#    which replaces the `proton` script -- including the close_fds=False change
-#    that keeps the decrypted-image memfds alive. Without it every GDK title
-#    fails to launch with exit code 1, so the patch goes back on afterwards.
+# Build and install the locked Proton fork, then measure its capabilities.
+# The build copies sources using preserved timestamps. Invalidate its source
+# and object stamps and touch the fork's modified files so a refreshed checkout
+# cannot silently install objects compiled from an older commit.
 
 set -eu
 . "$(dirname "$0")/xodus-env.sh"
 
 BUILD_DIR=${BUILD_DIR:-$XODUS_BUILD_DIR}
 REPO_DIR=${REPO_DIR:-$XODUS_REPO_DIR}
-PATCH=$REPO_DIR/patches/proton/0001-keep-inherited-fds-mediaconv-and-system-ffmpeg.patch
 J=${J:-16}
 
 cd "$BUILD_DIR"
+
+# Validate the tree this Makefile will actually copy, before changing stamps.
+PROTON_SRC=$(sed -n 's/^SRCDIR[[:space:]]*:=[[:space:]]*//p' Makefile | tail -n 1)
+[ -n "$PROTON_SRC" ] && [ -d "$PROTON_SRC" ] || { echo "!! configured Proton source is missing" >&2; exit 1; }
+WINE_SRC=$PROTON_SRC/wine
+VKD3D_SRC=$PROTON_SRC/vkd3d-proton
+for component in proton wine xgameruntime vkd3d-proton; do
+    case $component in
+        proton) source_dir=$PROTON_SRC ;;
+        wine) source_dir=$WINE_SRC ;;
+        xgameruntime) source_dir=$WINE_SRC/dlls/xgameruntime ;;
+        vkd3d-proton) source_dir=$VKD3D_SRC ;;
+    esac
+    python3 "$REPO_DIR/scripts/source-pins.py" verify "$component" --directory "$source_dir"
+done
 
 echo ":: invalidating Wine and vkd3d-proton source/build stamps"
 rm -f .wine-source .wine-x86_64-build .wine-x86_64-post-build .wine-x86_64-dist
 # Both architectures of vkd3d-proton rebuild on every install as a result. That
 # costs minutes, and is the price of never shipping a d3d12core.dll without
-# patches/vkd3d-proton.
+# the locked allocator-lifetime fix.
 rm -f .vkd3d-proton-source .vkd3d-proton-post-source
 for arch in i386 x86_64; do
     rm -f ".vkd3d-proton-$arch-build" ".vkd3d-proton-$arch-post-build" ".vkd3d-proton-$arch-dist"
@@ -43,49 +46,28 @@ done
 # exactly what was already there.
 #
 # It is a quiet failure and an expensive one: the runtime here sat four days
-# and several patches behind while reporting success, and the only visible sign
+# and several source changes behind while reporting success, and the only visible sign
 # was capabilities.json dropping from 19 to 15 -- which is easy to read as a
 # verification problem rather than as the build not having happened.
 #
-# So give the files the series touches a current timestamp, in the submodule,
+# So give the files the fork changes a current timestamp, in the submodule,
 # before the rsync copies them. Touching them in src-wine or src-vkd3d-proton is
 # no good: the refresh overwrites those timestamps on the way in.
-echo ":: marking patched sources for rebuild"
-WINE_SRC=${WINE_SRC:-${XODUS_SRC_DIR:-$HOME/src}/xodus-proton/wine}
-# A sibling of wine in the Proton tree, like every other Proton submodule.
-VKD3D_SRC=${VKD3D_SRC:-$(dirname "$WINE_SRC")/vkd3d-proton}
-
-# Touch every file a series patches, and say how many, per series: a count of
-# zero for a series that has patches is the stale build announcing itself.
-#
-# `if`, not `[ -f ] && touch`: under `set -e` a false test as the last command
-# of a loop body ends the script, so a patch naming a file that has since moved
-# would abort the install rather than be skipped.
-touch_series() {
-    local label=$1 dir=$2 p f n=0
-    shift 2
-    for p in "$@"; do
-        [ -e "$p" ] || continue
-        while read -r f; do
-            if [ -f "$dir/$f" ]; then
-                touch "$dir/$f"
-                n=$((n + 1))
-            fi
-        done < <(sed -n 's|^+++ b/\(.*\)$|\1|p' "$p")
-    done
+echo ":: marking fork sources for rebuild"
+mark_sources() {
+    local label=$1 dir=$2 f n=0
+    if [ ! -d "$dir" ]; then
+        echo "   no $label source checkout at $dir" >&2
+        return
+    fi
+    while IFS= read -r f; do
+        if [ -f "$dir/$f" ]; then touch "$dir/$f"; n=$((n + 1)); fi
+    done < <(python3 "$REPO_DIR/scripts/source-pins.py" modified "$label")
     echo "   $label: $n files"
 }
-if [ -d "$WINE_SRC" ]; then
-    touch_series wine "$WINE_SRC" "$REPO_DIR"/patches/wine/*.patch
-    touch_series xgameruntime "$WINE_SRC/dlls/xgameruntime" "$REPO_DIR"/patches/xgameruntime/*.patch
-else
-    echo "   !! no wine tree at $WINE_SRC; set WINE_SRC if the build ships a stale runtime" >&2
-fi
-if [ -d "$VKD3D_SRC" ]; then
-    touch_series vkd3d-proton "$VKD3D_SRC" "$REPO_DIR"/patches/vkd3d-proton/*.patch
-else
-    echo "   !! no vkd3d-proton tree at $VKD3D_SRC; set VKD3D_SRC if the build ships a stale d3d12core.dll" >&2
-fi
+mark_sources wine "$WINE_SRC"
+mark_sources xgameruntime "$WINE_SRC/dlls/xgameruntime"
+mark_sources vkd3d-proton "$VKD3D_SRC"
 
 # The build runs in containers. `newgrp docker` is only for a session that
 # predates its docker group membership; it does nothing for podman (there is no
@@ -110,7 +92,7 @@ set -o pipefail
 build 2>&1 | tee install.log | tail -3
 set +o pipefail
 
-# Check and patch the tree `make install` just wrote, which it names in its
+# Check the tree `make install` just wrote, which it names in its
 # log, not XODUS_PROTON_DIR: that may well point at a packaged, read-only copy.
 # TOOL_DIR still overrides it, for an install moved somewhere else by hand.
 INSTALLED=$(sed -n 's/^Installed Proton to //p' install.log | tail -n 1)
@@ -120,15 +102,9 @@ if [ -z "$INSTALLED" ]; then
 fi
 TOOL_DIR=${TOOL_DIR:-$INSTALLED}
 
-echo ":: re-applying the proton patch"
+echo ":: verifying the installed fork script"
 cd "$TOOL_DIR"
-if grep -q "close_fds=False" proton; then
-    echo "   already patched"
-else
-    patch -p1 < "$PATCH"
-    echo "   ok"
-fi
-grep -q "close_fds=False" proton || { echo "!! proton patch missing, GDK titles will not launch" >&2; exit 1; }
+grep -q "close_fds=False" proton || { echo "!! fork script lacks inherited-fd support; GDK titles will not launch" >&2; exit 1; }
 
 D=$TOOL_DIR/files/lib/wine/x86_64-windows/xgameruntime.dll
 if strings "$D" | grep -q "unrecognised index"; then
@@ -138,9 +114,9 @@ else
     exit 1
 fi
 
-# The same check for the vkd3d-proton series: its option name is compiled into
+# The same check for the vkd3d-proton fork: its option name is compiled into
 # d3d12core.dll's configuration table, so its absence means the build did not
-# include patches/vkd3d-proton.
+# include the locked allocator-lifetime fix.
 V=$TOOL_DIR/files/lib/wine/vkd3d-proton/x86_64-windows/d3d12core.dll
 if strings "$V" | grep -q "retain_recording_allocators"; then
     echo ":: vkd3d-proton carries retain_recording_allocators"
