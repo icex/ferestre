@@ -9,7 +9,7 @@ import tempfile
 import time
 import gui_smoke as s
 from gui_launch import prepare,active_pid
-from controller_driver import Driver,focus
+from controller_driver import Driver,focus,start_window_manager
 
 
 def main():
@@ -18,7 +18,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix='ferestre-running-ui-') as tmp:
         home=Path(tmp);ids,_,pad,env=prepare(home,args.binary)
         (home/'real-game-window').touch()
+        wm=None
         try:
+            wm=start_window_manager()
             with (home/'gui.log').open('wb') as log:process=subprocess.Popen([home/'bin/ferestre-gui'],env=env,stdout=log,stderr=log)
             app=s.find_app(process.pid,time.monotonic()+20)
             def wait(test,what):return s.wait_for(app,test,what,time.monotonic()+20)
@@ -71,6 +73,8 @@ def main():
             raise
         finally:
             pad()
+            if wm is not None:
+                wm.terminate();wm.wait(timeout=5)
             if process is not None and process.poll() is None:process.terminate();process.wait(timeout=5)
             for file in home.glob('launch-*'):
                 try:

@@ -5,7 +5,7 @@ from pathlib import Path
 import gui_smoke as s
 from gui_accounts import prepare,OWNER,PLAYER
 from gui_controller import SDL
-from controller_driver import Driver,focus
+from controller_driver import Driver,focus,start_window_manager
 
 
 def main():
@@ -18,7 +18,9 @@ def main():
         def pad(buttons=0,kind=4):
             (home/'pad-next').write_bytes(struct.pack('<Hhhhh2xii',buttons,0,0,0,0,kind,1));(home/'pad-next').replace(home/'pad')
         pad();env.update(LD_LIBRARY_PATH=str(home/'lib'),FERESTRE_TEST_PAD_FILE=str(home/'pad'))
+        wm=None
         try:
+            wm=start_window_manager()
             with (home/'gui.log').open('wb') as log:process=subprocess.Popen([home/'bin/ferestre-gui'],env=env,stdout=log,stderr=log)
             app=s.find_app(process.pid,time.monotonic()+20)
             def wait(test,what):return s.wait_for(app,test,what,time.monotonic()+20)
@@ -39,5 +41,7 @@ def main():
             raise
         finally:
             pad()
+            if wm is not None:
+                wm.terminate();wm.wait(timeout=5)
             if process is not None and process.poll() is None:process.terminate();process.wait(timeout=5)
 if __name__=='__main__':main()

@@ -1,6 +1,19 @@
 """Controller-only interaction through the fixture SDL adapter, no global input."""
+import os
+import subprocess
 import time
 import gui_smoke as s
+
+
+def start_window_manager():
+    """X11 focus assertions require a WM; external/private Wayland runners own theirs."""
+    if os.environ.get('FERESTRE_TEST_WM') == '1':
+        return None
+    wm = subprocess.Popen(['openbox', '--sm-disable'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(.3)
+    if wm.poll() is not None:
+        raise RuntimeError('private test window manager did not start')
+    return wm
 
 
 def focus(root):
