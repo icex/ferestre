@@ -325,7 +325,7 @@ fn is_control(root: &gtk::Widget) -> bool {
         || root.is::<gtk::CheckButton>()
         || root.is::<gtk::TextView>()
 }
-fn move_dialog(dialog: &adw::Dialog, action: Action) {
+fn move_surface(root: &gtk::Widget, focus: Option<gtk::Widget>, action: Action) {
     fn collect(root: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
         if !root.is_visible() || !root.is_mapped() || !root.is_sensitive() {
             return;
@@ -341,21 +341,21 @@ fn move_dialog(dialog: &adw::Dialog, action: Action) {
         }
     }
     let mut controls = vec![];
-    collect(dialog.upcast_ref(), &mut controls);
-    let Some(focus) = dialog.focus() else {
-        dialog.child_focus(gtk::DirectionType::TabForward);
+    collect(root, &mut controls);
+    let Some(focus) = focus else {
+        root.child_focus(gtk::DirectionType::TabForward);
         return;
     };
     let Some(index) = controls
         .iter()
-        .position(|w| *w == focus || focus.is_ancestor(w))
+        .position(|w| *w == focus || focus.is_ancestor(w) || w.is_ancestor(&focus))
     else {
         return;
     };
     let bounds: Option<Vec<Rect>> = controls
         .iter()
         .map(|w| {
-            w.compute_bounds(dialog).map(|r| Rect {
+            w.compute_bounds(root).map(|r| Rect {
                 x: r.x(),
                 y: r.y(),
                 width: r.width(),
@@ -366,6 +366,9 @@ fn move_dialog(dialog: &adw::Dialog, action: Action) {
     if let Some(next) = bounds.and_then(|rects| spatial_target(&rects, index, action)) {
         controls[next].grab_focus();
     }
+}
+fn move_dialog(dialog: &adw::Dialog, action: Action) {
+    move_surface(dialog.upcast_ref(), dialog.focus(), action);
 }
 fn main_controls(ui: &Ui) -> Vec<gtk::Widget> {
     fn collect(ui: &Ui, root: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
@@ -1035,7 +1038,7 @@ fn dispatch(ui: &Ui, action: Action) {
                 } else if let Some(dialog) = dialog {
                     move_dialog(&dialog, action);
                 } else {
-                    active.child_focus(direction);
+                    move_surface(active.upcast_ref(), focus.clone(), action);
                 }
             }
             Action::Accept => {
