@@ -298,6 +298,7 @@ struct Ui {
     controller_family: Rc<Cell<controller::Family>>,
     controller_connected: Rc<Cell<bool>>,
     last_game_focus: Rc<RefCell<Option<String>>>,
+    pending_tab_focus: Rc<Cell<Option<Section>>>,
     game_actions: Rc<RefCell<BTreeMap<String, String>>>,
     fullscreen_nav: gtk::Box,
     recent_games: gtk::Box,
@@ -641,6 +642,7 @@ fn build_ui(app: &adw::Application) {
         controller_family: Rc::new(Cell::new(controller::Family::default())),
         controller_connected: Rc::new(Cell::new(false)),
         last_game_focus: Rc::new(RefCell::new(None)),
+        pending_tab_focus: Rc::new(Cell::new(None)),
         game_actions: Rc::new(RefCell::new(BTreeMap::new())),
         fullscreen_nav: gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)

@@ -167,12 +167,32 @@ pub(super) fn focus_after_render(name: &str, section: Section) -> Option<String>
     }
 }
 
+fn owns_tab_focus(requested: Section, current: Section, pending: Option<Section>) -> bool {
+    current == requested && pending == Some(requested)
+}
+
 pub(super) fn focus_section_tab(ui: &Ui, section: Section) {
+    ui.pending_tab_focus.set(Some(section));
     let ui = ui.clone();
     let window = ui.window.clone();
     let frames = Cell::new(0u8);
     window.add_tick_callback(move |_, _| {
-        if ui.model.borrow().section != section || ui.window.visible_dialog().is_some() {
+        let clear = || {
+            if ui.pending_tab_focus.get() == Some(section) {
+                ui.pending_tab_focus.set(None);
+            }
+        };
+        let text_focus = GtkWindowExt::focus(&ui.window)
+            .is_some_and(|w| w.is::<gtk::Editable>() || w.is::<gtk::TextView>());
+        if !owns_tab_focus(
+            section,
+            ui.model.borrow().section,
+            ui.pending_tab_focus.get(),
+        ) || ui.window.visible_dialog().is_some()
+            || focused_popup(&ui).is_some()
+            || text_focus
+        {
+            clear();
             return glib::ControlFlow::Break;
         }
         frames.set(frames.get() + 1);
@@ -183,12 +203,14 @@ pub(super) fn focus_section_tab(ui: &Ui, section: Section) {
             ) {
                 if tab.is_mapped() {
                     tab.grab_focus();
+                    clear();
                     update_hints(&ui);
                     return glib::ControlFlow::Break;
                 }
             }
         }
         if frames.get() >= 4 {
+            clear();
             glib::ControlFlow::Break
         } else {
             glib::ControlFlow::Continue
@@ -196,6 +218,7 @@ pub(super) fn focus_section_tab(ui: &Ui, section: Section) {
     });
 }
 pub(super) fn focus_content(ui: &Ui) {
+    ui.pending_tab_focus.set(None);
     if let Some(dialog) = ui.window.visible_dialog() {
         if let Some(default) = dialog.default_widget() {
             dialog.set_focus(Some(&default));
@@ -225,7 +248,11 @@ pub(super) fn focus_content(ui: &Ui) {
             )
         });
     if let Some(button) = button {
-        button.grab_focus();
+        if button.widget_name().starts_with("section-") {
+            focus_section_tab(ui, ui.model.borrow().section);
+        } else {
+            button.grab_focus();
+        }
     } else if !ui.content.child_focus(gtk::DirectionType::TabForward) {
         if ui.search.is_visible() {
             ui.search.grab_focus();
@@ -1050,6 +1077,7 @@ fn activate(ui: &Ui, focus: &gtk::Widget) {
     }
 }
 fn dispatch(ui: &Ui, action: Action) {
+    ui.pending_tab_focus.set(None);
     ui.window.set_focus_visible(true);
     ui.window.add_css_class("controller-navigation");
     if let Some(active) =
@@ -1153,8 +1181,10 @@ fn dispatch(ui: &Ui, action: Action) {
                 .and_then(|d| d.focus())
                 .or_else(|| GtkWindowExt::focus(&ui.window))
             {
-                let enter = focus.widget_name().starts_with("section-")
-                    || focus.widget_name().starts_with("fullscreen-nav-");
+                // Library tabs keep focus on their selected tab. Moving Down
+                // enters the games; an idle focus_content here would override
+                // the tab restoration scheduled during the redraw.
+                let enter = focus.widget_name().starts_with("fullscreen-nav-");
                 activate(ui, &focus);
                 if enter {
                     let ui = ui.clone();
@@ -1249,6 +1279,7 @@ pub(super) fn install(ui: &Ui) {
     let keys = gtk::EventControllerKey::new();
     let key_ui = ui.clone();
     keys.connect_key_pressed(move |_, key, _, modifiers| {
+        key_ui.pending_tab_focus.set(None);
         if key == gdk::Key::F11 {
             dispatch(&key_ui, Action::Fullscreen);
             return glib::Propagation::Stop;
@@ -1319,7 +1350,9 @@ pub(super) fn install(ui: &Ui) {
     pointer.set_button(0);
     pointer.set_propagation_phase(gtk::PropagationPhase::Capture);
     let pointer_window = ui.window.clone();
+    let pointer_pending = ui.pending_tab_focus.clone();
     pointer.connect_pressed(move |_, _, _, _| {
+        pointer_pending.set(None);
         pointer_window.remove_css_class("controller-navigation")
     });
     ui.window.add_controller(pointer);
@@ -1370,6 +1403,7 @@ pub(super) fn install(ui: &Ui) {
         if ui.window.is_active()
             && ui.window.visible_dialog().is_none()
             && GtkWindowExt::focus(&ui.window).is_none()
+            && ui.pending_tab_focus.get().is_none()
         {
             focus_content(&ui);
         }
@@ -1403,6 +1437,30 @@ mod tests {
         );
         assert_eq!(focus_after_render("GtkButton", Section::Downloads), None);
     }
+    #[test]
+    fn tab_focus_requests_do_not_follow_cancelled_or_stale_navigation() {
+        assert!(owns_tab_focus(
+            Section::Downloads,
+            Section::Downloads,
+            Some(Section::Downloads)
+        ));
+        assert!(!owns_tab_focus(
+            Section::Downloads,
+            Section::Downloads,
+            None
+        ));
+        assert!(!owns_tab_focus(
+            Section::Downloads,
+            Section::Installed,
+            Some(Section::Downloads)
+        ));
+        assert!(!owns_tab_focus(
+            Section::Downloads,
+            Section::Downloads,
+            Some(Section::Installed)
+        ));
+    }
+
     #[test]
     fn modal_destination_controls_are_reachable_above_the_response_buttons() {
         let rects = [
