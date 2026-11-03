@@ -36,6 +36,11 @@ on:
       - 'tests/gui_presence.py'
       - 'tests/gui_client_deps.py'
       - 'tests/gui_updater.py'
+      - 'tests/gui_transfers.py'
+      - 'tests/gui_artwork.py'
+      - 'tests/gui_controller.py'
+      - 'tests/gui_launch.py'
+      - 'tests/test_transfer_controls.py'
       - 'tests/fake_packagekit.py'
       - 'tests/test_download_cancel.py'
       - 'tests/test_media_dependencies.py'
@@ -76,6 +81,11 @@ on:
       - 'tests/gui_presence.py'
       - 'tests/gui_client_deps.py'
       - 'tests/gui_updater.py'
+      - 'tests/gui_transfers.py'
+      - 'tests/gui_artwork.py'
+      - 'tests/gui_controller.py'
+      - 'tests/gui_launch.py'
+      - 'tests/test_transfer_controls.py'
       - 'tests/fake_packagekit.py'
       - 'tests/test_download_cancel.py'
       - 'tests/test_media_dependencies.py'
@@ -169,7 +179,7 @@ jobs:
         run: cargo test --locked --workspace
 
       - name: Download cancellation (offline)
-        run: cargo build --locked -p ferestre-cli && python3 tests/test_download_cancel.py && python3 tests/test_media_dependencies.py && python3 tests/test_client_dependencies.py
+        run: cargo build --locked -p ferestre-cli && python3 tests/test_download_cancel.py && python3 tests/test_transfer_controls.py && python3 tests/test_media_dependencies.py && python3 tests/test_client_dependencies.py
 
       - name: Launch helper tests
         env:
@@ -352,7 +362,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libgtk-4-dev libadwaita-1-dev \
-            at-spi2-core gir1.2-atspi-2.0 python3-gi \
+            at-spi2-core gir1.2-atspi-2.0 python3-gi openbox \
             xvfb dbus-x11
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
@@ -370,36 +380,56 @@ jobs:
 
       # A session bus for the accessibility bus to live on, a display for the
       # window to map into, and then the test drives it by pressing things.
+      # Do not reuse a display while the preceding Xvfb is shutting down.
       - name: Smoke test
         run: |
-          xvfb-run -a --server-args='-screen 0 1280x900x24' \
+          xvfb-run -a --server-num=110 --server-args='-screen 0 1280x900x24' \
             dbus-run-session -- python3 tests/gui_smoke.py
 
       - name: Move location and automatic space checks (offline)
         run: |
-          xvfb-run -a --server-args='-screen 0 1280x900x24' \
+          xvfb-run -a --server-num=111 --server-args='-screen 0 1280x900x24' \
             dbus-run-session -- python3 tests/gui_move.py --binary target/debug/ferestre-gui
 
       - name: Separate Store and Player accounts (offline)
         run: |
-          xvfb-run -a --server-args='-screen 0 1280x900x24' \
+          xvfb-run -a --server-num=112 --server-args='-screen 0 1280x900x24' \
             dbus-run-session -- python3 tests/gui_accounts.py
 
       # The client is a script that advertises presence-v1 and plays back
       # runner events, so this signs nothing in and posts nothing.
       - name: Online status while a game runs (offline)
         run: |
-          xvfb-run -a --server-args='-screen 0 1280x900x24' \
+          xvfb-run -a --server-num=113 --server-args='-screen 0 1280x900x24' \
             dbus-run-session -- python3 tests/gui_presence.py
 
       # PackageKit is a fake on a private bus standing in for the system one,
       # and the missing library is a fixture, so this installs nothing.
       - name: Secure application and runtime updater (offline)
         run: |
-          xvfb-run -a --server-args='-screen 0 1280x900x24' \
+          xvfb-run -a --server-num=114 --server-args='-screen 0 1280x900x24' \
             dbus-run-session -- python3 tests/gui_updater.py
+
+      - name: Game Pass artwork and handheld fullscreen (loopback)
+        run: |
+          xvfb-run -a --server-num=115 --server-args='-screen 0 1280x720x24' \
+            dbus-run-session -- python3 tests/gui_artwork.py --fullscreen
+      - name: Controller adapter, button glyphs and focus indicator (offline)
+        run: |
+          xvfb-run -a --server-num=116 --server-args='-screen 0 1280x900x24' \
+            dbus-run-session -- python3 tests/gui_controller.py
+
+      - name: Game launch loading, running state and background Home (offline)
+        run: |
+          xvfb-run -a --server-num=117 --server-args='-screen 0 1280x900x24' \
+            dbus-run-session -- python3 tests/gui_launch.py
+
+      - name: Persistent install queue and pause controls (offline)
+        run: |
+          xvfb-run -a --server-num=118 --server-args='-screen 0 1280x900x24' \
+            dbus-run-session -- python3 tests/gui_transfers.py
 
       - name: Missing WebKitGTK offered for install (offline)
         run: |
-          xvfb-run -a --server-args='-screen 0 1280x900x24' \
+          xvfb-run -a --server-num=119 --server-args='-screen 0 1280x900x24' \
             dbus-run-session -- python3 tests/gui_client_deps.py

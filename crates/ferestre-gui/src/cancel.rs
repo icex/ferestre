@@ -9,6 +9,7 @@ pub struct DownloadControl(Arc<Mutex<State>>);
 #[derive(Default)]
 struct State {
     requested: bool,
+    paused: bool,
     pipe: Option<ChildStdin>,
 }
 
@@ -25,6 +26,18 @@ impl DownloadControl {
         }
     }
 
+    pub fn pause(&self, paused: bool) {
+        let mut state = self.0.lock().unwrap();
+        state.paused = paused;
+        if let Some(pipe) = state.pipe.as_mut() {
+            let _ = pipe.write_all(if paused { b"p" } else { b"r" });
+            let _ = pipe.flush();
+        }
+    }
+    pub fn paused(&self) -> bool {
+        self.0.lock().unwrap().paused
+    }
+
     pub fn spawn(&self, command: &mut Command) -> std::io::Result<Child> {
         let mut child = command
             .env("FERESTRE_GUI_CANCELLATION", "1")
@@ -32,6 +45,12 @@ impl DownloadControl {
             .spawn()?;
         let mut state = self.0.lock().unwrap();
         state.pipe = child.stdin.take();
+        if state.paused {
+            if let Some(pipe) = state.pipe.as_mut() {
+                let _ = pipe.write_all(b"p");
+                let _ = pipe.flush();
+            }
+        }
         if state.requested {
             if let Some(mut pipe) = state.pipe.take() {
                 let _ = pipe.write_all(b"x");

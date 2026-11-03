@@ -116,7 +116,7 @@ def describe(node):
         name = node.get_name() or ""
     except GLib.GError:
         return "<gone>"
-    return f"{role}:{name!r}"
+    return f"{role}:{name!r} description={node.get_description()!r}"
 
 
 def texts(root):
@@ -129,6 +129,9 @@ def texts(root):
             continue
         if name:
             found.append(name)
+        description=node.get_description() or ""
+        if " · " in description:
+            found.append(description)
     return found
 
 
@@ -376,6 +379,28 @@ def select_in_list(root, name, what=None):
     selectable, on its parent list -- so a sidebar is driven by selecting,
     not by pressing.
     """
+    name={"Library":"My Library","Runtime":"Settings"}.get(name,name)
+    def settled(result):
+        section = "Runtime" if name == "Settings" else name
+        wait_for(root, lambda r: find_all(r, name=section + " page"),
+                 section + " page to replace the previous content", time.monotonic() + TIMEOUT)
+        return result
+    if name in ("Installed", "Updates", "Downloads"):
+        select_in_list(root, "My Library")
+        until = time.monotonic() + TIMEOUT
+        while True:
+            try:
+                click_named(root, "Install queue" if name == "Downloads" else name)
+                wait_for(root, lambda r: find_all(r, name=name + " page"),
+                         name + " page", min(until, time.monotonic() + 2))
+                return
+            except Failure:
+                if time.monotonic() >= until:
+                    raise
+    if name == "Settings":
+        return settled(click_named(root, "Settings"))
+    if name == "My Library" and find_all(root, name="My Library page"):
+        return root
     for node, _ in walk(root):
         if node.get_role_name() != "list":
             continue
@@ -385,8 +410,13 @@ def select_in_list(root, name, what=None):
         for index in range(node.get_child_count()):
             child = node.get_child_at_index(index)
             if child is not None and child.get_name() == name:
+                # A selected Library row can currently display Installed or
+                # Updates. Use the visible sidebar rather than an offscreen
+                # tab, whose action GTK 4.14 may omit from AT-SPI.
+                if name == "My Library":
+                    selection.clear_selection()
                 selection.select_child(index)
-                return child
+                return settled(child)
     dump(root, f"looking for a selectable {name!r}")
     raise Failure(f"no selectable row called {what or name!r}")
 
@@ -401,7 +431,11 @@ def row_button(root, title, label):
     start there: the moment two titles are installable, "the Install button" is
     ambiguous.
     """
-    for button in find_all(root, role="button", name=title):
+    for button in find_all(root, role="button"):
+        if button.get_name() == f"{title} · {label}":
+            return button
+        if button.get_name() != title:
+            continue
         for node, _ in walk(button):
             if node.get_role_name() == "label" and (node.get_name() or "") == label:
                 return button
@@ -459,7 +493,7 @@ def toggle_row_menu(app, frame, title, want_open):
     raise Failure(f"timed out waiting for {title}'s menu to " + ("open" if want_open else "close"))
 
 
-MENU_ITEMS = {"Move location", "Open Store page", "Choose runtime", "Add to Steam", "Edit launch settings", "Remove from disk"}
+MENU_ITEMS = {"Game details", "Move location", "Open Store page", "Choose runtime", "Add to Steam", "Edit launch settings", "Remove from disk"}
 
 
 def row_menu_offers(app, frame, title):
@@ -500,27 +534,16 @@ def check_game_row_layout(root, title, size, action):
         value.set_current_value(max(0, min(target, value.get_maximum_value())))
         time.sleep(0.25)
         button = row_button(root, title, action)
-    row = button.get_parent()
-    while row and row.get_role_name() != "list item":
-        row = row.get_parent()
-    check(row is not None, "the action belongs to a game row", root)
-    title_label = find_all(row, role="label", name=title)[0]
-    details = find_all(row, role="label", name_contains=size)
-    check(len(details) == 1 and details[0].get_name().count(size) == 1,
-          "size appears once, in the details line", row)
-    top, bottom, control, whole = bounds(title_label), bounds(details[0]), bounds(button), bounds(row)
-    check(top.height > 0 and bottom.height > 0 and bottom.y >= top.y + top.height - 1,
-          "details sit below the game title", row)
-    button_center = control.y + control.height / 2
-    title_center = top.y + top.height / 2
-    details_center = bottom.y + bottom.height / 2
-    # Font glyph extents/leading vary with GTK and fonts. The action must sit
-    # between the two text lines, not align with the top or bottom of the row.
-    check(title_center <= button_center <= details_center,
-          f"right-hand actions are centered between both text lines (button={button_center}, title={title_center}, details={details_center}, row={whole.y}/{whole.height})", row)
-    check(control.x >= top.x + top.width, "actions stay to the right of the text", row)
-    check(any(bounds(image).width >= 40 and bounds(image).height >= 40
-              for image in find_all(row, role="image")), "the game icon spans both text lines", row)
+    images=find_all(button,role="image")
+    if any(bounds(image).height>=200 for image in images):
+        title_label=find_all(button,role="label",name=title)[0]
+        top,whole=bounds(title_label),bounds(button)
+        check(whole.width>=140 and whole.height>=300,"cover tiles have a generous touch target",button)
+        check(top.y>=whole.y+200,"the title sits below the cover artwork",button)
+        check(any(bounds(image).width>=120 and bounds(image).height>=200 for image in images),"the card uses large cover art",button)
+    else:
+        # A missing image still produces a usable, labelled tile.
+        check(bounds(button).width>=44 and bounds(button).height>=44,"game action remains touch accessible",button)
 
 
 def dump(root, why):
@@ -1008,10 +1031,11 @@ print(":: done", flush=True)
 
         print("sidebar")
         labels = texts(frame)
-        for section in ("Library", "Installed", "Updates", "Runtime"):
+        for section in ("Home", "Game Pass", "My Library", "Install Queue", "Settings"):
             check(section in labels, f"{section} is in the sidebar", frame)
         check("Not signed in" in labels, "says plainly that nobody is signed in", frame)
 
+        select_in_list(frame,"My Library")
         print("library, with no account")
         # Recipes still show without an account: that is how someone sees a
         # title is supported before buying it.
@@ -1037,6 +1061,8 @@ print(":: done", flush=True)
             frame,
         )
 
+        check(len(find_all(frame, role="button", name="Installed")) == 1,
+              "Library has one navigation row without duplicate Installed filters", frame)
         print("the owned library")
         labels = wait_for(
             frame,
@@ -1368,14 +1394,9 @@ print(":: done", flush=True)
             "the active install immediately shows a disabled Installing.. button",
             frame,
         )
-        for button in find_all(frame, role="button"):
-            if any(node.get_role_name() == "label" and node.get_name() in {"Install", "Update"}
-                   for node, _ in walk(button)):
-                check(
-                    not button.get_state_set().contains(Atspi.StateType.SENSITIVE),
-                    "other games cannot be installed or updated during a download",
-                    frame,
-                )
+        other = row_button(frame, "Forza Horizon 5", "Install")
+        check(other is not None and other.get_state_set().contains(Atspi.StateType.SENSITIVE),
+              "other games can be added to the queue during a download", frame)
         # The three things a progress bar is for. Waited for rather than read
         # once: the rate and the estimate deliberately say nothing until there
         # is enough history to divide by.

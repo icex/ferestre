@@ -22,7 +22,6 @@ use crate::model::Ownership;
 
 /// Icons are drawn at this size and fetched at it: the CDN resizes, so asking
 /// for what will be shown turns a 1 MB download into 17 KB.
-pub const ICON_PX: u32 = 64;
 /// The gamerpic host serves only certain sizes; `account::supported_avatar_size`
 /// is what guarantees this is one of them.
 pub const AVATAR_PX: u32 = 64;
@@ -33,39 +32,39 @@ pub const PER_PAGE: usize = 20;
 /// Which section of the window is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
+    Home,
     Library,
     GamePass,
     Installed,
     Updates,
     Runtime,
+    Downloads,
 }
 
 impl Section {
-    pub const ALL: [Section; 5] = [
-        Section::Library,
-        Section::GamePass,
-        Section::Installed,
-        Section::Updates,
-        Section::Runtime,
-    ];
+    pub const NAV: [Section; 3] = [Section::Home, Section::GamePass, Section::Library];
 
     pub fn title(self) -> &'static str {
         match self {
-            Section::Library => "Library",
+            Section::Home => "Home",
+            Section::Library => "My Library",
             Section::GamePass => "Game Pass",
             Section::Installed => "Installed",
             Section::Updates => "Updates",
             Section::Runtime => "Runtime",
+            Section::Downloads => "Downloads",
         }
     }
 
     pub fn icon(self) -> &'static str {
         match self {
+            Section::Home => "go-home-symbolic",
             Section::Library => "view-grid-symbolic",
             Section::GamePass => "emblem-shared-symbolic",
             Section::Installed => "drive-harddisk-symbolic",
             Section::Updates => "software-update-available-symbolic",
             Section::Runtime => "applications-engineering-symbolic",
+            Section::Downloads => "folder-download-symbolic",
         }
     }
 }
@@ -209,17 +208,9 @@ impl Model {
             .and_then(|dir| Registry::load(&dir.join("capabilities.toml")).ok());
         let runtimes = paths.as_ref().map(runtime::all).unwrap_or_default();
         let runtime = runtimes.first().cloned();
-        let records: BTreeMap<String, Record> = paths
+        let records = paths
             .as_ref()
-            .map(|p| {
-                install::all(p.state_dir())
-                    .into_iter()
-                    // A record for a directory somebody deleted would keep the
-                    // title in Installed and offer it an update.
-                    .filter(|r| !r.is_stale())
-                    .map(|r| (r.product_id.to_ascii_uppercase(), r))
-                    .collect()
-            })
+            .map(|p| recorded_installs(p.state_dir()))
             .unwrap_or_default();
         let records = adopt_existing(paths.as_ref(), &recipes, records);
         let installed_products = paths
@@ -363,7 +354,7 @@ impl Model {
             subscriptions,
             entitlements_checked,
             tiers,
-            section: Section::Library,
+            section: Section::Home,
             query: String::new(),
             page: 0,
             show_unsupported: false,
@@ -960,6 +951,17 @@ fn installed_products(games_dir: &Path) -> BTreeMap<String, PathBuf> {
     found
 }
 
+/// Keep an interrupted update's destination even though it is not playable.
+fn recorded_installs(state: &Path) -> BTreeMap<String, Record> {
+    install::all(state)
+        .into_iter()
+        .filter(|record| {
+            !record.is_stale() || (record.dir.is_dir() && install::is_partial(&record.dir))
+        })
+        .map(|record| (record.product_id.to_ascii_uppercase(), record))
+        .collect()
+}
+
 /// Recipes from each directory, later ones winning, as the launcher layers
 /// them -- a file that cannot be read is skipped and named, rather than
 /// costing every other recipe. One typo used to empty the whole library.
@@ -978,7 +980,7 @@ fn existing_icons(cache: &Cache, catalog: &BTreeMap<String, Product>) -> BTreeMa
         .keys()
         .filter_map(|key| {
             cache
-                .image_path(key, ICON_PX)
+                .cover_path(key)
                 .filter(|path| path.is_file())
                 .map(|path| (key.clone(), path))
         })
@@ -1125,6 +1127,25 @@ mod tests {
             installed_at: None,
             package_version: None,
         }
+    }
+
+    #[test]
+    fn a_paused_update_retains_its_recorded_custom_destination() {
+        let root = Scratch::new("interrupted-custom-update");
+        let game = root.0.join("custom/elsewhere");
+        installed(&game, "9ZZTESTGAME1");
+        write(&game.join(install::UPDATE_INCOMPLETE), "pending update");
+        let state = root.0.join("state");
+        write(
+            &state.join("installed/9ZZTESTGAME1.json"),
+            &serde_json::to_string(&record("9ZZTESTGAME1", &game)).unwrap(),
+        );
+        let mut model = model_at(&root.0);
+        model.recipes = vec![recipe("9ZZTESTGAME1", None)];
+        model.records = recorded_installs(&state);
+        assert_eq!(model.game_dir(&model.recipes[0]), Some(game));
+        assert!(!model.is_installed(&model.recipes[0]));
+        assert!(model.incomplete("9ZZTESTGAME1"));
     }
 
     /// The package header and manifest arrive early in a download. With the

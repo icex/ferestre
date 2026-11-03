@@ -160,12 +160,72 @@ pub fn duration(d: Duration) -> String {
     }
 }
 
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Snapshot {
+    pub schema: u32,
+    pub sequence: u64,
+    pub phase: String,
+    pub completed_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub paused: bool,
+    pub can_pause: bool,
+    #[serde(default)]
+    pub network_bytes: Option<u64>,
+    #[serde(default)]
+    pub reused_bytes: Option<u64>,
+}
+pub fn parse_snapshot(line: &str) -> Option<Snapshot> {
+    if line.len() > 4096 {
+        return None;
+    }
+    let snapshot: Snapshot = serde_json::from_str(line.strip_prefix("FERESTRE_PROGRESS ")?).ok()?;
+    (snapshot.schema == 1
+        && [
+            "metadata",
+            "downloading",
+            "finalizing",
+            "complete",
+            "failed",
+            "",
+        ]
+        .contains(&snapshot.phase.as_str()))
+    .then_some(snapshot)
+}
+
+#[derive(Default)]
+pub struct Reader {
+    sequence: Option<u64>,
+}
+pub enum Update {
+    Structured(Snapshot),
+    Legacy(u64, u64),
+}
+impl Reader {
+    pub fn read(&mut self, line: &str) -> Option<Update> {
+        if let Some(snapshot) = parse_snapshot(line) {
+            if self.sequence.is_some_and(|n| snapshot.sequence <= n) {
+                return None;
+            }
+            self.sequence = Some(snapshot.sequence);
+            return Some(Update::Structured(snapshot));
+        }
+        if self.sequence.is_some() {
+            return None;
+        }
+        parse_line(line).map(|(done, total)| Update::Legacy(done, total))
+    }
+}
+
 /// One `{"progress":{"done":N,"total":M}}` line from the client.
 ///
 /// Anything else on that stream is not an error and not progress: the client
 /// prints its own messages there, and a line that is not this shape is simply
 /// not an update.
 pub fn parse_line(line: &str) -> Option<(u64, u64)> {
+    if let Some(snapshot) = parse_snapshot(line.trim()) {
+        return Some((snapshot.completed_bytes, snapshot.total_bytes.unwrap_or(0)));
+    }
     let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
     let progress = value.get("progress")?;
     Some((
@@ -177,6 +237,31 @@ pub fn parse_line(line: &str) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structured_progress_rejects_old_sequences_and_legacy_overwrites() {
+        let mut reader = Reader::default();
+        assert!(matches!(
+            reader.read(r#"{"progress":{"done":10,"total":100}}"#),
+            Some(Update::Legacy(10, 100))
+        ));
+        let line = |sequence, done| {
+            format!("FERESTRE_PROGRESS {{\"schema\":1,\"sequence\":{sequence},\"phase\":\"downloading\",\"completedBytes\":{done},\"totalBytes\":100,\"paused\":false,\"canPause\":true}}")
+        };
+        assert!(matches!(
+            reader.read(&line(8, 50)),
+            Some(Update::Structured(_))
+        ));
+        assert!(reader.read(&line(7, 20)).is_none());
+        assert!(reader.read(&line(8, 40)).is_none());
+        assert!(reader
+            .read(r#"{"progress":{"done":1,"total":100}}"#)
+            .is_none());
+        assert!(matches!(
+            reader.read(&line(9, 60)),
+            Some(Update::Structured(_))
+        ));
+    }
 
     fn at(base: Instant, secs: u64) -> Instant {
         base + Duration::from_secs(secs)

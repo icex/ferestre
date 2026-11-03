@@ -1,0 +1,1935 @@
+diff --git a/crates/msixvc/src/xvd.rs b/crates/msixvc/src/xvd.rs
+index 0e16d25..6ce7946 100644
+--- a/crates/msixvc/src/xvd.rs
++++ b/crates/msixvc/src/xvd.rs
+@@ -749,12 +749,17 @@ async fn open_range(
+             .and_then(|(s, _)| s.parse::<u64>().ok())
+             == Some(start);
+         if !starts_right {
++            eprintln!("FERESTRE_TRANSFER_DIAGNOSTIC_V1 transfer-range 0");
+             return Err(RangeError::Retry(format!(
+                 "the server answered a different range than bytes={start}-{end}"
+             )));
+         }
+         return Ok(Box::pin(response.bytes_stream()));
+     }
++    eprintln!(
++        "FERESTRE_TRANSFER_DIAGNOSTIC_V1 transfer-status {}",
++        status.as_u16()
++    );
+     let message = format!("the server answered {status} for bytes={start}-{end}");
+     if status.is_server_error()
+         || status == StatusCode::REQUEST_TIMEOUT
+@@ -1337,6 +1342,54 @@ impl XvdFile {
+         Ok(sfile.offset / PAGE_SIZE as u64)
+     }
+ 
++    /// A stage belongs to the exact signed container and authenticated tree.
++    pub fn transfer_stamp(&self) -> [u8; 32] {
++        let mut hash = Sha256::new();
++        hash.update(self.header.signature);
++        hash.update(self.header.top_hash_block_hash);
++        hash.finalize().into()
++    }
++
++    /// Reconstruct the package's stored page from an installed page. A local
++    /// candidate is useful only if the new container's authenticated tree
++    /// accepts it with the new licence key and page encryption parameters.
++    pub fn accepts_installed_page(
++        &self,
++        file: &SegmentFile,
++        index: u64,
++        key: [u8; 32],
++        installed: &[u8],
++    ) -> bool {
++        if !self.verified
++            || installed.len() != PAGE_SIZE
++            || index >= file.length.div_ceil(PAGE_SIZE as u64)
++        {
++            return false;
++        }
++        let Ok(first) = Self::first_page_of(file) else {
++            return false;
++        };
++        let absolute = first + index;
++        let mut encoded = [0u8; PAGE_SIZE];
++        encoded.copy_from_slice(installed);
++        if !file.keep_encrypted {
++            if let Some((_, tweak, tweak_cipher, _)) = self.file_crypto(file, key, true) {
++                let Some(unit) = self.hashes.unit(absolute) else {
++                    return false;
++                };
++                let data_key: [u8; 16] = key[16..].try_into().unwrap();
++                let cipher = Aes128Enc::new((&data_key).into());
++                crate::crypt::encrypt_page_xts(
++                    &mut encoded,
++                    tweak.with_data_unit(unit),
++                    &tweak_cipher,
++                    &cipher,
++                );
++            }
++        }
++        self.hashes.check(absolute, &encoded).is_ok()
++    }
++
+     pub async fn download_file_http<Writer, Progress>(
+         &self,
+         client: &reqwest::Client,
+@@ -1417,6 +1470,7 @@ impl XvdFile {
+             let Some(s) = stream.as_mut() else {
+                 if failures > 0 {
+                     if last_good.elapsed() >= policy.give_up_after {
++                        eprintln!("FERESTRE_TRANSFER_DIAGNOSTIC_V1 transfer-timeout 0");
+                         return Err(Box::new(Error::new(
+                             ErrorKind::TimedOut,
+                             format!(
+@@ -1484,6 +1538,7 @@ impl XvdFile {
+                         _ => 1,
+                     };
+                     if count >= policy.bad_page_limit {
++                        eprintln!("FERESTRE_TRANSFER_DIAGNOSTIC_V1 transfer-integrity 0");
+                         return Err(Box::new(Error::new(
+                             ErrorKind::InvalidData,
+                             format!("{err}, {count} times over; giving up on this file"),
+@@ -1764,6 +1819,66 @@ mod tests {
+         XvdFile::parse_verified(Cursor::new(bytes.to_vec())).await
+     }
+ 
++    #[tokio::test]
++    async fn installed_pages_are_accepted_only_by_the_authenticated_target_tree() {
++        use super::page_digest;
++        let package = package();
++        let mut xvd = parse_verified(&package.bytes).await.unwrap();
++        let (mut file, bytes) = sample_file(&package);
++        assert!(xvd.accepts_installed_page(&file, 0, [0; 32], &bytes[..PAGE_SIZE]));
++        let mut changed = bytes[..PAGE_SIZE].to_vec();
++        changed[100] ^= 1;
++        // A forged comparison hint cannot override the authenticated tree.
++        file.data_hashs = vec![page_digest(&changed)];
++        assert!(!xvd.accepts_installed_page(&file, 0, [0; 32], &changed));
++        assert!(!xvd.accepts_installed_page(&file, u64::MAX, [0; 32], &bytes[..PAGE_SIZE]));
++        assert!(!xvd.accepts_installed_page(&file, 0, [0; 32], &bytes[..100]));
++        xvd.verified = false;
++        assert!(!xvd.accepts_installed_page(&file, 0, [0; 32], &bytes[..PAGE_SIZE]));
++    }
++
++    #[tokio::test]
++    async fn plaintext_reuse_uses_the_new_key_region_and_data_unit() {
++        use super::{Aes128Enc, EncryptedSectionInfo, TweakGenerator, XvcRegionId, page_digest};
++        use aes::cipher::KeyInit;
++        let package = package();
++        let mut xvd = parse_verified(&package.bytes).await.unwrap();
++        let (file, bytes) = sample_file(&package);
++        let clear = &bytes[..PAGE_SIZE];
++        let absolute = file.offset / PAGE_SIZE as u64;
++        let index = xvd.hashes.index(absolute).unwrap();
++        let region = XvcRegionId::Other(17);
++        let content = uuid::Uuid::from_bytes([0x39; 16]);
++        let key = [0x81; 32];
++        let tweak_key: [u8; 16] = key[..16].try_into().unwrap();
++        let data_key: [u8; 16] = key[16..].try_into().unwrap();
++        let mut encrypted = [0; PAGE_SIZE];
++        encrypted.copy_from_slice(clear);
++        crate::crypt::encrypt_page_xts(
++            &mut encrypted,
++            TweakGenerator::new(region, content).with_data_unit(400),
++            &Aes128Enc::new((&tweak_key).into()),
++            &Aes128Enc::new((&data_key).into()),
++        );
++        xvd.encrypted_section_infos = vec![EncryptedSectionInfo {
++            section_offset: file.offset,
++            section_length: file.length,
++            header_id: region,
++            vduid: content,
++            first_segment_index: 0,
++        }];
++        // Isolate page reconstruction from the separately tested tree parser.
++        xvd.hashes.units[index] = 400;
++        xvd.hashes.hashes[index] = page_digest(&encrypted);
++        assert!(xvd.accepts_installed_page(&file, 0, key, clear));
++        assert!(!xvd.accepts_installed_page(&file, 0, [0x82; 32], clear));
++        xvd.hashes.units[index] = 401;
++        assert!(!xvd.accepts_installed_page(&file, 0, key, clear));
++        xvd.hashes.units[index] = 400;
++        xvd.encrypted_section_infos[0].header_id = XvcRegionId::Other(18);
++        assert!(!xvd.accepts_installed_page(&file, 0, key, clear));
++    }
++
+     #[test]
+     fn package_names_cannot_leave_the_install_folder() {
+         assert_eq!(
+diff --git a/crates/xodus-cli/src/commands/run.rs b/crates/xodus-cli/src/commands/run.rs
+index 60286fa..53567c6 100644
+--- a/crates/xodus-cli/src/commands/run.rs
++++ b/crates/xodus-cli/src/commands/run.rs
+@@ -145,6 +145,14 @@ pub async fn run(
+     exe: Option<String>,
+     market: Option<String>,
+ ) -> ExitCode {
++    let _installation = match crate::download_state::player(std::path::Path::new(&source)) {
++        Ok(guard) => guard,
++        Err(error) => {
++            eprintln!("{error}");
++            return ExitCode::FAILURE;
++        }
++    };
++
+     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
+ 
+     let out: &Path = Path::new(&source);
+diff --git a/crates/xodus-cli/src/commands/streaming.rs b/crates/xodus-cli/src/commands/streaming.rs
+index 582633f..e973b2a 100644
+--- a/crates/xodus-cli/src/commands/streaming.rs
++++ b/crates/xodus-cli/src/commands/streaming.rs
+@@ -3,10 +3,7 @@ use std::io::Write;
+ use std::path::Path;
+ use std::process::ExitCode;
+ use std::time::{Duration, Instant};
+-use std::vec;
+ 
+-use fs2::available_space;
+-use futures_util::{TryStreamExt, stream};
+ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+ use msixvc::layout::PAGE_SIZE;
+ use msixvc::signature::XvdSigningKey;
+@@ -16,7 +13,7 @@ use msixvc::xvd::{
+     package_relative_path,
+ };
+ use tokio::fs::File;
+-use tokio::io::{AsyncRead, AsyncSeek, AsyncWriteExt};
++use tokio::io::{AsyncRead, AsyncSeek};
+ use tokio::sync::mpsc::{Receiver, Sender};
+ use uuid::Uuid;
+ use xodus::tokens::TokenManager;
+@@ -26,10 +23,7 @@ use crate::package::{
+     HeaderCheck, get_content_id, get_packages, header_anchor, package_url, unanchored_note,
+ };
+ 
+-struct Job {
+-    name: String,
+-    content: SegmentFile,
+-}
++type Job = crate::download_plan::Entry;
+ 
+ /// What the package header is held to before anything in it is believed.
+ #[derive(Default)]
+@@ -57,15 +51,14 @@ impl HeaderTrust {
+ /// none and `XODUS_REQUIRE_SIGNED_PACKAGE=1`.
+ async fn signing_key(fetch: crate::xvd_key::Fetch) -> Result<Option<XvdSigningKey>, ExitCode> {
+     crate::xvd_key::for_install(fetch).await.map_err(|err| {
++        crate::download_session::diagnostic("metadata-invalid", 0);
+         eprintln!("{err}");
+         ExitCode::FAILURE
+     })
+ }
+ 
+ enum ProgressEvent {
+-    Started { id: usize, name: String, total: u64 },
+-    Advanced { id: usize, delta: u64 },
+-    Finished { id: usize },
++    Advanced { delta: u64 },
+     UpdateRemaining { name: String, total: u64 },
+     UpdateStatus { name: String },
+ }
+@@ -236,7 +229,6 @@ pub async fn run(
+             Some(move |c: u64, _| {
+                 if progress_tx
+                     .try_send(ProgressEvent::Advanced {
+-                        id: usize::MAX,
+                         delta: c.saturating_sub(pos),
+                     })
+                     .is_ok()
+@@ -249,6 +241,7 @@ pub async fn run(
+         {
+             Ok(http_file) => http_file,
+             Err(err) => {
++                crate::download_session::diagnostic("metadata-network", 0);
+                 eprintln!("could not start the download from {url}: {err}");
+                 return ExitCode::FAILURE;
+             }
+@@ -362,30 +355,11 @@ where
+         ));
+ 
+         total_progess.set_message("Initializing");
+-        let mut bars: HashMap<usize, ProgressBar> = HashMap::new();
+         let mut json = JsonProgress::from_env();
+ 
+         while let Some(event) = rx.recv().await {
+             match event {
+-                ProgressEvent::Started { id, name, total } => {
+-                    let cur_progess = multi_progress.add(ProgressBar::new(total).with_style(
+-                        ProgressStyle::with_template("{msg:30!} {bytes:>12}/{total_bytes:>12} {bytes_per_sec:>12} [{bar:40.cyan/blue}] {percent:>3}%").unwrap()
+-                        .progress_chars("#>-")
+-                    ));
+-                    cur_progess.set_message(name);
+-                    bars.insert(id, cur_progess);
+-                }
+-                ProgressEvent::Advanced { id, delta } => {
+-                    if let Some(bar) = bars.get(&id) {
+-                        bar.inc(delta);
+-                    }
+-                    total_progess.inc(delta);
+-                }
+-                ProgressEvent::Finished { id } => {
+-                    if let Some(bar) = bars.remove(&id) {
+-                        bar.finish_and_clear();
+-                    }
+-                }
++                ProgressEvent::Advanced { delta } => total_progess.inc(delta),
+                 ProgressEvent::UpdateRemaining { name, total } => {
+                     total_progess.set_message(name);
+                     total_progess.set_length(total_progess.position() + total);
+@@ -447,6 +421,7 @@ fn stopped<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> String + '_ {
+ /// Counted in characters, not bytes. Slicing at a byte offset panicked on a
+ /// name with anything but ASCII near its end -- deterministically, so a title
+ /// with such a file could never be installed.
++#[cfg(test)]
+ fn shown_name(path: &str) -> String {
+     const WIDTH: usize = 30;
+     if path.chars().count() <= WIDTH {
+@@ -509,6 +484,7 @@ where
+ {
+     let parsed = XvdFile::parse_checked(remote_file, trust.checks()).await;
+     parsed.map_err(|err| {
++        crate::download_session::diagnostic("metadata-invalid", 0);
+         if let Some(mismatch) = err.downcast_ref::<TopHashMismatch>() {
+             format!(
+                 "refusing this download: {mismatch}, which the package service gave as its \
+@@ -603,7 +579,17 @@ where
+ 
+     std::fs::create_dir_all(out).map_err(|e| format!("could not create {}: {e}", out.display()))?;
+ 
++    let _installation = crate::download_state::writer(out).map_err(|e| {
++        crate::download_session::diagnostic("installation-busy", 0);
++        e.to_string()
++    })?;
++    let recovering = crate::download_state::incomplete(out).map_err(|e| e.to_string())?;
+     let cache_path = out.join(".xodus-streaming-tmp.msixvc");
++    if std::fs::symlink_metadata(&cache_path)
++        .is_ok_and(|m| !m.is_file() || m.file_type().is_symlink())
++    {
++        return Err("Refusing an unsafe package metadata cache".into());
++    }
+     let final_path = out.join(".xodus-streaming.msixvc");
+ 
+     let mut remote_file = streaming::PrefixCacheFile::new(reader, l, cache_path.clone())
+@@ -671,7 +657,10 @@ where
+         market.unwrap_or("neutral".to_string()),
+     )
+     .await;
+-    let (key, game_splicense) = license.map_err(|err| err.to_string())?;
++    let (key, game_splicense) = license.map_err(|err| {
++        crate::download_session::diagnostic("license", 0);
++        err.to_string()
++    })?;
+     if game_splicense.content_keys.len() != 1 {
+         return Err(format!(
+             "unexpected number of content keys {}",
+@@ -687,39 +676,14 @@ where
+         .map_err(|e| format!("could not unpack the content key: {e}"))?;
+ 
+     let jobs: Vec<Job> = rfiles
+-        .iter()
+-        .filter(|(k, v1)| needs_download(out, k, v1, lfiles.get(*k)))
+-        .map(|(n, v)| Job {
+-            name: n.clone(),
+-            content: SegmentFile {
+-                offset: v.offset,
+-                length: v.length,
+-                data_hashs: vec![],
+-                keep_encrypted: v.keep_encrypted,
+-            },
++        .into_iter()
++        .filter(|(name, content)| {
++            recovering || needs_download(out, name, content, lfiles.get(name))
+         })
++        .map(|(name, content)| Job { name, content })
+         .collect();
+     let total_size: u64 = jobs.iter().map(|job| job.content.length).sum();
+ 
+-    let required_free_space = total_size;
+-    let available_free_space = available_space(out).map_err(|err| {
+-        format!(
+-            "failed to determine available space for {}: {}",
+-            out.display(),
+-            err
+-        )
+-    })?;
+-
+-    if available_free_space < required_free_space {
+-        return Err(format!(
+-            "not enough free disk space on {}: need {} bytes, have {} bytes (files: {})",
+-            out.display(),
+-            required_free_space,
+-            available_free_space,
+-            total_size
+-        ));
+-    }
+-
+     tx.send(ProgressEvent::UpdateRemaining {
+         name: "Downloading".to_owned(),
+         total: total_size,
+@@ -730,52 +694,22 @@ where
+     // Stops at the first file that fails, and that failure is the result. The
+     // cache is not committed unless every file arrived, so the next run still
+     // sees the old record and fetches whatever this one did not finish.
+-    fetch_files(client, &remote_xvd, jobs, out, url, *full_key, parallel, tx).await?;
+-
+-    commit(out, &cache_path, &final_path)
+-}
+-
+-/// A file being written under a temporary name beside the one it is for, and
+-/// removed when dropped unless it was put in place. The first file that fails
+-/// drops every other job mid-write; writing over the real name would leave
+-/// those files half written -- for an update, the good copies they were
+-/// replacing truncated -- until a later run noticed.
+-struct PartFile {
+-    path: std::path::PathBuf,
+-    armed: bool,
+-}
+-
+-impl PartFile {
+-    /// Create (or empty) the temporary file for `target`. Opened here rather
+-    /// than through tokio, so that once this returns the guard owns the file:
+-    /// an open still running on a blocking thread when the job is dropped
+-    /// would create it after the guard had removed it.
+-    fn create(target: &Path, id: usize) -> Result<(Self, File), String> {
+-        let path = target.with_file_name(format!(".xodus-part-{id}"));
+-        let file = std::fs::OpenOptions::new()
+-            .create(true)
+-            .write(true)
+-            .truncate(true)
+-            .open(&path)
+-            .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+-        Ok((Self { path, armed: true }, File::from_std(file)))
+-    }
+-
+-    /// Rename the finished file over `target`.
+-    fn put_in_place(mut self, target: &Path) -> Result<(), String> {
+-        std::fs::rename(&self.path, target)
+-            .map_err(|e| format!("could not write {}: {e}", target.display()))?;
+-        self.armed = false;
+-        Ok(())
+-    }
+-}
+-
+-impl Drop for PartFile {
+-    fn drop(&mut self) {
+-        if self.armed {
+-            let _ = std::fs::remove_file(&self.path);
+-        }
+-    }
++    let session = fetch_files_with_old(
++        client,
++        &remote_xvd,
++        jobs,
++        &lfiles,
++        out,
++        url,
++        *full_key,
++        parallel,
++        tx,
++    )
++    .await?;
++    let committed = commit(out, &cache_path, &final_path)
++        .and_then(|()| crate::download_state::finish(out).map_err(|e| e.to_string()));
++    session.finish(committed.is_ok());
++    committed
+ }
+ 
+ /// Fetch every file in `jobs` into `out`, `parallel` at a time, from `url`
+@@ -785,6 +719,7 @@ impl Drop for PartFile {
+ /// written under a temporary name and renamed into place only once all of it
+ /// is written, so neither the file that failed nor one stopped because of it
+ /// is left half written, and a file being replaced keeps its old contents.
++#[cfg(test)]
+ #[allow(clippy::too_many_arguments)]
+ async fn fetch_files(
+     client: &reqwest::Client,
+@@ -796,102 +731,47 @@ async fn fetch_files(
+     parallel: Option<usize>,
+     tx: &Sender<ProgressEvent>,
+ ) -> Result<(), String> {
+-    stream::iter(jobs.into_iter().enumerate().map(Ok::<_, String>))
+-        .try_for_each_concurrent(parallel.unwrap_or(4), |(id, job)| {
+-            let tx = tx.clone();
+-            let client = client.clone();
+-            async move {
+-                let relative = package_relative_path(&job.name)
+-                    .map_err(|e| format!("refusing to install this package: {e}"))?;
+-                let target_file = out.join(relative);
+-                if let Some(folder) = target_file.parent() {
+-                    std::fs::create_dir_all(folder)
+-                        .map_err(|e| format!("could not create {}: {e}", folder.display()))?;
+-                }
+-                let (part, mut fout) = PartFile::create(&target_file, id)?;
+-                let mut lp = 0;
+-
+-                let progress = |pos: u64, _| {
+-                    if tx
+-                        .try_send(ProgressEvent::Advanced {
+-                            id,
+-                            delta: pos.saturating_sub(lp),
+-                        })
+-                        .is_ok()
+-                    {
+-                        lp = pos;
+-                    }
+-                };
+-                tx.send(ProgressEvent::Started {
+-                    id,
+-                    name: shown_name(&job.name),
+-                    total: job.content.length,
+-                })
+-                .await
+-                .ok();
+-
+-                let result = if let Some(fpath) = url.strip_prefix("file://") {
+-                    match File::open(&fpath).await {
+-                        Err(err) => Err(format!("could not open {fpath}: {err}")),
+-                        // A local container is often a *prefix* of the
+-                        // package -- the streaming install keeps only what it
+-                        // read. Extracting from one therefore runs off the end
+-                        // partway through, and `early eof` arriving as a panic
+-                        // reads as a bug in the extractor rather than as "this
+-                        // container does not go that far".
+-                        Ok(mut i) => xvd
+-                            .extract_file(&mut i, &mut fout, &job.content, full_key, progress)
+-                            .await
+-                            .map_err(|err| {
+-                                format!(
+-                                    "{}: {err}\n  {fpath} does not contain this file. A container \
+-                                     left by a streaming install holds only the part of the \
+-                                     package that was read; extracting the whole title needs \
+-                                     the package, not the cache.",
+-                                    job.name
+-                                )
+-                            }),
+-                    }
+-                } else {
+-                    xvd.download_file_http(
+-                        &client,
+-                        url,
+-                        &mut fout,
+-                        &job.content,
+-                        full_key,
+-                        progress,
+-                    )
+-                    .await
+-                    .map_err(|err| format!("{}: {err}", job.name))
+-                };
+-                // tokio hands writes to another thread; an error from the last
+-                // of them (a full disk, say) only shows up here.
+-                let result = match result {
+-                    Ok(()) => fout
+-                        .flush()
+-                        .await
+-                        .map_err(|e| format!("could not write {}: {e}", target_file.display())),
+-                    Err(err) => Err(err),
+-                };
+-                #[cfg(not(target_os = "linux"))]
+-                let result = match result {
+-                    Ok(()) => fout
+-                        .sync_all()
+-                        .await
+-                        .map_err(|e| format!("could not write {}: {e}", target_file.display())),
+-                    Err(err) => Err(err),
+-                };
+-                // Half a file is not left looking like a file: `part` removes
+-                // it on an error, and when this job is dropped because
+-                // another one failed.
+-                result?;
+-                drop(fout);
+-                part.put_in_place(&target_file)?;
+-                tx.send(ProgressEvent::Finished { id }).await.ok();
+-                Ok(())
+-            }
+-        })
+-        .await
++    fetch_files_with_old(
++        client,
++        xvd,
++        jobs,
++        &HashMap::new(),
++        out,
++        url,
++        full_key,
++        parallel,
++        tx,
++    )
++    .await
++    .map(|_| ())
++}
++
++#[allow(clippy::too_many_arguments)]
++async fn fetch_files_with_old(
++    client: &reqwest::Client,
++    xvd: &XvdFile,
++    jobs: Vec<Job>,
++    old: &HashMap<String, SegmentFile>,
++    out: &Path,
++    url: &str,
++    key: [u8; 32],
++    parallel: Option<usize>,
++    tx: &Sender<ProgressEvent>,
++) -> Result<crate::download_session::Session, String> {
++    crate::download_plan::execute(
++        client,
++        xvd,
++        jobs,
++        old,
++        out,
++        url,
++        key,
++        parallel.unwrap_or(4),
++        |delta| {
++            let _ = tx.try_send(ProgressEvent::Advanced { delta });
++        },
++    )
++    .await
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/xodus-cli/src/download_plan.rs b/crates/xodus-cli/src/download_plan.rs
+new file mode 100644
+index 0000000..fe14622
+--- /dev/null
++++ b/crates/xodus-cli/src/download_plan.rs
+@@ -0,0 +1,457 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Copyright (C) 2026 Ferestre contributors.
++//! Rebuild files in bounded windows, committing only complete verified output.
++use crate::{
++    download_session::{Session, diagnostic},
++    download_state,
++};
++use futures_util::{StreamExt, stream};
++use msixvc::{
++    layout::PAGE_SIZE,
++    xvd::{SegmentFile, XvdFile},
++};
++use sha2::{Digest, Sha256};
++use std::{
++    collections::HashMap,
++    fs::{self, File, OpenOptions},
++    io,
++    ops::Range,
++    os::unix::fs::{FileExt, OpenOptionsExt},
++    path::Path,
++};
++
++const WINDOW: usize = 8 * 1024 * 1024;
++const REQUEST_PAGES: usize = 512;
++const INDEX_LIMIT: usize = 262144;
++pub struct Entry {
++    pub name: String,
++    pub content: SegmentFile,
++}
++
++pub fn stored_size(file: &SegmentFile) -> io::Result<u64> {
++    if file.keep_encrypted {
++        file.length
++            .checked_add(PAGE_SIZE as u64 - 1)
++            .map(|n| n / PAGE_SIZE as u64 * PAGE_SIZE as u64)
++            .ok_or_else(|| io::Error::other("File size exceeds the supported range"))
++    } else {
++        Ok(file.length)
++    }
++}
++fn fingerprint(package: [u8; 32], file: &SegmentFile) -> Vec<u8> {
++    let mut hash = Sha256::new();
++    hash.update(package);
++    hash.update(file.offset.to_le_bytes());
++    hash.update(file.length.to_le_bytes());
++    hash.update([u8::from(file.keep_encrypted)]);
++    for value in &file.data_hashs {
++        hash.update(value);
++    }
++    hash.finalize().to_vec()
++}
++fn read_only(path: &Path) -> io::Result<Option<File>> {
++    match OpenOptions::new()
++        .read(true)
++        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
++        .open(path)
++    {
++        Ok(file) if file.metadata()?.is_file() => Ok(Some(file)),
++        Ok(_) => Err(io::Error::other("Local reuse source is not a regular file")),
++        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
++        Err(e) => Err(e),
++    }
++}
++/// Recheck every complete stored page; a checkpoint is never an assertion that
++/// bytes are authentic. A partial final plaintext page is fetched again.
++fn verified_prefix(
++    file: &File,
++    limit: u64,
++    mut accepts: impl FnMut(u64, &[u8]) -> bool,
++) -> io::Result<u64> {
++    let limit = limit / PAGE_SIZE as u64 * PAGE_SIZE as u64;
++    let mut offset = 0;
++    let mut buffer = vec![0u8; WINDOW];
++    while offset < limit {
++        let bytes = (limit - offset).min(WINDOW as u64) as usize;
++        file.read_exact_at(&mut buffer[..bytes], offset)?;
++        for page in buffer[..bytes].chunks_exact(PAGE_SIZE) {
++            if !accepts(offset / PAGE_SIZE as u64, page) {
++                return Ok(offset);
++            }
++            offset += PAGE_SIZE as u64;
++        }
++    }
++    Ok(offset)
++}
++/// Short unchanged islands are cheaper to fetch inside one request. Long
++/// unchanged spans stay local; every range remains within a fixed window.
++fn gaps(valid: &[bool]) -> Vec<Range<usize>> {
++    let mut spans: Vec<Range<usize>> = vec![];
++    let mut page = 0;
++    while page < valid.len() {
++        if valid[page] {
++            page += 1;
++            continue;
++        }
++        let start = page;
++        while page < valid.len() && !valid[page] {
++            page += 1;
++        }
++        if let Some(previous) = spans.last_mut().filter(|r| start - r.end <= 8) {
++            previous.end = page;
++        } else {
++            spans.push(start..page);
++        }
++    }
++    spans
++        .into_iter()
++        .flat_map(|r| {
++            (r.start..r.end)
++                .step_by(REQUEST_PAGES)
++                .map(move |start| start..(start + REQUEST_PAGES).min(r.end))
++        })
++        .collect()
++}
++fn old_positions(old: Option<&SegmentFile>) -> HashMap<[u8; 20], u64> {
++    let Some(old) = old.filter(|old| old.data_hashs.len() <= INDEX_LIMIT) else {
++        return HashMap::new();
++    };
++    let mut positions = HashMap::new();
++    for (index, digest) in old.data_hashs.iter().enumerate() {
++        positions
++            .entry(*digest)
++            .or_insert(index as u64 * PAGE_SIZE as u64);
++    }
++    positions
++}
++fn fill_local(
++    buffer: &mut [u8],
++    offset: u64,
++    source: Option<&File>,
++    current: &SegmentFile,
++    positions: &HashMap<[u8; 20], u64>,
++    mut accepts: impl FnMut(u64, &[u8]) -> bool,
++) -> Vec<bool> {
++    let mut valid = vec![false; buffer.len().div_ceil(PAGE_SIZE)];
++    let Some(source) = source else { return valid };
++    for (local, page) in buffer.chunks_exact_mut(PAGE_SIZE).enumerate() {
++        let absolute = offset / PAGE_SIZE as u64 + local as u64;
++        let at_same_position = absolute * PAGE_SIZE as u64;
++        let relocated = current
++            .data_hashs
++            .get(absolute as usize)
++            .and_then(|digest| positions.get(digest))
++            .copied();
++        for position in [Some(at_same_position), relocated].into_iter().flatten() {
++            if source.read_exact_at(page, position).is_ok() && accepts(absolute, page) {
++                valid[local] = true;
++                break;
++            }
++        }
++    }
++    valid
++}
++
++#[allow(clippy::too_many_arguments)]
++pub async fn execute(
++    client: &reqwest::Client,
++    xvd: &XvdFile,
++    jobs: Vec<Entry>,
++    old: &HashMap<String, SegmentFile>,
++    root: &Path,
++    url: &str,
++    key: [u8; 32],
++    parallel: usize,
++    mut advanced: impl FnMut(u64),
++) -> Result<Session, String> {
++    fs::create_dir_all(root).map_err(|e| e.to_string())?;
++    // Validate the entire plan before replacing the first file.
++    for entry in &jobs {
++        download_state::destination(root, &entry.name)
++            .map_err(|e| format!("refusing to install this package: {e}"))?;
++    }
++    let total = jobs
++        .iter()
++        .try_fold(0u64, |sum, e| -> Result<u64, String> {
++            let size = stored_size(&e.content).map_err(|e| e.to_string())?;
++            e.content
++                .offset
++                .checked_add(size)
++                .ok_or("Package file range overflows")?;
++            sum.checked_add(size)
++                .ok_or_else(|| "Download plan is too large".into())
++        })?;
++    let session = Session::new(total);
++    if !jobs.is_empty() {
++        download_state::begin(root).map_err(|e| e.to_string())?;
++    }
++    for entry in jobs {
++        let result = one_file(
++            client,
++            xvd,
++            &entry,
++            old.get(&entry.name),
++            root,
++            url,
++            key,
++            parallel.clamp(1, 8),
++            &session,
++            &mut advanced,
++        )
++        .await;
++        if let Err(error) = result {
++            session.finish(false);
++            diagnostic("transfer-io", 0);
++            return Err(error);
++        }
++    }
++    session.finalizing();
++    Ok(session)
++}
++
++#[allow(clippy::too_many_arguments)]
++async fn one_file(
++    client: &reqwest::Client,
++    xvd: &XvdFile,
++    entry: &Entry,
++    old: Option<&SegmentFile>,
++    root: &Path,
++    url: &str,
++    key: [u8; 32],
++    parallel: usize,
++    session: &Session,
++    advanced: &mut impl FnMut(u64),
++) -> Result<(), String> {
++    let content = &entry.content;
++    let target = download_state::destination(root, &entry.name).map_err(|e| e.to_string())?;
++    let (temporary, output) = download_state::partial(
++        root,
++        &entry.name,
++        &fingerprint(xvd.transfer_stamp(), content),
++    )
++    .map_err(|e| e.to_string())?;
++    let length = stored_size(content).map_err(|e| e.to_string())?;
++    let saved = output
++        .metadata()
++        .map_err(|e| e.to_string())?
++        .len()
++        .min(length);
++    let mut offset = tokio::task::block_in_place(|| {
++        verified_prefix(&output, saved, |index, page| {
++            xvd.accepts_installed_page(content, index, key, page)
++        })
++    })
++    .map_err(|e| e.to_string())?;
++    output.set_len(offset).map_err(|e| e.to_string())?;
++    output.sync_data().map_err(|e| e.to_string())?;
++    let free = fs2::available_space(root).map_err(|e| e.to_string())?;
++    if free < length - offset {
++        diagnostic("disk-space", 0);
++        return Err(format!(
++            "Not enough free space to rebuild {}: need {} bytes, have {free}",
++            entry.name,
++            length - offset
++        ));
++    }
++    session.advance(offset, 0, offset);
++    advanced(offset);
++    let source = read_only(&target).map_err(|e| e.to_string())?;
++    let positions = old_positions(old);
++    while offset < length {
++        session.ready().await?;
++        let end = offset.saturating_add(WINDOW as u64).min(length);
++        let mut data = vec![0u8; (end - offset) as usize];
++        let valid = tokio::task::block_in_place(|| {
++            fill_local(
++                &mut data,
++                offset,
++                source.as_ref(),
++                content,
++                &positions,
++                |index, page| xvd.accepts_installed_page(content, index, key, page),
++            )
++        });
++        let fetched = stream::iter(gaps(&valid))
++            .map(|range| {
++                let start = offset + range.start as u64 * PAGE_SIZE as u64;
++                let request_end = (offset + range.end as u64 * PAGE_SIZE as u64).min(length);
++                let file = SegmentFile {
++                    offset: content.offset + start,
++                    length: (request_end - start).min(content.length - start.min(content.length)),
++                    data_hashs: vec![],
++                    keep_encrypted: content.keep_encrypted,
++                };
++                async move {
++                    let downloaded = session
++                        .request(|| async {
++                            let mut bytes = vec![];
++                            if let Some(local) = url.strip_prefix("file://") {
++                                let mut source = tokio::fs::File::open(local)
++                                    .await
++                                    .map_err(|e| e.to_string())?;
++                                xvd.extract_file(&mut source, &mut bytes, &file, key, |_, _| {})
++                                    .await
++                                    .map_err(|e| {
++                                        format!(
++                                            "{}: {e}; this container does not contain this file",
++                                            entry.name
++                                        )
++                                    })?;
++                            } else {
++                                xvd.download_file_http(
++                                    client,
++                                    url,
++                                    &mut bytes,
++                                    &file,
++                                    key,
++                                    |_, _| {},
++                                )
++                                .await
++                                .map_err(|e| format!("{}: {e}", entry.name))?;
++                            }
++                            Ok(bytes)
++                        })
++                        .await?;
++                    if downloaded.len() as u64 != request_end - start {
++                        return Err("Package returned an unexpected amount of output".to_string());
++                    }
++                    Ok((range.start * PAGE_SIZE, downloaded))
++                }
++            })
++            .buffer_unordered(parallel)
++            .collect::<Vec<Result<(usize, Vec<u8>), String>>>()
++            .await;
++        // Settle all HTTP buffers before exposing an error. No background task
++        // retains an installation writer after this function releases it.
++        let mut network = 0u64;
++        for result in fetched {
++            let (start, bytes) = result?;
++            network += bytes.len() as u64;
++            data[start..start + bytes.len()].copy_from_slice(&bytes);
++        }
++        session.ready().await?;
++        tokio::task::block_in_place(|| {
++            output.write_all_at(&data, offset)?;
++            output.sync_data()
++        })
++        .map_err(|e: io::Error| e.to_string())?;
++        let durable = data.len() as u64;
++        session.advance(durable, network, durable - network);
++        advanced(durable);
++        offset = end;
++    }
++    output.sync_all().map_err(|e| e.to_string())?;
++    drop(output);
++    drop(source);
++    fs::rename(&temporary, &target).map_err(|e| e.to_string())?;
++    File::open(target.parent().unwrap())
++        .and_then(|f| f.sync_all())
++        .map_err(|e| e.to_string())?;
++    File::open(temporary.parent().unwrap())
++        .and_then(|f| f.sync_all())
++        .map_err(|e| e.to_string())?;
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn resume_verifies_all_pages_and_discards_a_corrupt_suffix() {
++        let t = tempfile::tempdir().unwrap();
++        let path = t.path().join("saved");
++        fs::write(&path, vec![7; 3 * PAGE_SIZE + 13]).unwrap();
++        let f = File::open(path).unwrap();
++        let mut checked = vec![];
++        assert_eq!(
++            verified_prefix(&f, 3 * PAGE_SIZE as u64 + 13, |index, bytes| {
++                checked.push(index);
++                bytes[0] == 7 && index < 1
++            })
++            .unwrap(),
++            PAGE_SIZE as u64
++        );
++        assert_eq!(checked, vec![0, 1]);
++        assert_eq!(
++            verified_prefix(&f, 3 * PAGE_SIZE as u64 + 13, |_, _| true).unwrap(),
++            3 * PAGE_SIZE as u64
++        );
++    }
++    #[test]
++    fn missing_ranges_are_coalesced_and_capped_without_leaving_the_window() {
++        let mut valid = vec![true; 3000];
++        valid[2] = false;
++        valid[8] = false;
++        valid[1000..2999].fill(false);
++        let missing = gaps(&valid);
++        assert_eq!(missing[0], 2..9);
++        assert!(
++            missing
++                .iter()
++                .all(|r| r.len() <= REQUEST_PAGES && r.end <= valid.len())
++        );
++        for (index, present) in valid.iter().enumerate() {
++            if !present {
++                assert!(missing.iter().any(|r| r.contains(&index)));
++            }
++        }
++    }
++    #[test]
++    fn local_reuse_checks_candidates_in_the_new_target_position() {
++        let t = tempfile::tempdir().unwrap();
++        let path = t.path().join("old");
++        let mut bytes = vec![1; PAGE_SIZE];
++        bytes.extend(vec![2; PAGE_SIZE]);
++        fs::write(&path, bytes).unwrap();
++        let current = SegmentFile {
++            offset: 0,
++            length: PAGE_SIZE as u64,
++            data_hashs: vec![[9; 20]],
++            keep_encrypted: true,
++        };
++        let mut map = HashMap::new();
++        map.insert([9; 20], PAGE_SIZE as u64);
++        let mut output = vec![0; PAGE_SIZE];
++        let source = File::open(path).unwrap();
++        assert_eq!(
++            fill_local(
++                &mut output,
++                0,
++                Some(&source),
++                &current,
++                &map,
++                |index, p| index == 0 && p[0] == 2
++            ),
++            vec![true]
++        );
++        assert!(output.iter().all(|b| *b == 2));
++        assert_eq!(
++            fill_local(&mut output, 0, Some(&source), &current, &map, |_, _| false),
++            vec![false]
++        );
++    }
++    #[test]
++    fn stage_fingerprints_change_with_package_layout_and_ciphertext() {
++        let mut f = SegmentFile {
++            offset: 0,
++            length: 5000,
++            data_hashs: vec![[1; 20]],
++            keep_encrypted: false,
++        };
++        let original = fingerprint([0; 32], &f);
++        f.offset = 4096;
++        assert_ne!(original, fingerprint([0; 32], &f));
++        f.offset = 0;
++        f.keep_encrypted = true;
++        assert_ne!(original, fingerprint([0; 32], &f));
++        assert_eq!(stored_size(&f).unwrap(), 8192);
++        f.keep_encrypted = false;
++        f.data_hashs[0] = [2; 20];
++        assert_ne!(original, fingerprint([0; 32], &f));
++        assert_ne!(original, fingerprint([1; 32], &f));
++    }
++}
++
++#[cfg(test)]
++#[path = "download_plan_tests.rs"]
++mod transfer_tests;
+diff --git a/crates/xodus-cli/src/download_plan_tests.rs b/crates/xodus-cli/src/download_plan_tests.rs
+new file mode 100644
+index 0000000..0f87983
+--- /dev/null
++++ b/crates/xodus-cli/src/download_plan_tests.rs
+@@ -0,0 +1,295 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Copyright (C) 2026 Ferestre contributors.
++//! Credential-free tests of real package hashes, HTTP ranges and durable output.
++use super::*;
++use std::{
++    io::{BufRead, BufReader, Write},
++    net::{TcpListener, TcpStream},
++    sync::{
++        Arc, Mutex,
++        atomic::{AtomicBool, Ordering},
++    },
++    thread,
++    time::Duration,
++};
++struct Server {
++    url: String,
++    ranges: Arc<Mutex<Vec<(usize, usize)>>>,
++    stop: Arc<AtomicBool>,
++    worker: Option<thread::JoinHandle<()>>,
++}
++impl Server {
++    fn new(bytes: Vec<u8>, status: u16) -> Self {
++        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++        let address = listener.local_addr().unwrap();
++        let ranges = Arc::new(Mutex::new(vec![]));
++        let stop = Arc::new(AtomicBool::new(false));
++        let (worker_ranges, worker_stop) = (ranges.clone(), stop.clone());
++        let worker = thread::spawn(move || {
++            for stream in listener.incoming() {
++                if worker_stop.load(Ordering::SeqCst) {
++                    break;
++                }
++                let mut stream = stream.unwrap();
++                stream
++                    .set_read_timeout(Some(Duration::from_secs(2)))
++                    .unwrap();
++                let mut reader = BufReader::new(stream.try_clone().unwrap());
++                let mut range = None;
++                loop {
++                    let mut line = String::new();
++                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
++                        break;
++                    }
++                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
++                        if let Some((a, b)) = value.trim().split_once('-') {
++                            range =
++                                Some((a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()));
++                        }
++                    }
++                }
++                if status != 206 {
++                    write!(stream,"HTTP/1.1 {status} Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").ok();
++                    continue;
++                }
++                let Some((a, b)) = range else { continue };
++                worker_ranges.lock().unwrap().push((a, b));
++                if b >= bytes.len() {
++                    write!(
++                        stream,
++                        "HTTP/1.1 416 Range\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
++                    )
++                    .ok();
++                    continue;
++                }
++                write!(stream,"HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {a}-{b}/{}\r\nConnection: close\r\n\r\n",b-a+1,bytes.len()).unwrap();
++                stream.write_all(&bytes[a..=b]).ok();
++            }
++        });
++        Self {
++            url: format!("http://{address}/package"),
++            ranges,
++            stop,
++            worker: Some(worker),
++        }
++    }
++}
++impl Drop for Server {
++    fn drop(&mut self) {
++        self.stop.store(true, Ordering::SeqCst);
++        TcpStream::connect(
++            self.url
++                .strip_prefix("http://")
++                .unwrap()
++                .split('/')
++                .next()
++                .unwrap(),
++        )
++        .ok();
++        self.worker.take().unwrap().join().unwrap();
++    }
++}
++async fn fixture(changed: bool) -> (Vec<u8>, XvdFile, Entry, Vec<u8>) {
++    let package = msixvc::xvd::testing::package_with(|pages| {
++        if changed {
++            pages[32][30] ^= 1;
++        }
++    });
++    let start = package.drive_page * PAGE_SIZE;
++    let length = 64 * PAGE_SIZE;
++    let expected = package.bytes[start..start + length].to_vec();
++    let hashes = expected
++        .chunks_exact(PAGE_SIZE)
++        .map(|p| {
++            let digest = Sha256::digest(p);
++            let mut out = [0; 20];
++            out.copy_from_slice(&digest[..20]);
++            out
++        })
++        .collect();
++    let xvd = XvdFile::parse_verified(&mut std::io::Cursor::new(&package.bytes))
++        .await
++        .unwrap();
++    let entry = Entry {
++        name: "Content/payload.dat".into(),
++        content: SegmentFile {
++            offset: start as u64,
++            length: length as u64,
++            data_hashs: hashes,
++            keep_encrypted: false,
++        },
++    };
++    (package.bytes, xvd, entry, expected)
++}
++fn client() -> reqwest::Client {
++    reqwest::Client::builder().no_proxy().build().unwrap()
++}
++
++#[tokio::test(flavor = "multi_thread")]
++async fn authentic_local_content_needs_no_network_request() {
++    let (_, xvd, entry, expected) = fixture(false).await;
++    let root = tempfile::tempdir().unwrap();
++    fs::create_dir(root.path().join("Content")).unwrap();
++    fs::write(root.path().join(&entry.name), &expected).unwrap();
++    let mut durable = 0;
++    execute(
++        &client(),
++        &xvd,
++        vec![entry],
++        &HashMap::new(),
++        root.path(),
++        "http://127.0.0.1:9/unavailable",
++        [0; 32],
++        4,
++        |n| durable += n,
++    )
++    .await
++    .unwrap();
++    assert_eq!(durable, expected.len() as u64);
++    assert_eq!(
++        fs::read(root.path().join("Content/payload.dat")).unwrap(),
++        expected
++    );
++    assert!(
++        download_state::incomplete(root.path()).unwrap(),
++        "Only metadata commit may clear the barrier"
++    );
++}
++#[tokio::test(flavor = "multi_thread")]
++async fn failed_updates_keep_the_old_file_and_resume_only_verified_staged_pages() {
++    let (bytes, xvd, entry, expected) = fixture(false).await;
++    let root = tempfile::tempdir().unwrap();
++    fs::create_dir(root.path().join("Content")).unwrap();
++    let target = root.path().join(&entry.name);
++    fs::write(&target, b"previous installed version").unwrap();
++    let (_, stage) = download_state::partial(
++        root.path(),
++        &entry.name,
++        &fingerprint(xvd.transfer_stamp(), &entry.content),
++    )
++    .unwrap();
++    stage.write_all_at(&expected[..2 * PAGE_SIZE], 0).unwrap();
++    stage.sync_all().unwrap();
++    drop(stage);
++    let refused = Server::new(bytes.clone(), 403);
++    assert!(
++        execute(
++            &client(),
++            &xvd,
++            vec![entry],
++            &HashMap::new(),
++            root.path(),
++            &refused.url,
++            [0; 32],
++            4,
++            |_| {}
++        )
++        .await
++        .is_err()
++    );
++    assert_eq!(fs::read(&target).unwrap(), b"previous installed version");
++    assert!(download_state::incomplete(root.path()).unwrap());
++    let (_, _, entry, _) = fixture(false).await;
++    let server = Server::new(bytes, 206);
++    let first = entry.content.offset as usize;
++    execute(
++        &client(),
++        &xvd,
++        vec![entry],
++        &HashMap::new(),
++        root.path(),
++        &server.url,
++        [0; 32],
++        4,
++        |_| {},
++    )
++    .await
++    .unwrap();
++    assert_eq!(fs::read(target).unwrap(), expected);
++    assert!(
++        server
++            .ranges
++            .lock()
++            .unwrap()
++            .iter()
++            .all(|(start, _)| *start >= first + 2 * PAGE_SIZE)
++    );
++}
++#[tokio::test(flavor = "multi_thread")]
++async fn a_corrupt_saved_page_is_replaced_instead_of_trusting_its_length() {
++    let (bytes, xvd, entry, expected) = fixture(false).await;
++    let root = tempfile::tempdir().unwrap();
++    let (_, stage) = download_state::partial(
++        root.path(),
++        &entry.name,
++        &fingerprint(xvd.transfer_stamp(), &entry.content),
++    )
++    .unwrap();
++    let mut saved = expected[..5 * PAGE_SIZE].to_vec();
++    saved[PAGE_SIZE + 100] ^= 1;
++    stage.write_all_at(&saved, 0).unwrap();
++    stage.sync_all().unwrap();
++    drop(stage);
++    let server = Server::new(bytes, 206);
++    let first = entry.content.offset as usize;
++    execute(
++        &client(),
++        &xvd,
++        vec![entry],
++        &HashMap::new(),
++        root.path(),
++        &server.url,
++        [0; 32],
++        4,
++        |_| {},
++    )
++    .await
++    .unwrap();
++    assert_eq!(
++        fs::read(root.path().join("Content/payload.dat")).unwrap(),
++        expected
++    );
++    assert_eq!(
++        server.ranges.lock().unwrap().iter().map(|(a, _)| *a).min(),
++        Some(first + PAGE_SIZE)
++    );
++}
++#[tokio::test(flavor = "multi_thread")]
++async fn an_incremental_update_fetches_only_changed_authenticated_pages() {
++    let (_, _, old_entry, old_bytes) = fixture(false).await;
++    let (bytes, xvd, entry, expected) = fixture(true).await;
++    let root = tempfile::tempdir().unwrap();
++    fs::create_dir(root.path().join("Content")).unwrap();
++    fs::write(root.path().join(&entry.name), old_bytes).unwrap();
++    let mut old = HashMap::new();
++    old.insert(old_entry.name, old_entry.content);
++    let server = Server::new(bytes, 206);
++    execute(
++        &client(),
++        &xvd,
++        vec![entry],
++        &old,
++        root.path(),
++        &server.url,
++        [0; 32],
++        4,
++        |_| {},
++    )
++    .await
++    .unwrap();
++    assert_eq!(
++        fs::read(root.path().join("Content/payload.dat")).unwrap(),
++        expected
++    );
++    let transferred: usize = server
++        .ranges
++        .lock()
++        .unwrap()
++        .iter()
++        .map(|(a, b)| b - a + 1)
++        .sum();
++    assert_eq!(
++        transferred, PAGE_SIZE,
++        "The other 63 pages must be authenticated and reused locally"
++    );
++}
+diff --git a/crates/xodus-cli/src/download_session.rs b/crates/xodus-cli/src/download_session.rs
+new file mode 100644
+index 0000000..68ae41b
+--- /dev/null
++++ b/crates/xodus-cli/src/download_session.rs
+@@ -0,0 +1,285 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Copyright (C) 2026 Ferestre contributors.
++//! A process-local control channel and versioned, credential-free progress.
++use std::{
++    future::Future,
++    io::{BufRead, Write},
++    sync::{
++        Arc, Mutex,
++        atomic::{AtomicBool, Ordering},
++    },
++    time::{Duration, Instant},
++};
++use tokio::sync::Notify;
++
++#[derive(Clone)]
++pub struct Session(Arc<Shared>);
++struct Shared {
++    paused: AtomicBool,
++    stopped: AtomicBool,
++    wake: Notify,
++    json: bool,
++    controlled: bool,
++    progress: Mutex<Progress>,
++}
++struct Progress {
++    done: u64,
++    total: u64,
++    network: u64,
++    reused: u64,
++    sequence: u64,
++    phase: &'static str,
++    last: Instant,
++}
++impl Session {
++    pub fn new(total: u64) -> Self {
++        let controlled = std::env::var_os("FERESTRE_STREAMING_CONTROL").is_some();
++        let session = Self::with_options(
++            total,
++            std::env::var("XODUS_PROGRESS").is_ok_and(|s| s == "json"),
++            controlled,
++        );
++        if controlled {
++            let controls = session.clone();
++            std::thread::spawn(move || {
++                let input = std::io::stdin();
++                let mut reader = input.lock();
++                let mut command = Vec::new();
++                loop {
++                    command.clear();
++                    let received =
++                        std::io::Read::take(&mut reader, 513).read_until(b'\n', &mut command);
++                    match received {
++                        Ok(0) | Err(_) => break,
++                        Ok(_) if command.len() > 512 => {
++                            if command.last() != Some(&b'\n') {
++                                reader.skip_until(b'\n').ok();
++                            }
++                        }
++                        Ok(_) => {
++                            controls.command(&command);
++                        }
++                    }
++                }
++                controls.stop();
++            });
++        }
++        session.emit(true);
++        session
++    }
++    fn with_options(total: u64, json: bool, controlled: bool) -> Self {
++        Self(Arc::new(Shared {
++            paused: AtomicBool::new(false),
++            stopped: AtomicBool::new(false),
++            wake: Notify::new(),
++            json,
++            controlled,
++            progress: Mutex::new(Progress {
++                done: 0,
++                total,
++                network: 0,
++                reused: 0,
++                sequence: 0,
++                phase: "downloading",
++                last: Instant::now(),
++            }),
++        }))
++    }
++    fn command(&self, bytes: &[u8]) -> bool {
++        if bytes.len() > 512 {
++            return false;
++        }
++        let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
++            return false;
++        };
++        let Some(command) = value.as_object() else {
++            return false;
++        };
++        if command.len() != 2 || command.get("schema") != Some(&serde_json::json!(1)) {
++            return false;
++        }
++        match command.get("command").and_then(|v| v.as_str()) {
++            Some("pause") => self.set_paused(true),
++            Some("resume") => self.set_paused(false),
++            Some("stop") => self.stop(),
++            _ => return false,
++        }
++        true
++    }
++    fn set_paused(&self, value: bool) {
++        self.0.paused.store(value, Ordering::SeqCst);
++        self.0.wake.notify_waiters();
++        self.emit(true);
++    }
++    fn stop(&self) {
++        self.0.stopped.store(true, Ordering::SeqCst);
++        self.0.wake.notify_waiters();
++        diagnostic("transfer-cancelled", 0);
++    }
++    pub async fn ready(&self) -> Result<(), String> {
++        loop {
++            let wake = self.0.wake.notified();
++            if self.0.stopped.load(Ordering::SeqCst) {
++                return Err("Download stopped; verified staging data was retained".into());
++            }
++            if !self.0.paused.load(Ordering::SeqCst) {
++                return Ok(());
++            }
++            wake.await;
++        }
++    }
++    /// Cancelling only the in-memory HTTP buffer closes the connection on
++    /// pause. The durable staging file is never owned by a cancelled future.
++    pub async fn request<T, F, M>(&self, mut start: M) -> Result<T, String>
++    where
++        F: Future<Output = Result<T, String>>,
++        M: FnMut() -> F,
++    {
++        loop {
++            self.ready().await?;
++            let changed = self.0.wake.notified();
++            if self.0.paused.load(Ordering::SeqCst) || self.0.stopped.load(Ordering::SeqCst) {
++                continue;
++            }
++            tokio::select! { result=start()=>return result, _=changed=>() }
++        }
++    }
++    pub fn advance(&self, bytes: u64, downloaded: u64, reused: u64) {
++        {
++            let mut p = self.0.progress.lock().unwrap();
++            p.done = p.done.saturating_add(bytes);
++            p.network = p.network.saturating_add(downloaded);
++            p.reused = p.reused.saturating_add(reused);
++        }
++        self.emit(false);
++    }
++    pub fn finalizing(&self) {
++        self.0.progress.lock().unwrap().phase = "finalizing";
++        self.emit(true);
++    }
++    pub fn finish(&self, success: bool) {
++        self.0.progress.lock().unwrap().phase = if success { "complete" } else { "failed" };
++        self.emit(true);
++    }
++    fn snapshot(&self, force: bool) -> Option<serde_json::Value> {
++        let mut p = self.0.progress.lock().unwrap();
++        if !force && p.last.elapsed() < Duration::from_millis(100) {
++            return None;
++        }
++        p.sequence = p.sequence.saturating_add(1);
++        p.last = Instant::now();
++        Some(
++            serde_json::json!({"schema":1,"event":"progress","sequence":p.sequence,"phase":p.phase,
++            "completedBytes":p.done,"totalBytes":p.total,"networkBytes":p.network,"reusedBytes":p.reused,
++            "paused":self.0.paused.load(Ordering::SeqCst),"canPause":self.0.controlled&&p.phase=="downloading"}),
++        )
++    }
++    fn emit(&self, force: bool) {
++        if self.0.json {
++            if let Some(value) = self.snapshot(force) {
++                let mut out = std::io::stdout().lock();
++                writeln!(out, "FERESTRE_PROGRESS {value}").ok();
++                out.flush().ok();
++            }
++        }
++    }
++}
++pub fn diagnostic(stage: &str, status: u16) {
++    eprintln!("FERESTRE_TRANSFER_DIAGNOSTIC_V1 {stage} {status}");
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[tokio::test]
++    async fn pause_closes_an_inflight_request_and_resume_restarts_it() {
++        let s = Session::with_options(100, false, true);
++        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++        let task = {
++            let s = s.clone();
++            let attempts = attempts.clone();
++            tokio::spawn(async move {
++                s.request(|| {
++                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
++                    async move {
++                        if attempt == 0 {
++                            std::future::pending::<()>().await;
++                        }
++                        Ok(42)
++                    }
++                })
++                .await
++            })
++        };
++        while attempts.load(Ordering::SeqCst) == 0 {
++            tokio::task::yield_now().await;
++        }
++        assert!(s.command(br#"{"schema":1,"command":"pause"}"#));
++        tokio::time::sleep(Duration::from_millis(10)).await;
++        assert!(!task.is_finished());
++        assert!(s.command(br#"{"schema":1,"command":"resume"}"#));
++        assert_eq!(
++            tokio::time::timeout(Duration::from_secs(1), task)
++                .await
++                .unwrap()
++                .unwrap()
++                .unwrap(),
++            42
++        );
++        assert_eq!(attempts.load(Ordering::SeqCst), 2);
++    }
++    #[tokio::test]
++    async fn stop_or_controller_loss_wakes_a_paused_transfer_without_restarting_it() {
++        let session = Session::with_options(100, false, true);
++        assert!(session.command(br#"{"schema":1,"command":"pause"}"#));
++        let task = {
++            let session = session.clone();
++            tokio::spawn(async move {
++                session
++                    .request(|| async {
++                        panic!("Stopped work must not start");
++                        #[allow(unreachable_code)]
++                        Ok::<(), String>(())
++                    })
++                    .await
++            })
++        };
++        tokio::task::yield_now().await;
++        session.stop();
++        assert!(
++            tokio::time::timeout(Duration::from_secs(1), task)
++                .await
++                .unwrap()
++                .unwrap()
++                .is_err()
++        );
++    }
++    #[test]
++    fn controls_are_bounded_and_do_not_accept_other_fields() {
++        let s = Session::with_options(100, false, true);
++        for bytes in [
++            br#"{"schema":2,"command":"pause"}"#.as_slice(),
++            br#"{"schema":1,"command":"pause","token":"secret"}"#.as_slice(),
++            br#"{"schema":1,"command":"execute"}"#.as_slice(),
++        ] {
++            assert!(!s.command(bytes));
++        }
++        assert!(!s.command(&vec![b'x'; 513]));
++        assert!(!s.0.paused.load(Ordering::SeqCst));
++    }
++    #[test]
++    fn progress_counts_durable_data_and_monotonically_sequences_snapshots() {
++        let s = Session::with_options(100, false, true);
++        s.advance(80, 20, 60);
++        let first = s.snapshot(true).unwrap();
++        assert_eq!(first["completedBytes"], 80);
++        assert_eq!(first["networkBytes"], 20);
++        assert_eq!(first["reusedBytes"], 60);
++        assert!(
++            s.snapshot(true).unwrap()["sequence"].as_u64().unwrap()
++                > first["sequence"].as_u64().unwrap()
++        );
++        s.finish(false);
++        assert_eq!(s.snapshot(true).unwrap()["phase"], "failed");
++    }
++}
+diff --git a/crates/xodus-cli/src/download_state.rs b/crates/xodus-cli/src/download_state.rs
+new file mode 100644
+index 0000000..30d8e2c
+--- /dev/null
++++ b/crates/xodus-cli/src/download_state.rs
+@@ -0,0 +1,251 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Copyright (C) 2026 Ferestre contributors.
++//! Installation ownership and durable progress stored as verified output bytes.
++use fs2::FileExt;
++use sha2::{Digest, Sha256};
++use std::{
++    fs::{self, File, OpenOptions},
++    io::{self, Write},
++    os::unix::fs::{MetadataExt, OpenOptionsExt},
++    path::{Path, PathBuf},
++};
++
++pub const INCOMPLETE: &str = ".ferestre-update-incomplete-v1";
++const LOCK: &str = ".ferestre-streaming.lock";
++
++fn regular(file: &File) -> io::Result<()> {
++    let m = file.metadata()?;
++    if !m.is_file() || m.nlink() != 1 || m.uid() != unsafe { nix::libc::geteuid() } {
++        return Err(io::Error::other(
++            "Installation state is not a private regular file",
++        ));
++    }
++    Ok(())
++}
++pub fn incomplete(root: &Path) -> io::Result<bool> {
++    match fs::symlink_metadata(root.join(INCOMPLETE)) {
++        Ok(_) => Ok(true),
++        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
++        Err(e) => Err(e),
++    }
++}
++fn open_lock(root: &Path, create: bool) -> io::Result<File> {
++    let mut options = OpenOptions::new();
++    options
++        .read(true)
++        .write(create)
++        .create(create)
++        .mode(0o600)
++        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
++    let file = options.open(root.join(LOCK))?;
++    regular(&file)?;
++    Ok(file)
++}
++pub fn writer(root: &Path) -> io::Result<File> {
++    let file = open_lock(root, true)?;
++    FileExt::try_lock_exclusive(&file).map_err(|_| {
++        io::Error::other("This installation is being used by another game or download")
++    })?;
++    Ok(file)
++}
++pub fn player(root: &Path) -> io::Result<Option<File>> {
++    if incomplete(root)? {
++        return Err(io::Error::other(
++            "Resume the interrupted update before playing this game",
++        ));
++    }
++    let file = match open_lock(root, true) {
++        Ok(file) => Some(file),
++        Err(e)
++            if matches!(
++                e.kind(),
++                io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
++            ) =>
++        {
++            match open_lock(root, false) {
++                Ok(file) => Some(file),
++                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
++                Err(e) => return Err(e),
++            }
++        }
++        Err(e) => return Err(e),
++    };
++    if let Some(file) = &file {
++        FileExt::try_lock_shared(file).map_err(|_| {
++            io::Error::other("Finish the current installation operation before playing")
++        })?;
++        let flags = rustix::io::fcntl_getfd(file)?;
++        rustix::io::fcntl_setfd(file, flags - rustix::io::FdFlags::CLOEXEC)?;
++    }
++    if incomplete(root)? {
++        return Err(io::Error::other(
++            "Resume the interrupted update before playing this game",
++        ));
++    }
++    Ok(file)
++}
++pub fn begin(root: &Path) -> io::Result<()> {
++    let path = root.join(INCOMPLETE);
++    match OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .mode(0o600)
++        .open(&path)
++    {
++        Ok(mut file) => {
++            file.write_all(b"1\n")?;
++            file.sync_all()?;
++        }
++        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
++            let file = OpenOptions::new()
++                .read(true)
++                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
++                .open(&path)?;
++            regular(&file)?;
++        }
++        Err(e) => return Err(e),
++    }
++    File::open(root)?.sync_all()
++}
++pub fn finish(root: &Path) -> io::Result<()> {
++    match fs::remove_file(root.join(INCOMPLETE)) {
++        Ok(()) => (),
++        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
++        Err(e) => return Err(e),
++    }
++    File::open(root)?.sync_all()
++}
++/// Resolve package names component by component. Package-controlled links are
++/// refused before creating directories or replacing files outside the library.
++pub fn destination(root: &Path, name: &str) -> io::Result<PathBuf> {
++    let relative = msixvc::xvd::package_relative_path(name)?;
++    if relative.components().next().is_some_and(|p| {
++        let name = p.as_os_str().to_string_lossy().to_ascii_lowercase();
++        name.starts_with(".ferestre-") || name.starts_with(".xodus-")
++    }) {
++        return Err(io::Error::other(
++            "The package names reserved installation state",
++        ));
++    }
++    let mut path = root.to_path_buf();
++    let pieces: Vec<_> = relative.components().collect();
++    for (index, piece) in pieces.iter().enumerate() {
++        path.push(piece.as_os_str());
++        match fs::symlink_metadata(&path) {
++            Ok(m) if m.file_type().is_symlink() => {
++                return Err(io::Error::other("Refusing a link in an installation path"));
++            }
++            Ok(m) if index + 1 < pieces.len() && !m.is_dir() => {
++                return Err(io::Error::other(
++                    "An installation parent is not a directory",
++                ));
++            }
++            Ok(m) if index + 1 == pieces.len() && (!m.is_file() || m.nlink() != 1) => {
++                return Err(io::Error::other(
++                    "Refusing a non-private installation target",
++                ));
++            }
++            Ok(_) => (),
++            Err(e) if e.kind() == io::ErrorKind::NotFound => {
++                if index + 1 < pieces.len() {
++                    fs::create_dir(&path)?;
++                    File::open(path.parent().unwrap())?.sync_all()?;
++                }
++            }
++            Err(e) => return Err(e),
++        }
++    }
++    Ok(path)
++}
++/// The stage is keyed by package-controlled file identity, not by iteration
++/// order. It survives process death; every saved page is reverified on resume.
++pub fn partial(root: &Path, name: &str, identity: &[u8]) -> io::Result<(PathBuf, File)> {
++    let folder = root.join(".ferestre-transfer");
++    match fs::symlink_metadata(&folder) {
++        Ok(m) if !m.is_dir() || m.file_type().is_symlink() => {
++            return Err(io::Error::other("Invalid transfer staging directory"));
++        }
++        Ok(_) => (),
++        Err(e) if e.kind() == io::ErrorKind::NotFound => {
++            use std::os::unix::fs::DirBuilderExt;
++            fs::DirBuilder::new().mode(0o700).create(&folder)?;
++            File::open(root)?.sync_all()?;
++        }
++        Err(e) => return Err(e),
++    }
++    let mut digest = Sha256::new();
++    digest.update(name.as_bytes());
++    digest.update([0]);
++    digest.update(identity);
++    let token: String = digest
++        .finalize()
++        .iter()
++        .map(|byte| format!("{byte:02x}"))
++        .collect();
++    let basename = format!("{token}.part");
++    let path = folder.join(basename);
++    let file = OpenOptions::new()
++        .read(true)
++        .write(true)
++        .create(true)
++        .truncate(false)
++        .mode(0o600)
++        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
++        .open(&path)?;
++    regular(&file)?;
++    File::open(&folder)?.sync_all()?;
++    Ok((path, file))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn barrier_survives_writer_exit_and_prevents_play_until_commit() {
++        let t = tempfile::tempdir().unwrap();
++        let lock = writer(t.path()).unwrap();
++        assert!(player(t.path()).is_err());
++        begin(t.path()).unwrap();
++        drop(lock);
++        assert!(player(t.path()).is_err());
++        finish(t.path()).unwrap();
++        let game = player(t.path()).unwrap();
++        assert!(writer(t.path()).is_err());
++        drop(game);
++        assert!(writer(t.path()).is_ok());
++    }
++    #[test]
++    fn persistent_stage_is_bound_to_name_and_package_layout() {
++        let t = tempfile::tempdir().unwrap();
++        let (p, mut f) = partial(t.path(), "Game.dat", b"one").unwrap();
++        f.write_all(b"saved data").unwrap();
++        f.sync_all().unwrap();
++        drop(f);
++        assert_eq!(
++            partial(t.path(), "Game.dat", b"one")
++                .unwrap()
++                .1
++                .metadata()
++                .unwrap()
++                .len(),
++            10
++        );
++        assert_ne!(p, partial(t.path(), "Game.dat", b"two").unwrap().0);
++        assert_ne!(p, partial(t.path(), "Other.dat", b"one").unwrap().0);
++    }
++    #[test]
++    fn links_and_nonregular_state_cannot_escape_the_destination() {
++        let t = tempfile::tempdir().unwrap();
++        let outside = tempfile::tempdir().unwrap();
++        std::os::unix::fs::symlink(outside.path(), t.path().join("linked")).unwrap();
++        assert!(destination(t.path(), "linked/game.exe").is_err());
++        assert!(destination(t.path(), "../escape").is_err());
++        assert!(destination(t.path(), ".ferestre-transfer/escape").is_err());
++        assert!(destination(t.path(), ".xodus-streaming.msixvc").is_err());
++        std::os::unix::fs::symlink(outside.path(), t.path().join(".ferestre-transfer")).unwrap();
++        assert!(partial(t.path(), "Game.dat", b"x").is_err());
++        std::os::unix::fs::symlink("missing", t.path().join(INCOMPLETE)).unwrap();
++        assert!(incomplete(t.path()).unwrap());
++        assert!(begin(t.path()).is_err());
++    }
++}
+diff --git a/crates/xodus-cli/src/main.rs b/crates/xodus-cli/src/main.rs
+index 6aeff9f..06d35ea 100644
+--- a/crates/xodus-cli/src/main.rs
++++ b/crates/xodus-cli/src/main.rs
+@@ -6,6 +6,9 @@ use tracing_subscriber::layer::SubscriberExt;
+ use tracing_subscriber::util::SubscriberInitExt;
+ 
+ mod commands;
++mod download_plan;
++mod download_session;
++mod download_state;
+ mod license;
+ mod package;
+ mod webview;
+diff --git a/crates/xodus/src/api/xbox/auth.rs b/crates/xodus/src/api/xbox/auth.rs
+index dc94fb7..e7dd2de 100644
+--- a/crates/xodus/src/api/xbox/auth.rs
++++ b/crates/xodus/src/api/xbox/auth.rs
+@@ -42,6 +42,12 @@ async fn authenticate_xbox_user_at(
+         }
+         _ => response,
+     };
++    if !response.status().is_success() {
++        eprintln!(
++            "FERESTRE_TRANSFER_DIAGNOSTIC_V1 authentication {}",
++            response.status().as_u16()
++        );
++    }
+     response.error_for_status()?.json().await
+ }
+ 
