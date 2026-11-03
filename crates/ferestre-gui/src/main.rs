@@ -85,6 +85,9 @@ button.game-tile:focus-visible { outline: 3px solid white; outline-offset: 4px; 
 .game-tile .game-meta { font-size: 12px; color: #b3b6bd; }
 .game-tile .game-running { color: #8bd77b; font-weight: 700; }
 .game-tile spinner { color: #8bd77b; opacity: 1; }
+.game-launch-overlay { background-color: alpha(#080b0f, 0.72); border-radius: 7px; }
+.game-launch-overlay .game-overlay-state { font-size: 18px; font-weight: 600; color: #f4f4f5; }
+.game-launch-overlay .game-overlay-action { font-size: 20px; font-weight: 700; color: #ffffff; border: 1px solid alpha(#ffffff, 0.65); border-radius: 22px; padding: 7px 22px; }
 .game-more > button { background-color: alpha(#111317,0.85); border-radius: 5px; }
 .sidebar-recents button { padding: 6px; background: transparent; box-shadow: none; border-radius: 6px; }
 .sidebar-recents button:hover { background-color: #343840; }
@@ -2391,11 +2394,11 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
         row.action == Action::Stop && row.subtitle.split("  ·  ").any(|s| s == "starting");
     let state = if row.action == Action::Stop {
         if launching {
-            "Starting… · Stop"
+            "Starting…"
         } else if row.subtitle.split("  ·  ").any(|s| s == "stopping") {
             "Stopping…"
         } else {
-            "● Running · Stop"
+            "● Running"
         }
     } else if row.action == Action::Play {
         "✓ Installed"
@@ -2433,25 +2436,80 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
     status.update_property(&[gtk::accessible::Property::Label(
         description.subtitle().as_deref().unwrap_or_default(),
     )]);
-    let launch_status = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    if launching {
-        let spinner = gtk::Spinner::builder()
-            .spinning(true)
-            .width_request(18)
-            .height_request(18)
-            .build();
-        spinner.update_property(&[gtk::accessible::Property::Label("Starting game")]);
-        launch_status.append(&spinner);
-    } else if row.action == Action::Stop {
+    if row.action == Action::Stop && !launching {
         status.add_css_class("game-running");
     }
-    launch_status.append(&status);
-    text.append(&launch_status);
+    text.append(&status);
     body.append(&text);
+    let surface = gtk::Overlay::new();
+    surface.set_child(Some(&body));
+    if row.action == Action::Stop {
+        let stopping = row.subtitle.split("  ·  ").any(|s| s == "stopping");
+        let state = if launching {
+            "Starting…"
+        } else if stopping {
+            "Stopping…"
+        } else {
+            "Running"
+        };
+        let layer = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .halign(gtk::Align::Fill)
+            .valign(gtk::Align::Fill)
+            .css_classes(["game-launch-overlay"])
+            .can_target(false)
+            .build();
+        layer.set_accessible_role(gtk::AccessibleRole::Group);
+        layer.update_property(&[gtk::accessible::Property::Label(if launching {
+            "Starting overlay"
+        } else {
+            "Running overlay"
+        })]);
+        let center = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(14)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .vexpand(true)
+            .hexpand(true)
+            .build();
+        if launching || stopping {
+            let spinner = gtk::Spinner::builder()
+                .spinning(true)
+                .width_request(56)
+                .height_request(56)
+                .halign(gtk::Align::Center)
+                .build();
+            spinner.update_property(&[gtk::accessible::Property::Label(if launching {
+                "Starting game"
+            } else {
+                "Stopping game"
+            })]);
+            center.append(&spinner);
+        } else {
+            let icon = gtk::Image::from_icon_name("media-playback-stop-symbolic");
+            icon.set_pixel_size(48);
+            center.append(&icon);
+        }
+        center.append(
+            &gtk::Label::builder()
+                .label(state)
+                .css_classes(["game-overlay-state"])
+                .build(),
+        );
+        center.append(
+            &gtk::Label::builder()
+                .label(if stopping { "Stop now" } else { "Stop" })
+                .css_classes(["game-overlay-action"])
+                .build(),
+        );
+        layer.append(&center);
+        surface.add_overlay(&layer);
+    }
     let overlay = gtk::Overlay::new();
     if let Some(primary) = primary {
         actions.remove(&primary);
-        primary.set_child(Some(&body));
+        primary.set_child(Some(&surface));
         primary.set_tooltip_text(description.tooltip_text().as_deref());
         primary.reset_relation(gtk::AccessibleRelation::LabelledBy);
         primary.update_property(&[gtk::accessible::Property::Label(&format!(
@@ -2469,8 +2527,8 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
         ))]);
         overlay.set_child(Some(&primary));
     } else {
-        body.add_css_class("game-tile");
-        overlay.set_child(Some(&body));
+        surface.add_css_class("game-tile");
+        overlay.set_child(Some(&surface));
     }
     if let Some(more) = actions.first_child() {
         actions.remove(&more);

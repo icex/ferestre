@@ -11,9 +11,10 @@ After opening Game Pass, covers for its full catalogue preload in the background
 with four bounded workers. Visible pages take priority and each cover appears
 individually as it arrives; cached covers are reused across pages and restarts.
 
-A game's card shows an animated spinner and Starting… while its launcher prepares
-it. Once the executable from that specific launch is observed, the card shows
-Running · Stop in green. Stop also works during startup. Failed launches and game
+A game's whole card is dimmed under a centered animated spinner and Starting…
+while its launcher prepares it. Once the executable from that specific launch is
+observed, the overlay shows Running and a prominent Stop action. Pressing anywhere
+on the card stops it. Stop also works during startup. Failed launches and game
 exits return the card to Play; other running games retain their own state.
 
 SDL2 controllers navigate the focused Ferestre window with D-pad or the left
