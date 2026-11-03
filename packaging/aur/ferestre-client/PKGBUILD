@@ -9,7 +9,7 @@
 # separate process and package from the MIT launcher.
 
 pkgname=ferestre-client
-pkgver=0.1.0.r159.gf9fc18b
+pkgver=0.1.0.r160.ge35bde1
 pkgrel=1
 pkgdesc='Xodus client for Microsoft Store titles, with the Ferestre fixes (sign-in, licences, MSIXVC download and decrypt)'
 arch=('x86_64')
@@ -45,7 +45,7 @@ provides=('xodus-cli' 'xodus-service')
 conflicts=('xodus-cli' 'xodus-cli-git')
 
 # The same exact source commit as sources.lock.json and the AppImage build.
-_commit=f9fc18b18bd02c20443010cf61f6ccb2579f59c4
+_commit=e35bde1848e0ada2c5933b3ee1e6c82deb88256a
 source=("xodus::git+$url.git#commit=$_commit")
 sha256sums=('SKIP')
 

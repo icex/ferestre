@@ -404,6 +404,8 @@ pub fn all(paths: &Paths) -> Vec<InstalledRuntime> {
 /// one the choices it can read, rather than read as no choices at all.
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct Selections {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default: Option<PathBuf>,
     #[serde(default)]
     titles: BTreeMap<String, PathBuf>,
 }
@@ -447,7 +449,29 @@ pub fn selected(config_dir: &Path, product_id: &str) -> Option<PathBuf> {
     }
 }
 
-/// Persist a local runtime choice. Passing `None` restores automatic selection.
+/// The default for games without an override. Invalid choices are refused at
+/// launch rather than silently changing the runtime the user selected.
+pub fn default_selected(config_dir: &Path) -> Option<PathBuf> {
+    match read_selections(config_dir) {
+        Ok(selections) => selections.default,
+        Err(e) => {
+            eprintln!("-- ignoring the saved runtime choices: {e}");
+            None
+        }
+    }
+}
+
+/// Change the global default without discarding any per-game overrides.
+pub fn set_default(config_dir: &Path, path: Option<&Path>) -> anyhow::Result<()> {
+    let mut selections = read_selections(config_dir)?;
+    selections.default = path.map(Path::to_path_buf);
+    crate::cache::write(
+        &selections_file(config_dir),
+        toml::to_string_pretty(&selections)?.as_bytes(),
+    )
+}
+
+/// Persist a local runtime choice. Passing `None` inherits the global default.
 ///
 /// A file that is there and cannot be read is an error, not a blank slate:
 /// rewriting it with only this one choice would silently throw away every
@@ -473,7 +497,7 @@ pub fn set_selected(
 }
 
 /// The runtime a person asked for, for one title: their choice for that title
-/// if they made one, otherwise the one `XODUS_PROTON_DIR` names.
+/// if they made one, otherwise the Settings default, then `XODUS_PROTON_DIR`.
 ///
 /// `XODUS_PROTON_DIR` is a choice too, made for every title at once, so it is
 /// the requested runtime rather than one more candidate that a newer managed
@@ -481,6 +505,9 @@ pub fn set_selected(
 /// naming it, as [`InstalledRuntime::discover`] has always made it.
 pub fn requested(paths: &Paths, product_id: &str) -> anyhow::Result<Option<PathBuf>> {
     if let Some(chosen) = selected(paths.config_dir(), product_id) {
+        return Ok(Some(chosen));
+    }
+    if let Some(chosen) = default_selected(paths.config_dir()) {
         return Ok(Some(chosen));
     }
     match paths.runtime_override() {
@@ -1281,6 +1308,49 @@ hangs"""
         );
         set_selected(config.path(), "9NNX1VVR3KNQ", None).unwrap();
         assert_eq!(selected(config.path(), "9NNX1VVR3KNQ"), None);
+    }
+
+    #[test]
+    fn default_and_game_overrides_preserve_each_other_and_follow_precedence() {
+        let root = tempfile::tempdir().unwrap();
+        let env_runtime = root.path().join("environment");
+        std::fs::create_dir(&env_runtime).unwrap();
+        std::fs::write(env_runtime.join("proton"), "#!/bin/sh\n").unwrap();
+        let paths = Paths::resolve(&crate::paths::Env::from_map([
+            ("HOME", root.path().to_str().unwrap()),
+            ("XDG_CONFIG_HOME", root.path().to_str().unwrap()),
+            ("XODUS_PROTON_DIR", env_runtime.to_str().unwrap()),
+        ]))
+        .unwrap();
+        let config = paths.config_dir();
+        let global = Path::new("/runtime/default");
+        let game = Path::new("/runtime/game");
+        assert_eq!(
+            requested(&paths, "GAME").unwrap(),
+            Some(env_runtime.clone())
+        );
+        set_default(config, Some(global)).unwrap();
+        assert_eq!(requested(&paths, "GAME").unwrap().as_deref(), Some(global));
+        set_selected(config, "game", Some(game)).unwrap();
+        assert_eq!(requested(&paths, "GAME").unwrap().as_deref(), Some(game));
+        assert_eq!(requested(&paths, "OTHER").unwrap().as_deref(), Some(global));
+        set_default(config, None).unwrap();
+        assert_eq!(requested(&paths, "GAME").unwrap().as_deref(), Some(game));
+        assert_eq!(
+            requested(&paths, "OTHER").unwrap(),
+            Some(env_runtime.clone())
+        );
+        set_default(config, Some(global)).unwrap();
+        set_selected(config, "GAME", None).unwrap();
+        assert_eq!(requested(&paths, "GAME").unwrap().as_deref(), Some(global));
+
+        // Missing explicit choices remain explicit: the launch gate refuses
+        // them instead of silently substituting another runtime.
+        assert!(select(&Recipe::parse(RECIPE).unwrap(), &[], Some(global), None).is_err());
+        let file = selections_file(config);
+        std::fs::write(&file, "broken = [").unwrap();
+        assert!(set_default(config, None).is_err());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "broken = [");
     }
 
     #[test]

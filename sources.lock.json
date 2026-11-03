@@ -3,7 +3,7 @@
   "components": {
     "xodus": {
       "repository": "https://github.com/icex/xodus.git",
-      "commit": "f9fc18b18bd02c20443010cf61f6ccb2579f59c4",
+      "commit": "e35bde1848e0ada2c5933b3ee1e6c82deb88256a",
       "upstream": "https://github.com/xodus-gaming/xodus.git",
       "upstream_commit": "3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60",
       "modified_paths": [
@@ -78,6 +78,8 @@
         "crates/xodus-service/src/utils.rs",
         "crates/xodus/Cargo.toml",
         "crates/xodus/proto/xodus/common.proto",
+        "crates/xodus/src/api/live/mod.rs",
+        "crates/xodus/src/api/live/rst/error.rs",
         "crates/xodus/src/api/live/rst/request.rs",
         "crates/xodus/src/api/xbox/auth.rs",
         "crates/xodus/src/api/xbox/claims.rs",
@@ -95,6 +97,7 @@
         "crates/xodus/src/models/xgameruntime/xuser.rs",
         "crates/xodus/src/profiles.rs",
         "crates/xodus/src/secrets.rs",
+        "crates/xodus/src/tokens/device.rs",
         "crates/xodus/src/tokens/manager.rs",
         "crates/xodus/tests/key_chain_file.rs"
       ]

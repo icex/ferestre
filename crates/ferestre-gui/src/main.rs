@@ -1204,12 +1204,40 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
         row.add_suffix(&install);
     }
     group.add(&row);
+    let default = model
+        .paths
+        .as_ref()
+        .and_then(|paths| ferestre_core::runtime::default_selected(paths.config_dir()));
+    let default_label = default
+        .as_ref()
+        .map(|path| {
+            model
+                .runtimes
+                .iter()
+                .find(|rt| rt.path == *path)
+                .map(|rt| rt.label())
+                .unwrap_or_else(|| format!("Unavailable: {}", path.display()))
+        })
+        .unwrap_or_else(|| "Automatic (newest compatible)".into());
+    let default_row = plain_row("Default game runtime", Some(&default_label));
+    default_row.set_subtitle_lines(2);
+    let choose = gtk::Button::builder()
+        .label("Choose default runtime")
+        .valign(gtk::Align::Center)
+        .build();
+    choose.connect_clicked(glib::clone!(
+        #[strong]
+        ui,
+        move |_| runtime_chooser(&ui, None, "Default game runtime")
+    ));
+    default_row.add_suffix(&choose);
+    group.add(&default_row);
     page.append(&group);
 
     if model.runtimes.len() > 1 {
         let versions = adw::PreferencesGroup::builder()
             .title("Installed versions")
-            .description("New launches use the newest compatible version. A title-specific choice is kept locally.")
+            .description("Games use the default above unless you choose another runtime in a game's options. Changes apply to the next launch.")
             .build();
         for runtime in &model.runtimes {
             let row = plain_row(&runtime.label(), Some(&runtime.path.display().to_string()));
@@ -1985,6 +2013,10 @@ fn render_rows(
 }
 
 fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
+    runtime_chooser(ui, Some(product_id), &format!("Runtime for {title}"));
+}
+
+fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
     let (paths, runtimes, current) = {
         let model = ui.model.borrow();
         let Some(paths) = model.paths.clone() else {
@@ -1993,15 +2025,19 @@ fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
         (
             paths.clone(),
             model.runtimes.clone(),
-            ferestre_core::runtime::selected(paths.config_dir(), product_id),
+            match product_id {
+                Some(id) => ferestre_core::runtime::selected(paths.config_dir(), id),
+                None => ferestre_core::runtime::default_selected(paths.config_dir()),
+            },
         )
     };
     let dialog = gtk::Window::builder()
         .application(ui.window.application().as_ref().unwrap())
         .transient_for(&ui.window)
         .modal(true)
-        .title(format!("Runtime for {title}"))
+        .title(title)
         .default_width(520)
+        .default_height(420)
         .build();
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -2011,17 +2047,31 @@ fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
         .margin_start(18)
         .margin_end(18)
         .build();
-    let automatic = gtk::Button::with_label("Automatic (newest compatible)");
+    content.append(&gtk::Label::builder()
+        .label(if product_id.is_some() {
+            "Choose a runtime for this game, or inherit your Settings default. Applies to the next launch."
+        } else {
+            "Used for games without their own override. Automatic selects the newest compatible runtime. Applies to the next launch."
+        })
+        .wrap(true)
+        .xalign(0.0)
+        .build());
+    let automatic = gtk::Button::with_label(if product_id.is_some() {
+        "Use default runtime"
+    } else {
+        "Automatic (newest compatible)"
+    });
     let automatic_ui = ui.clone();
     let automatic_dialog = dialog.clone();
     let automatic_paths = paths.clone();
-    let automatic_product = product_id.to_string();
+    let automatic_product = product_id.map(str::to_string);
     automatic.connect_clicked(move |_| {
-        if let Err(error) = ferestre_core::runtime::set_selected(
+        let result = save_runtime_choice(
             automatic_paths.config_dir(),
-            &automatic_product,
+            automatic_product.as_deref(),
             None,
-        ) {
+        );
+        if let Err(error) = result {
             automatic_ui
                 .toasts
                 .add_toast(toast(format!("Could not save runtime choice: {error}")));
@@ -2029,9 +2079,7 @@ fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
             automatic_dialog.close();
             // The row is judged against the runtime its launch will use.
             render(&automatic_ui);
-            automatic_ui
-                .toasts
-                .add_toast(toast("Runtime selection reset to automatic"));
+            automatic_ui.toasts.add_toast(toast("Runtime choice reset"));
         }
     });
     content.append(&automatic);
@@ -2042,16 +2090,24 @@ fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
         } else {
             runtime.label()
         };
-        let choice = gtk::Button::with_label(&label);
+        let choice = gtk::Button::builder()
+            .child(
+                &gtk::Label::builder()
+                    .label(&label)
+                    .wrap(true)
+                    .xalign(0.0)
+                    .build(),
+            )
+            .build();
         let selected_ui = ui.clone();
         let selected_dialog = dialog.clone();
         let selected_paths = paths.clone();
-        let selected_product = product_id.to_string();
+        let selected_product = product_id.map(str::to_string);
         let path = runtime.path.clone();
         choice.connect_clicked(move |_| {
-            if let Err(error) = ferestre_core::runtime::set_selected(
+            if let Err(error) = save_runtime_choice(
                 selected_paths.config_dir(),
-                &selected_product,
+                selected_product.as_deref(),
                 Some(&path),
             ) {
                 selected_ui
@@ -2062,7 +2118,7 @@ fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
                 render(&selected_ui);
                 selected_ui
                     .toasts
-                    .add_toast(toast("Runtime selected for this title"));
+                    .add_toast(toast("Runtime choice saved for the next launch"));
             }
         });
         content.append(&choice);
@@ -2071,8 +2127,25 @@ fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
     let cancel_dialog = dialog.clone();
     cancel.connect_clicked(move |_| cancel_dialog.close());
     content.append(&cancel);
-    dialog.set_child(Some(&content));
+    dialog.set_child(Some(
+        &gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .child(&content)
+            .build(),
+    ));
     dialog.present();
+    automatic.grab_focus();
+}
+
+fn save_runtime_choice(
+    config: &std::path::Path,
+    product_id: Option<&str>,
+    path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    match product_id {
+        Some(id) => ferestre_core::runtime::set_selected(config, id, path),
+        None => ferestre_core::runtime::set_default(config, path),
+    }
 }
 
 fn render_library_tabs(ui: &Ui, page: &gtk::Box) {
@@ -3005,6 +3078,7 @@ fn library_components(ui: &Ui, row: &LibraryRow) -> (adw::ActionRow, gtk::Box) {
             );
             let plays = matches!(row.action, Action::Play);
             let updating = matches!(row.action, Action::Update);
+            let resumes = matches!(row.action, Action::Resume);
             // A bundle installs its child, and the dialog names the child: a
             // 23 GB download starting under a different title's name would be
             // the launcher doing something it never explained.
@@ -3017,7 +3091,9 @@ fn library_components(ui: &Ui, row: &LibraryRow) -> (adw::ActionRow, gtk::Box) {
                 ui,
                 move |_| {
                     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-                    if waits {
+                    if resumes {
+                        resume_download(&ui, &product_id, &title_name);
+                    } else if waits {
                         confirm_install(&ui, &product_id, &title_name, updating);
                     } else if plays {
                         spawn_title(&ui, &product_id, &title_name);
@@ -4287,11 +4363,47 @@ fn confirm_runtime_downgrade(ui: &Ui) {
     dialog.present(Some(&window));
 }
 
-/// Ask before downloading, and say where it is going.
-///
-/// A download here is between a few hundred megabytes and 160 GB, so starting
-/// one on a single click -- with no size, no destination, and no way back --
-/// is not a thing to do to somebody's evening or their disk.
+/// Resume the saved job without replacing its destination or update identity.
+fn resume_download(ui: &Ui, product_id: &str, name: &str) {
+    if queue_ui::resume(ui, product_id) {
+        return;
+    }
+    // A stopped transfer from before the durable queue still has a known folder.
+    let saved = {
+        let model = ui.model.borrow();
+        model
+            .install_destination(product_id)
+            .filter(|dir| {
+                dir.is_dir()
+                    && matches!(
+                        model.inspect_folder(product_id, dir),
+                        model::Folder::This | model::Folder::Download
+                    )
+            })
+            .and_then(|dir| {
+                model.install_argument(product_id, &dir).map(|arg| {
+                    (
+                        arg,
+                        model.records.contains_key(&product_id.to_ascii_uppercase()),
+                    )
+                })
+            })
+    };
+    if let Some((destination, updating)) = saved {
+        queue_ui::enqueue(
+            ui,
+            product_id,
+            name,
+            Some(&destination),
+            if updating { "Updating" } else { "Installing" },
+        );
+    } else {
+        ui.toasts
+            .add_toast(toast("The saved download location is unavailable"));
+    }
+}
+
+/// Ask before a new download, and say where it is going.
 fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
     if *ui.closing.borrow()
         || (ui.busy.borrow().is_some() && ui.download.current.borrow().is_none())

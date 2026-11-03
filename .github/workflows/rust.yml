@@ -43,6 +43,8 @@ on:
       - 'tests/gui_running.py'
       - 'tests/gui_controller_install.py'
       - 'tests/gui_accounts_controller.py'
+      - 'tests/gui_runtime_selection.py'
+      - 'tests/gui_update_resume.py'
       - 'tests/controller_driver.py'
       - 'tests/test_gui_actions.py'
       - 'tests/run_wayland_gui.py'
@@ -97,6 +99,8 @@ on:
       - 'tests/gui_running.py'
       - 'tests/gui_controller_install.py'
       - 'tests/gui_accounts_controller.py'
+      - 'tests/gui_runtime_selection.py'
+      - 'tests/gui_update_resume.py'
       - 'tests/controller_driver.py'
       - 'tests/test_gui_actions.py'
       - 'tests/run_wayland_gui.py'
@@ -341,6 +345,7 @@ jobs:
           cargo test --locked -p xodus-service
           cargo test --locked -p xodus profile
           cargo test --locked -p xodus api::xbox::auth
+          cargo test --locked -p xodus device_response_
           cargo test --locked -p msixvc
           cargo test --locked -p xodus-cli
           cargo test --locked -p xodus --features key-chain-file --test key_chain_file
@@ -436,6 +441,16 @@ jobs:
         run: |
           xvfb-run -a --server-num=122 --server-args='-screen 0 1280x720x24' \
             dbus-run-session -- python3 tests/gui_accounts_controller.py
+
+      - name: Controller global and per-game runtime selection (offline)
+        run: |
+          xvfb-run -a --server-num=123 --server-args='-screen 0 1280x720x24' \
+            dbus-run-session -- python3 tests/gui_runtime_selection.py
+
+      - name: Resume paused updates from the game grid (offline)
+        run: |
+          xvfb-run -a --server-num=124 --server-args='-screen 0 1280x720x24' \
+            dbus-run-session -- python3 tests/gui_update_resume.py
 
       - name: Persistent install queue and pause controls (offline)
         run: |

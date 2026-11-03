@@ -53,6 +53,41 @@ pub(super) fn enqueue(ui: &Ui, id: &str, name: &str, dir: Option<&Path>, what: &
     start_next(ui);
     render(ui);
 }
+/// Resume an existing transfer, including one loaded paused after a restart.
+pub(super) fn resume(ui: &Ui, id: &str) -> bool {
+    let key = id.to_ascii_uppercase();
+    if !ui
+        .install_queue
+        .borrow()
+        .jobs
+        .iter()
+        .any(|j| j.product_id == key)
+    {
+        return false;
+    }
+    if *ui.closing.borrow() {
+        return true;
+    }
+    if ui
+        .download
+        .current
+        .borrow()
+        .as_ref()
+        .is_some_and(|d| d.product_id == key)
+    {
+        pause(ui, false);
+        return true;
+    }
+    let before = ui.install_queue.borrow().jobs.clone();
+    ui.install_queue.borrow_mut().resume(&key);
+    if save(ui) {
+        start_next(ui);
+        render(ui);
+    } else {
+        ui.install_queue.borrow_mut().jobs = before;
+    }
+    true
+}
 pub(super) fn start_next(ui: &Ui) {
     if ui.busy.borrow().is_some() || *ui.closing.borrow() {
         return;
@@ -174,17 +209,10 @@ pub(super) fn render_queue(ui: &Ui, page: &gtk::Box) {
         }
         let (action_ui, id) = (ui.clone(), job.product_id.clone());
         action.connect_clicked(move |_| {
-            if active {
-                pause(&action_ui, job.status != Status::Paused);
+            if active && job.status == Status::Running {
+                pause(&action_ui, true);
             } else {
-                action_ui
-                    .install_queue
-                    .borrow_mut()
-                    .set_status(&id, Status::Pending);
-                if save(&action_ui) {
-                    start_next(&action_ui);
-                }
-                render(&action_ui);
+                resume(&action_ui, &id);
             }
         });
         row.add_suffix(&action);
