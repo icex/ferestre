@@ -84,7 +84,6 @@ button.game-tile:focus-visible { outline: 3px solid white; outline-offset: 4px; 
 .game-tile .game-title { font-size: 14px; font-weight: 700; }
 .game-tile .game-meta { font-size: 12px; color: #b3b6bd; }
 .game-tile .game-running { color: #8bd77b; font-weight: 700; }
-.game-tile spinner { color: #8bd77b; opacity: 1; }
 .game-launch-overlay { background-color: alpha(#080b0f, 0.72); border-radius: 7px; }
 .game-launch-overlay .game-overlay-state { font-size: 18px; font-weight: 600; color: #f4f4f5; }
 .game-launch-overlay .game-overlay-action { font-size: 20px; font-weight: 700; color: #ffffff; border: 1px solid alpha(#ffffff, 0.65); border-radius: 22px; padding: 7px 22px; }
@@ -2324,6 +2323,48 @@ fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
     view.add_suffix(&actions);
     view
 }
+/// A high-contrast indeterminate ring, independent of the desktop spinner theme.
+fn game_launch_spinner(label: &str) -> gtk::DrawingArea {
+    let ring = gtk::DrawingArea::builder()
+        .content_width(56)
+        .content_height(56)
+        .halign(gtk::Align::Center)
+        .accessible_role(gtk::AccessibleRole::ProgressBar)
+        .build();
+    ring.update_property(&[gtk::accessible::Property::Label(label)]);
+    let started = std::time::Instant::now();
+    ring.set_draw_func(move |widget, context, width, height| {
+        let center = (f64::from(width) / 2., f64::from(height) / 2.);
+        let radius = (f64::from(width.min(height)) / 2. - 5.).max(0.);
+        let angle = if widget.settings().is_gtk_enable_animations() {
+            started.elapsed().as_secs_f64() * std::f64::consts::TAU
+        } else {
+            0.
+        };
+        context.set_line_width(4.);
+        context.set_line_cap(gtk::cairo::LineCap::Round);
+        context.set_source_rgba(1., 1., 1., 0.22);
+        context.arc(center.0, center.1, radius, 0., std::f64::consts::TAU);
+        let _ = context.stroke();
+        context.set_source_rgb(139. / 255., 215. / 255., 123. / 255.);
+        context.arc(
+            center.0,
+            center.1,
+            radius,
+            angle,
+            angle + std::f64::consts::TAU * 0.72,
+        );
+        let _ = context.stroke();
+    });
+    ring.add_tick_callback(|widget, _| {
+        if widget.settings().is_gtk_enable_animations() {
+            widget.queue_draw();
+        }
+        glib::ControlFlow::Continue
+    });
+    ring
+}
+
 fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
     let (description, actions) = library_components(ui, row);
     let primary = actions
@@ -2474,18 +2515,11 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
             .hexpand(true)
             .build();
         if launching || stopping {
-            let spinner = gtk::Spinner::builder()
-                .spinning(true)
-                .width_request(56)
-                .height_request(56)
-                .halign(gtk::Align::Center)
-                .build();
-            spinner.update_property(&[gtk::accessible::Property::Label(if launching {
+            center.append(&game_launch_spinner(if launching {
                 "Starting game"
             } else {
                 "Stopping game"
-            })]);
-            center.append(&spinner);
+            }));
         } else {
             let icon = gtk::Image::from_icon_name("media-playback-stop-symbolic");
             icon.set_pixel_size(48);
