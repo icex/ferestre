@@ -87,7 +87,7 @@ def main():
         write(h/'runtime/proton','#!/bin/sh\nexit 0\n',True);write(h/'runtime/version','launch-fixture\n')
         write(h/'config/gtk-4.0/settings.ini','[Settings]\ngtk-enable-animations=true\n')
         write(h/'sdl.c',SDL);(h/'lib').mkdir();subprocess.run(['cc','-shared','-fPIC',str(h/'sdl.c'),'-o',str(h/'lib/libSDL2-2.0.so.0')],check=True)
-        ids=['9ZZLAUNCH001','9ZZLAUNCH002']
+        ids=['9ZZLAUNCH001','9ZZLAUNCH002','9ZZLAUNCH003']
         schema=int(re.search(r'const CACHE_SCHEMA: u32 = (\d+);',Path('crates/ferestre-core/src/catalog.rs').read_text())[1])
         for n,id in enumerate(ids):
             write(h/f'titles/{id}.toml',f'''schema=1
@@ -104,6 +104,9 @@ summary="Private launch fixture"
             write(h/f'games/launch-{n}/appxmanifest.xml','<Package><Identity Name="Launch.Fixture" Version="1.0.0.0" /></Package>')
             write(h/f'state/ferestre/installed/{id}.json',json.dumps({'product_id':id,'dir':str(h/f'games/launch-{n}')}))
             write(h/f'cache/ferestre/catalog/{id}.json',json.dumps({'schema':schema,'market':'US','language':'en-us','product':{'product_id':id,'name':f'Launch Game {n}','has_packages':True,'has_pc_package':True,'package_format':'MSIXVC'}}))
+        update_record={'product_id':ids[2],'dir':str(h/'games/launch-2'),'content_ids':['fixture-content'],'package_version':'1.0.0.0'}
+        write(h/f'state/ferestre/installed/{ids[2]}.json',json.dumps(update_record))
+        write(h/f'state/ferestre/updates/{ids[2]}.json',json.dumps({'schema':1,'record':update_record,'available':'2.0.0.0'}))
         write(h/'state/ferestre/library.json',json.dumps({'items':[{'productId':id,'productType':'Game','status':'Active'} for id in ids]}))
         def pad(buttons=0,kind=7):
             (h/'pad-next').write_bytes(struct.pack('<Hhhhh2xii',buttons,0,0,0,0,kind,1));(h/'pad-next').replace(h/'pad')
@@ -123,6 +126,13 @@ summary="Private launch fixture"
             def caption(n,text):
                 node=button(n,'Stop');return node and any(text in t for t in s.texts(node))
             wait(lambda _:button(0,'Play'),'first Play')
+            wait(lambda _:button(2,'Update'),'cached update detected')
+            badges=wait(lambda _:s.find_all(frame,role='label',name='Update available'),'update badge')
+            s.check(len(badges)==1,'only the installed game with a confirmed update gets a badge')
+            badge=badges[0].get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
+            tile=button(2,'Update').get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
+            s.check(tile.x<=badge.x and tile.y<=badge.y and badge.x+badge.width<=tile.x+tile.width,'update badge is placed on the game card')
+
             s.click_named(frame,'Launch Game 0 · Play')
             wait(lambda _:caption(0,'starting'),'starting caption')
             spinner=wait(lambda _: (node:=button(0,'Stop')) and next(iter(s.find_all(node,name='Starting game')),None),'starting spinner is exported to accessibility')
@@ -172,6 +182,15 @@ summary="Private launch fixture"
             s.check(not any('Starting game' in t for t in s.texts(frame)),'exit clears per-game loading state')
             s.click_named(frame,'Close');s.check(process.wait(timeout=10)==0,'launch fixture closes cleanly')
             s.check('panicked at' not in (h/'gui.log').read_text(),'launch transitions do not panic')
+            update_record['package_version']='2.0.0.0'
+            write(h/'games/launch-2/appxmanifest.xml','<Package><Identity Name="Launch.Fixture" Version="2.0.0.0" /></Package>')
+            write(h/f'state/ferestre/installed/{ids[2]}.json',json.dumps(update_record))
+            write(h/f'state/ferestre/updates/{ids[2]}.json',json.dumps({'schema':1,'record':update_record,'available':'2.0.0.0'}))
+            with (h/'restart.log').open('wb') as log:process=subprocess.Popen([h/'bin/ferestre-gui'],env=env,stdout=log,stderr=log)
+            app=s.find_app(process.pid,deadline());frame=s.wait_for(app,lambda r:next(iter(s.find_all(r,role='frame')),None),'updated restart window',deadline())
+            s.select_in_list(frame,'My Library');wait(lambda _:button(2,'Play'),'updated game returns to Play')
+            s.check(not s.find_all(frame,role='label',name='Update available'),'matching installed and available versions clear the badge after restart')
+            s.click_named(frame,'Close');s.check(process.wait(timeout=10)==0,'updated fixture closes cleanly')
             print('all launch/loading/Home checks passed',flush=True)
         except Exception:
             print((h/'gui.log').read_text(),flush=True)

@@ -799,6 +799,11 @@ pub struct LibraryRow {
 }
 
 impl LibraryRow {
+    /// Positive update evidence only; unknown checks are not update badges.
+    pub fn has_update(&self) -> bool {
+        self.installed && self.update == Some(true)
+    }
+
     /// Whether the catalog has been asked about this row yet. A row still
     /// showing its product id is waiting, not broken.
     pub fn is_named(&self) -> bool {
@@ -2808,7 +2813,7 @@ mod tests {
         )]
         .into();
         let avail = offering("9ZZTESTGAME1", "1.26.4600.0");
-        let rows = library(&Inputs {
+        let mut inputs = Inputs {
             recipes: &recipes,
             runtimes: std::slice::from_ref(&rt),
             selected_runtime: NO_SELECTION,
@@ -2826,9 +2831,30 @@ mod tests {
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
-        });
+        };
+        let rows = library(&inputs);
         assert_eq!(rows[0].action, Action::Update);
         assert_eq!(rows[0].update, Some(true));
+        assert!(rows[0].has_update());
+        let running = |id: &str| id == "9ZZTESTGAME1";
+        inputs.running = &running;
+        let active = library(&inputs);
+        assert_eq!(active[0].action, Action::Stop);
+        assert!(
+            active[0].has_update(),
+            "a running title retains its update badge"
+        );
+        let mut row = rows[0].clone();
+        row.update = None;
+        assert!(!row.has_update(), "an unknown check is not an update");
+        row.update = Some(false);
+        assert!(!row.has_update(), "current installs have no badge");
+        row.update = Some(true);
+        row.installed = false;
+        assert!(
+            !row.has_update(),
+            "a title not installed here needs no update badge"
+        );
         assert_eq!(
             rows[0].action.command("9ZZTESTGAME1"),
             Some(["install", "9ZZTESTGAME1"]),

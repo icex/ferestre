@@ -74,7 +74,7 @@ from a review of the whole codebase. Forza
 Horizon 6 is playable, with shader startup, native PlayFab saves and Continue
 confirmed. Its marketplace is still under qualification. Dune: Awakening is
 marked playable from player confirmation.
-See [the release qualification](docs/RELEASE-0.1.13.md) for tested scope.
+See [the release qualification](docs/RELEASE-0.1.16.md) for tested scope.
 
 Honest version, because this is early. Every row here was run on a real machine,
 not inferred from the fact that it downloaded:

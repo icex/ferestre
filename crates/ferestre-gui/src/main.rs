@@ -87,6 +87,9 @@ button.game-tile:focus-visible { outline: 3px solid white; outline-offset: 4px; 
 .game-launch-overlay { background-color: alpha(#080b0f, 0.72); border-radius: 7px; }
 .game-launch-overlay .game-overlay-state { font-size: 18px; font-weight: 600; color: #f4f4f5; }
 .game-launch-overlay .game-overlay-action { font-size: 20px; font-weight: 700; color: #ffffff; border: 1px solid alpha(#ffffff, 0.65); border-radius: 22px; padding: 7px 22px; }
+.game-update-badge { background-color: #f2ca64; color: #171b20; border-radius: 5px; padding: 5px 7px; }
+.game-update-badge label { color: #171b20; font-size: 11px; font-weight: 700; }
+.game-update-badge image { color: #171b20; }
 .game-more > button { background-color: alpha(#111317,0.85); border-radius: 5px; }
 .sidebar-recents button { padding: 6px; background: transparent; box-shadow: none; border-radius: 6px; }
 .sidebar-recents button:hover { background-color: #343840; }
@@ -2563,6 +2566,23 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
     } else {
         surface.add_css_class("game-tile");
         overlay.set_child(Some(&surface));
+    }
+    if row.has_update() {
+        let badge = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(4)
+            .halign(gtk::Align::Start)
+            .valign(gtk::Align::Start)
+            .margin_top(6)
+            .margin_start(6)
+            .css_classes(["game-update-badge"])
+            .can_target(false)
+            .build();
+        let icon = gtk::Image::from_icon_name("software-update-available-symbolic");
+        icon.set_pixel_size(14);
+        badge.append(&icon);
+        badge.append(&gtk::Label::new(Some("Update available")));
+        overlay.add_overlay(&badge);
     }
     if let Some(more) = actions.first_child() {
         actions.remove(&more);

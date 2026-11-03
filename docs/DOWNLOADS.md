@@ -2,7 +2,9 @@
 
 Home shows featured artwork and recent games. My Library, Game Pass and Installed
 use large cover cards; pressing a card starts its primary action. The always-visible
-More menu includes Game details, launch settings and other actions. Search is
+More menu includes Game details, launch settings and other actions. Installed games
+with a confirmed update show an Update available badge on their cover, including
+while running; current installs and unknown update checks show no badge. Search is
 centered above the library. On
 narrow windows, Show navigation opens the sidebar. Touch controls have at least
 44 logical pixels; scrolling uses GTK's touch and kinetic scrolling support.
