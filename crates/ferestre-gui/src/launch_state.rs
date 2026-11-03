@@ -35,6 +35,16 @@ fn observed(root: &Path, uid: u32, tag: &str, executable: &str) -> bool {
             return false;
         }
         let dir = entry.path();
+        // Most processes cannot be this title. Check the image first so a
+        // launch does not repeatedly read every other application's environment.
+        let Ok(cmd) = std::fs::read(dir.join("cmdline")) else {
+            return false;
+        };
+        let first = cmd.split(|b| *b == 0).next().unwrap_or_default();
+        let name = String::from_utf8_lossy(first);
+        if !image(&name).eq_ignore_ascii_case(image(executable)) {
+            return false;
+        }
         let Ok(status) = std::fs::read_to_string(dir.join("status")) else {
             return false;
         };
@@ -51,12 +61,7 @@ fn observed(root: &Path, uid: u32, tag: &str, executable: &str) -> bool {
         if !env.split(|b| *b == 0).any(|v| v == expected.as_bytes()) {
             return false;
         }
-        let Ok(cmd) = std::fs::read(dir.join("cmdline")) else {
-            return false;
-        };
-        let first = cmd.split(|b| *b == 0).next().unwrap_or_default();
-        let name = String::from_utf8_lossy(first);
-        image(&name).eq_ignore_ascii_case(image(executable))
+        true
     })
 }
 pub fn mark_ready(launches: &mut BTreeMap<String, stop::Launch>, key: &str, pgid: u32) -> bool {

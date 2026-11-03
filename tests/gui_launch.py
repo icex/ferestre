@@ -110,6 +110,11 @@ summary="Private launch fixture"
             s.check(caption(1,'starting'),'another game remains starting independently')
             (h/f'fail-{ids[1]}').touch();wait(lambda _:button(1,'Play'),'failed launch returns to Play')
             s.check(caption(0,'running'),'one launch failing does not reset another game')
+            (h/f'fail-{ids[1]}').unlink()
+            s.click_named(frame,'Launch Game 1 · Play');wait(lambda _:caption(1,'starting'),'retry starts a fresh loading state')
+            time.sleep(1.6);s.click_named(frame,'Launch Game 1 · Stop')
+            wait(lambda _:button(1,'Play'),'startup can be cancelled')
+            s.check(caption(0,'running'),'cancelling startup leaves the other game running')
             # A separate GTK application represents the focused game window.
             standin="import gi;gi.require_version('Gtk','4.0');from gi.repository import Gtk;app=Gtk.Application(application_id='io.github.icex.ferestre.FocusFixture');app.connect('activate',lambda a:Gtk.ApplicationWindow(application=a,title='Game focus fixture',default_width=350,default_height=180).present());app.run()"
             with (h/'other.log').open('wb') as log:other=subprocess.Popen(['python3','-c',standin],env=env,stdout=log,stderr=log)
@@ -125,6 +130,9 @@ summary="Private launch fixture"
                 s.check(active_pid()==process.pid and button(0,'Stop'),'Home brings the main window forward without activating Stop')
                 pad(0,kind);time.sleep(.1)
             other.terminate();other.wait(timeout=5);other=None
+            (h/f'end-{ids[0]}').touch();wait(lambda _:button(0,'Play'),'a game exiting normally resets its tile')
+            (h/f'end-{ids[0]}').unlink()
+            s.click_named(frame,'Launch Game 0 · Play');wait(lambda _:caption(0,'running'),'a new launch has its own readiness observation')
             time.sleep(1.6)
             s.click_named(frame,'Launch Game 0 · Stop')
             wait(lambda _:button(0,'Play'),'Stop returns the tile to Play')
