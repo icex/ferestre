@@ -3,7 +3,7 @@
   "components": {
     "xodus": {
       "repository": "https://github.com/icex/xodus.git",
-      "commit": "e35bde1848e0ada2c5933b3ee1e6c82deb88256a",
+      "commit": "b8364e5a36932e4f79a8ccab7dd02e46b5c5a956",
       "upstream": "https://github.com/xodus-gaming/xodus.git",
       "upstream_commit": "3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60",
       "modified_paths": [

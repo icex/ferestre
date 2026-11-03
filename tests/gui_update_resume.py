@@ -13,6 +13,7 @@ def main():
  with tempfile.TemporaryDirectory(prefix='ferestre-update-resume-') as tmp:
   home=Path(tmp);ids,_,pad,env=prepare(home,args.binary)
   client=CLI.replace("id=sys.argv[2]", "id=sys.argv[2]\nwith (h/'arguments').open('a') as out:out.write(json.dumps(sys.argv[1:])+'\\n')")
+  client=client.replace('paused=False;sequence=0;done=0', "print('FERESTRE_PROGRESS '+json.dumps({'schema':1,'sequence':0,'phase':'metadata','completedBytes':0,'totalBytes':None,'paused':False,'canPause':False}),flush=True)\nprint(json.dumps({'progress':{'done':1000000,'total':170000000000}}),flush=True)\nwhile not (h/'metadata-ready').exists():time.sleep(.03)\npaused=False;sequence=0;done=0")
   write(home/'bin/ferestre',client,True)
   jobs=[]
   for n,id in enumerate(ids[:2]):
@@ -35,6 +36,10 @@ def main():
    s.click(button)
    wait(lambda _: (home/'arguments').exists(),'saved download restarts directly')
    s.check(not s.find_all(app,role='button',name='Choose install folder'),'Resume opens no install confirmation')
+   wait(lambda root:any('Preparing package metadata' in text for text in s.texts(root)),'metadata phase is visible')
+   s.check(not any('170 GB' in text for text in s.texts(frame)),'metadata does not claim a full-game network download')
+   (home/'metadata-ready').touch()
+   wait(lambda root:any('game data downloaded' in text and 'reused' in text for text in s.texts(root)),'processed, downloaded and reused bytes shown separately')
    arguments=json.loads((home/'arguments').read_text().splitlines()[0])
    s.check(arguments==['install',ids[0],jobs[0]['destination']],'Resume keeps the exact saved destination')
    queue=json.loads((home/'state/ferestre/install-queue.json').read_text())['jobs']

@@ -4042,19 +4042,7 @@ impl DownloadBar {
         let detail = if let Some(snapshot) = snapshot {
             self.pause
                 .set_label(if snapshot.paused { "Resume" } else { "Pause" });
-            let status = if snapshot.paused {
-                "Paused — progress is kept".into()
-            } else {
-                download.detail(now)
-            };
-            match (snapshot.network_bytes, snapshot.reused_bytes) {
-                (Some(network), Some(reused)) => format!(
-                    "{status}  ·  {} downloaded  ·  {} reused",
-                    progress::bytes(network),
-                    progress::bytes(reused)
-                ),
-                _ => status,
-            }
+            snapshot.detail(download, now)
         } else {
             download.detail(now)
         };
