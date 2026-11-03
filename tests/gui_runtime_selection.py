@@ -18,6 +18,7 @@ def main():
     s.Atspi.init();process=app=wm=None
     with tempfile.TemporaryDirectory(prefix='ferestre-runtime-choice-') as tmp:
         home=Path(tmp);ids,_,pad,env=prepare(home,args.binary)
+        env['FERESTRE_SCRIPTS_DIR']=str(Path.cwd()/'scripts')
         # Two managed runtimes plus the environment override from prepare().
         versions=['11.0.1','11.0.2']
         runtimes=[home/'state/ferestre/runtimes'/v for v in versions]
@@ -37,14 +38,14 @@ def main():
             frame=wait(lambda root:next(iter(s.find_all(root,role='frame',name='Ferestre')),None),'window')
             s.select_in_list(frame,'Settings');driver=Driver(app,pad)
             driver.pulse(12);driver.seek('Choose default runtime')
-            driver.press(0,lambda root:s.find_all(root,role='frame',name='Default game runtime'),'controller opens default runtime chooser')
+            driver.press(0,lambda root:s.find_all(root,role='button',name='Automatic (newest compatible)'),'controller opens default runtime chooser')
             default_name=f'11.0.1 ({runtimes[0]})'
             driver.seek(default_name);driver.press(0,lambda _:saved().get('default')==str(runtimes[0]),'save global default')
             s.check(plan(ids[0])==str(runtimes[0]),'real CLI uses Settings default ahead of environment override')
             s.select_in_list(frame,'My Library')
             driver.pulse(12);driver.seek('Launch Game 0 · Play')
             driver.press(6,lambda root:s.find_all(root,role='button',name='Choose runtime'),'controller opens game options')
-            driver.seek('Choose runtime');driver.press(0,lambda root:s.find_all(root,role='frame',name='Runtime for Launch Game 0'),'controller opens per-game runtime chooser')
+            driver.seek('Choose runtime');driver.press(0,lambda root:s.find_all(root,role='button',name='Use default runtime'),'controller opens per-game runtime chooser')
             driver.seek(f'11.0.2 ({runtimes[1]})');driver.press(0,lambda _:saved().get('titles',{}).get(ids[0])==str(runtimes[1]),'save game override')
             s.check(plan(ids[0])==str(runtimes[1]) and plan(ids[1])==str(runtimes[0]),'game override applies only to its own launch')
             driver.seek('Launch Game 0 · Play');driver.press(6,lambda root:s.find_all(root,role='button',name='Choose runtime'),'reopen options')
@@ -52,7 +53,7 @@ def main():
             driver.seek('Use default runtime');driver.press(0,lambda _:ids[0] not in saved().get('titles',{}),'restore inherited default')
             s.check(plan(ids[0])==str(runtimes[0]),'removing game override restores Settings default')
             s.select_in_list(frame,'Settings');driver.pulse(12);driver.seek('Choose default runtime')
-            driver.press(0,lambda root:s.find_all(root,role='frame',name='Default game runtime'),'open default again')
+            driver.press(0,lambda root:s.find_all(root,role='button',name='Automatic (newest compatible)'),'open default again')
             driver.seek('Automatic (newest compatible)');driver.press(0,lambda _:'default' not in saved(),'restore automatic default')
             s.check(plan(ids[0])==str(home/'runtime'),'automatic restores existing environment override')
             driver.seek('Quit Ferestre');driver.pulse(0);s.check(process.wait(timeout=10)==0,'runtime selection session closes cleanly')

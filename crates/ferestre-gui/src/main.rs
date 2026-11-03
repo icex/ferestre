@@ -2031,13 +2031,10 @@ fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
             },
         )
     };
-    let dialog = gtk::Window::builder()
-        .application(ui.window.application().as_ref().unwrap())
-        .transient_for(&ui.window)
-        .modal(true)
+    let dialog = adw::Dialog::builder()
         .title(title)
-        .default_width(520)
-        .default_height(420)
+        .content_width(520)
+        .content_height(420)
         .build();
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -2125,7 +2122,9 @@ fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
     }
     let cancel = gtk::Button::with_label("Cancel");
     let cancel_dialog = dialog.clone();
-    cancel.connect_clicked(move |_| cancel_dialog.close());
+    cancel.connect_clicked(move |_| {
+        cancel_dialog.close();
+    });
     content.append(&cancel);
     dialog.set_child(Some(
         &gtk::ScrolledWindow::builder()
@@ -2133,7 +2132,7 @@ fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
             .child(&content)
             .build(),
     ));
-    dialog.present();
+    dialog.present(Some(&ui.window));
     automatic.grab_focus();
 }
 
@@ -2855,7 +2854,17 @@ fn library_components(ui: &Ui, row: &LibraryRow) -> (adw::ActionRow, gtk::Box) {
         .margin_start(6)
         .margin_end(6)
         .build();
-    let popover = gtk::Popover::builder().child(&menu).build();
+    // Installed games have more actions than fit below a tile on a 720p
+    // handheld. A bounded scroller lets the popup fit and follows controller
+    // focus; GTK 4.14 otherwise dismisses a popup below its minimum height.
+    let menu_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .min_content_width(240)
+        .max_content_height(320)
+        .propagate_natural_height(true)
+        .child(&menu)
+        .build();
+    let popover = gtk::Popover::builder().child(&menu_scroll).build();
     let more = gtk::MenuButton::builder()
         .icon_name("view-more-symbolic")
         .valign(gtk::Align::Center)
