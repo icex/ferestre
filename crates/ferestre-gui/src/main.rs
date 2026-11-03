@@ -84,6 +84,7 @@ button.game-tile:focus-visible { outline: 3px solid white; outline-offset: 4px; 
 .game-tile .game-title { font-size: 14px; font-weight: 700; }
 .game-tile .game-meta { font-size: 12px; color: #b3b6bd; }
 .game-tile .game-running { color: #8bd77b; font-weight: 700; }
+.game-tile spinner { color: #8bd77b; opacity: 1; }
 .game-more > button { background-color: alpha(#111317,0.85); border-radius: 5px; }
 .sidebar-recents button { padding: 6px; background: transparent; box-shadow: none; border-radius: 6px; }
 .sidebar-recents button:hover { background-color: #343840; }
@@ -2401,11 +2402,14 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
     } else {
         row.action.label()
     };
-    let size = description.subtitle().and_then(|text| {
-        text.split("  ·  ")
-            .find(|part| part.contains(" download") || part.contains("on disk"))
-            .map(str::to_owned)
-    });
+    let size = description
+        .subtitle()
+        .filter(|_| row.action != Action::Stop)
+        .and_then(|text| {
+            text.split("  ·  ")
+                .find(|part| part.contains(" download") || part.contains("on disk"))
+                .map(str::to_owned)
+        });
     let state = size.map_or_else(|| state.to_string(), |size| format!("{state} · {size}"));
     let state = if row.action == Action::Stop {
         state

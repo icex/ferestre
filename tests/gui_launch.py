@@ -56,6 +56,28 @@ def active_pid():
     finally:x.XCloseDisplay(d)
 
 
+def spinner_animates(pid, node):
+    x=ctypes.CDLL(ctypes.util.find_library('X11'));ptr=ctypes.c_void_p;ulong=ctypes.c_ulong
+    x.XOpenDisplay.argtypes=[ctypes.c_char_p];x.XOpenDisplay.restype=ptr
+    x.XDefaultRootWindow.argtypes=[ptr];x.XDefaultRootWindow.restype=ulong
+    x.XGetImage.argtypes=[ptr,ulong,ctypes.c_int,ctypes.c_int,ctypes.c_uint,ctypes.c_uint,ulong,ctypes.c_int];x.XGetImage.restype=ptr
+    x.XGetPixel.argtypes=[ptr,ctypes.c_int,ctypes.c_int];x.XGetPixel.restype=ulong
+    x.XDestroyImage.argtypes=[ptr];x.XCloseDisplay.argtypes=[ptr]
+    d=x.XOpenDisplay(None)
+    try:
+        origin=s.window_origin(pid);box=node.get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
+        frames=[]
+        for _ in range(4):
+            pixels=x.XGetImage(d,x.XDefaultRootWindow(d),origin[0]+box.x,origin[1]+box.y,box.width,box.height,ulong(-1).value,2)
+            if not pixels:raise s.Failure('cannot capture launch spinner')
+            try:frames.append(tuple(x.XGetPixel(pixels,i,j)&0xffffff for j in range(box.height) for i in range(box.width)))
+            finally:x.XDestroyImage(pixels)
+            time.sleep(.13)
+        visible=any(((v>>8)&255)>((v>>16)&255)+20 and ((v>>8)&255)>(v&255)+10 for f in frames for v in f)
+        return visible and len(set(frames))>1
+    finally:x.XCloseDisplay(d)
+
+
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--binary',default='target/debug/ferestre-gui');args=parser.parse_args()
     s.Atspi.init();process=other=wm=None;frame=None
@@ -63,7 +85,7 @@ def main():
         h=Path(tmp);(h/'bin').mkdir();shutil.copy2(Path(args.binary).resolve(),h/'bin/ferestre-gui')
         write(h/'bin/ferestre',CLI,True);write(h/'client/xodus-cli','#!/bin/sh\nexit 1\n',True)
         write(h/'runtime/proton','#!/bin/sh\nexit 0\n',True);write(h/'runtime/version','launch-fixture\n')
-        write(h/'config/gtk-4.0/settings.ini','[Settings]\ngtk-enable-animations=false\n')
+        write(h/'config/gtk-4.0/settings.ini','[Settings]\ngtk-enable-animations=true\n')
         write(h/'sdl.c',SDL);(h/'lib').mkdir();subprocess.run(['cc','-shared','-fPIC',str(h/'sdl.c'),'-o',str(h/'lib/libSDL2-2.0.so.0')],check=True)
         ids=['9ZZLAUNCH001','9ZZLAUNCH002']
         schema=int(re.search(r'const CACHE_SCHEMA: u32 = (\d+);',Path('crates/ferestre-core/src/catalog.rs').read_text())[1])
@@ -104,6 +126,8 @@ summary="Private launch fixture"
             s.click_named(frame,'Launch Game 0 · Play')
             wait(lambda _:caption(0,'starting'),'starting caption')
             s.check(any('Starting game' in t for t in s.texts(button(0,'Stop'))),'starting tile contains the animated spinner')
+            spinner=s.find_all(button(0,'Stop'),name='Starting game')[0]
+            s.check(spinner_animates(process.pid,spinner),'launch spinner paints contrasting pixels and animates on the actual grid tile')
             s.click_named(frame,'Launch Game 1 · Play');wait(lambda _:caption(1,'starting'),'second starting caption')
             (h/f'ready-{ids[0]}').touch();wait(lambda _:caption(0,'running'),'observed game becomes running')
             s.check(not any('Starting game' in t for t in s.texts(button(0,'Stop'))),'running tile removes its spinner')
