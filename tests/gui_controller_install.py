@@ -32,6 +32,7 @@ def main():
             driver.seek('Launch Game 0 · Install')
             driver.pulse(3);driver.press(0,lambda root:s.find_all(root,role='button',name='Done'),'controller opens the in-app keyboard')
             driver.seek('a');driver.pulse(0)
+            driver.press(0,lambda root:s.find_all(root,role='label',name='aa'),'two rapid Accept presses both enter text')
             driver.press(1,lambda root:not s.find_all(root,role='button',name='Done'),'Back cancels text entry')
             def search_text():
                 return next((s.Atspi.Text.get_text(n,0,-1) for n in s.find_all(frame,role='entry') if n.get_text_iface()),None)

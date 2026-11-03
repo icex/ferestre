@@ -241,7 +241,7 @@ fn activate_navigation(ui: &Ui) {
             focus.widget_name().as_str(),
             "navigation-downloads" | "navigation-settings"
         );
-    focus.activate();
+    activate(ui, &focus);
     if enter_games {
         let ui = ui.clone();
         glib::idle_add_local_once(move || focus_content(&ui));
@@ -944,6 +944,11 @@ fn activate(ui: &Ui, focus: &gtk::Widget) {
         switch.set_active(!switch.is_active());
     } else if let Some(check) = focus.downcast_ref::<gtk::CheckButton>() {
         check.set_active(!check.is_active());
+    } else if let Some(button) = focus.downcast_ref::<gtk::Button>() {
+        // Widget::activate animates GtkButton for 250 ms and merges a second
+        // activation during that interval. Controller edges are already
+        // debounced; each Accept must commit once, including repeated letters.
+        button.emit_clicked();
     } else {
         focus.activate();
     }
