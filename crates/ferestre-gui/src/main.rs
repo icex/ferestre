@@ -2397,7 +2397,29 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
     if let Some(texture) = texture.filter(|t| t.width() >= 300) {
         art.set_paintable(Some(&texture));
     }
-    body.append(&art);
+    let cover = gtk::Overlay::new();
+    cover.set_child(Some(&art));
+    if row.has_update() {
+        // Keep the badge on the cover, below the separate top-right menu.
+        // Both controls must remain readable on the narrow handheld cards.
+        let badge = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(4)
+            .halign(gtk::Align::Start)
+            .valign(gtk::Align::End)
+            .margin_bottom(6)
+            .margin_start(6)
+            .margin_end(6)
+            .css_classes(["game-update-badge"])
+            .can_target(false)
+            .build();
+        let icon = gtk::Image::from_icon_name("software-update-available-symbolic");
+        icon.set_pixel_size(14);
+        badge.append(&icon);
+        badge.append(&gtk::Label::new(Some("Update available")));
+        cover.add_overlay(&badge);
+    }
+    body.append(&cover);
     let text = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(5)
@@ -2566,23 +2588,6 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
     } else {
         surface.add_css_class("game-tile");
         overlay.set_child(Some(&surface));
-    }
-    if row.has_update() {
-        let badge = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(4)
-            .halign(gtk::Align::Start)
-            .valign(gtk::Align::Start)
-            .margin_top(6)
-            .margin_start(6)
-            .css_classes(["game-update-badge"])
-            .can_target(false)
-            .build();
-        let icon = gtk::Image::from_icon_name("software-update-available-symbolic");
-        icon.set_pixel_size(14);
-        badge.append(&icon);
-        badge.append(&gtk::Label::new(Some("Update available")));
-        overlay.add_overlay(&badge);
     }
     if let Some(more) = actions.first_child() {
         actions.remove(&more);

@@ -421,7 +421,7 @@ jobs:
 
       - name: Game launch loading, running state and background Home (offline)
         run: |
-          xvfb-run -a --server-num=117 --server-args='-screen 0 1280x900x24' \
+          xvfb-run -a --server-num=117 --server-args='-screen 0 1280x720x24' \
             dbus-run-session -- python3 tests/gui_launch.py
 
       - name: Persistent install queue and pause controls (offline)
