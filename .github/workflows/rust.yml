@@ -45,6 +45,7 @@ on:
       - 'tests/gui_accounts_controller.py'
       - 'tests/gui_runtime_selection.py'
       - 'tests/gui_update_resume.py'
+      - 'tests/gui_controller_focus.py'
       - 'tests/controller_driver.py'
       - 'tests/test_gui_actions.py'
       - 'tests/run_wayland_gui.py'
@@ -101,6 +102,7 @@ on:
       - 'tests/gui_accounts_controller.py'
       - 'tests/gui_runtime_selection.py'
       - 'tests/gui_update_resume.py'
+      - 'tests/gui_controller_focus.py'
       - 'tests/controller_driver.py'
       - 'tests/test_gui_actions.py'
       - 'tests/run_wayland_gui.py'
@@ -451,6 +453,11 @@ jobs:
         run: |
           xvfb-run -a --server-num=124 --server-args='-screen 0 1280x720x24' \
             dbus-run-session -- python3 tests/gui_update_resume.py
+
+      - name: Controller tab focus and single selection outline (offline)
+        run: |
+          xvfb-run -a --server-num=125 --server-args='-screen 0 1280x720x24' \
+            dbus-run-session -- python3 tests/gui_controller_focus.py
 
       - name: Persistent install queue and pause controls (offline)
         run: |

@@ -153,6 +153,48 @@ fn reveal_on_frame(ui: &Ui) {
         }
     });
 }
+
+/// Rebuilt tabs must retain the selected section, rather than GTK's fallback
+/// focus on a neighbouring button after the previous tab widget is removed.
+pub(super) fn focus_after_render(name: &str, section: Section) -> Option<String> {
+    if name.starts_with("section-") {
+        Some(format!("section-{}", section.title()))
+    } else if name.starts_with("game-") || name.starts_with("queue-") || name.starts_with("recent-")
+    {
+        Some(name.into())
+    } else {
+        None
+    }
+}
+
+pub(super) fn focus_section_tab(ui: &Ui, section: Section) {
+    let ui = ui.clone();
+    let window = ui.window.clone();
+    let frames = Cell::new(0u8);
+    window.add_tick_callback(move |_, _| {
+        if ui.model.borrow().section != section || ui.window.visible_dialog().is_some() {
+            return glib::ControlFlow::Break;
+        }
+        frames.set(frames.get() + 1);
+        if frames.get() >= 2 {
+            if let Some(tab) = named_widget(
+                ui.content.upcast_ref(),
+                &format!("section-{}", section.title()),
+            ) {
+                if tab.is_mapped() {
+                    tab.grab_focus();
+                    update_hints(&ui);
+                    return glib::ControlFlow::Break;
+                }
+            }
+        }
+        if frames.get() >= 4 {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+}
 pub(super) fn focus_content(ui: &Ui) {
     if let Some(dialog) = ui.window.visible_dialog() {
         if let Some(default) = dialog.default_widget() {
@@ -175,7 +217,13 @@ pub(super) fn focus_content(ui: &Ui) {
             })
         })
         .filter(|w| w.is_sensitive())
-        .or_else(|| game_buttons(ui).into_iter().next());
+        .or_else(|| game_buttons(ui).into_iter().next())
+        .or_else(|| {
+            named_widget(
+                ui.content.upcast_ref(),
+                &format!("section-{}", ui.model.borrow().section.title()),
+            )
+        });
     if let Some(button) = button {
         button.grab_focus();
     } else if !ui.content.child_focus(gtk::DirectionType::TabForward) {
@@ -1335,6 +1383,26 @@ pub(super) fn install(ui: &Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rebuilding_tabs_restores_the_selected_section_and_preserves_game_controls() {
+        assert_eq!(
+            focus_after_render("section-Installed", Section::Downloads).as_deref(),
+            Some("section-Downloads")
+        );
+        assert_eq!(
+            focus_after_render("section-Downloads", Section::Installed).as_deref(),
+            Some("section-Installed")
+        );
+        assert_eq!(
+            focus_after_render("game-9ZZTESTGAME1-primary", Section::Library).as_deref(),
+            Some("game-9ZZTESTGAME1-primary")
+        );
+        assert_eq!(
+            focus_after_render("queue-9ZZTESTGAME1-resume", Section::Downloads).as_deref(),
+            Some("queue-9ZZTESTGAME1-resume")
+        );
+        assert_eq!(focus_after_render("GtkButton", Section::Downloads), None);
+    }
     #[test]
     fn modal_destination_controls_are_reachable_above_the_response_buttons() {
         let rects = [

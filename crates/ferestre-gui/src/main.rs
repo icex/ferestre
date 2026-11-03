@@ -80,7 +80,7 @@ window.ferestre-window, .ferestre-content, .ferestre-content > contents {
 .ferestre-window button { color: #f4f4f5; }
 .ferestre-window button.suggested-action { background-color: #107c10; color: #ffffff; }
 .game-tile { background-color: #25282d; border-radius: 7px; }
-button.game-tile { padding: 0; border: 0; background-color: #25282d; color: #f4f4f5; box-shadow: none; border-radius: 7px; }
+button.game-tile { padding: 0; border: 0; background-image: none; background-color: #25282d; color: #f4f4f5; box-shadow: none; border-radius: 7px; }
 button.game-tile:hover { background-color: #30343b; }
 button.game-tile:focus-visible { outline: 3px solid white; outline-offset: 4px; }
 .game-tile picture { border-radius: 7px 7px 0 0; }
@@ -154,6 +154,16 @@ window.ferestre-window flowboxchild:focus-visible {
 .navigation-sidebar row { min-height: 52px; border-radius: 10px; margin: 3px 8px; }
 .game-grid { background: transparent; }
 .game-grid flowboxchild { padding: 0; border-radius: 16px; }
+window.ferestre-window .game-grid button { transition-property: none; }
+window.ferestre-window .game-grid button:focus-visible:not(:focus) { outline: none; box-shadow: none; }
+/* Only the actual tile/action owns its focus ring, never its FlowBox wrapper. */
+window.ferestre-window .game-grid flowboxchild,
+window.ferestre-window .game-grid flowboxchild:focus,
+window.ferestre-window .game-grid flowboxchild:focus-visible,
+window.ferestre-window .game-grid flowboxchild:focus-within {
+  outline: none;
+  box-shadow: none;
+}
 .game-card { border-radius: 16px; background: @card_bg_color; box-shadow: 0 2px 10px alpha(black,0.12); }
 .game-card picture { border-radius: 16px 16px 0 0; }
 .game-card .game-actions { margin: 0 14px 14px 14px; }
@@ -930,6 +940,8 @@ fn build_ui(app: &adw::Application) {
 // --- rendering ------------------------------------------------------------
 
 fn select_section(ui: &Ui, section: Section) {
+    let from_tab = GtkWindowExt::focus(&ui.window)
+        .is_some_and(|focus| focus.widget_name().starts_with("section-"));
     let nav = if matches!(
         section,
         Section::Installed | Section::Updates | Section::Downloads
@@ -957,6 +969,9 @@ fn select_section(ui: &Ui, section: Section) {
         render(ui);
     }
     ui.split.set_show_content(true);
+    if from_tab {
+        controller::focus_section_tab(ui, section);
+    }
 }
 
 fn named_widget(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
@@ -986,10 +1001,7 @@ fn render(ui: &Ui) {
     let window = &ui.window;
     let focus_name = GtkWindowExt::focus(window)
         .filter(|w| w.is_ancestor(&ui.content))
-        .map(|w| w.widget_name().to_string())
-        .filter(|name| {
-            name.starts_with("game-") || name.starts_with("queue-") || name.starts_with("recent-")
-        });
+        .and_then(|w| controller::focus_after_render(&w.widget_name(), ui.model.borrow().section));
     if GtkWindowExt::focus(window).is_some_and(|focus| focus.is_ancestor(&ui.content)) {
         GtkWindowExt::set_focus(window, None::<&gtk::Widget>);
     }
@@ -1101,14 +1113,18 @@ fn render(ui: &Ui) {
     }
     preload_gamepass_art(ui);
     if let Some(name) = focus_name {
-        let window = ui.window.clone();
-        glib::idle_add_local_once(move || {
-            if GtkWindowExt::focus(&window).is_none() {
-                if let Some(widget) = named_widget(window.upcast_ref(), &name) {
-                    widget.grab_focus();
+        if name.starts_with("section-") {
+            controller::focus_section_tab(ui, ui.model.borrow().section);
+        } else {
+            let window = ui.window.clone();
+            glib::idle_add_local_once(move || {
+                if GtkWindowExt::focus(&window).is_none() {
+                    if let Some(widget) = named_widget(window.upcast_ref(), &name) {
+                        widget.grab_focus();
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 }
 
@@ -1868,8 +1884,13 @@ fn render_rows(
             .column_spacing(18)
             .css_classes(["game-grid"])
             .build();
-        for row in &drawn.rows {
+        for (index, row) in drawn.rows.iter().enumerate() {
             grid.insert(&game_card(ui, row), -1);
+            // Each card already contains its own primary and More controls.
+            // A focusable wrapper adds a second selection boundary.
+            if let Some(child) = grid.child_at_index(index as i32) {
+                child.set_focusable(false);
+            }
         }
         grid.connect_child_activated(|_, child| {
             if let Some(card) = child.child() {
