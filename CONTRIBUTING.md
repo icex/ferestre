@@ -13,8 +13,8 @@ a log you paste into an issue.
 ```
 .github/   issue and PR templates, and the script that regenerates the
            compatibility matrix from the recipes
-patches/   modifications to Wine/Proton and to the GDK DLL, as plain git diffs
-           (LGPL-2.1-or-later, because Wine is; the Xodus ones are GPL-3.0-only)
+sources.lock.json  immutable component fork commits, upstream bases and modified paths
+third_party/       pinned Xodus and Proton submodules
 scripts/   build, install and per-title launch
 tests/     synthetic suites; run them before proposing a runtime change
 titles/    one TOML recipe per Store product id -- the per-title data the
@@ -110,9 +110,11 @@ the log" is.
 
 ## Changing the runtime
 
-`patches/` are plain `git diff` output against the fork, regenerated with
-`git diff --relative` from the relevant directory. Keep one concern per patch
-file, and explain *why* in the commit message rather than restating the diff.
+Runtime changes belong in the corresponding [component fork](docs/SOURCES.md).
+Keep one concern per commit and explain why it is needed. Update the parent
+submodule pins and `sources.lock.json` together, then run
+`scripts/check-sources.sh --remote`. Build and test the resulting runtime before
+proposing a runtime release. Do not add a patch-application step to Ferestre.
 
 Anything that changes GDK behaviour should come with a test that fails without
 it. Several fixes here looked right and were not; the ones that stuck were the

@@ -79,7 +79,7 @@ keys, or let one process read what it should not:
 
 - Token handling: how credentials reach the desktop keyring, and the
   `xodus-service` IPC socket that hands XSTS tokens to the runtime
-  (`patches/xodus-cli/0001-xsts-token-ipc-endpoint.patch`) — permissions,
+  ([pinned client source](../sources.lock.json)) — permissions,
   authentication, what any local process can ask it for.
 - The launch path: the memfd holding the decrypted executable, the file
   descriptors inherited by Wine, `WINE_DLL_FILE_MAP`, and anything that lets a

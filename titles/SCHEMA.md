@@ -160,7 +160,7 @@ line, `#` comments allowed — and the validator will check a recipe against it:
 
 No runtime build generates that file yet. This is the contract it has to
 satisfy when one does; until then the check is opt-in and the registry is
-maintained by hand against `patches/`.
+maintained by hand against the commits in `sources.lock.json`.
 
 Only list a capability you have evidence the title uses — a log line, a
 documented failure. Omitting one is not a claim that the title does not use it;
@@ -224,7 +224,7 @@ must not be in the future.
   is data, and data that can run commands is not data.
 - **Download URLs or keys.** The client fetches the title with the user's own
   licence; a recipe has nothing to say about that beyond the product id.
-- **A list of patches.** Recipes point at capabilities; capabilities point at
-  patches. A title should not have to care how a capability is implemented.
+- **A list of patches.** Recipes point at capabilities; capabilities identify
+  the implementing fork commits. A title should not have to care how a capability is implemented.
 - **Anything per-machine.** Paths are relative and resolved from `XODUS_*`
   environment variables, so a recipe is the same file on everyone's disk.

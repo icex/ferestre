@@ -6,7 +6,7 @@ project, and exactly where the ones that fail stop.
 ## Read this first
 
 **Many titles remain untested, and an untested title may expose another runtime
-gap.** Fifteen titles have been run. The GDK runtime is written against the
+gap.** The matrix below records the titles with checked-in recipes. The GDK runtime is written against the
 *observable* behaviour of the API — task queues, async, users, storage,
 networking, save games, packages — so each new title remains useful evidence.
 
@@ -35,11 +35,7 @@ real contribution even — especially — when the answer is that it does not ru
 **Before you paste anything: a session log contains your gamertag, your XUID and
 your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 
-Current release qualification: [0.1.13](RELEASE-0.1.13.md), with runtime
-11.0.20261018.1. Forza Horizon 6 and Minecraft for Windows play with separate
-Store and Player accounts; Minecraft Dungeons II takes a DualShock 4 without
-Steam; Steam Input layouts apply from Steam shortcuts. Halo is playable, with
-an intermittent offline indicator still unresolved.
+Current launcher: [0.1.17](RELEASE-0.1.17.md), using runtime **11.0.20261023.1**. The detailed [0.1.16 qualification](RELEASE-0.1.16.md) describes launcher and controller fixture coverage. The title-specific results and dates below come from the recipes; they are not refreshed merely because the launcher changes.
 
 ## The matrix
 

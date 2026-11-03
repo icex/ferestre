@@ -43,7 +43,7 @@ usr/bin/ferestre                  the launcher, or the placeholder shell command
 usr/lib/ferestre/client/          xodus-cli and xodus-service
 usr/lib/ferestre/runtime/         patched Proton, including xgameruntime.dll
 usr/lib/ferestre/scripts/         the launch path: launch-gdk.sh, proton-wine-shim.sh, …
-usr/lib/ferestre/patches/         so install-runtime works, and RECIPES.md is followable
+usr/lib/ferestre/sources.lock.json  exact source commits for the bundled components
 usr/share/{applications,icons,metainfo,doc}
 ```
 
@@ -174,11 +174,7 @@ the running game.
 
 ## Licensing note
 
-The AppImage carries the patch series, which is not all MIT: `patches/wine` and
-`patches/xgameruntime` are LGPL-2.1-or-later and `patches/xodus-cli` is GPL-3.0.
-They travel as source diffs, which is aggregation and satisfies both. `NOTICE`,
-`LICENSE` and `LICENSE.LGPL-2.1` ship in `usr/share/doc/ferestre/` so the map is
-inside the artefact and not just in the repository.
+The AppImage carries the launcher, a separate GPL-3.0 client process and the source lock identifying the corresponding source forks. Component licences are retained. `NOTICE`, `LICENSE` and `LICENSE.LGPL-2.1` ship in `usr/share/doc/ferestre/`; `sources.lock.json` ships in `usr/lib/ferestre/`.
 
 The application id defaults to `io.github.icex.ferestre`, derived from this
 project's own repository. A fork that publishes its own builds should pass
