@@ -18,6 +18,7 @@ mod controller;
 mod deadline;
 mod editor;
 mod handheld;
+mod launch_state;
 mod model;
 mod packagekit;
 mod presence_ui;
@@ -25,6 +26,7 @@ mod progress;
 mod queue_ui;
 mod state;
 mod stop;
+mod window_activation;
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -81,6 +83,7 @@ button.game-tile:focus-visible { outline: 3px solid white; outline-offset: 4px; 
 .game-tile picture { border-radius: 7px 7px 0 0; }
 .game-tile .game-title { font-size: 14px; font-weight: 700; }
 .game-tile .game-meta { font-size: 12px; color: #b3b6bd; }
+.game-tile .game-running { color: #8bd77b; font-weight: 700; }
 .game-more > button { background-color: alpha(#111317,0.85); border-radius: 5px; }
 .sidebar-recents button { padding: 6px; background: transparent; box-shadow: none; border-radius: 6px; }
 .sidebar-recents button:hover { background-color: #343840; }
@@ -1270,7 +1273,8 @@ fn draw_list(
     section: Section,
     keep: impl Fn(&LibraryRow) -> bool,
 ) -> Drawn {
-    let running = |product_id: &str| running.contains_key(&product_id.to_ascii_uppercase());
+    let launches = running;
+    let running = |product_id: &str| launches.contains_key(&product_id.to_ascii_uppercase());
     let installing = |product_id: &str| {
         downloading.is_some_and(|id| {
             id.eq_ignore_ascii_case(product_id)
@@ -1416,13 +1420,32 @@ fn draw_list(
         let child_running = row.install_as.as_ref().is_some_and(|(id, _)| running(id));
         if running(&row.product_id) || child_running {
             row.action = Action::Stop;
-            if !row.subtitle.contains("running") {
-                row.subtitle = if row.subtitle.is_empty() {
-                    "running".into()
-                } else {
-                    format!("{}  ·  running", row.subtitle)
-                };
-            }
+            let launch = launches
+                .get(&row.product_id.to_ascii_uppercase())
+                .or_else(|| {
+                    row.install_as
+                        .as_ref()
+                        .and_then(|(id, _)| launches.get(&id.to_ascii_uppercase()))
+                })
+                .unwrap();
+            let state = if launch.asked.is_some() {
+                "stopping"
+            } else if launch.ready {
+                "running"
+            } else {
+                "starting"
+            };
+            let details = row
+                .subtitle
+                .split("  ·  ")
+                .filter(|s| !matches!(*s, "running" | "starting" | "stopping"))
+                .collect::<Vec<_>>()
+                .join("  ·  ");
+            row.subtitle = if details.is_empty() {
+                state.into()
+            } else {
+                format!("{details}  ·  {state}")
+            };
         }
     }
     let unsupported = rows.iter().filter(|row| row.unsupported).count();
@@ -2363,7 +2386,17 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
             .css_classes(["game-meta"])
             .build(),
     );
-    let state = if row.action == Action::Play {
+    let launching =
+        row.action == Action::Stop && row.subtitle.split("  ·  ").any(|s| s == "starting");
+    let state = if row.action == Action::Stop {
+        if launching {
+            "Starting… · Stop"
+        } else if row.subtitle.split("  ·  ").any(|s| s == "stopping") {
+            "Stopping…"
+        } else {
+            "● Running · Stop"
+        }
+    } else if row.action == Action::Play {
         "✓ Installed"
     } else {
         row.action.label()
@@ -2374,7 +2407,9 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
             .map(str::to_owned)
     });
     let state = size.map_or_else(|| state.to_string(), |size| format!("{state} · {size}"));
-    let state = if let Some(reason) = &row.unavailable {
+    let state = if row.action == Action::Stop {
+        state
+    } else if let Some(reason) = &row.unavailable {
         reason.clone()
     } else if row.subtitle.contains("known not to run") {
         "Known not to run".into()
@@ -2394,7 +2429,20 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
     status.update_property(&[gtk::accessible::Property::Label(
         description.subtitle().as_deref().unwrap_or_default(),
     )]);
-    text.append(&status);
+    let launch_status = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    if launching {
+        let spinner = gtk::Spinner::builder()
+            .spinning(true)
+            .width_request(18)
+            .height_request(18)
+            .build();
+        spinner.update_property(&[gtk::accessible::Property::Label("Starting game")]);
+        launch_status.append(&spinner);
+    } else if row.action == Action::Stop {
+        status.add_css_class("game-running");
+    }
+    launch_status.append(&status);
+    text.append(&launch_status);
     body.append(&text);
     let overlay = gtk::Overlay::new();
     if let Some(primary) = primary {
@@ -3264,6 +3312,8 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
     let program = cli_binary();
     let mut command = std::process::Command::new(&program);
     command.arg("run").arg(product_id);
+    let launch_tag = launch_state::tag();
+    command.env(launch_state::TAG, &launch_tag);
     if let Some(roles) = &roles {
         command.env(
             "FERESTRE_ACCOUNT_ROLES",
@@ -3339,6 +3389,14 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
     // Set once the launch has exited: the follower reads what is left, then
     // stops.
     let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let executable = ui
+        .model
+        .borrow()
+        .recipe_for(product_id)
+        .map(|r| r.launch.executable.clone());
+    if let Some(executable) = executable {
+        launch_state::watch(ui, &key, pgid, launch_tag, executable, finished.clone());
+    }
     if let Some(path) = output.clone() {
         // The launch's runner reports on its stderr, which goes to the
         // launch's output file; follow it while the launch runs.
@@ -5982,9 +6040,12 @@ mod catalog_regressions {
         model
             .installed_products
             .insert("9NR1R1XWLCNB".into(), PathBuf::from("/games/9nr1r1xwlcnb"));
-        let running: BTreeMap<String, stop::Launch> = [(
+        let mut running: BTreeMap<String, stop::Launch> = [(
             "9NR1R1XWLCNB".to_string(),
-            stop::Launch::new(42, std::time::Instant::now()),
+            stop::Launch {
+                ready: true,
+                ..stop::Launch::new(42, std::time::Instant::now())
+            },
         )]
         .into();
         for section in [Section::GamePass, Section::Library] {
@@ -6005,6 +6066,24 @@ mod catalog_regressions {
                 .unwrap_or_else(|| panic!("no row in {section:?}"));
             assert_eq!(row.action, Action::Stop, "{section:?}");
             assert!(row.subtitle.contains("running"), "{}", row.subtitle);
+            running.get_mut("9NR1R1XWLCNB").unwrap().ready = false;
+            let starting = draw_list(&model, &running, None, no_lookups(), section, |_| true);
+            let row = starting
+                .rows
+                .iter()
+                .find(|row| row.product_id.eq_ignore_ascii_case("9NR1R1XWLCNB"))
+                .unwrap();
+            assert_eq!(
+                row.action,
+                Action::Stop,
+                "starting games can still be cancelled"
+            );
+            assert!(
+                row.subtitle.contains("starting") && !row.subtitle.contains("running"),
+                "{}",
+                row.subtitle
+            );
+            running.get_mut("9NR1R1XWLCNB").unwrap().ready = true;
         }
     }
 

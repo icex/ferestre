@@ -39,6 +39,7 @@ on:
       - 'tests/gui_transfers.py'
       - 'tests/gui_artwork.py'
       - 'tests/gui_controller.py'
+      - 'tests/gui_launch.py'
       - 'tests/test_transfer_controls.py'
       - 'tests/fake_packagekit.py'
       - 'tests/test_download_cancel.py'
@@ -83,6 +84,7 @@ on:
       - 'tests/gui_transfers.py'
       - 'tests/gui_artwork.py'
       - 'tests/gui_controller.py'
+      - 'tests/gui_launch.py'
       - 'tests/test_transfer_controls.py'
       - 'tests/fake_packagekit.py'
       - 'tests/test_download_cancel.py'
@@ -415,6 +417,11 @@ jobs:
         run: |
           xvfb-run -a --server-args='-screen 0 1280x900x24' \
             dbus-run-session -- python3 tests/gui_controller.py
+
+      - name: Game launch loading, running state and background Home (offline)
+        run: |
+          xvfb-run -a --server-args='-screen 0 1280x900x24' \
+            dbus-run-session -- python3 tests/gui_launch.py
 
       - name: Persistent install queue and pause controls (offline)
         run: |

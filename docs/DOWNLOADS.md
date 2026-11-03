@@ -11,12 +11,25 @@ After opening Game Pass, covers for its full catalogue preload in the background
 with four bounded workers. Visible pages take priority and each cover appears
 individually as it arrives; cached covers are reused across pages and restarts.
 
+A game's card shows an animated spinner and Starting… while its launcher prepares
+it. Once the executable from that specific launch is observed, the card shows
+Running · Stop in green. Stop also works during startup. Failed launches and game
+exits return the card to Play; other running games retain their own state.
+
 SDL2 controllers navigate the focused Ferestre window with D-pad or the left
 stick. A activates, B closes a dialog/menu or returns to navigation, Y focuses
 search, LB/RB change sections, View opens navigation and Menu opens the focused
 game's options. In navigation, ↑/↓ chooses an item; → or A enters its games.
 The stick moves spatially through banners, section tabs, game cards and paging.
 The focused control has a persistent green outline and scrolls into view.
+Xbox Home/Guide or PlayStation PS brings the main Ferestre window forward,
+including while another application has focus. It restores controller focus
+without pressing the highlighted game's action. View/Share/Create continues to
+open navigation. On KDE Wayland, a one-shot KWin activation request targets only
+Ferestre's own process, app ID and window title; it is unloaded afterward. Other
+desktops use GTK window presentation, subject to the compositor's activation
+policy. A desktop or Steam mapping that consumes Home before SDL must let that
+button reach Ferestre.
 SDL controller type detection displays PlayStation cross/circle/triangle,
 L1/R1 and Share/Create for DualShock/DualSense controllers. The footer explains
 the available controls for the current focus; Controller help shows the full

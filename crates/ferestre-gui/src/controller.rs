@@ -408,6 +408,11 @@ pub(super) fn update_hints(ui: &Ui) {
     let action = focused_game(ui)
         .and_then(|id| ui.game_actions.borrow().get(&id).cloned())
         .unwrap_or_else(|| "Select".into());
+    let home = if family == Family::Xbox {
+        "Xbox / Home"
+    } else {
+        "PS"
+    };
     let markup = if ui.window.visible_dialog().is_some() || focused_popup(ui).is_some() {
         format!("D-pad  Choose   ·   {a} Select   ·   {b} Back / Close")
     } else if navigation_focus(ui) {
@@ -415,6 +420,7 @@ pub(super) fn update_hints(ui: &Ui) {
     } else {
         format!("D-pad / Left stick  Move   ·   {a} {}   ·   {b} Back   ·   {y} Search   ·   {view} Navigation   ·   {menu} More   ·   {shoulders} Sections", glib::markup_escape_text(&action))
     };
+    let markup = format!("{markup}   ·   {home} Ferestre");
     if ui.controller_hints.label().as_str() != markup {
         ui.controller_hints.set_markup(&markup);
     }
@@ -435,7 +441,12 @@ pub(super) fn update_hints(ui: &Ui) {
 }
 pub(super) fn show_help(ui: &Ui) {
     let (a, b, y, view, menu, shoulders) = ui.controller_family.get().controls();
-    let text = format!("D-pad or left stick: move between games.\n\n{a}: select or launch the highlighted game.\n{b}: go back or close a menu.\n{y}: search.\n{view}: open or close navigation.\n{menu}: options for the highlighted game.\n{shoulders}: change sections.\n\nIn navigation, ↑/↓ chooses a section; → or {a} opens its games. ← from the first game returns to navigation.\n\nFullscreen is available in navigation and the window header (keyboard F11).");
+    let home = if ui.controller_family.get() == Family::Xbox {
+        "Xbox / Home"
+    } else {
+        "PS"
+    };
+    let text = format!("{home}: bring Ferestre to the front while a game is running.\n\nD-pad or left stick: move between games.\n\n{a}: select or launch the highlighted game.\n{b}: go back or close a menu.\n{y}: search.\n{view}: open or close navigation.\n{menu}: options for the highlighted game.\n{shoulders}: change sections.\n\nIn navigation, ↑/↓ chooses a section; → or {a} opens its games. ← from the first game returns to navigation.\n\nFullscreen is available in navigation and the window header (keyboard F11).");
     let dialog = adw::AlertDialog::new(Some("Controller controls"), Some(&text));
     dialog.add_response("close", "Close");
     dialog.set_close_response("close");
@@ -593,6 +604,21 @@ enum Action {
     Navigation,
     Options,
 }
+/// A newly attached or already-held Guide button must be released first.
+#[derive(Default)]
+struct HomeButton {
+    connected: bool,
+    held: bool,
+}
+impl HomeButton {
+    fn pressed(&mut self, connected: bool, input: Input) -> bool {
+        let held = input.buttons & (1 << 5) != 0;
+        let pressed = connected && self.connected && held && !self.held;
+        self.connected = connected;
+        self.held = held;
+        pressed
+    }
+}
 #[derive(Default)]
 struct Mapper {
     previous: u16,
@@ -610,7 +636,6 @@ impl Mapper {
             (9, Action::Previous),
             (10, Action::Next),
             (4, Action::Navigation),
-            (5, Action::Navigation),
             (6, Action::Options),
         ] {
             if held(button) && self.previous & (1u16 << button) == 0u16 {
@@ -894,6 +919,7 @@ pub(super) fn install(ui: &Ui) {
     let ui = ui.clone();
     let mut mapper = Mapper::default();
     let mut was_active = false;
+    let mut home = HomeButton::default();
     let mut focus_pending = false;
     glib::timeout_add_local(Duration::from_millis(25), move || {
         if !ui.window.is_visible() {
@@ -907,6 +933,13 @@ pub(super) fn install(ui: &Ui) {
             ui.controller_family.set(pad.family());
         }
         update_hints(&ui);
+        if home.pressed(connected, input) {
+            window_activation::present(&ui);
+            mapper.suppress(input);
+            was_active = false;
+            focus_pending = true;
+            return glib::ControlFlow::Continue;
+        }
         if connected && !was_connected {
             focus_pending = true;
         }
@@ -966,11 +999,7 @@ mod tests {
     #[test]
     fn view_opens_navigation_and_menu_opens_options() {
         let now = Instant::now();
-        for (button, expected) in [
-            (4, Action::Navigation),
-            (5, Action::Navigation),
-            (6, Action::Options),
-        ] {
+        for (button, expected) in [(4, Action::Navigation), (6, Action::Options)] {
             let mut mapper = Mapper::default();
             let input = Input {
                 buttons: 1 << button,
@@ -981,6 +1010,28 @@ mod tests {
                 .actions(input, now + Duration::from_secs(1))
                 .is_empty());
         }
+    }
+    #[test]
+    fn home_works_in_background_once_per_press_and_not_on_attachment() {
+        let mut home = HomeButton::default();
+        let held = Input {
+            buttons: 1 << 5,
+            ..Default::default()
+        };
+        assert!(!home.pressed(true, held));
+        assert!(!home.pressed(true, held));
+        assert!(!home.pressed(true, Input::default()));
+        assert!(home.pressed(true, held));
+        assert!(!home.pressed(true, held));
+        assert!(!home.pressed(false, Input::default()));
+        assert!(!home.pressed(true, held));
+        assert!(!home.pressed(true, Input::default()));
+        assert!(home.pressed(true, held));
+        let mut mapper = Mapper::default();
+        assert!(
+            mapper.actions(held, Instant::now()).is_empty(),
+            "Home must not also navigate or activate a game"
+        );
     }
     #[test]
     fn spatial_navigation_visits_tabs_cards_and_pagination() {

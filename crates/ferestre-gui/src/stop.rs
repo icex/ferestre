@@ -61,6 +61,8 @@ pub struct Launch {
     /// The launcher's process group: it is a session leader, so its pid.
     pub pgid: u32,
     pub started: Instant,
+    /// A game executable from this launch has been observed, beyond setup.
+    pub ready: bool,
     /// When it was asked to close, while the window waits for it to.
     pub asked: Option<Instant>,
 }
@@ -70,6 +72,7 @@ impl Launch {
         Launch {
             pgid,
             started,
+            ready: false,
             asked: None,
         }
     }
