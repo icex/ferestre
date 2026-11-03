@@ -34,16 +34,23 @@ def main():
             driver.seek('a');driver.pulse(0)
             driver.press(0,lambda root:s.find_all(root,role='label',name='aa'),'two rapid Accept presses both enter text')
             driver.press(1,lambda root:not s.find_all(root,role='button',name='Done'),'Back cancels text entry')
-            def search_text():
-                return next((s.Atspi.Text.get_text(n,0,-1) for n in s.find_all(frame,role='entry') if n.get_text_iface()),None)
-            s.check(search_text()=='','cancelling the keyboard preserves the original search')
+            def installed_choices():
+                return all(s.row_button(frame,f'Launch Game {n}','Install') for n in range(3))
+            s.check(installed_choices(),'cancelling the keyboard preserves the original unfiltered library')
             driver.pulse(3);driver.press(0,lambda root:s.find_all(root,role='button',name='Done'),'open keyboard again')
             draft=''
-            for ch in 'launch':
+            for ch in 'needle':
                 driver.seek(ch);draft+=ch
                 driver.press(0,lambda root:s.find_all(root,role='label',name=draft),'keyboard draft '+repr(draft))
-            print('Keyboard draft before Done:',repr(draft),flush=True)
-            driver.seek('Done');driver.press(0,lambda _:search_text()=='launch','Done commits controller-entered search text')
+            def no_matches(root):return s.find_all(root,role='label',name='Nothing matches "needle"')
+            driver.seek('Done');driver.press(0,no_matches,'Done applies the entered search to visible game results')
+            driver.pulse(3);driver.press(0,lambda root:s.find_all(root,role='button',name='Done'),'reopen the search keyboard')
+            wait(lambda root:s.find_all(root,role='label',name='needle'),'keyboard reads the previously committed field value')
+            driver.seek('Clear');driver.pulse(0)
+            driver.press(1,no_matches,'cancelling an edited draft preserves the existing search')
+            driver.pulse(3);driver.press(0,lambda root:s.find_all(root,role='button',name='Done'),'open keyboard to clear search')
+            driver.seek('Clear');driver.pulse(0)
+            driver.seek('Done');driver.press(0,lambda _:installed_choices(),'clearing search restores the library')
             driver.seek('Launch Game 0 · Install')
             driver.press(0,lambda root:s.find_all(root,role='button',name='Choose install folder'),'controller opens Install confirmation')
             driver.press(1,lambda root:not s.find_all(root,role='button',name='Choose install folder'),'Back cancels installation')
@@ -68,7 +75,6 @@ def main():
             print('all controller install/keyboard/folder/queue checks passed',flush=True)
         except Exception:
             print((home/'gui.log').read_text(),flush=True)
-            if 'search_text' in locals():print('Search text on failure:',repr(search_text()),flush=True)
             if app is not None:s.dump(app,'controller-install failure')
             raise
         finally:

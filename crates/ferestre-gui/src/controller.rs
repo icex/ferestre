@@ -315,6 +315,58 @@ fn spatial_target(rects: &[Rect], current: usize, action: Action) -> Option<usiz
         })
         .map(|(i, _)| i)
 }
+fn is_control(root: &gtk::Widget) -> bool {
+    root.is::<gtk::SearchEntry>()
+        || root.is::<gtk::Entry>()
+        || root.is::<gtk::Text>()
+        || root.is::<gtk::DropDown>()
+        || root.is::<gtk::Button>()
+        || root.is::<gtk::Switch>()
+        || root.is::<gtk::CheckButton>()
+        || root.is::<gtk::TextView>()
+}
+fn move_dialog(dialog: &adw::Dialog, action: Action) {
+    fn collect(root: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+        if !root.is_visible() || !root.is_mapped() || !root.is_sensitive() {
+            return;
+        }
+        if is_control(root) {
+            out.push(root.clone());
+            return;
+        }
+        let mut child = root.first_child();
+        while let Some(widget) = child {
+            collect(&widget, out);
+            child = widget.next_sibling();
+        }
+    }
+    let mut controls = vec![];
+    collect(dialog.upcast_ref(), &mut controls);
+    let Some(focus) = dialog.focus() else {
+        dialog.child_focus(gtk::DirectionType::TabForward);
+        return;
+    };
+    let Some(index) = controls
+        .iter()
+        .position(|w| *w == focus || focus.is_ancestor(w))
+    else {
+        return;
+    };
+    let bounds: Option<Vec<Rect>> = controls
+        .iter()
+        .map(|w| {
+            w.compute_bounds(dialog).map(|r| Rect {
+                x: r.x(),
+                y: r.y(),
+                width: r.width(),
+                height: r.height(),
+            })
+        })
+        .collect();
+    if let Some(next) = bounds.and_then(|rects| spatial_target(&rects, index, action)) {
+        controls[next].grab_focus();
+    }
+}
 fn main_controls(ui: &Ui) -> Vec<gtk::Widget> {
     fn collect(ui: &Ui, root: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
         if !root.is_visible()
@@ -327,14 +379,7 @@ fn main_controls(ui: &Ui) -> Vec<gtk::Widget> {
         {
             return;
         }
-        if root.is::<gtk::SearchEntry>()
-            || root.is::<gtk::Entry>()
-            || root.is::<gtk::DropDown>()
-            || root.is::<gtk::Button>()
-            || root.is::<gtk::Switch>()
-            || root.is::<gtk::CheckButton>()
-            || root.is::<gtk::TextView>()
-        {
+        if is_control(root) {
             out.push(root.clone());
             return;
         }
@@ -988,7 +1033,7 @@ fn dispatch(ui: &Ui, action: Action) {
                 if let Some(popup) = popup {
                     popup.child_focus(direction);
                 } else if let Some(dialog) = dialog {
-                    dialog.child_focus(direction);
+                    move_dialog(&dialog, action);
                 } else {
                     active.child_focus(direction);
                 }
@@ -1023,7 +1068,7 @@ fn dispatch(ui: &Ui, action: Action) {
             if let Some(popover) = focused_popup(ui) {
                 popover.child_focus(direction);
             } else if let Some(dialog) = dialog {
-                dialog.child_focus(direction);
+                move_dialog(&dialog, action);
             } else if navigation_focus(ui) {
                 match action {
                     Action::Right => {
@@ -1287,6 +1332,40 @@ pub(super) fn install(ui: &Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn modal_destination_controls_are_reachable_above_the_response_buttons() {
+        let rects = [
+            Rect {
+                x: 379.,
+                y: 440.,
+                width: 276.,
+                height: 64.,
+            },
+            Rect {
+                x: 654.,
+                y: 440.,
+                width: 275.,
+                height: 64.,
+            },
+            Rect {
+                x: 379.,
+                y: 319.,
+                width: 440.,
+                height: 54.,
+            },
+            Rect {
+                x: 822.,
+                y: 319.,
+                width: 54.,
+                height: 54.,
+            },
+        ];
+        assert_eq!(spatial_target(&rects, 1, Action::Up), Some(3));
+        assert_eq!(spatial_target(&rects, 3, Action::Left), Some(2));
+        assert_eq!(spatial_target(&rects, 2, Action::Right), Some(3));
+        assert_eq!(spatial_target(&rects, 3, Action::Down), Some(1));
+        assert_eq!(spatial_target(&rects, 1, Action::Left), Some(0));
+    }
     #[test]
     fn selected_controls_are_revealed_without_moving_an_already_visible_item() {
         assert_eq!(scroll_position(100., 500., 0., 2000., 200., 200.), 100.);
