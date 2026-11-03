@@ -232,7 +232,7 @@ def main():
         write(home/"profiles.json",json.dumps(profiles))
         settings.unlink()
         # Stand in for an account-menu sign-out, which also deletes the unscoped account cache.
-        (state/"account.json").unlink(missing_ok=True)
+        (home/"state/ferestre/account.json").unlink(missing_ok=True)
         gui=windows.start([home/"bin/ferestre-gui"],env,"signed-out restart",stdout=None)
         app=s.find_app(gui.pid,time.monotonic()+20)
         frame=s.wait_for(app,lambda root:next(iter(s.find_all(root,role="frame",name="Ferestre")),None),"signed-out restart",time.monotonic()+20)
