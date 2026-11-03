@@ -60,12 +60,15 @@ pub fn open(ui: &Ui, target: &gtk::Editable) {
             current.clone(),
             path.clone(),
             folders.clone(),
-            up.clone(),
-            hidden.clone(),
+            up.downgrade(),
+            hidden.downgrade(),
             generation.clone(),
             Rc::downgrade(&browse_slot),
         );
         Rc::new(move |dir| {
+            let (Some(up), Some(hidden)) = (up.upgrade(), hidden.upgrade()) else {
+                return;
+            };
             *current.borrow_mut() = dir.clone();
             path.set_label(&dir.to_string_lossy());
             up.set_sensitive(dir.parent().is_some());

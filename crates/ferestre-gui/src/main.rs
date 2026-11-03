@@ -2569,7 +2569,7 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
                 "Stopping game"
             }));
         } else {
-            let icon = gtk::Image::from_icon_name("media-playback-stop-symbolic");
+            let icon = gtk::Image::from_icon_name("media-playback-start-symbolic");
             icon.set_pixel_size(48);
             center.append(&icon);
         }

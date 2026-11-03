@@ -61,6 +61,8 @@ fn show(
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::Start)
         .height_request(44)
+        .lines(2)
+        .wrap(true)
         .selectable(false)
         .css_classes(["title-3"])
         .build();
