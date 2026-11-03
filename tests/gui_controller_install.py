@@ -37,7 +37,11 @@ def main():
                 return next((s.Atspi.Text.get_text(n,0,-1) for n in s.find_all(frame,role='entry') if n.get_text_iface()),None)
             s.check(search_text()=='','cancelling the keyboard preserves the original search')
             driver.pulse(3);driver.press(0,lambda root:s.find_all(root,role='button',name='Done'),'open keyboard again')
-            for ch in 'launch':driver.seek(ch);driver.pulse(0)
+            draft=''
+            for ch in 'launch':
+                driver.seek(ch);draft+=ch
+                driver.press(0,lambda root:s.find_all(root,role='label',name=draft),'keyboard draft '+repr(draft))
+            print('Keyboard draft before Done:',repr(draft),flush=True)
             driver.seek('Done');driver.press(0,lambda _:search_text()=='launch','Done commits controller-entered search text')
             driver.seek('Launch Game 0 · Install')
             driver.press(0,lambda root:s.find_all(root,role='button',name='Choose install folder'),'controller opens Install confirmation')
@@ -63,6 +67,7 @@ def main():
             print('all controller install/keyboard/folder/queue checks passed',flush=True)
         except Exception:
             print((home/'gui.log').read_text(),flush=True)
+            if 'search_text' in locals():print('Search text on failure:',repr(search_text()),flush=True)
             if app is not None:s.dump(app,'controller-install failure')
             raise
         finally:
