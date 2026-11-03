@@ -170,7 +170,12 @@ def main():
                         ancestor=ancestor.get_parent()
                 return None
             row=s.wait_for(combo,popup_row,"player choice",time.monotonic()+20)
-            s.press(row,gui.pid)
+            # Popup extents are relative to a separate GDK surface on GTK 4.20.
+            # Use the popup's keyboard navigation rather than main-window pointer
+            # coordinates. This two-profile fixture has Owner first, Player last.
+            s.Atspi.generate_keyboard_event(0xff57 if label == "Player Fixture" else 0xff50,
+                                           None, s.Atspi.KeySynthType.SYM)
+            s.Atspi.generate_keyboard_event(0xff0d, None, s.Atspi.KeySynthType.SYM)
             # The dropdown's accessible name is its role ("Player account"), so
             # read the choice back from the summary that describes the pair.
             s.wait_for(dialog,lambda root:any(f"{label} plays with" in t for t in s.texts(root)),"selected player",time.monotonic()+20)

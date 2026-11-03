@@ -1,6 +1,6 @@
 /*
  * Regression tests for the ntdll patches that change what a title can
- * observe: the mapped-image filename fallback (patches/wine/0010), the code
+ * observe: the mapped-image filename fallback (https://github.com/icex/wine/commit/1015c6b21c943398b21fb82240f7be384efa71d2), the code
  * bytes dumped for a fault under +seh (0007) and FileAllocationInformation
  * (0012).
  *

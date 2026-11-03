@@ -91,45 +91,45 @@ verified-with = "tools/drive-fh5.py: restored Windows profile, rendered world an
 [[issues]]
 symptom   = "the game exits seconds after launch with no window; the log ends in an unhandled illegal instruction inside ForzaHorizon5.exe"
 cause     = "the title asks which file its own image was mapped from and is told nothing, because the image is mapped from a memfd that has no name in the NT namespace; its own handler then declines to restore the first elided call site"
-fix       = "fixed by patches/wine/0010"
+fix       = "fixed by https://github.com/icex/wine/commit/1015c6b21c943398b21fb82240f7be384efa71d2"
 log-match = "Unhandled illegal instruction at address .* \\(thread"
 
 [[issues]]
 symptom   = "the game exits during startup and leaves Upload_CrashReport.xml naming ACCESS_VIOLATION_WRITE at 0x0000000000000009"
 cause     = "concrt140's _Internal_push_back returned SEGMENT_ALLOC_MARKER (1) instead of a pointer, because _Internal_capacity counts a segment another thread is still allocating as capacity"
-fix       = "fixed by patches/wine/0011"
+fix       = "fixed by https://github.com/icex/wine/commit/6d22d79be8d90e71efaa6c4169d37bd220fdb287"
 log-match = "ACCESS_VIOLATION_WRITE"
 
 [[issues]]
 symptom   = "the splash screen appears, the window closes again, and the process exits 1 with no crash report and no fatal signal"
 cause   = "the title opens its own executable as \\??\\GlobalRoot\\??\\Z:\\... to verify it, that spelling did not match the image map, and it hashed the encrypted bytes on disk. It then called TerminateProcess on itself with 0x1100"
-fix       = "fixed by patches/wine/0013: strip the GlobalRoot prefix before matching, as the file layer does"
+fix       = "fixed by https://github.com/icex/wine/commit/65c332c6dd327c911e89c1f8bcfc3cca9a39967b: strip the GlobalRoot prefix before matching, as the file layer does"
 log-match = "process terminating itself abnormally"
 
 [[issues]]
 symptom   = "the game reaches its welcome screen and then faults reading address 0 inside ucrtbase's memmove"
 cause     = "libHttpClient asked for a 16-byte websocket result; the block recorded that size but the operation holding the bytes had been withdrawn, so XAsyncGetResult copied from a null payload"
-fix       = "fixed by patches/xgameruntime/0010"
+fix       = "fixed by https://github.com/icex/xgameruntime/commit/a64fca67f4217801de3eb5a2ee7e63f9645eeb63"
 log-match = "completed with no payload for a .* byte buffer"
 
 [[issues]]
 symptom   = "the game faults reading 0xFFFFFFFFFFFFFFFF just after its Real-Time Activity websocket connects"
 cause     = "after the inline-result fix, XAsyncBegin still returned the provider's E_PENDING to libHttpClient, which treated it as a failed start and destroyed the context needed by the queued completion"
-fix       = "fixed by patches/xgameruntime/0014 and 0015: setup returns S_OK, provider failures complete asynchronously and failed-Begin cleanup waits for its callback"
+fix       = "fixed by https://github.com/icex/xgameruntime/commit/a8eff5c44fb493e3c509918b92066e0c3df3ad65 and https://github.com/icex/xgameruntime/commit/89de568400f5bf12c117685235401110177ab71d: setup returns S_OK, provider failures complete asynchronously and failed-Begin cleanup waits for its callback"
 log-match = "0xFFFFFFFFFFFFFFFF"
 
 [[issues]]
 symptom   = "the title's own profile is never found: it reads User_<xuid>/ProfileBackup and gets E_GS_BLOB_NOT_FOUND even where a save copied from Windows exists"
 cause     = "the title initialises its save provider with an all-zero configuration id, which means the title's own SCID; taking it literally named the save folder after a zero SCID"
-fix       = "fixed by patches/xgameruntime/0011"
+fix       = "fixed by https://github.com/icex/xgameruntime/commit/3a33eb73b048b521de4b1cb56cc0868b3e8118cb"
 log-match = "title named no service configuration; using its own"
 
 [[issues]]
 symptom   = "INSTALLING... PLEASE WAIT persists while the game repeatedly queries its current package identifier"
 cause     = "XPackageGetCurrentProcessPackageIdentifier returned a 35-character package family name into the GDK's 33-byte buffer and failed every query"
-fix       = "fixed by patches/xgameruntime/0016: current-package queries and enumeration share a bounded opaque session identifier"
+fix       = "fixed by https://github.com/icex/xgameruntime/commit/5aca98bfe7354765520180ab490ede23ea022969: current-package queries and enumeration share a bounded opaque session identifier"
 
 [[issues]]
 symptom   = "Forza Online reports: Forza Horizon 5 server is currently not available"
 cause     = "the client required MSAAppId for every title claim and only read default Xbox service endpoints; this legacy Windows title omits MSAAppId and publishes its own token audience"
-fix       = "fixed by patches/xodus-cli/0014: Windows TitleId authentication, per-title endpoint discovery and issuer-bound token caching; all selected from metadata"
+fix       = "fixed by https://github.com/icex/xodus/commit/41c9baa928bfec32d52b2d7a011f160c6523f31e: Windows TitleId authentication, per-title endpoint discovery and issuer-bound token caching; all selected from metadata"

@@ -519,7 +519,7 @@ TLS 1.2 and 1.3, which is what a current policy allows and what the services \
 these titles talk to negotiate. There are still no thumbprints, because there \
 is nothing to pin: XNetworkingVerifyServerCertificate verifies the request's \
 certificate chain against its host, as WinHTTP does, and no more \
-(patches/xgameruntime/0034).
+(https://github.com/icex/xgameruntime/commit/c68bdd47d0a7cda65cba4ec02be67f2253c4e271).
 
 Found while chasing Forza Horizon 5 and it did not change its outcome; kept \
 because a mask of zero is wrong on its own terms."""
