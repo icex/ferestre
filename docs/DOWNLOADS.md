@@ -25,11 +25,13 @@ search, LB/RB change sections, View opens navigation and Menu opens the focused
 game's options. In navigation, ↑/↓ chooses an item; → or A enters its games.
 The stick moves spatially through banners, section tabs, game cards and paging.
 The focused control has a persistent green outline and scrolls into view.
-Xbox Home/Guide or PlayStation PS brings the main Ferestre window forward,
+Xbox Home/Guide or PlayStation PS on any connected mapped controller brings the
+main Ferestre window forward. Controllers plugged in after startup are discovered
+by SDL event pumping,
 including while another application has focus. It restores controller focus
 without pressing the highlighted game's action. View/Share/Create continues to
 open navigation. On KDE Wayland, a one-shot KWin activation request targets only
-Ferestre's own process, app ID and window title; it is unloaded afterward. Other
+Ferestre's own process, app ID and main-window role; it is unloaded afterward. Other
 desktops use GTK window presentation, subject to the compositor's activation
 policy. A desktop or Steam mapping that consumes Home before SDL must let that
 button reach Ferestre.

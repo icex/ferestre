@@ -26,14 +26,18 @@ SDL = r'''
 #include <stdlib.h>
 struct State { uint16_t buttons; int16_t x,y,lt,rt; int32_t kind,attached; };
 static struct State state;
+static int enumerated;
 void SDL_GameControllerUpdate(void) {
   FILE *file=fopen(getenv("FERESTRE_TEST_PAD_FILE"),"rb");
   if(file){fread(&state,sizeof(state),1,file);fclose(file);}
 }
-int SDL_InitSubSystem(uint32_t flags){SDL_GameControllerUpdate();return 0;}
+int SDL_InitSubSystem(uint32_t flags){SDL_GameControllerUpdate();enumerated=state.attached;return 0;}
 void SDL_QuitSubSystem(uint32_t flags){}
 int SDL_SetHint(const char *name,const char *value){return 1;}
-int SDL_NumJoysticks(void){return state.attached;}
+int SDL_NumJoysticks(void){return enumerated;}
+int SDL_JoystickGetDeviceInstanceID(int index){return index+1;}
+void SDL_PumpEvents(void){SDL_GameControllerUpdate();enumerated=state.attached;}
+int SDL_PollEvent(void *event){SDL_PumpEvents();return 0;}
 int SDL_IsGameController(int index){return state.attached;}
 void *SDL_GameControllerOpen(int index){return state.attached?(void*)1:0;}
 void SDL_GameControllerClose(void *pad){}
@@ -135,11 +139,11 @@ summary="Offline controller fixture"
         write(home / 'state/ferestre/library.json', json.dumps({'count': len(ids), 'items': [{'productId': id, 'productType': 'Game', 'status': 'Active'} for id in ids]}))
         state = home / 'pad'
         kind = 7
-        def input(buttons=0):
+        def input(buttons=0, attached=1):
             temp = home / 'pad-next'
-            temp.write_bytes(struct.pack('<Hhhhh2xii', buttons, 0, 0, 0, 0, kind, 1))
+            temp.write_bytes(struct.pack('<Hhhhh2xii', buttons, 0, 0, 0, 0, kind, attached))
             temp.replace(state)
-        input()
+        input(attached=0)
         env = dict(os.environ, HOME=tmp, XDG_CONFIG_HOME=str(home / 'config'),
                    XDG_STATE_HOME=str(home / 'state'), XDG_CACHE_HOME=str(home / 'cache'), XDG_DATA_HOME=str(home / 'data'),
                    XODUS_CLI_DIR=str(home / 'client'), XODUS_PROTON_DIR=str(home / 'runtime'),
@@ -171,7 +175,9 @@ summary="Offline controller fixture"
                 finally:
                     input()
                     time.sleep(.08)
-            wait(lambda r: has_focus(r, 'Controller Game 0 · Install'), 'initial game focus')
+            input()
+            wait(lambda r: has_focus(r, 'Controller Game 0 · Install'), 'game focus after controller hotplug')
+            s.check(True, 'SDL event pumping discovers a controller connected after the window opens')
             wait(lambda r: any('✕' in t and 'L1 / R1' in t for t in s.texts(r)), 'automatic PlayStation controls')
             s.check(True, 'SDL PlayStation type displays cross/circle/triangle and L1/R1')
             time.sleep(.3)
@@ -183,7 +189,7 @@ summary="Offline controller fixture"
             press(12, lambda r: has_focus(r, 'My Library'), 'Library navigation')
             press(0, lambda r: bool(s.find_all(r, name='My Library page')) and has_focus(r, ' · Install'), 'A/cross enters games')
             s.check(True, 'navigation selects Library and enters the right pane')
-            press(11, lambda r: (focus(r).get_name() or '') in ['My games', 'Installed', 'Updates', 'Install queue'], 'up from games to section tabs')
+            press(11, lambda r: (node:=focus(r)) is not None and (node.get_name() or '') in ['My games', 'Installed', 'Updates', 'Install queue'], 'up from games to section tabs')
             s.check(True, 'up/down navigation reaches the section row above the game grid')
             press(12, lambda r: has_focus(r, ' · Install'), 'down back into game grid')
             press(6, lambda r: bool(s.find_all(r, role='button', name='Game details')), 'Menu/Options opens game options')

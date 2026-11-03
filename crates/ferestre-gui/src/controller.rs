@@ -14,6 +14,7 @@ type IsController = unsafe extern "C" fn(c_int) -> c_int;
 type Open = unsafe extern "C" fn(c_int) -> Handle;
 type Close = unsafe extern "C" fn(Handle);
 type Update = unsafe extern "C" fn();
+type Poll = unsafe extern "C" fn(*mut c_void) -> c_int;
 type Attached = unsafe extern "C" fn(Handle) -> c_int;
 type Button = unsafe extern "C" fn(Handle, c_int) -> u8;
 type Axis = unsafe extern "C" fn(Handle, c_int) -> i16;
@@ -455,7 +456,10 @@ pub(super) fn show_help(ui: &Ui) {
 
 struct Pad {
     library: Handle,
-    pad: Handle,
+    pads: Vec<(i32, Handle)>,
+    instance: IsController,
+    pump: Update,
+    poll: Poll,
     quit: Quit,
     count: Count,
     is_controller: IsController,
@@ -486,6 +490,9 @@ impl Pad {
                 let open = symbol(library, c"SDL_GameControllerOpen")?;
                 let close = symbol(library, c"SDL_GameControllerClose")?;
                 let update = symbol(library, c"SDL_GameControllerUpdate")?;
+                let instance = symbol(library, c"SDL_JoystickGetDeviceInstanceID")?;
+                let pump = symbol(library, c"SDL_PumpEvents")?;
+                let poll = symbol(library, c"SDL_PollEvent")?;
                 let attached = symbol(library, c"SDL_GameControllerGetAttached")?;
                 let button = symbol(library, c"SDL_GameControllerGetButton")?;
                 let axis = symbol(library, c"SDL_GameControllerGetAxis")?;
@@ -502,7 +509,10 @@ impl Pad {
                 }
                 Some(Self {
                     library,
-                    pad: std::ptr::null_mut(),
+                    pads: Vec::new(),
+                    instance,
+                    pump,
+                    poll,
                     quit,
                     count,
                     is_controller,
@@ -521,60 +531,78 @@ impl Pad {
             loaded
         }
     }
-    fn family(&self) -> Family {
-        if self.pad.is_null() {
-            return Family::Xbox;
-        }
-        Family::from_sdl_type(self.kind.map(|kind| unsafe { kind(self.pad) }).unwrap_or(0))
-    }
-    fn sample(&mut self) -> Input {
-        // These function pointers were resolved from SDL's documented C ABI;
-        // the library remains loaded until every controller has been closed.
+    fn sample(&mut self) -> Vec<Sample> {
+        // GTK owns the main loop. SDL still needs its own event pump for
+        // hotplug discovery; updating button state alone does not discover pads.
         unsafe {
-            (self.update)();
-            if !self.pad.is_null() && (self.attached)(self.pad) == 0 {
-                (self.close)(self.pad);
-                self.pad = std::ptr::null_mut();
+            (self.pump)();
+            // SDL2's event union is 56 bytes on our 64-bit target. Extra room
+            // and u64 alignment also cover the compatibility library's ABI.
+            let mut event = [0u64; 8];
+            for _ in 0..256 {
+                if (self.poll)(event.as_mut_ptr().cast()) == 0 {
+                    break;
+                }
             }
-            if self.pad.is_null() {
-                for index in 0..(self.count)().clamp(0, 64) {
-                    if (self.is_controller)(index) != 0 {
-                        self.pad = (self.open)(index);
-                        if !self.pad.is_null() {
-                            break;
+            (self.update)();
+            self.pads.retain(|(_, handle)| {
+                if (self.attached)(*handle) != 0 {
+                    true
+                } else {
+                    (self.close)(*handle);
+                    false
+                }
+            });
+            for index in 0..(self.count)().clamp(0, 64) {
+                let id = (self.instance)(index);
+                if id < 0
+                    || self.pads.iter().any(|(present, _)| *present == id)
+                    || (self.is_controller)(index) == 0
+                {
+                    continue;
+                }
+                let handle = (self.open)(index);
+                if !handle.is_null() {
+                    self.pads.push((id, handle));
+                }
+            }
+            self.pads
+                .iter()
+                .map(|(id, handle)| {
+                    let mut buttons = 0u16;
+                    for button in [0, 1, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14] {
+                        if (self.button)(*handle, button) != 0 {
+                            buttons |= 1 << button;
                         }
                     }
-                }
-            }
-            if self.pad.is_null() {
-                return Input::default();
-            }
-            let pressed = |button| (self.button)(self.pad, button) != 0;
-            let mut buttons = 0u16;
-            for button in [0, 1, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14] {
-                if pressed(button) {
-                    buttons |= 1 << button;
-                }
-            }
-            Input {
-                buttons,
-                x: (self.axis)(self.pad, 0),
-                y: (self.axis)(self.pad, 1),
-            }
+                    Sample {
+                        id: *id,
+                        family: Family::from_sdl_type(
+                            self.kind.map(|kind| kind(*handle)).unwrap_or(0),
+                        ),
+                        input: Input {
+                            buttons,
+                            x: (self.axis)(*handle, 0),
+                            y: (self.axis)(*handle, 1),
+                        },
+                    }
+                })
+                .collect()
         }
     }
 }
 impl Drop for Pad {
     fn drop(&mut self) {
         unsafe {
-            if !self.pad.is_null() {
-                (self.close)(self.pad);
+            for (_, handle) in self.pads.drain(..) {
+                (self.close)(handle);
             }
             (self.quit)(GAMECONTROLLER);
             libc::dlclose(self.library);
         }
     }
 }
+
 unsafe fn symbol<T: Copy>(library: Handle, name: &std::ffi::CStr) -> Option<T> {
     let pointer = unsafe { libc::dlsym(library, name.as_ptr()) };
     if pointer.is_null() || std::mem::size_of::<T>() != std::mem::size_of::<Handle>() {
@@ -583,6 +611,54 @@ unsafe fn symbol<T: Copy>(library: Handle, name: &std::ffi::CStr) -> Option<T> {
     // All callers specify a function pointer matching the named SDL declaration.
     Some(unsafe { std::mem::transmute_copy(&pointer) })
 }
+#[derive(Clone, Copy)]
+struct Sample {
+    id: i32,
+    family: Family,
+    input: Input,
+}
+
+#[derive(Default)]
+struct Controllers(BTreeMap<i32, (HomeButton, Mapper)>);
+impl Controllers {
+    fn sample(&mut self, samples: &[Sample]) -> Option<Family> {
+        self.0.retain(|id, _| samples.iter().any(|s| s.id == *id));
+        let mut home = None;
+        for sample in samples {
+            let (button, _) = self.0.entry(sample.id).or_insert_with(|| {
+                let mut mapper = Mapper::default();
+                mapper.suppress(sample.input);
+                (HomeButton::default(), mapper)
+            });
+            if button.pressed(true, sample.input) {
+                home = Some(sample.family);
+            }
+        }
+        home
+    }
+    fn suppress(&mut self, samples: &[Sample]) {
+        for sample in samples {
+            if let Some((_, mapper)) = self.0.get_mut(&sample.id) {
+                mapper.suppress(sample.input);
+            }
+        }
+    }
+    fn actions(&mut self, samples: &[Sample], now: Instant) -> Vec<(Family, Action)> {
+        samples
+            .iter()
+            .flat_map(|sample| {
+                self.0
+                    .get_mut(&sample.id)
+                    .unwrap()
+                    .1
+                    .actions(sample.input, now)
+                    .into_iter()
+                    .map(|action| (sample.family, action))
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct Input {
     buttons: u16,
@@ -917,25 +993,25 @@ pub(super) fn install(ui: &Ui) {
         return;
     };
     let ui = ui.clone();
-    let mut mapper = Mapper::default();
+    let mut controllers = Controllers::default();
     let mut was_active = false;
-    let mut home = HomeButton::default();
     let mut focus_pending = false;
     glib::timeout_add_local(Duration::from_millis(25), move || {
         if !ui.window.is_visible() {
             return glib::ControlFlow::Break;
         }
         let was_connected = ui.controller_connected.get();
-        let input = pad.sample();
-        let connected = !pad.pad.is_null();
+        let samples = pad.sample();
+        let connected = !samples.is_empty();
         ui.controller_connected.set(connected);
-        if connected {
-            ui.controller_family.set(pad.family());
+        if samples.len() == 1 || connected && !was_connected {
+            ui.controller_family.set(samples[0].family);
         }
         update_hints(&ui);
-        if home.pressed(connected, input) {
+        if let Some(family) = controllers.sample(&samples) {
+            ui.controller_family.set(family);
             window_activation::present(&ui);
-            mapper.suppress(input);
+            controllers.suppress(&samples);
             was_active = false;
             focus_pending = true;
             return glib::ControlFlow::Continue;
@@ -948,16 +1024,17 @@ pub(super) fn install(ui: &Ui) {
             focus_pending = false;
         }
         if active_app_window(&ui).is_none() {
-            mapper.suppress(input);
+            controllers.suppress(&samples);
             was_active = false;
             return glib::ControlFlow::Continue;
         }
         if !was_active {
-            mapper.suppress(input);
+            controllers.suppress(&samples);
             was_active = true;
             return glib::ControlFlow::Continue;
         }
-        for action in mapper.actions(input, Instant::now()) {
+        for (family, action) in controllers.actions(&samples, Instant::now()) {
+            ui.controller_family.set(family);
             dispatch(&ui, action);
         }
         glib::ControlFlow::Continue
@@ -1031,6 +1108,39 @@ mod tests {
         assert!(
             mapper.actions(held, Instant::now()).is_empty(),
             "Home must not also navigate or activate a game"
+        );
+    }
+    #[test]
+    fn every_controller_has_independent_home_and_navigation_edges() {
+        let now = Instant::now();
+        let mut pads = Controllers::default();
+        let xbox = Sample {
+            id: 1,
+            family: Family::Xbox,
+            input: Input::default(),
+        };
+        let mut ps = Sample {
+            id: 2,
+            family: Family::DualSense,
+            input: Input::default(),
+        };
+        assert_eq!(pads.sample(&[xbox, ps]), None);
+        ps.input.buttons = 1 << 5;
+        assert_eq!(pads.sample(&[xbox, ps]), Some(Family::DualSense));
+        assert_eq!(pads.sample(&[xbox, ps]), None);
+        ps.input.buttons = 0;
+        pads.sample(&[xbox, ps]);
+        ps.input.buttons = 1;
+        assert_eq!(
+            pads.actions(&[xbox, ps], now),
+            vec![(Family::DualSense, Action::Accept)]
+        );
+        assert!(pads.actions(&[xbox, ps], now).is_empty());
+        pads.sample(&[xbox]);
+        assert_eq!(pads.sample(&[xbox, ps]), None);
+        assert!(
+            pads.actions(&[xbox, ps], now).is_empty(),
+            "held input on reconnect is suppressed"
         );
     }
     #[test]
@@ -1159,21 +1269,27 @@ mod tests {
             let joystick = open(index);
             assert!(!joystick.is_null());
             // Select this exact private virtual device, never a physical pad.
-            pad.pad = (pad.open)(index);
-            assert!(!pad.pad.is_null());
+            let id = (pad.instance)(index);
+            assert!(id >= 0);
+            pad.sample();
             unsafe extern "C" fn ps5_type(_: Handle) -> c_int {
                 7
             }
             pad.kind = Some(ps5_type);
-            assert_eq!(pad.family(), Family::DualSense);
+            assert_eq!(
+                pad.sample()
+                    .into_iter()
+                    .find(|s| s.id == id)
+                    .unwrap()
+                    .family,
+                Family::DualSense
+            );
             assert_eq!(set(joystick, 0, 1), 0);
             assert_eq!(set(joystick, 12, 1), 0);
-            let input = pad.sample();
+            let input = pad.sample().into_iter().find(|s| s.id == id).unwrap().input;
             let actions = Mapper::default().actions(input, Instant::now());
             assert!(actions.contains(&Action::Accept));
             assert!(actions.contains(&Action::Down));
-            (pad.close)(pad.pad);
-            pad.pad = std::ptr::null_mut();
             close(joystick);
             assert_eq!(detach(index), 0);
         }
