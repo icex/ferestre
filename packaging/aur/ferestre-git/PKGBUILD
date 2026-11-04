@@ -8,13 +8,13 @@
 # portable archives while the non-git AUR package is prepared.
 #
 # The layout deliberately matches the AppImage's AppDir (usr/bin/ferestre,
-# usr/lib/ferestre/scripts, usr/lib/ferestre/patches, usr/lib/ferestre/VERSION) so the same
+# usr/lib/ferestre/scripts, usr/lib/ferestre/sources.lock.json, usr/lib/ferestre/VERSION) so the same
 # command behaves identically however it was installed. In particular the
 # the launcher finds its scripts through ../lib/ferestre, which is why they go
 # to /usr/lib/ferestre and not /usr/share.
 
 pkgname=ferestre-git
-pkgver=0.0.0.r18.g88a0378
+pkgver=0.1.18.r385.g1c451d8
 pkgrel=1
 pkgdesc='Download and run the Microsoft Store and Xbox GDK titles you own, on Linux'
 arch=('x86_64')

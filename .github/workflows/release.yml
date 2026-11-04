@@ -3,7 +3,7 @@
 # Three artefacts, all x86_64 Linux:
 #
 #   ferestre-<version>-x86_64.tar.zst   the tree an installed copy has, so the
-#                                       binary finds its scripts, patches and
+#                                       binary finds its scripts, source lock and
 #                                       recipes exactly the way the AUR package
 #                                       lays them out -- usr/bin beside
 #                                       usr/lib/ferestre. Extract anywhere.
@@ -166,9 +166,9 @@ jobs:
 
       # A release that opens but cannot sign in is not a usable AppImage. Build
       # the GPL client separately and ship it beside the MIT launcher; the two
-      # still communicate solely by process invocation. The same ordered patch
-      # series the AUR package applies is used here, so the binary in the image
-      # and its corresponding source diffs describe the same client.
+      # still communicate solely by process invocation. The same pinned
+      # source commit as the AUR package is used here, so the binary in the
+      # image and its corresponding source identify the same client.
       - name: Build bundled Xodus client
         run: |
           set -euo pipefail
