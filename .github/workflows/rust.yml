@@ -439,6 +439,11 @@ jobs:
           xvfb-run -a --server-num=121 --server-args='-screen 0 1280x720x24' \
             dbus-run-session -- python3 tests/gui_controller_install.py
 
+      - name: Controller download controls at desktop height (offline)
+        run: |
+          xvfb-run -a --server-num=126 --server-args='-screen 0 1280x900x24' \
+            dbus-run-session -- python3 tests/gui_controller_install.py
+
       - name: Controller account selection (offline)
         run: |
           xvfb-run -a --server-num=122 --server-args='-screen 0 1280x720x24' \

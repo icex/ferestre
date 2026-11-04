@@ -495,11 +495,16 @@ fn move_main(ui: &Ui, action: Action) -> bool {
         })
         .collect();
     let Some(bounds) = bounds else { return false };
-    let next = if focus.is_ancestor(&ui.content) {
+    // The active transfer bar belongs to the content navigation region.
+    // Keeping it outside this set traps horizontal movement on the queue
+    // and can skip its Pause/Stop controls at taller window sizes.
+    let in_content =
+        |w: &gtk::Widget| w.is_ancestor(&ui.content) || w.is_ancestor(&ui.download.root);
+    let next = if in_content(&focus) {
         let indices: Vec<usize> = buttons
             .iter()
             .enumerate()
-            .filter(|(_, w)| w.is_ancestor(&ui.content))
+            .filter(|(_, w)| in_content(w))
             .map(|(i, _)| i)
             .collect();
         let local: Vec<Rect> = indices.iter().map(|i| bounds[*i]).collect();
