@@ -68,15 +68,21 @@ summary="Offline queue fixture"
 ''')
  write(home/'state/ferestre/library.json',json.dumps({'count':2,'items':[{'productId':id,'productType':'Game','status':'Active'} for id in ids]}))
  write(home/'runtime/proton','#!/bin/sh\nexit 0\n',True);write(home/'runtime/version','11.0.20261023.1\n');write(home/'client/xodus-cli','#!/bin/sh\nexit 1\n',True)
- env=dict(os.environ,HOME=str(home),XDG_CONFIG_HOME=str(home/'config'),XDG_STATE_HOME=str(home/'state'),XDG_CACHE_HOME=str(home/'cache'),XDG_DATA_HOME=str(home/'data'),FERESTRE_TITLES=str(home/'recipes'),XODUS_CLI_DIR=str(home/'client'),XODUS_GAMES_DIR=str(home/'games'),XODUS_STEAM_DIR=str(home/'steam'),XODUS_PROTON_DIR=str(home/'runtime'),GTK_A11Y='atspi',FERESTRE_APPLICATION_ID='io.github.icex.ferestre.QueueFixture')
+ env=dict(os.environ,HOME=str(home),XDG_CONFIG_HOME=str(home/'config'),XDG_STATE_HOME=str(home/'state'),XDG_CACHE_HOME=str(home/'cache'),XDG_DATA_HOME=str(home/'data'),FERESTRE_TITLES=str(home/'recipes'),XODUS_CLI_DIR=str(home/'client'),XODUS_GAMES_DIR=str(home/'games'),XODUS_STEAM_DIR=str(home/'steam'),XODUS_PROTON_DIR=str(home/'runtime'),GTK_A11Y='atspi',FERESTRE_APPLICATION_ID='io.github.icex.ferestre.QueueFixture',GSK_RENDERER=os.environ.get('GSK_RENDERER','cairo'))
  for key in ['APPDIR','APPIMAGE','FERESTRE_PACKAGE_VERSION','FERESTRE_SCRIPTS_DIR']:env.pop(key,None)
  for key in ['HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy']:env[key]='http://127.0.0.1:9'
  env['NO_PROXY']=env['no_proxy']=''
  process=None;log=home/'gui.log'
  def start():
   with log.open('ab') as out:p=subprocess.Popen([local],env=env,stdout=out,stderr=out)
-  app=s.find_app(p.pid,time.monotonic()+s.TIMEOUT);frame=s.wait_for(app,lambda root:next(iter(s.find_all(root,role='frame')),None),'queue window',time.monotonic()+s.TIMEOUT)
-  return p,app,frame
+  try:
+   app=s.find_app(p.pid,time.monotonic()+s.TIMEOUT);frame=s.wait_for(app,lambda root:next(iter(s.find_all(root,role='frame')),None),'queue window',time.monotonic()+s.TIMEOUT)
+   return p,app,frame
+  except Exception:
+   print('Queue GUI startup exit status:',p.poll(),flush=True)
+   print(log.read_text(),flush=True)
+   if p.poll() is None:p.terminate();p.wait(timeout=5)
+   raise
  def calls():return (home/'calls').read_text().splitlines() if (home/'calls').exists() else []
  def events():return (home/'events').read_text().splitlines() if (home/'events').exists() else []
  def queue():return json.loads((home/'state/ferestre/install-queue.json').read_text())['jobs']
@@ -100,7 +106,7 @@ summary="Offline queue fixture"
   s.click_named(frame,'Close');s.check(process.wait(timeout=10)==0,'stopped transfers allow the window to close')
   previous=calls();process,app,frame=start();time.sleep(.5)
   s.check(calls()==previous,'a restart never silently starts saved downloads')
-  s.click_named(frame,'Install Queue');s.wait_for(frame,lambda root:'Queue One' in s.texts(root),'saved queue',time.monotonic()+s.TIMEOUT)
+  s.select_in_list(frame,'My Library');s.click_named(frame,'Install queue');s.wait_for(frame,lambda root:'Queue One' in s.texts(root),'saved queue',time.monotonic()+s.TIMEOUT)
   resumes=s.wait_for(frame,lambda root:(buttons if len(buttons:=s.find_all(root,role='button',name='Resume'))==2 else None),'both saved Resume controls',time.monotonic()+s.TIMEOUT);s.check(len(resumes)==2,'both paused jobs can be resumed after restart')
   s.click(resumes[0]);wait(lambda:len(calls())==len(previous)+1,'restarted queue item')
   (home/('finish-'+ids[0])).touch();wait(lambda:len(queue())==1,'finished entry removed')

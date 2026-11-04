@@ -40,8 +40,8 @@ policy. A desktop or Steam mapping that consumes Home before SDL must let that
 button reach Ferestre.
 SDL controller type detection displays PlayStation cross/circle/triangle,
 L1/R1 and Share/Create for DualShock/DualSense controllers. The footer explains
-the available controls for the current focus; Controller help shows the full
-mapping. Steam Input can expose a physical controller as a virtual Xbox device;
+the available controls for the current focus. Press Options/Menu without a title
+selected to show the full mapping. Steam Input can expose a physical controller as a virtual Xbox device;
 in that case the exposed device type determines the default labels. A stick dead zone and
 held-direction repeat avoid accidental movements. Buttons held when another
 application gives Ferestre focus do not activate anything. Devices are never

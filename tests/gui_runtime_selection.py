@@ -37,6 +37,8 @@ def main():
             def wait(test,what):return s.wait_for(app,test,what,time.monotonic()+20)
             frame=wait(lambda root:next(iter(s.find_all(root,role='frame',name='Ferestre')),None),'window')
             s.select_in_list(frame,'Settings');driver=Driver(app,pad)
+            labels=s.texts(frame)
+            s.check('Installed versions' not in labels and 'Capabilities' not in labels,'runtime chooser replaces redundant Settings lists')
             driver.pulse(12);driver.seek('Choose default runtime')
             driver.press(0,lambda root:s.find_all(root,role='button',name='Automatic (newest compatible)'),'controller opens default runtime chooser')
             default_name=f'11.0.1 ({runtimes[0]})'

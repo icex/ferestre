@@ -97,6 +97,8 @@ button.game-tile:focus-visible { outline: 3px solid white; outline-offset: 4px; 
 .sidebar-recents button { padding: 6px; background: transparent; box-shadow: none; border-radius: 6px; }
 .sidebar-recents button:hover { background-color: #343840; }
 .sidebar-footer button { background: transparent; box-shadow: none; }
+.sidebar-footer button:hover { background-color: #30343b; }
+.sidebar-footer button:active { background-color: #393d45; }
 .library-tabs button { background: transparent; border-radius: 0; box-shadow: none; border-bottom: 3px solid transparent; }
 .library-tabs button.active { border-bottom-color: white; font-weight: bold; }
 .filter-chip { border-radius: 18px; background-color: #30343b; }
@@ -452,15 +454,6 @@ fn build_ui(app: &adw::Application) {
         .margin_bottom(12)
         .css_classes(["sidebar-footer"])
         .build();
-    let downloads_link = gtk::Button::builder()
-        .child(
-            &adw::ButtonContent::builder()
-                .icon_name("folder-download-symbolic")
-                .label("Install Queue")
-                .build(),
-        )
-        .halign(gtk::Align::Fill)
-        .build();
     let settings_link = gtk::Button::builder()
         .child(
             &adw::ButtonContent::builder()
@@ -470,16 +463,8 @@ fn build_ui(app: &adw::Application) {
         )
         .halign(gtk::Align::Fill)
         .build();
-    downloads_link.set_widget_name("navigation-downloads");
     settings_link.set_widget_name("navigation-settings");
-    let fullscreen_link = gtk::Button::with_label("Fullscreen");
-    fullscreen_link.set_widget_name("navigation-fullscreen");
-    let help_link = gtk::Button::with_label("Controller help");
-    help_link.set_widget_name("navigation-help");
-    footer.append(&downloads_link);
     footer.append(&settings_link);
-    footer.append(&fullscreen_link);
-    footer.append(&help_link);
     sidebar_box.append(&footer);
     let sidebar_view = adw::ToolbarView::new();
     sidebar_view.add_css_class("ferestre-sidebar");
@@ -703,21 +688,6 @@ fn build_ui(app: &adw::Application) {
         presence: Rc::new(RefCell::new(Default::default())),
     };
 
-    let fullscreen_window = window.clone();
-    fullscreen_link.connect_clicked(move |_| {
-        if fullscreen_window.is_fullscreen() {
-            fullscreen_window.unfullscreen();
-        } else {
-            fullscreen_window.fullscreen();
-        }
-    });
-    let help_ui = ui.clone();
-    help_link.connect_clicked(move |_| controller::show_help(&help_ui));
-    downloads_link.connect_clicked(glib::clone!(
-        #[strong]
-        ui,
-        move |_| select_section(&ui, Section::Downloads)
-    ));
     settings_link.connect_clicked(glib::clone!(
         #[strong]
         ui,
@@ -1204,7 +1174,7 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
     let model = ui.model.borrow();
     let (title, subtitle) = model::runtime_summary(model.runtime.as_ref());
     let group = adw::PreferencesGroup::builder()
-        .title("Patched Proton")
+        .title("Game runtime")
         .build();
     let row = plain_row(&title, Some(&subtitle));
     row.set_subtitle_lines(3);
@@ -1233,10 +1203,15 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
                 .runtimes
                 .iter()
                 .find(|rt| rt.path == *path)
-                .map(|rt| rt.label())
-                .unwrap_or_else(|| format!("Unavailable: {}", path.display()))
+                .map(|rt| {
+                    rt.version
+                        .clone()
+                        .unwrap_or_else(|| "Custom runtime".into())
+                })
+                .unwrap_or_else(|| "Selected runtime is unavailable — choose another".into())
         })
         .unwrap_or_else(|| "Automatic (newest compatible)".into());
+    group.set_description(Some("Choose a default here, or a different runtime in each game’s options. Changes apply to the next launch."));
     let default_row = plain_row("Default game runtime", Some(&default_label));
     default_row.set_subtitle_lines(2);
     let choose = gtk::Button::builder()
@@ -1251,43 +1226,6 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
     default_row.add_suffix(&choose);
     group.add(&default_row);
     page.append(&group);
-
-    if model.runtimes.len() > 1 {
-        let versions = adw::PreferencesGroup::builder()
-            .title("Installed versions")
-            .description("Games use the default above unless you choose another runtime in a game's options. Changes apply to the next launch.")
-            .build();
-        for runtime in &model.runtimes {
-            let row = plain_row(&runtime.label(), Some(&runtime.path.display().to_string()));
-            row.set_subtitle_lines(2);
-            versions.add(&row);
-        }
-        page.append(&versions);
-    }
-
-    if let Some(runtime) = &model.runtime {
-        let capabilities = adw::PreferencesGroup::builder()
-            .title("Capabilities")
-            .description("What this build provides. A recipe names the ones it needs.")
-            .build();
-        for capability in &runtime.provides {
-            let row = plain_row(capability, None);
-            if let Some(symptom) = model.registry.as_ref().and_then(|r| r.symptom(capability)) {
-                row.set_subtitle(symptom);
-                row.set_subtitle_lines(2);
-            }
-            capabilities.add(&row);
-        }
-        if runtime.provides.is_empty() {
-            capabilities.add(
-                &adw::ActionRow::builder()
-                    .title("None found")
-                    .subtitle("The build publishes no capability list, and probing found nothing")
-                    .build(),
-            );
-        }
-        page.append(&capabilities);
-    }
 }
 
 /// What one page of the list looks like, lifted out of the borrow so widgets

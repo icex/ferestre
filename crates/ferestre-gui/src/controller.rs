@@ -280,15 +280,8 @@ fn navigation_buttons(ui: &Ui) -> Vec<gtk::Widget> {
         }
         recent = widget.next_sibling();
     }
-    for name in [
-        "navigation-downloads",
-        "navigation-settings",
-        "navigation-fullscreen",
-        "navigation-help",
-    ] {
-        if let Some(button) = named_widget(ui.window.upcast_ref(), name) {
-            items.push(button);
-        }
+    if let Some(button) = named_widget(ui.window.upcast_ref(), "navigation-settings") {
+        items.push(button);
     }
     items
 }
@@ -311,11 +304,8 @@ fn activate_navigation(ui: &Ui) {
     let Some(focus) = GtkWindowExt::focus(&ui.window) else {
         return;
     };
-    let enter_games = focus.is_ancestor(&ui.sidebar)
-        || matches!(
-            focus.widget_name().as_str(),
-            "navigation-downloads" | "navigation-settings"
-        );
+    let enter_games =
+        focus.is_ancestor(&ui.sidebar) || focus.widget_name() == "navigation-settings";
     activate(ui, &focus);
     if enter_games {
         let ui = ui.clone();
@@ -603,7 +593,7 @@ pub(super) fn show_help(ui: &Ui) {
     } else {
         "PS"
     };
-    let text = format!("{home}: bring Ferestre to the front while a game is running.\n\nD-pad or left stick: move between games.\n\n{a}: select or launch the highlighted game.\n{b}: go back or close a menu.\n{y}: search.\n{view}: open or close navigation.\n{menu}: options for the highlighted game.\n{shoulders}: change sections.\n\nIn navigation, ↑/↓ chooses a section; → or {a} opens its games. ← from the first game returns to navigation.\n\nFullscreen is available in navigation and the window header (keyboard F11).");
+    let text = format!("{home}: bring Ferestre to the front while a game is running.\n\nD-pad or left stick: move between games.\n\n{a}: select or launch the highlighted game.\n{b}: go back or close a menu.\n{y}: search.\n{view}: open or close navigation.\n{menu}: options for the highlighted game.\n{shoulders}: change sections.\n\nIn navigation, ↑/↓ chooses a section; → or {a} opens its games. ← from the first game returns to navigation.\n\nFullscreen is available in the window header (keyboard F11).");
     let dialog = adw::AlertDialog::new(Some("Controller controls"), Some(&text));
     dialog.add_response("close", "Close");
     dialog.set_close_response("close");
@@ -1158,11 +1148,7 @@ fn dispatch(ui: &Ui, action: Action) {
                     Action::Right => {
                         let focus = GtkWindowExt::focus(&ui.window);
                         if focus.as_ref().is_some_and(|w| {
-                            w.is_ancestor(&ui.sidebar)
-                                || matches!(
-                                    w.widget_name().as_str(),
-                                    "navigation-downloads" | "navigation-settings"
-                                )
+                            w.is_ancestor(&ui.sidebar) || w.widget_name() == "navigation-settings"
                         }) {
                             activate_navigation(ui);
                         } else {

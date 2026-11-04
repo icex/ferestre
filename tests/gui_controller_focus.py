@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Controller section focus and one visible selection outline per game tile."""
+"""Settings mouse hover, controller section focus and one game selection outline."""
 import argparse,ctypes,ctypes.util,os,subprocess,tempfile,time,struct,zlib
 from pathlib import Path
 import gui_smoke as s
@@ -11,7 +11,7 @@ def png():
 from controller_driver import Driver,focus,start_window_manager
 
 
-def outline_bands(pid,button):
+def pixel_row(pid,button,dx,dy,width):
     x=ctypes.CDLL(ctypes.util.find_library('X11'));p=ctypes.c_void_p;u=ctypes.c_ulong
     x.XOpenDisplay.argtypes=[ctypes.c_char_p];x.XOpenDisplay.restype=p
     x.XDefaultRootWindow.argtypes=[p];x.XDefaultRootWindow.restype=u
@@ -21,19 +21,36 @@ def outline_bands(pid,button):
     d=x.XOpenDisplay(None)
     try:
         origin=s.window_origin(pid);box=button.get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
-        pixels=x.XGetImage(d,x.XDefaultRootWindow(d),origin[0]+box.x-15,origin[1]+box.y+box.height//3,45,1,u(-1).value,2)
+        pixels=x.XGetImage(d,x.XDefaultRootWindow(d),origin[0]+box.x+dx,origin[1]+box.y+dy,width,1,u(-1).value,2)
         if not pixels:raise s.Failure('selection pixels unavailable')
         try:
-            bands=[];inside=False
-            for index in range(45):
-                color=x.XGetPixel(pixels,index,0)&0xffffff
-                r,g,b=color>>16,(color>>8)&255,color&255
-                green=g>r+35 and g>b+35
-                if green and not inside:bands.append(index-15)
-                inside=green
-            return bands
+            return [x.XGetPixel(pixels,index,0)&0xffffff for index in range(width)]
         finally:x.XDestroyImage(pixels)
     finally:x.XCloseDisplay(d)
+
+
+def outline_bands(pid,button):
+    box=button.get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
+    bands=[];inside=False
+    for index,color in enumerate(pixel_row(pid,button,-15,box.height//3,45)):
+        r,g,b=color>>16,(color>>8)&255,color&255
+        green=g>r+35 and g>b+35
+        if green and not inside:bands.append(index-15)
+        inside=green
+    return bands
+
+
+def check_settings_hover(pid,frame):
+    button=s.find_all(frame,role='button',name='Settings')[0]
+    box=button.get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
+    origin=s.window_origin(pid)
+    s.Atspi.generate_mouse_event(origin[0]+350,origin[1]+80,'abs');time.sleep(.3)
+    normal=pixel_row(pid,button,8,box.height//2,1)[0]
+    s.Atspi.generate_mouse_event(origin[0]+box.x+box.width//2,origin[1]+box.y+box.height//2,'abs');time.sleep(.3)
+    hovered=pixel_row(pid,button,8,box.height//2,1)[0]
+    s.check(normal!=hovered and hovered==0x30343b,'Settings paints the sidebar mouse hover state')
+    s.Atspi.generate_mouse_event(origin[0]+350,origin[1]+80,'abs');time.sleep(.3)
+    s.check(pixel_row(pid,button,8,box.height//2,1)[0]==normal,'Settings clears its hover state when the pointer leaves')
 
 
 def main():
@@ -52,6 +69,7 @@ def main():
             app=s.find_app(gui.pid,time.monotonic()+20)
             def wait(test,what):return s.wait_for(app,test,what,time.monotonic()+20)
             frame=wait(lambda root:next(iter(s.find_all(root,role='frame',name='Ferestre')),None),'window')
+            check_settings_hover(gui.pid,frame)
             s.select_in_list(frame,'My Library');driver=Driver(app,pad)
             for fullscreen in (False,True):
                 if fullscreen:s.click_named(frame,'Enter fullscreen');wait(lambda r:s.find_all(r,name='Exit fullscreen'),'fullscreen')
@@ -78,15 +96,12 @@ def main():
             wait(lambda r:focus(r) is not None and focus(r).get_name()=='Installed','background refresh preserves tab focus')
             driver.seek('Install queue');driver.press(0,lambda r:s.find_all(r,name='Downloads page'),'queue again')
             wait(lambda r:focus(r) is not None and focus(r).get_name()=='Install queue','queue focus after repeated switches')
-            driver.pulse(4);driver.seek('Install Queue')
-            driver.press(0,lambda r:s.find_all(r,name='Downloads page'),'open queue from sidebar footer')
-            wait(lambda r:focus(r) is not None and focus(r).get_name()=='Install queue','footer entry focuses the active queue tab')
             driver.pulse(3)
             time.sleep(.3)
             driver.press(0,lambda r:s.find_all(r,role='button',name='Done'),'Search from queue opens the keyboard')
             driver.press(1,lambda r:not s.find_all(r,role='button',name='Done'),'cancel queue search')
-            driver.pulse(4);driver.seek('Install Queue')
-            driver.press(0,lambda r:s.find_all(r,name='Downloads page'),'sidebar opens queue from the library')
+            driver.seek('Install queue')
+            driver.press(0,lambda r:s.find_all(r,name='Downloads page'),'Library opens its queue tab')
             wait(lambda r:focus(r) is not None and focus(r).get_name()=='Install queue','new queue page keeps its tab focused')
             s.click_named(frame,'Close');s.check(gui.wait(timeout=10)==0,'focus fixture closes cleanly')
             print('PASS: section selection matches focus and game tiles have one outline',flush=True)
