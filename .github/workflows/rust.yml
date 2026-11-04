@@ -354,6 +354,9 @@ jobs:
 
   gui:
     runs-on: ubuntu-latest
+    env:
+      GDK_BACKEND: x11
+      GSK_RENDERER: cairo
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -385,91 +388,94 @@ jobs:
 
       # A session bus for the accessibility bus to live on, a display for the
       # window to map into, and then the test drives it by pressing things.
+      # Keep virtual displays running across transient periods with no clients;
+      # retain server diagnostics if a window cannot connect. Use the same X11
+      # software renderer as the local headless checks.
       # Do not reuse a display while the preceding Xvfb is shutting down.
       - name: Smoke test
         run: |
-          xvfb-run -a --server-num=110 --server-args='-screen 0 1280x900x24' \
+          xvfb-run -a --error-file=/dev/stderr --server-num=110 --server-args='-screen 0 1280x900x24 -noreset' \
             dbus-run-session -- python3 tests/gui_smoke.py
 
       - name: Move location and automatic space checks (offline)
         run: |
-          xvfb-run -a --server-num=111 --server-args='-screen 0 1280x900x24' \
+          xvfb-run -a --error-file=/dev/stderr --server-num=111 --server-args='-screen 0 1280x900x24 -noreset' \
             dbus-run-session -- python3 tests/gui_move.py --binary target/debug/ferestre-gui
 
       - name: Separate Store and Player accounts (offline)
         run: |
-          xvfb-run -a --server-num=112 --server-args='-screen 0 1280x900x24' \
+          xvfb-run -a --error-file=/dev/stderr --server-num=112 --server-args='-screen 0 1280x900x24 -noreset' \
             dbus-run-session -- python3 tests/gui_accounts.py
 
       # The client is a script that advertises presence-v1 and plays back
       # runner events, so this signs nothing in and posts nothing.
       - name: Online status while a game runs (offline)
         run: |
-          xvfb-run -a --server-num=113 --server-args='-screen 0 1280x900x24' \
+          xvfb-run -a --error-file=/dev/stderr --server-num=113 --server-args='-screen 0 1280x900x24 -noreset' \
             dbus-run-session -- python3 tests/gui_presence.py
 
       # PackageKit is a fake on a private bus standing in for the system one,
       # and the missing library is a fixture, so this installs nothing.
       - name: Secure application and runtime updater (offline)
         run: |
-          xvfb-run -a --server-num=114 --server-args='-screen 0 1280x900x24' \
+          xvfb-run -a --error-file=/dev/stderr --server-num=114 --server-args='-screen 0 1280x900x24 -noreset' \
             dbus-run-session -- python3 tests/gui_updater.py
 
       - name: Game Pass artwork and handheld fullscreen (loopback)
         run: |
-          xvfb-run -a --server-num=115 --server-args='-screen 0 1280x720x24' \
+          xvfb-run -a --error-file=/dev/stderr --server-num=115 --server-args='-screen 0 1280x720x24 -noreset' \
             dbus-run-session -- python3 tests/gui_artwork.py --fullscreen
       - name: Controller adapter, button glyphs and focus indicator (offline)
         run: |
-          xvfb-run -a --server-num=116 --server-args='-screen 0 1280x900x24' \
+          xvfb-run -a --error-file=/dev/stderr --server-num=116 --server-args='-screen 0 1280x900x24 -noreset' \
             dbus-run-session -- python3 tests/gui_controller.py
 
       - name: Game launch loading, running state and background Home (offline)
         run: |
-          xvfb-run -a --server-num=117 --server-args='-screen 0 1280x720x24' \
+          xvfb-run -a --error-file=/dev/stderr --server-num=117 --server-args='-screen 0 1280x720x24 -noreset' \
             dbus-run-session -- python3 tests/gui_launch.py
 
       - name: Controller Resume and confirmed Stop (offline)
         run: |
-          xvfb-run -a --server-num=120 --server-args='-screen 0 1280x720x24' \
+          xvfb-run -a --error-file=/dev/stderr --server-num=120 --server-args='-screen 0 1280x720x24 -noreset' \
             dbus-run-session -- python3 tests/gui_running.py
 
       - name: Controller keyboard, install destination and queue (offline)
         run: |
-          xvfb-run -a --server-num=121 --server-args='-screen 0 1280x720x24' \
+          xvfb-run -a --error-file=/dev/stderr --server-num=121 --server-args='-screen 0 1280x720x24 -noreset' \
             dbus-run-session -- python3 tests/gui_controller_install.py
 
       - name: Controller download controls at desktop height (offline)
         run: |
-          xvfb-run -a --server-num=126 --server-args='-screen 0 1280x900x24' \
+          xvfb-run -a --error-file=/dev/stderr --server-num=126 --server-args='-screen 0 1280x900x24 -noreset' \
             dbus-run-session -- python3 tests/gui_controller_install.py
 
       - name: Controller account selection (offline)
         run: |
-          xvfb-run -a --server-num=122 --server-args='-screen 0 1280x720x24' \
+          xvfb-run -a --error-file=/dev/stderr --server-num=122 --server-args='-screen 0 1280x720x24 -noreset' \
             dbus-run-session -- python3 tests/gui_accounts_controller.py
 
       - name: Controller global and per-game runtime selection (offline)
         run: |
-          xvfb-run -a --server-num=123 --server-args='-screen 0 1280x720x24' \
+          xvfb-run -a --error-file=/dev/stderr --server-num=123 --server-args='-screen 0 1280x720x24 -noreset' \
             dbus-run-session -- python3 tests/gui_runtime_selection.py
 
       - name: Resume paused updates from the game grid (offline)
         run: |
-          xvfb-run -a --server-num=124 --server-args='-screen 0 1280x720x24' \
+          xvfb-run -a --error-file=/dev/stderr --server-num=124 --server-args='-screen 0 1280x720x24 -noreset' \
             dbus-run-session -- python3 tests/gui_update_resume.py
 
       - name: Controller tab focus and single selection outline (offline)
         run: |
-          xvfb-run -a --server-num=125 --server-args='-screen 0 1280x720x24' \
+          xvfb-run -a --error-file=/dev/stderr --server-num=125 --server-args='-screen 0 1280x720x24 -noreset' \
             dbus-run-session -- python3 tests/gui_controller_focus.py
 
       - name: Persistent install queue and pause controls (offline)
         run: |
-          xvfb-run -a --server-num=118 --server-args='-screen 0 1280x900x24' \
+          xvfb-run -a --error-file=/dev/stderr --server-num=118 --server-args='-screen 0 1280x900x24 -noreset' \
             dbus-run-session -- python3 tests/gui_transfers.py
 
       - name: Missing WebKitGTK offered for install (offline)
         run: |
-          xvfb-run -a --server-num=119 --server-args='-screen 0 1280x900x24' \
+          xvfb-run -a --error-file=/dev/stderr --server-num=119 --server-args='-screen 0 1280x900x24 -noreset' \
             dbus-run-session -- python3 tests/gui_client_deps.py
