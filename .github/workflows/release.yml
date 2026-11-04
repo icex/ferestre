@@ -3,7 +3,7 @@
 # Three artefacts, all x86_64 Linux:
 #
 #   ferestre-<version>-x86_64.tar.zst   the tree an installed copy has, so the
-#                                       binary finds its scripts, patches and
+#                                       binary finds its scripts, source lock and
 #                                       recipes exactly the way the AUR package
 #                                       lays them out -- usr/bin beside
 #                                       usr/lib/ferestre. Extract anywhere.
@@ -166,19 +166,15 @@ jobs:
 
       # A release that opens but cannot sign in is not a usable AppImage. Build
       # the GPL client separately and ship it beside the MIT launcher; the two
-      # still communicate solely by process invocation. The same ordered patch
-      # series the AUR package applies is used here, so the binary in the image
-      # and its corresponding source diffs describe the same client.
+      # still communicate solely by process invocation. The same pinned
+      # source commit as the AUR package is used here, so the binary in the
+      # image and its corresponding source identify the same client.
       - name: Build bundled Xodus client
         run: |
           set -euo pipefail
-          # The submodule pin is the upstream commit the series is written
-          # against; scripts/check-patches.sh and the AUR package name the same one.
+          # Build the fork commit locked by the submodule and sources.lock.json.
           git submodule update --init --quiet third_party/xodus-cli
-          for patch in patches/xodus-cli/*.patch; do
-              case "$(basename "$patch")" in 0001-*) continue ;; esac
-              git -C third_party/xodus-cli apply "$GITHUB_WORKSPACE/$patch"
-          done
+          python3 scripts/source-pins.py verify xodus --directory third_party/xodus-cli
           cargo build --locked --release --manifest-path third_party/xodus-cli/Cargo.toml \
               -p xodus-cli -p xodus-service
 
@@ -205,9 +201,9 @@ jobs:
           sha256sum "$root/usr/lib/ferestre/client/xodus-service" | cut -d' ' -f1 > "$root/usr/lib/ferestre/client/SERVICE_ID"
           # Not documentation: launch-gdk.sh is the launch path and
           # proton-wine-shim.sh is what the client execs as its "wine".
-          # patches/ travels with them because install-xodus-proton.sh reads
-          # patches/proton out of the repository root.
-          cp -a scripts patches titles "$root/usr/lib/ferestre/"
+          # The source lock identifies the bundled client and runtime forks.
+          cp -a scripts titles "$root/usr/lib/ferestre/"
+          install -Dm644 sources.lock.json "$root/usr/lib/ferestre/sources.lock.json"
           find "$root/usr/lib/ferestre/scripts" -name '*.sh' -exec chmod 0755 {} +
           printf '%s\n' "$VERSION" > "$root/usr/lib/ferestre/VERSION"
 

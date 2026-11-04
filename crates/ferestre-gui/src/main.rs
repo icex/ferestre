@@ -17,6 +17,7 @@ mod client_check;
 mod controller;
 mod deadline;
 mod editor;
+mod folder_picker;
 mod handheld;
 mod launch_state;
 mod model;
@@ -26,6 +27,7 @@ mod progress;
 mod queue_ui;
 mod state;
 mod stop;
+mod text_input;
 mod window_activation;
 
 use adw::prelude::*;
@@ -77,7 +79,8 @@ window.ferestre-window, .ferestre-content, .ferestre-content > contents {
 .ferestre-window entry, .ferestre-window searchentry { background-color: #292c32; color: #f4f4f5; border: 1px solid #565b66; border-radius: 24px; }
 .ferestre-window button { color: #f4f4f5; }
 .ferestre-window button.suggested-action { background-color: #107c10; color: #ffffff; }
-button.game-tile { padding: 0; border: 0; background-color: #25282d; color: #f4f4f5; box-shadow: none; border-radius: 7px; }
+.game-tile { background-color: #25282d; border-radius: 7px; }
+button.game-tile { padding: 0; border: 0; background-image: none; background-color: #25282d; color: #f4f4f5; box-shadow: none; border-radius: 7px; }
 button.game-tile:hover { background-color: #30343b; }
 button.game-tile:focus-visible { outline: 3px solid white; outline-offset: 4px; }
 .game-tile picture { border-radius: 7px 7px 0 0; }
@@ -94,6 +97,8 @@ button.game-tile:focus-visible { outline: 3px solid white; outline-offset: 4px; 
 .sidebar-recents button { padding: 6px; background: transparent; box-shadow: none; border-radius: 6px; }
 .sidebar-recents button:hover { background-color: #343840; }
 .sidebar-footer button { background: transparent; box-shadow: none; }
+.sidebar-footer button:hover { background-color: #30343b; }
+.sidebar-footer button:active { background-color: #393d45; }
 .library-tabs button { background: transparent; border-radius: 0; box-shadow: none; border-bottom: 3px solid transparent; }
 .library-tabs button.active { border-bottom-color: white; font-weight: bold; }
 .filter-chip { border-radius: 18px; background-color: #30343b; }
@@ -151,6 +156,16 @@ window.ferestre-window flowboxchild:focus-visible {
 .navigation-sidebar row { min-height: 52px; border-radius: 10px; margin: 3px 8px; }
 .game-grid { background: transparent; }
 .game-grid flowboxchild { padding: 0; border-radius: 16px; }
+window.ferestre-window .game-grid button { transition-property: none; }
+window.ferestre-window .game-grid button:focus-visible:not(:focus) { outline: none; box-shadow: none; }
+/* Only the actual tile/action owns its focus ring, never its FlowBox wrapper. */
+window.ferestre-window .game-grid flowboxchild,
+window.ferestre-window .game-grid flowboxchild:focus,
+window.ferestre-window .game-grid flowboxchild:focus-visible,
+window.ferestre-window .game-grid flowboxchild:focus-within {
+  outline: none;
+  box-shadow: none;
+}
 .game-card { border-radius: 16px; background: @card_bg_color; box-shadow: 0 2px 10px alpha(black,0.12); }
 .game-card picture { border-radius: 16px 16px 0 0; }
 .game-card .game-actions { margin: 0 14px 14px 14px; }
@@ -285,6 +300,7 @@ struct Ui {
     controller_family: Rc<Cell<controller::Family>>,
     controller_connected: Rc<Cell<bool>>,
     last_game_focus: Rc<RefCell<Option<String>>>,
+    pending_tab_focus: Rc<Cell<Option<Section>>>,
     game_actions: Rc<RefCell<BTreeMap<String, String>>>,
     fullscreen_nav: gtk::Box,
     recent_games: gtk::Box,
@@ -295,6 +311,15 @@ struct Ui {
 }
 
 fn main() -> glib::ExitCode {
+    let args: Vec<_> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a == "--resume-x11") {
+        let pids: Result<Vec<u32>, _> = args[2..].iter().map(|s| s.parse()).collect();
+        return if pids.is_ok_and(|pids| !pids.is_empty() && window_activation::x11_resume(&pids)) {
+            glib::ExitCode::SUCCESS
+        } else {
+            glib::ExitCode::FAILURE
+        };
+    }
     let application_id = std::env::var("FERESTRE_APPLICATION_ID")
         .ok()
         .filter(|id| gio::Application::id_is_valid(id))
@@ -429,15 +454,6 @@ fn build_ui(app: &adw::Application) {
         .margin_bottom(12)
         .css_classes(["sidebar-footer"])
         .build();
-    let downloads_link = gtk::Button::builder()
-        .child(
-            &adw::ButtonContent::builder()
-                .icon_name("folder-download-symbolic")
-                .label("Install Queue")
-                .build(),
-        )
-        .halign(gtk::Align::Fill)
-        .build();
     let settings_link = gtk::Button::builder()
         .child(
             &adw::ButtonContent::builder()
@@ -447,16 +463,8 @@ fn build_ui(app: &adw::Application) {
         )
         .halign(gtk::Align::Fill)
         .build();
-    downloads_link.set_widget_name("navigation-downloads");
     settings_link.set_widget_name("navigation-settings");
-    let fullscreen_link = gtk::Button::with_label("Fullscreen");
-    fullscreen_link.set_widget_name("navigation-fullscreen");
-    let help_link = gtk::Button::with_label("Controller help");
-    help_link.set_widget_name("navigation-help");
-    footer.append(&downloads_link);
     footer.append(&settings_link);
-    footer.append(&fullscreen_link);
-    footer.append(&help_link);
     sidebar_box.append(&footer);
     let sidebar_view = adw::ToolbarView::new();
     sidebar_view.add_css_class("ferestre-sidebar");
@@ -619,6 +627,7 @@ fn build_ui(app: &adw::Application) {
         controller_family: Rc::new(Cell::new(controller::Family::default())),
         controller_connected: Rc::new(Cell::new(false)),
         last_game_focus: Rc::new(RefCell::new(None)),
+        pending_tab_focus: Rc::new(Cell::new(None)),
         game_actions: Rc::new(RefCell::new(BTreeMap::new())),
         fullscreen_nav: gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -679,21 +688,6 @@ fn build_ui(app: &adw::Application) {
         presence: Rc::new(RefCell::new(Default::default())),
     };
 
-    let fullscreen_window = window.clone();
-    fullscreen_link.connect_clicked(move |_| {
-        if fullscreen_window.is_fullscreen() {
-            fullscreen_window.unfullscreen();
-        } else {
-            fullscreen_window.fullscreen();
-        }
-    });
-    let help_ui = ui.clone();
-    help_link.connect_clicked(move |_| controller::show_help(&help_ui));
-    downloads_link.connect_clicked(glib::clone!(
-        #[strong]
-        ui,
-        move |_| select_section(&ui, Section::Downloads)
-    ));
     settings_link.connect_clicked(glib::clone!(
         #[strong]
         ui,
@@ -918,6 +912,8 @@ fn build_ui(app: &adw::Application) {
 // --- rendering ------------------------------------------------------------
 
 fn select_section(ui: &Ui, section: Section) {
+    let from_tab = GtkWindowExt::focus(&ui.window)
+        .is_some_and(|focus| focus.widget_name().starts_with("section-"));
     let nav = if matches!(
         section,
         Section::Installed | Section::Updates | Section::Downloads
@@ -945,6 +941,9 @@ fn select_section(ui: &Ui, section: Section) {
         render(ui);
     }
     ui.split.set_show_content(true);
+    if from_tab {
+        controller::focus_section_tab(ui, section);
+    }
 }
 
 fn named_widget(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
@@ -974,10 +973,7 @@ fn render(ui: &Ui) {
     let window = &ui.window;
     let focus_name = GtkWindowExt::focus(window)
         .filter(|w| w.is_ancestor(&ui.content))
-        .map(|w| w.widget_name().to_string())
-        .filter(|name| {
-            name.starts_with("game-") || name.starts_with("queue-") || name.starts_with("recent-")
-        });
+        .and_then(|w| controller::focus_after_render(&w.widget_name(), ui.model.borrow().section));
     if GtkWindowExt::focus(window).is_some_and(|focus| focus.is_ancestor(&ui.content)) {
         GtkWindowExt::set_focus(window, None::<&gtk::Widget>);
     }
@@ -1089,14 +1085,18 @@ fn render(ui: &Ui) {
     }
     preload_gamepass_art(ui);
     if let Some(name) = focus_name {
-        let window = ui.window.clone();
-        glib::idle_add_local_once(move || {
-            if GtkWindowExt::focus(&window).is_none() {
-                if let Some(widget) = named_widget(window.upcast_ref(), &name) {
-                    widget.grab_focus();
+        if name.starts_with("section-") {
+            controller::focus_section_tab(ui, ui.model.borrow().section);
+        } else {
+            let window = ui.window.clone();
+            glib::idle_add_local_once(move || {
+                if GtkWindowExt::focus(&window).is_none() {
+                    if let Some(widget) = named_widget(window.upcast_ref(), &name) {
+                        widget.grab_focus();
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 }
 
@@ -1161,13 +1161,20 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
         move |_| app_updates::refresh(&ui, true)
     ));
     release_row.add_suffix(&check);
+    let quit = gtk::Button::builder()
+        .label("Quit Ferestre")
+        .valign(gtk::Align::Center)
+        .build();
+    let quit_window = ui.window.clone();
+    quit.connect_clicked(move |_| quit_window.close());
+    release_row.add_suffix(&quit);
     release.add(&release_row);
     page.append(&release);
 
     let model = ui.model.borrow();
     let (title, subtitle) = model::runtime_summary(model.runtime.as_ref());
     let group = adw::PreferencesGroup::builder()
-        .title("Patched Proton")
+        .title("Game runtime")
         .build();
     let row = plain_row(&title, Some(&subtitle));
     row.set_subtitle_lines(3);
@@ -1185,44 +1192,40 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
         row.add_suffix(&install);
     }
     group.add(&row);
+    let default = model
+        .paths
+        .as_ref()
+        .and_then(|paths| ferestre_core::runtime::default_selected(paths.config_dir()));
+    let default_label = default
+        .as_ref()
+        .map(|path| {
+            model
+                .runtimes
+                .iter()
+                .find(|rt| rt.path == *path)
+                .map(|rt| {
+                    rt.version
+                        .clone()
+                        .unwrap_or_else(|| "Custom runtime".into())
+                })
+                .unwrap_or_else(|| "Selected runtime is unavailable — choose another".into())
+        })
+        .unwrap_or_else(|| "Automatic (newest compatible)".into());
+    group.set_description(Some("Choose a default here, or a different runtime in each game’s options. Changes apply to the next launch."));
+    let default_row = plain_row("Default game runtime", Some(&default_label));
+    default_row.set_subtitle_lines(2);
+    let choose = gtk::Button::builder()
+        .label("Choose default runtime")
+        .valign(gtk::Align::Center)
+        .build();
+    choose.connect_clicked(glib::clone!(
+        #[strong]
+        ui,
+        move |_| runtime_chooser(&ui, None, "Default game runtime")
+    ));
+    default_row.add_suffix(&choose);
+    group.add(&default_row);
     page.append(&group);
-
-    if model.runtimes.len() > 1 {
-        let versions = adw::PreferencesGroup::builder()
-            .title("Installed versions")
-            .description("New launches use the newest compatible version. A title-specific choice is kept locally.")
-            .build();
-        for runtime in &model.runtimes {
-            let row = plain_row(&runtime.label(), Some(&runtime.path.display().to_string()));
-            row.set_subtitle_lines(2);
-            versions.add(&row);
-        }
-        page.append(&versions);
-    }
-
-    if let Some(runtime) = &model.runtime {
-        let capabilities = adw::PreferencesGroup::builder()
-            .title("Capabilities")
-            .description("What this build provides. A recipe names the ones it needs.")
-            .build();
-        for capability in &runtime.provides {
-            let row = plain_row(capability, None);
-            if let Some(symptom) = model.registry.as_ref().and_then(|r| r.symptom(capability)) {
-                row.set_subtitle(symptom);
-                row.set_subtitle_lines(2);
-            }
-            capabilities.add(&row);
-        }
-        if runtime.provides.is_empty() {
-            capabilities.add(
-                &adw::ActionRow::builder()
-                    .title("None found")
-                    .subtitle("The build publishes no capability list, and probing found nothing")
-                    .build(),
-            );
-        }
-        page.append(&capabilities);
-    }
 }
 
 /// What one page of the list looks like, lifted out of the borrow so widgets
@@ -1821,8 +1824,13 @@ fn render_rows(
             .column_spacing(18)
             .css_classes(["game-grid"])
             .build();
-        for row in &drawn.rows {
+        for (index, row) in drawn.rows.iter().enumerate() {
             grid.insert(&game_card(ui, row), -1);
+            // Each card already contains its own primary and More controls.
+            // A focusable wrapper adds a second selection boundary.
+            if let Some(child) = grid.child_at_index(index as i32) {
+                child.set_focusable(false);
+            }
         }
         grid.connect_child_activated(|_, child| {
             if let Some(card) = child.child() {
@@ -1966,6 +1974,10 @@ fn render_rows(
 }
 
 fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
+    runtime_chooser(ui, Some(product_id), &format!("Runtime for {title}"));
+}
+
+fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
     let (paths, runtimes, current) = {
         let model = ui.model.borrow();
         let Some(paths) = model.paths.clone() else {
@@ -1974,14 +1986,16 @@ fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
         (
             paths.clone(),
             model.runtimes.clone(),
-            ferestre_core::runtime::selected(paths.config_dir(), product_id),
+            match product_id {
+                Some(id) => ferestre_core::runtime::selected(paths.config_dir(), id),
+                None => ferestre_core::runtime::default_selected(paths.config_dir()),
+            },
         )
     };
-    let dialog = gtk::Window::builder()
-        .transient_for(&ui.window)
-        .modal(true)
-        .title(format!("Runtime for {title}"))
-        .default_width(520)
+    let dialog = adw::Dialog::builder()
+        .title(title)
+        .content_width(520)
+        .content_height(420)
         .build();
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -1991,17 +2005,31 @@ fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
         .margin_start(18)
         .margin_end(18)
         .build();
-    let automatic = gtk::Button::with_label("Automatic (newest compatible)");
+    content.append(&gtk::Label::builder()
+        .label(if product_id.is_some() {
+            "Choose a runtime for this game, or inherit your Settings default. Applies to the next launch."
+        } else {
+            "Used for games without their own override. Automatic selects the newest compatible runtime. Applies to the next launch."
+        })
+        .wrap(true)
+        .xalign(0.0)
+        .build());
+    let automatic = gtk::Button::with_label(if product_id.is_some() {
+        "Use default runtime"
+    } else {
+        "Automatic (newest compatible)"
+    });
     let automatic_ui = ui.clone();
     let automatic_dialog = dialog.clone();
     let automatic_paths = paths.clone();
-    let automatic_product = product_id.to_string();
+    let automatic_product = product_id.map(str::to_string);
     automatic.connect_clicked(move |_| {
-        if let Err(error) = ferestre_core::runtime::set_selected(
+        let result = save_runtime_choice(
             automatic_paths.config_dir(),
-            &automatic_product,
+            automatic_product.as_deref(),
             None,
-        ) {
+        );
+        if let Err(error) = result {
             automatic_ui
                 .toasts
                 .add_toast(toast(format!("Could not save runtime choice: {error}")));
@@ -2009,9 +2037,7 @@ fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
             automatic_dialog.close();
             // The row is judged against the runtime its launch will use.
             render(&automatic_ui);
-            automatic_ui
-                .toasts
-                .add_toast(toast("Runtime selection reset to automatic"));
+            automatic_ui.toasts.add_toast(toast("Runtime choice reset"));
         }
     });
     content.append(&automatic);
@@ -2022,16 +2048,24 @@ fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
         } else {
             runtime.label()
         };
-        let choice = gtk::Button::with_label(&label);
+        let choice = gtk::Button::builder()
+            .child(
+                &gtk::Label::builder()
+                    .label(&label)
+                    .wrap(true)
+                    .xalign(0.0)
+                    .build(),
+            )
+            .build();
         let selected_ui = ui.clone();
         let selected_dialog = dialog.clone();
         let selected_paths = paths.clone();
-        let selected_product = product_id.to_string();
+        let selected_product = product_id.map(str::to_string);
         let path = runtime.path.clone();
         choice.connect_clicked(move |_| {
-            if let Err(error) = ferestre_core::runtime::set_selected(
+            if let Err(error) = save_runtime_choice(
                 selected_paths.config_dir(),
-                &selected_product,
+                selected_product.as_deref(),
                 Some(&path),
             ) {
                 selected_ui
@@ -2042,17 +2076,36 @@ fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
                 render(&selected_ui);
                 selected_ui
                     .toasts
-                    .add_toast(toast("Runtime selected for this title"));
+                    .add_toast(toast("Runtime choice saved for the next launch"));
             }
         });
         content.append(&choice);
     }
     let cancel = gtk::Button::with_label("Cancel");
     let cancel_dialog = dialog.clone();
-    cancel.connect_clicked(move |_| cancel_dialog.close());
+    cancel.connect_clicked(move |_| {
+        cancel_dialog.close();
+    });
     content.append(&cancel);
-    dialog.set_child(Some(&content));
-    dialog.present();
+    dialog.set_child(Some(
+        &gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .child(&content)
+            .build(),
+    ));
+    dialog.present(Some(&ui.window));
+    automatic.grab_focus();
+}
+
+fn save_runtime_choice(
+    config: &std::path::Path,
+    product_id: Option<&str>,
+    path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    match product_id {
+        Some(id) => ferestre_core::runtime::set_selected(config, id, path),
+        None => ferestre_core::runtime::set_default(config, path),
+    }
 }
 
 fn render_library_tabs(ui: &Ui, page: &gtk::Box) {
@@ -2231,6 +2284,10 @@ fn render_featured(ui: &Ui, page: &gtk::Box, rows: &[LibraryRow]) {
     page.append(&strip);
     let features = gtk::Box::new(gtk::Orientation::Horizontal, 18);
     for row in rows.iter().take(3) {
+        if row.action == Action::Stop {
+            features.append(&game_card(ui, row));
+            continue;
+        }
         let overlay = gtk::Overlay::builder()
             .width_request(420)
             .height_request(260)
@@ -2523,7 +2580,6 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
             .halign(gtk::Align::Fill)
             .valign(gtk::Align::Fill)
             .css_classes(["game-launch-overlay"])
-            .can_target(false)
             .build();
         layer.set_accessible_role(gtk::AccessibleRole::Group);
         layer.update_property(&[gtk::accessible::Property::Label(if launching {
@@ -2546,7 +2602,7 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
                 "Stopping game"
             }));
         } else {
-            let icon = gtk::Image::from_icon_name("media-playback-stop-symbolic");
+            let icon = gtk::Image::from_icon_name("media-playback-start-symbolic");
             icon.set_pixel_size(48);
             center.append(&icon);
         }
@@ -2556,17 +2612,38 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
                 .css_classes(["game-overlay-state"])
                 .build(),
         );
-        center.append(
-            &gtk::Label::builder()
-                .label(if stopping { "Stop now" } else { "Stop" })
-                .css_classes(["game-overlay-action"])
-                .build(),
-        );
+        // These are separate controls, never buttons nested inside a button.
+        let mut control = actions.first_child();
+        while let Some(widget) = control {
+            control = widget.next_sibling();
+            if widget.is::<gtk::Button>() {
+                actions.remove(&widget);
+                widget.set_size_request(144, 48);
+                widget.add_css_class("pill");
+                widget.reset_relation(gtk::AccessibleRelation::LabelledBy);
+                if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+                    widget.update_property(&[gtk::accessible::Property::Label(&format!(
+                        "{} · {}",
+                        row.name,
+                        button.label().unwrap_or_default()
+                    ))]);
+                }
+                center.append(&widget);
+            }
+        }
         layer.append(&center);
         surface.add_overlay(&layer);
     }
     let overlay = gtk::Overlay::new();
-    if let Some(primary) = primary {
+    if row.action == Action::Stop {
+        surface.add_css_class("game-tile");
+        surface.set_accessible_role(gtk::AccessibleRole::Group);
+        surface.update_property(&[gtk::accessible::Property::Label(&format!(
+            "{} · Game card",
+            row.name
+        ))]);
+        overlay.set_child(Some(&surface));
+    } else if let Some(primary) = primary {
         actions.remove(&primary);
         primary.set_child(Some(&surface));
         primary.set_tooltip_text(description.tooltip_text().as_deref());
@@ -2738,7 +2815,17 @@ fn library_components(ui: &Ui, row: &LibraryRow) -> (adw::ActionRow, gtk::Box) {
         .margin_start(6)
         .margin_end(6)
         .build();
-    let popover = gtk::Popover::builder().child(&menu).build();
+    // Installed games have more actions than fit below a tile on a 720p
+    // handheld. A bounded scroller lets the popup fit and follows controller
+    // focus; GTK 4.14 otherwise dismisses a popup below its minimum height.
+    let menu_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .min_content_width(240)
+        .max_content_height(320)
+        .propagate_natural_height(true)
+        .child(&menu)
+        .build();
+    let popover = gtk::Popover::builder().child(&menu_scroll).build();
     let more = gtk::MenuButton::builder()
         .icon_name("view-more-symbolic")
         .valign(gtk::Align::Center)
@@ -2906,11 +2993,34 @@ fn library_components(ui: &Ui, row: &LibraryRow) -> (adw::ActionRow, gtk::Box) {
                 .borrow()
                 .get(&running_id.to_ascii_uppercase())
                 .is_some_and(|launch| launch.asked.is_some());
-            button.set_tooltip_text(Some(if asked {
-                "Asked to close. Press again to end it now"
-            } else {
-                "Ask the title to close. It is ended if it has not closed in 15 seconds"
-            }));
+            let ready = ui
+                .running
+                .borrow()
+                .get(&running_id.to_ascii_uppercase())
+                .is_some_and(|launch| launch.ready);
+            if ready {
+                let resume = gtk::Button::with_label("Resume");
+                resume.set_widget_name(&format!("game-{}-primary", row.product_id));
+                resume.update_property(&[gtk::accessible::Property::Label(&format!(
+                    "{} · Resume",
+                    row.name
+                ))]);
+                resume.add_css_class("suggested-action");
+                resume.set_tooltip_text(Some("Return to the running game's window"));
+                let (resume_ui, id, name) = (ui.clone(), running_id.clone(), row.name.clone());
+                resume.connect_clicked(move |_| window_activation::resume(&resume_ui, &id, &name));
+                actions.append(&resume);
+                ui.game_actions
+                    .borrow_mut()
+                    .insert(row.product_id.clone(), "Resume".into());
+                button.set_widget_name(&format!("game-{}-stop", row.product_id));
+            }
+            button.set_label(if asked { "Force Stop" } else { "Stop" });
+            button.set_tooltip_text(Some("Choose Stop to confirm before closing the game"));
+            button.update_property(&[gtk::accessible::Property::Label(&format!(
+                "{} · Stop",
+                row.name
+            ))]);
             button.remove_css_class("suggested-action");
             button.add_css_class("destructive-action");
             let product_id = running_id;
@@ -2918,7 +3028,7 @@ fn library_components(ui: &Ui, row: &LibraryRow) -> (adw::ActionRow, gtk::Box) {
             button.connect_clicked(glib::clone!(
                 #[strong]
                 ui,
-                move |_| stop_title(&ui, &product_id, &name)
+                move |_| confirm_stop_title(&ui, &product_id, &name)
             ));
         }
         action => {
@@ -2938,6 +3048,7 @@ fn library_components(ui: &Ui, row: &LibraryRow) -> (adw::ActionRow, gtk::Box) {
             );
             let plays = matches!(row.action, Action::Play);
             let updating = matches!(row.action, Action::Update);
+            let resumes = matches!(row.action, Action::Resume);
             // A bundle installs its child, and the dialog names the child: a
             // 23 GB download starting under a different title's name would be
             // the launcher doing something it never explained.
@@ -2950,7 +3061,9 @@ fn library_components(ui: &Ui, row: &LibraryRow) -> (adw::ActionRow, gtk::Box) {
                 ui,
                 move |_| {
                     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-                    if waits {
+                    if resumes {
+                        resume_download(&ui, &product_id, &title_name);
+                    } else if waits {
                         confirm_install(&ui, &product_id, &title_name, updating);
                     } else if plays {
                         spawn_title(&ui, &product_id, &title_name);
@@ -3491,7 +3604,10 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
     let pgid = child.id();
     ui.running.borrow_mut().insert(
         key.clone(),
-        stop::Launch::new(pgid, std::time::Instant::now()),
+        stop::Launch {
+            tag: launch_tag.clone(),
+            ..stop::Launch::new(pgid, std::time::Instant::now())
+        },
     );
     if let Some(server) = server {
         ui.running_servers.borrow_mut().insert(key.clone(), server);
@@ -3614,24 +3730,49 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
     });
 }
 
-/// Stop a title this window started: ask it to close, then end it.
-///
-/// The first press asks, the way closing the game's window would, so it can
-/// save -- ending it outright loses whatever it had not written, and a save
-/// being written at that moment can be left torn. If it has not exited within
-/// [`stop::CLOSE_WAIT`], or Stop is pressed again, the prefix is ended. A
-/// press that is the second click of the double-click that started it, or of
-/// the one that asked, does nothing.
-fn stop_title(ui: &Ui, product_id: &str, name: &str) {
+/// Confirm the exact launch, so an old dialog cannot stop a replacement game.
+fn confirm_stop_title(ui: &Ui, product_id: &str, name: &str) {
     let key = product_id.to_ascii_uppercase();
     let Some(launch) = ui.running.borrow().get(&key).cloned() else {
         return;
     };
-    match stop::press(&launch, std::time::Instant::now()) {
-        stop::Press::Ignore => {}
-        stop::Press::End => end_title(ui, &key, launch.pgid, name),
-        stop::Press::Ask => ask_title_to_close(ui, &key, launch.pgid, name),
+    if ui.window.visible_dialog().is_some()
+        || stop::press(&launch, std::time::Instant::now()) == stop::Press::Ignore
+    {
+        return;
     }
+    let force = launch.asked.is_some();
+    let dialog = adw::AlertDialog::new(
+        Some(&format!(
+            "{} {name}?",
+            if force { "Force stop" } else { "Stop" }
+        )),
+        Some(if force {
+            "The game has not closed yet. Force stopping can lose unsaved progress."
+        } else {
+            "Unsaved progress may be lost. Ferestre will ask the game to close before ending it."
+        }),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("stop", if force { "Force Stop" } else { "Stop Game" });
+    dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let window = ui.window.clone();
+    let ui = ui.clone();
+    let name = name.to_string();
+    dialog.connect_response(None, move |_, response| {
+        if response != "stop" {
+            return;
+        }
+        let action = stop::confirmed(ui.running.borrow().get(&key), &launch);
+        match action {
+            Some(stop::Press::Ask) => ask_title_to_close(&ui, &key, launch.pgid, &name),
+            Some(stop::Press::End) => end_title(&ui, &key, launch.pgid, &name),
+            _ => (),
+        }
+    });
+    dialog.present(Some(&window));
 }
 
 /// The wineserver and prefix of a running title. Worked out again when the
@@ -3862,19 +4003,7 @@ impl DownloadBar {
         let detail = if let Some(snapshot) = snapshot {
             self.pause
                 .set_label(if snapshot.paused { "Resume" } else { "Pause" });
-            let status = if snapshot.paused {
-                "Paused — progress is kept".into()
-            } else {
-                download.detail(now)
-            };
-            match (snapshot.network_bytes, snapshot.reused_bytes) {
-                (Some(network), Some(reused)) => format!(
-                    "{status}  ·  {} downloaded  ·  {} reused",
-                    progress::bytes(network),
-                    progress::bytes(reused)
-                ),
-                _ => status,
-            }
+            snapshot.detail(download, now)
         } else {
             download.detail(now)
         };
@@ -4192,11 +4321,47 @@ fn confirm_runtime_downgrade(ui: &Ui) {
     dialog.present(Some(&window));
 }
 
-/// Ask before downloading, and say where it is going.
-///
-/// A download here is between a few hundred megabytes and 160 GB, so starting
-/// one on a single click -- with no size, no destination, and no way back --
-/// is not a thing to do to somebody's evening or their disk.
+/// Resume the saved job without replacing its destination or update identity.
+fn resume_download(ui: &Ui, product_id: &str, name: &str) {
+    if queue_ui::resume(ui, product_id) {
+        return;
+    }
+    // A stopped transfer from before the durable queue still has a known folder.
+    let saved = {
+        let model = ui.model.borrow();
+        model
+            .install_destination(product_id)
+            .filter(|dir| {
+                dir.is_dir()
+                    && matches!(
+                        model.inspect_folder(product_id, dir),
+                        model::Folder::This | model::Folder::Download
+                    )
+            })
+            .and_then(|dir| {
+                model.install_argument(product_id, &dir).map(|arg| {
+                    (
+                        arg,
+                        model.records.contains_key(&product_id.to_ascii_uppercase()),
+                    )
+                })
+            })
+    };
+    if let Some((destination, updating)) = saved {
+        queue_ui::enqueue(
+            ui,
+            product_id,
+            name,
+            Some(&destination),
+            if updating { "Updating" } else { "Installing" },
+        );
+    } else {
+        ui.toasts
+            .add_toast(toast("The saved download location is unavailable"));
+    }
+}
+
+/// Ask before a new download, and say where it is going.
 fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
     if *ui.closing.borrow()
         || (ui.busy.borrow().is_some() && ui.download.current.borrow().is_none())
@@ -4258,6 +4423,17 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
         .margin_top(6)
         .css_classes(["caption", "dim-label"])
         .build();
+    let browse = gtk::Button::builder()
+        .icon_name("folder-open-symbolic")
+        .tooltip_text("Choose install folder")
+        .valign(gtk::Align::Center)
+        .build();
+    browse.update_property(&[gtk::accessible::Property::Label("Choose install folder")]);
+    where_to.add_suffix(&browse);
+    {
+        let (ui, entry) = (ui.clone(), where_to.clone());
+        browse.connect_clicked(move |_| folder_picker::open(&ui, entry.upcast_ref()));
+    }
     let group = adw::PreferencesGroup::new();
     group.add(&where_to);
     let extra = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -5846,32 +6022,10 @@ fn choose_move(ui: &Ui, product_id: &str, name: &str) {
     let chosen = Rc::new(RefCell::new(None::<PathBuf>));
     let generation = Rc::new(std::cell::Cell::new(0u64));
     let window = ui.window.clone();
-    browse.connect_clicked(glib::clone!(
-        #[strong]
-        entry,
-        #[strong]
-        window,
-        move |_| {
-            let chooser = gtk::FileDialog::builder()
-                .title("Choose library folder")
-                .build();
-            chooser.select_folder(
-                Some(&window),
-                None::<&gio::Cancellable>,
-                glib::clone!(
-                    #[strong]
-                    entry,
-                    move |result| {
-                        if let Ok(folder) = result {
-                            if let Some(path) = folder.path() {
-                                entry.set_text(&path.to_string_lossy());
-                            }
-                        }
-                    }
-                ),
-            );
-        }
-    ));
+    {
+        let (ui, entry) = (ui.clone(), entry.clone());
+        browse.connect_clicked(move |_| folder_picker::open(&ui, entry.upcast_ref()));
+    }
     let product = product_id.to_string();
     entry.connect_changed(glib::clone!(
         #[strong]

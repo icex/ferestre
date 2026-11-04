@@ -35,7 +35,7 @@ with the selected player; Ferestre does not create an entitlement for the player
 
 ## Implementation
 
-- `patches/xodus-cli/0020-separate-store-and-player-accounts.patch` adds opaque
+- `https://github.com/icex/xodus/commit/85704f4cda895ccce2cd31279a1c54cd3c0dcf0c` adds opaque
   profile metadata, per-profile keychain keys and isolated ephemeral token caches.
   Legacy migration copies and verifies both user entries before publishing the
   default profile; interruption is retryable and the original entries remain.
@@ -47,7 +47,7 @@ with the selected player; Ferestre does not create an entitlement for the player
   generation, the packaged service fingerprint and the bound product/content ID.
   IPC does not accept a title-selected profile or credentials, and licence-token
   requests are signed only for the bound title.
-- `patches/xodus-cli/0021-scope-service-tokens-to-the-bound-title.patch` binds
+- `https://github.com/icex/xodus/commit/b0e59a3444c024cb933ec8f586431b4a367eb721` binds
   the service to the title's identity as well as its product. The launcher reads
   `TitleId` and `MSAAppId` from the install's `MicrosoftGame.config` the way the
   runtime does and passes them as `XODUS_TITLE_ID` (decimal) and
@@ -71,7 +71,7 @@ with the selected player; Ferestre does not create an entitlement for the player
   calls use Store credentials. XUser/MSA/Xbox/PlayFab calls use Player credentials.
   Public catalog/tier data stays shared; private library, account and update
   caches are scoped by Store profile. Replies from older selections are ignored.
-- `patches/xgameruntime/0030-separate-store-and-player-accounts.patch` makes
+- `https://github.com/icex/xgameruntime/commit/36099cff2b87e81b05c4ea4527ddac5e66782891` makes
   `XUserIsStoreUser` compare the verified MSA identities. Current-game entitlement,
   game licences and package licences come from an authenticated, title-bound
   Store content-licence check. Installed files do not imply ownership. Unrelated
@@ -80,7 +80,7 @@ with the selected player; Ferestre does not create an entitlement for the player
   work queue. The service caches its answers: successful checks for up to 60
   seconds, denials for 10. A verified grant survives failed refreshes (network
   errors look the same as denials) for 30 minutes; local sign-out is checked
-  before any cached grant. Since `patches/xgameruntime/0032-keep-service-requests-off-title-threads.patch`
+  before any cached grant. Since `https://github.com/icex/xgameruntime/commit/6dc7ec579857929df1c769f2fff1044d0f2b3ae7`
   the runtime keeps the last definitive player and licence state itself, refreshed
   once per second by a private thread while something watches it or a title asked
   in the last 30 seconds. `XStoreIsLicenseValid`, `XUserGetState`,

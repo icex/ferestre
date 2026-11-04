@@ -60,6 +60,8 @@ pub const CHANNEL_FD: &str = "FERESTRE_STOP_FD";
 pub struct Launch {
     /// The launcher's process group: it is a session leader, so its pid.
     pub pgid: u32,
+    /// Private marker inherited only by processes from this launch.
+    pub tag: String,
     pub started: Instant,
     /// A game executable from this launch has been observed, beyond setup.
     pub ready: bool,
@@ -71,6 +73,7 @@ impl Launch {
     pub fn new(pgid: u32, started: Instant) -> Self {
         Launch {
             pgid,
+            tag: String::new(),
             started,
             ready: false,
             asked: None,
@@ -98,6 +101,17 @@ pub fn press(launch: &Launch, now: Instant) -> Press {
         None => Press::Ask,
         Some(asked) if now.saturating_duration_since(asked) < REPEAT_GRACE => Press::Ignore,
         Some(_) => Press::End,
+    }
+}
+
+/// The answer applies only to the launch and kind of stop shown in the dialog.
+pub fn confirmed(current: Option<&Launch>, shown: &Launch) -> Option<Press> {
+    let current = current
+        .filter(|l| l.pgid == shown.pgid && l.tag == shown.tag && l.started == shown.started)?;
+    match (shown.asked, current.asked) {
+        (None, None) => Some(Press::Ask),
+        (Some(before), Some(now)) if before == now => Some(Press::End),
+        _ => None,
     }
 }
 
@@ -409,6 +423,26 @@ pub fn end(pgid: u32, server: Option<&(PathBuf, PathBuf)>) -> Option<std::proces
 mod tests {
     use super::*;
     use std::os::fd::FromRawFd;
+
+    #[test]
+    fn confirmation_cannot_stop_a_new_launch_or_silently_escalate() {
+        let shown = Launch {
+            tag: "launch-one".into(),
+            ..Launch::new(42, Instant::now())
+        };
+        assert_eq!(confirmed(Some(&shown), &shown), Some(Press::Ask));
+        assert_eq!(confirmed(None, &shown), None);
+        let mut next = shown.clone();
+        next.tag = "launch-two".into();
+        assert_eq!(confirmed(Some(&next), &shown), None);
+        next = shown.clone();
+        next.pgid = 43;
+        assert_eq!(confirmed(Some(&next), &shown), None);
+        next = shown.clone();
+        next.asked = Some(Instant::now());
+        assert_eq!(confirmed(Some(&next), &shown), None);
+        assert_eq!(confirmed(Some(&next), &next), Some(Press::End));
+    }
 
     #[test]
     fn a_press_right_after_play_is_the_rest_of_a_double_click() {

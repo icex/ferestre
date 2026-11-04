@@ -93,7 +93,7 @@ class WorkflowTests(unittest.TestCase):
     def test_a_tagged_runtime_builds_the_pinned_proton(self):
         job = load(REPO / '.github/workflows/runtime.yml')['jobs']['build']
         step = next(s for s in job['steps'] if s.get('id') == 'ref')
-        self.assertEqual(step['env']['PINNED_REF'], '7c0b4354')
+        self.assertIn('PINNED_REF=$(python3 ferestre/scripts/source-pins.py get proton commit)', step['run'])
         run = step['run']
         self.assertIn('ref=$PINNED_REF', run)
         self.assertIn('[ "$GITHUB_EVENT_NAME" = workflow_dispatch ]', run)
@@ -167,15 +167,13 @@ class WorkflowTests(unittest.TestCase):
                 for m in call.finditer(text):
                     self.assertRegex(m.group(0), r'--(locked|frozen)\b', f'{wf}/{name}: {m.group(0)}')
 
-    def test_the_proton_patch_takes_no_fuzz_and_both_checks_use_one_commit(self):
+    def test_runtime_and_source_validation_read_the_same_locked_fork(self):
         runtime = (REPO / '.github/workflows/runtime.yml').read_text()
-        self.assertRegex(runtime, r'patch -p1 --fuzz=0 [^\n]*patches/proton/')
-        base = re.search(r'PROTON_BASE=\$\{PROTON_BASE:-([0-9a-f]{40})\}',
-                         (REPO / 'scripts/check-patches.sh').read_text()).group(1)
-        defaults = re.findall(r"(?:default|PINNED_REF): '([0-9a-f]+)'", runtime)
-        self.assertEqual(len(defaults), 2)
-        for ref in defaults:
-            self.assertTrue(base.startswith(ref), f'{ref} is not {base}')
+        self.assertIn('source-pins.py get proton commit', runtime)
+        self.assertIn('source-pins.py get proton repository', runtime)
+        self.assertIn('source-pins.py verify proton --directory proton', runtime)
+        self.assertNotIn('patch -p1', runtime)
+        self.assertIn('source-pins.py', (REPO / 'scripts/check-sources.sh').read_text())
 
     def test_ci_runs_for_every_script_and_packaging_change(self):
         triggers = load(REPO / '.github/workflows/rust.yml')[True]
@@ -200,8 +198,8 @@ class WorkflowTests(unittest.TestCase):
                     self.assertEqual(step.get('env', {}).get('FERESTRE_REQUIRE_USERNS'), '1',
                                      f'{name}/{step.get("name")}')
 
-    def test_the_client_series_tests_run_in_ci(self):
-        job = load(REPO / '.github/workflows/rust.yml')['jobs']['patches']
+    def test_the_pinned_client_fork_tests_run_in_ci(self):
+        job = load(REPO / '.github/workflows/rust.yml')['jobs']['sources']
         text = '\n'.join(runs(job))
         for crate in ('-p xodus-service', '-p msixvc', '-p xodus-cli',
                       '--features key-chain-file --test key_chain_file'):

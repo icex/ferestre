@@ -44,27 +44,20 @@ on your machine before starting.
 
 ## 1. Build and install the patched Xodus Proton
 
-The runtime fork and the client are submodules of this repository, pinned at
-the commits the patch series is written against: `third_party/xodus-proton`
-(xodus-gaming/Proton, which pins its own Wine and xgameruntime trees) and
-`third_party/xodus-cli` (xodus-gaming/xodus).
+The runtime and client use the pinned `icex` forks in [sources.lock.json](../sources.lock.json). [SOURCES.md](SOURCES.md) describes their source graph and verification. No patch files are applied during the build.
 
 ```bash
-# this repo, with the patches and scripts
+# this repository, with the source pins and build scripts
 git clone https://github.com/icex/ferestre ~/src/ferestre
 cd ~/src/ferestre
 
 # the runtime fork, with its submodules (git-lfs bypass: don't fetch gigabytes
 # of gstreamer test media, which otherwise leaves wine/ and openfst/ empty)
 git -c filter.lfs.smudge= -c filter.lfs.process= \
-    submodule update --init --force --recursive third_party/xodus-proton
+    submodule update --init --recursive third_party/xodus-proton
 
-# apply the local patches (they are plain git diffs against the fork)
-cd third_party/xodus-proton/wine
-git apply ~/src/ferestre/patches/wine/*.patch
-git -C dlls/xgameruntime apply ~/src/ferestre/patches/xgameruntime/*.patch
-git -C ../vkd3d-proton apply ~/src/ferestre/patches/vkd3d-proton/*.patch
-# the proton script patch is re-applied by the installer after every install
+cd ~/src/ferestre
+scripts/check-sources.sh --remote
 
 # configure the build tree once (Xodus' own instructions), then build+install:
 mkdir -p ~/src/xodus-build && cd ~/src/xodus-build
@@ -79,9 +72,7 @@ means a full rebuild. Moving the *source* is fine -- only the top-level
 
 `install-xodus-proton.sh` invalidates the stale build stamps (editing the
 submodule alone changes nothing otherwise), builds, installs into Steam's
-`compatibilitytools.d/xodus`, re-applies the `proton` script patch that keeps
-the decrypted-image file descriptors alive, and refuses to finish if the
-installed `xgameruntime.dll` is stale.
+`compatibilitytools.d/xodus`, verifies the fork script preserves inherited file descriptors, and refuses to finish if the installed `xgameruntime.dll` is stale.
 
 **Rebuilding one DLL after a change** (seconds instead of a full build):
 
@@ -105,10 +96,7 @@ not the installed one.
 cd ~/src/ferestre
 git submodule update --init third_party/xodus-cli
 cd third_party/xodus-cli
-# the client series, skipping 0001 (an earlier export that 0002 contains)
-for p in ../../patches/xodus-cli/*.patch; do
-    case $(basename "$p") in 0001-*) continue ;; esac; git apply "$p"; done
-cargo build --release                            # target/release/{xodus-cli,xodus-service}
+cargo build --locked --release                  # target/release/{xodus-cli,xodus-service}
 ./target/release/xodus-cli login                 # Microsoft sign-in in a window
 ```
 
@@ -214,17 +202,17 @@ the previous startup and installation failures:
 
 - The title's code-restoring handler needs the mapped image's real filename,
   and its integrity check needs reads of that file to return the decrypted
-  bytes. Wine patches 0010 and 0013 supply those answers; 0011 fixes a separate
-  concurrent-vector allocation race.
+  bytes. The Wine fork supplies those file-identity answers and fixes a
+  separate concurrent-vector allocation race.
 - libHttpClient can complete a websocket send inside its provider's Begin and
-  return `E_PENDING`. Runtime patch 0010 preserved that result, but
+  return `E_PENDING`. Preserving that result alone was insufficient:
   `XAsyncBegin` still returned `E_PENDING` to its caller, which then destroyed
-  the context needed by the queued callback. Patches 0014 and 0015 return
+  the context needed by the queued callback. The xgameruntime fork returns
   `S_OK` after setup and complete provider failures asynchronously, with cleanup
   after the callback. The missing-title-claim theory did not explain this crash.
 - `XPackageGetCurrentProcessPackageIdentifier` must fit the GDK's 33-byte
   buffer. Returning the 35-character package family name made every query fail
-  and left the game at `INSTALLING... PLEASE WAIT`. Patch 0016 supplies an
+  and left the game at `INSTALLING... PLEASE WAIT`. The fork supplies an
   opaque session identifier shared with enumeration. Package family names used
   by AppModel and saves stay the same.
 
@@ -311,8 +299,8 @@ game/controller coverage are not separately qualified.
 | `Selection failed` from `xodus-cli download` | it needs an interactive terminal for its file picker | use `xodus-cli streaming` (what `get-game.sh` does) — it picks the `.msixvc` itself |
 | `not entitled to this content: Device group is full` | the Microsoft account's device limit | remove an old device at account.microsoft.com/devices, retry |
 | streaming fails immediately | not signed in | `xodus-cli login` |
-| game exits at once, `APPMODEL_ERROR_NO_PACKAGE` | packaged app with no package identity | fixed by `patches/wine/0002-kernelbase-current-package-identity.patch`; the manifest must sit beside the exe (or set `WINE_PACKAGE_MANIFEST`) |
-| `Critical Failure: GameInput Runtime could not be loaded` | Wine's `GameInputCreate` is allow-listed | `WINE_GAMEINPUT=1` (set by `launch-gdk.sh`) + `patches/wine/0003-...` |
+| game exits at once, `APPMODEL_ERROR_NO_PACKAGE` | packaged app with no package identity | fixed by `https://github.com/icex/wine/commit/02ead80a916b83472af7c458395741fbae33c732`; the manifest must sit beside the exe (or set `WINE_PACKAGE_MANIFEST`) |
+| `Critical Failure: GameInput Runtime could not be loaded` | Wine's `GameInputCreate` is allow-listed | `WINE_GAMEINPUT=1` (set by `launch-gdk.sh`) + the pinned Wine fork’s GameInput support |
 | `Failed to Register TaskQueue Monitor for GameInput tasks` | `XTaskQueueRegisterWaiter` was a stub | xgameruntime patch (RegisterWaiter/RegisterMonitor) |
 | `RoGetActivationFactory Failed to find library for Windows.Internal.System.Profile.RegionPolicyEvaluator` then `frame is not in stack limits` | undocumented region-policy class missing; the title throws on a fiber | hosted in `windows.system.profile.systemid.dll`; a fresh prefix registers it, an existing prefix needs `wine reg add` of its `ActivatableClassId` (see README) |
 | `cp: Permission denied` installing a DLL into the tool | Proton installs files read-only | `chmod u+w` the file first |

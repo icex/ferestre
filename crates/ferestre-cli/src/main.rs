@@ -752,8 +752,7 @@ fn prepare_launch(
     // that exits 1 with an empty log and someone guessing which of eleven
     // patches is missing.
     let runtimes = runtime::all(paths);
-    // The title's own choice, else XODUS_PROTON_DIR, which is a choice made
-    // for every title at once.
+    // Per-game override, then the Settings default, then the environment override.
     let requested_runtime = runtime::requested(paths, &recipe.title.product_id)?;
     let registry = registry_for(paths);
     let runtime = choose_runtime(

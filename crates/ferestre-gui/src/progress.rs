@@ -175,6 +175,29 @@ pub struct Snapshot {
     #[serde(default)]
     pub reused_bytes: Option<u64>,
 }
+
+impl Snapshot {
+    pub fn detail(&self, download: &Download, now: Instant) -> String {
+        if self.phase == "metadata" {
+            return "Preparing package metadata — download size is not known yet".into();
+        }
+        let status = if self.paused {
+            "Paused — progress is kept".into()
+        } else if self.phase == "finalizing" {
+            "Finishing and saving the update".into()
+        } else {
+            format!("Processed {}", download.detail(now))
+        };
+        match (self.network_bytes, self.reused_bytes) {
+            (Some(network), Some(reused)) => format!(
+                "{status}  ·  {} game data downloaded  ·  {} reused",
+                bytes(network),
+                bytes(reused)
+            ),
+            _ => status,
+        }
+    }
+}
 pub fn parse_snapshot(line: &str) -> Option<Snapshot> {
     if line.len() > 4096 {
         return None;
@@ -237,6 +260,31 @@ pub fn parse_line(line: &str) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_does_not_claim_the_full_package_is_a_network_download() {
+        let now = Instant::now();
+        let mut download = Download::new("9NR1R1XWLCNB", "Forza", "Updating", now);
+        download.observe(1_000_000_000, 170_000_000_000, now);
+        let mut reader = Reader::default();
+        let Some(Update::Structured(metadata)) = reader.read(
+            r#"FERESTRE_PROGRESS {"schema":1,"sequence":0,"phase":"metadata","completedBytes":0,"totalBytes":null,"paused":false,"canPause":false}"#
+        ) else { panic!("metadata event missing") };
+        let detail = metadata.detail(&download, now);
+        assert!(detail.contains("Preparing package metadata"));
+        assert!(!detail.contains("170"));
+        // Legacy package-size events cannot overwrite the preparation phase.
+        assert!(reader
+            .read(r#"{"progress":{"done":1000,"total":170000000000}}"#)
+            .is_none());
+        let Some(Update::Structured(transfer)) = reader.read(
+            r#"FERESTRE_PROGRESS {"schema":1,"sequence":1,"phase":"downloading","completedBytes":1000000000,"totalBytes":170000000000,"networkBytes":1000000,"reusedBytes":999000000,"paused":false,"canPause":true}"#
+        ) else { panic!("planned transfer must follow metadata") };
+        let detail = transfer.detail(&download, now);
+        assert!(detail.starts_with("Processed "));
+        assert!(detail.contains("1 MB game data downloaded"), "{detail}");
+        assert!(detail.contains("999 MB reused"), "{detail}");
+    }
 
     #[test]
     fn structured_progress_rejects_old_sequences_and_legacy_overwrites() {

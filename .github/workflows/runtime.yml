@@ -18,16 +18,10 @@
 # Only one copy is kept (the prune job deletes older ones) because the whole
 # repository shares 10 GB.
 #
-# The three sources are all public, and all pinned by commit rather than by
-# branch. A runtime nobody can reproduce is a binary blob with a changelog:
-#
-#   xodus-gaming/Proton          the compatibility tool
-#     └─ xodus-gaming/wine       submodule, the Wine tree the patches target
-#          └─ xodus-gaming/xgameruntime   submodule, the GDK runtime
-#
-# The submodule pins carry the wine and xgameruntime commits, so only the Proton
-# ref needs stating; --recurse-submodules produces exactly the tree
-# scripts/check-patches.sh checks the series against.
+# Runtime sources are public icex forks, locked in sources.lock.json:
+#   icex/Proton-UWP -> icex/wine -> icex/xgameruntime
+#                  -> icex/vkd3d-proton
+# Recursive submodules resolve the same commits checked by source-pins.py.
 #
 # Two jobs. `build` compiles a third-party tree of millions of lines with a
 # read-only token that is not written to any checkout; `publish` runs only on a
@@ -58,22 +52,20 @@ on:
   push:
     tags:
       - 'runtime-*'
-    # What goes into the runtime: the patch series, the capability script,
-    # and this file, which holds the Proton pin.
+    # Source pins, verification, capability measurement and build instructions.
     branches: [main]
     paths:
-      - 'patches/wine/**'
-      - 'patches/xgameruntime/**'
-      - 'patches/vkd3d-proton/**'
-      - 'patches/proton/**'
+      - 'sources.lock.json'
+      - '.gitmodules'
+      - 'scripts/source-pins.py'
       - 'scripts/write-capabilities.sh'
       - '.github/workflows/runtime.yml'
   workflow_dispatch:
     inputs:
       proton_ref:
-        description: 'Commit or branch of xodus-gaming/Proton to build'
+        description: 'Optional unsigned development ref of the pinned Proton fork'
         required: false
-        default: '7c0b4354'
+        default: ''
         type: string
 
 permissions:
@@ -143,12 +135,12 @@ jobs:
       - name: Resolve the Proton ref
         id: ref
         env:
-          PINNED_REF: '7c0b4354'
           INPUT_REF: ${{ inputs.proton_ref }}
         run: |
           set -euo pipefail
           # Through the environment, not interpolated: a dispatch input is text
           # somebody typed.
+          PINNED_REF=$(python3 ferestre/scripts/source-pins.py get proton commit)
           ref=$PINNED_REF
           if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ -n "$INPUT_REF" ]; then
               if [ "$GITHUB_REF_TYPE" != tag ]; then
@@ -165,11 +157,11 @@ jobs:
           PROTON_REF: ${{ steps.ref.outputs.proton }}
         run: |
           set -euo pipefail
-          git clone --quiet https://github.com/xodus-gaming/Proton.git proton
+          PROTON_URL=$(python3 ferestre/scripts/source-pins.py get proton repository)
+          git clone --quiet "$PROTON_URL" proton
           cd proton
           git checkout --quiet "$PROTON_REF"
-          # The submodule pins are the whole point: they name the exact wine and
-          # xgameruntime commits the patch series was written against.
+          # Resolve the complete locked source graph without applying local changes.
           git submodule update --init --recursive --depth 1
           echo ":: proton   $(git rev-parse --short HEAD)"
           echo ":: wine     $(git -C wine rev-parse --short HEAD)"
@@ -187,43 +179,37 @@ jobs:
               echo "xgameruntime=$(git -C proton/wine/dlls/xgameruntime rev-parse HEAD)"
           } >> "$GITHUB_OUTPUT"
 
-      # The same series scripts/check-patches.sh verifies per push, applied for
-      # real. If one has drifted, this is where the build stops -- before an
-      # hour of compilation, not after it.
+      # Refuse a source graph that differs from the lock before compilation.
       #
       # Note for anyone reading a failure further down: Wine's configure turns
       # on -Werror when it finds a .git, so this clone compiles more strictly
       # than the local build tree does (which works from a copy with no .git).
       # scripts/check-werror.sh reproduces that locally in about a minute --
-      # run it before pushing a patch that touches C.
-      - name: Apply the patch series
+      # run it before pushing a change that touches C.
+      - name: Verify the source lock
+        env:
+          PROTON_REF: ${{ steps.ref.outputs.proton }}
         run: |
           set -euo pipefail
-          cd proton
-          for p in "$GITHUB_WORKSPACE"/ferestre/patches/wine/*.patch; do
-              echo ":: wine $(basename "$p")"
-              git -C wine apply "$p"
-          done
-          for p in "$GITHUB_WORKSPACE"/ferestre/patches/xgameruntime/*.patch; do
-              echo ":: xgameruntime $(basename "$p")"
-              git -C wine/dlls/xgameruntime apply "$p"
-          done
-          for p in "$GITHUB_WORKSPACE"/ferestre/patches/vkd3d-proton/*.patch; do
-              echo ":: vkd3d-proton $(basename "$p")"
-              git -C vkd3d-proton apply "$p"
-          done
+          pinned=$(python3 ferestre/scripts/source-pins.py get proton commit)
+          if [ "$PROTON_REF" = "$pinned" ]; then
+              python3 ferestre/scripts/source-pins.py verify proton --directory proton
+              python3 ferestre/scripts/source-pins.py verify wine --directory proton/wine
+              python3 ferestre/scripts/source-pins.py verify xgameruntime --directory proton/wine/dlls/xgameruntime
+              python3 ferestre/scripts/source-pins.py verify vkd3d-proton --directory proton/vkd3d-proton
+          fi
 
       # Keyed on what the objects are compiled from. An exact match is only
       # likely for a rebuild; the fallbacks are what make the usual case, a
-      # patch series that moved since the last build, mostly hits.
+      # source commit that moved since the last build, mostly hits.
       - name: Restore the compiler cache
         id: ccache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: runtime-ccache-v1-${{ steps.commits.outputs.proton }}-${{ hashFiles('ferestre/patches/wine/**', 'ferestre/patches/xgameruntime/**', 'ferestre/patches/vkd3d-proton/**') }}
+          key: runtime-ccache-v2-${{ steps.commits.outputs.proton }}
           restore-keys: |
-            runtime-ccache-v1-${{ steps.commits.outputs.proton }}-
+            runtime-ccache-v2-
             runtime-ccache-v1-
 
       # Only to read the statistics; the compilers run inside Proton's
@@ -275,19 +261,16 @@ jobs:
       # executable. Without this every GDK title fails to launch with exit
       # code 1, so a runtime without it is not a runtime this launcher can use.
       #
-      # --fuzz=0 because patch's default accepts a hunk whose context has
-      # drifted and applies it a few lines away; scripts/check-patches.sh checks
-      # the same patch against the same Proton commit with git apply, which
-      # also takes no fuzz.
+      # The pinned fork already contains inherited-descriptor support; verify
+      # that the build copied that script into the distribution.
       - name: Keep inherited descriptors
         run: |
           set -euo pipefail
           cd proton/build/dist
-          patch -p1 --fuzz=0 --forward < "$GITHUB_WORKSPACE/ferestre/patches/proton/0001-keep-inherited-fds-mediaconv-and-system-ffmpeg.patch"
           grep -q close_fds=False proton
 
       # What the runtime can do, measured against the tree that was just built
-      # rather than asserted from the patch list. The launcher reads this to
+      # rather than asserted from the source manifest. The launcher reads this to
       # decide whether a title can run at all; a runtime that ships without it
       # makes the launcher fall back to probing, which finds a third of the
       # capabilities and tells the user every title "may not start".
@@ -445,11 +428,11 @@ jobs:
 
           | Component | Commit |
           |---|---|
-          | xodus-gaming/Proton | \`$PROTON_COMMIT\` |
-          | xodus-gaming/wine | \`$WINE_COMMIT\` |
-          | xodus-gaming/xgameruntime | \`$XGR_COMMIT\` |
+          | icex/Proton-UWP | \`$PROTON_COMMIT\` |
+          | icex/wine | \`$WINE_COMMIT\` |
+          | icex/xgameruntime | \`$XGR_COMMIT\` |
 
-          plus the patch series in \`patches/\` at this tag. \`capabilities.json\`
+          with the fork commits in \`sources.lock.json\` at this tag. \`capabilities.json\`
           inside the tarball says what this build actually provides, measured
-          against the built tree rather than taken from the patch list.
+          against the built tree rather than taken from source history.
           "

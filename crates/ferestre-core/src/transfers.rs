@@ -114,6 +114,20 @@ impl Queue {
             job.status = status;
         }
     }
+    /// Continue the existing decision without replacing its destination or kind.
+    pub fn resume(&mut self, id: &str) -> bool {
+        let Some(job) = self
+            .jobs
+            .iter_mut()
+            .find(|j| j.product_id.eq_ignore_ascii_case(id))
+        else {
+            return false;
+        };
+        if job.status != Status::Running {
+            job.status = Status::Pending;
+        }
+        true
+    }
     pub fn remove(&mut self, id: &str) {
         self.jobs.retain(|j| j.product_id != id);
     }
@@ -225,6 +239,38 @@ mod tests {
             ))
             .unwrap());
         assert_eq!(q.jobs[0].destination, Some("/games/original".into()));
+    }
+    #[test]
+    fn resume_preserves_update_destination_and_only_schedules_the_selected_job() {
+        let mut queue = Queue::default();
+        queue
+            .enqueue(Job::new(
+                "9ZZTESTGAME1",
+                "Update",
+                Some(Path::new("/games/custom/title")),
+                true,
+            ))
+            .unwrap();
+        queue
+            .enqueue(Job::new(
+                "9ZZTESTGAME2",
+                "Other",
+                Some(Path::new("/games/other")),
+                true,
+            ))
+            .unwrap();
+        queue.set_status("9ZZTESTGAME1", Status::Paused);
+        queue.set_status("9ZZTESTGAME2", Status::Paused);
+        assert!(queue.resume("9zztestgame1"));
+        let resumed = queue.next().unwrap();
+        assert!(resumed.updating);
+        assert_eq!(
+            resumed.destination,
+            Some(PathBuf::from("/games/custom/title"))
+        );
+        assert_eq!(queue.jobs[1].status, Status::Paused);
+        assert!(!queue.resume("9ZZUNKNOWN00"));
+        assert_eq!(queue.jobs.len(), 2);
     }
     #[test]
     fn unsafe_or_malformed_queue_is_not_overwritten() {

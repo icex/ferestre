@@ -149,13 +149,13 @@ A cold runtime build takes a little over two hours. To avoid paying that on
 every release, the runtime workflow keeps Proton's compiler cache (ccache)
 between runs:
 
-- A push to `main` that changes `patches/wine`, `patches/xgameruntime`,
-  `patches/vkd3d-proton`, `patches/proton`, `scripts/write-capabilities.sh` or
-  the workflow itself (which holds the Proton pin) builds the runtime on
+- A push to `main` that changes `sources.lock.json`, `.gitmodules`,
+  `scripts/source-pins.py`, `scripts/write-capabilities.sh` or
+  the workflow itself builds the runtime on
   `main`, unsigned. That build saves the cache, and a newer push cancels an
   older one still running.
 - Only that automatic `main` build saves the cache. It always builds the
-  pinned Proton commit, from reviewed patches. A manual run may build any
+  pinned Proton commit, from reviewed fork sources. A manual run may build any
   Proton ref, whose build scripts could write anything into the cache, so it
   restores the cache and saves nothing. What a signed release restores was
   therefore compiled only from sources that were merged to `main`.

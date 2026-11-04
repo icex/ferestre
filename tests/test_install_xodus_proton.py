@@ -16,6 +16,7 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts/install-xodus-proton.sh"
 
 MAKEFILE = """\
 BUILD_NAME := xodus
+SRCDIR := {source}
 CONTAINER_ENGINE := {engine}
 DEST := $(HOME)/.steam/root/compatibilitytools.d/$(BUILD_NAME)
 install:
@@ -38,6 +39,10 @@ class InstallScriptTests(unittest.TestCase):
         self.build.mkdir()
         self.repo = self.root / "repo"
         (self.repo / "scripts").mkdir(parents=True)
+        self.source = self.root / "source"
+        (self.source / "wine/dlls/xgameruntime").mkdir(parents=True)
+        (self.source / "vkd3d-proton").mkdir()
+        (self.repo / "scripts/source-pins.py").write_text("import os,sys\nfrom pathlib import Path\nif sys.argv[1]=='verify':\n with Path(os.environ['CALLS']).open('a') as f:f.write('verify '+sys.argv[2]+'\\n')\n if os.environ.get('BAD_SOURCE')=='1':sys.exit(1)\nelse: print('fixture.c')\n")
         self.capabilities = self.root / "capabilities.record"
         self.stub(self.repo / "scripts/write-capabilities.sh", 'echo "$1" >> "$CAPABILITIES"')
         self.calls = self.root / "calls"
@@ -54,19 +59,20 @@ class InstallScriptTests(unittest.TestCase):
         path.write_text(f"#!/bin/sh\n{body}\n")
         path.chmod(0o755)
 
-    def run_script(self, engine, docker_works=False, group=None, session_groups="user wheel"):
-        (self.build / "Makefile").write_text(MAKEFILE.format(engine=engine))
+    def run_script(self, engine, docker_works=False, group=None, session_groups="user wheel", bad_source=False):
+        (self.build / "Makefile").write_text(MAKEFILE.format(engine=engine,source=self.source))
         self.stub(self.bin / "docker", "exit 0" if docker_works else "exit 1")
         self.stub(self.bin / "getent", f"echo '{group}'" if group else "exit 2")
         self.stub(self.bin / "id", f'[ "$1" = -nG ] && echo "{session_groups}"')
         env = {k: v for k, v in os.environ.items() if k != "TOOL_DIR"}
         env.update(HOME=str(self.home), PATH=f"{self.bin}:{os.environ['PATH']}",
                    BUILD_DIR=str(self.build), REPO_DIR=str(self.repo),
-                   WINE_SRC=str(self.root / "no-wine"), VKD3D_SRC=str(self.root / "no-vkd3d"),
+                   WINE_SRC=str(self.source / "wine"), VKD3D_SRC=str(self.source / "vkd3d-proton"),
+                   BAD_SOURCE="1" if bad_source else "0",
                    XODUS_PROTON_DIR=str(self.packaged), CALLS=str(self.calls),
                    CAPABILITIES=str(self.capabilities), J="1")
         p = subprocess.run([str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60)
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.returncode != 0, bad_source, p.stdout + p.stderr)
         return p
 
     def installed(self):
@@ -74,6 +80,11 @@ class InstallScriptTests(unittest.TestCase):
 
     def newgrp_used(self):
         return self.calls.exists() and "newgrp" in self.calls.read_text()
+
+    def test_a_source_pin_failure_stops_before_installing_anything(self):
+        self.run_script("podman", bad_source=True)
+        self.assertFalse(Path(self.installed()).exists())
+        self.assertFalse(self.capabilities.exists())
 
     def test_podman_builds_without_a_docker_group(self):
         self.run_script("podman")

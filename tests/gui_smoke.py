@@ -353,23 +353,18 @@ def press_actions(node):
 
 
 def click_named(root, name, what=None):
-    """Click the first thing carrying this name that can actually be clicked."""
-    for candidate in find_all(root, name=name):
-        action, useful = press_actions(candidate)
-        if useful:
-            action.do_action(
-                next(
-                    (
-                        i
-                        for i in range(action.get_n_actions())
-                        if action.get_action_name(i) == useful[0]
-                    ),
-                    0,
-                )
-            )
-            return candidate
-    dump(root, f"looking for {name!r}")
-    raise Failure(f"nothing clickable called {what or name!r}")
+    """Wait for action export, then click once; GTK can export the name first."""
+    def ready(root):
+        for candidate in find_all(root, name=name):
+            action, useful = press_actions(candidate)
+            if useful:
+                index = next(i for i in range(action.get_n_actions())
+                             if action.get_action_name(i) == useful[0])
+                return candidate, action, index
+        return None
+    candidate, action, index = wait_for(root, ready, what or f"clickable {name!r}", time.monotonic()+TIMEOUT)
+    action.do_action(index)
+    return candidate
 
 
 def select_in_list(root, name, what=None):
@@ -1031,8 +1026,12 @@ print(":: done", flush=True)
 
         print("sidebar")
         labels = texts(frame)
-        for section in ("Home", "Game Pass", "My Library", "Install Queue", "Settings"):
+        for section in ("Home", "Game Pass", "My Library", "Settings"):
             check(section in labels, f"{section} is in the sidebar", frame)
+        for removed in ("Install Queue", "Fullscreen", "Controller help"):
+            check(not any(n.get_state_set().contains(Atspi.StateType.SHOWING)
+                          for n in find_all(frame, role="button", name=removed)),
+                  f"{removed} does not clutter the sidebar", frame)
         check("Not signed in" in labels, "says plainly that nobody is signed in", frame)
 
         select_in_list(frame,"My Library")
@@ -1187,7 +1186,15 @@ print(":: done", flush=True)
         select_in_list(frame, "Runtime")
         wait_for(frame, lambda root: "Ferestre release" in texts(root), "section navigation", time.monotonic() + TIMEOUT)
         time.sleep(0.2)
-        check(scroll_value().get_current_value() == 0, "a different section starts at the top", frame)
+        runtime_page = find_all(frame, name="Runtime page")[0]
+        viewport = runtime_page.get_parent()
+        while viewport is not None and viewport.get_role_name() != "scroll pane":
+            viewport = viewport.get_parent()
+        check(viewport is not None, "Settings uses the shared content viewport", frame)
+        page_box = runtime_page.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+        view_box = viewport.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+        check(view_box.y <= page_box.y <= view_box.y + 32,
+              "a different section starts at the top even when Settings fits without scrolling", frame)
         select_in_list(frame, "Library")
         wait_for(frame, lambda root: "Minecraft for Windows" in texts(root), "return to library", time.monotonic() + TIMEOUT)
 
@@ -1261,7 +1268,7 @@ print(":: done", flush=True)
         check(True, "the Runtime section can be selected")
         labels = wait_for(
             frame,
-            lambda root: texts(root) if any("Proton" in t for t in texts(root)) else None,
+            lambda root: texts(root) if "Game runtime" in texts(root) else None,
             "the runtime section to draw",
             time.monotonic() + TIMEOUT,
         )
@@ -1277,10 +1284,13 @@ print(":: done", flush=True)
             frame,
         )
         check(
-            labels.index("Ferestre release") < labels.index("Patched Proton"),
+            labels.index("Ferestre release") < labels.index("Game runtime"),
             "the launcher release appears before the Proton runtime",
             frame,
         )
+
+        check("Installed versions" not in labels and "Capabilities" not in labels,
+              "Settings omits redundant versions and technical capability lists", frame)
 
         print("installed section")
         select_in_list(frame, "Installed")

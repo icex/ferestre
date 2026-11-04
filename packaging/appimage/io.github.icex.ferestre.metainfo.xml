@@ -74,13 +74,10 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
-    <release version="0.0.0" date="2026-09-06" type="development">
+    <release version="0.1.18" date="2026-11-04">
       <description>
-        <p>
-          Placeholder build. The launcher binary does not exist yet; the
-          packaged command drives the repository's shell scripts so the
-          packaging itself can be tested.
-        </p>
+        <p>Resume running games, confirm Stop with a controller, select global and per-game runtimes, and resume updates directly.</p>
+        <p>Improved controller focus, a cleaner sidebar and Settings, reliable device-token recovery, and verified metadata reuse. Components build from pinned source forks.</p>
       </description>
     </release>
   </releases>

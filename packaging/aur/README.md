@@ -9,7 +9,7 @@ by a compatibility tool showing up in `compatibilitytools.d`.
 | package | what it is | size | changes when |
 |---|---|---|---|
 | [`ferestre-runtime-bin`](ferestre-runtime-bin/) | the patched Proton, prebuilt, into `/usr/share/steam/compatibilitytools.d/ferestre` | ~344 MiB download, ~1.4 GB installed | Wine or `xgameruntime.dll` changes |
-| [`ferestre-client`](ferestre-client/) | the Xodus client with our patches: `xodus-cli`, `xodus-service` | ~15 MB | the fork rebases |
+| [`ferestre-client`](ferestre-client/) | the pinned Xodus fork: `xodus-cli`, `xodus-service` | ~15 MB | the fork rebases |
 | [`ferestre-git`](ferestre-git/) | the front end: `ferestre`, the launch scripts, the docs | ~400 KB | constantly |
 
 `ferestre-git` depends on the other two, so `paru -S ferestre-git`
@@ -52,7 +52,7 @@ both, so nobody has to know the structure to install it.
 /usr/bin/ferestre                                   front end
 /usr/bin/xodus-cli, /usr/bin/xodus-service      client
 /usr/lib/ferestre/scripts/                          the launch path
-/usr/lib/ferestre/patches/                          read by `ferestre install-runtime`
+/usr/lib/ferestre/sources.lock.json                 exact source-fork commits
 /usr/lib/ferestre/VERSION
 /usr/share/steam/compatibilitytools.d/ferestre/     the runtime
 /usr/share/doc/ferestre/                            README, NOTICE, RECIPES, ROADMAP
@@ -175,8 +175,8 @@ asset, and regenerate `.SRCINFO` with `makepkg --printsrcinfo`. Runtime
 
 Each directory here becomes its own AUR git repository — the AUR has no concept
 of a monorepo, and a `PKGBUILD` cannot reference a file outside its own
-directory. That is why `ferestre-client` fetches its patches by URL from a pinned
-commit of this repository rather than reaching up the tree.
+directory. `ferestre-client` therefore fetches the pinned public Xodus fork
+directly, without referencing files from this repository.
 
 ```sh
 git clone ssh://aur@aur.archlinux.org/ferestre-runtime-bin.git
@@ -199,26 +199,21 @@ detected and not included". Those are the documented gaps, not oversights.
 
 ## The client fork, pinned
 
-`ferestre-client` pins upstream commit `3e75c9f` and applies patches `0002`
-through `0015` in order. The patch sources are public URLs pinned to a Ferestre
-commit, with SHA-256 checksums. Patch `0001` is an earlier overlapping export
-and is deliberately excluded.
+`ferestre-client` builds `icex/xodus` commit
+`b8364e5a36932e4f79a8ccab7dd02e46b5c5a956`, matching the Xodus pin in
+[`sources.lock.json`](../../sources.lock.json). There is one Git source and no
+patch-application stage. The package installs its corresponding-source URL
+alongside the client and service.
 
-The PKGBUILD uses one `_patches` array for downloading, applying and installing
-the corresponding source. Client patch `0014` supplies metadata-driven title
-authentication and service discovery; `0015` keeps diagnostic memfd labels within
-Linux's length limit. Updating only the runtime does not install these fixes.
+The initial fork import was checked against the former ordered build inputs.
+A fresh checkout of the public fork built both release binaries and passed the
+offline client, service, integrity, profile and authentication fixtures. This
+is not a complete Arch build-chroot qualification.
 
-Validation on 2026-09-07 applied the complete series to a clean upstream
-worktree, reproduced every modified client file, built the release CLI/service,
-and passed 48 offline client tests. All 14 pinned patch URLs were fetched and
-matched their package checksums. Live title discovery passed for Windows and
-SISU titles, including cache reuse after switching titles. This is not a clean
-Arch build-chroot result.
-
-Bumping the upstream pin requires rebasing and rechecking the series. Bumping
-`_patchrev` requires regenerating checksums and `.SRCINFO`, then verifying the
-public URLs. A local working tree cannot prove those remote sources exist.
+When advancing the fork, update `_commit`, `pkgver` and the source lock together,
+then regenerate `.SRCINFO` with `makepkg --printsrcinfo`. Verify the public
+commit with `scripts/check-sources.sh --remote` and rebuild the client before
+publishing the package.
 
 ## What is not done here
 

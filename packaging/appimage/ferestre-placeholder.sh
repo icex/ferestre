@@ -39,7 +39,7 @@ fi
 
 # xodus-env.sh derives XODUS_REPO_DIR from $0, which would be *this* file and
 # therefore wrong once the scripts live under usr/lib/ferestre. install-xodus-proton.sh
-# reads patches/ out of that directory, so pin it to the scripts' actual parent.
+# reads sources.lock.json out of that directory, so pin it to the scripts' actual parent.
 export XODUS_REPO_DIR="${XODUS_REPO_DIR:-$(cd "$SCRIPTS/.." && pwd)}"
 
 # --- output ------------------------------------------------------------------
@@ -175,7 +175,7 @@ cmd_doctor() {
             ok "proton keeps inherited file descriptors"
         else
             bad "proton closes inherited fds; every title will exit 1"
-            note "re-run install-runtime, which re-applies patches/proton/0001-*.patch"
+            note "rebuild install-runtime from the pinned Proton fork"
         fi
         if [ -f "$XODUS_PROTON_DIR/files/lib/wine/x86_64-windows/xgameruntime.dll" ]; then
             ok "xgameruntime.dll present"

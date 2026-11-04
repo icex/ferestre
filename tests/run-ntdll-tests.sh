@@ -1,6 +1,6 @@
 #!/bin/bash
 # Regression tests for the ntdll patches whose behaviour a title can see:
-# the mapped-image filename fallback (patches/wine/0010), the code-byte dump
+# the mapped-image filename fallback (https://github.com/icex/wine/commit/1015c6b21c943398b21fb82240f7be384efa71d2), the code-byte dump
 # under +seh (0007) and FileAllocationInformation (0012).
 #
 #   tests/run-ntdll-tests.sh              # test the currently built ntdll

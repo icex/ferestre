@@ -65,37 +65,23 @@ The app checks for newer Ferestre and runtime releases and shows an **Update** b
 
 ## Status
 
-Release **0.1.13** pairs with runtime **11.0.20261018.2**. It adds separate
-Store and Player accounts, online status for games started through Ferestre,
-PlayStation and Steam Input controllers in GDK titles, and an offer to install
-WebKitGTK when sign-in cannot start. Releases are now signed, and game package
-headers are checked against Microsoft's signature. It also carries the fixes
-from a review of the whole codebase. Forza
-Horizon 6 is playable, with shader startup, native PlayFab saves and Continue
-confirmed. Its marketplace is still under qualification. Dune: Awakening is
-marked playable from player confirmation.
-See [the release qualification](docs/RELEASE-0.1.16.md) for tested scope.
+Ferestre **0.1.18** uses signed runtime **11.0.20261023.1**. It includes signed application/runtime updates, resumable game downloads, an install queue, game update badges and a fullscreen interface for handheld PCs. See the [0.1.18 release notes](docs/RELEASE-0.1.18.md) for changes and tested scope.
 
-Honest version, because this is early. Every row here was run on a real machine,
-not inferred from the fact that it downloaded:
+Running games offer **Resume** to return to their window and **Stop** with a confirmation dialog. Controller text entry and folder selection stay inside Ferestre. **Settings → Choose default runtime** selects the default; **game options → Choose runtime** overrides it for one game. **Use default runtime** removes that override, and choices apply to the next launch. Paused updates resume their saved destination and package metadata directly. Transfer progress distinguishes preparation, processed data, actual game-data downloads and reused bytes. Source builds use pinned `icex` forks rather than applying patch files.
 
-| Title | Source | State |
-|---|---|---|
-| **Minecraft for Windows** (Bedrock) | Store | Playable. Signs in to Xbox Live, loads the profile, and **joins third-party servers from the in-game list**; also plays as a separate Player account on the Store account's licence |
-| **Clair Obscur: Expedition 33** | Store / Game Pass | Playable — saves, video, full game |
-| **Retro Classics** | Game Pass | Playable — player-confirmed; needs a runtime with the allocator-lifetime and save-interface fixes |
-| **Hollow Knight: Silksong** | Game Pass | Playable — player-confirmed |
-| **DREDGE** | Game Pass | Playable |
-| **Stardew Valley** | Game Pass | Playable — Steam Input controller layout applies from a Steam shortcut |
-| **DOOM 64** | Game Pass | Playable |
-| **Overthrown** | Game Pass | Playable |
-| **Minecraft Dungeons II** | Game Pass Ultimate | Playable — sign-in and gameplay work; saving confirmed after finishing the tutorial; a DualShock 4 (USB or Bluetooth) and Steam Input pads drive it |
-| **Halo Infinite** | Store / Game Pass Ultimate | Playable — campaign, training and multiplayer; intermittent offline display under investigation |
-| **Goat Simulator 3** | Game Pass | Playable — player-confirmed offline and online; saves resume; peer joining and voice untested |
-| **Age of Empires Definitive Edition** | Game Pass | Playable — boots, starts a custom game, and plays |
-| **Forza Horizon 5** | Store | Playable with restored Windows saves; Forza Online and the live Festival Playlist work |
-| **Forza Horizon 6** | Store / Game Pass | Playable — gameplay and Continue with saves; also plays with separate Store and Player accounts; in-game marketplace unavailable |
-| **Dune: Awakening** | Store | Playable — player-confirmed |
+The full **[game list and compatibility notes](docs/COMPATIBILITY.md#the-matrix)** live in a separate document, generated from the title recipes. It includes Halo: The Master Chief Collection and records each title's tested scope and verification date. Downloading successfully does not establish that a game is playable.
+
+## Screenshots
+
+Development previews use an isolated demo library and synthetic account data.
+
+![Fullscreen game library with controller navigation](docs/screenshots/library-handheld.png)
+
+![Running game with Resume and Stop controls](docs/screenshots/running-game.png)
+
+![Controller-friendly stop confirmation](docs/screenshots/stop-confirmation.png)
+
+![Install confirmation with an in-app destination picker](docs/screenshots/install-game.png)
 
 Notes worth having before you try your own library:
 
@@ -128,9 +114,11 @@ and keep their game files for resuming, removals finish, and the window waits
 for cleanup before exiting.
 
 **Install to** chooses a library folder: each title gets its own folder inside
-it, and **Remove from disk** only ever deletes that title's folder. **Stop**
-asks a running game to close and gives it 15 seconds to save before ending
-it; a second press ends it at once.
+it, and **Remove from disk** only ever deletes that title's folder. Running cards
+show **Resume** to return to the existing game window and **Stop** to open a
+confirmation dialog. **Cancel** is selected first. Confirmed Stop asks the game
+to close and allows 15 seconds before ending it; forcing an early stop also asks
+for confirmation.
 
 **Signed downloads.** Ferestre's own releases are signed with minisign, and
 the launcher installs only runtimes signed with the project's key
@@ -272,6 +260,8 @@ launches and Steam shortcuts follow the updated installation record.
 
 ## Documentation
 
+- [Pinned source forks](docs/SOURCES.md) — component repositories, exact commits and source-build checks.
+
 - [docs/RECIPES.md](docs/RECIPES.md) — build the runtime, sign in, download a
   title, launch it. Machine-independent; every script takes its paths from
   `XODUS_*` environment variables.
@@ -294,8 +284,7 @@ launches and Steam shortcuts follow the updated installation record.
 ## Licence
 
 Mixed, because the work is. MIT for the original tooling, tests, scripts and
-notes; LGPL-2.1-or-later for the Wine patches; GPL-3.0-or-later for the Xodus
-patches; BSD-3-Clause for the Proton one. [NOTICE](NOTICE) has the map.
+notes; LGPL-2.1-or-later for the Wine, xgameruntime and vkd3d-proton forks; GPL-3.0-only for the Xodus client; BSD-3-Clause for Proton’s top-level components. [NOTICE](NOTICE) has the map.
 
 One consequence worth knowing before building on this: Xodus is GPL-3.0, and it
 is what signs in and downloads. A launcher that *shells out* to the `xodus-cli`

@@ -8,20 +8,19 @@
 # portable archives while the non-git AUR package is prepared.
 #
 # The layout deliberately matches the AppImage's AppDir (usr/bin/ferestre,
-# usr/lib/ferestre/scripts, usr/lib/ferestre/patches, usr/lib/ferestre/VERSION) so the same
+# usr/lib/ferestre/scripts, usr/lib/ferestre/sources.lock.json, usr/lib/ferestre/VERSION) so the same
 # command behaves identically however it was installed. In particular the
 # the launcher finds its scripts through ../lib/ferestre, which is why they go
 # to /usr/lib/ferestre and not /usr/share.
 
 pkgname=ferestre-git
-pkgver=0.0.0.r18.g88a0378
+pkgver=0.1.18.r385.g1c451d8
 pkgrel=1
 pkgdesc='Download and run the Microsoft Store and Xbox GDK titles you own, on Linux'
 arch=('x86_64')
 url='https://github.com/icex/ferestre'
-# Mixed, because the tree is: the scripts and tooling are MIT, and the patches/
-# directory that ships with the package is LGPL-2.1-or-later (wine,
-# xgameruntime), GPL-3.0-only (xodus-cli) and BSD-3-Clause (proton).
+# Launcher and component licences; provenance is recorded in NOTICE and
+# sources.lock.json.
 license=('MIT' 'LGPL-2.1-or-later' 'GPL-3.0-only' 'BSD-3-Clause')
 
 depends=(
@@ -51,7 +50,6 @@ optdepends=(
   # container engine plus the tools install-xodus-proton.sh drives.
   'docker: building the patched Proton runtime yourself (ferestre install-runtime)'
   'podman: building the patched Proton runtime yourself, instead of docker'
-  'patch: re-applying the proton patch after a self-built runtime install'
   'binutils: the runtime build checks the installed xgameruntime.dll with strings(1)'
   'rsync: rebuilding a single DLL against the runtime build tree'
 )
@@ -96,11 +94,9 @@ package() {
 
   # The scripts are the launch path, not documentation: launch-gdk.sh strips
   # the environment Steam injects and proton-wine-shim.sh is what xodus-cli
-  # execs as its "wine" binary. patches/ comes with them because
-  # install-xodus-proton.sh reads patches/proton out of the repository root,
-  # which for an installed copy is /usr/lib/ferestre.
+  # execs as its "wine" binary. The source lock records component provenance.
   cp -a scripts  "$pkgdir/usr/lib/ferestre/scripts"
-  cp -a patches  "$pkgdir/usr/lib/ferestre/patches"
+  install -Dm644 sources.lock.json "$pkgdir/usr/lib/ferestre/sources.lock.json"
   # The recipes, without which an installed copy knows about no titles at all:
   # paths.rs resolves titles/ relative to the repository root, which for a
   # packaged install is /usr/lib/ferestre. They are data the launcher reads at

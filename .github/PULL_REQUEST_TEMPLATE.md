@@ -8,9 +8,8 @@
 <!-- Tick what this touches. The licence of a change follows its directory --
      see NOTICE -- so this is not bookkeeping. -->
 
-- [ ] `patches/wine/` or `patches/xgameruntime/` — the runtime (LGPL-2.1-or-later)
-- [ ] `patches/xodus-cli/` — the client (GPL-3.0-or-later)
-- [ ] `patches/proton/` — the Proton script (BSD-3-Clause)
+- [ ] `sources.lock.json`, `.gitmodules`, `third_party/` — pinned component forks
+- [ ] Runtime/client source changes — link the corresponding fork commit or PR
 - [ ] `scripts/`, `tools/`, `tests/` — tooling (MIT)
 - [ ] `titles/` — a title recipe
 - [ ] `docs/`, `notes/`, `.github/` — documentation and repository plumbing
@@ -39,8 +38,8 @@
 - [ ] A change under `titles/` was followed by
       `.github/scripts/gen-compatibility.py`, and `docs/COMPATIBILITY.md` is
       committed with it. CI runs `--check` and will fail otherwise.
-- [ ] A patch file is `git diff --relative` output from the relevant directory,
-      one concern per file.
+- [ ] Component changes live in the matching fork, with parent gitlinks and
+      `sources.lock.json` updated together.
 
 <!-- A title moving state in the matrix needs someone to have actually run it.
      "Should work now" is not a state. -->

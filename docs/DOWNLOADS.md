@@ -15,8 +15,11 @@ individually as it arrives; cached covers are reused across pages and restarts.
 
 A game's whole card is dimmed under a centered animated spinner and Starting…
 while its launcher prepares it. Once the executable from that specific launch is
-observed, the overlay shows Running and a prominent Stop action. Pressing anywhere
-on the card stops it. Stop also works during startup. Failed launches and game
+observed, the overlay shows Running with separate Resume and Stop controls.
+Resume focuses that existing game's window without launching another copy.
+Stop opens a confirmation dialog with Cancel selected first; D-pad/stick and
+A/cross select the response, while B/circle cancels. Stop also works during
+startup, and force stop during shutdown requires another confirmation. Failed launches and game
 exits return the card to Play; other running games retain their own state.
 
 SDL2 controllers navigate the focused Ferestre window with D-pad or the left
@@ -37,13 +40,19 @@ policy. A desktop or Steam mapping that consumes Home before SDL must let that
 button reach Ferestre.
 SDL controller type detection displays PlayStation cross/circle/triangle,
 L1/R1 and Share/Create for DualShock/DualSense controllers. The footer explains
-the available controls for the current focus; Controller help shows the full
-mapping. Steam Input can expose a physical controller as a virtual Xbox device;
+the available controls for the current focus. Press Options/Menu without a title
+selected to show the full mapping. Steam Input can expose a physical controller as a virtual Xbox device;
 in that case the exposed device type determines the default labels. A stick dead zone and
 held-direction repeat avoid accidental movements. Buttons held when another
 application gives Ferestre focus do not activate anything. Devices are never
 grabbed and no desktop-wide input is injected. SDL2 is loaded optionally from
 the system; missing SDL2 leaves normal touch, mouse and keyboard navigation.
+Controller activation of a text field opens an in-app keyboard. Done commits its
+draft and Cancel/B leaves the field unchanged; password drafts stay masked. The
+install destination button opens an in-app folder browser with Home, Parent,
+hidden-folder and Use This Folder controls. Account and other option selectors
+also use controller-navigable choices. Settings includes Quit Ferestre.
+
 Keyboard: arrows/Tab navigate, Enter/Space activate, F6 changes pane, Ctrl+F
 searches and F11 toggles fullscreen.
 

@@ -74,9 +74,9 @@ than treat it as an optional extra.
       did not deserve.
 - [x] CI, sized to what each check costs. Per push: the Rust workspace, `cargo
       fmt`, `clippy`, the AT-SPI end-to-end GUI test, recipe validation, and
-      **`scripts/check-patches.sh`** — every patch series applied to a pristine
-      checkout of the commit it targets, and, where the repository is a build
-      tree, checked to reproduce it exactly.
+      **`scripts/check-sources.sh --remote`** — all five public fork commits,
+      nested repository URLs and gitlinks verified against `sources.lock.json`,
+      followed by offline client tests.
 
       The synthetic C suites (`tests/run-*.sh`) are deliberately **not** per
       push and the roadmap should stop implying they could be: they need the
@@ -492,7 +492,7 @@ Building this runtime on a free four-core runner takes **2h09m** and produces a
 **300 MB** tarball. Every run is cold: `--enable-ccache` is passed but nothing
 carries the cache between runs. That is affordable for a train that only moves
 when Wine or the GDK runtime does, and it is not affordable per push -- which is
-why `scripts/check-patches.sh` and `scripts/check-werror.sh` exist. A
+why `scripts/check-sources.sh` and `scripts/check-werror.sh` exist. A
 self-hosted runner is a nice-to-have for a GPU smoke test, not a requirement to
 build at all.
 
@@ -553,10 +553,10 @@ These are judgement calls, not engineering ones:
    Valve or Xodus.
 3. **How the client is carried** — vendored, submodule, or a maintained fork —
    given upstream will not take these changes. Since 2026-09-14 it is a
-   submodule (`third_party/xodus-cli`, pinned at the upstream commit the
-   series targets) with the patches applied on top, and the Proton fork is
-   carried the same way (`third_party/xodus-proton`). The licensing question
-   stands; the layout is settled.
+   submodule (`third_party/xodus-cli`). Both it and Proton
+   (`third_party/xodus-proton`) now use maintained `icex` forks, with immutable
+   commits and nested source pins in [sources.lock.json](../sources.lock.json).
+   Builds verify the pins and do not apply patch files. See [SOURCES.md](SOURCES.md).
 
 ## Known gaps, stated plainly
 

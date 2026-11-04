@@ -8,7 +8,7 @@
 #
 # Adding a name here is a promise: the runtime must keep providing it, or drop
 # it deliberately and update every recipe that asks for it. Do not add a name
-# for a debugging aid (patches/wine/0005-datagram-tracing.patch adds a WINEDEBUG
+# for a debugging aid (https://github.com/icex/wine/commit/90a9bbbffab33f330a813d761254f87718efbf00 adds a WINEDEBUG
 # channel, not a capability) -- only for something a title depends on.
 #
 # `symptom-if-missing` is what you see when the runtime does not have it. It is
@@ -32,8 +32,8 @@ summary = """
 Wine loads the process's main image from an inherited file descriptor named in \
 WINE_DLL_FILE_MAP, and the fd survives the exec into Proton."""
 provided-by = [
-    "patches/wine/0001-mapped-main-image-appstate-and-mediaconv-rank.patch",
-    "patches/proton/0001-keep-inherited-fds-mediaconv-and-system-ffmpeg.patch",
+    "https://github.com/icex/wine/commit/af0624a42fe0bc20cdf4ecc52c3b3f7c10c0230c",
+    "https://github.com/icex/Proton-UWP/commit/2b7ccfc51fcac583cad2c1fe7feaf5210658da29",
 ]
 symptom-if-missing = "the title exits immediately with rc=1 and nothing in the log; the executable on disk is encrypted, so there is nothing to load without this"
 note = "Every GDK/MSIXVC title requires this. It is the reason a title cannot be started by any other launcher."
@@ -47,7 +47,7 @@ name = "loader.image-name-for-mapped-image"
 summary = """
 NtQueryInformationProcess reports the real path of a main image that was mapped \
 from a memfd, so a title that asks where its own executable is gets an answer."""
-provided-by = ["patches/wine/0006-process-image-name-for-a-memfd-mapped-main-image.patch"]
+provided-by = ["https://github.com/icex/wine/commit/0ff4c1ee32b1198dfd16197520a1778ef71f179b"]
 symptom-if-missing = "GetModuleFileNameEx(GetCurrentProcess(), NULL, ...) returns an empty string; DOOM 64 then calls strlen on what it makes of that and dies before it draws a frame, with rc=3 and nothing in the log"
 note = """
 Nothing in a recipe can work around this and no title needs to ask for it: the \
@@ -63,7 +63,7 @@ name = "winrt.loggingchannel"
 summary = """
 Windows.Foundation.Diagnostics.LoggingChannel, LoggingChannelOptions and \
 LoggingOptions are activatable, hosted in windows.system.profile.systemid.dll."""
-provided-by = ["patches/wine/0008-loggingchannel-winrt-classes.patch"]
+provided-by = ["https://github.com/icex/wine/commit/bce28364e07ceb9ab43ad64f75163ef31b0bb4c3"]
 symptom-if-missing = "RoGetActivationFactory fails for the class and the title dereferences what it got back -- Age of Empires Definitive Edition faults reading 0xFFFFFFFFFFFFFFFF on the next instruction"
 note = """
 Interface ids and method order are the published ones, taken from Microsoft's \
@@ -89,7 +89,7 @@ verify = [
 [[capability]]
 name = "loader.exception-bytes"
 summary = "An access violation logs the faulting instruction's bytes, not just its address."
-provided-by = ["patches/wine/0007-dump-faulting-bytes-for-access-violations.patch"]
+provided-by = ["https://github.com/icex/wine/commit/2ef0cf66abea7e012f1e3b4758a1a004258567f9"]
 symptom-if-missing = "a crash in a title gives an address and nothing else; the image is decrypted into a memfd, so there is nothing on disk to disassemble afterwards"
 note = "Diagnostic only, and it paid for itself twice: the bytes said `cmp byte ptr [rdi+rax], 0` in a loop, which is a strlen on a pointer somebody handed the title."
 verify = [
@@ -99,7 +99,7 @@ verify = [
 [[capability]]
 name = "xgameruntime.analytics-info"
 summary = "XSystemGetAnalyticsInfo fills the caller's buffer and returns it, on every path including the failing ones."
-provided-by = ["patches/xgameruntime/0002-analytics-info-must-return-the-callers-buffer.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/f53c8c5aae0d1562ddd21bb2b85bc3d1bea5c6e3"]
 symptom-if-missing = "the title faults one instruction after the call, on `movups xmm0,[rax]` -- Goat Simulator 3 does exactly that and exits 3"
 note = """
 The API returns a struct by value, which in this ABI means the caller passes the \
@@ -113,7 +113,7 @@ verify = [
 [[capability]]
 name = "xgameruntime.task-queue-lifetime"
 summary = "A task queue terminates when told to, and an async result never reports success without writing what it promised."
-provided-by = ["patches/xgameruntime/0003-task-queue-termination-and-async-results.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/4f0d8dadf943a165a71c8d89cbe7f56b23b8f3bf"]
 symptom-if-missing = "callbacks run after the title was told none would, against objects it has already freed; and a second XAsyncGetResult returns S_OK with the caller's buffer untouched"
 note = """
 Three defects an adversarial audit of this runtime confirmed. The queue runner \
@@ -130,7 +130,7 @@ verify = [
 [[capability]]
 name = "xgameruntime.async-block-ownership"
 summary = "XAsyncComplete refuses a block this runtime never began, instead of writing a result into whatever the pointer happens to be."
-provided-by = ["patches/xgameruntime/0006-refuse-to-complete-an-async-block-we-never-began.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/bad1197b45e4347c8c3e0e24d3b4f8665297bc0a"]
 symptom-if-missing = "a fault inside xgameruntime.dll on the first dereference of the async block -- Age of Empires: Definitive Edition dies on the way into a match"
 note = """
 libHttpClient nests two async operations per HTTP call, and its error path \
@@ -151,7 +151,7 @@ verify = [
 [[capability]]
 name = "appmodel.package-identity"
 summary = "kernelbase reports the current process's package identity from the manifest beside the executable, so GetCurrentPackageFullName and friends succeed."
-provided-by = ["patches/wine/0002-kernelbase-current-package-identity.patch"]
+provided-by = ["https://github.com/icex/wine/commit/02ead80a916b83472af7c458395741fbae33c732"]
 symptom-if-missing = "APPMODEL_ERROR_NO_PACKAGE, and a packaged title exits at once"
 verify = [
     { file = "files/lib/wine/x86_64-windows/kernelbase.dll", contains = "manifest %s lacks an <Identity Name/Publisher>." },
@@ -160,7 +160,7 @@ verify = [
 [[capability]]
 name = "appmodel.state-change-notification"
 summary = "RegisterAppStateChangeNotification succeeds and returns a token Unregister accepts, instead of ERROR_CALL_NOT_IMPLEMENTED."
-provided-by = ["patches/wine/0001-mapped-main-image-appstate-and-mediaconv-rank.patch"]
+provided-by = ["https://github.com/icex/wine/commit/af0624a42fe0bc20cdf4ecc52c3b3f7c10c0230c"]
 symptom-if-missing = "Microsoft's XCurl.dll aborts curl_global_init -- \"Could not initialize libcurl\" during startup"
 note = "Needed by any title that loads Microsoft's XCurl.dll, which is most of them."
 verify = [
@@ -170,7 +170,7 @@ verify = [
 [[capability]]
 name = "gameinput.v2"
 summary = "gameinput.dll exposes IGameInput_v2 and its dispatcher, opted into with WINE_GAMEINPUT=1."
-provided-by = ["patches/wine/0003-gameinput-v2-dispatcher-opt-in.patch"]
+provided-by = ["https://github.com/icex/wine/commit/ec1446d9a595191a52d59fec554ddc7cf64337e9"]
 symptom-if-missing = "\"Critical Failure: GameInput Runtime could not be loaded\""
 verify = [
     { file = "files/lib/wine/x86_64-windows/gameinput.dll", contains = "impl %p, quota_ms %I64u." },
@@ -179,7 +179,7 @@ verify = [
 [[capability]]
 name = "winrt.regionpolicyevaluator"
 summary = "Windows.Internal.System.Profile.RegionPolicyEvaluator is activatable, hosted in windows.system.profile.systemid.dll."
-provided-by = ["patches/wine/0004-regionpolicyevaluator-winrt-class.patch"]
+provided-by = ["https://github.com/icex/wine/commit/46ab2cb34f8aba93cd69b17d806399ee942f5afd"]
 symptom-if-missing = "RoGetActivationFactory fails for that class and the title then throws on a fiber: \"frame is not in stack limits\""
 note = "Registering it is a separate job from implementing it: Proton copies new prefixes from a default baked at runtime-build time, so a class added later is missing from every prefix made since. The launcher adds what is missing before a launch."
 winrt-classes = [
@@ -192,7 +192,7 @@ verify = [
 [[capability]]
 name = "winhttp.websocket-close-timeout"
 summary = "WinHttp websockets accept and report WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT, which bounds the wait for the peer's close frame."
-provided-by = ["patches/wine/0002-winhttp-websocket-close-timeout.patch"]
+provided-by = ["https://github.com/icex/wine/commit/355430b366dbd2fc1d9e8fa15564b5eb4d1bdc14"]
 symptom-if-missing = "a websocket close waits for a peer that never answers, so shutdown or sign-out hangs"
 verify = [
     { file = "files/lib/wine/x86_64-windows/winhttp.dll", contains = "WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT" },
@@ -202,8 +202,8 @@ verify = [
 name = "media.real-video"
 summary = "The title's own video files are decoded (system ffmpeg preferred, Proton's converter elements demoted by rank) rather than replaced by the placeholder."
 provided-by = [
-    "patches/wine/0001-mapped-main-image-appstate-and-mediaconv-rank.patch",
-    "patches/proton/0001-keep-inherited-fds-mediaconv-and-system-ffmpeg.patch",
+    "https://github.com/icex/wine/commit/af0624a42fe0bc20cdf4ecc52c3b3f7c10c0230c",
+    "https://github.com/icex/Proton-UWP/commit/2b7ccfc51fcac583cad2c1fe7feaf5210658da29",
 ]
 symptom-if-missing = "colour bars in place of cutscenes and loading movies"
 note = "Also needs a system ffmpeg with an H.264 decoder; Steam's has none outside Steam."
@@ -214,7 +214,7 @@ verify = [
 [[capability]]
 name = "xgameruntime.taskqueue"
 summary = "XTaskQueue in full: composite queues, ports, waiters and monitors, and the XAsync provider framework the rest of the GDK completes through."
-provided-by = ["patches/xgameruntime/0001-taskqueue-user-networking-gamesave-package.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/d0450c0216f11207012d1381300d17ad2c839381"]
 symptom-if-missing = "\"Failed to Register TaskQueue Monitor\", or async work that is submitted and never completes"
 note = "Required by every GDK title; nothing else in the runtime completes without it."
 verify = [
@@ -224,7 +224,7 @@ verify = [
 [[capability]]
 name = "xgameruntime.user"
 summary = "XUser sign-in against the real Microsoft account, with gamertag and XUID, through the running xodus-service."
-provided-by = ["patches/xgameruntime/0001-taskqueue-user-networking-gamesave-package.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/d0450c0216f11207012d1381300d17ad2c839381"]
 symptom-if-missing = "the title reports no signed-in user, or sits on its sign-in screen"
 note = "Needs xodus-service running for tokens; the launch script starts it."
 verify = [
@@ -234,7 +234,7 @@ verify = [
 [[capability]]
 name = "xgameruntime.networking"
 summary = "XNetworking connectivity hints, security information for a URL, and change registrations that deliver the current value at registration time."
-provided-by = ["patches/xgameruntime/0001-taskqueue-user-networking-gamesave-package.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/d0450c0216f11207012d1381300d17ad2c839381"]
 symptom-if-missing = "the title believes the machine is offline: plain HTTP still works, but every WebSocket connect is refused before it is attempted"
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "XNetworkingRegisterConnectivityHintChanged" },
@@ -243,7 +243,7 @@ verify = [
 [[capability]]
 name = "xgameruntime.gamesave"
 summary = "XGameSave containers, blobs and updates over the Windows Gaming Services (wgs) on-disk layout, so Windows saves are read and written in place."
-provided-by = ["patches/xgameruntime/0001-taskqueue-user-networking-gamesave-package.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/d0450c0216f11207012d1381300d17ad2c839381"]
 symptom-if-missing = "no save slots are found, or new saves are written where Windows will not look for them"
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "unrecognised index" },
@@ -252,7 +252,7 @@ verify = [
 [[capability]]
 name = "xgameruntime.package"
 summary = "XPackage queries: the current package's mount path, identity and user locale."
-provided-by = ["patches/xgameruntime/0001-taskqueue-user-networking-gamesave-package.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/d0450c0216f11207012d1381300d17ad2c839381"]
 symptom-if-missing = "the title cannot locate its own installed content, or falls back to a default locale"
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "XPackageGetCurrentProcessPackageIdentifier" },
@@ -266,8 +266,8 @@ An image named in WINE_DLL_FILE_MAP is served from its descriptor when it is \
 opened read-only through the ordinary file API, not only when the loader maps \
 it, and each handle gets a file offset of its own."""
 provided-by = [
-    "patches/wine/0009-serve-a-mapped-image-through-the-file-api.patch",
-    "patches/wine/0013-match-the-globalroot-form-of-a-mapped-image-s-name.patch",
+    "https://github.com/icex/wine/commit/4378574344d4b2a1a619f96c0a9c6a96f8d24b4f",
+    "https://github.com/icex/wine/commit/65c332c6dd327c911e89c1f8bcfc3cca9a39967b",
 ]
 symptom-if-missing = "a launcher or an integrity check that reads the game's own image gets the still-encrypted bytes. Halo Infinite's EasyAntiCheat bootstrapper stops with 201, 'Invalid game executable path!', naming a file that is plainly there; Forza Horizon 5 hashes what it reads and kills its own process"
 note = """
@@ -294,7 +294,7 @@ summary = """
 NtQueryVirtualMemory(MemoryMappedFilenameInformation) reports the real path of \
 a main image mapped from a memfd, so a title that asks which file its own code \
 came from gets an answer instead of an empty string."""
-provided-by = ["patches/wine/0010-answer-the-mapped-image-s-own-filename.patch"]
+provided-by = ["https://github.com/icex/wine/commit/1015c6b21c943398b21fb82240f7be384efa71d2"]
 symptom-if-missing = "Forza Horizon 5 asks three times on its image base, is told its code came from nowhere, and its own code-restoring handler then declines the first elided call site: an unhandled illegal instruction at ForzaHorizon5.exe+0x53d5cec, seconds after launch, with no window"
 note = """
 The server answers this from the name of the file a view was mapped from, and \
@@ -314,7 +314,7 @@ summary = """
 _Concurrent_vector_base_v4::_Internal_capacity does not count a segment that \
 is still being allocated, so _Internal_reserve settles it and no caller \
 derives an element address from the in-progress marker."""
-provided-by = ["patches/wine/0011-concrt140-do-not-derive-a-pointer-from-the-in-progres.patch"]
+provided-by = ["https://github.com/icex/wine/commit/6d22d79be8d90e71efaa6c4169d37bd220fdb287"]
 symptom-if-missing = "an access violation writing to 0x9 during startup, from a `mov [rax+8], reg` two instructions after the _Internal_push_back call; Forza Horizon 5 records it in its own Upload_CrashReport.xml as ACCESS_VIOLATION_WRITE with EXCEPTION_INFO 0x0000000000000009"
 note = """
 A Wine bug rather than anything specific to this project, and worth sending \
@@ -335,7 +335,7 @@ name = "xgameruntime.title-id"
 summary = """
 XGameGetXboxTitleId reports the TitleId from MicrosoftGame.config rather than \
 zero, so a title that asks for its own identity gets it."""
-provided-by = ["patches/xgameruntime/0007-report-the-package-s-own-xbox-title-id.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/f43e7f6bd4e2581474489953b2cea358cc99280d"]
 symptom-if-missing = "XGameGetXboxTitleId returns zero despite a TitleId in MicrosoftGame.config, so calls scoped to the running title lack its identity"
 note = """
 The config carries it and xgr_title_identity() already reads it for the token \
@@ -352,7 +352,7 @@ summary = """
 XPackageEnumeratePackages reports the package's real display name, description, \
 publisher and store id from MicrosoftGame.config, instead of the package family \
 name and three empty strings."""
-provided-by = ["patches/xgameruntime/0008-report-the-package-s-real-details.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/16f57729015d8ca97c3a24b049c5b735f50fb443"]
 symptom-if-missing = "a title looking for itself in the list it just asked for does not recognise the entry, and anything keyed on storeId finds nothing"
 note = """
 The descriptive fields come from MicrosoftGame.config. The packageIdentifier \
@@ -369,7 +369,7 @@ summary = """
 NtSetInformationFile implements FileAllocationInformation instead of stubbing \
 it, and a process that terminates itself abnormally says so with its exit \
 code."""
-provided-by = ["patches/wine/0012-file-allocation-and-an-abnormal-self-termination-is-w.patch"]
+provided-by = ["https://github.com/icex/wine/commit/5d4618f73ec605b7203936d6dd743779183d4dc8"]
 symptom-if-missing = "setting a file's allocation size silently does nothing, and a title that hard-kills itself leaves no trace at all: the process vanishes and Proton reports 1, because a status whose low byte is zero is mapped to 1 on the way out"
 note = """
 Both came out of Forza Horizon 5's startup and neither fixes it. The allocation \
@@ -387,7 +387,7 @@ name = "xgameruntime.speech-voice-enumeration"
 summary = """
 XSpeechSynthesizerEnumerateInstalledVoices reports that there are no voices, \
 rather than failing with E_NOTIMPL."""
-provided-by = ["patches/xgameruntime/0009-enumerating-no-voices-is-a-success.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/efe41b1e0e6af8e905e636c4346d4f11b89894da"]
 symptom-if-missing = "a title that asks what speech voices exist during startup is told the question is invalid, which is not an answer it can carry on from"
 note = """
 There is no speech synthesiser here, so there are no voices -- and reporting \
@@ -402,7 +402,7 @@ name = "xgameruntime.async-provider-completed-in-begin"
 summary = """
 An XAsync operation completed inside its provider's Begin keeps its result \
 and defers callback delivery while that provider call runs."""
-provided-by = ["patches/xgameruntime/0010-an-operation-the-provider-already-completed-is-still.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/a64fca67f4217801de3eb5a2ee7e63f9645eeb63"]
 symptom-if-missing = "a title using libHttpClient's WinHttp websocket transport crashes shortly after the socket connects because its completed operation was withdrawn before GetResult could fill the result buffer"
 note = """
 Wine's WinHttpWebSocketSend can finish inline. libHttpClient completes its \
@@ -423,8 +423,8 @@ summary = """
 XAsyncBegin returns S_OK after setup; provider failures complete the operation \
 asynchronously and failed-Begin providers are cleaned up without GetResult."""
 provided-by = [
-    "patches/xgameruntime/0014-begin-reports-setup-success-and-completes-provider-errors.patch",
-    "patches/xgameruntime/0015-clean-up-failed-begin-after-its-completion-callback.patch",
+    "https://github.com/icex/xgameruntime/commit/a8eff5c44fb493e3c509918b92066e0c3df3ad65",
+    "https://github.com/icex/xgameruntime/commit/89de568400f5bf12c117685235401110177ab71d",
 ]
 symptom-if-missing = "libHttpClient treats a provider's E_PENDING as a failed start and tears down context still needed by its queued completion; Forza Horizon 5 faults reading 0xFFFFFFFFFFFFFFFF in its websocket completion handler"
 note = """
@@ -443,7 +443,7 @@ name = "xgameruntime.package-identifier"
 summary = """
 Current-package queries and enumeration share an opaque session identifier \
 that fits the GDK's 33-byte buffer, including its terminator."""
-provided-by = ["patches/xgameruntime/0016-use-a-bounded-opaque-xpackage-identifier.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/5aca98bfe7354765520180ab490ede23ea022969"]
 symptom-if-missing = "Forza Horizon 5 stays at INSTALLING... PLEASE WAIT because its 33-byte current-package identifier query cannot hold the package family name returned by the runtime"
 note = """
 XPackage installation identifiers are opaque and valid for the current game \
@@ -460,7 +460,7 @@ name = "xgameruntime.save-provider-default-scid"
 summary = """
 A save provider initialised with an all-zero configuration id uses the title's \
 own service configuration, derived from its title id."""
-provided-by = ["patches/xgameruntime/0011-a-save-provider-with-no-configuration-id-uses-the-ti.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/3a33eb73b048b521de4b1cb56cc0868b3e8118cb"]
 symptom-if-missing = "a title that passes zeros gets a save folder named for a zero SCID, so a profile copied over from Windows -- or written by an earlier run -- is invisible and it starts as though it had never been played"
 note = """
 An all-zero configuration id means "the one this title was built with", not a \
@@ -480,7 +480,7 @@ name = "xgameruntime.store-current-game-product"
 summary = """
 XStore reports the running game as a product the player owns, rather than \
 answering every product query with an empty result."""
-provided-by = ["patches/xgameruntime/0012-report-the-running-game-as-a-product-the-player-owns.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/38480afc3804b180d66b1e3862ca040266e69a8d"]
 symptom-if-missing = "a title asking what its own product is, or which games it is entitled to, is told it does not exist"
 note = """
 The one product that can be described honestly offline is the game running now: \
@@ -505,7 +505,7 @@ name = "xnetworking.tls-protocol-flags"
 summary = """
 XNetworkingQuerySecurityInformationForUrl reports the TLS versions the HTTP \
 stack may use, instead of a mask with nothing set."""
-provided-by = ["patches/xgameruntime/0013-report-the-tls-versions-the-http-stack-may-use.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/4cc07f29957b4b0da703ba570aeb8bf1d0c7ae0c"]
 symptom-if-missing = "a title that follows the documented pattern configures its WinHTTP session to permit no TLS version at all"
 note = """
 The GDK documents `enabledHttpSecurityProtocolFlags` as a \
@@ -519,7 +519,7 @@ TLS 1.2 and 1.3, which is what a current policy allows and what the services \
 these titles talk to negotiate. There are still no thumbprints, because there \
 is nothing to pin: XNetworkingVerifyServerCertificate verifies the request's \
 certificate chain against its host, as WinHTTP does, and no more \
-(patches/xgameruntime/0034).
+(https://github.com/icex/xgameruntime/commit/c68bdd47d0a7cda65cba4ec02be67f2253c4e271).
 
 Found while chasing Forza Horizon 5 and it did not change its outcome; kept \
 because a mask of zero is wrong on its own terms."""
@@ -530,7 +530,7 @@ verify = [
 [[capability]]
 name = "winhttp.ipv6-fast-fallback-option"
 summary = "WinHTTP accepts XCurl's IPv6 fast fallback session option, matching upstream Wine."
-provided-by = ["patches/wine/0014-winhttp-ipv6-fast-fallback.patch"]
+provided-by = ["https://github.com/icex/wine/commit/a94376e7059e257fb41f2a6110594cfc3a168c1b"]
 symptom-if-missing = "XCurl abandons initialization before connecting; Minecraft Dungeons II reports login error 0063"
 note = "The upstream backport accepts the option; it does not implement a new connection-racing algorithm."
 verify = [
@@ -541,9 +541,9 @@ verify = [
 name = "xgameruntime.store-license-token"
 summary = "XStoreQueryLicenseTokenAsync fetches a nonempty licence token asynchronously through the service."
 provided-by = [
-    "patches/xgameruntime/0018-clean-up-background-provider-failures.patch",
-    "patches/xgameruntime/0019-fetch-license-tokens-through-the-service.patch",
-    "patches/xodus-cli/0017-fetch-license-tokens-in-the-service.patch",
+    "https://github.com/icex/xgameruntime/commit/75ae42d034c632d3167409861d7095d3f74c466e",
+    "https://github.com/icex/xgameruntime/commit/108d038830fd1f0ef7b02ed8e96c460a62cee54e",
+    "https://github.com/icex/xodus/commit/085ff9cad8dc4b21a19cf69cebdb84d964cf6886",
 ]
 symptom-if-missing = "a title requiring a Store licence token receives an empty result or cannot verify ownership"
 note = "The runtime probe checks IPC support only. The matching xodus-service must also be installed and restarted; old services fail closed."
@@ -554,7 +554,7 @@ verify = [
 [[capability]]
 name = "xgameruntime.user-handle-result-size"
 summary = "XUserAddAsync exposes the user handle through the generic async size and result APIs."
-provided-by = ["patches/xgameruntime/0022-report-the-user-handle-async-result-size.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/b89378f94d0e0fa662a41b1d0bd777cc9b6eeff0"]
 symptom-if-missing = "Halo's native sign-in wrapper sees a zero-byte result and dereferences a missing user handle"
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "user handle async result:" },
@@ -563,7 +563,7 @@ verify = [
 [[capability]]
 name = "xgameruntime.save-result-sizes"
 summary = "Save provider and remaining quota operations expose correctly sized generic async results."
-provided-by = ["patches/xgameruntime/0023-report-save-provider-and-quota-result-sizes.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/5f39800413a224c6307e6a1c932a7a56663ef9b2"]
 symptom-if-missing = "Halo sees a successful but empty save-provider result and crashes before loading gameplay"
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "save provider async result:" },
@@ -573,7 +573,7 @@ verify = [
 [[capability]]
 name = "xgameruntime.manual-queue-thread-affinity"
 summary = "With XGR_STRICT_MANUAL_QUEUES=1, Manual work and completion ports run only when their owning endpoint is dispatched."
-provided-by = ["patches/xgameruntime/0024-dispatch-async-work-on-the-requested-manual-port.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/a8aabedde2f60fcd91cfd4ee2cd142b77cdb2732"]
 symptom-if-missing = "Halo campaign aborts with Thread not registered when its async work runs on an unrelated thread-pool thread"
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "XGR_STRICT_MANUAL_QUEUES" },
@@ -582,7 +582,7 @@ verify = [
 [[capability]]
 name = "xgameruntime.analytics-device-family"
 summary = "System analytics preserves the full Windows.Desktop device family used by native PlayFab Party to identify its platform."
-provided-by = ["patches/xgameruntime/0025-preserve-the-complete-analytics-device-family.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/4d9a840c5226d5a2bf6caf74db7a42710da61441"]
 symptom-if-missing = "Party initialization fails with unmapped platform error and Goat Simulator 3 reports GS3-NF-2"
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "returning complete analytics device family" },
@@ -591,7 +591,7 @@ verify = [
 [[capability]]
 name = "xgameruntime.store-product-lifetime"
 summary = "Enumerated Store products and their metadata remain valid until the query handle closes."
-provided-by = ["patches/xgameruntime/0026-keep-store-products-alive-for-the-query-lifetime.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/a0c106b3de4a25d411c35b6340a59f72606ec7ff"]
 symptom-if-missing = "Goat Simulator 3 retains a pointer to expired stack data and crashes while processing owned products"
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "query-owned product" },
@@ -600,7 +600,7 @@ verify = [
 [[capability]]
 name = "xgameruntime.gamesave-interface4-legacy"
 summary = "IXGameSaveImpl4 is exposed with its complete GDK 2510 layout, so legacy local save calls made through it keep their slots; PlayFab file saves are a separate capability."
-provided-by = ["patches/xgameruntime/0027-expose-legacy-save-apis-through-the-complete-interface4.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/967675584c01982908d9e2c25f3e342bab8ea2cd"]
 symptom-if-missing = "A title that asks for IXGameSaveImpl4 gets E_NOINTERFACE, and every save call after it fails; Retro Classics logs XGameSaveFilesGetFolderWithUiAsync failed with 0x80004002"
 # A string compiled into the DLL for this check, not a diagnostic's wording.
 verify = [
@@ -610,7 +610,7 @@ verify = [
 [[capability]]
 name = "d3d12.recording-allocator-lifetime"
 summary = "VKD3D_CONFIG=retain_recording_allocators keeps an allocator released while a command list records from it alive until the list's next Reset or destruction; without it the list is invalidated and Close fails."
-provided-by = ["patches/vkd3d-proton/0001-retain-retired-recording-allocators-for-engine-compatibility.patch"]
+provided-by = ["https://github.com/icex/vkd3d-proton/commit/e6874335c04585e5fb693bb5a074977031c70406"]
 symptom-if-missing = "An engine that releases an allocator mid-recording faults in vkEndCommandBuffer on a null command buffer when it closes the list"
 verify = [
     { file = "files/lib/wine/vkd3d-proton/x86_64-windows/d3d12core.dll", contains = "retain_recording_allocators" },
@@ -619,14 +619,14 @@ verify = [
 [[capability]]
 name = "concrt140.concurrent-queue-iterator"
 summary = "Concurrent queue iterators preserve FIFO traversal, copying, assignment and page boundaries."
-provided-by = ["patches/wine/0015-implement-concurrent-queue-iterators.patch"]
+provided-by = ["https://github.com/icex/wine/commit/3aa830229316ad48285e516e5ade4ffda1e41be1"]
 symptom-if-missing = "Forza Horizon 6 aborts on an unimplemented concurrent queue iterator constructor after compiling shaders"
 verify = [{ file = "files/lib/wine/x86_64-windows/concrt140.dll", contains = "_Concurrent_queue_iterator_base_v4__Advance" }]
 
 [[capability]]
 name = "xgameruntime.playfab-file-saves"
 summary = "PFX file-save calls use the title-matched native SDK for authentication, manifests, folders, quota and uploads."
-provided-by = ["patches/xgameruntime/0028-register-runtime-and-bridge-playfab-file-saves.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/9ca43bf5344888489c41391fc402f840586dd5fb"]
 symptom-if-missing = "New PlayFab save clients fail PFXGameSaveInitializeConfig before loading gameplay"
 note = "Runs in-process. Entity-only and custom-root configurations, and final upload after process exit are not implemented."
 verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "authenticated native PlayFab save backend initialized" }]
@@ -634,21 +634,21 @@ verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = 
 [[capability]]
 name = "xgameruntime.service-socket-override"
 summary = "The runtime can connect to a separately versioned service without changing desktop or audio discovery."
-provided-by = ["patches/xgameruntime/0028-register-runtime-and-bridge-playfab-file-saves.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/9ca43bf5344888489c41391fc402f840586dd5fb"]
 symptom-if-missing = "An updated launcher cannot isolate its matching service from a still-running older session"
 verify = [{ file = "files/lib/wine/x86_64-unix/xgameruntime.so", contains = "XODUS_RUNTIME_DIR" }]
 
 [[capability]]
 name = "xgameruntime.playfab-shutdown-upload"
 summary = "Online PFX save configurations complete a final upload and release the active device before their native handles close."
-provided-by = ["patches/xgameruntime/0028-register-runtime-and-bridge-playfab-file-saves.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/9ca43bf5344888489c41391fc402f840586dd5fb"]
 symptom-if-missing = "Progress stays unsynced when a GRTS client releases its save configuration at exit"
 note = "Normal shutdown waits up to 30 seconds; failures retain local game files and do not claim successful cloud synchronization. Crash-time background upload remains unavailable."
 verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "final save upload completed before config close" }]
 [[capability]]
 name = "xgameruntime.store-catalog"
 summary = "Opt-in XStore product and associated-product queries return live Microsoft catalog data with retained SKU/image data and independent page handles."
-provided-by = ["patches/xgameruntime/0029-bridge-live-store-catalog.patch", "patches/xodus-cli/0019-serve-read-only-store-catalog.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/468d0ecaa3037de9d8f52129ef5316331ca69e67", "https://github.com/icex/xodus/commit/fb0b69fa1728d0d6c0816522c3768891d460839a"]
 symptom-if-missing = "Forza Horizon 6 receives empty marketplace product listings"
 note = "Enable XGR_STORE_CATALOG=1 per title. Catalog data does not grant DLC ownership; purchasing remains unsupported."
 verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "catalog snapshot:" }, { file = "files/lib/wine/x86_64-unix/xgameruntime.so", contains = "CSDX" }]
@@ -656,7 +656,7 @@ verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = 
 [[capability]]
 name = "xgameruntime.store-player-accounts"
 summary = "Separate Store entitlement and Xbox player contexts with authenticated account and licence change notifications."
-provided-by = ["patches/xgameruntime/0030-separate-store-and-player-accounts.patch", "patches/xodus-cli/0020-separate-store-and-player-accounts.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/36099cff2b87e81b05c4ea4527ddac5e66782891", "https://github.com/icex/xodus/commit/85704f4cda895ccce2cd31279a1c54cd3c0dcf0c"]
 symptom-if-missing = "A Store owner cannot be selected independently from the Xbox player"
 note = "Requires the matching profile-aware service. Microsoft still decides content access; separate Player prefixes retain independent local saves."
 verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "XGR_ACCOUNT_ROLES_V1" }, { file = "files/lib/wine/x86_64-unix/xgameruntime.so", contains = "Ferestre account roles v1:" }]
@@ -664,14 +664,14 @@ verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = 
 [[capability]]
 name = "xgameruntime.related-packages"
 summary = "Enumerate and mount installed related content; acquire independent authenticated package licences and page entitled add-ons."
-provided-by = ["patches/xgameruntime/0035-enumerate-installed-related-content.patch", "patches/xodus-cli/0028-license-installed-related-content.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/07a374557f0b6b7a2c7306121fb76639e0fcfda8", "https://github.com/icex/xodus/commit/1597292aa22679c13e00e798e9fee0f69a3cc516"]
 symptom-if-missing = "Installed campaign add-ons do not appear in XPackageEnumeratePackages(Content, ThisAndRelated)."
 verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "reporting installed related package" }]
 
 [[capability]]
 name = "xgameruntime.termination-completion-port"
 summary = "Asynchronous queue termination is delivered through the Completion port after accepted work drains."
-provided-by = ["patches/xgameruntime/0036-complete-termination-on-the-completion-port.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/25a085e4444b3a0ce179e1e67106fef4eeaf1c19"]
 symptom-if-missing = "An asynchronous termination callback bypasses a Manual Completion port and runs on the last worker."
 note = "Use strict manual dispatch for titles that own their Completion port."
 verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "queuing terminated callback on Completion port" }]
@@ -679,6 +679,6 @@ verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = 
 [[capability]]
 name = "xgameruntime.provider-data-lifetime"
 summary = "Provider data remains valid for deferred callbacks until operation Cleanup."
-provided-by = ["patches/xgameruntime/0037-retain-provider-data-until-cleanup.patch"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/18a1752f4a3fac4913d57186071fb6a5c0b316ca"]
 symptom-if-missing = "MCC's deferred queue-cleanup callback reads expired stack provider data and crashes on desktop exit."
 verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "retained provider data" }]

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Compile every file the patches touch the way a clone of Wine compiles it.
+# Compile every file the forks change the way a clone of Wine compiles it.
 #
 #   scripts/check-werror.sh [object ...]
 #
@@ -13,11 +13,11 @@
 #     a failed build -- 48 minutes in, after the bundled ffmpeg, kaldi and vosk
 #     have all been built and thrown away.
 #
-# That is what happened to `patches/wine/0006`: a declaration below a statement,
+# That happened to a mapped-image filename change: a declaration below a statement,
 # which is a warning here and `error: ISO C90 forbids mixed declarations and
 # code` there. One line, an hour to find out.
 #
-# So compile the patched translation units, in the same container, with the
+# So compile the modified translation units, in the same container, with the
 # flags the Makefile already uses plus -Werror. About a minute against a warm
 # build tree, and it answers the same question.
 #
@@ -55,39 +55,27 @@ for d in "$OBJ_DIR" "$OBJ32_DIR"; do
         "  scripts/install-xodus-proton.sh"
 done
 
-# The objects for every .c the wine and xgameruntime series touch. Derived from
-# the patches rather than listed, so a patch that starts touching a new file is
-# checked without anyone remembering to add it here.
+# Derive modified C files from the source lock, so new fork changes are checked
+# without maintaining a second object list.
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 # objects PE_DIR MAKEFILE: PE_DIR is x86_64-windows or i386-windows, and
 # MAKEFILE is the tree's own, for the sources only it can place.
 objects() {
-    local pe=$1 makefile=$2 p f
-    for p in "$REPO"/patches/wine/*.patch; do
-        # `+++ b/dlls/foo/bar.c` -> the object the Makefile builds from it.
-        while read -r f; do
-            case $f in
-                # Unix-side sources build to an object beside themselves; PE
-                # sources build under <arch>-windows/. media-converter is
-                # neither -- it is compiled into two different unix libraries,
-                # so ask the Makefile which objects it has rather than guess.
-                dlls/ntdll/unix/*.c) printf '%s\n' "${f%.c}.o" ;;
-                dlls/winegstreamer/media-converter/*.c)
-                    grep -oE "^dlls/[a-z0-9_]+/media-converter/$(basename "$f" .c)\.o" \
-                        "$makefile" | sort -u ;;
-                dlls/*/*.c)
-                    printf '%s/%s/%s.o\n' "$(dirname "$f")" "$pe" "$(basename "$f" .c)" ;;
-            esac
-        done < <(sed -n 's|^+++ b/\(.*\.c\)$|\1|p' "$p")
-    done
-    for p in "$REPO"/patches/xgameruntime/*.patch; do
-        while read -r f; do
-            case $f in
-                unixlib.c) printf 'dlls/xgameruntime/unixlib.o\n' ;;
-                *.c) printf 'dlls/xgameruntime/%s/%s.o\n' "$pe" "${f%.c}" ;;
-            esac
-        done < <(sed -n 's|^+++ b/\(.*\.c\)$|\1|p' "$p")
-    done
+    local pe=$1 makefile=$2 f
+    while read -r f; do
+        case $f in
+            dlls/ntdll/unix/*.c) printf '%s\n' "${f%.c}.o" ;;
+            dlls/winegstreamer/media-converter/*.c)
+                grep -oE "^dlls/[a-z0-9_]+/media-converter/$(basename "$f" .c)\\.o" "$makefile" | sort -u ;;
+            dlls/*/*.c) printf '%s/%s/%s.o\n' "$(dirname "$f")" "$pe" "$(basename "$f" .c)" ;;
+        esac
+    done < <(python3 "$REPO/scripts/source-pins.py" modified wine)
+    while read -r f; do
+        case $f in
+            unixlib.c) printf 'dlls/xgameruntime/unixlib.o\n' ;;
+            *.c) printf 'dlls/xgameruntime/%s/%s.o\n' "$pe" "${f%.c}" ;;
+        esac
+    done < <(python3 "$REPO/scripts/source-pins.py" modified xgameruntime)
 }
 
 # Arguments name 64-bit objects, the way they always have; the same objects
@@ -173,7 +161,7 @@ if [ ${#OBJECTS32[@]} -gt 0 ]; then
     compile "$OBJ32_DIR" "${FLAGS32[@]}" "${OBJECTS32[@]}" || status=1
 fi
 if [ "$status" -eq 0 ]; then
-    printf '   %sok%s   every patched file compiles as a clone of Wine compiles it, on both architectures\n' "$C_G" "$C_0" >&2
+    printf '   %sok%s   every modified file compiles as a clone of Wine compiles it, on both architectures\n' "$C_G" "$C_0" >&2
     exit 0
 fi
 

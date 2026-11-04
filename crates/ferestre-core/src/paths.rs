@@ -28,7 +28,7 @@ const COMPAT_TOOL: &str = "compatibilitytools.d/xodus";
 const APP: &str = "ferestre";
 /// What marks a directory as the installed tree: the AppImage, the AUR package
 /// and a checkout all carry `scripts/`, and `install-xodus-proton.sh` reads
-/// `patches/` out of the same place. Probing for it stops us pointing at some
+/// `sources.lock.json` out of the same place. Probing for it stops us pointing at some
 /// unrelated ancestor of wherever the binary happens to sit.
 ///
 /// The shim rather than the directory, because plenty of people have a
@@ -341,7 +341,7 @@ impl Paths {
         &self.build
     }
 
-    /// The installed tree: `scripts/`, `patches/` and (usually) `titles/`.
+    /// The installed tree: `scripts/`, `sources.lock.json` and (usually) `titles/`.
     pub fn tree_dir(&self) -> Option<&Path> {
         self.repo.as_deref()
     }
@@ -637,7 +637,7 @@ fn xdg(env: &Env, var: &str, fallback: &str) -> PathBuf {
     }
 }
 
-/// Find the installed tree -- scripts, patches and recipes -- however this
+/// Find the installed tree -- scripts, source pins and recipes -- however this
 /// build was installed.
 ///
 /// xodus-env.sh derives it from `$0`, which a compiled binary has no equivalent

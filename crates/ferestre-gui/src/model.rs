@@ -1260,29 +1260,18 @@ pub fn paginate<'a>(rows: &[&'a LibraryRow], page: usize, per_page: usize) -> Pa
     }
 }
 
-/// How to describe the runtime at the top of the window.
+/// A concise runtime status for Settings; compatibility stays in the launch gates.
 pub fn runtime_summary(runtime: Option<&InstalledRuntime>) -> (String, String) {
     match runtime {
         Some(rt) => (
-            rt.label(),
-            format!(
-                "{} {} · {}",
-                rt.provides.len(),
-                if rt.provides.len() == 1 {
-                    "capability"
-                } else {
-                    "capabilities"
-                },
-                if rt.source.is_published() {
-                    "declared by the build"
-                } else {
-                    "probed, so the list may be incomplete"
-                }
-            ),
+            rt.version
+                .clone()
+                .unwrap_or_else(|| "Custom Proton runtime".into()),
+            "Ready to run compatible games".into(),
         ),
         None => (
-            "No patched runtime installed".into(),
-            "Nothing can launch until it is built and installed".into(),
+            "Runtime not installed".into(),
+            "Install a runtime to play your games".into(),
         ),
     }
 }
@@ -2054,18 +2043,19 @@ mod tests {
     }
 
     #[test]
-    fn a_probed_runtime_says_its_list_may_be_incomplete() {
-        let probed = runtime_with(&["a"], CapabilitySource::Probed);
-        let (_, subtitle) = runtime_summary(Some(&probed));
-        assert!(subtitle.contains("incomplete"), "{subtitle}");
-        assert!(subtitle.contains("1 capability"), "{subtitle}");
-
-        let declared = runtime_with(&["a", "b"], CapabilitySource::Manifest);
-        let (_, subtitle) = runtime_summary(Some(&declared));
-        assert!(subtitle.contains("2 capabilities"), "{subtitle}");
-
-        let (title, _) = runtime_summary(None);
-        assert!(title.contains("No patched runtime"), "{title}");
+    fn settings_runtime_status_omits_internal_paths_and_capability_details() {
+        for source in [CapabilitySource::Probed, CapabilitySource::Manifest] {
+            let mut runtime = runtime_with(&["internal-capability"], source);
+            runtime.version = Some("11.0.2".into());
+            let (title, subtitle) = runtime_summary(Some(&runtime));
+            assert_eq!(title, "11.0.2");
+            assert_eq!(subtitle, "Ready to run compatible games");
+            runtime.version = None;
+            assert_eq!(runtime_summary(Some(&runtime)).0, "Custom Proton runtime");
+        }
+        let (title, subtitle) = runtime_summary(None);
+        assert_eq!(title, "Runtime not installed");
+        assert!(subtitle.contains("Install a runtime"));
     }
 
     // --- the library view -------------------------------------------------

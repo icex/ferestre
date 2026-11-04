@@ -63,7 +63,7 @@ happened.
 Ultralight releases its last reference to a command allocator while a command
 list recorded from it is still open, then closes the list. The allocator owns
 the list's Vulkan command buffer. The vkd3d-proton patch
-(`patches/vkd3d-proton/`) handles that in two ways:
+([pinned vkd3d-proton fork](SOURCES.md)) handles that in two ways:
 
 - **With the setting**, the list keeps one internal reference to that
   allocator until its next successful `Reset` onto another allocator, or until

@@ -4,7 +4,7 @@
  * Retro Classics' Ultralight renderer releases its last reference to a command
  * allocator while a command list recorded from it is still open, then closes
  * the list. Stock vkd3d-proton freed the recording VkCommandBuffer with the
- * allocator and faulted in vkEndCommandBuffer. patches/vkd3d-proton/0001 makes
+ * allocator and faulted in vkEndCommandBuffer. https://github.com/icex/vkd3d-proton/commit/e6874335c04585e5fb693bb5a074977031c70406 makes
  * that safe in two ways, and this drives each one:
  *
  *   retain      with VKD3D_CONFIG=retain_recording_allocators the list keeps

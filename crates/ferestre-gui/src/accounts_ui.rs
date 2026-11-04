@@ -41,6 +41,7 @@ pub(super) fn open(ui: &Ui) {
 fn show(ui: &Ui, profiles: accounts::Profiles) {
     ui.model.borrow_mut().profiles = Some(profiles.clone());
     let window = adw::Window::builder()
+        .application(ui.window.application().as_ref().unwrap())
         .title("Accounts")
         .transient_for(&ui.window)
         .modal(true)
@@ -96,6 +97,7 @@ fn show(ui: &Ui, profiles: accounts::Profiles) {
         let dropdown = gtk::DropDown::from_strings(&refs);
         dropdown.set_valign(gtk::Align::Center);
         dropdown.set_selected(selected);
+        dropdown.set_tooltip_text(Some(title));
         dropdown.update_property(&[gtk::accessible::Property::Label(title)]);
         let row = adw::ActionRow::builder()
             .title(title)
