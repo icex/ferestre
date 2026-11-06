@@ -352,6 +352,7 @@ jobs:
           cargo test --locked -p xodus profile
           cargo test --locked -p xodus api::xbox::auth
           cargo test --locked -p xodus device_response_
+          cargo test --locked -p xodus licensing::store_ticket
           cargo test --locked -p msixvc
           cargo test --locked -p xodus-cli
           cargo test --locked -p xodus --features key-chain-file --test key_chain_file
