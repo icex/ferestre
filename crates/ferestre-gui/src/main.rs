@@ -3063,8 +3063,10 @@ fn library_components(ui: &Ui, row: &LibraryRow) -> (adw::ActionRow, gtk::Box) {
                     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
                     if resumes {
                         resume_download(&ui, &product_id, &title_name);
+                    } else if updating {
+                        update_download(&ui, &product_id, &title_name);
                     } else if waits {
-                        confirm_install(&ui, &product_id, &title_name, updating);
+                        confirm_install(&ui, &product_id, &title_name);
                     } else if plays {
                         spawn_title(&ui, &product_id, &title_name);
                     } else {
@@ -4361,8 +4363,32 @@ fn resume_download(ui: &Ui, product_id: &str, name: &str) {
     }
 }
 
+/// Updates use the installed folder; choosing a library is only for new installs.
+fn update_download(ui: &Ui, product_id: &str, name: &str) {
+    if *ui.closing.borrow() {
+        return;
+    }
+    if ui
+        .running
+        .borrow()
+        .contains_key(&product_id.to_ascii_uppercase())
+    {
+        ui.toasts
+            .add_toast(toast(format!("Stop {name} before updating it")));
+        return;
+    }
+    if queue_ui::resume(ui, product_id) {
+        return;
+    }
+    let destination = ui.model.borrow().update_destination(product_id);
+    match destination {
+        Ok(dir) => queue_ui::enqueue(ui, product_id, name, Some(&dir), "Updating"),
+        Err(why) => ui.toasts.add_toast(toast(why)),
+    }
+}
+
 /// Ask before a new download, and say where it is going.
-fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
+fn confirm_install(ui: &Ui, product_id: &str, name: &str) {
     if *ui.closing.borrow()
         || (ui.busy.borrow().is_some() && ui.download.current.borrow().is_none())
     {
@@ -4392,11 +4418,7 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
         return;
     };
 
-    let heading = if updating {
-        format!("Update {name}?")
-    } else {
-        format!("Install {name}?")
-    };
+    let heading = format!("Install {name}?");
     let body = match &size {
         Some(size) => format!("{size} to download."),
         None => "The catalog does not give a size.".to_string(),
@@ -4404,7 +4426,7 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
 
     let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
     dialog.add_response("cancel", "Cancel");
-    dialog.add_response("install", if updating { "Update" } else { "Install" });
+    dialog.add_response("install", "Install");
     dialog.set_response_appearance("install", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("install"));
     dialog.set_close_response("cancel");
@@ -4482,7 +4504,7 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str, updating: bool) {
         if response != "install" {
             return;
         }
-        let what = if updating { "Updating" } else { "Installing" };
+        let what = "Installing";
         match resolve(&where_to.text()) {
             Ok(dir) => {
                 // `ferestre install` takes the folder as the library, as the
@@ -5739,9 +5761,13 @@ fn refresh_library(ui: &Ui) {
                 ),
                 deadline::CLIENT_LISTING,
             )
-            .map_err(|e| format!("{}: {e}", client.display()))?;
+            .map_err(|e| format!("Could not reload your library: {e}"))?;
             if !output.status.success() {
-                return Err(format!("{} exited {}", client.display(), output.status));
+                return Err(model::library_failure(
+                    &String::from_utf8_lossy(&output.stdout),
+                    &String::from_utf8_lossy(&output.stderr),
+                    output.status.code(),
+                ));
             }
             let entries = ferestre_core::library::parse(&String::from_utf8_lossy(&output.stdout))
                 .map_err(|e| e.to_string())?;

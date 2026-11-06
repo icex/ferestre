@@ -535,6 +535,38 @@ impl Model {
         Some((library, folder, default))
     }
 
+    /// A known installation for Update, without falling back from an unavailable
+    /// recorded drive to the recipe's default folder and starting a new install.
+    pub fn update_destination(&self, product_id: &str) -> Result<PathBuf, String> {
+        let unavailable = || {
+            "The installed game folder is unavailable or no longer matches this game. Check its location before updating.".to_string()
+        };
+        let paths = self.paths.as_ref().ok_or_else(unavailable)?;
+        let explicit = self
+            .recipe_for(product_id)
+            .and_then(|recipe| recipe.install.dir_env.as_deref())
+            .is_some_and(|name| paths.var(name).is_some());
+        let dir = if explicit {
+            self.install_destination(product_id)
+        } else {
+            self.records
+                .get(&product_id.to_ascii_uppercase())
+                .map(|record| record.dir.clone())
+                .or_else(|| self.install_destination(product_id))
+        }
+        .ok_or_else(unavailable)?;
+        if !dir.is_absolute()
+            || dir
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            || !dir.is_dir()
+            || self.inspect_folder(product_id, &dir) != crate::model::Folder::This
+        {
+            return Err(unavailable());
+        }
+        Ok(dir)
+    }
+
     /// What to pass `ferestre install` for a destination the "Install to"
     /// dialog resolved: the folder itself when it already is the title's --
     /// its install, its stopped download, or the default folder `ferestre
@@ -1243,6 +1275,97 @@ mod tests {
                 games.join("players/bbbb/test-proton"),
             ]
         );
+    }
+
+    #[test]
+    fn update_uses_the_recorded_custom_installation() {
+        let scratch = Scratch::new("update-custom");
+        let mut model = model_at(&scratch.0);
+        let id = "9NBLGGH2JHXJ";
+        model.recipes = vec![recipe(id, Some("default/game"))];
+        let custom = scratch.0.join("other library/renamed/game");
+        installed(&custom, id);
+        model.records.insert(id.into(), record(id, &custom));
+        assert_eq!(
+            model.update_destination(&id.to_ascii_lowercase()),
+            Ok(custom)
+        );
+    }
+
+    #[test]
+    fn update_never_falls_back_from_a_missing_recorded_drive() {
+        let scratch = Scratch::new("update-missing");
+        let mut model = model_at(&scratch.0);
+        let id = "9NBLGGH2JHXJ";
+        model.recipes = vec![recipe(id, Some("default/game"))];
+        installed(&scratch.0.join("games/default/game"), id);
+        model
+            .records
+            .insert(id.into(), record(id, &scratch.0.join("disconnected/game")));
+        assert!(model.update_destination(id).is_err());
+    }
+
+    #[test]
+    fn update_refuses_a_recorded_library_containing_other_games() {
+        let scratch = Scratch::new("update-library");
+        let mut model = model_at(&scratch.0);
+        let id = "9NBLGGH2JHXJ";
+        let library = scratch.0.join("library");
+        installed(&library, id);
+        installed(&library.join("Other Game"), "9ZZB");
+        model.records.insert(id.into(), record(id, &library));
+        assert!(model.update_destination(id).is_err());
+    }
+
+    #[test]
+    fn update_accepts_a_discovered_package_but_not_an_empty_new_destination() {
+        let scratch = Scratch::new("update-discovered");
+        let model = model_at(&scratch.0);
+        let id = "9NBLGGH2JHXJ";
+        assert!(model.update_destination(id).is_err());
+        let dir = scratch.0.join("games").join(id.to_ascii_lowercase());
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(model.update_destination(id).is_err());
+        installed(&dir, id);
+        assert_eq!(model.update_destination(id), Ok(dir));
+    }
+
+    #[test]
+    fn update_refuses_relative_and_parent_traversal_records() {
+        let scratch = Scratch::new("update-ambiguous-path");
+        let mut model = model_at(&scratch.0);
+        let id = "9NBLGGH2JHXJ";
+        model.records.insert(id.into(), record(id, Path::new(".")));
+        assert!(model.update_destination(id).is_err());
+        std::fs::create_dir_all(scratch.0.join("folder")).unwrap();
+        installed(&scratch.0.join("game"), id);
+        model
+            .records
+            .insert(id.into(), record(id, &scratch.0.join("folder/../game")));
+        assert!(model.update_destination(id).is_err());
+    }
+
+    #[test]
+    fn update_honours_an_explicit_recipe_directory_override() {
+        let scratch = Scratch::new("update-override");
+        let mut model = model_at(&scratch.0);
+        let id = "9NBLGGH2JHXJ";
+        let target = scratch.0.join("explicit/game");
+        installed(&target, id);
+        let mut title = recipe(id, Some("default"));
+        title.install.dir_env = Some("TEST_DIR".into());
+        model.recipes = vec![title];
+        model.paths = Some(
+            Paths::resolve(&Env::from_map([
+                ("HOME", scratch.0.join("home").display().to_string()),
+                ("TEST_DIR", target.display().to_string()),
+            ]))
+            .unwrap(),
+        );
+        model
+            .records
+            .insert(id.into(), record(id, &scratch.0.join("disconnected/old")));
+        assert_eq!(model.update_destination(id), Ok(target));
     }
 
     #[test]

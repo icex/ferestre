@@ -718,6 +718,45 @@ pub fn is_licence_refusal(reason: &str) -> bool {
     reason.starts_with("not entitled to this content")
 }
 
+/// Explain library failures without displaying bundle paths or raw service bodies.
+pub fn library_failure(stdout: &str, stderr: &str, exit_code: Option<i32>) -> String {
+    let response = serde_json::from_str::<serde_json::Value>(stdout).ok();
+    let code = response.as_ref().and_then(|value| {
+        value
+            .pointer("/innererror/code")
+            .or_else(|| value.get("code"))
+            .and_then(|v| v.as_str())
+    });
+    if code == Some("InvalidMsaTicketFormat") {
+        return "Microsoft rejected the Store sign-in ticket. Check your Store account sign-in and try again.".into();
+    }
+    let http = stderr.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("HTTP ")?
+            .split_whitespace()
+            .next()?
+            .parse::<u16>()
+            .ok()
+    });
+    if code == Some("Unauthorized")
+        || matches!(http, Some(401 | 403))
+        || client_reports_signed_out(stderr)
+    {
+        return "Microsoft refused the library request. Sign in to your Store account and try again.".into();
+    }
+    if let Some(status) = http {
+        return format!(
+            "The Store service could not reload your library (HTTP {status}). Try again."
+        );
+    }
+    match exit_code {
+        Some(code) => {
+            format!("Could not reload your library (client exit code {code}). Try again.")
+        }
+        None => "The library client exited unexpectedly. Try Reload library again.".into(),
+    }
+}
+
 /// Why `ferestre run` failed, from the tail of what it wrote to stderr. The
 /// launcher's own refusals are `!! message`. A title stopped before it starts
 /// -- at the licence step, for instance -- prints its reason last, before the
@@ -2010,6 +2049,30 @@ mod tests {
             "not entitled to this content: Users do not possess any satisfying entitlements"
         ));
         assert!(!is_licence_refusal("Player account is signed out"));
+    }
+
+    #[test]
+    fn library_errors_explain_authentication_without_echoing_credentials_or_bundle_paths() {
+        let response = r#"{"code":"Unauthorized","message":"do not display raw-secret","innererror":{"code":"InvalidMsaTicketFormat"}}"#;
+        let message = library_failure(
+            response,
+            "/tmp/.mount_fixture/client/xodus-cli
+HTTP 401 Unauthorized",
+            Some(1),
+        );
+        assert!(message.contains("Store sign-in ticket"));
+        assert!(!message.contains("raw-secret") && !message.contains("/tmp/"));
+        let message = library_failure("", "HTTP 401 Unauthorized (MS-CV synthetic)", Some(1));
+        assert!(message.contains("Sign in to your Store account"));
+    }
+
+    #[test]
+    fn library_errors_distinguish_service_failure_and_abnormal_exit() {
+        assert!(library_failure("", "HTTP 503 Service Unavailable", Some(1)).contains("HTTP 503"));
+        assert!(library_failure("", "", Some(7)).contains("exit code 7"));
+        let message = library_failure("", "", None);
+        assert!(message.contains("exited unexpectedly"));
+        assert!(!message.contains("-1"));
     }
 
     #[test]

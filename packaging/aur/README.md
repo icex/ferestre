@@ -200,7 +200,7 @@ detected and not included". Those are the documented gaps, not oversights.
 ## The client fork, pinned
 
 `ferestre-client` builds `icex/xodus` commit
-`b8364e5a36932e4f79a8ccab7dd02e46b5c5a956`, matching the Xodus pin in
+`a4f9d5ccd8747656b2197cbf87f7d467c7f61ec7`, matching the Xodus pin in
 [`sources.lock.json`](../../sources.lock.json). There is one Git source and no
 patch-application stage. The package installs its corresponding-source URL
 alongside the client and service.

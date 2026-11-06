@@ -45,6 +45,8 @@ on:
       - 'tests/gui_accounts_controller.py'
       - 'tests/gui_runtime_selection.py'
       - 'tests/gui_update_resume.py'
+      - 'tests/gui_update_existing.py'
+      - 'tests/gui_library_error.py'
       - 'tests/gui_controller_focus.py'
       - 'tests/controller_driver.py'
       - 'tests/test_gui_actions.py'
@@ -102,6 +104,8 @@ on:
       - 'tests/gui_accounts_controller.py'
       - 'tests/gui_runtime_selection.py'
       - 'tests/gui_update_resume.py'
+      - 'tests/gui_update_existing.py'
+      - 'tests/gui_library_error.py'
       - 'tests/gui_controller_focus.py'
       - 'tests/controller_driver.py'
       - 'tests/test_gui_actions.py'
@@ -464,6 +468,16 @@ jobs:
         run: |
           xvfb-run -a --error-file=/dev/stderr --server-num=124 --server-args='-screen 0 1280x720x24 -noreset' \
             dbus-run-session -- python3 tests/gui_update_resume.py
+
+      - name: Update installed games in place without an install prompt (offline)
+        run: |
+          xvfb-run -a --error-file=/dev/stderr --server-num=127 --server-args='-screen 0 1280x720x24 -noreset' \
+            dbus-run-session -- python3 tests/gui_update_existing.py
+
+      - name: Library authentication errors and recovery (offline)
+        run: |
+          xvfb-run -a --error-file=/dev/stderr --server-num=128 --server-args='-screen 0 1280x720x24 -noreset' \
+            dbus-run-session -- python3 tests/gui_library_error.py
 
       - name: Controller tab focus and single selection outline (offline)
         run: |
