@@ -14,7 +14,7 @@
 # to /usr/lib/ferestre and not /usr/share.
 
 pkgname=ferestre-git
-pkgver=0.1.18.r385.g1c451d8
+pkgver=0.1.19.r389.g16ba543
 pkgrel=1
 pkgdesc='Download and run the Microsoft Store and Xbox GDK titles you own, on Linux'
 arch=('x86_64')

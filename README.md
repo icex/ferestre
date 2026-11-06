@@ -65,7 +65,9 @@ The app checks for newer Ferestre and runtime releases and shows an **Update** b
 
 ## Status
 
-Ferestre **0.1.18** uses signed runtime **11.0.20261023.1**. It includes signed application/runtime updates, resumable game downloads, an install queue, game update badges and a fullscreen interface for handheld PCs. See the [0.1.18 release notes](docs/RELEASE-0.1.18.md) for changes and tested scope.
+Ferestre **0.1.19** uses signed runtime **11.0.20261023.1**. It includes signed application/runtime updates, resumable game downloads, an install queue, game update badges and a fullscreen interface for handheld PCs. See the [0.1.19 release notes](docs/RELEASE-0.1.19.md) for changes and tested scope.
+
+Game updates use the existing installation directly. Reload library handles Store ticket formats correctly and reports authentication errors clearly.
 
 Running games offer **Resume** to return to their window and **Stop** with a confirmation dialog. Controller text entry and folder selection stay inside Ferestre. **Settings → Choose default runtime** selects the default; **game options → Choose runtime** overrides it for one game. **Use default runtime** removes that override, and choices apply to the next launch. Paused updates resume their saved destination and package metadata directly. Transfer progress distinguishes preparation, processed data, actual game-data downloads and reused bytes. Source builds use pinned `icex` forks rather than applying patch files.
 

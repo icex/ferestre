@@ -74,6 +74,12 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.1.19" date="2026-11-06">
+      <description>
+        <p>Update installed games in their existing folder without an install-location prompt.</p>
+        <p>Fix Store library reload for delegationcompact tickets and explain service failures without internal temporary paths.</p>
+      </description>
+    </release>
     <release version="0.1.18" date="2026-11-04">
       <description>
         <p>Resume running games, confirm Stop with a controller, select global and per-game runtimes, and resume updates directly.</p>
