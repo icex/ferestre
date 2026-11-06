@@ -18,6 +18,8 @@
 # or a branch can be moved to code nobody reviewed. Every cargo call is
 # --locked: CI tests the dependency versions in Cargo.lock, which are the ones
 # a release ships.
+# Keep the tested system libraries and the release glibc baseline stable when
+# ubuntu-latest moves to a newer distribution.
 name: Rust
 
 on:
@@ -154,7 +156,7 @@ env:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -179,6 +181,7 @@ jobs:
       # copy counts against the repository's 10 GB.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          key: ubuntu-24.04
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format
@@ -259,7 +262,7 @@ jobs:
   # together with `rust-version` in Cargo.toml, in the commit that moves the
   # lock; tests/test_workflows.py checks the two agree.
   msrv:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -279,6 +282,7 @@ jobs:
       # copy counts against the repository's 10 GB.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          key: ubuntu-24.04
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # As in `test`: the namespace tests must run, not skip.
@@ -301,7 +305,7 @@ jobs:
   # Verify all five immutable fork commits and their nested gitlinks without
   # checking out the complete Wine tree, then run the client’s offline tests.
   sources:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -328,6 +332,7 @@ jobs:
       # The client is a workspace of its own, with its own target directory.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          key: ubuntu-24.04
           workspaces: third_party/xodus-cli -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -358,7 +363,7 @@ jobs:
           cargo test --locked -p xodus --features key-chain-file --test key_chain_file
 
   gui:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       GDK_BACKEND: x11
       GSK_RENDERER: cairo
@@ -383,6 +388,7 @@ jobs:
       # copy counts against the repository's 10 GB.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          key: ubuntu-24.04
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build the window

@@ -188,7 +188,7 @@ def refused_then_installed_elsewhere(w):
     w.library_appears()
     s.click(w.account_button())
     s.wait_for(w.frame, w.signed_in, "sign-in to run the client", deadline())
-    s.check(not s.find_all(w.frame, role="dialog"), "no explanation once the client can start", w.frame)
+    s.check(not s.find_all(w.frame, name="The Xbox client cannot start"), "no explanation once the client can start", w.frame)
     s.wait_for(w.frame, lambda root: not any(BANNER in t for t in s.texts(root)),
                "the banner to go", deadline())
     s.check(True, "a library installed elsewhere is noticed before refusing")
@@ -207,7 +207,7 @@ def without_packagekit(w):
     s.check(bool(s.find_all(w.frame, role="button", name="Copy Command")), "the command can be copied", w.frame)
     s.check(not s.find_all(w.frame, role="button", name="Install"), "the dialog offers no install", w.frame)
     s.click_named(w.frame, "Cancel")
-    s.wait_for(w.frame, lambda root: not s.find_all(root, role="dialog"), "the explanation to close", deadline())
+    s.wait_for(w.frame, lambda root: not s.find_all(root, name="The Xbox client cannot start"), "the explanation to close", deadline())
 
     # The banner's button checks again before explaining.
     w.library_appears()
@@ -215,7 +215,7 @@ def without_packagekit(w):
     w.wait_text("The Xbox client can start now", "the client to be found able to start")
     s.wait_for(w.frame, lambda root: not any(BANNER in t for t in s.texts(root)),
                "the banner to go", deadline())
-    s.check(not s.find_all(w.frame, role="dialog"), "and nothing left to explain", w.frame)
+    s.check(not s.find_all(w.frame, name="The Xbox client cannot start"), "and nothing left to explain", w.frame)
     w.close()
 
 

@@ -47,6 +47,8 @@
 # against the public key built into ferestre-core; packaging/sign-release.sh
 # refuses to sign with a key the launcher being published would not accept.
 # docs/RELEASING.md covers making, storing and rotating the key.
+# Build against Ubuntu 24.04 so a runner image migration cannot silently raise
+# the AppImage/portable binary's glibc and system-library requirements.
 name: Release
 
 on:
@@ -68,7 +70,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -116,6 +118,7 @@ jobs:
       # it would only take space from the caches main saves for every push.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          key: ubuntu-24.04
           save-if: false
 
       # A tag is the version, without its leading v. Otherwise the workspace
@@ -287,7 +290,7 @@ jobs:
   publish:
     needs: build
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The signing secrets are environment secrets of `release`. Restrict that
     # environment to v* and runtime-* tags and give it a required reviewer
     # (docs/RELEASING.md), and nothing else can reach the key.
