@@ -3,7 +3,7 @@
   "components": {
     "xodus": {
       "repository": "https://github.com/icex/xodus.git",
-      "commit": "b8364e5a36932e4f79a8ccab7dd02e46b5c5a956",
+      "commit": "a4f9d5ccd8747656b2197cbf87f7d467c7f61ec7",
       "upstream": "https://github.com/xodus-gaming/xodus.git",
       "upstream_commit": "3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60",
       "modified_paths": [
@@ -92,6 +92,7 @@
         "crates/xodus/src/licensing/acquire.rs",
         "crates/xodus/src/licensing/content.rs",
         "crates/xodus/src/licensing/splicense.rs",
+        "crates/xodus/src/licensing/store_ticket.rs",
         "crates/xodus/src/licensing/utils.rs",
         "crates/xodus/src/models/xbox.rs",
         "crates/xodus/src/models/xgameruntime/xuser.rs",
