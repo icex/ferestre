@@ -95,6 +95,16 @@ class SelectionTests(unittest.TestCase):
     def driver(self, hdr=True):
         path = self.runtime / 'files/lib/wine/x86_64-unix/winewayland.so'
         write(path, 'wp_color_manager_v1' if hdr else 'basic Wayland')
+        write(self.runtime / 'files/lib/wine/x86_64-windows/winewayland.drv', 'driver')
+        write(self.runtime / 'files/share/default_pfx/drive_c/windows/system32/winewayland.drv', 'driver')
+
+    def test_incomplete_wayland_prefix_template_keeps_the_regular_display(self):
+        self.driver()
+        (self.runtime / 'files/share/default_pfx/drive_c/windows/system32/winewayland.drv').unlink()
+        env, nested, native = session.selection(WAYLAND, self.runtime, HDR, True)
+        self.assertFalse(native); self.assertFalse(nested)
+        self.assertEqual(env['WAYLAND_DISPLAY'], WAYLAND['WAYLAND_DISPLAY'])
+        self.assertNotIn('PROTON_USE_XALIA', env)
 
     def test_capable_runtime_gets_wayland_hdr_and_compositor_refresh(self):
         self.driver()

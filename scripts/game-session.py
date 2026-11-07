@@ -142,7 +142,14 @@ def wayland_driver(runtime):
     for lib in ('lib', 'lib64'):
         for name in ('winewayland.so', 'winewayland.drv.so'):
             path = runtime / 'files' / lib / 'wine/x86_64-unix' / name
-            if path.is_file():
+            windows = runtime / 'files' / lib / 'wine'
+            prefix = runtime / 'files/share/default_pfx/drive_c/windows'
+            complete = ((windows / 'x86_64-windows/winewayland.drv').is_file()
+                        and (prefix / 'system32/winewayland.drv').is_file())
+            if (windows / 'i386-windows/kernel32.dll').is_file():
+                complete = (complete and (windows / 'i386-windows/winewayland.drv').is_file()
+                            and (prefix / 'syswow64/winewayland.drv').is_file())
+            if path.is_file() and complete:
                 return path
     return None
 
