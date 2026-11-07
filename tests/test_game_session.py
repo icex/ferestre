@@ -274,6 +274,7 @@ class SessionProcessTests(unittest.TestCase):
             root = Path(directory)
             fake = root / 'gamescope'
             write(fake, f'#!{sys.executable}\nimport os,sys\n'
+                  "assert '--force-windows-fullscreen' in sys.argv\n"
                   "assert 'WINE_DLL_FILE_MAP' not in os.environ\nassert 'FERESTRE_STOP_FD' not in os.environ\n"
                   "os.closerange(3,1024)\nos.environ['DISPLAY']=':fixture'\n"
                   "os.environ['GAMESCOPE_WAYLAND_DISPLAY']='nested'\n"

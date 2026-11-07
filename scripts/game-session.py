@@ -283,6 +283,7 @@ class GamescopeHold:
                 listener.listen(1)
                 listener.settimeout(8)
                 args = ['gamescope', '--backend', 'wayland', '-f', '--hdr-enabled',
+                        '--force-windows-fullscreen',
                         '-W', str(screen['width']), '-H', str(screen['height']),
                         '-w', str(screen['width']), '-h', str(screen['height']),
                         '-r', str(round(screen['refresh'])), '--',

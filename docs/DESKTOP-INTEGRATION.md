@@ -13,6 +13,8 @@ HDR-capable displays running in SDR are treated as SDR.
   to the active desktop: `PROTON_ENABLE_WAYLAND=1`, `PROTON_ENABLE_HDR=1` and
   `DXVK_HDR=1`. A runtime without native HDR can use an installed Gamescope
   compositor with HDR enabled. An existing Gamescope session is not nested again.
+  In that fullscreen HDR session, game windows fill the virtual display so a
+  small startup window cannot remain on the desktop-sized canvas.
 - Explicit environment settings and Proton's `user_settings.py` take precedence.
   `PROTON_ENABLE_HDR=0` or `DXVK_HDR=0` disables automatic HDR. A recipe can set
   `FERESTRE_GAMESCOPE=0` to decline the compositor fallback, or
