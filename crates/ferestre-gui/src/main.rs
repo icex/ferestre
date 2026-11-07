@@ -29,6 +29,7 @@ mod state;
 mod stop;
 mod text_input;
 mod window_activation;
+mod window_controls;
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -469,8 +470,8 @@ fn build_ui(app: &adw::Application) {
     let sidebar_view = adw::ToolbarView::new();
     sidebar_view.add_css_class("ferestre-sidebar");
     let sidebar_header = adw::HeaderBar::new();
-    sidebar_header.set_show_start_title_buttons(false);
-    sidebar_header.set_show_end_title_buttons(false);
+    sidebar_header.set_show_title(false);
+    sidebar_view.add_top_bar(&sidebar_header);
     sidebar_view.set_content(Some(&sidebar_box));
 
     // --- content ----------------------------------------------------------
@@ -493,7 +494,6 @@ fn build_ui(app: &adw::Application) {
 
     let content_header = adw::HeaderBar::new();
     content_header.set_title_widget(Some(&search));
-    content_header.set_decoration_layout(Some(":minimize,maximize,close"));
     let back = gtk::Button::from_icon_name("go-previous-symbolic");
     back.set_tooltip_text(Some("Back to Home"));
     content_header.pack_start(&back);
@@ -609,6 +609,7 @@ fn build_ui(app: &adw::Application) {
     scroll.set_kinetic_scrolling(true);
     window.set_size_request(360, 480);
     window.set_content(Some(&split));
+    window_controls::install(&window, &split, &sidebar_header, &content_header);
 
     let queue = model
         .borrow()
@@ -3333,14 +3334,15 @@ fn confirm_sign_out(ui: &Ui) {
     let dialog = adw::AlertDialog::new(
         Some("Sign out?"),
         Some(
-            "This machine's tokens are removed. Titles already downloaded stay on disk, \
-             but none of them will start until you sign in again -- launching needs a \
-             licence, and a licence needs a signed-in account.",
+            "This signs the Store account out of this computer. Downloaded games and \
+             local saves stay on disk. Sign in again or choose another signed-in \
+             Store account before launching games.",
         ),
     );
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("out", "Sign out");
     dialog.set_response_appearance("out", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
 
     let window = ui.window.clone();

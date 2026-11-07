@@ -13,6 +13,10 @@
 
 . "$(dirname "$0")/xodus-env.sh"
 
+if [ "${FERESTRE_DESKTOP_INTEGRATION:-0}" = "1" ] && [ "${FERESTRE_DESKTOP_SESSION_READY:-0}" != "1" ]; then
+    exec python3 "$(dirname "$0")/game-session.py" -- "$0" "$@"
+fi
+
 PROTON_DIR="${PROTON_DIR:-$XODUS_PROTON_DIR}"
 [ -x "$PROTON_DIR/proton" ] || { echo "!! no Xodus Proton at '$PROTON_DIR' (set XODUS_PROTON_DIR)" >&2; exit 1; }
 

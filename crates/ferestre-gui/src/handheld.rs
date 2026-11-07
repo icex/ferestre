@@ -59,7 +59,6 @@ pub(super) fn install(
         } else {
             window.remove_css_class("fullscreen-browser");
         }
-        header.set_show_end_title_buttons(!fullscreen);
         header.set_show_back_button(!fullscreen);
         back.set_visible(!fullscreen);
         navigation.set_visible(fullscreen);

@@ -262,6 +262,9 @@ launches and Steam shortcuts follow the updated installation record.
 
 ## Documentation
 
+- [Desktop integration](docs/DESKTOP-INTEGRATION.md): automatic window-button
+  layout, HDR/display detection, refresh-rate correction and performance helpers.
+
 - [Pinned source forks](docs/SOURCES.md) — component repositories, exact commits and source-build checks.
 
 - [docs/RECIPES.md](docs/RECIPES.md) — build the runtime, sign in, download a
