@@ -147,13 +147,10 @@ def wayland_driver(runtime):
 
 
 def native_hdr(driver):
-    if driver is None:
-        return False
-    try:
-        data = driver.read_bytes()
-        return b'wp_color_manager_v1' in data or b'xx_color_manager_v4' in data
-    except OSError:
-        return False
+    # Wine creates the Wayland Vulkan surface; the host Vulkan WSI implements
+    # color management and advertises its HDR formats to DXVK/vkd3d. Those
+    # protocols need not be embedded in Wine's own driver binary.
+    return driver is not None
 
 
 def enabled(value):
@@ -178,7 +175,7 @@ def selection(env, runtime, screen, gamescope_available):
         native = False
     already_nested = bool(env.get('GAMESCOPE_WAYLAND_DISPLAY'))
     use_gamescope = (hdr and not native_hdr(driver) and gamescope_available and not already_nested
-                     and env.get('FERESTRE_GAMESCOPE', '1') != '0'
+                     and env.get('FERESTRE_GAMESCOPE') == '1'
                      and (driver is None or not any(enabled(policy.get(k, ''))
                                                     for k in ('PROTON_ENABLE_WAYLAND', 'PROTON_USE_WAYLAND'))))
     if already_nested:
@@ -282,8 +279,7 @@ class GamescopeHold:
                 listener.bind(address)
                 listener.listen(1)
                 listener.settimeout(8)
-                args = ['gamescope', '--backend', 'wayland', '-f', '--hdr-enabled',
-                        '--force-windows-fullscreen',
+                args = ['gamescope', '--backend', 'wayland', '--hdr-enabled',
                         '-W', str(screen['width']), '-H', str(screen['height']),
                         '-w', str(screen['width']), '-h', str(screen['height']),
                         '-r', str(round(screen['refresh'])), '--',

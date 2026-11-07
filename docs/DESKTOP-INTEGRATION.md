@@ -9,12 +9,15 @@ Games detect the current KDE or GNOME Wayland display when they start. Detection
 reads the active mode and HDR setting; it never changes the monitor configuration.
 HDR-capable displays running in SDR are treated as SDR.
 
-- A compatible native Wayland runtime gets the Wayland/HDR defaults appropriate
-  to the active desktop: `PROTON_ENABLE_WAYLAND=1`, `PROTON_ENABLE_HDR=1` and
-  `DXVK_HDR=1`. A runtime without native HDR can use an installed Gamescope
-  compositor with HDR enabled. An existing Gamescope session is not nested again.
-  In that fullscreen HDR session, game windows fill the virtual display so a
-  small startup window cannot remain on the desktop-sized canvas.
+- A native Wayland runtime gets the Wayland/HDR defaults appropriate to the
+  active desktop: `PROTON_ENABLE_WAYLAND=1`, `PROTON_ENABLE_HDR=1` and `DXVK_HDR=1`.
+  HDR formats come from the host Vulkan WSI; Wine's driver does not need to
+  embed the compositor's color-management protocol. Current Mesa implements it.
+  Without a Wayland driver, the normal display path and game window preferences
+  are preserved. Installing Gamescope does not silently wrap or fullscreen games.
+- Gamescope remains an experimental, explicit choice with `FERESTRE_GAMESCOPE=1`.
+  Retail Forza testing found unusable scaling/progression in that path. An
+  existing Gamescope session is never nested again.
 - Explicit environment settings and Proton's `user_settings.py` take precedence.
   `PROTON_ENABLE_HDR=0` or `DXVK_HDR=0` disables automatic HDR. A recipe can set
   `FERESTRE_GAMESCOPE=0` to decline the compositor fallback, or

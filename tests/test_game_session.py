@@ -104,16 +104,29 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual(env[key], '1')
         self.assertEqual(env['FERESTRE_DESKTOP_MODE'], '7680x2160@240.000000')
 
-    def test_old_runtime_uses_hdr_compositor_without_forcing_missing_driver(self):
-        env, nested, native = session.selection(WAYLAND, self.runtime, HDR, True)
+    def test_old_runtime_can_opt_into_hdr_compositor(self):
+        env, nested, native = session.selection(dict(WAYLAND, FERESTRE_GAMESCOPE='1'), self.runtime, HDR, True)
         self.assertTrue(nested); self.assertFalse(native)
         self.assertNotIn('PROTON_ENABLE_WAYLAND', env)
         self.assertEqual(env['DXVK_HDR'], '1')
 
     def test_wayland_flag_on_a_runtime_without_the_driver_still_allows_hdr_fallback(self):
-        env, nested, native = session.selection(dict(WAYLAND, PROTON_ENABLE_WAYLAND='1'), self.runtime, HDR, True)
+        env, nested, native = session.selection(dict(WAYLAND, PROTON_ENABLE_WAYLAND='1', FERESTRE_GAMESCOPE='1'), self.runtime, HDR, True)
         self.assertTrue(nested); self.assertFalse(native)
         self.assertEqual(env['PROTON_ENABLE_WAYLAND'], '1')
+        self.assertEqual(env['DXVK_HDR'], '1')
+
+    def test_missing_wayland_driver_never_wraps_a_normal_launch(self):
+        env, nested, native = session.selection(WAYLAND, self.runtime, HDR, True)
+        self.assertFalse(nested); self.assertFalse(native)
+        self.assertNotIn('DXVK_HDR', env)
+        self.assertEqual(env['WAYLAND_DISPLAY'], WAYLAND['WAYLAND_DISPLAY'])
+        self.assertEqual(env['FERESTRE_DESKTOP_MODE'], '7680x2160@240.000000')
+
+    def test_host_vulkan_handles_hdr_without_protocol_markers_in_wine(self):
+        self.driver(hdr=False)
+        env, nested, native = session.selection(WAYLAND, self.runtime, HDR, True)
+        self.assertTrue(native); self.assertFalse(nested)
         self.assertEqual(env['DXVK_HDR'], '1')
 
     def test_missing_runtime_and_compositor_keep_existing_graphics_settings(self):
@@ -193,7 +206,7 @@ class SessionProcessTests(unittest.TestCase):
             fd = os.memfd_create('licensed-hdr-fixture', 0)
             try:
                 os.write(fd, b'licensed-image')
-                env = dict(os.environ, **WAYLAND, FERESTRE_PERFORMANCE='0', WAYLAND_SOCKET='999',
+                env = dict(os.environ, **WAYLAND, FERESTRE_PERFORMANCE='0', FERESTRE_GAMESCOPE='1', WAYLAND_SOCKET='999',
                            PROTON_DIR=str(root / 'runtime'), IMAGE_FD=str(fd),
                            WINE_DLL_FILE_MAP=f'Game.exe={fd}', RECEIPT=str(root / 'receipt'),
                            PATH=str(root / 'bin') + ':' + os.environ['PATH'])
@@ -274,7 +287,7 @@ class SessionProcessTests(unittest.TestCase):
             root = Path(directory)
             fake = root / 'gamescope'
             write(fake, f'#!{sys.executable}\nimport os,sys\n'
-                  "assert '--force-windows-fullscreen' in sys.argv\n"
+                  "assert '--force-windows-fullscreen' not in sys.argv and '-f' not in sys.argv\n"
                   "assert 'WINE_DLL_FILE_MAP' not in os.environ\nassert 'FERESTRE_STOP_FD' not in os.environ\n"
                   "os.closerange(3,1024)\nos.environ['DISPLAY']=':fixture'\n"
                   "os.environ['GAMESCOPE_WAYLAND_DISPLAY']='nested'\n"
