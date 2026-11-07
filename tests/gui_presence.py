@@ -368,6 +368,12 @@ summary="Synthetic presence fixture"
         status_detail(frame, "Online", f"Playing {TITLE}")
         dialog = open_accounts(app, frame)
         s.click_named(dialog, "Sign out Player Fixture")
+        s.wait_for(app, lambda root: s.find_all(root, name="Sign out Player Fixture?"),
+                   "the Player's sign-out confirmation", deadline())
+        s.check(not any(c.get("args") == ["logout"] for c in calls()),
+                "opening confirmation keeps the Player signed in")
+        s.check(runners_up() == 1, "presence continues until sign-out is confirmed")
+        s.click_named(app, "Sign out")
         s.wait_for(frame, lambda root: any(c.get("args") == ["logout"] for c in calls()), "the Player's logout", deadline())
         log = calls()
         logout = next(i for i, c in enumerate(log) if c.get("args") == ["logout"])
