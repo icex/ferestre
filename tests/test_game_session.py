@@ -20,6 +20,26 @@ HDR = dict(width=7680, height=2160, refresh=240.0, hdr=True, source='fixture', s
 WAYLAND = dict(WAYLAND_DISPLAY='wayland-1', XDG_SESSION_TYPE='wayland', XDG_CURRENT_DESKTOP='KDE')
 
 
+class CompositorIsolationTests(unittest.TestCase):
+    def test_bus_activation_uses_a_private_runtime_before_the_session_starts(self):
+        runner_spec = importlib.util.spec_from_file_location('wayland_runner', Path(__file__).with_name('run_wayland_gui.py'))
+        runner = importlib.util.module_from_spec(runner_spec)
+        runner_spec.loader.exec_module(runner)
+        seen = []
+        def launch(command, env):
+            runtime = Path(env['XDG_RUNTIME_DIR'])
+            seen.append(runtime)
+            self.assertNotEqual(str(runtime), '/run/user/1000')
+            self.assertEqual(runtime.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(env['FERESTRE_WAYLAND_SESSION'], '1')
+            self.assertEqual(command[0], 'dbus-run-session')
+            return 17
+        with patch.dict(os.environ, {'XDG_RUNTIME_DIR': '/run/user/1000'}, clear=True), patch.object(runner.subprocess, 'call', launch):
+            self.assertEqual(runner.main(), 17)
+        self.assertEqual(len(seen), 1)
+        self.assertFalse(seen[0].exists())
+
+
 def write(path, text):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)

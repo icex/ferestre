@@ -16,8 +16,13 @@ import time
 
 def main():
     if os.environ.get('FERESTRE_WAYLAND_SESSION')!='1':
-        env=dict(os.environ,FERESTRE_WAYLAND_SESSION='1')
-        return subprocess.call(['dbus-run-session','--',sys.executable,__file__,*sys.argv[1:]],env=env)
+        # D-Bus-activated services inherit the bus daemon's environment, not
+        # the later compositor child's. Isolate XDG_RUNTIME_DIR before starting
+        # that daemon, or its accessibility launcher can replace the desktop's
+        # at-spi/bus_0 socket and leave it unusable when this fixture exits.
+        with tempfile.TemporaryDirectory(prefix='ferestre-wayland-session-') as runtime:
+            env=dict(os.environ,FERESTRE_WAYLAND_SESSION='1',XDG_RUNTIME_DIR=runtime)
+            return subprocess.call(['dbus-run-session','--',sys.executable,__file__,*sys.argv[1:]],env=env)
     with tempfile.TemporaryDirectory(prefix='ferestre-wayland-gui-') as tmp:
         root=Path(tmp)
         for part in ('home','runtime','config','data'):(root/part).mkdir(mode=0o700)
