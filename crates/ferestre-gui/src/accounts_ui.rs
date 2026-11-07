@@ -244,17 +244,17 @@ fn show(ui: &Ui, profiles: accounts::Profiles) {
         // leave every row with the same "Sign out".
         action.reset_relation(gtk::AccessibleRelation::LabelledBy);
         action.update_property(&[gtk::accessible::Property::Label(&name)]);
-        let (id, signed_in) = (profile.id.clone(), profile.signed_in);
+        let (id, label, signed_in) = (profile.id.clone(), profile.label.clone(), profile.signed_in);
         action.connect_clicked(glib::clone!(
             #[strong]
             ui,
             #[strong]
             window,
             move |_| {
-                window.close();
                 if signed_in {
-                    logout(&ui, id.clone());
+                    confirm_logout(&ui, &window, id.clone(), &label);
                 } else {
+                    window.close();
                     // The client recognises a known account and reuses its
                     // profile and save namespace.
                     add_account(&ui);
@@ -364,6 +364,34 @@ fn add_account(ui: &Ui) {
         }
         open(&ui);
     });
+}
+
+fn confirm_logout(ui: &Ui, parent: &adw::Window, id: String, label: &str) {
+    if parent.visible_dialog().is_some() || *ui.closing.borrow() {
+        return;
+    }
+    let dialog = adw::AlertDialog::new(
+        Some(&format!("Sign out {label}?")),
+        Some(
+            "This removes this account's sign-in from this computer. Downloaded games \
+             and local saves stay on disk. Sign in again before using this account \
+             to launch games.",
+        ),
+    );
+    dialog.set_heading_use_markup(false);
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("out", "Sign out");
+    dialog.set_response_appearance("out", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let (ui, window) = (ui.clone(), parent.clone());
+    dialog.connect_response(None, move |_, response| {
+        if response == "out" {
+            window.close();
+            logout(&ui, id.clone());
+        }
+    });
+    dialog.present(Some(parent));
 }
 
 fn logout(ui: &Ui, id: String) {

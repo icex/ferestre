@@ -50,6 +50,7 @@ on:
       - 'tests/gui_update_existing.py'
       - 'tests/gui_library_error.py'
       - 'tests/gui_controller_focus.py'
+      - 'tests/gui_window_controls.py'
       - 'tests/controller_driver.py'
       - 'tests/test_gui_actions.py'
       - 'tests/run_wayland_gui.py'
@@ -109,6 +110,7 @@ on:
       - 'tests/gui_update_existing.py'
       - 'tests/gui_library_error.py'
       - 'tests/gui_controller_focus.py'
+      - 'tests/gui_window_controls.py'
       - 'tests/controller_driver.py'
       - 'tests/test_gui_actions.py'
       - 'tests/run_wayland_gui.py'
@@ -412,6 +414,13 @@ jobs:
         run: |
           xvfb-run -a --error-file=/dev/stderr --server-num=111 --server-args='-screen 0 1280x900x24 -noreset' \
             dbus-run-session -- python3 tests/gui_move.py --binary target/debug/ferestre-gui
+
+      - name: Desktop window controls and fullscreen (offline)
+        run: |
+          xvfb-run -a --error-file=/dev/stderr --server-num=136 --server-args='-screen 0 1280x800x24 -noreset' \
+            dbus-run-session -- python3 tests/gui_window_controls.py --binary target/debug/ferestre-gui
+          xvfb-run -a --error-file=/dev/stderr --server-num=137 --server-args='-screen 0 800x720x24 -noreset' \
+            dbus-run-session -- python3 tests/gui_window_controls.py --binary target/debug/ferestre-gui --narrow
 
       - name: Separate Store and Player accounts (offline)
         run: |
