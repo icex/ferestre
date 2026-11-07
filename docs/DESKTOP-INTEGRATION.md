@@ -18,6 +18,11 @@ HDR-capable displays running in SDR are treated as SDR.
   Older Proton launchers get driver overrides for that launch only; Xalia and
   the X11 fullscreen hack are disabled for native Wayland. Prefix graphics
   preferences are not rewritten.
+  On scaled desktops, automatic native Wayland also requires the runtime's
+  fractional-scaling protocol support. Older drivers can enlarge and crop a
+  game's child rendering window; those runtimes keep the existing display path.
+  Runtime builds verify both drivers and both default-prefix templates before
+  packaging, and fail if the SDK cannot compile the native Wayland driver.
 - Gamescope remains an experimental, explicit choice with `FERESTRE_GAMESCOPE=1`.
   Retail Forza testing found unusable scaling/progression in that path. An
   existing Gamescope session is never nested again.

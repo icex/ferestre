@@ -37,12 +37,15 @@ def output(arguments):
     return None
 
 
-def mode(width, height, refresh, hdr, source):
+def mode(width, height, refresh, hdr, source, scale=1.0):
     if (isinstance(width, int) and isinstance(height, int)
             and isinstance(refresh, (int, float)) and not isinstance(refresh, bool)
             and 16 <= width <= 32768 and 16 <= height <= 32768
-            and math.isfinite(refresh) and 1 <= refresh <= 1000):
-        return dict(width=width, height=height, refresh=refresh, hdr=hdr is True, source=source)
+            and math.isfinite(refresh) and 1 <= refresh <= 1000
+            and isinstance(scale, (int, float)) and not isinstance(scale, bool)
+            and math.isfinite(scale) and 0.25 <= scale <= 8):
+        return dict(width=width, height=height, refresh=refresh, hdr=hdr is True,
+                    source=source, scale=scale)
     return None
 
 
@@ -64,7 +67,7 @@ def kde_display(data):
             size = current.get('size', {})
             if isinstance(size, dict):
                 return mode(size.get('width'), size.get('height'), current.get('refreshRate'),
-                            monitor.get('hdr'), 'KDE')
+                            monitor.get('hdr'), 'KDE', monitor.get('scale', 1.0))
     return None
 
 
@@ -101,7 +104,7 @@ def gnome_display(data):
                     if (isinstance(current, list) and len(current) == 7
                             and isinstance(current[6], dict) and current[6].get('is-current') is True):
                         return mode(current[1], current[2], current[3],
-                                    properties.get('color-mode') == 1, 'GNOME')
+                                    properties.get('color-mode') == 1, 'GNOME', logical_monitor[2])
     return None
 
 
@@ -161,6 +164,14 @@ def native_hdr(driver):
     return driver is not None
 
 
+def supports_scaling(driver):
+    try:
+        with driver.open('rb') as file:
+            return b'wp_fractional_scale_manager_v1' in file.read(8 * 1024 * 1024)
+    except (OSError, AttributeError):
+        return False
+
+
 def enabled(value):
     return value not in ('', '0')
 
@@ -176,6 +187,11 @@ def selection(env, runtime, screen, gamescope_available):
            for key in ('PROTON_ENABLE_HDR', 'PROTON_USE_HDR', 'DXVK_HDR')):
         hdr = False
     native = screen is not None and driver is not None
+    # Older drivers use Wine's DPI for the Wayland viewport. On a scaled
+    # desktop this enlarges/crops child rendering surfaces. Preserve XWayland
+    # until the selected runtime can consume the compositor's actual scale.
+    if native and screen.get('scale', 1.0) != 1.0 and not supports_scaling(driver):
+        native = False
     if any(key in policy and not enabled(policy[key])
            for key in ('PROTON_ENABLE_WAYLAND', 'PROTON_USE_WAYLAND')):
         native = False

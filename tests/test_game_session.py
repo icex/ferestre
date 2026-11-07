@@ -16,7 +16,7 @@ SCRIPT = Path(__file__).resolve().parents[1] / 'scripts/game-session.py'
 spec = importlib.util.spec_from_file_location('game_session', SCRIPT)
 session = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(session)
-HDR = dict(width=7680, height=2160, refresh=240.0, hdr=True, source='fixture')
+HDR = dict(width=7680, height=2160, refresh=240.0, hdr=True, source='fixture', scale=1.0)
 WAYLAND = dict(WAYLAND_DISPLAY='wayland-1', XDG_SESSION_TYPE='wayland', XDG_CURRENT_DESKTOP='KDE')
 
 
@@ -48,6 +48,7 @@ class DesktopTests(unittest.TestCase):
         result = session.gnome_display(self.gnome())
         self.assertTrue(result['hdr'])
         self.assertEqual(result['refresh'], 239.975)
+        self.assertEqual(result['scale'], 1.5)
         self.assertFalse(session.gnome_display(self.gnome(0))['hdr'])
         data = self.gnome(); data['data'][2] = []
         self.assertIsNone(session.gnome_display(data))
@@ -58,6 +59,13 @@ class DesktopTests(unittest.TestCase):
             self.assertIsNone(session.gnome_display(value))
         for rate in (0, -1, float('nan'), float('inf'), 1001, '240'):
             self.assertIsNone(session.mode(7680, 2160, rate, True, 'fixture'))
+        for scale in (0, -1, float('nan'), float('inf'), 10, '1.5', True):
+            self.assertIsNone(session.mode(7680, 2160, 240, True, 'fixture', scale))
+
+    def test_kde_reads_the_active_output_scale(self):
+        data = self.kde()
+        data['outputs'][1]['scale'] = 1.5
+        self.assertEqual(session.kde_display(data)['scale'], 1.5)
 
     def test_x11_never_enables_wayland_from_a_stale_environment(self):
         calls = []
@@ -136,6 +144,18 @@ class SelectionTests(unittest.TestCase):
     def test_host_vulkan_handles_hdr_without_protocol_markers_in_wine(self):
         self.driver(hdr=False)
         env, nested, native = session.selection(WAYLAND, self.runtime, HDR, True)
+        self.assertTrue(native); self.assertFalse(nested)
+        self.assertEqual(env['DXVK_HDR'], '1')
+
+    def test_scaled_desktop_requires_fractional_scaling_in_the_driver(self):
+        self.driver(hdr=False)
+        env, nested, native = session.selection(WAYLAND, self.runtime, dict(HDR, scale=1.5), True)
+        self.assertFalse(native); self.assertFalse(nested)
+        self.assertNotIn('PROTON_ENABLE_WAYLAND', env)
+        self.assertNotIn('DXVK_HDR', env)
+        driver = self.runtime / 'files/lib/wine/x86_64-unix/winewayland.so'
+        write(driver, 'wp_fractional_scale_manager_v1')
+        env, nested, native = session.selection(WAYLAND, self.runtime, dict(HDR, scale=1.5), True)
         self.assertTrue(native); self.assertFalse(nested)
         self.assertEqual(env['DXVK_HDR'], '1')
 
