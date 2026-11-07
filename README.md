@@ -65,7 +65,7 @@ The app checks for newer Ferestre and runtime releases and shows an **Update** b
 
 ## Status
 
-Ferestre **0.1.19** uses signed runtime **11.0.20261023.1**. It includes signed application/runtime updates, resumable game downloads, an install queue, game update badges and a fullscreen interface for handheld PCs. See the [0.1.19 release notes](docs/RELEASE-0.1.19.md) for changes and tested scope.
+Ferestre **0.1.20** uses signed runtime **11.0.20261107.1**. It adds native Wayland HDR on supported desktops, correct fractional scaling and practical 4K/ultrawide resolutions, automatic desktop window controls and confirmed sign-out. See the [0.1.20 release notes](docs/RELEASE-0.1.20.md) for changes and tested scope.
 
 Game updates use the existing installation directly. Reload library handles Store ticket formats correctly and reports authentication errors clearly.
 

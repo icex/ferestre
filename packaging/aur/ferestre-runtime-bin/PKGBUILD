@@ -38,9 +38,11 @@ depends=(
   # that cannot find a Vulkan ICD does not render at all.
   'vulkan-icd-loader' 'vulkan-driver' 'libglvnd' 'mesa' 'libdrm'
 
-  # X11. winex11.so links libX11/libXext and dlopens the extension libraries.
-  # There is no winewayland.so in this build, so a Wayland session goes through
-  # XWayland and these are needed there too.
+  # Native Wayland. winewayland.so links both Wayland libraries and the
+  # xkbcommon/xkbregistry libraries supplied by these packages.
+  'wayland' 'libxkbcommon'
+
+  # X11 remains available for titles and desktops using XWayland.
   'libx11' 'libxext' 'libxcb' 'libxcursor' 'libxcomposite' 'libxfixes'
   'libxi' 'libxinerama' 'libxrandr' 'libxrender' 'libxxf86vm'
 
