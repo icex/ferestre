@@ -129,6 +129,28 @@ class SelectionTests(unittest.TestCase):
         self.assertTrue(native); self.assertFalse(nested)
         self.assertEqual(env['DXVK_HDR'], '1')
 
+    def test_native_defaults_keep_game_overrides_and_disable_incompatible_helpers(self):
+        self.driver(hdr=False)
+        write(self.runtime / 'proton', '#!/bin/sh\n# legacy runtime\n')
+        env, _, native = session.selection(dict(WAYLAND, WINEDLLOVERRIDES='GameInput=b'), self.runtime, HDR, True)
+        self.assertTrue(native)
+        self.assertIn('GameInput=b', env['WINEDLLOVERRIDES'])
+        self.assertIn('winex11.drv=d', env['WINEDLLOVERRIDES'])
+        self.assertIn('winewayland.drv=b', env['WINEDLLOVERRIDES'])
+        self.assertEqual(env['PROTON_USE_XALIA'], '0')
+        self.assertEqual(env['WINE_DISABLE_FULLSCREEN_HACK'], '1')
+        self.assertNotIn('DISPLAY', env)
+
+    def test_native_settings_respect_user_helpers_and_driver_modes(self):
+        self.driver()
+        write(self.runtime / 'proton', '#!/bin/sh\n# legacy runtime\n')
+        write(self.runtime / 'user_settings.py', "user_settings={'PROTON_USE_XALIA':'1', 'WINEDLLOVERRIDES':'GameInput=n,b;winewayland.drv=n,b'}")
+        env, _, _ = session.selection(WAYLAND, self.runtime, HDR, True)
+        self.assertNotIn('PROTON_USE_XALIA', env)
+        self.assertIn('GameInput=n,b', env['WINEDLLOVERRIDES'])
+        self.assertIn('winewayland.drv=n,b', env['WINEDLLOVERRIDES'])
+        self.assertNotIn('winewayland.drv=b', env['WINEDLLOVERRIDES'])
+
     def test_missing_runtime_and_compositor_keep_existing_graphics_settings(self):
         env, nested, native = session.selection(WAYLAND, self.runtime, HDR, False)
         self.assertFalse(nested); self.assertFalse(native)

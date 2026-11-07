@@ -22,7 +22,8 @@ import time
 
 DISPLAY_ENV = ('DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'GAMESCOPE_WAYLAND_DISPLAY')
 FLAGS = ('PROTON_ENABLE_WAYLAND', 'PROTON_USE_WAYLAND', 'WINE_GRAPHICS_DRIVER',
-         'PROTON_ENABLE_HDR', 'PROTON_USE_HDR', 'DXVK_HDR')
+         'PROTON_ENABLE_HDR', 'PROTON_USE_HDR', 'DXVK_HDR', 'WINEDLLOVERRIDES',
+         'PROTON_USE_XALIA', 'WINE_USE_EGL', 'WINE_DISABLE_FULLSCREEN_HACK')
 
 
 def output(arguments):
@@ -191,8 +192,21 @@ def selection(env, runtime, screen, gamescope_available):
             support = (runtime / 'proton').read_text(errors='replace')
         except OSError:
             support = ''
+        # Xalia cannot position native Wayland windows. Keep this per-launch;
+        # the prefix and desktop graphics settings must remain untouched.
+        for key, value in (('PROTON_USE_XALIA', '0'), ('WINE_USE_EGL', '1'),
+                           ('WINE_DISABLE_FULLSCREEN_HACK', '1')):
+            if key not in policy:
+                result[key] = value
         if 'PROTON_ENABLE_WAYLAND' not in support and 'WINE_GRAPHICS_DRIVER' not in policy:
-            result['DISPLAY'] = ''
+            overrides = policy.get('WINEDLLOVERRIDES', '')
+            specified = {name.strip().lower() for group in overrides.split(';')
+                         for name in group.split('=', 1)[0].split(',')}
+            defaults = [name + '=' + value for name, value in
+                        (('winex11.drv', 'd'), ('winewayland.drv', 'b'))
+                        if name not in specified]
+            result['WINEDLLOVERRIDES'] = ';'.join(filter(None, [overrides, *defaults]))
+            result.pop('DISPLAY', None)
     if hdr and (use_gamescope or (native and native_hdr(driver))):
         for key in ('PROTON_ENABLE_HDR', 'DXVK_HDR'):
             if key not in policy:

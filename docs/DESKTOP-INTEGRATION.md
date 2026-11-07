@@ -15,6 +15,9 @@ HDR-capable displays running in SDR are treated as SDR.
   embed the compositor's color-management protocol. Current Mesa implements it.
   Without a Wayland driver, the normal display path and game window preferences
   are preserved. Installing Gamescope does not silently wrap or fullscreen games.
+  Older Proton launchers get driver overrides for that launch only; Xalia and
+  the X11 fullscreen hack are disabled for native Wayland. Prefix graphics
+  preferences are not rewritten.
 - Gamescope remains an experimental, explicit choice with `FERESTRE_GAMESCOPE=1`.
   Retail Forza testing found unusable scaling/progression in that path. An
   existing Gamescope session is never nested again.
