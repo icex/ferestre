@@ -36,10 +36,10 @@ provided-by = [
 symptom-if-missing = "Native Wayland HDR is unavailable, or a scaled desktop crops the game's rendering surface."
 verify = [
     { file = "files/lib/wine/x86_64-unix/winewayland.so", contains = "wp_fractional_scale_manager_v1" },
-    { file = "files/lib/wine/x86_64-windows/winewayland.drv", contains = "winewayland.drv" },
-    { file = "files/lib/wine/i386-windows/winewayland.drv", contains = "winewayland.drv" },
-    { file = "files/share/default_pfx/drive_c/windows/system32/winewayland.drv", contains = "winewayland.drv" },
-    { file = "files/share/default_pfx/drive_c/windows/syswow64/winewayland.drv", contains = "winewayland.drv" },
+    { file = "files/lib/wine/x86_64-windows/winewayland.drv", contains = "waylanddrv" },
+    { file = "files/lib/wine/i386-windows/winewayland.drv", contains = "waylanddrv" },
+    { file = "files/share/default_pfx/drive_c/windows/system32/winewayland.drv", contains = "waylanddrv" },
+    { file = "files/share/default_pfx/drive_c/windows/syswow64/winewayland.drv", contains = "waylanddrv" },
 ]
 
 [[capability]]

@@ -295,6 +295,8 @@ jobs:
           XODUS_PROTON_DIR="$GITHUB_WORKSPACE/proton/build/dist" \
               scripts/write-capabilities.sh
           cat "$GITHUB_WORKSPACE/proton/build/dist/files/share/ferestre/capabilities.json"
+          python3 -c 'import json, sys; assert "graphics.native-wayland" in json.load(open(sys.argv[1]))["capabilities"], "built runtime lacks native Wayland capability"' \
+              "$GITHUB_WORKSPACE/proton/build/dist/files/share/ferestre/capabilities.json"
 
       - name: Version
         id: version

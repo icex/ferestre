@@ -33,6 +33,10 @@ class CompositorIsolationTests(unittest.TestCase):
             self.assertEqual(runtime.stat().st_mode & 0o777, 0o700)
             self.assertEqual(env['FERESTRE_WAYLAND_SESSION'], '1')
             self.assertEqual(command[0], 'dbus-run-session')
+            config = Path(command[1].split('=', 1)[1]).read_text()
+            self.assertIn('<listen>unix:tmpdir=' + str(runtime), config)
+            self.assertNotIn('<servicedir', config)
+            self.assertNotIn('<include', config)
             return 17
         with patch.dict(os.environ, {'XDG_RUNTIME_DIR': '/run/user/1000'}, clear=True), patch.object(runner.subprocess, 'call', launch):
             self.assertEqual(runner.main(), 17)
