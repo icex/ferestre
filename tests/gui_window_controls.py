@@ -57,8 +57,14 @@ def main():
                             boxes = [controls()[name][0].get_component_iface().get_extents(s.Atspi.CoordType.WINDOW) for name in names]
                             coordinates = [box.x for box in boxes]
                             s.check(coordinates == sorted(coordinates), f'{layout} preserves {edge} button order')
-                            s.check(all(box.width > 0 and (box.x < 160 if edge == 'left' else box.x > width - 170)
-                                        for box in boxes), f'{layout} places controls at the outside {edge} edge')
+                            # Touch targets can make the group wider than 170px.
+                            # Measure its outside inset and contiguous spacing,
+                            # rather than the first button against a fixed band.
+                            inset = (boxes[0].x if edge == 'left' else width - boxes[-1].x - boxes[-1].width) if boxes else 0
+                            s.check(all(box.width > 0 for box in boxes)
+                                    and all(0 <= b.x - a.x - a.width <= 16 for a, b in zip(boxes, boxes[1:]))
+                                    and -4 <= inset <= 24,
+                                    f'{layout} places controls at the outside {edge} edge')
                         s.check(ready(), 'each configured control appears once')
                     positions()
                     navigation = s.find_all(frame, role='button', name='Show navigation')
