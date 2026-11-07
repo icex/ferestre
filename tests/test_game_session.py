@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -109,6 +110,12 @@ class SelectionTests(unittest.TestCase):
         self.assertNotIn('PROTON_ENABLE_WAYLAND', env)
         self.assertEqual(env['DXVK_HDR'], '1')
 
+    def test_wayland_flag_on_a_runtime_without_the_driver_still_allows_hdr_fallback(self):
+        env, nested, native = session.selection(dict(WAYLAND, PROTON_ENABLE_WAYLAND='1'), self.runtime, HDR, True)
+        self.assertTrue(nested); self.assertFalse(native)
+        self.assertEqual(env['PROTON_ENABLE_WAYLAND'], '1')
+        self.assertEqual(env['DXVK_HDR'], '1')
+
     def test_missing_runtime_and_compositor_keep_existing_graphics_settings(self):
         env, nested, native = session.selection(WAYLAND, self.runtime, HDR, False)
         self.assertFalse(nested); self.assertFalse(native)
@@ -148,6 +155,59 @@ class SelectionTests(unittest.TestCase):
 
 
 class SessionProcessTests(unittest.TestCase):
+    def test_shim_enables_the_session_once_and_preserves_the_licensed_image(self):
+        with tempfile.TemporaryDirectory(prefix='ferestre-shim-session-') as directory:
+            root = Path(directory)
+            runtime = root / 'runtime'
+            write(runtime / 'proton', f'#!{sys.executable}\nimport os,sys\nfrom pathlib import Path\n'
+                  "if sys.argv[1:3]==['run','reg']:sys.exit(0)\n"
+                  "assert os.environ['FERESTRE_DESKTOP_SESSION_READY']=='1'\n"
+                  "Path(os.environ['RECEIPT']).write_bytes(os.pread(int(os.environ['IMAGE_FD']),14,0))\n")
+            fd = os.memfd_create('licensed-shim-fixture', 0)
+            try:
+                os.write(fd, b'licensed-image')
+                env = dict(os.environ, PROTON_DIR=str(runtime), XODUS_PROTON_DIR=str(runtime),
+                           XODUS_GAMES_DIR=str(root / 'games'), STEAM_COMPAT_DATA_PATH=str(root / 'prefix'),
+                           FERESTRE_DESKTOP_INTEGRATION='1', FERESTRE_PERFORMANCE='0',
+                           XDG_SESSION_TYPE='x11', IMAGE_FD=str(fd),
+                           WINE_DLL_FILE_MAP=f'Game With Spaces.exe={fd}', RECEIPT=str(root / 'receipt'),
+                           PROTON_DISABLE_HIDRAW='')
+                env.pop('FERESTRE_IMAGE_VIEW', None)
+                env.pop('FERESTRE_DESKTOP_SESSION_READY', None)
+                subprocess.run([str(SCRIPT.with_name('proton-wine-shim.sh')), 'Game With Spaces.exe'],
+                               env=env, pass_fds=(fd,), check=True, timeout=10)
+                self.assertEqual((root / 'receipt').read_bytes(), b'licensed-image')
+            finally:
+                os.close(fd)
+
+    def test_full_hdr_compositor_session_keeps_the_image_descriptor(self):
+        with tempfile.TemporaryDirectory(prefix='ferestre-hdr-session-') as directory:
+            root = Path(directory)
+            write(root / 'bin/kscreen-doctor', f'#!{sys.executable}\nimport json\nprint(json.dumps(' +
+                  repr({'outputs': [{'enabled': True, 'hdr': True, 'currentModeId': '1', 'modes': [
+                      {'id': '1', 'refreshRate': 240, 'size': {'width': 7680, 'height': 2160}}]}]}) + '))\n')
+            write(root / 'bin/gamescope', f'#!{sys.executable}\nimport os,sys\n'
+                  "os.closerange(3,1024)\nos.environ['DISPLAY']=':nested-fixture'\n"
+                  "os.environ['GAMESCOPE_WAYLAND_DISPLAY']='nested'\n"
+                  "args=sys.argv[sys.argv.index('--')+1:];os.execv(args[0],args)\n")
+            fd = os.memfd_create('licensed-hdr-fixture', 0)
+            try:
+                os.write(fd, b'licensed-image')
+                env = dict(os.environ, **WAYLAND, FERESTRE_PERFORMANCE='0',
+                           PROTON_DIR=str(root / 'runtime'), IMAGE_FD=str(fd),
+                           WINE_DLL_FILE_MAP=f'Game.exe={fd}', RECEIPT=str(root / 'receipt'),
+                           PATH=str(root / 'bin') + ':' + os.environ['PATH'])
+                code = ("import os,json;from pathlib import Path;"
+                        "assert os.environ['DISPLAY']==':nested-fixture';"
+                        "assert os.environ['DXVK_HDR']=='1';"
+                        "assert os.environ['ENABLE_GAMESCOPE_WSI']=='1';"
+                        "Path(os.environ['RECEIPT']).write_bytes(os.pread(int(os.environ['IMAGE_FD']),14,0))")
+                subprocess.run([sys.executable, str(SCRIPT), '--', sys.executable, '-c', code],
+                               env=env, pass_fds=(fd,), check=True, timeout=15)
+                self.assertEqual((root / 'receipt').read_bytes(), b'licensed-image')
+            finally:
+                os.close(fd)
+
     def test_inherited_images_and_stop_channel_survive_game_session(self):
         with tempfile.TemporaryDirectory(prefix='ferestre-session-fds-') as directory:
             root = Path(directory)
@@ -193,6 +253,20 @@ class SessionProcessTests(unittest.TestCase):
             finally:
                 hold.close(); os.close(fd)
 
+    def test_partial_profile_output_cannot_stall_game_start_indefinitely(self):
+        with tempfile.TemporaryDirectory(prefix='ferestre-profile-timeout-') as directory:
+            root = Path(directory)
+            write(root / 'game-performance', f'#!{sys.executable}\nimport sys\n'
+                  "sys.stdout.write('starting');sys.stdout.flush();sys.stdin.buffer.read()\n")
+            hold = session.PerformanceHold()
+            try:
+                started = time.monotonic()
+                self.assertFalse(hold.start(dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'])))
+                self.assertLess(time.monotonic() - started, 5)
+                self.assertIsNone(hold.process)
+            finally:
+                hold.close()
+
     def test_compositor_handoff_keeps_game_images_outside_its_child(self):
         with tempfile.TemporaryDirectory(prefix='ferestre-compositor-test-') as directory:
             root = Path(directory)
@@ -213,6 +287,7 @@ class SessionProcessTests(unittest.TestCase):
                 self.assertEqual(nested['FERESTRE_STOP_FD'], '201')
                 self.assertEqual(nested['ENABLE_GAMESCOPE_WSI'], '1')
                 process = hold.process; temporary = Path(hold.directory.name)
+                self.assertEqual(os.getpgid(process.pid), os.getpgrp())
                 hold.close()
                 self.assertEqual(process.returncode, 0)
                 self.assertFalse(temporary.exists())

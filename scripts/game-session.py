@@ -17,6 +17,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 
 DISPLAY_ENV = ('DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'GAMESCOPE_WAYLAND_DISPLAY')
@@ -178,8 +179,8 @@ def selection(env, runtime, screen, gamescope_available):
     already_nested = bool(env.get('GAMESCOPE_WAYLAND_DISPLAY'))
     use_gamescope = (hdr and not native_hdr(driver) and gamescope_available and not already_nested
                      and env.get('FERESTRE_GAMESCOPE', '1') != '0'
-                     and not any(enabled(policy.get(k, ''))
-                                 for k in ('PROTON_ENABLE_WAYLAND', 'PROTON_USE_WAYLAND')))
+                     and (driver is None or not any(enabled(policy.get(k, ''))
+                                                    for k in ('PROTON_ENABLE_WAYLAND', 'PROTON_USE_WAYLAND'))))
     if already_nested:
         native = False
     if use_gamescope:
@@ -244,9 +245,18 @@ class PerformanceHold:
             self.process = subprocess.Popen(['game-performance', sys.executable, '-I', '-c', code],
                                             env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                             stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True)
-            readable, _, _ = select.select([self.process.stdout], [], [], 3)
-            if readable and self.process.stdout.readline(80).strip() == b'ferestre-performance-ready':
-                return True
+            deadline = time.monotonic() + 3
+            data = bytearray()
+            while len(data) < 4096:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([self.process.stdout], [], [], remaining)[0]:
+                    break
+                chunk = os.read(self.process.stdout.fileno(), 4096 - len(data))
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if b'\nferestre-performance-ready\n' in b'\n' + data:
+                    return True
         except OSError:
             pass
         self.close()
