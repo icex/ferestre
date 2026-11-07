@@ -77,6 +77,7 @@ on:
       - 'tests/test_real_path_image_view.py'
       - 'tests/test_caller_ids_image_view.py'
       - 'tests/test_proton_wine_shim.py'
+      - 'tests/test_game_session.py'
       - 'tests/test_fix_xcurl.py'
       - 'tests/test_launch_gdk.py'
       - 'tests/test_install_xodus_proton.py'
@@ -137,6 +138,7 @@ on:
       - 'tests/test_real_path_image_view.py'
       - 'tests/test_caller_ids_image_view.py'
       - 'tests/test_proton_wine_shim.py'
+      - 'tests/test_game_session.py'
       - 'tests/test_fix_xcurl.py'
       - 'tests/test_launch_gdk.py'
       - 'tests/test_install_xodus_proton.py'
@@ -221,6 +223,7 @@ jobs:
           set -euo pipefail
           python3 -m unittest discover -s tests -p 'test_*image_view.py'
           python3 tests/test_proton_wine_shim.py
+          python3 tests/test_game_session.py
           python3 tests/test_fix_xcurl.py
           python3 tests/test_launch_gdk.py
           python3 tests/test_install_xodus_proton.py
@@ -363,6 +366,21 @@ jobs:
           cargo test --locked -p msixvc
           cargo test --locked -p xodus-cli
           cargo test --locked -p xodus --features key-chain-file --test key_chain_file
+
+      - name: Runtime refresh correction unit tests
+        run: |
+          set -euo pipefail
+          scratch=$(mktemp -d)
+          trap 'rm -rf "$scratch"' EXIT
+          repository=$(python3 scripts/source-pins.py get wine repository)
+          commit=$(python3 scripts/source-pins.py get wine commit)
+          git clone --quiet --filter=blob:none --no-checkout --depth=1 "$repository" "$scratch/wine"
+          git -C "$scratch/wine" fetch --quiet --depth=1 origin "$commit"
+          for file in dlls/winex11.drv/desktop_refresh.h tools/ferestre/test_desktop_refresh.py; do
+              mkdir -p "$scratch/check/$(dirname "$file")"
+              git -C "$scratch/wine" show "$commit:$file" > "$scratch/check/$file"
+          done
+          python3 "$scratch/check/tools/ferestre/test_desktop_refresh.py"
 
   gui:
     runs-on: ubuntu-24.04

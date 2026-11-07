@@ -291,6 +291,7 @@ pub fn plan(recipe: &Recipe, dirs: &Dirs, options: &Options) -> Plan {
     // the GameInput runtime says so and stops: "Critical Failure: GameInput
     // Runtime could not be loaded".
     env_set.insert("WINE_GAMEINPUT".into(), "1".into());
+    env_set.insert("FERESTRE_DESKTOP_INTEGRATION".into(), "1".into());
 
     // Proton derives the prefix from STEAM_COMPAT_DATA_PATH (pfx/ inside it),
     // so this is how a title gets its own prefix. Set in both modes: under

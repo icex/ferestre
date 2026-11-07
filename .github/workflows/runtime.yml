@@ -79,7 +79,8 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Keep runtime compilation and 32-bit prefix creation on the tested baseline.
+    runs-on: ubuntu-24.04
     # An hour and a quarter cold, and a runner that dies at the default six
     # hours mid-link wastes the whole build rather than reporting anything.
     timeout-minutes: 330
@@ -337,7 +338,7 @@ jobs:
   prune-ccache:
     needs: build
     if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       actions: write
     steps:
@@ -357,7 +358,7 @@ jobs:
   publish:
     needs: build
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Where the signing secrets live; see release.yml and docs/RELEASING.md.
     environment: release
     permissions:

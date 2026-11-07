@@ -27,6 +27,13 @@
 schema = 1
 
 [[capability]]
+name = "graphics.xrandr-desktop-refresh"
+summary = "Recover the compositor refresh rate for clamped XWayland modes"
+provided-by = ["https://github.com/icex/wine/commit/6a7ff337648d9ff41950b929c0639022dbae887f"]
+symptom-if-missing = "An ultrawide 7680x2160 display at 240 Hz can be reported as 158 Hz through XWayland's clamped synthetic pixel clock."
+verify = [{ file = "files/lib/wine/x86_64-unix/winex11.so", contains = "FERESTRE_DESKTOP_MODE" }]
+
+[[capability]]
 name = "loader.memfd-main-image"
 summary = """
 Wine loads the process's main image from an inherited file descriptor named in \
