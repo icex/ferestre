@@ -193,12 +193,14 @@ class SessionProcessTests(unittest.TestCase):
             fd = os.memfd_create('licensed-hdr-fixture', 0)
             try:
                 os.write(fd, b'licensed-image')
-                env = dict(os.environ, **WAYLAND, FERESTRE_PERFORMANCE='0',
+                env = dict(os.environ, **WAYLAND, FERESTRE_PERFORMANCE='0', WAYLAND_SOCKET='999',
                            PROTON_DIR=str(root / 'runtime'), IMAGE_FD=str(fd),
                            WINE_DLL_FILE_MAP=f'Game.exe={fd}', RECEIPT=str(root / 'receipt'),
                            PATH=str(root / 'bin') + ':' + os.environ['PATH'])
                 code = ("import os,json;from pathlib import Path;"
                         "assert os.environ['DISPLAY']==':nested-fixture';"
+                        "assert os.environ['WAYLAND_DISPLAY']==os.environ['GAMESCOPE_WAYLAND_DISPLAY']=='nested';"
+                        "assert 'WAYLAND_SOCKET' not in os.environ;"
                         "assert os.environ['DXVK_HDR']=='1';"
                         "assert os.environ['ENABLE_GAMESCOPE_WSI']=='1';"
                         "Path(os.environ['RECEIPT']).write_bytes(os.pread(int(os.environ['IMAGE_FD']),14,0))")

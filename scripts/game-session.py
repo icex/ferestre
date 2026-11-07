@@ -304,12 +304,18 @@ class GamescopeHold:
                     break
                 data.extend(chunk)
             context = json.loads(data)
-            if not isinstance(context, dict) or not context.get('DISPLAY'):
+            if (not isinstance(context, dict) or not context.get('DISPLAY')
+                    or not context.get('GAMESCOPE_WAYLAND_DISPLAY')):
                 raise ValueError('compositor did not report a display')
             result = dict(env)
             for key in DISPLAY_ENV:
                 if key in context and isinstance(context[key], str):
                     result[key] = context[key]
+            # Gamescope leaves WAYLAND_DISPLAY pointing at its parent. Its
+            # WSI layer bypasses that parent only when the game's Wayland
+            # locator identifies Gamescope too; otherwise HDR formats vanish.
+            result['WAYLAND_DISPLAY'] = result['GAMESCOPE_WAYLAND_DISPLAY']
+            result.pop('WAYLAND_SOCKET', None)
             result['ENABLE_GAMESCOPE_WSI'] = '1'
             return result
         except (OSError, ValueError):
