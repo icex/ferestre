@@ -23,6 +23,10 @@ HDR-capable displays running in SDR are treated as SDR.
   game's child rendering window; those runtimes keep the existing display path.
   Runtime builds verify both drivers and both default-prefix templates before
   packaging, and fail if the SDK cannot compile the native Wayland driver.
+  Wine also exposes 3840x2160 and scaled ultrawide modes (3440x1440,
+  3840x1080 and 5120x1440) when they fit the monitor. This allows practical
+  rendering resolutions on an 8K ultrawide display. Runtime CI exercises the
+  public Windows display API against a private headless output.
 - Gamescope remains an experimental, explicit choice with `FERESTRE_GAMESCOPE=1`.
   Retail Forza testing found unusable scaling/progression in that path. An
   existing Gamescope session is never nested again.

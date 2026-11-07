@@ -59,6 +59,8 @@ on:
       - '.gitmodules'
       - 'scripts/source-pins.py'
       - 'scripts/write-capabilities.sh'
+      - 'tests/runtime-display-modes.c'
+      - 'tests/check-runtime-modes.sh'
       - '.github/workflows/runtime.yml'
   workflow_dispatch:
     inputs:
@@ -282,6 +284,16 @@ jobs:
           done
           test -s share/default_pfx/drive_c/windows/system32/winewayland.drv
           test -s share/default_pfx/drive_c/windows/syswow64/winewayland.drv
+
+      - name: Verify practical resolutions through Wine's display API
+        run: |
+          set -euo pipefail
+          sdk=$(sed -n 's/^STEAMRT_IMAGE[[:space:]]*:=[[:space:]]*//p' proton/build/Makefile | tail -n 1)
+          test -n "$sdk"
+          docker run --rm --network none --user "$(id -u):$(id -g)" \
+              -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" "$sdk" \
+              bash "$GITHUB_WORKSPACE/ferestre/tests/check-runtime-modes.sh" \
+              "$GITHUB_WORKSPACE/proton/build/dist"
 
       # What the runtime can do, measured against the tree that was just built
       # rather than asserted from the source manifest. The launcher reads this to
