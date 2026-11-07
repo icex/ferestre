@@ -155,7 +155,7 @@
     },
     "wine": {
       "repository": "https://github.com/icex/wine.git",
-      "commit": "91b8dc9aaafcfcb37558b928f53bdce791b365dc",
+      "commit": "ec6e8787b64b80da118450c135535ca362f631e6",
       "upstream": "https://github.com/xodus-gaming/wine.git",
       "upstream_commit": "b1dd32734a34472a28eb5be9922df06e07ac0834",
       "modified_paths": [
@@ -175,10 +175,19 @@
         "dlls/ntdll/unix/unix_private.h",
         "dlls/ntdll/unix/virtual.c",
         "dlls/twinapi.appcore/main.c",
+        "dlls/win32u/sysparams.c",
         "dlls/windows.system.profile.systemid/classes.idl",
         "dlls/windows.system.profile.systemid/main.c",
         "dlls/windows.system.profile.systemid/private.h",
         "dlls/winegstreamer/media-converter/lib.c",
+        "dlls/winewayland.drv/Makefile.in",
+        "dlls/winewayland.drv/fractional-scale-v1.xml",
+        "dlls/winewayland.drv/wayland.c",
+        "dlls/winewayland.drv/wayland_surface.c",
+        "dlls/winewayland.drv/waylanddrv.h",
+        "dlls/winewayland.drv/window.c",
+        "dlls/winex11.drv/desktop_refresh.h",
+        "dlls/winex11.drv/xrandr.c",
         "dlls/winhttp/request.c",
         "dlls/winhttp/session.c",
         "dlls/winhttp/winhttp_private.h",
@@ -186,16 +195,20 @@
         "dlls/xgameruntime",
         "include/Makefile.in",
         "include/windows.foundation.diagnostics.idl",
-        "include/windows.internal.system.profile.idl"
+        "include/windows.internal.system.profile.idl",
+        "tools/ferestre/test_desktop_refresh.py"
       ]
     },
     "proton": {
       "repository": "https://github.com/icex/Proton-UWP.git",
-      "commit": "c8fb3fc265c6f1232280e5d98f049a6a2f28adfa",
+      "commit": "2380d745d8e36e69861858b16f0c492d337e5827",
       "upstream": "https://github.com/xodus-gaming/Proton.git",
       "upstream_commit": "7c0b435495814349735c913fde78da906aecea52",
       "modified_paths": [
         ".gitmodules",
+        "Makefile.in",
+        "configure.sh",
+        "contrib/ferestre/Dockerfile.sdk",
         "proton",
         "vkd3d-proton",
         "wine"

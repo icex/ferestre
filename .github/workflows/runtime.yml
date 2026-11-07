@@ -59,6 +59,8 @@ on:
       - '.gitmodules'
       - 'scripts/source-pins.py'
       - 'scripts/write-capabilities.sh'
+      - 'tests/runtime-display-modes.c'
+      - 'tests/check-runtime-modes.sh'
       - '.github/workflows/runtime.yml'
   workflow_dispatch:
     inputs:
@@ -79,7 +81,8 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Keep runtime compilation and 32-bit prefix creation on the tested baseline.
+    runs-on: ubuntu-24.04
     # An hour and a quarter cold, and a runner that dies at the default six
     # hours mid-link wastes the whole build rather than reporting anything.
     timeout-minutes: 330
@@ -269,6 +272,29 @@ jobs:
           cd proton/build/dist
           grep -q close_fds=False proton
 
+      - name: Verify native Wayland drivers and prefix templates
+        run: |
+          set -euo pipefail
+          cd proton/build/dist/files
+          for arch in x86_64 i386; do
+              test -s "lib/wine/$arch-unix/winewayland.so"
+              test -s "lib/wine/$arch-windows/winewayland.drv"
+              strings "lib/wine/$arch-unix/winewayland.so" > "$RUNNER_TEMP/wayland-$arch-strings"
+              grep -q wp_fractional_scale_manager_v1 "$RUNNER_TEMP/wayland-$arch-strings"
+          done
+          test -s share/default_pfx/drive_c/windows/system32/winewayland.drv
+          test -s share/default_pfx/drive_c/windows/syswow64/winewayland.drv
+
+      - name: Verify practical resolutions through Wine's display API
+        run: |
+          set -euo pipefail
+          sdk=$(sed -n 's/^STEAMRT_IMAGE[[:space:]]*:=[[:space:]]*//p' proton/build/Makefile | tail -n 1)
+          test -n "$sdk"
+          docker run --rm --network none --user "$(id -u):$(id -g)" \
+              -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" "$sdk" \
+              bash "$GITHUB_WORKSPACE/ferestre/tests/check-runtime-modes.sh" \
+              "$GITHUB_WORKSPACE/proton/build/dist"
+
       # What the runtime can do, measured against the tree that was just built
       # rather than asserted from the source manifest. The launcher reads this to
       # decide whether a title can run at all; a runtime that ships without it
@@ -281,6 +307,8 @@ jobs:
           XODUS_PROTON_DIR="$GITHUB_WORKSPACE/proton/build/dist" \
               scripts/write-capabilities.sh
           cat "$GITHUB_WORKSPACE/proton/build/dist/files/share/ferestre/capabilities.json"
+          python3 -c 'import json, sys; assert "graphics.native-wayland" in json.load(open(sys.argv[1]))["capabilities"], "built runtime lacks native Wayland capability"' \
+              "$GITHUB_WORKSPACE/proton/build/dist/files/share/ferestre/capabilities.json"
 
       - name: Version
         id: version
@@ -337,7 +365,7 @@ jobs:
   prune-ccache:
     needs: build
     if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       actions: write
     steps:
@@ -357,7 +385,7 @@ jobs:
   publish:
     needs: build
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Where the signing secrets live; see release.yml and docs/RELEASING.md.
     environment: release
     permissions:

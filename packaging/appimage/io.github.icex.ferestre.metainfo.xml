@@ -74,6 +74,12 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.1.20" date="2026-11-07">
+      <description>
+        <p>Enable native Wayland HDR on supported desktops, correct fractional scaling, and expose practical 4K and ultrawide game resolutions with the updated runtime.</p>
+        <p>Follow the desktop window-button layout automatically, confirm sign-out, and hold the available game performance profile during play.</p>
+      </description>
+    </release>
     <release version="0.1.19" date="2026-11-06">
       <description>
         <p>Update installed games in their existing folder without an install-location prompt.</p>

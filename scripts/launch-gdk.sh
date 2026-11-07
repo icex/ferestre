@@ -52,6 +52,7 @@ export DISABLE_VK_LAYER_VALVE_steam_fossilize_1=1
 # GDK/UWP titles (Minecraft) require the GameInput runtime; enable our
 # gameinput.dll implementation, which is otherwise behind an allow-list.
 export WINE_GAMEINPUT=1
+export FERESTRE_DESKTOP_INTEGRATION="${FERESTRE_DESKTOP_INTEGRATION:-1}"
 
 export STEAM_COMPAT_DATA_PATH=$PREFIX
 export STEAM_COMPAT_CLIENT_INSTALL_PATH=${XODUS_STEAM_DIR:-$HOME/.steam/steam}

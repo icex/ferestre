@@ -14,7 +14,7 @@
 # to /usr/lib/ferestre and not /usr/share.
 
 pkgname=ferestre-git
-pkgver=0.1.19.r389.g16ba543
+pkgver=0.1.20
 pkgrel=1
 pkgdesc='Download and run the Microsoft Store and Xbox GDK titles you own, on Linux'
 arch=('x86_64')
@@ -135,6 +135,7 @@ package() {
   install -Dm644 docs/RECIPES.md  "$pkgdir/usr/share/doc/ferestre/RECIPES.md"
   install -Dm644 docs/ROADMAP.md  "$pkgdir/usr/share/doc/ferestre/ROADMAP.md"
   install -Dm644 docs/UPDATES.md  "$pkgdir/usr/share/doc/ferestre/UPDATES.md"
+  install -Dm644 docs/DESKTOP-INTEGRATION.md "$pkgdir/usr/share/doc/ferestre/DESKTOP-INTEGRATION.md"
 
   install -Dm644 LICENSE            "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 LICENSE.LGPL-2.1   "$pkgdir/usr/share/licenses/$pkgname/LICENSE.LGPL-2.1"
