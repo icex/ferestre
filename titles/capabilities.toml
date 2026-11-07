@@ -27,6 +27,22 @@
 schema = 1
 
 [[capability]]
+name = "graphics.native-wayland"
+summary = "Native Wayland display and fractional scaling for HDR through the host Vulkan driver"
+provided-by = [
+    "https://github.com/icex/wine/commit/accc08b648ebef4191ef91a5070ee2ece733ebde",
+    "https://github.com/icex/Proton-UWP/commit/cb6e279c2fb373e7ea85de2d91ca19ffd60c04fe",
+]
+symptom-if-missing = "Native Wayland HDR is unavailable, or a scaled desktop crops the game's rendering surface."
+verify = [
+    { file = "files/lib/wine/x86_64-unix/winewayland.so", contains = "wp_fractional_scale_manager_v1" },
+    { file = "files/lib/wine/x86_64-windows/winewayland.drv", contains = "winewayland.drv" },
+    { file = "files/lib/wine/i386-windows/winewayland.drv", contains = "winewayland.drv" },
+    { file = "files/share/default_pfx/drive_c/windows/system32/winewayland.drv", contains = "winewayland.drv" },
+    { file = "files/share/default_pfx/drive_c/windows/syswow64/winewayland.drv", contains = "winewayland.drv" },
+]
+
+[[capability]]
 name = "graphics.xrandr-desktop-refresh"
 summary = "Recover the compositor refresh rate for clamped XWayland modes"
 provided-by = ["https://github.com/icex/wine/commit/6a7ff337648d9ff41950b929c0639022dbae887f"]

@@ -270,6 +270,19 @@ jobs:
           cd proton/build/dist
           grep -q close_fds=False proton
 
+      - name: Verify native Wayland drivers and prefix templates
+        run: |
+          set -euo pipefail
+          cd proton/build/dist/files
+          for arch in x86_64 i386; do
+              test -s "lib/wine/$arch-unix/winewayland.so"
+              test -s "lib/wine/$arch-windows/winewayland.drv"
+              strings "lib/wine/$arch-unix/winewayland.so" > "$RUNNER_TEMP/wayland-$arch-strings"
+              grep -q wp_fractional_scale_manager_v1 "$RUNNER_TEMP/wayland-$arch-strings"
+          done
+          test -s share/default_pfx/drive_c/windows/system32/winewayland.drv
+          test -s share/default_pfx/drive_c/windows/syswow64/winewayland.drv
+
       # What the runtime can do, measured against the tree that was just built
       # rather than asserted from the source manifest. The launcher reads this to
       # decide whether a title can run at all; a runtime that ships without it

@@ -155,7 +155,7 @@
     },
     "wine": {
       "repository": "https://github.com/icex/wine.git",
-      "commit": "6a7ff337648d9ff41950b929c0639022dbae887f",
+      "commit": "accc08b648ebef4191ef91a5070ee2ece733ebde",
       "upstream": "https://github.com/xodus-gaming/wine.git",
       "upstream_commit": "b1dd32734a34472a28eb5be9922df06e07ac0834",
       "modified_paths": [
@@ -179,6 +179,12 @@
         "dlls/windows.system.profile.systemid/main.c",
         "dlls/windows.system.profile.systemid/private.h",
         "dlls/winegstreamer/media-converter/lib.c",
+        "dlls/winewayland.drv/Makefile.in",
+        "dlls/winewayland.drv/fractional-scale-v1.xml",
+        "dlls/winewayland.drv/wayland.c",
+        "dlls/winewayland.drv/wayland_surface.c",
+        "dlls/winewayland.drv/waylanddrv.h",
+        "dlls/winewayland.drv/window.c",
         "dlls/winex11.drv/desktop_refresh.h",
         "dlls/winex11.drv/xrandr.c",
         "dlls/winhttp/request.c",
@@ -194,11 +200,14 @@
     },
     "proton": {
       "repository": "https://github.com/icex/Proton-UWP.git",
-      "commit": "2c9bfce9a7df5f6fdb03901eb1d4a5c57957c0fe",
+      "commit": "cb6e279c2fb373e7ea85de2d91ca19ffd60c04fe",
       "upstream": "https://github.com/xodus-gaming/Proton.git",
       "upstream_commit": "7c0b435495814349735c913fde78da906aecea52",
       "modified_paths": [
         ".gitmodules",
+        "Makefile.in",
+        "configure.sh",
+        "contrib/ferestre/Dockerfile.sdk",
         "proton",
         "vkd3d-proton",
         "wine"
