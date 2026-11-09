@@ -74,6 +74,12 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.1.21" date="2026-11-09">
+      <description>
+        <p>Keep My Library limited to owned and locally managed games instead of adding every compatibility recipe after sign-in.</p>
+        <p>Put screenshots and quick guides first in the README, with clearer installation, updates, controller and account instructions.</p>
+      </description>
+    </release>
     <release version="0.1.20" date="2026-11-07">
       <description>
         <p>Enable native Wayland HDR on supported desktops, correct fractional scaling, and expose practical 4K and ultrawide game resolutions with the updated runtime.</p>
