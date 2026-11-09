@@ -53,7 +53,7 @@ Let Ferestre download its **signed runtime** when prompted. The AppImage include
 
 Open the profile menu and choose **Sign in**. If the sign-in window needs WebKitGTK, Ferestre offers the appropriate package installation or a command for your distribution.
 
-In **Accounts**, choose the Microsoft account supplying purchases/Game Pass (**Store**) and the Xbox account you want to play as (**Player**). They can be the same account. See the [account guide](docs/ACCOUNT-SHARING-PROPOSAL.md) for separate accounts and saves.
+In **Accounts**, choose the Microsoft account supplying purchases/Game Pass (**Store**) and the Xbox account you want to play as (**Player**). They can be the same account. See the [account guide](docs/ACCOUNTS.md) for separate accounts and saves.
 
 ### 3. Install and play
 
@@ -157,7 +157,7 @@ Use `./ferestre.AppImage --help` for all commands. The window and CLI use the sa
 | [Downloads](docs/DOWNLOADS.md) | Install queues, pause/resume and progress |
 | [Updates](docs/UPDATES.md) | Signed application/runtime updates and recovery |
 | [Desktop integration](docs/DESKTOP-INTEGRATION.md) | HDR, scaling, refresh rate, window controls and performance helpers |
-| [Account roles](docs/ACCOUNT-SHARING-PROPOSAL.md) | Store/Player accounts and separate saves |
+| [Accounts](docs/ACCOUNTS.md) | Sign-in, Store/Player selection, saves and sign-out |
 | [Online presence](docs/PRESENCE.md) | What Xbox friends see while you play |
 | [Pinned source forks](docs/SOURCES.md) | Component repositories, commits and source verification |
 | [Package verification](docs/PACKAGE-SIGNATURES.md) | Microsoft package signatures and download integrity |

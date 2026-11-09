@@ -809,7 +809,10 @@ last-verified = 2026-10-10
     catalog = os.path.join(home, "cache", "ferestre", "catalog")
     os.makedirs(state, exist_ok=True)
     os.makedirs(catalog, exist_ok=True)
-    owned = [("9ZZSMOKEGDK1", "Smoke Test Racer", "MSIXVC", 12_500_000_000)]
+    owned = [
+        ("9ZZSMOKEGDK1", "Smoke Test Racer", "MSIXVC", 12_500_000_000),
+        ("9ZZBROKEN001", "Smoke Test Broken Game", "MSIXVC", 100_000_000),
+    ]
     owned += [
         (f"9ZZSMOKEUWP{n}", f"Uwp Puzzle {n}", "AppxBundle", 90_000_000) for n in range(1, 26)
     ]
@@ -1036,8 +1039,8 @@ print(":: done", flush=True)
 
         select_in_list(frame,"My Library")
         print("library, with no account")
-        # Recipes still show without an account: that is how someone sees a
-        # title is supported before buying it.
+        # Local installations and cached account titles remain usable when
+        # sign-in is unreachable. A compatibility recipe alone adds no row.
         labels = wait_for(
             frame,
             lambda root: texts(root) if any("Minecraft" in t for t in texts(root)) else None,
@@ -1046,7 +1049,7 @@ print(":: done", flush=True)
         )
         check(
             any("Minecraft" in label for label in labels),
-            "a recipe shows without anyone being signed in",
+            "an installed game remains visible while sign-in is unavailable",
             frame,
         )
         check(
