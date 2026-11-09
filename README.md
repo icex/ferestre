@@ -1,297 +1,181 @@
-<img src="packaging/icons/hicolor/scalable/apps/io.github.icex.ferestre.svg" width="96" align="left" alt="">
+<img src="packaging/icons/hicolor/scalable/apps/io.github.icex.ferestre.svg" width="64" align="left" alt="">
 
 # Ferestre
 
-Running **Xbox GDK / Microsoft Store (MSIXVC) titles on Linux**, on a patched
-Wine/Proton with a from-scratch implementation of the Xbox Game Development Kit
-runtime.
+Play compatible **Xbox PC and Microsoft Store games on Linux** using your Microsoft account, purchases and Game Pass subscription.
 
 <br clear="left">
 
-> **You need to own the games.** This project ships no game content and never
-> will. It signs in with *your* Microsoft account, uses *your* licences, and
-> downloads *your* purchases. If you do not own a title, or your account does
-> not have a Game Pass entitlement for it, there is nothing here that will let
-> you play it — and that is deliberate.
+**[Download the AppImage](https://github.com/icex/ferestre/releases/download/v0.1.21/ferestre-0.1.21-x86_64.AppImage)** · [Compatible games](docs/COMPATIBILITY.md#the-matrix) · [Quick start](#quick-start) · [Report a problem](https://github.com/icex/ferestre/issues)
 
-## Why
+![Ferestre game library in handheld fullscreen mode, with controller navigation and game-update badges](docs/screenshots/library-handheld.png)
 
-My son wanted to keep playing **Minecraft** after moving his machine from
-Windows to Linux.
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/running-game.png" alt="Resume or stop a running game from its library card"><br><strong>Switch between running games</strong></td>
+    <td width="50%"><img src="docs/screenshots/install-game.png" alt="Choose a game installation folder inside Ferestre"><br><strong>Install with a controller-friendly folder picker</strong></td>
+  </tr>
+</table>
 
-The usual answer is the Android build under an emulator, which is a different
-game: different edition, different input, different performance, and it does not
-join the servers his friends are on. The version he already owns is the Windows
-Store one, and that is a `.msixvc` package — encrypted, licence-gated, and built
-against the Xbox GDK, none of which Wine could open.
+<details>
+<summary>See the Stop confirmation dialog</summary>
 
-So the goal was narrow and specific: **let a kid play the Minecraft he already
-owns, on Linux, without pretending to be a phone.** That works now, servers and
-all. Everything else here — the GDK runtime, the launcher, the catalogue work —
-grew out of that one requirement, and the same machinery turned out to run other
-Store titles too.
+![In-app Stop confirmation with Cancel selected and controller button hints](docs/screenshots/stop-confirmation.png)
 
-## What to expect from it
+</details>
 
-This is a pet project I built for my kid over a weekend, largely vibe-coded, and
-it should be read that way. It is not a product and there is no team behind it —
-support is whatever my personal time allows, which some weeks is none.
+*Screenshots use a demo library and synthetic account data.*
 
-That said, it works, it is public, and it is open source for a reason: **please
-test it, open issues, and send pull requests.** A bug report that names a title
-and says what it did is genuinely useful, and a recipe for a title that turned
-out to need something unusual is the most useful thing anyone can contribute —
-[CONTRIBUTING.md](CONTRIBUTING.md) covers adding one, and
-[docs/RECIPES.md](docs/RECIPES.md) covers doing it by hand first. Just do not
-mistake it for something with a support contract behind it.
+## Quick start
 
-## The name
+### 1. Download and open Ferestre
 
-**Ferestre** is Romanian for **windows** — the plural of *fereastră*, the thing
-in a wall you look through, not the operating system. Romanian gets it from
-Latin *fenestra*, the same root behind French *fenêtre*, Italian *finestra* and
-the English word *defenestration*.
+You need **x86_64 Linux**, a Vulkan-capable GPU with working drivers, and the [host libraries](docs/DEPENDENCIES.md) used by the launcher and runtime. Steam can supply some video-playback dependencies.
 
-The joke is that this project runs Windows games, on Linux, by putting a window
-around them — and that the pun only works in a language Microsoft did not name
-anything after. The icon is an arched window rather than a four-pane rectangle
-for the same reason: a four-pane rectangle is somebody else's trademark.
+Download the `.AppImage` from the [latest release](https://github.com/icex/ferestre/releases/latest). Save it as `ferestre.AppImage` to use the commands below, or substitute its downloaded filename.
 
-Pronounced roughly *feh-RESS-treh*.
+```sh
+chmod +x ferestre.AppImage
+./ferestre.AppImage
+```
 
-## Application updates
+You can also make it executable through your file manager's **Properties → Permissions**, then open it normally. If FUSE mounting is unavailable, run:
 
-The app checks for newer Ferestre and runtime releases and shows an **Update** banner. One click verifies the release signatures, updates a writable AppImage and its bundled Xbox components, installs a newer runtime beside existing versions, and restarts when current work finishes. **Settings → Check for Updates** checks manually. See [signed updates and recovery](docs/UPDATES.md) for supported installations and rollback.
+```sh
+./ferestre.AppImage --appimage-extract-and-run
+```
 
-## Status
+Arch users can use the [AUR packages](packaging/aur/README.md). For source builds, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Ferestre **0.1.20** uses signed runtime **11.0.20261107.1**. It adds native Wayland HDR on supported desktops, correct fractional scaling and practical 4K/ultrawide resolutions, automatic desktop window controls and confirmed sign-out. See the [0.1.20 release notes](docs/RELEASE-0.1.20.md) for changes and tested scope.
+### 2. Set up the runtime and sign in
 
-Game updates use the existing installation directly. Reload library handles Store ticket formats correctly and reports authentication errors clearly.
+Let Ferestre download its **signed runtime** when prompted. The AppImage includes the launcher and Xbox client; the Proton/GDK runtime is a separate download.
 
-Running games offer **Resume** to return to their window and **Stop** with a confirmation dialog. Controller text entry and folder selection stay inside Ferestre. **Settings → Choose default runtime** selects the default; **game options → Choose runtime** overrides it for one game. **Use default runtime** removes that override, and choices apply to the next launch. Paused updates resume their saved destination and package metadata directly. Transfer progress distinguishes preparation, processed data, actual game-data downloads and reused bytes. Source builds use pinned `icex` forks rather than applying patch files.
+Open the profile menu and choose **Sign in**. If the sign-in window needs WebKitGTK, Ferestre offers the appropriate package installation or a command for your distribution.
 
-The full **[game list and compatibility notes](docs/COMPATIBILITY.md#the-matrix)** live in a separate document, generated from the title recipes. It includes Halo: The Master Chief Collection and records each title's tested scope and verification date. Downloading successfully does not establish that a game is playable.
+In **Accounts**, choose the Microsoft account supplying purchases/Game Pass (**Store**) and the Xbox account you want to play as (**Player**). They can be the same account. See the [account guide](docs/ACCOUNTS.md) for separate accounts and saves.
 
-## Screenshots
+### 3. Install and play
 
-Development previews use an isolated demo library and synthetic account data.
+1. Open **My Library** for your account's games and local installations, or **Game Pass** to browse the current PC catalogue.
+2. Choose a game, select **Install**, choose a library folder and confirm.
+3. Follow progress in **My Library → Install Queue**. Choose **Play** when installation finishes.
 
-![Fullscreen game library with controller navigation](docs/screenshots/library-handheld.png)
+Check the [compatibility list](docs/COMPATIBILITY.md#the-matrix) before a large download. Ferestre supports compatible **GDK/MSIXVC** games; many other Store apps use UWP/Appx/Msix formats that are currently unsupported. Game Pass access depends on your subscription, region and the title still being included. Microsoft checks the licence when installing or launching.
 
-![Running game with Resume and Stop controls](docs/screenshots/running-game.png)
+## Quick guides
 
-![Controller-friendly stop confirmation](docs/screenshots/stop-confirmation.png)
+### Pause or resume a download
 
-![Install confirmation with an in-app destination picker](docs/screenshots/install-game.png)
+Open **My Library → Install Queue** and choose **Pause** or **Resume**. The queue survives restarts and runs one transfer at a time. Resume keeps the saved destination and verified progress.
 
-Notes worth having before you try your own library:
+See [downloads and controls](docs/DOWNLOADS.md) for progress, reused data and recovery.
 
-- **Only MSIXVC packages.** That is the container Xbox GDK titles ship in.
-  Everything else in a typical Store library is UWP (`Appx`, `Msix` and their
-  bundle and encrypted variants) and this runtime cannot open it — measured on
-  one real account, that is 95 of 102 owned titles. The window holds them back
-  behind a switch that says how many there are and why, rather than mixing them
-  in. Support for them is on the roadmap and is not a small job.
-- **Game Pass lists more than any one tier grants.** The PC catalogue is
-  public — 524 titles at the time of writing — but a given subscription covers a
-  subset, and installing outside it is refused at the licence step. Those rows
-  are filtered out by default too.
+### Update a game
 
-There is a launcher: a CLI (`ferestre`) and a GTK4 window (`ferestre-gui`) that
-signs in, lists what your account owns with real names, cover art and download
-sizes, lists what a Game Pass subscription includes, installs with a progress
-bar and a time remaining, detects updates, and launches. See
-[docs/ROADMAP.md](docs/ROADMAP.md) for what is still missing and
-[docs/RECIPES.md](docs/RECIPES.md) for doing any of it by hand.
+Open **My Library → Updates**, then choose **Update**. Ferestre updates the existing installation in its current folder. A paused update offers **Resume** and continues that update.
 
-Install Queue saves downloads across restarts, with one active transfer at a time.
-Pause and Resume keep verified progress; game updates can reuse authenticated
-local pages. Touch targets and optional SDL2 controller navigation support
-handheld use. See [downloads and controls](docs/DOWNLOADS.md) for details.
+### Switch between games
 
-Active operations stay visible, and the top-right spinner's tooltip names the
-current task. Closing during a download or removal asks first: downloads stop
-and keep their game files for resuming, removals finish, and the window waits
-for cleanup before exiting.
+Running game cards show **Resume** and **Stop**. Resume returns to the existing game window. Stop opens an in-app confirmation with **Cancel** selected first.
 
-**Install to** chooses a library folder: each title gets its own folder inside
-it, and **Remove from disk** only ever deletes that title's folder. Running cards
-show **Resume** to return to the existing game window and **Stop** to open a
-confirmation dialog. **Cancel** is selected first. Confirmed Stop asks the game
-to close and allows 15 seconds before ending it; forcing an early stop also asks
-for confirmation.
+Keep Ferestre open while playing to use the controller's **Xbox/Home** or **PS** button to return to the launcher. Select another game, resume one already running, or stop it from its card.
 
-**Signed downloads.** Ferestre's own releases are signed with minisign, and
-the launcher installs only runtimes signed with the project's key
-([docs/RELEASING.md](docs/RELEASING.md)). Game downloads are checked page by
-page against the package's hash tree, and the package header against
-Microsoft's own signature, using a key the client fetches from Microsoft on
-first use ([docs/PACKAGE-SIGNATURES.md](docs/PACKAGE-SIGNATURES.md)).
+### Use a controller or handheld PC
 
-Two things the window is careful about, because both are easy to get wrong in a
-way that looks like it works. Titles whose package this runtime cannot open --
-Appx and Msix, which is most of a typical Store library -- are held back behind
-a switch that says how many there are, rather than mixed in among the ones that
-run. And a title being in the Game Pass catalogue is not the same as your
-account being entitled to it: the window says what the catalogue includes and
-which subscriptions the account holds, and lets the licence request at install
-time be the thing that decides.
+Use the header's fullscreen button or **F11** to enter the handheld layout. Button hints adapt to Xbox and PlayStation controllers.
 
-## Accounts, controllers and sign-in
+| Action | Xbox | PlayStation |
+|---|---|---|
+| Move focus | D-pad / left stick | D-pad / left stick |
+| Select | A | ✕ |
+| Back / cancel | B | ○ |
+| Game options | Menu | Options |
+| Return to Ferestre | Xbox/Home | PS |
 
-**Store and Player accounts.** Accounts settings choose the account whose
-purchases and Game Pass are used (Store) separately from the Xbox account that
-plays (Player: gamertag, achievements, saves). Both are shown before launch,
-each Player gets its own save prefix, and a running game keeps the pair it
-started with. Splitting them needs runtime 11.0.20261018.1 or newer; older
-runtimes refuse instead of launching with the wrong account. Microsoft's and
-publishers' own account-sharing rules still apply. See
-[docs/ACCOUNT-SHARING-PROPOSAL.md](docs/ACCOUNT-SHARING-PROPOSAL.md).
+Text entry, destination selection, installation, queues and confirmation dialogs work inside the app. PlayStation controllers need the [host SDL2 library](docs/DEPENDENCIES.md#sdl2-for-playstation-controllers).
 
-**Online status.** While a game started through Ferestre runs, from the
-window, a Steam shortcut or `ferestre run`, your Xbox friends see you playing
-it. Ferestre reports it with the game's own identity and reports nothing when no
-game is running. It is on by default after sign-in. To turn it off for a Player
-account, switch off **Show me online** in the account menu. The dot by your
-name says Online or Offline, as Xbox reports it; with no game running it says
-Offline. See [docs/PRESENCE.md](docs/PRESENCE.md).
+### Update Ferestre and its runtime
 
-**MCC campaign content.** Installing The Master Chief Collection automatically
-prepares its campaign packages. Play also repairs missing content before the
-game starts. Installed add-ons such as Reach show **Installed** and name their
-base game; launch MCC to play them. They need no Set up step or separate prefix.
+Open **Settings → Check for Updates**, then use the **Update** banner. Downloads are signature-checked; a writable AppImage is replaced with a backup kept for recovery. New runtimes install alongside previous versions, and a restart waits for current work to finish.
 
-**Controllers.** Xbox pads, DualShock 4 and DualSense pads reach GDK titles
-through Wine's XInput and GameInput. PlayStation pads go through SDL, which
-needs the host's SDL2 (`sdl2-compat` on Arch and Fedora). From a Steam
-shortcut, the shortcut's Steam Input layout applies without `--steam`, and
-Steam sees the game exit when it quits.
+Existing per-game runtime choices remain selected. To change one, use the game's **More actions → Choose runtime**. **Settings → Choose default runtime** sets the default; **Use default runtime** clears a game's override. Changes apply to the next launch.
 
-**Sign-in needs WebKitGTK 4.1.** The Xbox client's sign-in window is a
-WebKitGTK view. If it is missing, the window says so and offers to install it
-through your system's package manager, or shows the command.
-[docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) lists what each part needs.
+See [signed updates and rollback](docs/UPDATES.md) for supported installations. Update package-managed installations through your package manager.
 
-## How it fits together
+### Enable HDR
 
-Three layers, only one of which is unusual:
+Enable HDR in your desktop's display settings, install the current Ferestre runtime, then enable HDR in the game's video settings when available. Native Wayland HDR is supported on tested KDE/Mesa configurations; support varies by desktop, driver and game.
 
-1. **The client** — signing in, fetching your licences and content keys, and
-   downloading and decrypting the MSIXVC package. This is what the upstream
-   [Xodus](https://github.com/xodus-gaming) project already does.
-2. **The runtime** — a Proton fork whose Wine is patched so an encrypted title
-   can actually be *loaded*, plus `xgameruntime.dll`: an implementation of the
-   GDK (task queues, async, users, storage, networking, save games, packages)
-   written against the observable behaviour of the API.
-3. **The launcher** — this repository. `ferestre-core` decides everything (which
-   recipe applies, whether the runtime can satisfy it, where a title installs);
-   the CLI and the window are two faces on the same decisions, so they cannot
-   disagree. It never links the client: Xodus is GPL-3.0-only and this is MIT,
-   so the client is run as a child process — which is also the only shape that
-   works, because a decrypted executable is passed to Wine as an inherited file
-   descriptor.
+Choose a suitable rendering resolution in the game. The runtime includes 4K and scaled ultrawide modes and preserves the display's native refresh rate. See [desktop integration](docs/DESKTOP-INTEGRATION.md) for detection, window controls and performance helpers.
 
-The awkward part is that a GDK title's executable is encrypted on disk and only
-ever exists decrypted inside a memfd handed to Wine, so it cannot be started
-directly. Everything has to go through the client's `run` path.
+### Move a game or add it to Steam
 
-## What this is not
+- **Move:** open the game's **More actions → Move location**, choose an existing library folder and confirm after the space check. Ferestre verifies the move, and keeps the original if it fails or is cancelled. Saves and prefixes retain their existing locations.
+- **Steam:** close Steam, then choose **Add to Steam** in the game's menu. **Add All to Steam** in the Installed list adds all installed games. Shortcuts include available artwork and retain their identity when updated.
 
-- Not a way to play games you do not own.
-- Not a piracy tool: no content, no keys, no bypass of a title's own protection.
-  Where a title defends itself against running under Wine, it stays unsupported:
-  the job here is to tell those checks the truth, not to defeat them.
-- Not affiliated with Microsoft, Mojang, Valve, or the Xodus project.
-- Not upstreamable to Xodus: they operate a clean-room policy that excludes
-  AI-assisted contributions, so this stays a downstream fork.
+### Refresh your library
 
-## Library sizes and cached lists
+Use the top-right **Refresh** button, or **Reload library** in the profile menu, after purchases or subscription changes. Lists open from cache for speed; refresh checks them again. A failed refresh retains the last complete library.
 
-Home uses featured artwork and recent games. My Library, Game Pass and Installed
-use large cover cards with a primary action and an always-visible More menu.
-Updates keeps compact version rows. More → Game details shows full metadata.
-Cards show either measured disk usage for the game directory or the
-Store's PC download size. Wine prefixes and cached downloads are separate from
-the installed game total; unavailable sizes are labelled explicitly. Disk usage
-measurements persist across restarts and list refreshes for 24 hours. Install
-record, directory identity or manifest changes invalidate them; expired totals
-remain visible while a background scan updates them. Changes to existing files
-deep inside a game are picked up by that daily scan.
+**My Library** contains account titles, local installations and transfers in progress. **Game Pass** is the separate public PC catalogue. A game leaving Game Pass can remain installed and manageable, but still needs a valid licence to play. The [compatibility list](docs/COMPATIBILITY.md#the-matrix) lists tested games independently of what your account owns.
 
-Owned games, subscription access and the public Game Pass catalogue open from
-disk cache. Library/subscription lists, game-update checks, public Game Pass listings
-and product details are reused for 24 hours. Switching views does not repeat
-game-update queries. The top-right Refresh button forces an immediate check. Cached names and sizes appear
-immediately while stale details revalidate in the background. Changing market
-or language revalidates product details too. The refresh button bypasses cache
-freshness, including for already named games. Account changes
-invalidate cached ownership, and a detected subscription change refreshes the
-Game Pass listing. Failed or interrupted refreshes preserve the last complete
-snapshot. Closing during a list/account/update refresh exits immediately;
-downloads still stop with cleanup, and removals finish before closing.
+## Troubleshooting
 
-Add to Steam is in each game's menu, and **Add All to Steam** at the top of
-the Installed list adds every installed game at once. A shortcut saves the
-persistent AppImage target and the game's icon, with
-portrait cover, landscape cover, hero banner and title logo when the Store
-provides them. Re-adding updates the existing shortcut by launch identity or
-name and retains its Steam ID, settings, play history and custom artwork.
-Downloads are cached, and copied artwork lives in Steam's own `config/grid`
-directory. Two games that share a name, such as two editions, get a shortcut
-each. Close Steam before adding or updating a shortcut.
+| Problem | Start here |
+|---|---|
+| Sign-in will not open | Install the WebKitGTK package offered by Ferestre; see [host dependencies](docs/DEPENDENCIES.md#webkitgtk-for-sign-in). |
+| A game is missing or access is refused | Refresh the library, check the selected Store account and current Game Pass coverage. A previous subscription download does not grant permanent ownership. |
+| A game will not start | Run `./ferestre.AppImage doctor`, check the game's [compatibility notes](docs/COMPATIBILITY.md#the-matrix), and select a suitable runtime in game options. |
+| Videos are black or silent | Check [video-playback dependencies](docs/DEPENDENCIES.md#video-playback-with-current-runtimes). |
+| Controller input is missing | Check [SDL2 dependencies](docs/DEPENDENCIES.md#sdl2-for-playstation-controllers). Steam shortcuts can use Steam Input. |
+| An update needs recovery | See [update backups and rollback](docs/UPDATES.md). |
 
-### Move an installed game
+When [reporting a problem](https://github.com/icex/ferestre/issues), include the game, Ferestre/runtime versions, Linux distribution and what happened. Review logs for personal information before sharing them.
 
-In a game's **More actions** menu, choose **Move location**, select an existing
-library folder. Ferestre automatically shows the game's size, its new folder
-and the space available. **Move** stays disabled while checking or if there
-isn't enough space. The window shows
-progress and offers **Cancel Move**.
+## Command line
 
-The CLI does the same with `ferestre move PRODUCT-ID /path/to/library`.
-`ferestre --json move PRODUCT-ID /path/to/library` checks the plan without
-moving files. An existing destination is never merged or overwritten, and a
-running game cannot be moved.
+The AppImage also accepts CLI commands:
 
-Across drives, Ferestre copies and verifies the files before updating the
-installation record and removing the original. Cancellation or a copy failure
-keeps the original installation. On one filesystem it stages hard links without
-duplicating the game data. Prefixes and saved games keep their existing paths;
-launches and Steam shortcuts follow the updated installation record.
+```sh
+./ferestre.AppImage doctor
+./ferestre.AppImage library
+./ferestre.AppImage install PRODUCT-ID
+./ferestre.AppImage run PRODUCT-ID
+./ferestre.AppImage updates
+./ferestre.AppImage check-app-updates
+```
 
-## Documentation
+Use `./ferestre.AppImage --help` for all commands. The window and CLI use the same installation records and launch decisions. [Recipes and advanced setup](docs/RECIPES.md) cover custom paths and manual troubleshooting.
 
-- [Desktop integration](docs/DESKTOP-INTEGRATION.md): automatic window-button
-  layout, HDR/display detection, refresh-rate correction and performance helpers.
+## Documentation and development
 
-- [Pinned source forks](docs/SOURCES.md) — component repositories, exact commits and source-build checks.
+| Guide | Covers |
+|---|---|
+| [Game compatibility](docs/COMPATIBILITY.md) | Tested titles, limitations and verification dates |
+| [Dependencies](docs/DEPENDENCIES.md) | Distribution-specific sign-in, graphics, video and controller libraries |
+| [Downloads](docs/DOWNLOADS.md) | Install queues, pause/resume and progress |
+| [Updates](docs/UPDATES.md) | Signed application/runtime updates and recovery |
+| [Desktop integration](docs/DESKTOP-INTEGRATION.md) | HDR, scaling, refresh rate, window controls and performance helpers |
+| [Accounts](docs/ACCOUNTS.md) | Sign-in, Store/Player selection, saves and sign-out |
+| [Online presence](docs/PRESENCE.md) | What Xbox friends see while you play |
+| [Pinned source forks](docs/SOURCES.md) | Component repositories, commits and source verification |
+| [Package verification](docs/PACKAGE-SIGNATURES.md) | Microsoft package signatures and download integrity |
+| [Contributing](CONTRIBUTING.md) | Build, test and add game recipes |
+| [Roadmap](docs/ROADMAP.md) | Current work and planned support |
+| [Releasing](docs/RELEASING.md) | Release builds and signing |
+| [Debugging notes](notes/) | Technical investigations |
 
-- [docs/RECIPES.md](docs/RECIPES.md) — build the runtime, sign in, download a
-  title, launch it. Machine-independent; every script takes its paths from
-  `XODUS_*` environment variables.
-- [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) — every title that has been
-  run, generated from the recipes, and how to report one.
-- [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) — host libraries for video,
-  controllers and sign-in, per distribution.
-- [docs/PRESENCE.md](docs/PRESENCE.md) — what friends see while you play, and
-  how to turn it off.
-- [docs/PACKAGE-SIGNATURES.md](docs/PACKAGE-SIGNATURES.md) — how downloads are
-  held to Microsoft's signature, and where the key comes from.
-- [docs/ROADMAP.md](docs/ROADMAP.md) — the plan for turning this into a launcher.
-- [notes/](notes/) — the debugging write-ups. Worth reading if you want to know
-  *why* something is the way it is; several were genuinely hard to find.
-- [CONTRIBUTING.md](CONTRIBUTING.md) — building (Rust 1.88 or newer), adding a
-  title, running the tests.
-- [docs/RELEASING.md](docs/RELEASING.md) — cutting a release, and the minisign
-  key that signs it.
+Current releases: **[Ferestre 0.1.21](https://github.com/icex/ferestre/releases/tag/v0.1.21)** and **[runtime 11.0.20261107.1](https://github.com/icex/ferestre/releases/tag/runtime-11.0.20261107.1)**. Read the [release notes](docs/RELEASE-0.1.21.md) for tested scope.
+
+## About the project
+
+Ferestre began with a simple goal: let my son play the Windows Store version of Minecraft he already owned after moving to Linux. The launcher, catalogue and runtime support grew from that work.
+
+It is a personal open-source project, with support as time allows. Reports, game recipes and pull requests are welcome. **Ferestre** is Romanian for **windows**, pronounced roughly *feh-RESS-treh*.
+
+Ferestre uses a Microsoft Store/Xbox client for authentication and downloads, a Wine/Proton runtime with an implementation of the Xbox GDK, and this launcher. It signs in with your account and ships no game content. It is independent of Microsoft, Mojang, Valve and the upstream Xodus project.
 
 ## Licence
 
-Mixed, because the work is. MIT for the original tooling, tests, scripts and
-notes; LGPL-2.1-or-later for the Wine, xgameruntime and vkd3d-proton forks; GPL-3.0-only for the Xodus client; BSD-3-Clause for Proton’s top-level components. [NOTICE](NOTICE) has the map.
-
-One consequence worth knowing before building on this: Xodus is GPL-3.0, and it
-is what signs in and downloads. A launcher that *shells out* to the `xodus-cli`
-binary is aggregation and may carry any licence; one that *links* the `xodus` or
-`msixvc` crates becomes GPL-3.0 itself.
+MIT for the original launcher, scripts and tests; LGPL-2.1-or-later for the Wine, xgameruntime and vkd3d-proton forks; GPL-3.0-only for the Xodus client; BSD-3-Clause for Proton's top-level components. [NOTICE](NOTICE) records component provenance and licences. The launcher invokes the client as a separate process.

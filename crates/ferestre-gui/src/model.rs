@@ -860,27 +860,34 @@ impl LibraryRow {
     }
 }
 
-/// Every title worth a row: everything owned, plus everything described once
-/// an account has supplied a library, plus what is installed on disk.
-///
-/// The union rather than the intersection, deliberately. A recipe for something
-/// this account does not own still belongs on screen -- it is how someone finds
-/// out the launcher supports a game before buying it -- and an owned title with
-/// no recipe is the most useful row in the list, because it is the one someone
-/// can do something about.
+/// The account's titles, local installations and transfers in progress.
+/// Compatibility recipes describe how to run games; their presence alone does
+/// not put those games in the account's library. Game Pass discovery has its
+/// own view, and the complete compatibility list lives in the documentation.
 pub fn library(inputs: &Inputs) -> Vec<LibraryRow> {
     let mut rows: BTreeMap<String, LibraryRow> = BTreeMap::new();
 
-    // A packaged recipe is a compatibility description, not proof that this
-    // machine owns or installed the game. Showing all of them before sign-in
-    // made a fresh AppImage look like it had populated somebody's library.
-    // Keep a recipe-backed row for an on-disk record, and otherwise wait for
-    // the account listing that turns a catalogue of support into a library.
+    let mut owned = BTreeSet::new();
+    if let Ownership::Known(entries) = inputs.ownership {
+        for entry in entries.iter().filter(|entry| entry.is_title()) {
+            let key = entry.product_id.to_ascii_uppercase();
+            owned.insert(key.clone());
+            if let Some(product) = inputs.catalog.get(&key) {
+                owned.extend(product.bundled_ids.iter().map(|id| id.to_ascii_uppercase()));
+            }
+        }
+    }
+
+    // Keep local titles even after subscription access ends, so they can still
+    // be managed. Transfers and running games must not disappear on refresh.
     for recipe in inputs.recipes {
         let key = recipe.title.product_id.to_ascii_uppercase();
-        if !matches!(inputs.ownership, Ownership::Unknown)
+        if owned.contains(&key)
             || (inputs.installed)(recipe)
             || inputs.records.contains_key(&key)
+            || (inputs.installing)(&key)
+            || (inputs.incomplete)(&key)
+            || (inputs.running)(&key)
         {
             rows.insert(key.clone(), described_row(inputs, recipe, &key));
         }
@@ -2124,7 +2131,7 @@ HTTP 401 Unauthorized",
     // --- the library view -------------------------------------------------
 
     #[test]
-    fn the_library_is_the_union_of_what_is_owned_and_what_is_described() {
+    fn the_library_includes_owned_titles_and_local_installations() {
         let recipes = vec![
             recipe("9ZZTESTGAME1", "playable", &[]),
             recipe("9ZZTESTGAME2", "playable", &[]),
@@ -2159,7 +2166,7 @@ HTTP 401 Unauthorized",
 
         let by_id: BTreeMap<&str, &LibraryRow> =
             rows.iter().map(|r| (r.product_id.as_str(), r)).collect();
-        assert_eq!(by_id.len(), 3, "owned, described, and both");
+        assert_eq!(by_id.len(), 3, "owned, installed, and both");
 
         let owned_and_described = by_id["9ZZTESTGAME1"];
         assert!(owned_and_described.owned && owned_and_described.has_recipe);
@@ -2169,7 +2176,7 @@ HTTP 401 Unauthorized",
         assert!(!described_not_owned.owned && described_not_owned.has_recipe);
         assert!(
             !matches!(described_not_owned.action, Action::Adopt),
-            "a recipe for something unowned still belongs on screen"
+            "an installed title stays manageable without an ownership entry"
         );
 
         let owned_not_described = by_id["9ZZTESTNEW3"];
@@ -2183,6 +2190,80 @@ HTTP 401 Unauthorized",
             "{}",
             owned_not_described.subtitle
         );
+    }
+
+    #[test]
+    fn removed_access_drops_uninstalled_recipes_from_the_library() {
+        let recipes = vec![
+            recipe("9PPT8K6GQHRZ", "playable", &[]),
+            recipe("9ZZPURCHASED", "playable", &[]),
+            recipe("9ZZEXPIRED", "playable", &[]),
+            recipe("9ZZREVOKED", "playable", &[]),
+        ];
+        let rt = runtime_with(&[], CapabilitySource::Manifest);
+        let before = Ownership::Known(entries(&["9PPT8K6GQHRZ", "9ZZPURCHASED"]));
+        assert_eq!(
+            library(&inputs(&recipes, Some(&rt), &before, NOTHING_INSTALLED)).len(),
+            2
+        );
+        let mut refreshed = entries(&["9ZZPURCHASED", "9ZZEXPIRED", "9ZZREVOKED"]);
+        refreshed[1].status = ferestre_core::library::EntitlementStatus::Expired;
+        refreshed[2].status = ferestre_core::library::EntitlementStatus::Revoked;
+        let after = Ownership::Known(refreshed);
+        let rows = library(&inputs(&recipes, Some(&rt), &after, NOTHING_INSTALLED));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].product_id, "9ZZPURCHASED");
+        assert!(rows[0].owned && rows[0].has_recipe);
+        assert_eq!(rows[0].action, Action::Install);
+
+        let installed = |recipe: &Recipe| recipe.matches("9PPT8K6GQHRZ");
+        let rows = library(&inputs(&recipes, Some(&rt), &after, &installed));
+        assert_eq!(rows.len(), 2, "keep the installed game after access ends");
+        assert!(rows
+            .iter()
+            .any(|row| row.product_id == "9PPT8K6GQHRZ" && row.installed));
+    }
+
+    #[test]
+    fn an_active_owned_bundle_keeps_its_described_children() {
+        let recipes = vec![recipe("9ZZCHILD", "playable", &[])];
+        let mut bundle = product("9ZZBUNDLE", "Purchased bundle", &[]);
+        bundle.bundled_ids = vec!["9zzchild".into()];
+        let catalog = catalog(vec![bundle]);
+        let mut entitlements = entries(&["9zzbundle"]);
+        let ownership = Ownership::Known(entitlements.clone());
+        let mut fixture = inputs(&recipes, None, &ownership, NOTHING_INSTALLED);
+        fixture.catalog = &catalog;
+        let rows = library(&fixture);
+        assert!(rows
+            .iter()
+            .any(|row| row.product_id == "9ZZCHILD" && row.has_recipe));
+        assert!(rows
+            .iter()
+            .any(|row| row.product_id.eq_ignore_ascii_case("9ZZBUNDLE") && row.owned));
+
+        entitlements[0].status = ferestre_core::library::EntitlementStatus::Expired;
+        let ownership = Ownership::Known(entitlements);
+        fixture.ownership = &ownership;
+        assert!(library(&fixture).is_empty());
+    }
+
+    #[test]
+    fn library_refresh_keeps_transfers_and_running_recipe_titles() {
+        let recipes = vec![recipe("9ZZINPROGRESS", "playable", &[])];
+        let ownership = Ownership::Known(Vec::new());
+        let present = |_: &str| true;
+        for state in ["downloading", "paused", "running"] {
+            let mut fixture = inputs(&recipes, None, &ownership, NOTHING_INSTALLED);
+            match state {
+                "downloading" => fixture.installing = &present,
+                "paused" => fixture.incomplete = &present,
+                _ => fixture.running = &present,
+            }
+            let rows = library(&fixture);
+            assert_eq!(rows.len(), 1, "{state} stays manageable on refresh");
+            assert_eq!(rows[0].product_id, "9ZZINPROGRESS");
+        }
     }
 
     #[test]

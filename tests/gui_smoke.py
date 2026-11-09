@@ -765,13 +765,11 @@ last-verified = 2026-10-10
     with open(os.path.join(runtime, "version"), "w") as f:
         f.write("0 smoke-test-runtime\n")
     wanted = set()
-    recipe_count = 0
     for name in os.listdir(recipes_dir):
         if not name.endswith(".toml") or name == "capabilities.toml":
             continue
         with open(os.path.join(recipes_dir, name), "rb") as f:
             recipe = tomllib.load(f)
-        recipe_count += 1
         wanted |= set(recipe.get("runtime", {}).get("requires", []))
         wanted |= set(recipe.get("runtime", {}).get("wants", []))
     with open(os.path.join(runtime, "files", "share", "ferestre", "capabilities.json"), "w") as f:
@@ -791,10 +789,9 @@ last-verified = 2026-10-10
     # instead of product ids, the filter that keeps the unrunnable majority out
     # of the way, and the confirmation before a download starts.
     #
-    # The proportions are the real ones. Of 102 titles owned on the development
-    # account exactly seven ship as MSIXVC; the rest are UWP packages this
-    # runtime cannot open. A fixture with one of each would pass a filter that
-    # is useless at the size that matters.
+    # A sizeable unsupported group exercises filtering and its explanation.
+    # Explicit owned games below also give the scrolling checks enough rows;
+    # unrelated compatibility recipes must not be used to populate a library.
     # The cache refuses an entry written by a different build, which is the
     # whole point of the field -- so a fixture that hardcodes a number seeds a
     # cache the window correctly ignores, and every check below times out
@@ -809,7 +806,15 @@ last-verified = 2026-10-10
     catalog = os.path.join(home, "cache", "ferestre", "catalog")
     os.makedirs(state, exist_ok=True)
     os.makedirs(catalog, exist_ok=True)
-    owned = [("9ZZSMOKEGDK1", "Smoke Test Racer", "MSIXVC", 12_500_000_000)]
+    owned = [
+        ("9ZZSMOKEGDK1", "Smoke Test Racer", "MSIXVC", 12_500_000_000),
+        ("9ZZBROKEN001", "Smoke Test Broken Game", "MSIXVC", 100_000_000),
+        ("9NNX1VVR3KNQ", "Forza Horizon 5", "MSIXVC", 1_000_000_000),
+    ]
+    owned += [
+        (f"9ZZSCROL{n:04}", f"ZZ Scroll Fixture {n}", "MSIXVC", 100_000_000)
+        for n in range(1, 9)
+    ]
     owned += [
         (f"9ZZSMOKEUWP{n}", f"Uwp Puzzle {n}", "AppxBundle", 90_000_000) for n in range(1, 26)
     ]
@@ -1036,8 +1041,8 @@ print(":: done", flush=True)
 
         select_in_list(frame,"My Library")
         print("library, with no account")
-        # Recipes still show without an account: that is how someone sees a
-        # title is supported before buying it.
+        # Local installations and cached account titles remain usable when
+        # sign-in is unreachable. A compatibility recipe alone adds no row.
         labels = wait_for(
             frame,
             lambda root: texts(root) if any("Minecraft" in t for t in texts(root)) else None,
@@ -1046,7 +1051,7 @@ print(":: done", flush=True)
         )
         check(
             any("Minecraft" in label for label in labels),
-            "a recipe shows without anyone being signed in",
+            "an installed game remains visible while sign-in is unavailable",
             frame,
         )
         check(
@@ -1442,22 +1447,20 @@ print(":: done", flush=True)
             "the library to come back",
             time.monotonic() + TIMEOUT,
         )
-        # One per recipe, counted from titles/ rather than written down here.
-        # This used to assert a literal 3 and went stale the moment a fourth
-        # recipe landed -- it then failed on every commit that added a title,
-        # which is exactly the commit whose author has least reason to suspect
-        # the GUI suite.
+        # Only recipe-backed games in this fixture's library have these
+        # actions. Adding an unrelated support recipe must not add a row.
+        recipe_titles = {"Minecraft for Windows", "Smoke Test Broken Game", "Forza Horizon 5"}
         offered = {name: row_menu_offers(app, frame, name) for name in list(row_menus(frame))}
         edit = [name for name, items in offered.items() if "Edit launch settings" in items]
         steam = [name for name, items in offered.items() if "Add to Steam" in items]
         check(
-            len(edit) == recipe_count,
-            f"every recipe offers an edit ({len(edit)} menus for {recipe_count} recipes)",
+            set(edit) == recipe_titles,
+            f"each managed recipe offers an edit ({edit!r})",
             frame,
         )
         check(
-            len(steam) == recipe_count,
-            f"and an Add to Steam ({len(steam)} for {recipe_count} recipes)",
+            set(steam) == recipe_titles,
+            f"each managed recipe offers Add to Steam ({steam!r})",
             frame,
         )
         check(
