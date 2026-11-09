@@ -812,6 +812,7 @@ last-verified = 2026-10-10
     owned = [
         ("9ZZSMOKEGDK1", "Smoke Test Racer", "MSIXVC", 12_500_000_000),
         ("9ZZBROKEN001", "Smoke Test Broken Game", "MSIXVC", 100_000_000),
+        ("9NNX1VVR3KNQ", "Forza Horizon 5", "MSIXVC", 1_000_000_000),
     ]
     owned += [
         (f"9ZZSMOKEUWP{n}", f"Uwp Puzzle {n}", "AppxBundle", 90_000_000) for n in range(1, 26)
