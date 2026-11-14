@@ -58,10 +58,7 @@ fn observed(root: &Path, uid: u32, tag: &str, executable: &str) -> bool {
         let Ok(env) = std::fs::read(dir.join("environ")) else {
             return false;
         };
-        if !env.split(|b| *b == 0).any(|v| v == expected.as_bytes()) {
-            return false;
-        }
-        true
+        env.split(|b| *b == 0).any(|v| v == expected.as_bytes())
     })
 }
 pub fn mark_ready(launches: &mut BTreeMap<String, stop::Launch>, key: &str, pgid: u32) -> bool {

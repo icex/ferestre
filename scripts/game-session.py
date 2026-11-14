@@ -186,7 +186,12 @@ def selection(env, runtime, screen, gamescope_available):
     if any(key in policy and not enabled(policy[key])
            for key in ('PROTON_ENABLE_HDR', 'PROTON_USE_HDR', 'DXVK_HDR')):
         hdr = False
-    native = screen is not None and driver is not None
+    # A driver and an HDR monitor establish capability, not compatibility
+    # with this game. In particular, global Proton flags reach every title.
+    # Only a tested recipe or a deliberate Ferestre opt-in selects native
+    # Wayland; automatic launches retain XWayland.
+    opted_in = env.get('FERESTRE_NATIVE_WAYLAND') == '1'
+    native = opted_in and screen is not None and driver is not None
     # Older drivers use Wine's DPI for the Wayland viewport. On a scaled
     # desktop this enlarges/crops child rendering surfaces. Preserve XWayland
     # until the selected runtime can consume the compositor's actual scale.
@@ -198,14 +203,35 @@ def selection(env, runtime, screen, gamescope_available):
     if 'WINE_GRAPHICS_DRIVER' in policy and policy['WINE_GRAPHICS_DRIVER'] != 'wayland':
         native = False
     already_nested = bool(env.get('GAMESCOPE_WAYLAND_DISPLAY'))
-    use_gamescope = (hdr and not native_hdr(driver) and gamescope_available and not already_nested
-                     and env.get('FERESTRE_GAMESCOPE') == '1'
-                     and (driver is None or not any(enabled(policy.get(k, ''))
-                                                    for k in ('PROTON_ENABLE_WAYLAND', 'PROTON_USE_WAYLAND'))))
+    use_gamescope = (hdr and not native and gamescope_available and not already_nested
+                     and env.get('FERESTRE_GAMESCOPE') == '1')
     if already_nested:
         native = False
     if use_gamescope:
         native = False
+    if not native:
+        # Override inherited/global settings in the child only. Removing a
+        # variable is insufficient when Proton's user_settings.py sets it.
+        for key in ('PROTON_ENABLE_WAYLAND', 'PROTON_USE_WAYLAND'):
+            if key in policy:
+                result[key] = '0'
+        if 'WINE_GRAPHICS_DRIVER' in policy:
+            result['WINE_GRAPHICS_DRIVER'] = 'x11'
+        # Upstream Wine can fall through to Wayland when X11 is unavailable,
+        # and does not consume all Proton-specific driver flags. Make the
+        # compatibility choice explicit while retaining unrelated DLL policy.
+        overrides = []
+        for group in policy.get('WINEDLLOVERRIDES', '').split(';'):
+            names, separator, value = group.partition('=')
+            names = ','.join(name for name in names.split(',')
+                             if name.strip().lower() not in ('winex11.drv', 'winewayland.drv'))
+            if names and separator:
+                overrides.append(names + '=' + value)
+        result['WINEDLLOVERRIDES'] = ';'.join([*overrides, 'winex11.drv=b', 'winewayland.drv=d'])
+        if not use_gamescope and not already_nested:
+            for key in ('PROTON_ENABLE_HDR', 'PROTON_USE_HDR', 'DXVK_HDR'):
+                if key in policy:
+                    result[key] = '0'
     if native:
         if not any(k in policy for k in ('PROTON_ENABLE_WAYLAND', 'PROTON_USE_WAYLAND')):
             result['PROTON_ENABLE_WAYLAND'] = '1'
@@ -415,8 +441,8 @@ def run(command, env, screen):
                 print('-- HDR compositor unavailable; continuing without compositor HDR', file=sys.stderr)
         elif native:
             print(':: using the selected runtime\'s native Wayland display driver', file=sys.stderr)
-        elif screen and screen['hdr']:
-            print('-- selected runtime has no native Wayland HDR support; existing display settings were kept', file=sys.stderr)
+        elif not env.get('GAMESCOPE_WAYLAND_DISPLAY'):
+            print(':: using the compatibility display path (XWayland on a Wayland desktop); native Wayland requires FERESTRE_NATIVE_WAYLAND=1', file=sys.stderr)
         if wrapper == 'gamemoderun':
             command = ['gamemoderun', *command]
         if pending:

@@ -130,17 +130,66 @@ class SelectionTests(unittest.TestCase):
         write(self.runtime / 'files/lib/wine/x86_64-windows/winewayland.drv', 'driver')
         write(self.runtime / 'files/share/default_pfx/drive_c/windows/system32/winewayland.drv', 'driver')
 
+    def test_driver_presence_and_desktop_hdr_do_not_qualify_a_game_for_wayland(self):
+        self.driver()
+        original = dict(WAYLAND, DISPLAY=':0', PROTON_ENABLE_WAYLAND='1',
+                        PROTON_ENABLE_HDR='1', DXVK_HDR='1')
+        env, nested, native = session.selection(original, self.runtime, HDR, True)
+        self.assertFalse(native)
+        self.assertFalse(nested)
+        self.assertEqual(env['DISPLAY'], ':0')
+        for key in ('PROTON_ENABLE_WAYLAND', 'PROTON_ENABLE_HDR', 'DXVK_HDR'):
+            self.assertEqual(env[key], '0')
+        self.assertEqual(original['PROTON_ENABLE_WAYLAND'], '1')
+        self.assertIn('winewayland.drv=d', env['WINEDLLOVERRIDES'])
+
+    def test_compatibility_cannot_fall_through_to_wayland_without_an_x_display(self):
+        self.driver()
+        env, _, native = session.selection(dict(WAYLAND,
+            WINEDLLOVERRIDES='GameInput=n,b;winex11.drv,winewayland.drv=b;d3d12=n'),
+            self.runtime, HDR, False)
+        self.assertFalse(native)
+        self.assertIn('winewayland.drv=d', env['WINEDLLOVERRIDES'])
+        self.assertIn('winex11.drv=b', env['WINEDLLOVERRIDES'])
+        self.assertIn('GameInput=n,b', env['WINEDLLOVERRIDES'])
+        self.assertIn('d3d12=n', env['WINEDLLOVERRIDES'])
+        self.assertNotIn('DISPLAY', env)
+
+    def test_automatic_mode_overrides_unsafe_proton_user_settings_only_for_the_child(self):
+        self.driver()
+        settings = self.runtime / 'user_settings.py'
+        for value in ("'1'", "str(1)"):
+            with self.subTest(value=value):
+                text = ("user_settings={'PROTON_USE_WAYLAND':" + value + ", 'PROTON_USE_HDR':" + value
+                        + ", 'WINE_GRAPHICS_DRIVER': ''.join(['way', 'land'])}")
+                write(settings, text)
+                env, _, native = session.selection(dict(WAYLAND, DISPLAY=':0'), self.runtime, HDR, False)
+                self.assertFalse(native)
+                self.assertEqual(env['PROTON_USE_WAYLAND'], '0')
+                self.assertEqual(env['PROTON_USE_HDR'], '0')
+                self.assertEqual(env['WINE_GRAPHICS_DRIVER'], 'x11')
+                self.assertEqual(settings.read_text(), text)
+
+    def test_explicit_gamescope_can_use_hdr_even_when_a_native_driver_exists(self):
+        self.driver()
+        env, nested, native = session.selection(dict(WAYLAND, DISPLAY=':0',
+            PROTON_ENABLE_WAYLAND='1', FERESTRE_GAMESCOPE='1'), self.runtime, HDR, True)
+        self.assertFalse(native)
+        self.assertTrue(nested)
+        self.assertEqual(env['PROTON_ENABLE_WAYLAND'], '0')
+        self.assertEqual(env['DXVK_HDR'], '1')
+
     def test_incomplete_wayland_prefix_template_keeps_the_regular_display(self):
         self.driver()
         (self.runtime / 'files/share/default_pfx/drive_c/windows/system32/winewayland.drv').unlink()
-        env, nested, native = session.selection(WAYLAND, self.runtime, HDR, True)
+        env, nested, native = session.selection(dict(WAYLAND, FERESTRE_NATIVE_WAYLAND='1'), self.runtime, HDR, True)
         self.assertFalse(native); self.assertFalse(nested)
         self.assertEqual(env['WAYLAND_DISPLAY'], WAYLAND['WAYLAND_DISPLAY'])
         self.assertNotIn('PROTON_USE_XALIA', env)
 
     def test_capable_runtime_gets_wayland_hdr_and_compositor_refresh(self):
         self.driver()
-        env, nested, native = session.selection(WAYLAND, self.runtime, HDR, True)
+        env, nested, native = session.selection(dict(WAYLAND, FERESTRE_NATIVE_WAYLAND='1'), self.runtime, HDR, True)
         self.assertFalse(nested); self.assertTrue(native)
         for key in ('PROTON_ENABLE_WAYLAND', 'PROTON_ENABLE_HDR', 'DXVK_HDR'):
             self.assertEqual(env[key], '1')
@@ -155,7 +204,7 @@ class SelectionTests(unittest.TestCase):
     def test_wayland_flag_on_a_runtime_without_the_driver_still_allows_hdr_fallback(self):
         env, nested, native = session.selection(dict(WAYLAND, PROTON_ENABLE_WAYLAND='1', FERESTRE_GAMESCOPE='1'), self.runtime, HDR, True)
         self.assertTrue(nested); self.assertFalse(native)
-        self.assertEqual(env['PROTON_ENABLE_WAYLAND'], '1')
+        self.assertEqual(env['PROTON_ENABLE_WAYLAND'], '0')
         self.assertEqual(env['DXVK_HDR'], '1')
 
     def test_missing_wayland_driver_never_wraps_a_normal_launch(self):
@@ -167,26 +216,26 @@ class SelectionTests(unittest.TestCase):
 
     def test_host_vulkan_handles_hdr_without_protocol_markers_in_wine(self):
         self.driver(hdr=False)
-        env, nested, native = session.selection(WAYLAND, self.runtime, HDR, True)
+        env, nested, native = session.selection(dict(WAYLAND, FERESTRE_NATIVE_WAYLAND='1'), self.runtime, HDR, True)
         self.assertTrue(native); self.assertFalse(nested)
         self.assertEqual(env['DXVK_HDR'], '1')
 
     def test_scaled_desktop_requires_fractional_scaling_in_the_driver(self):
         self.driver(hdr=False)
-        env, nested, native = session.selection(WAYLAND, self.runtime, dict(HDR, scale=1.5), True)
+        env, nested, native = session.selection(dict(WAYLAND, FERESTRE_NATIVE_WAYLAND='1'), self.runtime, dict(HDR, scale=1.5), True)
         self.assertFalse(native); self.assertFalse(nested)
         self.assertNotIn('PROTON_ENABLE_WAYLAND', env)
         self.assertNotIn('DXVK_HDR', env)
         driver = self.runtime / 'files/lib/wine/x86_64-unix/winewayland.so'
         write(driver, 'wp_fractional_scale_manager_v1')
-        env, nested, native = session.selection(WAYLAND, self.runtime, dict(HDR, scale=1.5), True)
+        env, nested, native = session.selection(dict(WAYLAND, FERESTRE_NATIVE_WAYLAND='1'), self.runtime, dict(HDR, scale=1.5), True)
         self.assertTrue(native); self.assertFalse(nested)
         self.assertEqual(env['DXVK_HDR'], '1')
 
     def test_native_defaults_keep_game_overrides_and_disable_incompatible_helpers(self):
         self.driver(hdr=False)
         write(self.runtime / 'proton', '#!/bin/sh\n# legacy runtime\n')
-        env, _, native = session.selection(dict(WAYLAND, WINEDLLOVERRIDES='GameInput=b'), self.runtime, HDR, True)
+        env, _, native = session.selection(dict(WAYLAND, FERESTRE_NATIVE_WAYLAND='1', WINEDLLOVERRIDES='GameInput=b'), self.runtime, HDR, True)
         self.assertTrue(native)
         self.assertIn('GameInput=b', env['WINEDLLOVERRIDES'])
         self.assertIn('winex11.drv=d', env['WINEDLLOVERRIDES'])
@@ -199,7 +248,7 @@ class SelectionTests(unittest.TestCase):
         self.driver()
         write(self.runtime / 'proton', '#!/bin/sh\n# legacy runtime\n')
         write(self.runtime / 'user_settings.py', "user_settings={'PROTON_USE_XALIA':'1', 'WINEDLLOVERRIDES':'GameInput=n,b;winewayland.drv=n,b'}")
-        env, _, _ = session.selection(WAYLAND, self.runtime, HDR, True)
+        env, _, _ = session.selection(dict(WAYLAND, FERESTRE_NATIVE_WAYLAND='1'), self.runtime, HDR, True)
         self.assertNotIn('PROTON_USE_XALIA', env)
         self.assertIn('GameInput=n,b', env['WINEDLLOVERRIDES'])
         self.assertIn('winewayland.drv=n,b', env['WINEDLLOVERRIDES'])
@@ -227,8 +276,8 @@ class SelectionTests(unittest.TestCase):
         write(self.runtime / 'user_settings.py', "user_settings = {'PROTON_ENABLE_WAYLAND':'0', 'PROTON_ENABLE_HDR':'0'}\n")
         env, nested, native = session.selection(WAYLAND, self.runtime, HDR, True)
         self.assertFalse(native); self.assertFalse(nested)
-        self.assertNotIn('PROTON_ENABLE_WAYLAND', env)
-        self.assertNotIn('PROTON_ENABLE_HDR', env)
+        self.assertEqual(env['PROTON_ENABLE_WAYLAND'], '0')
+        self.assertEqual(env['PROTON_ENABLE_HDR'], '0')
 
     def test_user_settings_are_never_executed_by_detection(self):
         marker = self.root / 'executed'
@@ -251,6 +300,8 @@ class SessionProcessTests(unittest.TestCase):
             write(runtime / 'proton', f'#!{sys.executable}\nimport os,sys\nfrom pathlib import Path\n'
                   "if sys.argv[1:3]==['run','reg']:sys.exit(0)\n"
                   "assert os.environ['FERESTRE_DESKTOP_SESSION_READY']=='1'\n"
+                  "assert os.environ['PROTON_ENABLE_WAYLAND']=='0'\n"
+                  "assert os.environ['DXVK_HDR']=='0'\n"
                   "Path(os.environ['RECEIPT']).write_bytes(os.pread(int(os.environ['IMAGE_FD']),14,0))\n")
             fd = os.memfd_create('licensed-shim-fixture', 0)
             try:
@@ -259,6 +310,7 @@ class SessionProcessTests(unittest.TestCase):
                            XODUS_GAMES_DIR=str(root / 'games'), STEAM_COMPAT_DATA_PATH=str(root / 'prefix'),
                            FERESTRE_DESKTOP_INTEGRATION='1', FERESTRE_PERFORMANCE='0',
                            XDG_SESSION_TYPE='x11', IMAGE_FD=str(fd),
+                           PROTON_ENABLE_WAYLAND='1', DXVK_HDR='1',
                            WINE_DLL_FILE_MAP=f'Game With Spaces.exe={fd}', RECEIPT=str(root / 'receipt'),
                            PROTON_DISABLE_HIDRAW='')
                 env.pop('FERESTRE_IMAGE_VIEW', None)
