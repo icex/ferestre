@@ -204,8 +204,12 @@ jobs:
       # restriction for this runner before any test runs, and tell the tests
       # a skip is a failure here.
       - name: Allow unprivileged user namespaces
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
         run: |
-          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+          # Self-hosted isolation is configured by the runner administrator;
+          # its no-new-privileges boundary deliberately rejects sudo.
+          if [ "$RUNNER_KIND" != self-hosted ] && [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
               sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           unshare --user --map-root-user --mount true
@@ -296,8 +300,12 @@ jobs:
 
       # As in `test`: the namespace tests must run, not skip.
       - name: Allow unprivileged user namespaces
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
         run: |
-          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+          # Self-hosted isolation is configured by the runner administrator;
+          # its no-new-privileges boundary deliberately rejects sudo.
+          if [ "$RUNNER_KIND" != self-hosted ] && [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
               sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           unshare --user --map-root-user --mount true
