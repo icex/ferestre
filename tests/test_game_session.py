@@ -141,7 +141,19 @@ class SelectionTests(unittest.TestCase):
         for key in ('PROTON_ENABLE_WAYLAND', 'PROTON_ENABLE_HDR', 'DXVK_HDR'):
             self.assertEqual(env[key], '0')
         self.assertEqual(original['PROTON_ENABLE_WAYLAND'], '1')
-        self.assertNotIn('WINEDLLOVERRIDES', env)
+        self.assertIn('winewayland.drv=d', env['WINEDLLOVERRIDES'])
+
+    def test_compatibility_cannot_fall_through_to_wayland_without_an_x_display(self):
+        self.driver()
+        env, _, native = session.selection(dict(WAYLAND,
+            WINEDLLOVERRIDES='GameInput=n,b;winex11.drv,winewayland.drv=b;d3d12=n'),
+            self.runtime, HDR, False)
+        self.assertFalse(native)
+        self.assertIn('winewayland.drv=d', env['WINEDLLOVERRIDES'])
+        self.assertIn('winex11.drv=b', env['WINEDLLOVERRIDES'])
+        self.assertIn('GameInput=n,b', env['WINEDLLOVERRIDES'])
+        self.assertIn('d3d12=n', env['WINEDLLOVERRIDES'])
+        self.assertNotIn('DISPLAY', env)
 
     def test_automatic_mode_overrides_unsafe_proton_user_settings_only_for_the_child(self):
         self.driver()

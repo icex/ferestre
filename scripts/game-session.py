@@ -217,6 +217,17 @@ def selection(env, runtime, screen, gamescope_available):
                 result[key] = '0'
         if 'WINE_GRAPHICS_DRIVER' in policy:
             result['WINE_GRAPHICS_DRIVER'] = 'x11'
+        # Upstream Wine can fall through to Wayland when X11 is unavailable,
+        # and does not consume all Proton-specific driver flags. Make the
+        # compatibility choice explicit while retaining unrelated DLL policy.
+        overrides = []
+        for group in policy.get('WINEDLLOVERRIDES', '').split(';'):
+            names, separator, value = group.partition('=')
+            names = ','.join(name for name in names.split(',')
+                             if name.strip().lower() not in ('winex11.drv', 'winewayland.drv'))
+            if names and separator:
+                overrides.append(names + '=' + value)
+        result['WINEDLLOVERRIDES'] = ';'.join([*overrides, 'winex11.drv=b', 'winewayland.drv=d'])
         if not use_gamescope and not already_nested:
             for key in ('PROTON_ENABLE_HDR', 'PROTON_USE_HDR', 'DXVK_HDR'):
                 if key in policy:
