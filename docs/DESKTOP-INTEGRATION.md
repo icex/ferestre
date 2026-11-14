@@ -9,12 +9,17 @@ Games detect the current KDE or GNOME Wayland display when they start. Detection
 reads the active mode and HDR setting; it never changes the monitor configuration.
 HDR-capable displays running in SDR are treated as SDR.
 
-- A native Wayland runtime gets the Wayland/HDR defaults appropriate to the
-  active desktop: `PROTON_ENABLE_WAYLAND=1`, `PROTON_ENABLE_HDR=1` and `DXVK_HDR=1`.
-  HDR formats come from the host Vulkan WSI; Wine's driver does not need to
-  embed the compositor's color-management protocol. Current Mesa implements it.
-  Without a Wayland driver, the normal display path and game window preferences
-  are preserved. Installing Gamescope does not silently wrap or fullscreen games.
+- Automatic launches use XWayland on a Wayland desktop. A complete native
+  Wayland driver and an HDR monitor do not establish that a game works with
+  that driver. Inherited global Proton Wayland/HDR flags are disabled for the
+  compatibility launch only; desktop settings and Proton settings files stay
+  unchanged.
+  Tested recipes can opt into native Wayland with
+  `FERESTRE_NATIVE_WAYLAND=1` in `[launch.env]`. Forza Horizon 6 retains its
+  verified native HDR path this way. To test another game deliberately, set
+  `FERESTRE_NATIVE_WAYLAND=1` for its launch. That opt-in still requires a
+  complete driver and a suitable desktop. HDR defaults apply only to a native
+  or explicitly selected Gamescope path, and HDR opt-outs remain effective.
   Older Proton launchers get driver overrides for that launch only; Xalia and
   the X11 fullscreen hack are disabled for native Wayland. Prefix graphics
   preferences are not rewritten.
@@ -30,7 +35,8 @@ HDR-capable displays running in SDR are treated as SDR.
 - Gamescope remains an experimental, explicit choice with `FERESTRE_GAMESCOPE=1`.
   Retail Forza testing found unusable scaling/progression in that path. An
   existing Gamescope session is never nested again.
-- Explicit environment settings and Proton's `user_settings.py` take precedence.
+- Within an explicitly selected native display path, environment settings and
+  Proton's `user_settings.py` are respected.
   `PROTON_ENABLE_HDR=0` or `DXVK_HDR=0` disables automatic HDR. A recipe can set
   `FERESTRE_GAMESCOPE=0` to decline the compositor fallback, or
   `FERESTRE_DESKTOP_INTEGRATION=0` to retain the legacy launch path entirely.

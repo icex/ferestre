@@ -17,6 +17,7 @@ dir = "forza-horizon-6"
 executable = "forzahorizon6.exe"
 
 [launch.env]
+FERESTRE_NATIVE_WAYLAND = "1"
 XGR_STORE_CATALOG = "1"
 
 [runtime]

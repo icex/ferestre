@@ -74,6 +74,12 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.1.22" date="2026-11-14">
+      <description>
+        <p>Use the compatibility display path for games without a tested native Wayland recipe, preventing automatic HDR detection from forcing an incompatible driver.</p>
+        <p>Keep Forza Horizon 6 native HDR explicitly enabled and preserve desktop display settings.</p>
+      </description>
+    </release>
     <release version="0.1.21" date="2026-11-09">
       <description>
         <p>Keep My Library limited to owned and locally managed games instead of adding every compatibility recipe after sign-in.</p>

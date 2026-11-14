@@ -105,7 +105,7 @@ See [signed updates and rollback](docs/UPDATES.md) for supported installations. 
 
 ### Enable HDR
 
-Enable HDR in your desktop's display settings, install the current Ferestre runtime, then enable HDR in the game's video settings when available. Native Wayland HDR is supported on tested KDE/Mesa configurations; support varies by desktop, driver and game.
+Enable HDR in your desktop's display settings, install the current Ferestre runtime, then enable HDR in the game's video settings when available. Tested recipes such as Forza Horizon 6 select native Wayland HDR explicitly. Other games use XWayland for compatibility; testing native Wayland requires `FERESTRE_NATIVE_WAYLAND=1`. See [desktop integration](docs/DESKTOP-INTEGRATION.md) for details.
 
 Choose a suitable rendering resolution in the game. The runtime includes 4K and scaled ultrawide modes and preserves the display's native refresh rate. See [desktop integration](docs/DESKTOP-INTEGRATION.md) for detection, window controls and performance helpers.
 
