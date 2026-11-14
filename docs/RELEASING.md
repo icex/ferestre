@@ -122,6 +122,16 @@ Rulesets**: a tag ruleset for `v*` and `runtime-*` that limits who can create,
 move or delete them. The environment controls who can use the key; the
 ruleset controls who can start a release at all.
 
+## Runner fallback
+
+Application CI, compatibility checks and application releases default to the
+isolated self-hosted runners. If that infrastructure is unavailable, set the
+repository Actions variable `FERESTRE_RUNNER_LABELS` to the JSON array
+`["ubuntu-24.04"]` before starting the checks. Delete the variable afterward
+to restore the self-hosted default. Hosted runners install the existing system
+dependencies; self-hosted runners retain their administrator-managed setup.
+The runtime workflow keeps its separate runner policy.
+
 ## Cutting a release
 
 1. Merge to `main`. Both workflows refuse a tag that is not reachable from

@@ -71,7 +71,7 @@ env:
 jobs:
   build:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, x64, icex-ci]
+    runs-on: ${{ fromJSON(vars.FERESTRE_RUNNER_LABELS || '["self-hosted", "linux", "x64", "icex-ci"]') }}
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -292,7 +292,7 @@ jobs:
   publish:
     needs: build
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    runs-on: [self-hosted, linux, x64, icex-ci]
+    runs-on: ${{ fromJSON(vars.FERESTRE_RUNNER_LABELS || '["self-hosted", "linux", "x64", "icex-ci"]') }}
     # The signing secrets are environment secrets of `release`. Restrict that
     # environment to v* and runtime-* tags and give it a required reviewer
     # (docs/RELEASING.md), and nothing else can reach the key.

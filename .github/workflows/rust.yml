@@ -161,7 +161,7 @@ env:
 jobs:
   test:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, x64, icex-ci]
+    runs-on: ${{ fromJSON(vars.FERESTRE_RUNNER_LABELS || '["self-hosted", "linux", "x64", "icex-ci"]') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -274,7 +274,7 @@ jobs:
   # lock; tests/test_workflows.py checks the two agree.
   msrv:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, x64, icex-ci]
+    runs-on: ${{ fromJSON(vars.FERESTRE_RUNNER_LABELS || '["self-hosted", "linux", "x64", "icex-ci"]') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -323,7 +323,7 @@ jobs:
   # checking out the complete Wine tree, then run the client’s offline tests.
   sources:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, x64, icex-ci]
+    runs-on: ${{ fromJSON(vars.FERESTRE_RUNNER_LABELS || '["self-hosted", "linux", "x64", "icex-ci"]') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -398,7 +398,7 @@ jobs:
 
   gui:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, x64, icex-ci]
+    runs-on: ${{ fromJSON(vars.FERESTRE_RUNNER_LABELS || '["self-hosted", "linux", "x64", "icex-ci"]') }}
     env:
       GDK_BACKEND: x11
       GSK_RENDERER: cairo
