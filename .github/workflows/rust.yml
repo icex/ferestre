@@ -160,7 +160,8 @@ env:
 
 jobs:
   test:
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, icex-ci]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -171,6 +172,7 @@ jobs:
       # minisign for the release signing tests, shellcheck for the shell
       # syntax step, PyYAML for the workflow checks.
       - name: System libraries
+        if: runner.environment != 'self-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev minisign shellcheck python3-yaml
@@ -267,13 +269,15 @@ jobs:
   # together with `rust-version` in Cargo.toml, in the commit that moves the
   # lock; tests/test_workflows.py checks the two agree.
   msrv:
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, icex-ci]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
       - name: System libraries
+        if: runner.environment != 'self-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
@@ -310,7 +314,8 @@ jobs:
   # Verify all five immutable fork commits and their nested gitlinks without
   # checking out the complete Wine tree, then run the client’s offline tests.
   sources:
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, icex-ci]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -329,6 +334,7 @@ jobs:
       # WebKitGTK, GTK 3 and libsoup because xodus-cli links wry for the
       # sign-in window, and its tests link the binary's crate.
       - name: Client test dependencies
+        if: runner.environment != 'self-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev libdbus-1-dev protobuf-compiler \
@@ -383,7 +389,8 @@ jobs:
           python3 "$scratch/check/tools/ferestre/test_desktop_refresh.py"
 
   gui:
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, icex-ci]
     env:
       GDK_BACKEND: x11
       GSK_RENDERER: cairo
@@ -393,6 +400,7 @@ jobs:
           persist-credentials: false
 
       - name: System libraries
+        if: runner.environment != 'self-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y \

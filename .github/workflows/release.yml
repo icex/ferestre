@@ -70,7 +70,8 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, icex-ci]
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -102,6 +103,7 @@ jobs:
       # it just built, and a build that cannot run its own output has not been
       # tested at all.
       - name: System libraries
+        if: runner.environment != 'self-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -290,7 +292,7 @@ jobs:
   publish:
     needs: build
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64, icex-ci]
     # The signing secrets are environment secrets of `release`. Restrict that
     # environment to v* and runtime-* tags and give it a required reviewer
     # (docs/RELEASING.md), and nothing else can reach the key.
@@ -317,6 +319,7 @@ jobs:
           path: notes
 
       - name: minisign
+        if: runner.environment != 'self-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y minisign zstd

@@ -82,14 +82,15 @@ concurrency:
 jobs:
   build:
     # Keep runtime compilation and 32-bit prefix creation on the tested baseline.
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, icex-ci]
     # An hour and a quarter cold, and a runner that dies at the default six
     # hours mid-link wastes the whole build rather than reporting anything.
     timeout-minutes: 330
     env:
       # Proton's Makefile mounts this into its container and passes every
       # CCACHE_* variable through.
-      CCACHE_DIR: /home/runner/.ccache
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 4G
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -103,6 +104,7 @@ jobs:
       # thirds of the way in -- which presents as a link error, not as a disk
       # error.
       - name: Make room
+        if: runner.environment != 'self-hosted'
         run: |
           df -h /
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
@@ -221,7 +223,9 @@ jobs:
         run: |
           mkdir -p "$CCACHE_DIR"
           du -sh "$CCACHE_DIR"
-          sudo apt-get install -y -qq ccache >/dev/null || echo "::notice::no host ccache; no statistics"
+          if [ "$RUNNER_ENVIRONMENT" != self-hosted ]; then
+            sudo apt-get install -y -qq ccache >/dev/null || echo "::notice::no host ccache; no statistics"
+          fi
           ccache --zero-stats || true
 
       - name: Configure
@@ -290,7 +294,11 @@ jobs:
           set -euo pipefail
           sdk=$(sed -n 's/^STEAMRT_IMAGE[[:space:]]*:=[[:space:]]*//p' proton/build/Makefile | tail -n 1)
           test -n "$sdk"
-          docker run --rm --network none --user "$(id -u):$(id -g)" \
+          container_user="$(id -u):$(id -g)"
+          if docker info --format '{{json .SecurityOptions}}' | grep -q rootless; then
+            container_user=0:0
+          fi
+          docker run --rm --network none --user "$container_user" \
               -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" "$sdk" \
               bash "$GITHUB_WORKSPACE/ferestre/tests/check-runtime-modes.sh" \
               "$GITHUB_WORKSPACE/proton/build/dist"
@@ -365,7 +373,7 @@ jobs:
   prune-ccache:
     needs: build
     if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64, icex-ci]
     permissions:
       actions: write
     steps:
@@ -385,7 +393,7 @@ jobs:
   publish:
     needs: build
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64, icex-ci]
     # Where the signing secrets live; see release.yml and docs/RELEASING.md.
     environment: release
     permissions:
@@ -406,6 +414,7 @@ jobs:
           path: out
 
       - name: minisign
+        if: runner.environment != 'self-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y minisign
