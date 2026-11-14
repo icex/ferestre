@@ -6476,10 +6476,11 @@ summary = "Runs."
         );
 
         // Kept unless asked.
-        uninstall(&paths, GAME, YES).unwrap();
+        let outcome = uninstall(&paths, GAME, YES).unwrap();
+        assert_eq!(code(outcome), code(ExitCode::SUCCESS));
         assert!(base.exists() && player.exists());
         installed_package(&games.join("testgame"), GAME);
-        uninstall(
+        let outcome = uninstall(
             &paths,
             GAME,
             Removal {
@@ -6488,6 +6489,7 @@ summary = "Runs."
             },
         )
         .unwrap();
+        assert_eq!(code(outcome), code(ExitCode::SUCCESS));
         assert!(!base.exists());
         assert!(!player.exists());
         assert!(unrelated.exists());
@@ -6539,7 +6541,8 @@ summary = "Runs."
         }
         // The same prefix spelled with a trailing slash is that prefix.
         let spelled = PathBuf::from(format!("{}/", listed.display()));
-        removing(&[base.clone(), spelled, gone.clone()]).unwrap();
+        let outcome = removing(&[base.clone(), spelled, gone.clone()]).unwrap();
+        assert_eq!(code(outcome), code(ExitCode::SUCCESS));
         assert!(!base.exists());
         assert!(!listed.exists());
         assert!(
@@ -6570,7 +6573,8 @@ summary = "Runs."
         assert_eq!(code(answered), code(ExitCode::FAILURE));
         assert!(prefix.exists());
         let mut yes = std::io::Cursor::new(b"y\n".to_vec());
-        uninstall_title(&cli(), &paths, GAME, removal, &mut yes).unwrap();
+        let outcome = uninstall_title(&cli(), &paths, GAME, removal, &mut yes).unwrap();
+        assert_eq!(code(outcome), code(ExitCode::SUCCESS));
         assert!(!prefix.exists());
     }
 

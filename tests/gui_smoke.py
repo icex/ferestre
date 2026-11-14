@@ -1087,6 +1087,12 @@ print(":: done", flush=True)
             "the titles this runtime cannot open are kept out of the way",
             frame,
         )
+        labels = wait_for(
+            frame,
+            lambda root: texts(root) if any("25 ship as Appx or Msix packages" in t for t in texts(root)) else None,
+            "the unsupported-package count and explanation to draw",
+            time.monotonic() + TIMEOUT,
+        )
         check(
             any("25 ship as Appx or Msix packages" in t for t in labels),
             "and the count of them is stated, with the reason, rather than left "
