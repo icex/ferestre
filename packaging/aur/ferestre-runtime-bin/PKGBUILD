@@ -23,7 +23,7 @@ url='https://github.com/icex/ferestre'
 # Valve's top-level Proton components are BSD-3-Clause, the Wine inside it and
 # our xgameruntime.dll are LGPL-2.1-or-later, the bundled fonts are OFL-1.1, and
 # the DXVK/vkd3d-proton pieces are zlib and LGPL. See NOTICE in the source repo.
-license=('BSD-3-Clause' 'LGPL-2.1-or-later' 'OFL-1.1' 'Zlib')
+license=('BSD-3-Clause' 'LGPL-2.1-or-later' 'OFL-1.1' 'Zlib' 'MIT')
 
 # Everything below was derived from the installed tree rather than copied from
 # another Proton package: every ELF file under files/ was read for its NEEDED
@@ -157,6 +157,11 @@ package() {
     install -Dm644 "$src/LICENSE.OFL" "$pkgdir/usr/share/licenses/$pkgname/LICENSE.OFL"
   [[ -f $src/PATENTS.AV1 ]] &&
     install -Dm644 "$src/PATENTS.AV1" "$pkgdir/usr/share/licenses/$pkgname/PATENTS.AV1"
+  for file in LICENSE.NGHTTP2 LICENSE.SFPARSE LICENSE.WINHTTP-NEXUS; do
+    if [[ -f $src/$file ]]; then
+      install -Dm644 "$src/$file" "$pkgdir/usr/share/licenses/$pkgname/$file"
+    fi
+  done
 
   return 0
 }

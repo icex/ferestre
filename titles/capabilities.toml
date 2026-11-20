@@ -222,6 +222,20 @@ verify = [
 ]
 
 [[capability]]
+name = "winhttp.http2"
+summary = "WinHTTP can negotiate HTTP/2 over TLS and use HTTP/1.1 when selected by the server."
+provided-by = [
+    "https://github.com/icex/wine/commit/25b0df23f2ca68eb0c0050e540fa3cc513609b8f",
+    "https://github.com/domsvoboda/nexus-launcher/blob/47db4313b838aca7dfea4bf27df424be7a73f7a4/assets/wine-winhttp-http2.patch",
+]
+symptom-if-missing = "Gears of War: E-Day fails to reach the configuration service and reports gill-gutpuncher."
+note = "The title recipe enables HTTP/2 for WinHTTP sessions using FERESTRE_WINHTTP_HTTP2=1. WebSockets continue to use HTTP/1.1."
+verify = [
+    { file = "files/lib/wine/x86_64-windows/winhttp.dll", contains = "FERESTRE_WINHTTP_HTTP2" },
+    { file = "files/lib/wine/i386-windows/winhttp.dll", contains = "FERESTRE_WINHTTP_HTTP2" },
+]
+
+[[capability]]
 name = "media.real-video"
 summary = "The title's own video files are decoded (system ffmpeg preferred, Proton's converter elements demoted by rank) rather than replaced by the placeholder."
 provided-by = [

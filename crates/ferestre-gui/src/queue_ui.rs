@@ -1,6 +1,6 @@
 //! Install queue state survives redraws and application restarts.
 use super::*;
-use ferestre_core::transfers::{Job, Status};
+use ferestre_core::transfers::{InstallMount, Job, Status};
 
 pub(super) fn save(ui: &Ui) -> bool {
     if let Some(error) = ui.queue_error.borrow().as_ref() {
@@ -23,16 +23,21 @@ pub(super) fn save(ui: &Ui) -> bool {
     }
     true
 }
-pub(super) fn enqueue(ui: &Ui, id: &str, name: &str, dir: Option<&Path>, what: &str) {
+pub(super) fn enqueue(
+    ui: &Ui,
+    id: &str,
+    name: &str,
+    dir: Option<&Path>,
+    what: &str,
+    mount: Option<InstallMount>,
+) {
     if *ui.closing.borrow() {
         return;
     }
     let before = ui.install_queue.borrow().jobs.clone();
-    match ui
-        .install_queue
-        .borrow_mut()
-        .enqueue(Job::new(id, name, dir, what == "Updating"))
-    {
+    let mut job = Job::new(id, name, dir, what == "Updating");
+    job.mount = mount;
+    match ui.install_queue.borrow_mut().enqueue(job) {
         Ok(false) => {
             ui.toasts
                 .add_toast(toast("This game is already in Downloads"));
@@ -78,6 +83,10 @@ pub(super) fn resume(ui: &Ui, id: &str) -> bool {
         pause(ui, false);
         return true;
     }
+    if !destination_ready(ui, &key) {
+        render(ui);
+        return true;
+    }
     let before = ui.install_queue.borrow().jobs.clone();
     ui.install_queue.borrow_mut().resume(&key);
     if save(ui) {
@@ -88,12 +97,37 @@ pub(super) fn resume(ui: &Ui, id: &str) -> bool {
     }
     true
 }
+fn destination_ready(ui: &Ui, id: &str) -> bool {
+    let result = ui
+        .install_queue
+        .borrow()
+        .jobs
+        .iter()
+        .find(|job| job.product_id == id)
+        .map(Job::check_destination);
+    if let Some(Err(error)) = result {
+        ui.toasts.add_toast(toast(error.to_string()));
+        return false;
+    }
+    true
+}
+
 pub(super) fn start_next(ui: &Ui) {
     if ui.busy.borrow().is_some() || *ui.closing.borrow() {
         return;
     }
-    let next = ui.install_queue.borrow().next();
-    if let Some(job) = next {
+    loop {
+        let next = ui.install_queue.borrow().next();
+        let Some(job) = next else { return };
+        if !destination_ready(ui, &job.product_id) {
+            ui.install_queue
+                .borrow_mut()
+                .set_status(&job.product_id, Status::Paused);
+            if !save(ui) {
+                return;
+            }
+            continue;
+        }
         ui.install_queue
             .borrow_mut()
             .set_status(&job.product_id, Status::Running);
@@ -114,7 +148,9 @@ pub(super) fn start_next(ui: &Ui) {
                 "Installing"
             },
             "install",
+            job.mount,
         );
+        return;
     }
 }
 pub(super) fn completed(ui: &Ui, id: &str, success: bool, stopped: bool) {
@@ -133,15 +169,18 @@ pub(super) fn completed(ui: &Ui, id: &str, success: bool, stopped: bool) {
     save(ui);
 }
 pub(super) fn pause(ui: &Ui, paused: bool) {
-    if let Some(control) = ui.download_control.borrow().as_ref() {
-        control.pause(paused);
-    }
     let id = ui
         .download
         .current
         .borrow()
         .as_ref()
         .map(|d| d.product_id.clone());
+    if !paused && id.as_deref().is_some_and(|id| !destination_ready(ui, id)) {
+        return;
+    }
+    if let Some(control) = ui.download_control.borrow().as_ref() {
+        control.pause(paused);
+    }
     if let Some(id) = id {
         ui.install_queue.borrow_mut().set_status(
             &id,
@@ -193,7 +232,8 @@ pub(super) fn render_queue(ui: &Ui, page: &gtk::Box) {
         .as_ref()
         .map(|d| d.product_id.clone());
     for job in jobs {
-        let row = plain_row(&job.name, Some(job.status.label()));
+        let reason = job.check_destination().err().map(|error| error.to_string());
+        let row = plain_row(&job.name, reason.as_deref().or(Some(job.status.label())));
         row.set_title_lines(2);
         row.set_subtitle_lines(2);
         let active = current.as_deref() == Some(job.product_id.as_str());

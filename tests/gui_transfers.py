@@ -88,15 +88,25 @@ summary="Offline queue fixture"
  def queue():return json.loads((home/'state/ferestre/install-queue.json').read_text())['jobs']
  try:
   process,app,frame=start();s.select_in_list(frame,'My Library')
-  for name in names:
+  for index,name in enumerate(names):
    button=s.wait_for(frame,lambda root:s.row_button(root,name,'Install'),'Install '+name,time.monotonic()+s.TIMEOUT);s.click(button)
    s.wait_for(frame,lambda root:any('Install '+name+'?' in t for t in s.texts(root)),'install confirmation',time.monotonic()+s.TIMEOUT)
+   if index==1:
+    library=home/'Custom Game Library'
+    folder=s.find_all(frame,role='text',name='Install to')[0]
+    folder.get_editable_text_iface().set_text_contents(str(library))
+    expected=library/ids[index].lower()
+    s.wait_for(frame,lambda root:any(f'Installs into {expected}.' in t for t in s.texts(root)),
+               'the preview to use the custom library',time.monotonic()+s.TIMEOUT)
    s.click_named(frame,'Install')
-   wait(lambda:len(queue())==names.index(name)+1,'saved queue entry')
+   wait(lambda:len(queue())==index+1,'saved queue entry')
+   if index==1:
+    s.check(queue()[index]['destination']==str(library),'the queue stores the custom library')
   wait(lambda:calls()==[ids[0]],'only the first queued game to start')
   s.check(calls()==[ids[0]],'a second install queues instead of running concurrently')
   pause=s.wait_for(frame,lambda root:next((n for n in s.find_all(root,role='button',name='Pause') if n.get_state_set().contains(s.Atspi.StateType.SHOWING)),None),'Pause control',time.monotonic()+s.TIMEOUT);s.click(pause)
-  wait(lambda:'pause '+ids[0] in events(),'pause byte');s.check(queue()[0]['status']=='paused','Pause is saved persistently')
+  wait(lambda:'pause '+ids[0] in events(),'pause byte')
+  wait(lambda:queue()[0]['status']=='paused','Pause saved persistently')
   s.click_named(frame,'Resume');wait(lambda:'resume '+ids[0] in events(),'resume byte')
   s.click_named(frame,'Stop Download');wait(lambda:'stop '+ids[0] in events(),'cooperative stop')
   # A stopped entry remains paused; the next explicitly queued job starts.
@@ -113,6 +123,24 @@ summary="Offline queue fixture"
   # The other paused job stays paused, preserving the user's decision.
   time.sleep(.3);s.check(calls()[-1]==ids[0] and queue()[0]['status']=='paused','completion does not resume an explicitly paused job')
   s.click_named(frame,'Close');s.check(process.wait(timeout=10)==0,'queue fixture closes cleanly')
+
+  # Simulate a saved drive selection whose mountpoint now belongs to the host.
+  mountpoint=home/'unmounted drive';mountpoint.mkdir()
+  jobs=queue()
+  jobs[0]['destination']=str(mountpoint/'xbox-games')
+  jobs[0]['mount']={'path':str(mountpoint),'source':'/dev/fixture',
+                    'root':'/','filesystem':'ext4','fs_id':123}
+  write(home/'state/ferestre/install-queue.json',json.dumps({'schema':1,'jobs':jobs}))
+  previous=calls();process,app,frame=start()
+  s.select_in_list(frame,'My Library');s.click_named(frame,'Install queue')
+  reason=f'Reconnect the selected drive at {mountpoint} to continue.'
+  s.wait_for(frame,lambda root:reason in s.texts(root),'missing drive warning',time.monotonic()+s.TIMEOUT)
+  s.click_named(frame,'Resume')
+  time.sleep(.5)
+  s.check(calls()==previous and queue()[0]['status']=='paused',
+          'an absent drive keeps its restored job paused without calling the installer')
+  s.check(not (mountpoint/'xbox-games').exists(),'the underlying host directory stays untouched')
+  s.click_named(frame,'Close');s.check(process.wait(timeout=10)==0,'missing-drive fixture closes cleanly')
   s.check('panicked at' not in log.read_text(),'queue interactions did not panic')
   print('all persistent queue/pause UI checks passed',flush=True)
  finally:

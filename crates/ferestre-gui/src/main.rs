@@ -19,6 +19,7 @@ mod deadline;
 mod editor;
 mod folder_picker;
 mod handheld;
+mod install_drives;
 mod launch_state;
 mod model;
 mod packagekit;
@@ -4024,10 +4025,6 @@ impl DownloadBar {
 /// for machine-readable progress instead, and prints one JSON line per quarter
 /// second. A client too old to know about that simply prints nothing this can
 /// read, and the bar stays indeterminate rather than breaking.
-fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&Path>, what: &str) {
-    queue_ui::enqueue(ui, product_id, name, dir, what);
-}
-
 fn spawn_transfer(
     ui: &Ui,
     product_id: &str,
@@ -4035,6 +4032,7 @@ fn spawn_transfer(
     dir: Option<&Path>,
     what: &str,
     command_name: &str,
+    mount: Option<ferestre_core::transfers::InstallMount>,
 ) {
     if !begin(ui, &format!("{what} {name}")) {
         report_busy(ui);
@@ -4080,6 +4078,10 @@ fn spawn_transfer(
                 .env("XODUS_PROGRESS", "json")
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
+            if let Some(mount) = mount {
+                let identity = serde_json::to_string(&mount).map_err(|e| e.to_string())?;
+                command.env(ferestre_core::transfers::INSTALL_MOUNT_ENV, identity);
+            }
             let mut child = control
                 .spawn(&mut command)
                 .map_err(|e| format!("{}: {e}", program.display()))?;
@@ -4358,6 +4360,7 @@ fn resume_download(ui: &Ui, product_id: &str, name: &str) {
             name,
             Some(&destination),
             if updating { "Updating" } else { "Installing" },
+            None,
         );
     } else {
         ui.toasts
@@ -4384,7 +4387,7 @@ fn update_download(ui: &Ui, product_id: &str, name: &str) {
     }
     let destination = ui.model.borrow().update_destination(product_id);
     match destination {
-        Ok(dir) => queue_ui::enqueue(ui, product_id, name, Some(&dir), "Updating"),
+        Ok(dir) => queue_ui::enqueue(ui, product_id, name, Some(&dir), "Updating", None),
         Err(why) => ui.toasts.add_toast(toast(why)),
     }
 }
@@ -4459,6 +4462,8 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str) {
         browse.connect_clicked(move |_| folder_picker::open(&ui, entry.upcast_ref()));
     }
     let group = adw::PreferencesGroup::new();
+    let (selector, mount) = install_drives::selector(&library, &where_to);
+    group.add(&selector);
     group.add(&where_to);
     let extra = gtk::Box::new(gtk::Orientation::Vertical, 0);
     extra.append(&group);
@@ -4470,11 +4475,18 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str) {
     let resolve: Resolve = {
         let ui = ui.clone();
         let product_id = product_id.to_string();
+        let mount = mount.clone();
         Rc::new(move |text: &str| {
             let model = ui.model.borrow();
-            model::install_destination(text, home.as_deref(), &folder, &|dir| {
+            let destination = model::install_destination(text, home.as_deref(), &folder, &|dir| {
                 model.inspect_folder(&product_id, dir)
-            })
+            })?;
+            if let Some(mount) = &*mount.borrow() {
+                mount
+                    .check_path(&destination)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(destination)
         })
     };
     let show = {
@@ -4517,9 +4529,14 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str) {
                 // install would get.
                 let argument = ui.model.borrow().install_argument(&product_id, &dir);
                 match argument {
-                    Some(argument) => {
-                        spawn_install(&ui, &product_id, &name, Some(argument.as_path()), what)
-                    }
+                    Some(argument) => queue_ui::enqueue(
+                        &ui,
+                        &product_id,
+                        &name,
+                        Some(&argument),
+                        what,
+                        mount.borrow().clone(),
+                    ),
                     None => ui
                         .toasts
                         .add_toast(toast("Cannot work out where to put it")),
@@ -6142,7 +6159,7 @@ fn choose_move(ui: &Ui, product_id: &str, name: &str) {
         generation.set(generation.get() + 1);
         if response == "move" {
             if let Some(path) = chosen.borrow().as_ref() {
-                spawn_transfer(&ui, &product, &name, Some(path), "Moving", "move");
+                spawn_transfer(&ui, &product, &name, Some(path), "Moving", "move", None);
             }
         }
     });

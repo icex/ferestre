@@ -12,9 +12,12 @@ compatibility libraries before starting a title.
 Run `ferestre doctor` afterwards. It reports **32-bit Linux loader available**
 when Wine can start 32-bit helpers.
 
-Halo Infinite also needs Python 3 and util-linux (`unshare`, `mount`, `umount`),
-with unprivileged user and mount namespaces enabled. Its licensed executable
-view exists only in private tmpfs mounts for the lifetime of the launch.
+Licensed Xbox packages detected by their Easy Anti-Cheat bootstrapper or
+Easy Anti-Cheat directory also need Python 3 and util-linux (`unshare`, `mount`,
+`umount`), with unprivileged user and mount namespaces enabled. Ferestre
+automatically makes the licensed images available at their installed paths
+through private tmpfs mounts for the lifetime of the launch. Protected play on
+Proton requires the publisher to enable Linux support for that game build.
 
 ## WebKitGTK for sign-in
 

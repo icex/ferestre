@@ -1168,6 +1168,19 @@ fn install_package(
     // being rewritten, and a running title's files must not be replaced.
     let _lock = TitleLock::take(paths, &product_id, LockMode::Change)?;
 
+    // Recheck immediately before touching the actual installation folder.
+    // The drive may have gone away after the window started this queued job.
+    let _drive = if let Some(identity) =
+        std::env::var_os(ferestre_core::transfers::INSTALL_MOUNT_ENV).filter(|_| include_content)
+    {
+        let mount: ferestre_core::transfers::InstallMount =
+            serde_json::from_slice(identity.as_encoded_bytes())
+                .context("Reading the selected install drive")?;
+        Some(mount.pin(&dest)?)
+    } else {
+        None
+    };
+
     // Remembered so a failed install can put the disk back the way it found it.
     let dest_existed = dest.is_dir();
     let before = container_state(&dest);

@@ -1236,6 +1236,8 @@ print(":: done", flush=True)
         )
         destination = next(iter(find_all(frame, role="text", name="Install to")), None)
         check(destination is not None, "and the destination can be changed", frame)
+        check(bool(find_all(frame, name="Destination drive")),
+              "the install dialog offers a drive selector", frame)
         check(
             bool(Atspi.Text.get_text(destination.get_text_iface(), 0, -1).strip()),
             "prefilled with somewhere to put it",
