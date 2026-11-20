@@ -7155,12 +7155,17 @@ summary = "Runs."
     #[test]
     fn a_game_that_closes_when_asked_is_not_killed() {
         let wine = FakeWine::new("stop-closes");
-        let forwarding = wine.detached(std::time::Duration::from_secs(30));
-        let running = Arc::clone(&wine.running);
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            running.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut session = wine.session(std::time::Duration::from_secs(30));
+        let call_log = wine.scratch.root.join("calls");
+        // The fake game leaves only after Wine has received the close request.
+        Arc::get_mut(&mut session).unwrap().running = Box::new(move || {
+            !std::fs::read_to_string(&call_log).is_ok_and(|calls| calls.contains("wine taskkill"))
         });
+        let forwarding = Forwarding {
+            shared: Shared::new(),
+            installed: false,
+        };
+        forwarding.set_session(Some(session));
         let started = std::time::Instant::now();
         forwarding.shared.deliver(libc::SIGINT);
         forwarding.finish(std::time::Duration::from_secs(30));
