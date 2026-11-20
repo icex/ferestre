@@ -1542,10 +1542,11 @@ print(":: done", flush=True)
                         raise
             click_named(frame, "Add All")
             # The summary is drawn once the work is done and the window is
-            # free again, so the next click is never refused as busy.
+            # free again. Allow for the catalogue lookup (15 seconds) and
+            # artwork for two titles (up to 60 seconds each, sequentially).
             wait_for(frame, lambda root: any(t.startswith(summary) and "Restart Steam to see them." in t
                                              for t in texts(root)),
-                     f"the summary {summary!r}", time.monotonic() + TIMEOUT)
+                     f"the summary {summary!r}", time.monotonic() + 150)
 
         stardew = os.path.join(home, "games", "stardew-valley")
         os.makedirs(stardew, exist_ok=True)

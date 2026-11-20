@@ -77,6 +77,7 @@
     <release version="0.1.23" date="2026-11-21">
       <description>
         <p>Choose a destination drive or a custom folder for new installations. Queued drive installs wait for their selected drive to be available.</p>
+        <p>Downloads can fetch up to eight verified HTTP ranges at once and resume using saved progress.</p>
         <p>Detect Easy Anti-Cheat launchers automatically and keep the protected launch path. The updated Proton runtime adds WinHTTP HTTP/2 support for Gears of War: E-Day sign-in.</p>
       </description>
     </release>
