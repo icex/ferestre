@@ -1196,14 +1196,29 @@ print(":: done", flush=True)
 
         select_in_list(frame, "Runtime")
         wait_for(frame, lambda root: "Ferestre release" in texts(root), "section navigation", time.monotonic() + TIMEOUT)
-        time.sleep(0.2)
-        runtime_page = find_all(frame, name="Runtime page")[0]
-        viewport = runtime_page.get_parent()
-        while viewport is not None and viewport.get_role_name() != "scroll pane":
-            viewport = viewport.get_parent()
-        check(viewport is not None, "Settings uses the shared content viewport", frame)
-        page_box = runtime_page.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
-        view_box = viewport.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+
+        def runtime_extents(root):
+            for page in find_all(root, name="Runtime page"):
+                viewport = page.get_parent()
+                while viewport is not None and viewport.get_role_name() != "scroll pane":
+                    viewport = viewport.get_parent()
+                if viewport is None:
+                    continue
+                page_component = page.get_component_iface()
+                view_component = viewport.get_component_iface()
+                if page_component is None or view_component is None:
+                    continue
+                page_box = page_component.get_extents(Atspi.CoordType.WINDOW)
+                view_box = view_component.get_extents(Atspi.CoordType.WINDOW)
+                if page_box.height > 0 and view_box.height > 0:
+                    return page_box, view_box
+            return None
+
+        # Updates can replace the page during the parent or geometry query.
+        # Poll the whole lookup so every retry starts with fresh objects.
+        page_box, view_box = wait_for(
+            frame, runtime_extents, "Settings to use the shared content viewport", time.monotonic() + TIMEOUT,
+        )
         check(view_box.y <= page_box.y <= view_box.y + 32,
               "a different section starts at the top even when Settings fits without scrolling", frame)
         select_in_list(frame, "Library")
