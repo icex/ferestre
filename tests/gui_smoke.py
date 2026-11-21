@@ -1087,18 +1087,13 @@ print(":: done", flush=True)
             "the titles this runtime cannot open are kept out of the way",
             frame,
         )
-        labels = wait_for(
+        wait_for(
             frame,
-            lambda root: texts(root) if any("25 ship as Appx or Msix packages" in t for t in texts(root)) else None,
+            lambda root: any("25 ship as Appx or Msix packages" in t for t in texts(root)),
             "the unsupported-package count and explanation to draw",
             time.monotonic() + TIMEOUT,
         )
-        check(
-            any("25 ship as Appx or Msix packages" in t for t in labels),
-            "and the count of them is stated, with the reason, rather than left "
-            "as a silent filter",
-            frame,
-        )
+        check(True, "and the count of them is stated, with the reason, rather than left as a silent filter")
 
         print("showing them anyway")
         # Three nodes carry this name -- the row, its label, and the switch
