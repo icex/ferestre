@@ -3,13 +3,146 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{Read, Write},
+    io::{self, Read, Write},
+    os::fd::AsRawFd,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
 const LIMIT: usize = 1024 * 1024;
 const MAX_JOBS: usize = 100;
+pub const INSTALL_MOUNT_ENV: &str = "FERESTRE_INSTALL_MOUNT";
+
+/// The mount selected in the drive picker. Linux mount IDs distinguish mounts
+/// within a running system. The source and filesystem ID are saved with the job
+/// so it can recognize the same drive mounted again in the same place.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InstallMount {
+    path: PathBuf,
+    source: String,
+    root: String,
+    filesystem: String,
+    fs_id: libc::c_ulong,
+}
+
+impl InstallMount {
+    pub fn capture(path: &Path) -> io::Result<Self> {
+        Self::current(path).map(|(mount, _, _)| mount)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn check_path(&self, destination: &Path) -> Result<()> {
+        self.pin(destination).map(drop)
+    }
+
+    /// Hold the mount open for the installer so a regular unmount cannot
+    /// expose the underlying host directory while the downloader is running.
+    pub fn pin(&self, destination: &Path) -> Result<fs::File> {
+        let (current, directory, mount_id) = Self::current(&self.path)
+            .ok()
+            .filter(|(current, _, _)| current == self)
+            .with_context(|| {
+                format!(
+                    "Reconnect the selected drive at {} to continue.",
+                    self.path.display()
+                )
+            })?;
+        debug_assert_eq!(current, *self);
+        if !destination.starts_with(&self.path)
+            || destination
+                .components()
+                .any(|part| part == std::path::Component::ParentDir)
+        {
+            bail!(
+                "The destination must stay on the selected drive at {}.",
+                self.path.display()
+            );
+        }
+        // The library and title may not exist yet. Closest existing ancestor
+        // must still be on this mount, including when a path follows symlinks.
+        for ancestor in destination.ancestors() {
+            match mount_directory(ancestor) {
+                Ok((_, id)) if id == mount_id => return Ok(directory),
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        && matches!(fs::symlink_metadata(ancestor), Err(ref stat) if stat.kind() == io::ErrorKind::NotFound) =>
+                    {}
+                _ => break,
+            }
+        }
+        bail!(
+            "The destination must stay on the selected drive at {}.",
+            self.path.display()
+        );
+    }
+
+    fn current(path: &Path) -> io::Result<(Self, fs::File, u64)> {
+        let (directory, id) = mount_directory(path)?;
+        let text = fs::read("/proc/self/mountinfo")?;
+        let prefix = format!("{id} ");
+        let invalid = || io::Error::other("Not a writable mount point");
+        let line = text
+            .split(|byte| *byte == b'\n')
+            .find(|line| line.starts_with(prefix.as_bytes()))
+            .ok_or_else(invalid)?;
+        let line = std::str::from_utf8(line).map_err(io::Error::other)?;
+        let (location, details) = line.split_once(" - ").ok_or_else(invalid)?;
+        let mut location = location.split(' ').skip(3);
+        let root = location.next().ok_or_else(invalid)?;
+        let mount_point = location.next().ok_or_else(invalid)?;
+        let escaped = path
+            .to_str()
+            .ok_or_else(invalid)?
+            .replace('\\', "\\134")
+            .replace(' ', "\\040")
+            .replace('\t', "\\011")
+            .replace('\n', "\\012");
+        if mount_point != escaped {
+            return Err(invalid());
+        }
+        let mut details = details.split(' ');
+        let filesystem = details.next().ok_or_else(invalid)?;
+        let source = details.next().ok_or_else(invalid)?;
+        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // The descriptor pins this mount during the check.
+        if unsafe { libc::fstatvfs(directory.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let stats = unsafe { stats.assume_init() };
+        if stats.f_flag & libc::ST_RDONLY != 0 {
+            return Err(invalid());
+        }
+        Ok((
+            Self {
+                path: path.to_path_buf(),
+                source: source.into(),
+                root: root.into(),
+                filesystem: filesystem.into(),
+                fs_id: stats.f_fsid,
+            },
+            directory,
+            id,
+        ))
+    }
+}
+
+fn mount_directory(path: &Path) -> io::Result<(fs::File, u64)> {
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+        .open(path)?;
+    let fd_info = fs::read_to_string(format!("/proc/self/fdinfo/{}", directory.as_raw_fd()))?;
+    let id = fd_info
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())
+        .ok_or_else(|| io::Error::other("Missing mount ID"))?;
+    Ok((directory, id))
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
@@ -36,6 +169,8 @@ pub struct Job {
     pub destination: Option<PathBuf>,
     pub updating: bool,
     pub status: Status,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount: Option<InstallMount>,
 }
 impl Job {
     pub fn new(id: &str, name: &str, destination: Option<&Path>, updating: bool) -> Self {
@@ -45,7 +180,18 @@ impl Job {
             destination: destination.map(Path::to_path_buf),
             updating,
             status: Status::Pending,
+            mount: None,
         }
+    }
+    pub fn check_destination(&self) -> Result<()> {
+        if let Some(mount) = &self.mount {
+            mount.check_path(
+                self.destination
+                    .as_deref()
+                    .context("Missing install destination")?,
+            )?;
+        }
+        Ok(())
     }
     fn valid(&self) -> bool {
         self.product_id.len() == 12
@@ -56,6 +202,13 @@ impl Job {
                 .destination
                 .as_ref()
                 .is_none_or(|p| p.is_absolute() && p.as_os_str().len() <= 4096)
+            && self.mount.as_ref().is_none_or(|mount| {
+                mount.path.is_absolute()
+                    && self
+                        .destination
+                        .as_ref()
+                        .is_some_and(|path| path.starts_with(&mount.path))
+            })
     }
 }
 #[derive(Default, Debug, Serialize, Deserialize)]
@@ -198,6 +351,53 @@ pub(crate) fn private_write(state: &Path, name: &str, bytes: &[u8]) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_saved_drive_job_is_read_even_when_its_mount_is_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_mount = tmp.path().join("unmounted");
+        fs::create_dir(&missing_mount).unwrap();
+        fs::write(
+            tmp.path().join("install-queue.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1,
+                "jobs": [{
+                    "product_id": "9ZZTESTGAME1",
+                    "name": "A",
+                    "destination": missing_mount.join("xbox-games"),
+                    "updating": false,
+                    "status": "pending",
+                    "mount": {
+                        "path": missing_mount,
+                        "source": "/dev/selected-drive",
+                        "root": "/",
+                        "filesystem": "ext4",
+                        "fs_id": 123,
+                    },
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let queue = Queue::load(tmp.path()).unwrap();
+        assert_eq!(queue.jobs[0].status, Status::Paused);
+        assert!(queue.next().is_none());
+        assert!(queue.jobs[0].check_destination().is_err());
+        queue.save(tmp.path()).unwrap();
+        assert_eq!(Queue::load(tmp.path()).unwrap().jobs, queue.jobs);
+    }
+
+    #[test]
+    fn a_drive_target_cannot_follow_a_link_onto_another_mount() {
+        let mount = InstallMount::capture(Path::new("/proc")).unwrap();
+        assert!(mount
+            .check_path(Path::new("/proc/0-absent-directory/xbox-games"))
+            .is_ok());
+        // /proc/self/root resolves to the host root mount.
+        assert!(mount
+            .check_path(Path::new("/proc/self/root/tmp/xbox-games"))
+            .is_err());
+    }
+
     #[test]
     fn restart_keeps_order_and_destinations_but_requires_explicit_resume() {
         let tmp = tempfile::tempdir().unwrap();

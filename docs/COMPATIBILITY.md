@@ -50,6 +50,7 @@ Current launcher: [0.1.22](RELEASE-0.1.22.md), using runtime **11.0.20261107.1**
 | Dune: Awakening | `9PJ6FV3130QZ` | Playable | Gameplay confirmed by the player. | 2026-10-13 |
 | Forza Horizon 5 | `9NNX1VVR3KNQ` | Playable | Plays with a restored Windows career; title services and the live Festival Playlist load after generic authentication and endpoint-discovery fixes. Player confirmed the online fix. | 2026-09-07 |
 | Forza Horizon 6 | `9NR1R1XWLCNB` | Playable | Gameplay and Continue with saved progress confirmed by the player. Also plays with separate Store and Player accounts: the Store account's Game Pass licence, the Player account's gamertag, profile and saves. The in-game marketplace is currently unavailable. | 2026-10-17 |
+| Gears 5 | `C2KDNLT2H7DM` | Playable | Campaign and multiplayer play with Easy Anti-Cheat; the launcher supplies EAC's Linux library, which the Xbox PC package lacks. | 2026-11-21 |
 | Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable | Playable, confirmed by the player offline and online. New games save and resume across relaunches, and Quit Game exits. Peer joining and voice are untested. | 2026-10-11 |
 | Halo Infinite | `9PP5G1F0C2B6` | Playable | Campaign, Academy training and multiplayer run; campaign save restoration was confirmed locally. Intermittent offline display remains under investigation. | 2026-10-10 |
 | Halo: The Master Chief Collection | `9N6VPDLQDVT5` | Playable | Halo CE and Reach campaign content is detected and loads with the official Anti-Cheat Disabled executable. Local Save/Quit and clean game exit tested. | 2026-10-23 |
@@ -59,6 +60,7 @@ Current launcher: [0.1.22](RELEASE-0.1.22.md), using runtime **11.0.20261107.1**
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
 | Retro Classics | `9MTVJ3HHTQGS` | Playable | Playable, confirmed by the player. Signs in, loads the catalogue and streams Tennis; broader game, controller and save-restore coverage is not separately qualified. | 2026-10-10 |
 | Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. From a Steam shortcut, the shortcut's Steam Input controller layout applies, and Steam sees the game exit. | 2026-10-18 |
+| Gears of War: E-Day | `9N4PT8HGCDHQ` | Playable, with issues | Xbox sign-in and tutorial gameplay verified with HTTP/2. Online deployment was observed. An intermittent crash occurred on an earlier lobby entry. | 2026-11-21 |
 | Hogwarts Legacy | `9MT5NJ5W7B8Z` | Untested | Package 1.0.22.0 launched with a local runtime build that waits for the Xbox callbacks. | never |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.

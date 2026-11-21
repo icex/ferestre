@@ -51,6 +51,49 @@ class ImageViewTests(unittest.TestCase):
                                 cwd=self.root, env=env, pass_fds=(self.fd,),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
+    def test_shim_selects_the_image_view_for_eac_packages(self):
+        self.require_namespace()
+        runtime = self.root / "runtime"
+        runtime.mkdir()
+        proton = runtime / "proton"
+        proton.write_text(
+            '#!/bin/sh\n'
+            '[ "$2" = reg ] && exit 0\n'
+            'printf "%s\\n" "$2"\n'
+            'head -c 2 Game.exe\n'
+        )
+        proton.chmod(0o755)
+        env = dict(os.environ, WINE_DLL_FILE_MAP=self.mapping, PROTON_DIR=str(runtime),
+                   STEAM_COMPAT_DATA_PATH=str(self.root / "compat"),
+                   XODUS_GAMES_DIR=str(self.root))
+        for name in ("FERESTRE_IMAGE_VIEW", "FERESTRE_DESKTOP_INTEGRATION", "WINEPREFIX"):
+            env.pop(name, None)
+
+        def launch(entry, **extra):
+            result = subprocess.run(
+                [str(HELPER.with_name("proton-wine-shim.sh")), entry],
+                cwd=self.root, env=dict(env, **extra), pass_fds=(self.fd,),
+                check=True, capture_output=True, text=True, timeout=20,
+            )
+            self.assertEqual(self.image.read_bytes(), b"encrypted package bytes")
+            return result.stdout
+
+        self.assertEqual(launch("Game.exe"), "Game.exe\nen")
+        eac_entry = r"Z:\Game package\Start_Protected_Game.EXE"
+        self.assertEqual(launch(eac_entry), eac_entry + "\nMZ")
+        legacy_entry = "launcher/EasyAntiCheat_launcher.exe"
+        self.assertEqual(launch(legacy_entry), legacy_entry + "\nMZ")
+        named_entry = "Game/Binaries/WinStore/Game_EAC.exe"
+        self.assertEqual(launch(named_entry), named_entry + "\nMZ")
+        metadata = self.root / "Game/Binaries/WinStore/EasyAntiCheat"
+        metadata.mkdir(parents=True)
+        nested_entry = "Z:" + str(metadata.parent / "Launcher.exe").replace("/", chr(92))
+        self.assertEqual(launch(nested_entry), nested_entry + "\nMZ")
+        (self.root / "easyanticheat").mkdir()
+        self.assertEqual(launch("Game.exe"), "Game.exe\nMZ")
+        self.assertEqual(launch(eac_entry, WINE_DLL_FILE_MAP=""), eac_entry + "\nen")
+        self.assertEqual(launch(eac_entry, FERESTRE_IMAGE_VIEW="memfd"), eac_entry + "\nen")
+
     def launch_with_channel(self, title):
         """Start `title` (a shell command) through the view as the window
         does: with the launch's end of a stop channel. Returns the view and
@@ -177,6 +220,50 @@ print('mapped PE at its installed path')
         self.assertEqual(p.returncode, 0, err)
         self.assertIn("mapped PE at its installed path", out)
         self.assertEqual(self.image.read_bytes(), b"encrypted package bytes")
+
+    def test_eac_linux_library_appears_beside_the_windows_one_for_the_launch_only(self):
+        self.require_namespace()
+        eac = self.root / "EasyAntiCheat"
+        eac.mkdir()
+        (eac / "EasyAntiCheat_x64.dll").write_bytes(b"MZ windows eac")
+        library = Path(self.directory.name + "-library.so")
+        library.write_bytes(b"\x7fELF linux eac")
+        self.addCleanup(library.unlink)
+        env = dict(os.environ, WINE_DLL_FILE_MAP=self.mapping, FERESTRE_IMAGE_VIEW="real-path",
+                   FERESTRE_EAC_LINUX_LIBRARY=str(library))
+        code = """
+import os
+from pathlib import Path
+eac=Path('EasyAntiCheat')
+assert (eac/'easyanticheat_x64.so').read_bytes() == b'\\x7fELF linux eac'
+assert (eac/'EasyAntiCheat_x64.dll').read_bytes() == b'MZ windows eac'
+assert 'FERESTRE_EAC_LINUX_LIBRARY' not in os.environ
+print('library beside the dll')
+"""
+        p = subprocess.Popen([sys.executable, str(HELPER), "--", sys.executable, "-c", code],
+                             cwd=self.root, env=env, pass_fds=(self.fd,),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        out, err = p.communicate(timeout=15)
+        self.assertEqual(p.returncode, 0, err)
+        self.assertIn("library beside the dll", out)
+        self.assertIn("added EAC's Linux library", err)
+        self.assertEqual(sorted(x.name for x in eac.iterdir()), ["EasyAntiCheat_x64.dll"])
+
+    def test_eac_directory_skips_packages_that_ship_the_library(self):
+        eac = self.root / "EasyAntiCheat"
+        eac.mkdir()
+        (eac / "EasyAntiCheat_x64.dll").write_bytes(b"MZ")
+        self.assertEqual(view.eac_directory(["proton"], self.root.resolve()), eac.resolve())
+        (eac / "EasyAntiCheat_x64.so").write_bytes(b"\x7fELF")
+        self.assertIsNone(view.eac_directory(["proton"], self.root.resolve()))
+
+    def test_eac_directory_is_found_beside_a_nested_entry_point(self):
+        nested = self.root / "Game" / "Bin" / "EasyAntiCheat"
+        nested.mkdir(parents=True)
+        (nested / "easyanticheat_x64.dll").write_bytes(b"MZ")
+        entry = "Z:" + str(self.root / "Game" / "Bin" / "Game_EAC.exe").replace("/", "\\")
+        self.assertEqual(view.eac_directory(["proton", "run", entry], self.root.resolve()),
+                         nested.resolve())
 
     def test_rejects_paths_outside_the_installation(self):
         directory = tempfile.TemporaryDirectory(prefix="ferestre-view-outside-")

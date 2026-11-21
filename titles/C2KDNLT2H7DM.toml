@@ -1,0 +1,39 @@
+# Gears 5 -- Microsoft Store / Xbox PC.
+#
+# Legacy Easy Anti-Cheat (game 269). The Xbox PC package ships only the
+# Windows EAC library, and Epic serves no Wine module for this game, so under
+# Proton EAC needs its Linux library (easyanticheat_x64.so) beside
+# EasyAntiCheat_x64.dll, as the Steam build has shipped since 2023-06-21.
+# FERESTRE_EAC_LINUX_LIBRARY = "pinned" asks the launcher for its verified copy
+# of that generic library; the private image view shows it in the package's
+# EAC directory for the launch only. A path set in the environment wins.
+schema = 1
+
+[title]
+product-id = "C2KDNLT2H7DM"
+name = "Gears 5"
+slug = "gears-5"
+publisher = "Xbox Game Studios"
+
+[install]
+
+[launch]
+executable = 'GearGame\Binaries\WinStore\Gears5_EAC.exe'
+
+[launch.env]
+FERESTRE_EAC_LINUX_LIBRARY = "pinned"
+
+[runtime]
+requires = ["loader.memfd-main-image", "xgameruntime.user"]
+wants = ["appmodel.package-identity"]
+
+[status]
+state = "playable"
+summary = "Campaign and multiplayer play with Easy Anti-Cheat; the launcher supplies EAC's Linux library, which the Xbox PC package lacks."
+last-verified = 2026-11-21
+verified-with = "Xbox PC package 1.1.967.0 on CachyOS, runtime with legacy XPackage support, EAC Linux library added by the image view; campaign and multiplayer played"
+
+[[issues]]
+symptom = "Easy Anti-Cheat's splash appears, then the game closes or relaunches without reaching a menu"
+cause = "EAC's Linux library is missing: its download failed and FERESTRE_EAC_LINUX_LIBRARY names no file."
+fix = "Check the network and launch again, or set FERESTRE_EAC_LINUX_LIBRARY to an easyanticheat_x64.so (the legacy EAC client library)."

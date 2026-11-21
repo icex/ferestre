@@ -9,6 +9,7 @@ pkgbase = ferestre-runtime-bin
 	license = LGPL-2.1-or-later
 	license = OFL-1.1
 	license = Zlib
+	license = MIT
 	depends = glibc
 	depends = gcc-libs
 	depends = python

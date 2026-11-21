@@ -1,0 +1,32 @@
+# Gears of War: E-Day -- Microsoft Store / Xbox PC.
+schema = 1
+
+[title]
+product-id = "9N4PT8HGCDHQ"
+name = "Gears of War: E-Day"
+slug = "gears-of-war-e-day"
+publisher = "Xbox Game Studios"
+package-identity = "Microsoft.Fairlightbasegame"
+title-id = "6BE41AB5"
+
+[install]
+
+[launch]
+executable = "start_protected_game.exe"
+env = { FERESTRE_WINHTTP_HTTP2 = "1" }
+
+[runtime]
+requires = ["loader.memfd-main-image", "xgameruntime.user", "winhttp.http2"]
+wants = ["appmodel.package-identity"]
+
+[status]
+state = "playable-with-issues"
+summary = "Xbox sign-in and tutorial gameplay verified with HTTP/2. Online deployment was observed. An intermittent crash occurred on an earlier lobby entry."
+last-verified = 2026-11-21
+verified-with = "Xbox PC package 1.5.0.0 on CachyOS with the local Ferestre HTTP/2 runtime"
+
+[[issues]]
+symptom = "Online sign-in exits the queue with gill-gutpuncher"
+cause = "The configuration service requires HTTP/2 over TLS. A runtime without WinHTTP HTTP/2 sends HTTP/1.1 and receives no response."
+fix = "Use a runtime advertising winhttp.http2 and the default launch environment from this recipe."
+log-match = "gill-gutpuncher"

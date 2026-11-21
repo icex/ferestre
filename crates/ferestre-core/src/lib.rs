@@ -15,6 +15,7 @@
 
 pub mod account;
 pub mod accounts;
+pub mod anticheat;
 pub mod appx;
 pub mod autofix;
 pub mod cache;

@@ -12,9 +12,29 @@ compatibility libraries before starting a title.
 Run `ferestre doctor` afterwards. It reports **32-bit Linux loader available**
 when Wine can start 32-bit helpers.
 
-Halo Infinite also needs Python 3 and util-linux (`unshare`, `mount`, `umount`),
-with unprivileged user and mount namespaces enabled. Its licensed executable
-view exists only in private tmpfs mounts for the lifetime of the launch.
+Licensed Xbox packages detected by their Easy Anti-Cheat bootstrapper or
+Easy Anti-Cheat directory also need Python 3 and util-linux (`unshare`, `mount`,
+`umount`), with unprivileged user and mount namespaces enabled. Ferestre
+automatically makes the licensed images available at their installed paths
+through private tmpfs mounts for the lifetime of the launch. Protected play on
+Proton requires the publisher to enable Linux support for that game build.
+
+On the first launch Ferestre also downloads Valve's Proton Easy Anti-Cheat and
+BattlEye runtimes from the same Lutris URLs that Lutris and Heroic use. It keeps
+each one only if its SHA-256 matches the pinned value, unpacks it under
+`~/.local/state/ferestre/anticheat` (or your state directory), and passes it to
+Proton as `PROTON_EAC_RUNTIME` and `PROTON_BATTLEYE_RUNTIME`. A value you set
+yourself, or one set by the title's recipe, takes precedence. The Easy
+Anti-Cheat runtime is used only when the game ships EAC's Linux library
+(`easyanticheat_x64.so`) next to its Windows one.
+
+The Xbox PC build of Gears 5 does not ship that library. Its recipe asks for
+it (`FERESTRE_EAC_LINUX_LIBRARY = "pinned"`), so Ferestre downloads a copy,
+keeps it only if its SHA-256 matches the pinned value, and stores it under
+`~/.local/state/ferestre/anticheat/eac_linux`. During the launch the private
+image view shows it in the game's `EasyAntiCheat` directory through a
+read-only overlay; the installed package is not changed. To use your own copy
+instead, set `FERESTRE_EAC_LINUX_LIBRARY` to its path.
 
 ## WebKitGTK for sign-in
 

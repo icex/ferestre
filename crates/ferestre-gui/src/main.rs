@@ -19,6 +19,7 @@ mod deadline;
 mod editor;
 mod folder_picker;
 mod handheld;
+mod install_drives;
 mod launch_state;
 mod model;
 mod packagekit;
@@ -2923,11 +2924,31 @@ fn library_components(ui: &Ui, row: &LibraryRow) -> (adw::ActionRow, gtk::Box) {
     }
     actions.append(&more);
 
-    // A greyed-out "Play" is a button that says a title might work if you found
-    // the right thing to click. It never will: the reason is in the subtitle
-    // and on the row, and the Store link beside it is the thing to press.
+    // A title the runtime cannot start keeps its Play button, and pressing it
+    // says why and offers another runtime. Without a button the home screen's
+    // game card had nothing to press, so pressing it did nothing at all. A
+    // package this launcher cannot open at all has no Play: nothing in the
+    // window would make it work, and the reason is on the row.
     if let Action::Blocked(reason) = &row.action {
         action_row.set_tooltip_text(Some(&format!("{}\n{}\n{}", row.name, details, reason)));
+        if row.unsupported || !row.has_recipe {
+            return (action_row, actions);
+        }
+        let button = gtk::Button::builder()
+            .label(row.action.label())
+            .width_request(88)
+            .valign(gtk::Align::Center)
+            .tooltip_text(reason)
+            .build();
+        button.set_widget_name(&format!("game-{}-primary", row.product_id));
+        let (ui, product_id, name, reason) = (
+            ui.clone(),
+            row.product_id.clone(),
+            row.name.clone(),
+            reason.clone(),
+        );
+        button.connect_clicked(move |_| explain_blocked(&ui, &product_id, &name, &reason));
+        actions.append(&button);
         return (action_row, actions);
     }
 
@@ -3486,6 +3507,28 @@ fn warn_about_media(ui: &Ui, product_id: &str) {
     });
 }
 
+/// Why a title with a recipe cannot start, with the fix the window can offer:
+/// its blocked reasons are about the runtime the launch would use.
+fn explain_blocked(ui: &Ui, product_id: &str, name: &str, reason: &str) {
+    let dialog = adw::AlertDialog::new(
+        Some(&format!("{name} cannot start")),
+        Some(&format!(
+            "{reason}\n\nChoose a runtime that provides what it needs, or update the runtime."
+        )),
+    );
+    dialog.set_body_use_markup(false);
+    dialog.add_response("close", "Close");
+    dialog.add_response("runtime", "Choose runtime");
+    dialog.set_response_appearance("runtime", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("runtime"));
+    dialog.set_close_response("close");
+    let (chooser_ui, product_id, name) = (ui.clone(), product_id.to_string(), name.to_string());
+    dialog.connect_response(Some("runtime"), move |_, _| {
+        choose_runtime(&chooser_ui, &product_id, &name)
+    });
+    dialog.present(Some(&ui.window));
+}
+
 fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
     let key = product_id.to_ascii_uppercase();
     // A second `ferestre run` in the same prefix would replace the first in
@@ -4024,10 +4067,6 @@ impl DownloadBar {
 /// for machine-readable progress instead, and prints one JSON line per quarter
 /// second. A client too old to know about that simply prints nothing this can
 /// read, and the bar stays indeterminate rather than breaking.
-fn spawn_install(ui: &Ui, product_id: &str, name: &str, dir: Option<&Path>, what: &str) {
-    queue_ui::enqueue(ui, product_id, name, dir, what);
-}
-
 fn spawn_transfer(
     ui: &Ui,
     product_id: &str,
@@ -4035,6 +4074,7 @@ fn spawn_transfer(
     dir: Option<&Path>,
     what: &str,
     command_name: &str,
+    mount: Option<ferestre_core::transfers::InstallMount>,
 ) {
     if !begin(ui, &format!("{what} {name}")) {
         report_busy(ui);
@@ -4080,6 +4120,10 @@ fn spawn_transfer(
                 .env("XODUS_PROGRESS", "json")
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
+            if let Some(mount) = mount {
+                let identity = serde_json::to_string(&mount).map_err(|e| e.to_string())?;
+                command.env(ferestre_core::transfers::INSTALL_MOUNT_ENV, identity);
+            }
             let mut child = control
                 .spawn(&mut command)
                 .map_err(|e| format!("{}: {e}", program.display()))?;
@@ -4358,6 +4402,7 @@ fn resume_download(ui: &Ui, product_id: &str, name: &str) {
             name,
             Some(&destination),
             if updating { "Updating" } else { "Installing" },
+            None,
         );
     } else {
         ui.toasts
@@ -4384,7 +4429,7 @@ fn update_download(ui: &Ui, product_id: &str, name: &str) {
     }
     let destination = ui.model.borrow().update_destination(product_id);
     match destination {
-        Ok(dir) => queue_ui::enqueue(ui, product_id, name, Some(&dir), "Updating"),
+        Ok(dir) => queue_ui::enqueue(ui, product_id, name, Some(&dir), "Updating", None),
         Err(why) => ui.toasts.add_toast(toast(why)),
     }
 }
@@ -4459,6 +4504,8 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str) {
         browse.connect_clicked(move |_| folder_picker::open(&ui, entry.upcast_ref()));
     }
     let group = adw::PreferencesGroup::new();
+    let (selector, mount) = install_drives::selector(&library, &where_to);
+    group.add(&selector);
     group.add(&where_to);
     let extra = gtk::Box::new(gtk::Orientation::Vertical, 0);
     extra.append(&group);
@@ -4470,11 +4517,18 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str) {
     let resolve: Resolve = {
         let ui = ui.clone();
         let product_id = product_id.to_string();
+        let mount = mount.clone();
         Rc::new(move |text: &str| {
             let model = ui.model.borrow();
-            model::install_destination(text, home.as_deref(), &folder, &|dir| {
+            let destination = model::install_destination(text, home.as_deref(), &folder, &|dir| {
                 model.inspect_folder(&product_id, dir)
-            })
+            })?;
+            if let Some(mount) = &*mount.borrow() {
+                mount
+                    .check_path(&destination)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(destination)
         })
     };
     let show = {
@@ -4517,9 +4571,14 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str) {
                 // install would get.
                 let argument = ui.model.borrow().install_argument(&product_id, &dir);
                 match argument {
-                    Some(argument) => {
-                        spawn_install(&ui, &product_id, &name, Some(argument.as_path()), what)
-                    }
+                    Some(argument) => queue_ui::enqueue(
+                        &ui,
+                        &product_id,
+                        &name,
+                        Some(&argument),
+                        what,
+                        mount.borrow().clone(),
+                    ),
                     None => ui
                         .toasts
                         .add_toast(toast("Cannot work out where to put it")),
@@ -6142,7 +6201,7 @@ fn choose_move(ui: &Ui, product_id: &str, name: &str) {
         generation.set(generation.get() + 1);
         if response == "move" {
             if let Some(path) = chosen.borrow().as_ref() {
-                spawn_transfer(&ui, &product, &name, Some(path), "Moving", "move");
+                spawn_transfer(&ui, &product, &name, Some(path), "Moving", "move", None);
             }
         }
     });
