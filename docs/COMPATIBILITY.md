@@ -59,7 +59,7 @@ Current launcher: [0.1.22](RELEASE-0.1.22.md), using runtime **11.0.20261107.1**
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
 | Retro Classics | `9MTVJ3HHTQGS` | Playable | Playable, confirmed by the player. Signs in, loads the catalogue and streams Tennis; broader game, controller and save-restore coverage is not separately qualified. | 2026-10-10 |
 | Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. From a Steam shortcut, the shortcut's Steam Input controller layout applies, and Steam sees the game exit. | 2026-10-18 |
-| Hogwarts Legacy | `9MT5NJ5W7B8Z` | Untested | Package 1.0.22.0 opened with the callback-wait runtime. Gameplay verification is pending. | never |
+| Hogwarts Legacy | `9MT5NJ5W7B8Z` | Untested | Package 1.0.22.0 launched with a local runtime build that waits for the Xbox callbacks. | never |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.
 

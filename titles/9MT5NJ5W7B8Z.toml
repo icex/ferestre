@@ -20,8 +20,7 @@ requires = [
     "xgameruntime.user",
     "xgameruntime.async-callback-wait",
 ]
-wants = ["appmodel.package-identity"]
 
 [status]
 state = "untested"
-summary = "Package 1.0.22.0 opened with the callback-wait runtime. Gameplay verification is pending."
+summary = "Package 1.0.22.0 launched with a local runtime build that waits for the Xbox callbacks."

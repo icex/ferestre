@@ -581,100 +581,86 @@ static int log_probe(void)
     return 0;
 }
 
-struct user_callback_probe
+struct callback_order_probe
 {
     HANDLE callback_started, release_callback, callback_finished, waiter_started;
-    HRESULT callback_status, add_result, wait_status;
+    HRESULT callback_status, result_hr, wait_status;
     XUserHandle user;
+    XStoreContextHandle store_context;
     XStoreGameLicense license;
     XAsyncBlock async;
 };
 
-static void CALLBACK user_callback(XAsyncBlock *async)
+static void CALLBACK read_callback_result(XAsyncBlock *async)
 {
-    struct user_callback_probe *probe = async->context;
+    struct callback_order_probe *probe = async->context;
 
     SetEvent(probe->callback_started);
-    if (WaitForSingleObject(probe->release_callback,5000) != WAIT_OBJECT_0) return;
+    if (WaitForSingleObject(probe->release_callback,5000) != WAIT_OBJECT_0) ExitProcess(35);
     probe->callback_status = IXThreadingImpl_XAsyncGetStatus(threading,async,TRUE);
-    probe->add_result = IXUserImpl6_XUserAddResult(users,async,&probe->user);
+    if (probe->store_context)
+        probe->result_hr = IXStoreImpl6_XStoreQueryGameLicenseResult(store,async,&probe->license);
+    else
+        probe->result_hr = IXUserImpl6_XUserAddResult(users,async,&probe->user);
     SetEvent(probe->callback_finished);
 }
 
-static void CALLBACK game_license_callback(XAsyncBlock *async)
+static DWORD WINAPI wait_for_callback(void *context)
 {
-    struct user_callback_probe *probe = async->context;
-
-    SetEvent(probe->callback_started);
-    if (WaitForSingleObject(probe->release_callback,5000) != WAIT_OBJECT_0) return;
-    probe->callback_status = IXThreadingImpl_XAsyncGetStatus(threading,async,TRUE);
-    probe->add_result = IXStoreImpl6_XStoreQueryGameLicenseResult(store,async,&probe->license);
-    SetEvent(probe->callback_finished);
-}
-
-static DWORD WINAPI user_callback_waiter(void *context)
-{
-    struct user_callback_probe *probe = context;
+    struct callback_order_probe *probe = context;
 
     SetEvent(probe->waiter_started);
     probe->wait_status = IXThreadingImpl_XAsyncGetStatus(threading,&probe->async,TRUE);
     return 0;
 }
 
-static BOOL verify_callback_wait(struct user_callback_probe *probe)
+static BOOL verify_callback_wait(struct callback_order_probe *probe)
 {
     HANDLE waiter;
 
-    if (WaitForSingleObject(probe->callback_started,5000) != WAIT_OBJECT_0) return FALSE;
+    if (WaitForSingleObject(probe->callback_started,5000) != WAIT_OBJECT_0) ExitProcess(36);
     CHECK(IXThreadingImpl_XAsyncGetStatus(threading,&probe->async,FALSE) == S_OK,
         "polling can read the result while its callback is running");
-    waiter = CreateThread(NULL,0,user_callback_waiter,probe,0,NULL);
-    if (!waiter || WaitForSingleObject(probe->waiter_started,5000) != WAIT_OBJECT_0) return FALSE;
+    waiter = CreateThread(NULL,0,wait_for_callback,probe,0,NULL);
+    if (!waiter || WaitForSingleObject(probe->waiter_started,5000) != WAIT_OBJECT_0) ExitProcess(37);
     CHECK(WaitForSingleObject(waiter,100) == WAIT_TIMEOUT, "the blocking wait includes the ThreadPool callback");
     SetEvent(probe->release_callback);
     if (WaitForSingleObject(waiter,5000) != WAIT_OBJECT_0 ||
-        WaitForSingleObject(probe->callback_finished,5000) != WAIT_OBJECT_0) return FALSE;
+        WaitForSingleObject(probe->callback_finished,5000) != WAIT_OBJECT_0) ExitProcess(38);
     CloseHandle(waiter);
-    return probe->wait_status == S_OK && probe->callback_status == S_OK && probe->add_result == S_OK;
+    return probe->wait_status == S_OK && probe->callback_status == S_OK && probe->result_hr == S_OK;
 }
 
-static int user_callback_order_probe(void)
+static int callback_order_probe(void)
 {
-    struct user_callback_probe probe = {0};
+    struct callback_order_probe probe = {0};
     XTaskQueueHandle queue = NULL;
-    XStoreContextHandle context = NULL;
     BOOL completed;
 
     control(1,1,1,1,0);
     SetEnvironmentVariableA("XGR_ACCOUNT_ROLES_V1","1");
-    SetEnvironmentVariableA("XGR_WAIT_FOR_ASYNC_CALLBACKS","1");
-    probe.callback_started = CreateEventW(NULL,TRUE,FALSE,NULL);
-    probe.release_callback = CreateEventW(NULL,TRUE,FALSE,NULL);
-    probe.callback_finished = CreateEventW(NULL,TRUE,FALSE,NULL);
-    probe.waiter_started = CreateEventW(NULL,TRUE,FALSE,NULL);
+    probe.callback_started = CreateEventW(NULL,FALSE,FALSE,NULL);
+    probe.release_callback = CreateEventW(NULL,FALSE,FALSE,NULL);
+    probe.callback_finished = CreateEventW(NULL,FALSE,FALSE,NULL);
+    probe.waiter_started = CreateEventW(NULL,FALSE,FALSE,NULL);
     if (!probe.callback_started || !probe.release_callback || !probe.callback_finished ||
         !probe.waiter_started) return 30;
     if (IXThreadingImpl_XTaskQueueCreate(threading,XTaskQueueDispatchMode_ThreadPool,
         XTaskQueueDispatchMode_ThreadPool,&queue) != S_OK) return 31;
     probe.async.queue = queue;
     probe.async.context = &probe;
-    probe.async.callback = user_callback;
+    probe.async.callback = read_callback_result;
     if (IXUserImpl6_XUserAddAsync(users,XUserAddOptions_AddDefaultUserSilently,&probe.async) != S_OK) return 32;
     completed = verify_callback_wait(&probe);
     CHECK(completed && probe.user, "the user-add callback gives the waiter its user handle");
     if (!completed || !probe.user ||
-        IXStoreImpl6_XStoreCreateContext(store,probe.user,&context) != S_OK) return 33;
+        IXStoreImpl6_XStoreCreateContext(store,probe.user,&probe.store_context) != S_OK) return 33;
 
-    ResetEvent(probe.callback_started);
-    ResetEvent(probe.release_callback);
-    ResetEvent(probe.callback_finished);
-    ResetEvent(probe.waiter_started);
     memset(&probe.async.internal,0,sizeof(probe.async.internal));
-    probe.async.callback = game_license_callback;
-    if (IXStoreImpl6_XStoreQueryGameLicenseAsync(store,context,&probe.async) != S_OK) return 34;
+    if (IXStoreImpl6_XStoreQueryGameLicenseAsync(store,probe.store_context,&probe.async) != S_OK) return 34;
     completed = verify_callback_wait(&probe);
     CHECK(completed && probe.license.isActive, "the game-license callback gives the waiter the verified grant");
-    IXStoreImpl6_XStoreCloseContextHandle(store,context);
+    IXStoreImpl6_XStoreCloseContextHandle(store,probe.store_context);
     IXUserImpl6_XUserCloseHandle(users,probe.user);
     IXThreadingImpl_XTaskQueueCloseHandle(threading,queue);
     CloseHandle(probe.waiter_started);
@@ -708,7 +694,7 @@ int main(int argc,char **argv)
     if(argc>2 && !strcmp(argv[1],"--sleep")) { Sleep(atoi(argv[2])*1000); return 0; }
     if(argc>1 && !strcmp(argv[1],"--log-probe")) return log_probe();
     if(argc>1 && !strcmp(argv[1],"--strict-token")) return strict_token_probe();
-    if(argc>1 && !strcmp(argv[1],"--user-callback-order")) return user_callback_order_probe();
+    if(argc>1 && !strcmp(argv[1],"--callback-order")) return callback_order_probe();
     SetEnvironmentVariableA("XGR_ACCOUNT_ROLES_V1","1");
     test_identity_off_the_callers_thread();
     control(1,1,0,1,0);
