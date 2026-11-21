@@ -3464,12 +3464,13 @@ fn stop_service(directory: &Path) {
     let ours = || service_in(pid, &home);
     if let Some(process) = Process::open(pid) {
         if ours() {
+            let running = || process.has_exited().map_or_else(&ours, |exited| !exited);
             process.signal(libc::SIGTERM);
-            if !gone_within(&ours, std::time::Duration::from_secs(3)) {
+            if !gone_within(&running, std::time::Duration::from_secs(3)) {
                 process.signal(libc::SIGKILL);
                 // Not let go of until it has: a launch waiting for the lock
                 // would otherwise find the dying service still listening.
-                gone_within(&ours, std::time::Duration::from_secs(2));
+                gone_within(&running, std::time::Duration::from_secs(2));
             }
         }
     }
@@ -3543,6 +3544,19 @@ impl Process {
                 libc::kill(self.pid, signal);
             },
         }
+    }
+
+    /// Check for process exit. Its cwd can disappear earlier during teardown.
+    fn has_exited(&self) -> Option<bool> {
+        use std::os::fd::AsRawFd;
+        let mut event = libc::pollfd {
+            fd: self.pidfd.as_ref()?.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Safety: poll receives one initialized entry for a descriptor we own.
+        let ready = unsafe { libc::poll(&mut event, 1, 0) };
+        Some(ready > 0 && event.revents & (libc::POLLIN | libc::POLLHUP) != 0)
     }
 }
 
