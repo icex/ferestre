@@ -484,7 +484,10 @@ mod tests {
         .unwrap();
         let launch = Presence::start(Some(fixture.setup()));
         wait_until("the runner", || {
-            pid.exists() && fixture.count("presence run") == 1
+            // The runner writes its pid after creating the file; wait for
+            // the number, not just the file.
+            std::fs::read_to_string(&pid).is_ok_and(|text| text.trim().parse::<i32>().is_ok())
+                && fixture.count("presence run") == 1
         });
         let runner: i32 = std::fs::read_to_string(&pid)
             .unwrap()

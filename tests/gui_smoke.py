@@ -1041,7 +1041,11 @@ print(":: done", flush=True)
             check(not any(n.get_state_set().contains(Atspi.StateType.SHOWING)
                           for n in find_all(frame, role="button", name=removed)),
                   f"{removed} does not clutter the sidebar", frame)
-        check("Not signed in" in labels, "says plainly that nobody is signed in", frame)
+        # The account loads in the background after the window appears; on a
+        # busy runner the first read of the tree can come before it.
+        signed_out = wait_for(frame, lambda root: "Not signed in" in texts(root) or None,
+                              "the signed-out label", time.monotonic() + 20)
+        check(bool(signed_out), "says plainly that nobody is signed in", frame)
 
         select_in_list(frame,"My Library")
         print("library, with no account")
