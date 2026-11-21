@@ -19,6 +19,16 @@ automatically makes the licensed images available at their installed paths
 through private tmpfs mounts for the lifetime of the launch. Protected play on
 Proton requires the publisher to enable Linux support for that game build.
 
+On the first launch Ferestre also downloads Valve's Proton Easy Anti-Cheat and
+BattlEye runtimes from the same Lutris URLs that Lutris and Heroic use. It keeps
+each one only if its SHA-256 matches the pinned value, unpacks it under
+`~/.local/state/ferestre/anticheat` (or your state directory), and passes it to
+Proton as `PROTON_EAC_RUNTIME` and `PROTON_BATTLEYE_RUNTIME`. A value you set
+yourself, or one set by the title's recipe, takes precedence. The Easy
+Anti-Cheat runtime is used only when the game ships EAC's Linux library
+(`easyanticheat_x64.so`) next to its Windows one. The Xbox PC build of Gears 5
+does not ship that library, so it still cannot pass Easy Anti-Cheat.
+
 ## WebKitGTK for sign-in
 
 The Xbox client (`xodus-cli`) shows Microsoft's sign-in page in a WebKitGTK

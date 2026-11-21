@@ -853,6 +853,7 @@ fn prepare_launch(
         "XODUS_RELATED_CONTENT".into(),
         ferestre_core::related::service_binding(&related),
     );
+    add_anticheat_runtimes(&mut plan, paths.state_dir(), request.dry_run);
     let service_socket = plan_service_socket(&mut plan, &dirs, runtime, roles.as_ref())?;
     Ok(PreparedLaunch {
         runtime: runtime.clone(),
@@ -3271,6 +3272,40 @@ fn scoped_service_directory(supported: bool, id: &str, root: &Path) -> Result<Op
     // Keep the Unix socket path below sun_path limits (the full SHA remains
     // in SERVICE_ID; 128 bits identify the namespace).
     Ok(Some(root.join("ferestre-services").join(&id[..32])))
+}
+
+/// Point Proton at the EAC and BattlEye runtimes, fetching them on first use
+/// as Lutris and Heroic do. A value the user or the recipe already set wins.
+/// A failed download costs only titles that need the runtime, so it warns and
+/// the launch goes on; a dry run never downloads.
+fn add_anticheat_runtimes(plan: &mut launch::Plan, state_dir: &Path, dry_run: bool) {
+    let root = ferestre_core::anticheat::dir(state_dir);
+    for runtime in &ferestre_core::anticheat::ALL {
+        if plan.env_set.contains_key(runtime.env) || std::env::var_os(runtime.env).is_some() {
+            continue;
+        }
+        let found = if dry_run {
+            ferestre_core::anticheat::installed(&root, runtime)
+        } else {
+            if ferestre_core::anticheat::installed(&root, runtime).is_none() {
+                eprintln!(":: downloading the {}", runtime.label);
+            }
+            match ferestre_core::anticheat::ensure(&root, runtime) {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    eprintln!(
+                        "-- the {} is unavailable, so titles that need it may not start: {e:#}",
+                        runtime.label
+                    );
+                    None
+                }
+            }
+        };
+        if let Some(path) = found {
+            plan.env_set
+                .insert(runtime.env.into(), path.to_string_lossy().into_owned());
+        }
+    }
 }
 
 /// A capable runtime and its packaged service share a content-addressed socket
