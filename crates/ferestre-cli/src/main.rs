@@ -3306,6 +3306,47 @@ fn add_anticheat_runtimes(plan: &mut launch::Plan, state_dir: &Path, dry_run: bo
                 .insert(runtime.env.into(), path.to_string_lossy().into_owned());
         }
     }
+    add_eac_linux_library(plan, &root, dry_run);
+}
+
+/// A recipe asks for EAC's Linux library with `FERESTRE_EAC_LINUX_LIBRARY =
+/// "pinned"`. A path the user set in the environment wins; otherwise the
+/// pinned download replaces the request. Without either, the variable is
+/// dropped so the image view does nothing and the launch says why EAC will
+/// fail.
+fn add_eac_linux_library(plan: &mut launch::Plan, root: &Path, dry_run: bool) {
+    use ferestre_core::anticheat::{self, EAC_LINUX_LIBRARY, LIBRARY_ENV, PINNED};
+    if let Some(own) = std::env::var_os(LIBRARY_ENV) {
+        plan.env_set
+            .insert(LIBRARY_ENV.into(), own.to_string_lossy().into_owned());
+        return;
+    }
+    if plan.env_set.get(LIBRARY_ENV).map(String::as_str) != Some(PINNED) {
+        return;
+    }
+    let found = if dry_run {
+        anticheat::library_installed(root, &EAC_LINUX_LIBRARY)
+            .ok_or_else(|| anyhow::anyhow!("not downloaded yet"))
+    } else {
+        if anticheat::library_installed(root, &EAC_LINUX_LIBRARY).is_none()
+            && !EAC_LINUX_LIBRARY.url.is_empty()
+        {
+            eprintln!(":: downloading Easy Anti-Cheat's Linux library");
+        }
+        anticheat::ensure_library(root, &EAC_LINUX_LIBRARY)
+    };
+    match found {
+        Ok(path) => {
+            plan.env_set
+                .insert(LIBRARY_ENV.into(), path.to_string_lossy().into_owned());
+        }
+        Err(e) => {
+            plan.env_set.remove(LIBRARY_ENV);
+            eprintln!(
+                "-- this title needs Easy Anti-Cheat's Linux library and it is unavailable, so EAC will stop it: {e:#}"
+            );
+        }
+    }
 }
 
 /// A capable runtime and its packaged service share a content-addressed socket

@@ -1,12 +1,12 @@
 # Gears 5 -- Microsoft Store / Xbox PC.
 #
 # Legacy Easy Anti-Cheat (game 269). The Xbox PC package ships only the
-# Windows EAC library. Under Proton that library asks Epic's CDN for a Wine
-# module, which is empty for this game, so EAC never initialises. The Steam
-# build has shipped EAC's Linux library (easyanticheat_x64.so) since its
-# 2023-06-21 Steam Deck update, and with it Proton's EAC bridge works. Only the
-# publisher can add that library to this package; Ferestre does not copy one
-# in from anywhere else.
+# Windows EAC library, and Epic serves no Wine module for this game, so under
+# Proton EAC needs its Linux library (easyanticheat_x64.so) beside
+# EasyAntiCheat_x64.dll, as the Steam build has shipped since 2023-06-21.
+# FERESTRE_EAC_LINUX_LIBRARY = "pinned" asks the launcher for its verified copy
+# of that generic library; the private image view shows it in the package's
+# EAC directory for the launch only. A path set in the environment wins.
 schema = 1
 
 [title]
@@ -20,19 +20,21 @@ publisher = "Xbox Game Studios"
 [launch]
 executable = 'GearGame\Binaries\WinStore\Gears5_EAC.exe'
 
+[launch.env]
+FERESTRE_EAC_LINUX_LIBRARY = "pinned"
+
 [runtime]
 requires = ["loader.memfd-main-image", "xgameruntime.user"]
 wants = ["appmodel.package-identity"]
 
 [status]
-state = "broken"
-summary = "Blocked by Easy Anti-Cheat: the Xbox PC package does not include EAC's Linux library, which only the publisher can add."
-stops-at = "Gears5.exe restarts through Gears5_EAC.exe before a window; EAC's loader logs Code 915 after an empty wine64 module download"
-blocked-by = "title-protection"
+state = "menus"
+stops-at = "Title screen (PRESS ENTER TO PLAY) reached in a headless test; input, sign-in and play beyond it not yet tested"
+summary = "Reaches the title screen with Easy Anti-Cheat's Linux library; play past it is not verified yet."
 last-verified = 2026-11-21
-verified-with = "Xbox PC package 1.1.967.0 on CachyOS, runtime with legacy XPackage support, Proton EAC runtime set, headless gamescope"
+verified-with = "Xbox PC package 1.1.967.0 on CachyOS, runtime with legacy XPackage support, Proton EAC runtime, EAC Linux library added by the image view, headless gamescope"
 
 [[issues]]
-symptom = "The Easy Anti-Cheat splash appears, then the game closes or relaunches without reaching a menu"
-cause = "Legacy EAC needs easyanticheat_x64.so next to EasyAntiCheat_x64.dll. The Steam build has it; this package does not, and Epic serves no Wine module for game 269."
-fix = "None known on Linux. The publisher has to ship easyanticheat_x64.so in the Xbox PC package, as it did for Steam."
+symptom = "Easy Anti-Cheat's splash appears, then the game closes or relaunches without reaching a menu"
+cause = "EAC's Linux library is missing: the download failed or no location is configured, and FERESTRE_EAC_LINUX_LIBRARY names no file."
+fix = "Set FERESTRE_EAC_LINUX_LIBRARY to an easyanticheat_x64.so (the legacy EAC client library, such as the one the free Steam game Overstep ships)."

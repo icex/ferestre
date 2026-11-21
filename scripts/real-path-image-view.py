@@ -379,6 +379,67 @@ def image_entries(mapping, root):
     return entries
 
 
+EAC_LIBRARY = "FERESTRE_EAC_LINUX_LIBRARY"
+EAC_LIBRARY_NAME = "easyanticheat_x64.so"
+
+
+def find_child(directory, name):
+    """`directory`'s entry called `name`, compared without case, or None."""
+    try:
+        for entry in directory.iterdir():
+            if entry.name.lower() == name.lower():
+                return entry
+    except OSError:
+        pass
+    return None
+
+
+def eac_directory(args, root):
+    """The package's legacy EAC directory that lacks EAC's Linux library.
+
+    Proton's EAC bridge only loads when easyanticheat_x64.so sits beside the
+    game's EasyAntiCheat_x64.dll. Look where the shim does: next to the entry
+    point and at the package root.
+    """
+    candidates = []
+    if args[1:2] == ["run"] and len(args) > 2:
+        entry = args[2].replace("\\", "/")
+        if entry[:2].lower() == "z:":
+            entry = entry[2:]
+        candidates.append((root / entry).parent)
+    candidates.append(root)
+    for base in candidates:
+        found = find_child(base, "EasyAntiCheat")
+        if (found and found.is_dir() and find_child(found, "EasyAntiCheat_x64.dll")
+                and not find_child(found, EAC_LIBRARY_NAME)):
+            found = found.resolve()
+            if found.is_relative_to(root):
+                return found
+    return None
+
+
+def add_eac_library(library, args, root, stage):
+    """Show `library` as easyanticheat_x64.so in the package's EAC directory.
+
+    A read-only overlay in this namespace adds the file; the package on disk
+    is untouched. Returns the overlaid directory, or None when there is
+    nothing to do.
+    """
+    directory = eac_directory(args, root)
+    if directory is None:
+        return None
+    source = Path(library)
+    if not source.is_file() or source.read_bytes()[:4] != b"\x7fELF":
+        raise ValueError(f"{library} is not EAC's Linux library")
+    upper = stage / "eac-library"
+    upper.mkdir()
+    shutil.copyfile(source, upper / EAC_LIBRARY_NAME)
+    (upper / EAC_LIBRARY_NAME).chmod(0o755)
+    subprocess.run(["mount", "-t", "overlay", "overlay", "-o",
+                    f"lowerdir={upper}:{directory}", str(directory)], check=True)
+    return directory
+
+
 def main():
     args = sys.argv[1:]
     inside = args[:1] == ["--inside"]
@@ -415,9 +476,18 @@ def main():
         server_dir = None
         try:
             size = sum((n + 4095) // 4096 * 4096 for _, _, n in entries) + 8 * 1024 * 1024
+            library = os.environ.get(EAC_LIBRARY)
+            if library and os.path.isfile(library):
+                size += (os.path.getsize(library) + 4095) // 4096 * 4096
             subprocess.run(["mount", "-t", "tmpfs", "-o",
                             f"mode=0700,nodev,nosuid,size={size}", "tmpfs", str(stage)], check=True)
             mounted = True
+            if library:
+                # Before the image binds: they may sit inside this directory.
+                overlaid = add_eac_library(library, args, Path.cwd().resolve(), stage)
+                if overlaid:
+                    targets.insert(0, overlaid)
+                    print(f":: added EAC's Linux library to {overlaid}", file=sys.stderr)
             for index, (descriptor, target, _) in enumerate(entries):
                 source = stage / str(index)
                 # Reopen rather than duplicate: do not change the client's
@@ -438,6 +508,7 @@ def main():
             env = dict(os.environ)
             env.pop("WINE_DLL_FILE_MAP", None)
             env.pop("FERESTRE_IMAGE_VIEW", None)
+            env.pop(EAC_LIBRARY, None)
             with subprocess.Popen(args, env=env, close_fds=True,
                                   preexec_fn=as_caller(uid, gid)) as launch:
                 if channel is not None:

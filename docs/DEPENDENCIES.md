@@ -26,8 +26,15 @@ each one only if its SHA-256 matches the pinned value, unpacks it under
 Proton as `PROTON_EAC_RUNTIME` and `PROTON_BATTLEYE_RUNTIME`. A value you set
 yourself, or one set by the title's recipe, takes precedence. The Easy
 Anti-Cheat runtime is used only when the game ships EAC's Linux library
-(`easyanticheat_x64.so`) next to its Windows one. The Xbox PC build of Gears 5
-does not ship that library, so it still cannot pass Easy Anti-Cheat.
+(`easyanticheat_x64.so`) next to its Windows one.
+
+The Xbox PC build of Gears 5 does not ship that library. Its recipe asks for
+it (`FERESTRE_EAC_LINUX_LIBRARY = "pinned"`), so Ferestre downloads a copy,
+keeps it only if its SHA-256 matches the pinned value, and stores it under
+`~/.local/state/ferestre/anticheat/eac_linux`. During the launch the private
+image view shows it in the game's `EasyAntiCheat` directory through a
+read-only overlay; the installed package is not changed. To use your own copy
+instead, set `FERESTRE_EAC_LINUX_LIBRARY` to its path.
 
 ## WebKitGTK for sign-in
 

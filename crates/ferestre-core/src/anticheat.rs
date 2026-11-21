@@ -130,9 +130,94 @@ fn unpack(root: &Path, runtime: &Runtime, archive: &Path) -> Result<PathBuf> {
     result
 }
 
+/// EAC's legacy Linux client library, for titles whose package has only the
+/// Windows one (the Xbox PC build of Gears 5). Proton's EAC bridge loads it
+/// from beside the game's `EasyAntiCheat_x64.dll`; the private image view
+/// puts it there for the launch only. It is the same generic library that
+/// legacy-EAC games ship for Linux; the game-specific part still comes from
+/// Epic's servers.
+pub struct Library {
+    /// Where to fetch it. Empty until a download location is published, in
+    /// which case only a file the user names (`FERESTRE_EAC_LINUX_LIBRARY`)
+    /// is used.
+    pub url: &'static str,
+    pub sha256: &'static str,
+    pub size: u64,
+}
+
+pub const EAC_LINUX_LIBRARY: Library = Library {
+    url: "https://www.dropbox.com/scl/fi/wulm6yzv1ybt1nej11sdp/easyanticheat_x64.so?rlkey=vrt9hbjafnm3jux7qxrwl4p5z&dl=1",
+    sha256: "109a015168b673b6d09c0d388bcfd46d46433e9723897e507d9431f5f2336209",
+    size: 4_268_976,
+};
+
+/// The variable naming the library: a path the user chose, or `pinned` in a
+/// recipe to ask for the downloaded one.
+pub const LIBRARY_ENV: &str = "FERESTRE_EAC_LINUX_LIBRARY";
+
+/// The recipe value asking for the pinned download.
+pub const PINNED: &str = "pinned";
+
+fn library_path(root: &Path) -> PathBuf {
+    root.join("eac_linux").join("easyanticheat_x64.so")
+}
+
+/// The library's path if a verified copy is there.
+pub fn library_installed(root: &Path, library: &Library) -> Option<PathBuf> {
+    let path = library_path(root);
+    crate::updater::verify_checksum(&path, library.sha256)
+        .is_ok()
+        .then_some(path)
+}
+
+/// The library's path, downloading it first if needed.
+pub fn ensure_library(root: &Path, library: &Library) -> Result<PathBuf> {
+    if let Some(path) = library_installed(root, library) {
+        return Ok(path);
+    }
+    if library.url.is_empty() {
+        bail!("no download location is configured; set {LIBRARY_ENV} to an easyanticheat_x64.so");
+    }
+    let path = library_path(root);
+    crate::http::download_pinned(library.url, &path, library.sha256, library.size)?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_library_is_installed_only_when_its_hash_matches() {
+        let root = tempfile::tempdir().unwrap();
+        let path = library_path(root.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"elf").unwrap();
+        let other = Library {
+            url: "",
+            sha256: EAC_LINUX_LIBRARY.sha256,
+            size: 3,
+        };
+        assert_eq!(library_installed(root.path(), &other), None);
+        // sha256("elf")
+        let matching = Library {
+            sha256: "780d84b20d7ae7e6292919399348bdbf96025270136198083fc8a4da398b5ca9",
+            ..other
+        };
+        assert_eq!(library_installed(root.path(), &matching), Some(path));
+    }
+
+    #[test]
+    fn without_a_location_the_library_asks_for_a_file() {
+        let root = tempfile::tempdir().unwrap();
+        let none = Library {
+            url: "",
+            sha256: EAC_LINUX_LIBRARY.sha256,
+            size: 1,
+        };
+        let e = ensure_library(root.path(), &none).unwrap_err();
+        assert!(format!("{e:#}").contains(LIBRARY_ENV), "{e:#}");
+    }
 
     fn fake(root: &Path, runtime: &Runtime, stamp: &str) -> PathBuf {
         let path = root.join(runtime.name);
@@ -215,5 +300,14 @@ mod network {
         }
         // The archive is not kept once unpacked.
         assert!(!root.path().join(".eac_runtime.tar.xz").exists());
+    }
+
+    #[test]
+    #[ignore = "downloads from dropbox.com"]
+    fn the_pinned_eac_linux_library_downloads() {
+        let root = tempfile::tempdir().unwrap();
+        let path = ensure_library(root.path(), &EAC_LINUX_LIBRARY).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap()[..4], *b"\x7fELF");
+        assert_eq!(library_installed(root.path(), &EAC_LINUX_LIBRARY), Some(path));
     }
 }
