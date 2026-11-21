@@ -33,6 +33,12 @@ pub struct Runtime {
     pub archive_dir: &'static str,
     /// A file every complete copy has, relative to the runtime directory.
     pub marker: &'static str,
+    /// A directory a title using this anti-cheat ships, at its root or next
+    /// to its executable, compared without case.
+    pub title_dir: &'static str,
+    /// Entry points that start this anti-cheat, lowercase; `*` matches any
+    /// prefix.
+    pub entry_points: &'static [&'static str],
 }
 
 pub const EAC: Runtime = Runtime {
@@ -43,6 +49,8 @@ pub const EAC: Runtime = Runtime {
     sha256: "8c711a3dd0906fdedd2fdcdedc7b33e09eff5aa22fe2b2dffcc046f02e194957",
     archive_dir: "eac_runtime",
     marker: "v2/lib64/easyanticheat_x64.dll",
+    title_dir: "easyanticheat",
+    entry_points: &["start_protected_game.exe", "easyanticheat_launcher.exe", "*_eac.exe"],
 };
 
 pub const BATTLEYE: Runtime = Runtime {
@@ -54,6 +62,8 @@ pub const BATTLEYE: Runtime = Runtime {
     // Lutris's archive spells it this way.
     archive_dir: "battleeye_runtime",
     marker: "v1/lib/wine/beclient.dll.so",
+    title_dir: "battleye",
+    entry_points: &["*_be.exe"],
 };
 
 pub const ALL: [Runtime; 2] = [EAC, BATTLEYE];
@@ -64,6 +74,40 @@ const MAX_ARCHIVE: u64 = 64 * 1024 * 1024;
 /// Records which archive a complete install came from, so a new pin replaces
 /// it and a half-extracted one is never mistaken for complete.
 const STAMP: &str = ".ferestre-sha256";
+
+/// Whether the title installed at `game_dir`, started through `executable`
+/// (a package-relative Windows path), uses `runtime`. Only these titles pay
+/// for its download.
+pub fn needed(runtime: &Runtime, game_dir: &Path, executable: &str) -> bool {
+    let executable = executable.replace('\\', "/");
+    let entry = executable
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let named = runtime
+        .entry_points
+        .iter()
+        .any(|p| match p.strip_prefix('*') {
+            Some(suffix) => entry.ends_with(suffix),
+            None => entry == *p,
+        });
+    let beside = Path::new(&executable).parent().map(|p| game_dir.join(p));
+    named
+        || [Some(game_dir.to_path_buf()), beside]
+            .into_iter()
+            .flatten()
+            .any(|dir| has_child_dir(&dir, runtime.title_dir))
+}
+
+fn has_child_dir(dir: &Path, name: &str) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            e.file_name().to_string_lossy().eq_ignore_ascii_case(name)
+                && e.file_type().is_ok_and(|t| t.is_dir())
+        })
+    })
+}
 
 /// Where the runtimes live, under the launcher's state directory.
 pub fn dir(state_dir: &Path) -> PathBuf {
@@ -83,7 +127,14 @@ pub fn ensure(root: &Path, runtime: &Runtime) -> Result<PathBuf> {
         return Ok(path);
     }
     std::fs::create_dir_all(root).with_context(|| format!("{}", root.display()))?;
-    let archive = root.join(format!(".{}.tar.xz", runtime.name));
+    let path = root.join(runtime.name);
+    // Left by launches that were killed part way.
+    for extension in ["archive", "unpack", "old"] {
+        crate::cache::sweep_stale_temporaries(&path, extension);
+    }
+    // Each launch has its own archive, so two first launches never share or
+    // delete one another's.
+    let archive = crate::cache::temporary_beside(&path, "archive");
     crate::http::download_pinned(runtime.url, &archive, runtime.sha256, MAX_ARCHIVE)?;
     let result = unpack(root, runtime, &archive);
     let _ = std::fs::remove_file(&archive);
@@ -113,10 +164,18 @@ fn unpack(root: &Path, runtime: &Runtime, archive: &Path) -> Result<PathBuf> {
         }
         std::fs::write(unpacked.join(STAMP), runtime.sha256)?;
         let path = root.join(runtime.name);
+        if let Some(done) = installed(root, runtime) {
+            // Another launch finished while this one downloaded. Keep its
+            // copy: a game it started may already be using it.
+            return Ok(done);
+        }
         if path.exists() {
-            // An older pin or an incomplete copy: `installed` said no.
-            std::fs::remove_dir_all(&path)
+            // An older pin or an incomplete copy. Move it aside rather than
+            // deleting it in place, so the swap below is one rename.
+            let old = crate::cache::temporary_beside(&path, "old");
+            std::fs::rename(&path, &old)
                 .with_context(|| format!("cannot replace {}", path.display()))?;
+            let _ = std::fs::remove_dir_all(&old);
         }
         if let Err(e) = std::fs::rename(&unpacked, &path) {
             // Another launch finished first.
@@ -186,6 +245,32 @@ pub fn ensure_library(root: &Path, library: &Library) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_titles_that_ship_an_anti_cheat_need_its_runtime() {
+        let game = tempfile::tempdir().unwrap();
+        let exe = "Game\\Binaries\\Win64\\Game.exe";
+        assert!(!needed(&EAC, game.path(), exe));
+        assert!(!needed(&BATTLEYE, game.path(), exe));
+        std::fs::create_dir_all(game.path().join("Game/Binaries/Win64/EasyAntiCheat")).unwrap();
+        assert!(needed(&EAC, game.path(), exe));
+        assert!(!needed(&BATTLEYE, game.path(), exe));
+        std::fs::create_dir(game.path().join("BattlEye")).unwrap();
+        assert!(needed(&BATTLEYE, game.path(), exe));
+    }
+
+    #[test]
+    fn an_anti_cheat_entry_point_names_its_runtime() {
+        let game = tempfile::tempdir().unwrap();
+        assert!(needed(
+            &EAC,
+            game.path(),
+            "GearGame\\Binaries\\WinStore\\Gears5_EAC.exe"
+        ));
+        assert!(needed(&EAC, game.path(), "start_protected_game.exe"));
+        assert!(needed(&BATTLEYE, game.path(), "Bin\\Game_BE.exe"));
+        assert!(!needed(&EAC, game.path(), "Bin\\Game_BE.exe"));
+    }
 
     #[test]
     fn a_library_is_installed_only_when_its_hash_matches() {
@@ -298,8 +383,13 @@ mod network {
             assert!(path.join(runtime.marker).is_file(), "{}", runtime.name);
             assert_eq!(installed(root.path(), runtime), Some(path));
         }
-        // The archive is not kept once unpacked.
-        assert!(!root.path().join(".eac_runtime.tar.xz").exists());
+        // Nothing but the runtimes is left behind.
+        let mut names: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["battleye_runtime", "eac_runtime"]);
     }
 
     #[test]

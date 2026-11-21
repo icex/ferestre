@@ -853,7 +853,13 @@ fn prepare_launch(
         "XODUS_RELATED_CONTENT".into(),
         ferestre_core::related::service_binding(&related),
     );
-    add_anticheat_runtimes(&mut plan, paths.state_dir(), request.dry_run);
+    add_anticheat_runtimes(
+        &mut plan,
+        paths.state_dir(),
+        &launch::game_dir(&recipe, &dirs, &options),
+        &recipe.launch.executable,
+        request.dry_run,
+    );
     let service_socket = plan_service_socket(&mut plan, &dirs, runtime, roles.as_ref())?;
     Ok(PreparedLaunch {
         runtime: runtime.clone(),
@@ -3275,13 +3281,23 @@ fn scoped_service_directory(supported: bool, id: &str, root: &Path) -> Result<Op
 }
 
 /// Point Proton at the EAC and BattlEye runtimes, fetching them on first use
-/// as Lutris and Heroic do. A value the user or the recipe already set wins.
-/// A failed download costs only titles that need the runtime, so it warns and
-/// the launch goes on; a dry run never downloads.
-fn add_anticheat_runtimes(plan: &mut launch::Plan, state_dir: &Path, dry_run: bool) {
+/// as Lutris and Heroic do, for titles that ship that anti-cheat (its
+/// directory or bootstrapper). Other titles never wait on a download. A value
+/// the user or the recipe already set wins. A failed download warns and the
+/// launch goes on; a dry run never downloads.
+fn add_anticheat_runtimes(
+    plan: &mut launch::Plan,
+    state_dir: &Path,
+    game_dir: &Path,
+    executable: &str,
+    dry_run: bool,
+) {
     let root = ferestre_core::anticheat::dir(state_dir);
     for runtime in &ferestre_core::anticheat::ALL {
-        if plan.env_set.contains_key(runtime.env) || std::env::var_os(runtime.env).is_some() {
+        if plan.env_set.contains_key(runtime.env)
+            || std::env::var_os(runtime.env).is_some()
+            || !ferestre_core::anticheat::needed(runtime, game_dir, executable)
+        {
             continue;
         }
         let found = if dry_run {
