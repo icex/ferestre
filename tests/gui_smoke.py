@@ -1105,7 +1105,30 @@ print(":: done", flush=True)
         # inside it -- and only the last of them does anything, so this goes
         # through the by-name search that skips the ones that cannot act.
         SWITCH = "Show titles you cannot install"
-        click_named(frame, SWITCH, "the show-everything switch")
+
+        def set_show_unsupported(active):
+            def observed(root):
+                for node in find_all(root, name=SWITCH):
+                    if node.get_role_name() in ("check box", "toggle button", "switch"):
+                        return (node.get_state_set().contains(Atspi.StateType.CHECKED),)
+                return None
+
+            deadline = time.monotonic() + TIMEOUT
+            while time.monotonic() < deadline:
+                if wait_for(frame, observed, "the show-everything switch state", deadline) == (active,):
+                    return
+                try:
+                    click_named(frame, SWITCH, "the show-everything switch")
+                    wait_for(frame, lambda root: observed(root) == (active,),
+                             "the switch to change", min(deadline, time.monotonic() + 2))
+                    return
+                except (GLib.GError, Failure):
+                    # The catalogue can replace the switch as GTK activates
+                    # it. Read the new widget's state before retrying.
+                    continue
+            raise Failure("the show-everything switch did not change state")
+
+        set_show_unsupported(True)
         labels = wait_for(
             frame,
             lambda root: texts(root) if any("Uwp Puzzle" in t for t in texts(root)) else None,
@@ -1117,7 +1140,7 @@ print(":: done", flush=True)
             "each says which container it ships in, not just that it failed",
             frame,
         )
-        click_named(frame, SWITCH, "the show-everything switch")
+        set_show_unsupported(False)
         wait_for(
             frame,
             lambda root: not any("Uwp Puzzle" in t for t in texts(root)),
