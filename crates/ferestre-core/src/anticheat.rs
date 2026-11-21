@@ -304,10 +304,33 @@ mod network {
 
     #[test]
     #[ignore = "downloads from dropbox.com"]
+    fn a_download_that_does_not_match_its_pin_is_rejected_and_not_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let wrong = Library {
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            ..EAC_LINUX_LIBRARY
+        };
+        let e = ensure_library(root.path(), &wrong).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("does not match its pinned SHA-256"),
+            "{e:#}"
+        );
+        let dir = root.path().join("eac_linux");
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .map(|d| d.flatten().collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    #[ignore = "downloads from dropbox.com"]
     fn the_pinned_eac_linux_library_downloads() {
         let root = tempfile::tempdir().unwrap();
         let path = ensure_library(root.path(), &EAC_LINUX_LIBRARY).unwrap();
         assert_eq!(std::fs::read(&path).unwrap()[..4], *b"\x7fELF");
-        assert_eq!(library_installed(root.path(), &EAC_LINUX_LIBRARY), Some(path));
+        assert_eq!(
+            library_installed(root.path(), &EAC_LINUX_LIBRARY),
+            Some(path)
+        );
     }
 }
