@@ -143,6 +143,24 @@ class LaunchGdkServiceTests(unittest.TestCase):
         self.launch()
         self.assertEqual(len(self.services()), 1)
 
+    def test_client_starts_in_the_package_with_absolute_paths(self):
+        client = self.cli / "xodus-cli"
+        client.write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$PWD" "$4" "$PROTON_DIR" '
+            '"$STEAM_COMPAT_DATA_PATH" "$XODUS_RUNTIME_DIR" > "$CLIENT_RECORD"\n'
+        )
+        result = subprocess.run(
+            [str(SCRIPT), "game", r"Binaries\Game_EAC.exe", "prefix", "launch.log"],
+            cwd=self.root,
+            env=self.env(XODUS_CLI_DIR="cli", XODUS_PROTON_DIR="proton",
+                         XODUS_RUNTIME_DIR="service"),
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / "client.record").read_text().splitlines(),
+                         [str(self.root / name) for name in
+                          ("game", "game", "proton", "prefix", "service")])
+
     def test_the_service_log_is_private_and_kept_in_the_runtime_directory(self):
         self.launch()
         log = self.xdg / "xodus-service.log"

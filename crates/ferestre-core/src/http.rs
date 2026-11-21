@@ -299,6 +299,40 @@ pub fn download_signed_https(
     )
 }
 
+/// Fetch `url` over HTTPS to `dest`, keeping it only when its SHA-256 is
+/// `sha256` (lowercase hex). For third-party files that carry no signature of
+/// ours, so the pinned digest is the whole of the trust. A copy already at
+/// `dest` with that digest is reused; one without it is fetched again.
+pub fn download_pinned(url: &str, dest: &Path, sha256: &str, limit: u64) -> Result<()> {
+    if dest.is_file() && crate::updater::verify_checksum(dest, sha256).is_ok() {
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::cache::sweep_stale_temporaries(dest, "part");
+    let (temporary, mut file) = create_temporary(dest)?;
+    let result = (|| -> Result<()> {
+        let reader = agent_with_scheme(DOWNLOAD_TIMEOUT, true)
+            .get(url)
+            .call()?
+            .into_body()
+            .into_reader();
+        copy_limited(reader, &mut file, limit, &|| false)?;
+        file.sync_all()?;
+        crate::updater::verify_checksum(&temporary, sha256)
+            .map_err(|_| anyhow!("the download does not match its pinned SHA-256"))?;
+        std::fs::rename(&temporary, dest)?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(anyhow!("{url}: {e}"));
+    }
+    Ok(())
+}
+
 fn download_release(
     url: &str,
     signature_url: &str,

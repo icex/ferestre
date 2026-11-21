@@ -21,6 +21,14 @@ xodus_require "xodus-cli"   "$XODUS_CLI_DIR/xodus-cli" "build it: cargo build --
 xodus_require "Xodus Proton" "$XODUS_PROTON_DIR"        "run scripts/install-xodus-proton.sh, or set XODUS_PROTON_DIR"
 xodus_require "game dir"    "$GAME_DIR"                 "download it first: scripts/get-game.sh <product id> \"$GAME_DIR\""
 
+# The client and shim run from the package root. Resolve paths supplied
+# relative to the caller before changing directory for the title.
+GAME_DIR=$(realpath -e -- "$GAME_DIR") || exit 1
+PREFIX=$(realpath -m -- "$PREFIX") || exit 1
+XODUS_CLI_DIR=$(realpath -e -- "$XODUS_CLI_DIR") || exit 1
+XODUS_GAMES_DIR=$(realpath -m -- "$XODUS_GAMES_DIR") || exit 1
+XODUS_PROTON_DIR=$(realpath -e -- "$XODUS_PROTON_DIR") || exit 1
+
 mkdir -p "$(dirname "$LOG")" "$PREFIX"
 exec > >(tee -a "$LOG") 2>&1
 echo "=== launch $(date) ==="
@@ -55,7 +63,8 @@ export WINE_GAMEINPUT=1
 export FERESTRE_DESKTOP_INTEGRATION="${FERESTRE_DESKTOP_INTEGRATION:-1}"
 
 export STEAM_COMPAT_DATA_PATH=$PREFIX
-export STEAM_COMPAT_CLIENT_INSTALL_PATH=${XODUS_STEAM_DIR:-$HOME/.steam/steam}
+STEAM_COMPAT_CLIENT_INSTALL_PATH=$(realpath -m -- "${XODUS_STEAM_DIR:-$HOME/.steam/steam}") || exit 1
+export STEAM_COMPAT_CLIENT_INSTALL_PATH
 export PROTON_DIR=$XODUS_PROTON_DIR
 
 # XUID the Windows install saved under (the prefix of its save folder names).
@@ -70,6 +79,8 @@ export PROTON_DIR=$XODUS_PROTON_DIR
 # under it. Only this shell holds it: the service and the title get the
 # descriptor closed, or a service started here would count as a title forever.
 SERVICE_DIR=${XODUS_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}}
+SERVICE_DIR=$(realpath -m -- "$SERVICE_DIR") || exit 1
+export XODUS_RUNTIME_DIR=$SERVICE_DIR
 lock_fd=
 if mkdir -p "$SERVICE_DIR" && exec {lock_fd}>>"$SERVICE_DIR/users.lock"; then
     if ! flock -s "$lock_fd"; then
@@ -124,7 +135,7 @@ fi
 if [ -n "$start_fd" ]; then exec {start_fd}>&-; fi
 
 echo "launching $EXE from $GAME_DIR (prefix $PREFIX)..."
-close_lock "$XODUS_CLI_DIR/xodus-cli" run -e "$EXE" "$GAME_DIR" "$SHIM"
+(cd -- "$GAME_DIR" && close_lock "$XODUS_CLI_DIR/xodus-cli" run -e "$EXE" "$GAME_DIR" "$SHIM")
 rc=$?
 echo "=== exited rc=$rc $(date) ==="
 exit $rc

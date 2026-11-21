@@ -510,8 +510,12 @@ def row_action(app, frame, item, title=None):
 
 
 def check_game_row_layout(root, title, size, action):
-    button = row_button(root, title, action)
-    check(button is not None, f"{title} keeps its {action} action", root)
+    def find_button(root):
+        return row_button(root, title, action)
+
+    what = f"{title}'s {action} action"
+    button = wait_for(root, find_button, what, time.monotonic() + TIMEOUT)
+    check(True, f"{title} keeps its {action} action")
     bounds = lambda node: node.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
     viewport = button.get_parent()
     while viewport and viewport.get_role_name() != "scroll pane":
@@ -528,7 +532,7 @@ def check_game_row_layout(root, title, size, action):
         target = value.get_current_value() + center - (view.y + view.height / 2)
         value.set_current_value(max(0, min(target, value.get_maximum_value())))
         time.sleep(0.25)
-        button = row_button(root, title, action)
+        button = wait_for(root, find_button, what, time.monotonic() + TIMEOUT)
     images=find_all(button,role="image")
     if any(bounds(image).height>=200 for image in images):
         title_label=find_all(button,role="label",name=title)[0]
@@ -1087,25 +1091,43 @@ print(":: done", flush=True)
             "the titles this runtime cannot open are kept out of the way",
             frame,
         )
-        labels = wait_for(
+        wait_for(
             frame,
-            lambda root: texts(root) if any("25 ship as Appx or Msix packages" in t for t in texts(root)) else None,
+            lambda root: any("25 ship as Appx or Msix packages" in t for t in texts(root)),
             "the unsupported-package count and explanation to draw",
             time.monotonic() + TIMEOUT,
         )
-        check(
-            any("25 ship as Appx or Msix packages" in t for t in labels),
-            "and the count of them is stated, with the reason, rather than left "
-            "as a silent filter",
-            frame,
-        )
+        check(True, "and the count of them is stated, with the reason, rather than left as a silent filter")
 
         print("showing them anyway")
         # Three nodes carry this name -- the row, its label, and the switch
         # inside it -- and only the last of them does anything, so this goes
         # through the by-name search that skips the ones that cannot act.
         SWITCH = "Show titles you cannot install"
-        click_named(frame, SWITCH, "the show-everything switch")
+
+        def set_show_unsupported(active):
+            def observed(root):
+                for node in find_all(root, name=SWITCH):
+                    if node.get_role_name() in ("check box", "toggle button", "switch"):
+                        return (node.get_state_set().contains(Atspi.StateType.CHECKED),)
+                return None
+
+            deadline = time.monotonic() + TIMEOUT
+            while time.monotonic() < deadline:
+                if wait_for(frame, observed, "the show-everything switch state", deadline) == (active,):
+                    return
+                try:
+                    click_named(frame, SWITCH, "the show-everything switch")
+                    wait_for(frame, lambda root: observed(root) == (active,),
+                             "the switch to change", min(deadline, time.monotonic() + 2))
+                    return
+                except (GLib.GError, Failure):
+                    # The catalogue can replace the switch as GTK activates
+                    # it. Read the new widget's state before retrying.
+                    continue
+            raise Failure("the show-everything switch did not change state")
+
+        set_show_unsupported(True)
         labels = wait_for(
             frame,
             lambda root: texts(root) if any("Uwp Puzzle" in t for t in texts(root)) else None,
@@ -1117,7 +1139,7 @@ print(":: done", flush=True)
             "each says which container it ships in, not just that it failed",
             frame,
         )
-        click_named(frame, SWITCH, "the show-everything switch")
+        set_show_unsupported(False)
         wait_for(
             frame,
             lambda root: not any("Uwp Puzzle" in t for t in texts(root)),
@@ -1196,14 +1218,29 @@ print(":: done", flush=True)
 
         select_in_list(frame, "Runtime")
         wait_for(frame, lambda root: "Ferestre release" in texts(root), "section navigation", time.monotonic() + TIMEOUT)
-        time.sleep(0.2)
-        runtime_page = find_all(frame, name="Runtime page")[0]
-        viewport = runtime_page.get_parent()
-        while viewport is not None and viewport.get_role_name() != "scroll pane":
-            viewport = viewport.get_parent()
-        check(viewport is not None, "Settings uses the shared content viewport", frame)
-        page_box = runtime_page.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
-        view_box = viewport.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+
+        def runtime_extents(root):
+            for page in find_all(root, name="Runtime page"):
+                viewport = page.get_parent()
+                while viewport is not None and viewport.get_role_name() != "scroll pane":
+                    viewport = viewport.get_parent()
+                if viewport is None:
+                    continue
+                page_component = page.get_component_iface()
+                view_component = viewport.get_component_iface()
+                if page_component is None or view_component is None:
+                    continue
+                page_box = page_component.get_extents(Atspi.CoordType.WINDOW)
+                view_box = view_component.get_extents(Atspi.CoordType.WINDOW)
+                if page_box.height > 0 and view_box.height > 0:
+                    return page_box, view_box
+            return None
+
+        # Updates can replace the page during the parent or geometry query.
+        # Poll the whole lookup so every retry starts with fresh objects.
+        page_box, view_box = wait_for(
+            frame, runtime_extents, "Settings to use the shared content viewport", time.monotonic() + TIMEOUT,
+        )
         check(view_box.y <= page_box.y <= view_box.y + 32,
               "a different section starts at the top even when Settings fits without scrolling", frame)
         select_in_list(frame, "Library")
@@ -1236,6 +1273,8 @@ print(":: done", flush=True)
         )
         destination = next(iter(find_all(frame, role="text", name="Install to")), None)
         check(destination is not None, "and the destination can be changed", frame)
+        check(bool(find_all(frame, name="Destination drive")),
+              "the install dialog offers a drive selector", frame)
         check(
             bool(Atspi.Text.get_text(destination.get_text_iface(), 0, -1).strip()),
             "prefilled with somewhere to put it",
@@ -1438,12 +1477,12 @@ print(":: done", flush=True)
             time.monotonic() + TIMEOUT,
         )
         check(True, "and it disappears when the download finishes")
-        restored = row_button(frame, "Smoke Test Racer", "Install")
-        check(
-            restored is not None and restored.get_state_set().contains(Atspi.StateType.SENSITIVE),
-            "the Install button is enabled again after completion",
-            frame,
-        )
+        def install_enabled(root):
+            button = row_button(root, "Smoke Test Racer", "Install")
+            return button is not None and button.get_state_set().contains(Atspi.StateType.SENSITIVE)
+
+        wait_for(frame, install_enabled, "the Install button to be enabled again after completion",
+                 time.monotonic() + TIMEOUT)
 
         print("the editor")
         select_in_list(frame, "Library")
@@ -1474,9 +1513,14 @@ print(":: done", flush=True)
             "every row's menu links its Store page",
             frame,
         )
-        row_action(app, frame, "Add to Steam", steam[0])
+        steam_title = steam[0]
+        row_action(app, frame, "Add to Steam", steam_title)
         wait_for(frame, lambda root: os.path.isfile(shortcuts),
                  "the saved Steam shortcut", time.monotonic() + TIMEOUT)
+        # The worker publishes the file before the window clears its busy
+        # state. Wait for the completion toast before asking it to re-add.
+        wait_for(frame, lambda root: any(t.startswith(f'Added "{steam_title}" in Steam.') for t in texts(root)),
+                 "the first Steam shortcut operation to complete", time.monotonic() + TIMEOUT)
         with open(shortcuts, "rb") as f:
             shortcut_bytes = f.read()
 
@@ -1506,7 +1550,7 @@ print(":: done", flush=True)
             f.write(legacy)
         os.unlink(icon_path)
         previous_mtime = os.stat(shortcuts).st_mtime_ns
-        row_action(app, frame, "Add to Steam")
+        row_action(app, frame, "Add to Steam", steam_title)
         wait_for(frame, lambda root: os.stat(shortcuts).st_mtime_ns != previous_mtime,
                  "the existing Steam shortcut to update", time.monotonic() + TIMEOUT)
         shortcut_bytes = open(shortcuts, "rb").read()
@@ -1540,10 +1584,11 @@ print(":: done", flush=True)
                         raise
             click_named(frame, "Add All")
             # The summary is drawn once the work is done and the window is
-            # free again, so the next click is never refused as busy.
+            # free again. Allow for the catalogue lookup (15 seconds) and
+            # artwork for two titles (up to 60 seconds each, sequentially).
             wait_for(frame, lambda root: any(t.startswith(summary) and "Restart Steam to see them." in t
                                              for t in texts(root)),
-                     f"the summary {summary!r}", time.monotonic() + TIMEOUT)
+                     f"the summary {summary!r}", time.monotonic() + 150)
 
         stardew = os.path.join(home, "games", "stardew-valley")
         os.makedirs(stardew, exist_ok=True)
@@ -1901,8 +1946,9 @@ elif sys.argv[1] == 'update':
                          "stale catalogue window", time.monotonic() + TIMEOUT)
         wait_for(frame, lambda root: any("displaycatalog.mp.microsoft.com" in request for request in CountingProxy.requests),
                  "automatic stale metadata revalidation", time.monotonic() + TIMEOUT)
-        check(any("Smoke Test Racer" in t for t in texts(frame)),
-              "stale product names remain visible while revalidation fails", frame)
+        wait_for(frame, lambda root: any("Smoke Test Racer" in t for t in texts(root)),
+                 "the stale product name through the revalidation redraw", time.monotonic() + TIMEOUT)
+        check(True, "stale product names remain visible while revalidation fails")
         check(open(cached_product, "rb").read() == previous_product,
               "automatic failed revalidation keeps the previous snapshot")
         wait_for(frame, lambda root: open(os.path.join(home, "client-calls")).read().splitlines().count("update") > update_calls,

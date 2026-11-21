@@ -127,6 +127,36 @@ if ! awk '/^\[/ { in_key = ($0 ~ /^\[Microsoft\\\\GamingServices\]/) }
         echo "-- could not set ServiceRetryTimeout in the prefix; titles using Party may wait 60 s for Gaming Services" >&2
 fi
 
+# EAC's Linux module locates the game by its installed path. Give it the
+# licensed images at those paths in a private mount namespace, while keeping
+# the package's original bootstrapper and EAC module in the launch chain.
+# Publishers also use title-specific bootstrapper names and may put the EAC
+# directory next to a nested executable. Xodus runs this shim from the package
+# root, with the executable as a Wine Z: path.
+uses_easy_anti_cheat() {
+    entry_point=$(printf '%s' "$1" | tr '\\\\' '/')
+    entry_name=$(printf '%s' "${entry_point##*/}" | LC_ALL=C tr 'A-Z' 'a-z')
+    case "$entry_name" in
+        start_protected_game.exe|easyanticheat_launcher.exe|*_eac.exe)
+            return 0 ;;
+    esac
+    case "$entry_point" in
+        [Zz]:/*) entry_point=${entry_point#??} ;;
+    esac
+    entry_dir=$(dirname -- "$entry_point")
+    for eac_dir in ./[Ee][Aa][Ss][Yy][Aa][Nn][Tt][Ii][Cc][Hh][Ee][Aa][Tt] \
+            "$entry_dir"/[Ee][Aa][Ss][Yy][Aa][Nn][Tt][Ii][Cc][Hh][Ee][Aa][Tt]; do
+        [ ! -d "$eac_dir" ] || return 0
+    done
+    return 1
+}
+
+if [ -z "${FERESTRE_IMAGE_VIEW+x}" ] && [ -n "${WINE_DLL_FILE_MAP:-}" ] &&
+        uses_easy_anti_cheat "${1:-}"; then
+    echo ":: using the private image view for Easy Anti-Cheat" >&2
+    FERESTRE_IMAGE_VIEW=real-path
+fi
+
 if [ "${FERESTRE_IMAGE_VIEW:-}" = "real-path" ]; then
     exec python3 "$(dirname "$0")/real-path-image-view.py" -- "$PROTON_DIR/proton" run "$@"
 fi

@@ -1,0 +1,38 @@
+# Gears 5 -- Microsoft Store / Xbox PC.
+#
+# Legacy Easy Anti-Cheat (game 269). The Xbox PC package ships only the
+# Windows EAC library. Under Proton that library asks Epic's CDN for a Wine
+# module, which is empty for this game, so EAC never initialises. The Steam
+# build has shipped EAC's Linux library (easyanticheat_x64.so) since its
+# 2023-06-21 Steam Deck update, and with it Proton's EAC bridge works. Only the
+# publisher can add that library to this package; Ferestre does not copy one
+# in from anywhere else.
+schema = 1
+
+[title]
+product-id = "C2KDNLT2H7DM"
+name = "Gears 5"
+slug = "gears-5"
+publisher = "Xbox Game Studios"
+
+[install]
+
+[launch]
+executable = 'GearGame\Binaries\WinStore\Gears5_EAC.exe'
+
+[runtime]
+requires = ["loader.memfd-main-image", "xgameruntime.user"]
+wants = ["appmodel.package-identity"]
+
+[status]
+state = "broken"
+summary = "Blocked by Easy Anti-Cheat: the Xbox PC package does not include EAC's Linux library, which only the publisher can add."
+stops-at = "Gears5.exe restarts through Gears5_EAC.exe before a window; EAC's loader logs Code 915 after an empty wine64 module download"
+blocked-by = "title-protection"
+last-verified = 2026-11-21
+verified-with = "Xbox PC package 1.1.967.0 on CachyOS, runtime with legacy XPackage support, Proton EAC runtime set, headless gamescope"
+
+[[issues]]
+symptom = "The Easy Anti-Cheat splash appears, then the game closes or relaunches without reaching a menu"
+cause = "Legacy EAC needs easyanticheat_x64.so next to EasyAntiCheat_x64.dll. The Steam build has it; this package does not, and Epic serves no Wine module for game 269."
+fix = "None known on Linux. The publisher has to ship easyanticheat_x64.so in the Xbox PC package, as it did for Steam."

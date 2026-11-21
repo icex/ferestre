@@ -51,6 +51,49 @@ class ImageViewTests(unittest.TestCase):
                                 cwd=self.root, env=env, pass_fds=(self.fd,),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
+    def test_shim_selects_the_image_view_for_eac_packages(self):
+        self.require_namespace()
+        runtime = self.root / "runtime"
+        runtime.mkdir()
+        proton = runtime / "proton"
+        proton.write_text(
+            '#!/bin/sh\n'
+            '[ "$2" = reg ] && exit 0\n'
+            'printf "%s\\n" "$2"\n'
+            'head -c 2 Game.exe\n'
+        )
+        proton.chmod(0o755)
+        env = dict(os.environ, WINE_DLL_FILE_MAP=self.mapping, PROTON_DIR=str(runtime),
+                   STEAM_COMPAT_DATA_PATH=str(self.root / "compat"),
+                   XODUS_GAMES_DIR=str(self.root))
+        for name in ("FERESTRE_IMAGE_VIEW", "FERESTRE_DESKTOP_INTEGRATION", "WINEPREFIX"):
+            env.pop(name, None)
+
+        def launch(entry, **extra):
+            result = subprocess.run(
+                [str(HELPER.with_name("proton-wine-shim.sh")), entry],
+                cwd=self.root, env=dict(env, **extra), pass_fds=(self.fd,),
+                check=True, capture_output=True, text=True, timeout=20,
+            )
+            self.assertEqual(self.image.read_bytes(), b"encrypted package bytes")
+            return result.stdout
+
+        self.assertEqual(launch("Game.exe"), "Game.exe\nen")
+        eac_entry = r"Z:\Game package\Start_Protected_Game.EXE"
+        self.assertEqual(launch(eac_entry), eac_entry + "\nMZ")
+        legacy_entry = "launcher/EasyAntiCheat_launcher.exe"
+        self.assertEqual(launch(legacy_entry), legacy_entry + "\nMZ")
+        named_entry = "Game/Binaries/WinStore/Game_EAC.exe"
+        self.assertEqual(launch(named_entry), named_entry + "\nMZ")
+        metadata = self.root / "Game/Binaries/WinStore/EasyAntiCheat"
+        metadata.mkdir(parents=True)
+        nested_entry = "Z:" + str(metadata.parent / "Launcher.exe").replace("/", chr(92))
+        self.assertEqual(launch(nested_entry), nested_entry + "\nMZ")
+        (self.root / "easyanticheat").mkdir()
+        self.assertEqual(launch("Game.exe"), "Game.exe\nMZ")
+        self.assertEqual(launch(eac_entry, WINE_DLL_FILE_MAP=""), eac_entry + "\nen")
+        self.assertEqual(launch(eac_entry, FERESTRE_IMAGE_VIEW="memfd"), eac_entry + "\nen")
+
     def launch_with_channel(self, title):
         """Start `title` (a shell command) through the view as the window
         does: with the launch's end of a stop channel. Returns the view and
