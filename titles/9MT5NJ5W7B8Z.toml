@@ -1,0 +1,27 @@
+schema = 1
+
+[title]
+product-id = "9MT5NJ5W7B8Z"
+name = "Hogwarts Legacy"
+slug = "hogwarts-legacy"
+
+[install]
+dir = "9mt5nj5w7b8z"
+
+[launch]
+executable = 'Phoenix\Binaries\WinGDK\HogwartsLegacy.exe'
+
+[launch.env]
+XGR_WAIT_FOR_ASYNC_CALLBACKS = "1"
+
+[runtime]
+requires = [
+    "loader.memfd-main-image",
+    "xgameruntime.user",
+    "xgameruntime.async-callback-wait",
+]
+wants = ["appmodel.package-identity"]
+
+[status]
+state = "untested"
+summary = "Package 1.0.22.0 opened with the callback-wait runtime. Gameplay verification is pending."

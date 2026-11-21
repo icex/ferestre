@@ -245,6 +245,15 @@ verify = [
 ]
 
 [[capability]]
+name = "xgameruntime.async-callback-wait"
+summary = "Opt-in blocking XAsync status waits include the result callback for thread pool queues."
+provided-by = ["https://github.com/Chipi-Chapa-Corp/xgameruntime/commit/6f68644441687cda88108c64dca6b97bec5d7cd1"]
+symptom-if-missing = "Hogwarts Legacy reads its Xbox user or Store license token before the callback supplies it."
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "XGR_WAIT_FOR_ASYNC_CALLBACKS" },
+]
+
+[[capability]]
 name = "xgameruntime.user"
 summary = "XUser sign-in against the real Microsoft account, with gamertag and XUID, through the running xodus-service."
 provided-by = ["https://github.com/icex/xgameruntime/commit/d0450c0216f11207012d1381300d17ad2c839381"]

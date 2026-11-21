@@ -35,6 +35,7 @@ python3 "$REPO_DIR/tests/account_roles_fixture.py" "$XODUS_RUNTIME_DIR" "$WORK/a
 FIXTURE=$!
 for ((i=0;i<100;i++)); do [ -S "$XODUS_RUNTIME_DIR/xodus.sock" ] && break; sleep 0.05; done
 (cd "$WORK" && timeout 300 "$WINE" "$WORK/account_roles.exe")
+(cd "$WORK" && timeout 30 "$WINE" "$WORK/account_roles.exe" --user-callback-order)
 # Strict manual queues are read once per process, so they get a run of their
 # own: the token request's service round trip must stay off the title's Work
 # port there too.
