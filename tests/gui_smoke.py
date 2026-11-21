@@ -1478,12 +1478,12 @@ print(":: done", flush=True)
             time.monotonic() + TIMEOUT,
         )
         check(True, "and it disappears when the download finishes")
-        restored = row_button(frame, "Smoke Test Racer", "Install")
-        check(
-            restored is not None and restored.get_state_set().contains(Atspi.StateType.SENSITIVE),
-            "the Install button is enabled again after completion",
-            frame,
-        )
+        def install_enabled(root):
+            button = row_button(root, "Smoke Test Racer", "Install")
+            return button is not None and button.get_state_set().contains(Atspi.StateType.SENSITIVE)
+
+        wait_for(frame, install_enabled, "the Install button to be enabled again after completion",
+                 time.monotonic() + TIMEOUT)
 
         print("the editor")
         select_in_list(frame, "Library")
