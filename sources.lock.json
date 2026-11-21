@@ -266,7 +266,7 @@
     },
     "proton": {
       "repository": "https://github.com/icex/Proton-UWP.git",
-      "commit": "15f26daa59dc22168544004b5dfe2cee4e3aefe2",
+      "commit": "1845bdca2f7ba253d2f54da270db51ace69c616d",
       "upstream": "https://github.com/xodus-gaming/Proton.git",
       "upstream_commit": "7c0b435495814349735c913fde78da906aecea52",
       "modified_paths": [
@@ -274,6 +274,7 @@
         "Makefile.in",
         "configure.sh",
         "contrib/ferestre/Dockerfile.sdk",
+        "piper",
         "proton",
         "vkd3d-proton",
         "wine"
