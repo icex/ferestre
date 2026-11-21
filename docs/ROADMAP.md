@@ -6,7 +6,7 @@ for Bedrock on Android, for Microsoft Store titles on Linux.
 
 ## Current qualification
 
-Release 0.1.23 pairs with runtime 11.0.20261121.1. Gears 5 (Xbox PC) plays,
+Release 0.1.23 pairs with runtime 11.0.20261122.1. Gears 5 (Xbox PC) plays,
 campaign and multiplayer, with Easy Anti-Cheat. Two gaps stood in the way. The
 runtime lacked the legacy GDK XPackage interface Gears 5 asks for at startup,
 and the Xbox PC package ships only EAC's Windows library: unlike the Steam
