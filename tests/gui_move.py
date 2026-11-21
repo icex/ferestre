@@ -52,8 +52,10 @@ summary="Synthetic move fixture"
         write(game/'MicrosoftGame.config', f'<Game><Identity Name="Fixture.Move" Version="1.0.0.0"/><StoreId>{PRODUCT}</StoreId></Game>')
         write(game/'.xodus-streaming.msixvc', 'synthetic header')
         payload = game/'payload.bin'
+        # Exercise many copy and verification chunks without making the
+        # successful move depend on gigabyte-scale debug hashing speed.
         with payload.open('wb') as file:
-            for _ in range(1024): file.write(b'move verification'*65536)
+            for _ in range(64): file.write(b'move verification'*65536)
         expected = hashlib.file_digest(payload.open('rb'), 'sha256').hexdigest()
         record = state/f'installed/{PRODUCT}.json'
         write(record, json.dumps(dict(product_id=PRODUCT,dir=str(game),content_ids=[],package_version='1.0.0.0')))
@@ -107,7 +109,6 @@ summary="Synthetic move fixture"
             s.wait_for(dialog,lambda r:can_move() and any('free' in t and dest in t for t in s.texts(r)),'automatic valid destination recheck',time.monotonic()+10)
             s.click_named(dialog,'Move')
             s.wait_for(app,lambda r:any('Moving '+TITLE in t for t in s.texts(r)),'progress',time.monotonic()+10)
-            # CI uses an unoptimized binary for two passes over 1.1 GB.
             s.wait_for(app,lambda r:json.loads(record.read_text())['dir']!=str(game),'record update',time.monotonic()+120)
             destination=Path(json.loads(record.read_text())['dir'])
             s.wait_for(app,lambda r:not game.exists(),'source cleanup',time.monotonic()+10)

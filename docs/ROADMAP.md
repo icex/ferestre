@@ -6,6 +6,22 @@ for Bedrock on Android, for Microsoft Store titles on Linux.
 
 ## Current qualification
 
+Release 0.1.23 pairs with runtime 11.0.20261122.1. Gears 5 (Xbox PC) plays,
+campaign and multiplayer, with Easy Anti-Cheat. Two gaps stood in the way. The
+runtime lacked the legacy GDK XPackage interface Gears 5 asks for at startup,
+and the Xbox PC package ships only EAC's Windows library: unlike the Steam
+build, it has no `easyanticheat_x64.so` for Proton's EAC bridge, and Epic
+serves no Wine module for the game. Ferestre now downloads that generic legacy
+EAC client library, keeps it only if its SHA-256 matches the pinned value, and
+shows it in the game's EAC folder through a read-only overlay in the launch's
+private namespace; the installed package is not changed. It also fetches
+Valve's EAC and BattlEye runtimes the way Lutris and Heroic do, for titles that
+ship that anti-cheat. Gears of War: E-Day reaches its Xbox PC services over
+WinHTTP HTTP/2. The install dialog chooses among mounted drives, downloads use
+up to eight verified ranges, and pressing Play on a title the runtime cannot
+start explains why and offers another runtime. See
+[release qualification](RELEASE-0.1.23.md).
+
 Release 0.1.13 pairs with runtime 11.0.20261018.2, the first signed runtime.
 It adds separate Store and Player accounts (#9), controllers in GDK titles --
 PlayStation pads through SDL, Steam Input layouts from Steam shortcuts,
@@ -559,6 +575,21 @@ These are judgement calls, not engineering ones:
    Builds verify the pins and do not apply patch files. See [SOURCES.md](SOURCES.md).
 
 ## Known gaps, stated plainly
+
+- **Gears 5's EAC library comes from one download location.** The Xbox PC
+  package lacks `easyanticheat_x64.so`, and no publisher offers it at a public
+  address without a store login, so the launcher fetches a copy from a single
+  link and checks it against a pinned SHA-256. If the link goes away, Gears 5
+  stops at Easy Anti-Cheat again until the location is updated;
+  `FERESTRE_EAC_LINUX_LIBRARY` can name a local copy meanwhile. The lasting fix
+  is the publisher shipping the library in the Xbox PC package, as it did for
+  Steam in 2023.
+
+- **Gears of War: E-Day can still crash on a loading screen.** It happened
+  once more entering Bootcamp with 0.1.23 and did not recur on the next
+  attempt. The faulting thread was in a native library loaded from memory, and
+  Wine's fault handler then faulted too, so the game closed without a message.
+  The library has not been identified.
 
 - **Age of Empires Definitive Edition — resolved.** It now boots, opens a
   custom game and plays. Two gaps, both the same shape: the title asks for

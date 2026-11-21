@@ -853,6 +853,13 @@ fn prepare_launch(
         "XODUS_RELATED_CONTENT".into(),
         ferestre_core::related::service_binding(&related),
     );
+    add_anticheat_runtimes(
+        &mut plan,
+        paths.state_dir(),
+        &launch::game_dir(&recipe, &dirs, &options),
+        &recipe.launch.executable,
+        request.dry_run,
+    );
     let service_socket = plan_service_socket(&mut plan, &dirs, runtime, roles.as_ref())?;
     Ok(PreparedLaunch {
         runtime: runtime.clone(),
@@ -1167,6 +1174,19 @@ fn install_package(
     // Held until the command ends: a launch must not start on a tree that is
     // being rewritten, and a running title's files must not be replaced.
     let _lock = TitleLock::take(paths, &product_id, LockMode::Change)?;
+
+    // Recheck immediately before touching the actual installation folder.
+    // The drive may have gone away after the window started this queued job.
+    let _drive = if let Some(identity) =
+        std::env::var_os(ferestre_core::transfers::INSTALL_MOUNT_ENV).filter(|_| include_content)
+    {
+        let mount: ferestre_core::transfers::InstallMount =
+            serde_json::from_slice(identity.as_encoded_bytes())
+                .context("Reading the selected install drive")?;
+        Some(mount.pin(&dest)?)
+    } else {
+        None
+    };
 
     // Remembered so a failed install can put the disk back the way it found it.
     let dest_existed = dest.is_dir();
@@ -3260,6 +3280,91 @@ fn scoped_service_directory(supported: bool, id: &str, root: &Path) -> Result<Op
     Ok(Some(root.join("ferestre-services").join(&id[..32])))
 }
 
+/// Point Proton at the EAC and BattlEye runtimes, fetching them on first use
+/// as Lutris and Heroic do, for titles that ship that anti-cheat (its
+/// directory or bootstrapper). Other titles never wait on a download. A value
+/// the user or the recipe already set wins. A failed download warns and the
+/// launch goes on; a dry run never downloads.
+fn add_anticheat_runtimes(
+    plan: &mut launch::Plan,
+    state_dir: &Path,
+    game_dir: &Path,
+    executable: &str,
+    dry_run: bool,
+) {
+    let root = ferestre_core::anticheat::dir(state_dir);
+    for runtime in &ferestre_core::anticheat::ALL {
+        if plan.env_set.contains_key(runtime.env)
+            || std::env::var_os(runtime.env).is_some()
+            || !ferestre_core::anticheat::needed(runtime, game_dir, executable)
+        {
+            continue;
+        }
+        let found = if dry_run {
+            ferestre_core::anticheat::installed(&root, runtime)
+        } else {
+            if ferestre_core::anticheat::installed(&root, runtime).is_none() {
+                eprintln!(":: downloading the {}", runtime.label);
+            }
+            match ferestre_core::anticheat::ensure(&root, runtime) {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    eprintln!(
+                        "-- the {} is unavailable, so titles that need it may not start: {e:#}",
+                        runtime.label
+                    );
+                    None
+                }
+            }
+        };
+        if let Some(path) = found {
+            plan.env_set
+                .insert(runtime.env.into(), path.to_string_lossy().into_owned());
+        }
+    }
+    add_eac_linux_library(plan, &root, dry_run);
+}
+
+/// A recipe asks for EAC's Linux library with `FERESTRE_EAC_LINUX_LIBRARY =
+/// "pinned"`. A path the user set in the environment wins; otherwise the
+/// pinned download replaces the request. Without either, the variable is
+/// dropped so the image view does nothing and the launch says why EAC will
+/// fail.
+fn add_eac_linux_library(plan: &mut launch::Plan, root: &Path, dry_run: bool) {
+    use ferestre_core::anticheat::{self, EAC_LINUX_LIBRARY, LIBRARY_ENV, PINNED};
+    if let Some(own) = std::env::var_os(LIBRARY_ENV) {
+        plan.env_set
+            .insert(LIBRARY_ENV.into(), own.to_string_lossy().into_owned());
+        return;
+    }
+    if plan.env_set.get(LIBRARY_ENV).map(String::as_str) != Some(PINNED) {
+        return;
+    }
+    let found = if dry_run {
+        anticheat::library_installed(root, &EAC_LINUX_LIBRARY)
+            .ok_or_else(|| anyhow::anyhow!("not downloaded yet"))
+    } else {
+        if anticheat::library_installed(root, &EAC_LINUX_LIBRARY).is_none()
+            && !EAC_LINUX_LIBRARY.url.is_empty()
+        {
+            eprintln!(":: downloading Easy Anti-Cheat's Linux library");
+        }
+        anticheat::ensure_library(root, &EAC_LINUX_LIBRARY)
+    };
+    match found {
+        Ok(path) => {
+            plan.env_set
+                .insert(LIBRARY_ENV.into(), path.to_string_lossy().into_owned());
+        }
+        Err(e) => {
+            plan.env_set.remove(LIBRARY_ENV);
+            eprintln!(
+                "-- this title needs Easy Anti-Cheat's Linux library and it is unavailable, so EAC will stop it: {e:#}"
+            );
+        }
+    }
+}
+
 /// A capable runtime and its packaged service share a content-addressed socket
 /// directory. Replacing the AppImage can start the updated service without
 /// interrupting a game connected to the previous one. Older runtimes retain
@@ -3451,12 +3556,13 @@ fn stop_service(directory: &Path) {
     let ours = || service_in(pid, &home);
     if let Some(process) = Process::open(pid) {
         if ours() {
+            let running = || process.has_exited().map_or_else(&ours, |exited| !exited);
             process.signal(libc::SIGTERM);
-            if !gone_within(&ours, std::time::Duration::from_secs(3)) {
+            if !gone_within(&running, std::time::Duration::from_secs(3)) {
                 process.signal(libc::SIGKILL);
                 // Not let go of until it has: a launch waiting for the lock
                 // would otherwise find the dying service still listening.
-                gone_within(&ours, std::time::Duration::from_secs(2));
+                gone_within(&running, std::time::Duration::from_secs(2));
             }
         }
     }
@@ -3530,6 +3636,19 @@ impl Process {
                 libc::kill(self.pid, signal);
             },
         }
+    }
+
+    /// Check for process exit. Its cwd can disappear earlier during teardown.
+    fn has_exited(&self) -> Option<bool> {
+        use std::os::fd::AsRawFd;
+        let mut event = libc::pollfd {
+            fd: self.pidfd.as_ref()?.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Safety: poll receives one initialized entry for a descriptor we own.
+        let ready = unsafe { libc::poll(&mut event, 1, 0) };
+        Some(ready > 0 && event.revents & (libc::POLLIN | libc::POLLHUP) != 0)
     }
 }
 
@@ -7142,12 +7261,17 @@ summary = "Runs."
     #[test]
     fn a_game_that_closes_when_asked_is_not_killed() {
         let wine = FakeWine::new("stop-closes");
-        let forwarding = wine.detached(std::time::Duration::from_secs(30));
-        let running = Arc::clone(&wine.running);
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            running.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut session = wine.session(std::time::Duration::from_secs(30));
+        let call_log = wine.scratch.root.join("calls");
+        // The fake game leaves only after Wine has received the close request.
+        Arc::get_mut(&mut session).unwrap().running = Box::new(move || {
+            !std::fs::read_to_string(&call_log).is_ok_and(|calls| calls.contains("wine taskkill"))
         });
+        let forwarding = Forwarding {
+            shared: Shared::new(),
+            installed: false,
+        };
+        forwarding.set_session(Some(session));
         let started = std::time::Instant::now();
         forwarding.shared.deliver(libc::SIGINT);
         forwarding.finish(std::time::Duration::from_secs(30));

@@ -245,6 +245,13 @@ def main():
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
     binary = Path(args.binary).resolve()
+    # The window offers WebKitGTK only where the system lacks it; on a machine
+    # that has it (such as the self-hosted CI runners) this test cannot run.
+    linker = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True,
+                            env=dict(os.environ, LC_ALL="C"))
+    if f"{WEBKIT} " in linker.stdout:
+        print(f"SKIPPED: this system has {WEBKIT}; the missing-WebKitGTK checks need one without it")
+        return
     root = Path(tempfile.mkdtemp(prefix="fcd-"))
     s.Atspi.init()
     try:

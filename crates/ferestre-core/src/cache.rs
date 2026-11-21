@@ -108,7 +108,14 @@ pub(crate) fn sweep_stale_temporaries(path: &Path, extension: &str) {
             .split_once('-')
             .is_some_and(|(pid, n)| is_digits(pid) && is_digits(n));
         if ours && !is_fresh(&entry.path(), STALE_TEMPORARY) {
-            let _ = std::fs::remove_file(entry.path());
+            // A staging directory goes whole. A link is removed, never
+            // followed.
+            let path = entry.path();
+            if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+                let _ = std::fs::remove_dir_all(path);
+            } else {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 }

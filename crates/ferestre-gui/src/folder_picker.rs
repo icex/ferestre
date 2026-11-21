@@ -22,15 +22,9 @@ pub fn open(ui: &Ui, target: &gtk::Editable) {
             .css_classes(["title-2"])
             .build(),
     );
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"));
-    let initial = PathBuf::from(target.text().as_str());
-    let current = Rc::new(RefCell::new(if initial.is_dir() {
-        initial
-    } else {
-        home.clone()
-    }));
+    let home = home_path();
+    let initial = current_path(&target.text(), &home);
+    let current = Rc::new(RefCell::new(initial.clone()));
     let path = gtk::Label::builder()
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::Start)
@@ -184,7 +178,6 @@ pub fn open(ui: &Ui, target: &gtk::Editable) {
     dialog.connect_closed(move |_| {
         browse_slot.borrow_mut().take();
     });
-    let initial = current_path(&target.text(), &home_path());
     browse(initial);
     dialog.set_child(Some(&page));
     dialog.set_focus(Some(&select));
@@ -196,10 +189,11 @@ fn home_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 fn current_path(text: &str, home: &Path) -> PathBuf {
-    let path = PathBuf::from(text);
-    if path.is_dir() {
-        path
-    } else {
-        home.to_path_buf()
-    }
+    let path = Path::new(text);
+    // A selected drive's library may not exist yet. Start on that drive so
+    // that Browse can choose a different folder there.
+    path.ancestors()
+        .find(|parent| parent.is_absolute() && parent.is_dir())
+        .unwrap_or(home)
+        .to_path_buf()
 }
