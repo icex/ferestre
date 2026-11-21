@@ -1491,9 +1491,14 @@ print(":: done", flush=True)
             "every row's menu links its Store page",
             frame,
         )
-        row_action(app, frame, "Add to Steam", steam[0])
+        steam_title = steam[0]
+        row_action(app, frame, "Add to Steam", steam_title)
         wait_for(frame, lambda root: os.path.isfile(shortcuts),
                  "the saved Steam shortcut", time.monotonic() + TIMEOUT)
+        # The worker publishes the file before the window clears its busy
+        # state. Wait for the completion toast before asking it to re-add.
+        wait_for(frame, lambda root: any(t.startswith(f'Added "{steam_title}" in Steam.') for t in texts(root)),
+                 "the first Steam shortcut operation to complete", time.monotonic() + TIMEOUT)
         with open(shortcuts, "rb") as f:
             shortcut_bytes = f.read()
 
@@ -1523,7 +1528,7 @@ print(":: done", flush=True)
             f.write(legacy)
         os.unlink(icon_path)
         previous_mtime = os.stat(shortcuts).st_mtime_ns
-        row_action(app, frame, "Add to Steam")
+        row_action(app, frame, "Add to Steam", steam_title)
         wait_for(frame, lambda root: os.stat(shortcuts).st_mtime_ns != previous_mtime,
                  "the existing Steam shortcut to update", time.monotonic() + TIMEOUT)
         shortcut_bytes = open(shortcuts, "rb").read()
