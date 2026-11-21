@@ -31,7 +31,9 @@ def stop(*_):
 signal.signal(signal.SIGTERM, stop)
 parent = os.getppid()
 (dest / "partial").write_text("downloaded bytes")
-(dest / "ready").write_text(str(os.getpid()))
+ready = dest / "ready.tmp"
+ready.write_text(str(os.getpid()))
+ready.rename(dest / "ready")
 # Outliving the launcher would leave this spinning after a failed run, so a
 # downloader whose parent is gone has nobody left to clean up for.
 while os.getppid() == parent:

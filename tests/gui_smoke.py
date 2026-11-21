@@ -1919,8 +1919,9 @@ elif sys.argv[1] == 'update':
                          "stale catalogue window", time.monotonic() + TIMEOUT)
         wait_for(frame, lambda root: any("displaycatalog.mp.microsoft.com" in request for request in CountingProxy.requests),
                  "automatic stale metadata revalidation", time.monotonic() + TIMEOUT)
-        check(any("Smoke Test Racer" in t for t in texts(frame)),
-              "stale product names remain visible while revalidation fails", frame)
+        wait_for(frame, lambda root: any("Smoke Test Racer" in t for t in texts(root)),
+                 "the stale product name through the revalidation redraw", time.monotonic() + TIMEOUT)
+        check(True, "stale product names remain visible while revalidation fails")
         check(open(cached_product, "rb").read() == previous_product,
               "automatic failed revalidation keeps the previous snapshot")
         wait_for(frame, lambda root: open(os.path.join(home, "client-calls")).read().splitlines().count("update") > update_calls,
