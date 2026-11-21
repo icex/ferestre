@@ -2924,11 +2924,31 @@ fn library_components(ui: &Ui, row: &LibraryRow) -> (adw::ActionRow, gtk::Box) {
     }
     actions.append(&more);
 
-    // A greyed-out "Play" is a button that says a title might work if you found
-    // the right thing to click. It never will: the reason is in the subtitle
-    // and on the row, and the Store link beside it is the thing to press.
+    // A title the runtime cannot start keeps its Play button, and pressing it
+    // says why and offers another runtime. Without a button the home screen's
+    // game card had nothing to press, so pressing it did nothing at all. A
+    // package this launcher cannot open at all has no Play: nothing in the
+    // window would make it work, and the reason is on the row.
     if let Action::Blocked(reason) = &row.action {
         action_row.set_tooltip_text(Some(&format!("{}\n{}\n{}", row.name, details, reason)));
+        if row.unsupported || !row.has_recipe {
+            return (action_row, actions);
+        }
+        let button = gtk::Button::builder()
+            .label(row.action.label())
+            .width_request(88)
+            .valign(gtk::Align::Center)
+            .tooltip_text(reason)
+            .build();
+        button.set_widget_name(&format!("game-{}-primary", row.product_id));
+        let (ui, product_id, name, reason) = (
+            ui.clone(),
+            row.product_id.clone(),
+            row.name.clone(),
+            reason.clone(),
+        );
+        button.connect_clicked(move |_| explain_blocked(&ui, &product_id, &name, &reason));
+        actions.append(&button);
         return (action_row, actions);
     }
 
@@ -3485,6 +3505,28 @@ fn warn_about_media(ui: &Ui, product_id: &str) {
             }
         }
     });
+}
+
+/// Why a title with a recipe cannot start, with the fix the window can offer:
+/// its blocked reasons are about the runtime the launch would use.
+fn explain_blocked(ui: &Ui, product_id: &str, name: &str, reason: &str) {
+    let dialog = adw::AlertDialog::new(
+        Some(&format!("{name} cannot start")),
+        Some(&format!(
+            "{reason}\n\nChoose a runtime that provides what it needs, or update the runtime."
+        )),
+    );
+    dialog.set_body_use_markup(false);
+    dialog.add_response("close", "Close");
+    dialog.add_response("runtime", "Choose runtime");
+    dialog.set_response_appearance("runtime", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("runtime"));
+    dialog.set_close_response("close");
+    let (chooser_ui, product_id, name) = (ui.clone(), product_id.to_string(), name.to_string());
+    dialog.connect_response(Some("runtime"), move |_, _| {
+        choose_runtime(&chooser_ui, &product_id, &name)
+    });
+    dialog.present(Some(&ui.window));
 }
 
 fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
