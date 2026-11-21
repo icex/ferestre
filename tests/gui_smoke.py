@@ -510,8 +510,12 @@ def row_action(app, frame, item, title=None):
 
 
 def check_game_row_layout(root, title, size, action):
-    button = row_button(root, title, action)
-    check(button is not None, f"{title} keeps its {action} action", root)
+    def find_button(root):
+        return row_button(root, title, action)
+
+    what = f"{title}'s {action} action"
+    button = wait_for(root, find_button, what, time.monotonic() + TIMEOUT)
+    check(True, f"{title} keeps its {action} action")
     bounds = lambda node: node.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
     viewport = button.get_parent()
     while viewport and viewport.get_role_name() != "scroll pane":
@@ -528,7 +532,7 @@ def check_game_row_layout(root, title, size, action):
         target = value.get_current_value() + center - (view.y + view.height / 2)
         value.set_current_value(max(0, min(target, value.get_maximum_value())))
         time.sleep(0.25)
-        button = row_button(root, title, action)
+        button = wait_for(root, find_button, what, time.monotonic() + TIMEOUT)
     images=find_all(button,role="image")
     if any(bounds(image).height>=200 for image in images):
         title_label=find_all(button,role="label",name=title)[0]
