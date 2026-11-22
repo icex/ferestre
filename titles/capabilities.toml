@@ -709,6 +709,14 @@ note = "Enable XGR_STORE_CATALOG=1 per title. Catalog data does not grant DLC ow
 verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "catalog snapshot:" }, { file = "files/lib/wine/x86_64-unix/xgameruntime.so", contains = "CSDX" }]
 
 [[capability]]
+name = "xgameruntime.store-collections-id"
+summary = "XStoreGetUserCollectionsIdAsync returns the Store's Collections ID key for the title service's ticket, fetched through the service."
+provided-by = ["https://github.com/icex/xgameruntime/commit/9de84aa985536fbf65015fb9da82ea0b9f77efb5", "https://github.com/icex/xodus/commit/536871bf0939dce66ae1fc6906290949fc629aa0"]
+symptom-if-missing = "Dead by Daylight shows CANNOT CONNECT TO STORE (Cannot retrieve the list of available content) on its splash screen; its get-update-entitlements request is refused with 400."
+note = "Requires the matching xodus-service (KSDX request); an older service makes the call fail rather than return an empty key. XStoreGetUserPurchaseIdAsync is still a stub."
+verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "Collections ID key: status" }, { file = "files/lib/wine/x86_64-unix/xgameruntime.so", contains = "Store ID key" }]
+
+[[capability]]
 name = "xgameruntime.store-player-accounts"
 summary = "Separate Store entitlement and Xbox player contexts with authenticated account and licence change notifications."
 provided-by = ["https://github.com/icex/xgameruntime/commit/36099cff2b87e81b05c4ea4527ddac5e66782891", "https://github.com/icex/xodus/commit/85704f4cda895ccce2cd31279a1c54cd3c0dcf0c"]
