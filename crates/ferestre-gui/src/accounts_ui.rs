@@ -60,6 +60,7 @@ fn show(ui: &Ui, profiles: accounts::Profiles) {
     content.add_top_bar(&header);
     content.set_content(Some(&page));
     window.set_content(Some(&content));
+    effects::install_secondary(&window, &ui.window);
 
     let choices = Rc::new(profiles.profiles.clone());
     let labels: Vec<String> = choices

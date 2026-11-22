@@ -17,6 +17,7 @@ mod client_check;
 mod controller;
 mod deadline;
 mod editor;
+mod effects;
 mod folder_picker;
 mod handheld;
 mod install_drives;
@@ -187,6 +188,21 @@ window.fullscreen-browser button, window.fullscreen-browser menubutton > button 
 .fullscreen-browser .game-meta { font-size: 14px; }
 .fullscreen-browser button:focus-visible, .fullscreen-browser button.game-tile:focus { outline: 4px solid #8bd77b; outline-offset: 3px; }
 .fullscreen-browser .game-grid flowboxchild:focus-visible { outline: none; }
+/* Page switches: a page that replaced another settles in. Blur only where it
+   is cheap (see effects.rs); otherwise an opacity fade; nothing at all when
+   the desktop asks for reduced motion. */
+@keyframes page-enter { from { filter: blur(12px); opacity: 0.35; } to { filter: blur(0px); opacity: 1; } }
+@keyframes page-fade { from { opacity: 0.45; } to { opacity: 1; } }
+window.ferestre-window .page-enter { animation: page-fade 160ms ease-out; }
+window.ferestre-window.blur-ok .page-enter { animation: page-enter 220ms ease-out; }
+window.ferestre-window.reduced-motion .page-enter { animation: none; }
+/* Behind a dialog: the window's content blurs and darkens on a GPU, and
+   libadwaita's own dimming is darker everywhere, which is the fallback. */
+window .app-shell { transition: filter 180ms ease-out; }
+window.reduced-motion .app-shell { transition: none; }
+window.blur-ok.dialog-open .app-shell { filter: blur(6px) brightness(0.8); }
+floating-sheet > dimming, bottom-sheet > dimming { background-color: alpha(black, 0.42); }
+floating-sheet > sheet { border-radius: 18px; }
 
 ";
 
@@ -325,6 +341,9 @@ struct Ui {
     /// A name lookup was asked for while one was running, so the running one
     /// must redraw when it ends to start the next.
     names_requeued: Rc<Cell<bool>>,
+    /// The section the content last showed, so only a page that replaced a
+    /// different one animates in, never a redraw of the same page.
+    last_section: Rc<Cell<Option<Section>>>,
 }
 
 fn main() -> glib::ExitCode {
@@ -389,6 +408,7 @@ fn build_ui(app: &adw::Application) {
             &css,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+        effects::load_glass(&display);
     }
     // Without this the shell has no icon to draw and falls back to a generated
     // letter tile. The name is the application id, which is what the packaging
@@ -625,6 +645,7 @@ fn build_ui(app: &adw::Application) {
     scroll.set_kinetic_scrolling(true);
     window.set_size_request(360, 480);
     window.set_content(Some(&split));
+    effects::install(&window, &split);
     window_controls::install(&window, &split, &sidebar_header, &content_header);
 
     let queue = model
@@ -661,6 +682,7 @@ fn build_ui(app: &adw::Application) {
         art_slots: Rc::new(RefCell::new(textures::Slots::default())),
         showed_pending_names: Rc::new(Cell::new(false)),
         names_requeued: Rc::new(Cell::new(false)),
+        last_section: Rc::new(Cell::new(None)),
         window: window.clone(),
         toasts,
         content,
@@ -1058,6 +1080,9 @@ fn render(ui: &Ui) {
         .child(&page)
         .build();
     ui.content.append(&clamp);
+    if ui.last_section.replace(Some(section)) != Some(section) {
+        effects::enter(&clamp, &ui.window);
+    }
 
     if let Some(problem) = ui.model.borrow().problem.clone() {
         let group = adw::PreferencesGroup::builder().title("Not ready").build();
