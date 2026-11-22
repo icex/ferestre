@@ -3538,6 +3538,22 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
             .add_toast(toast(format!("{name} is already running")));
         return;
     }
+    // One this window did not start -- an earlier window, a Steam shortcut, a
+    // terminal -- is just as much in the way: a second copy in the same prefix
+    // closes at once with a code that says nothing about why.
+    let found_server = {
+        let model = ui.model.borrow();
+        model
+            .recipe_for(product_id)
+            .and_then(|r| model.wineserver(r))
+    };
+    if let Some((wineserver, prefix)) = found_server {
+        let images = stop::running_in(&prefix);
+        if !images.is_empty() {
+            confirm_already_running(ui, product_id, name, wineserver, prefix, &images);
+            return;
+        }
+    }
     let (roles, server, state_dir) = {
         let model = ui.model.borrow();
         if let Some(roles) = &model.roles {
@@ -3818,6 +3834,81 @@ fn confirm_stop_title(ui: &Ui, product_id: &str, name: &str) {
             Some(stop::Press::End) => end_title(&ui, &key, launch.pgid, &name),
             _ => (),
         }
+    });
+    dialog.present(Some(&window));
+}
+
+/// A title is already running in its prefix, started outside this window:
+/// leave it, close it, or close it and start it again. Never a second copy.
+fn confirm_already_running(
+    ui: &Ui,
+    product_id: &str,
+    name: &str,
+    wineserver: PathBuf,
+    prefix: PathBuf,
+    images: &[String],
+) {
+    let dialog = adw::AlertDialog::new(
+        Some(&format!("{name} is already running")),
+        Some(&format!(
+            "A copy started earlier is still running ({}), perhaps from another \
+             window or one that never closed. A second copy would close at once.\n\n\
+             Closing it asks it to quit the way closing its window does, and ends \
+             it after {} seconds if it does not.",
+            images.join(", "),
+            stop::CLOSE_WAIT.as_secs()
+        )),
+    );
+    dialog.add_response("leave", "Leave It Running");
+    dialog.add_response("close", "Close It");
+    dialog.add_response("restart", "Close and Start Again");
+    dialog.set_response_appearance("close", adw::ResponseAppearance::Destructive);
+    dialog.set_response_appearance("restart", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("leave"));
+    dialog.set_close_response("leave");
+    let window = ui.window.clone();
+    let ui = ui.clone();
+    let product_id = product_id.to_string();
+    let name = name.to_string();
+    dialog.connect_response(None, move |_, response| {
+        let restart = match response {
+            "close" => false,
+            "restart" => true,
+            _ => return,
+        };
+        ui.toasts.add_toast(toast(format!("Closing {name}…")));
+        let ui = ui.clone();
+        let product_id = product_id.clone();
+        let name = name.clone();
+        let (wineserver, prefix) = (wineserver.clone(), prefix.clone());
+        glib::spawn_future_local(async move {
+            let closed = gio::spawn_blocking(move || {
+                stop::ask_to_close(&wineserver, &prefix, None);
+                let started = std::time::Instant::now();
+                while started.elapsed() < stop::CLOSE_WAIT {
+                    if stop::running_in(&prefix).is_empty() {
+                        return true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                stop::kill_prefix(&wineserver, &prefix);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                stop::running_in(&prefix).is_empty()
+            })
+            .await
+            .unwrap_or(false);
+            if !closed {
+                ui.toasts.add_toast(toast(format!(
+                    "{name} is still running and could not be closed"
+                )));
+                return;
+            }
+            if restart {
+                spawn_title(&ui, &product_id, &name);
+            } else {
+                ui.toasts.add_toast(toast(format!("{name} was closed")));
+            }
+        });
     });
     dialog.present(Some(&window));
 }
@@ -4849,14 +4940,28 @@ fn open_editor(ui: &Ui, product_id: &str, name: &str) {
 
     let window = ui.window.clone();
     let ui = ui.clone();
-    editor::present(&window, recipe, titles_dir, move |path| {
-        ui.model.borrow_mut().reload();
-        render(&ui);
-        ui.toasts.add_toast(toast(format!(
-            "Saved {}",
-            path.file_name().unwrap_or_default().to_string_lossy()
-        )));
-    });
+    let reset_ui = ui.clone();
+    let reset_name = name.to_string();
+    editor::present(
+        &window,
+        recipe,
+        titles_dir,
+        move |path| {
+            ui.model.borrow_mut().reload();
+            render(&ui);
+            ui.toasts.add_toast(toast(format!(
+                "Saved {}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )));
+        },
+        move || {
+            reset_ui.model.borrow_mut().reload();
+            render(&reset_ui);
+            reset_ui.toasts.add_toast(toast(format!(
+                "{reset_name} is back on its default settings"
+            )));
+        },
+    );
 }
 
 fn add_to_steam(ui: &Ui, product_id: &str, name: &str) {

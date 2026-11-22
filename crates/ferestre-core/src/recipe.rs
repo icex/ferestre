@@ -571,6 +571,32 @@ impl Recipe {
         )))
     }
 
+    /// The file a title's recipe has in a directory, whether or not it exists.
+    pub fn path_for(product_id: &str, dir: &Path) -> anyhow::Result<PathBuf> {
+        if product_id.is_empty()
+            || !product_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            anyhow::bail!("not a usable product id: {product_id:?}");
+        }
+        Ok(dir.join(format!("{}.toml", product_id.to_ascii_uppercase())))
+    }
+
+    /// Put a title back on its defaults: its recipe in `dir`, the user's own
+    /// edits, is renamed to `<ID>.toml.bak` (replacing an older one), so the
+    /// packaged or detected recipe applies again and the edit can still be
+    /// recovered by hand. `Ok(None)` when there was no edit to undo.
+    pub fn reset_in(product_id: &str, dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+        let path = Self::path_for(product_id, dir)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let backup = path.with_extension("toml.bak");
+        std::fs::rename(&path, &backup).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        Ok(Some(backup))
+    }
+
     /// Match a recipe by product id or slug, case-insensitively, because people
     /// will type either and the product id is not memorable.
     pub fn matches(&self, needle: &str) -> bool {
@@ -1173,5 +1199,33 @@ summary = "Runs."
         }
         recipe.install.content = (0..129).map(|i| format!("9{i:011}")).collect();
         assert!(Recipe::parse(&toml::to_string(&recipe).unwrap()).is_err());
+    }
+    /// Reset sets the edit aside where it can be recovered, and the directory
+    /// then holds no recipe for that title, so the packaged one applies.
+    #[test]
+    fn reset_sets_an_edit_aside() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut recipe = Recipe::blank("9ZZRESET0001", "Reset Test");
+        recipe.launch.executable = "Game.exe".into();
+        recipe
+            .launch
+            .env
+            .insert("FERESTRE_NATIVE_WAYLAND".into(), "1".into());
+        recipe.save_to(dir.path()).expect("saves");
+
+        let backup = Recipe::reset_in("9zzreset0001", dir.path())
+            .expect("resets")
+            .expect("there was an edit");
+        assert!(backup.ends_with("9ZZRESET0001.toml.bak"));
+        assert!(Recipe::load_dir(dir.path()).expect("loads").is_empty());
+        assert!(std::fs::read_to_string(&backup)
+            .unwrap()
+            .contains("FERESTRE_NATIVE_WAYLAND"));
+
+        assert_eq!(
+            Recipe::reset_in("9ZZRESET0001", dir.path()).expect("no-op"),
+            None
+        );
+        assert!(Recipe::reset_in("../etc", dir.path()).is_err());
     }
 }

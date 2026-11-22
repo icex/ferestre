@@ -289,12 +289,15 @@ impl OtherVariables {
     }
 }
 
-/// Show the editor for a recipe. `on_saved` is handed the path it wrote.
+/// Show the editor for a recipe. `on_saved` is handed the path it wrote;
+/// `on_reset` runs after the title's edits were set aside by "Reset to
+/// defaults".
 pub fn present(
     parent: &impl IsA<gtk::Widget>,
     recipe: Recipe,
     titles_dir: PathBuf,
     on_saved: impl Fn(PathBuf) + 'static,
+    on_reset: impl Fn() + 'static,
 ) {
     let draft = Draft::from_recipe(&recipe);
     let recipe = Rc::new(RefCell::new(recipe));
@@ -360,6 +363,25 @@ pub fn present(
     header.pack_start(&cancel);
     header.pack_end(&save);
 
+    // A way back from an experiment: whatever was changed here, the title
+    // returns to the recipe Ferestre ships (or detects). Only when there is an
+    // edit to undo.
+    let product_id = recipe.borrow().title.product_id.clone();
+    let has_edit = Recipe::path_for(&product_id, &titles_dir)
+        .map(|path| path.exists())
+        .unwrap_or(false);
+    let reset = gtk::Button::builder()
+        .label("Reset to defaults")
+        .css_classes(["destructive-action"])
+        .sensitive(has_edit)
+        .tooltip_text(if has_edit {
+            "Undo every change made here for this title"
+        } else {
+            "Nothing has been changed for this title"
+        })
+        .build();
+    header.pack_start(&reset);
+
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&page));
     let toolbar = adw::ToolbarView::new();
@@ -371,6 +393,47 @@ pub fn present(
         let dialog = dialog.clone();
         cancel.connect_clicked(move |_| {
             dialog.close();
+        });
+    }
+
+    {
+        let dialog = dialog.clone();
+        let toasts = toasts.clone();
+        let titles_dir = titles_dir.clone();
+        let name = recipe.borrow().title.name.clone();
+        let on_reset = Rc::new(on_reset);
+        reset.connect_clicked(move |button| {
+            let confirm = adw::AlertDialog::new(
+                Some(&format!("Reset {name} to its defaults?")),
+                Some(
+                    "Every launch setting changed here for this title is undone, and \
+                     it uses the settings Ferestre ships for it again. Your edit is \
+                     kept beside it as a .bak file.",
+                ),
+            );
+            confirm.add_response("cancel", "Cancel");
+            confirm.add_response("reset", "Reset");
+            confirm.set_response_appearance("reset", adw::ResponseAppearance::Destructive);
+            confirm.set_default_response(Some("cancel"));
+            confirm.set_close_response("cancel");
+            let dialog = dialog.clone();
+            let toasts = toasts.clone();
+            let titles_dir = titles_dir.clone();
+            let product_id = product_id.clone();
+            let on_reset = on_reset.clone();
+            confirm.connect_response(None, move |_, response| {
+                if response != "reset" {
+                    return;
+                }
+                match Recipe::reset_in(&product_id, &titles_dir) {
+                    Ok(_) => {
+                        on_reset();
+                        dialog.close();
+                    }
+                    Err(e) => toasts.add_toast(crate::toast(format!("Could not reset: {e}"))),
+                }
+            });
+            confirm.present(Some(button));
         });
     }
 

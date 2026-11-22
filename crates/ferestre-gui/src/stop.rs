@@ -241,6 +241,64 @@ pub fn processes_in(proc_root: &Path, uid: u32, prefix: &Path) -> Vec<WineProces
     found
 }
 
+/// Wine's own processes, which start with any title and can outlive it by a
+/// few seconds; none of them means a title is running.
+const WINE_HELPERS: &[&str] = &[
+    "conhost.exe",
+    "explorer.exe",
+    "plugplay.exe",
+    "rpcss.exe",
+    "rundll32.exe",
+    "services.exe",
+    "start.exe",
+    "steam.exe",
+    "svchost.exe",
+    "tabtip.exe",
+    "winedevice.exe",
+    "wineboot.exe",
+    "xalia.exe",
+];
+
+/// The image names of a title's own processes among `found`: everything that
+/// is not one of Wine's helpers, each name once.
+pub fn title_images(found: &[WineProcess]) -> Vec<String> {
+    let mut images: Vec<String> = Vec::new();
+    for process in found {
+        let helper = WINE_HELPERS
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(&process.image));
+        if !helper
+            && !images
+                .iter()
+                .any(|i| i.eq_ignore_ascii_case(&process.image))
+        {
+            images.push(process.image.clone());
+        }
+    }
+    images
+}
+
+/// What is still running of a title in `prefix`, started by anyone: an earlier
+/// window, a Steam shortcut, a terminal. Empty when nothing is.
+pub fn running_in(prefix: &Path) -> Vec<String> {
+    // Safety: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    title_images(&processes_in(Path::new("/proc"), uid, prefix))
+}
+
+/// End everything in `prefix` now, without a launch of this window's to
+/// signal: `wineserver -k`. Blocking, bounded by [`ASK_LIMIT`].
+pub fn kill_prefix(server: &Path, prefix: &Path) {
+    let mut command = Command::new(server);
+    command
+        .env("WINEPREFIX", prefix)
+        .arg("-k")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _ = crate::deadline::status(&mut command, ASK_LIMIT);
+}
+
 /// The `taskkill` that asks every one of `found` to close, run as the first of
 /// them would be. `None` when there is nothing to ask.
 pub fn close_command(wine: &Path, found: &[WineProcess]) -> Option<Command> {
@@ -964,5 +1022,32 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(200));
         }
+    }
+
+    /// Wine's helpers linger after a title and must not read as the title
+    /// still running; the title's own executables do, each named once.
+    #[test]
+    fn only_a_titles_own_processes_count_as_running() {
+        let process = |pid, image: &str| WineProcess {
+            pid,
+            image: image.into(),
+            env: Vec::new(),
+        };
+        let helpers = [
+            process(1, "services.exe"),
+            process(2, "Explorer.exe"),
+            process(3, "steam.exe"),
+        ];
+        assert!(title_images(&helpers).is_empty());
+        let game = [
+            process(1, "services.exe"),
+            process(4, "HogwartsLegacy.exe"),
+            process(5, "HogwartsLegacy.exe"),
+            process(6, "CrashReportClient.exe"),
+        ];
+        assert_eq!(
+            title_images(&game),
+            vec!["HogwartsLegacy.exe", "CrashReportClient.exe"]
+        );
     }
 }
