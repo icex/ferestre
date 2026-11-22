@@ -13,6 +13,21 @@
 # with the wrong label or a button wired to nothing, and it is worth the extra
 # minute of setup.
 #
+# The self-hosted runners share one host, which lets four jobs build at once,
+# so every job here is a slot another pull request waits for:
+#
+# - `preflight` runs on a hosted runner: rustfmt, and on a pull request, which
+#   of msrv, gui and sources the change can affect (.github/scripts/
+#   ci-changes.sh). A push to main or dev, or a manual run, runs them all.
+# - On a pull request, msrv type-checks with the old compiler instead of
+#   building and running every test a second time. The full msrv test runs on
+#   every push to main and dev.
+# - A newer push to a pull request cancels its older run, and a failed `test`
+#   on a pull request stops the rest of the run.
+# - Self-hosted jobs build into a directory that outlives the job
+#   (.github/scripts/ci-target-dir.sh), so only what changed is rebuilt. The
+#   GitHub cache is kept for hosted runners. Neither reaches a release.
+#
 # Every job here runs with a read-only token that is not written to the
 # checkout, and every third-party action is pinned to a commit, because a tag
 # or a branch can be moved to code nobody reviewed. Every cargo call is
@@ -90,11 +105,15 @@ on:
       - 'tests/test_workflows.py'
       - 'tests/test_no_nvidia_urls.py'
       - 'tests/test_build_dlssnr.py'
+      - 'tests/test_ci_changes.py'
       # The native harnesses and fixtures: the shell syntax step and the
       # `sources` job check these.
       - 'tests/*.sh'
       - 'tests/license_token_fixture.py'
+      # The pinned forks: a gitlink bump is what the `sources` job checks.
+      - 'third_party/**'
       - '.github/workflows/**'
+      - '.github/scripts/ci-*.sh'
   pull_request:
     paths:
       - 'crates/**'
@@ -157,22 +176,70 @@ on:
       - 'tests/test_workflows.py'
       - 'tests/test_no_nvidia_urls.py'
       - 'tests/test_build_dlssnr.py'
+      - 'tests/test_ci_changes.py'
       # The native harnesses and fixtures: the shell syntax step and the
       # `sources` job check these.
       - 'tests/*.sh'
       - 'tests/license_token_fixture.py'
+      # The pinned forks: a gitlink bump is what the `sources` job checks.
+      - 'third_party/**'
       - '.github/workflows/**'
+      - '.github/scripts/ci-*.sh'
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# One run per pull request: a newer push, or the second event a stacked
+# force-push fires for the same commit, cancels the run before it. Pushes to
+# main and dev, tags and manual runs each get a group of their own (the run
+# id), so they never cancel or queue behind one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
+  # Incremental data is large and CI rebuilds whole crates anyway; the hosted
+  # cache would drop it, and the persistent self-hosted directory would only
+  # fill up with it.
+  CARGO_INCREMENTAL: '0'
 
 jobs:
-  test:
+  # On a hosted runner, so it never waits for a build slot: formatting, which
+  # fails fast and costs nothing, and the paths that decide which of the
+  # heavier jobs a pull request needs.
+  preflight:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    outputs:
+      rust: ${{ steps.changes.outputs.rust }}
+      gui: ${{ steps.changes.outputs.gui }}
+      sources: ${{ steps.changes.outputs.sources }}
+    steps:
+      # Two commits: a pull request's checkout is GitHub's merge commit, and
+      # its first parent is the base branch it would merge into.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Which jobs this change needs
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+        run: .github/scripts/ci-changes.sh "$EVENT"
+
+  test:
+    needs: preflight
     runs-on: ${{ fromJSON(vars.FERESTRE_RUNNER_LABELS || '["self-hosted", "linux", "x64", "icex-ci"]') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -192,19 +259,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
           toolchain: stable
-          components: clippy, rustfmt
+          components: clippy
 
-      # Restored everywhere, saved only from main: a cache saved for a pull
-      # request or another branch is visible to that ref alone, and every
-      # copy counts against the repository's 10 GB.
+      # Self-hosted: a build directory that outlives the job, so only what
+      # changed is rebuilt (see the script). Hosted: the GitHub cache,
+      # restored everywhere and saved only from main, because a cache saved
+      # for a pull request or another branch is visible to that ref alone,
+      # and every copy counts against the repository's 10 GB.
+      - name: Persistent build directory
+        if: runner.environment == 'self-hosted'
+        run: .github/scripts/ci-target-dir.sh target ferestre 12
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: runner.environment != 'self-hosted'
         with:
           key: ubuntu-24.04
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Format
-        run: cargo fmt --all --check
-
+      # Formatting is checked in `preflight`.
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
@@ -264,7 +336,7 @@ jobs:
               esac
               "$shell" -n "$f" || status=1
               shellcheck --severity=error --shell="$shell" "$f" || status=1
-          done < <(find scripts packaging tests -type f \( -name '*.sh' -o -name AppRun \) -print0)
+          done < <(find scripts packaging tests .github/scripts -type f \( -name '*.sh' -o -name AppRun \) -print0)
           exit "$status"
 
       - name: Packaging and release tests
@@ -272,6 +344,7 @@ jobs:
           FERESTRE_REQUIRE_MINISIGN: '1'
         run: |
           python3 tests/test_workflows.py
+          python3 tests/test_ci_changes.py
           python3 tests/test_source_pins.py
           python3 tests/test_no_nvidia_urls.py
           python3 tests/test_build_dlssnr.py
@@ -287,8 +360,14 @@ jobs:
   # (zopfli, under zip's deflate feature, is the newest at 1.88). Raise this
   # together with `rust-version` in Cargo.toml, in the commit that moves the
   # lock; tests/test_workflows.py checks the two agree.
+  #
+  # On a pull request it type-checks every target, tests included, which is
+  # what catches a newer std or language feature; a push to main or dev
+  # builds and runs the whole test suite with it. Pull requests that touch
+  # no Rust skip it.
   msrv:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: preflight
+    if: needs.preflight.outputs.rust == 'true'
     runs-on: ${{ fromJSON(vars.FERESTRE_RUNNER_LABELS || '["self-hosted", "linux", "x64", "icex-ci"]') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -305,10 +384,17 @@ jobs:
         with:
           toolchain: '1.88'
 
-      # Restored everywhere, saved only from main: a cache saved for a pull
-      # request or another branch is visible to that ref alone, and every
-      # copy counts against the repository's 10 GB.
+      # Self-hosted: a build directory that outlives the job, so only what
+      # changed is rebuilt (see the script). Hosted: the GitHub cache,
+      # restored everywhere and saved only from main, because a cache saved
+      # for a pull request or another branch is visible to that ref alone,
+      # and every copy counts against the repository's 10 GB.
+      - name: Persistent build directory
+        if: runner.environment == 'self-hosted'
+        run: .github/scripts/ci-target-dir.sh target ferestre 12
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: runner.environment != 'self-hosted'
         with:
           key: ubuntu-24.04
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -327,7 +413,14 @@ jobs:
 
       # Named explicitly, so a runner image with a different default compiler
       # cannot make this job test something else.
+      - name: Type-check with the minimum supported Rust
+        if: github.event_name == 'pull_request'
+        run: |
+          rustc +1.88 --version
+          cargo +1.88 check --locked --workspace --all-targets
+
       - name: Test with the minimum supported Rust
+        if: github.event_name != 'pull_request'
         env:
           FERESTRE_REQUIRE_USERNS: '1'
         run: |
@@ -336,8 +429,11 @@ jobs:
 
   # Verify all five immutable fork commits and their nested gitlinks without
   # checking out the complete Wine tree, then run the client’s offline tests.
+  # A pull request that touches none of the pins, the forks or the scripts
+  # and fixtures they use skips it (.github/scripts/ci-changes.sh).
   sources:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: preflight
+    if: needs.preflight.outputs.sources == 'true'
     runs-on: ${{ fromJSON(vars.FERESTRE_RUNNER_LABELS || '["self-hosted", "linux", "x64", "icex-ci"]') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -364,7 +460,18 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev
 
       # The client is a workspace of its own, with its own target directory.
+      # As in `test`: persistent on self-hosted, the GitHub cache on hosted.
+      # Not a symlink in the submodule, which checkout never cleans and a
+      # release builds in: CARGO_TARGET_DIR for this job, and the in-tree
+      # target/ an older job left there goes.
+      - name: Persistent build directory
+        if: runner.environment == 'self-hosted'
+        run: |
+          rm -rf third_party/xodus-cli/target
+          .github/scripts/ci-target-dir.sh --env xodus-cli 8
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: runner.environment != 'self-hosted'
         with:
           key: ubuntu-24.04
           workspaces: third_party/xodus-cli -> target
@@ -411,8 +518,11 @@ jobs:
           done
           python3 "$scratch/check/tools/ferestre/test_desktop_refresh.py"
 
+  # A pull request that touches neither the crates nor the window's tests,
+  # fixtures or recipes skips it (.github/scripts/ci-changes.sh).
   gui:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: preflight
+    if: needs.preflight.outputs.gui == 'true'
     runs-on: ${{ fromJSON(vars.FERESTRE_RUNNER_LABELS || '["self-hosted", "linux", "x64", "icex-ci"]') }}
     env:
       GDK_BACKEND: x11
@@ -434,10 +544,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
           toolchain: stable
-      # Restored everywhere, saved only from main: a cache saved for a pull
-      # request or another branch is visible to that ref alone, and every
-      # copy counts against the repository's 10 GB.
+      # Self-hosted: a build directory that outlives the job, so only what
+      # changed is rebuilt (see the script). Hosted: the GitHub cache,
+      # restored everywhere and saved only from main, because a cache saved
+      # for a pull request or another branch is visible to that ref alone,
+      # and every copy counts against the repository's 10 GB.
+      - name: Persistent build directory
+        if: runner.environment == 'self-hosted'
+        run: .github/scripts/ci-target-dir.sh target ferestre 12
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: runner.environment != 'self-hosted'
         with:
           key: ubuntu-24.04
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -573,3 +690,21 @@ jobs:
         run: |
           xvfb-run -a --error-file=/dev/stderr --server-num=119 --server-args='-screen 0 1280x900x24 -noreset' \
             dbus-run-session -- python3 tests/gui_client_deps.py
+
+  # A pull request whose `test` failed is not going to merge as it is, and
+  # its msrv, sources and gui jobs would otherwise hold build slots other
+  # pull requests are waiting for. Cancel the rest of this run. Hosted, no
+  # checkout and no build: the token can cancel runs and nothing else.
+  stop-on-failure:
+    needs: test
+    if: failure() && github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel the rest of this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO"

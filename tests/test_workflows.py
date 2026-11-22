@@ -176,6 +176,54 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(toolchains, [declared])
         self.assertTrue(any(f'cargo +{declared} test --locked --workspace' in t
                             for t in runs(job)))
+        # A pull request type-checks every target, tests included.
+        self.assertTrue(any(f'cargo +{declared} check --locked --workspace --all-targets' in t
+                            for t in runs(job)))
+
+    def test_releases_never_build_in_the_persistent_ci_directory(self):
+        # Self-hosted CI jobs build in a directory that outlives the job and
+        # that pull requests write to. A signed release must keep building in
+        # a clean checkout from main's sources.
+        for wf in ('release.yml', 'runtime.yml'):
+            text = (REPO / '.github/workflows' / wf).read_text()
+            for marker in ('ci-target-dir', 'ferestre-ci', 'CARGO_TARGET_DIR'):
+                self.assertNotIn(marker, text, wf)
+            # A runner shares its work directory between workflows, so the
+            # `target` symlink a CI job left there is still in the checkout
+            # when a release runs on that runner. checkout's clean step (the
+            # default) removes it; a release must never turn that off.
+            for _, job in load(REPO / '.github/workflows' / wf)['jobs'].items():
+                for step in job.get('steps', []):
+                    if str(step.get('uses', '')).startswith('actions/checkout@'):
+                        self.assertNotIn('clean', step.get('with', {}), wf)
+
+    def test_ci_uses_the_persistent_directory_or_the_cache_never_both(self):
+        workflow = load(REPO / '.github/workflows/rust.yml')
+        for name in ('test', 'msrv', 'gui', 'sources'):
+            steps = workflow['jobs'][name]['steps']
+            persistent = [s for s in steps if 'ci-target-dir.sh' in s.get('run', '')]
+            cached = [s for s in steps if str(s.get('uses', '')).startswith('Swatinem/rust-cache@')]
+            self.assertEqual(len(persistent), 1, name)
+            self.assertEqual(len(cached), 1, name)
+            self.assertEqual(persistent[0].get('if'), "runner.environment == 'self-hosted'", name)
+            self.assertEqual(cached[0].get('if'), "runner.environment != 'self-hosted'", name)
+            self.assertEqual(cached[0]['with'].get('save-if'),
+                             "${{ github.ref == 'refs/heads/main' }}", name)
+
+    def test_only_pull_request_runs_cancel_one_another(self):
+        for wf in ('rust.yml', 'compatibility-matrix.yml'):
+            concurrency = load(REPO / '.github/workflows' / wf)['concurrency']
+            self.assertEqual(concurrency['cancel-in-progress'],
+                             "${{ github.event_name == 'pull_request' }}", wf)
+            # Anything but a pull request is a group of one.
+            self.assertIn("github.event_name == 'pull_request' &&", concurrency['group'], wf)
+            self.assertTrue(concurrency['group'].endswith('|| github.run_id }}'), wf)
+
+    def test_the_test_job_always_runs_and_formatting_is_checked(self):
+        workflow = load(REPO / '.github/workflows/rust.yml')
+        self.assertNotIn('if', workflow['jobs']['test'])
+        self.assertTrue(any('cargo fmt --all --check' in t
+                            for t in runs(workflow['jobs']['preflight'])))
 
     def test_the_published_launcher_must_trust_the_signing_key(self):
         job = load(REPO / '.github/workflows/release.yml')['jobs']['publish']

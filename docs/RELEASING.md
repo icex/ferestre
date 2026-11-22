@@ -125,8 +125,10 @@ ruleset controls who can start a release at all.
 
 ## Runner fallback
 
-Application CI, compatibility checks and application releases default to the
-isolated self-hosted runners. If that infrastructure is unavailable, set the
+Application CI and application releases default to the isolated self-hosted
+runners. The compatibility matrix and the Rust workflow's `preflight` job are
+stdlib Python and rustfmt with a read-only token, and always run on hosted
+`ubuntu-24.04`, so they never wait for a build slot. If that infrastructure is unavailable, set the
 repository Actions variable `FERESTRE_RUNNER_LABELS` to the JSON array
 `["ubuntu-24.04"]` before starting the checks. Delete the variable afterward
 to restore the self-hosted default. Hosted runners install the existing system
@@ -210,10 +212,26 @@ between runs:
 - Only the newest runtime cache is kept: the `prune-ccache` job deletes older
   ones. Its token can delete caches and nothing else.
 
-The Rust jobs work the same way. They restore their caches everywhere, but
-only save them on `main`, because a cache saved for a pull request, another
-branch or a tag can only be read there, and every copy counts against the
-repository's 10 GB.
+The Rust CI jobs (`.github/workflows/rust.yml`) do not use the GitHub cache
+on self-hosted runners. Each runner is its own user, its `CARGO_HOME` goes
+into every cache key and version, and so no runner ever restored what another
+saved, while `main` spent up to 17 minutes of a build slot saving gigabytes of
+copies. Instead, each self-hosted job builds in a directory in the runner's
+home that outlives the job, `~/.cache/ferestre-ci/<name>`
+(`.github/scripts/ci-target-dir.sh`): through a `target` symlink at the top of
+the checkout, which checkout's clean step removes before the next job, and
+through `CARGO_TARGET_DIR` for the client fork, whose submodule checkout never
+cleans. It is emptied when it grows past its cap or the disk runs low.
+
+- Pull requests from this repository write to that directory, and `main` and
+  `dev` pushes build in it after them. It only ever feeds CI test results.
+- The release and runtime workflows never use it: a signed release builds in
+  a clean checkout, restoring only a GitHub cache saved on `main`.
+  `tests/test_workflows.py` checks that neither workflow names it.
+- On hosted runners (the fallback above), the Rust jobs restore the GitHub
+  cache everywhere and save it only on `main`, because a cache saved for a
+  pull request, another branch or a tag can only be read there, and every
+  copy counts against the repository's 10 GB.
 
 ## Verifying a download by hand
 

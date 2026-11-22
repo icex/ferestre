@@ -28,10 +28,19 @@ on:
 permissions:
   contents: read
 
+# As in rust.yml: a newer push to a pull request cancels its older run, and
+# pushes and manual runs never cancel one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # A hosted runner, not the self-hosted build host: this is half a minute of
+  # stdlib Python with a read-only token and no secrets, and on the build host
+  # it waited up to half an hour for a slot behind Rust builds.
   check:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ${{ fromJSON(vars.FERESTRE_RUNNER_LABELS || '["self-hosted", "linux", "x64", "icex-ci"]') }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

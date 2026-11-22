@@ -66,6 +66,7 @@ game. Each is `python3 tests/<name>.py`; CI's `test` job lists them all.
 | `test_no_nvidia_urls.py` | no address of an NVIDIA file anywhere in the repository (also its own `guards` workflow) |
 | `test_build_dlssnr.py` | `scripts/build-dlssnr.sh`: the pinned DLSSNR-AMD commit, the packaged layout, and no NVIDIA model in it |
 | `test_workflows.py`, `test_source_pins.py`, `test_runtime_staging.py`, `test_release_signing.py`, `test_build_appimage.py` | CI/release invariants, source pins, signing, the AppImage build |
+| `test_ci_changes.py` | which Rust CI jobs a pull request runs: every file the `sources` and `gui` jobs name switches that job on (`.github/scripts/ci-changes.sh`) |
 | `tools/test_tool_hygiene.py`, `tools/test_xsts_probe.py` | the developer tools below (`python3 -m unittest discover -s tools -p 'test_*.py'`) |
 
 ## 3. GUI tests (the real window, through AT-SPI)
@@ -131,6 +132,25 @@ Look at every picture before committing it.
 from newer GTK. Expect a GUI test that passes locally to fail in the `gui` job
 now and then, and the reverse. To check before pushing, run it in an Ubuntu
 24.04 container with CI's packages, or push and read the `gui` job.
+
+### What CI runs on a pull request
+
+`.github/workflows/rust.yml` runs every job on a push to `main` or `dev`. On a
+pull request it runs only what the change can affect, decided by
+`.github/scripts/ci-changes.sh` in the hosted `preflight` job, which also
+checks formatting:
+
+| Job | On a pull request |
+|---|---|
+| `test` | always |
+| `msrv` | when `crates/`, `Cargo.toml` or `Cargo.lock` change; `cargo +1.88 check --all-targets` instead of the full test run |
+| `gui` | when the crates, `titles/`, `tests/fixtures/` or the GUI tests and their drivers change |
+| `sources` | when `sources.lock.json`, `.gitmodules`, `third_party/`, `scripts/check-sources.sh`, `scripts/source-pins.py` or the license fixtures change |
+
+The workflow and `.github/scripts/ci-*.sh` switch all of them on. A newer push
+cancels the pull request's older run, and a failed `test` cancels the rest of
+it. A skipped job is not a pass: when a change needs a job the filter does not
+see, add the path to `ci-changes.sh` and to `tests/test_ci_changes.py`.
 
 ## 4. Runtime suites (Wine DLLs under Wine)
 
