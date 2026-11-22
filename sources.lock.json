@@ -3,7 +3,7 @@
   "components": {
     "xodus": {
       "repository": "https://github.com/icex/xodus.git",
-      "commit": "a41bb842a909f6e2fcc091153c320e143626bcc4",
+      "commit": "536871bf0939dce66ae1fc6906290949fc629aa0",
       "upstream": "https://github.com/xodus-gaming/xodus.git",
       "upstream_commit": "3e75c9f2d3aad2ea2fdc488d92d0163eb68c1a60",
       "modified_paths": [
@@ -64,6 +64,7 @@
         "crates/xodus-cli/src/xvd_key/xml.rs",
         "crates/xodus-cli/src/xvd_key/zip.rs",
         "crates/xodus-service/Cargo.toml",
+        "crates/xodus-service/src/connection/b2b_key.rs",
         "crates/xodus-service/src/connection/catalog.rs",
         "crates/xodus-service/src/connection/license.rs",
         "crates/xodus-service/src/connection/license/tests.rs",
@@ -105,7 +106,7 @@
     },
     "xgameruntime": {
       "repository": "https://github.com/icex/xgameruntime.git",
-      "commit": "c93cb86d5ca6082e58c309d32e6600857941350a",
+      "commit": "51b23f1003340fac3884bb41efe23c1fb0d7ceba",
       "upstream": "https://github.com/xodus-gaming/xgameruntime.git",
       "upstream_commit": "64aebcabb8c66121eae25d3bf0ace4b582ebb0da",
       "modified_paths": [
@@ -156,7 +157,7 @@
     },
     "wine": {
       "repository": "https://github.com/icex/wine.git",
-      "commit": "f79155c7363000de53e6dc6894d3c4ab04d0cf97",
+      "commit": "8c7e8e7e985f5009fe902c73e48989212e481adc",
       "upstream": "https://github.com/xodus-gaming/wine.git",
       "upstream_commit": "b1dd32734a34472a28eb5be9922df06e07ac0834",
       "modified_paths": [
@@ -266,7 +267,7 @@
     },
     "proton": {
       "repository": "https://github.com/icex/Proton-UWP.git",
-      "commit": "e43e75e29431a87190a61cf0bce1acf4e496d979",
+      "commit": "64724102b84352364a68fcb9680b99df359c3278",
       "upstream": "https://github.com/xodus-gaming/Proton.git",
       "upstream_commit": "7c0b435495814349735c913fde78da906aecea52",
       "modified_paths": [

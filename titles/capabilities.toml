@@ -224,7 +224,7 @@ verify = [
 [[capability]]
 name = "winhttp.websocket-repeated-first-receive"
 summary = "An asynchronous web socket's first WinHttpWebSocketReceive, repeated with the same buffer while it is pending, is taken as the same request instead of failing."
-provided-by = ["https://github.com/icex/wine/commit/72ad5159eb0dfa0f982dd83e639ea5e7fd191e04"]
+provided-by = ["https://github.com/icex/wine/commit/4bc2e4819a6f91cb0664816af5f245f786c52132"]
 symptom-if-missing = "Dead by Daylight crashes on Loading Characters (EXCEPTION_ACCESS_VIOLATION), or stays on Connecting to RTM server..., right after its rtm-v3.live.bhvrdbd.com websocket connects; the log shows Attempt to queue receive while another is pending."
 note = "Only the socket's first receive is affected; any other receive while one is pending still fails with ERROR_INVALID_OPERATION, as on Windows. Completing receives on the calling thread instead was tried and left the game stuck on Connecting to RTM server..."
 verify = [
