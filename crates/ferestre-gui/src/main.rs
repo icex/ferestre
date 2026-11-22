@@ -23,6 +23,7 @@ mod handheld;
 mod home;
 mod install_drives;
 mod launch_state;
+mod max_width;
 mod model;
 mod notifications;
 mod packagekit;
@@ -1346,7 +1347,11 @@ fn render(ui: &Ui) {
     ui.title.set_title(section.title());
     ui.search.set_visible(matches!(
         section,
-        Section::Home | Section::Library | Section::GamePass | Section::Installed
+        Section::Home
+            | Section::Library
+            | Section::GamePass
+            | Section::Installed
+            | Section::Updates
     ));
     render_account_button(ui);
     render_recents(ui);
@@ -1368,10 +1373,17 @@ fn render(ui: &Ui) {
         section.title()
     ))]);
     // Artwork pages use the whole width, so a 32:9 display shows more
-    // covers rather than wide margins; pages of text stay readable.
+    // covers rather than wide margins; pages of text stay readable. Every
+    // Library tab shares the full-width header so it stays put between tabs;
+    // the Install queue caps only its list, below.
     let artwork = matches!(
         section,
-        Section::Home | Section::Library | Section::Installed | Section::GamePass
+        Section::Home
+            | Section::Library
+            | Section::Installed
+            | Section::Updates
+            | Section::Downloads
+            | Section::GamePass
     );
     let margin = if ui.window.width() > 2560 { 48 } else { 32 };
     page.set_margin_start(margin);
@@ -1421,7 +1433,14 @@ fn render(ui: &Ui) {
     }
     match section {
         Section::Runtime => render_runtime(ui, &page),
-        Section::Downloads => queue_ui::render_queue(ui, &page),
+        Section::Downloads => {
+            let body = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(24)
+                .build();
+            queue_ui::render_queue(ui, &body);
+            page.append(&max_width::wrap(&body, 1100));
+        }
         Section::Home if home::render_home(ui, &page) => {}
         Section::Home | Section::Library => {
             let show_all = ui.model.borrow().show_unsupported;
