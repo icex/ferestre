@@ -55,6 +55,7 @@ before=$(displays)
 systemd-run --user --scope --unit="$unit" --collect -p CPUWeight=50 -p IOWeight=50 -- \
     env -u WAYLAND_DISPLAY gamescope --backend headless -w "${size%x*}" -h "${size#*x}" -r 60 -- \
     "$ferestre" run "$id" > "$out/launch.log" 2>&1 &
+disown  # its end is the scope's end; no job-control notice when it is stopped
 sleep 8
 display=$(comm -13 <(echo "$before") <(displays) | tail -1)
 echo "display=$display" > "$out/summary.txt"
@@ -65,7 +66,7 @@ t=0
 while [ "$t" -lt "$secs" ]; do
     sleep 30; t=$((t + 30))
     exe=$(for p in $(scope_procs); do tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null; echo; done \
-        | grep -i '\.exe' | grep -v -i -E "$helpers" | sed 's/.*\\//' | cut -c1-80 | sort -u | tr '\n' ';')
+        | grep -i '\.exe' | grep -v -i -E "$helpers" | sed 's/.*\\//; s/ *$//' | cut -c1-80 | sort -u | tr '\n' ';')
     [ -n "$display" ] && GAMESCOPE_WAYLAND_DISPLAY=$display timeout 10 \
         gamescopectl screenshot "$out/shot-$(printf %03d "$t").png" > /dev/null 2>&1
     echo "t=$t exe=[$exe]" >> "$out/summary.txt"
