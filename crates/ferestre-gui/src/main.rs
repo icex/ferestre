@@ -1780,6 +1780,8 @@ fn draw_list(
         running: &running,
         game_dir: &game_dir,
         engine: &engine,
+        local_runtimes: &[],
+        anticheat: &|_| Vec::new(),
     };
     // The Game Pass section is a different list, not a filter over the same
     // one: its rows come from a public catalogue listing rather than from what
