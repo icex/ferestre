@@ -1,0 +1,22 @@
+schema = 1
+
+[title]
+product-id = "9PL1J8PJKH29"
+name = "Control Standard Edition"
+slug = "control-standard-edition"
+
+[launch]
+executable = "Game_rmdutggamepass_f.exe"
+
+[runtime]
+requires = [
+    "loader.memfd-main-image",
+    "xgameruntime.user",
+]
+wants = ["appmodel.package-identity"]
+
+[status]
+state = "playable"
+summary = "Starts and plays; checked by a person."
+last-verified = 2026-11-22
+verified-with = "Xbox PC package 1.0.6.0, played by a person on the XWayland display path."

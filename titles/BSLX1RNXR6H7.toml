@@ -18,9 +18,9 @@ wants = ["appmodel.package-identity"]
 
 [status]
 state = "playable"
-summary = "Signs in, creates its save and starts the campaign; checked headless, not yet played through by a person."
+summary = "Signs in, creates its save and plays; checked by a person."
 last-verified = 2026-11-22
-verified-with = "Xbox PC package 1.0.0.0, tools/headless-title.sh with scripted input past New Game Options to the opening scene."
+verified-with = "Xbox PC package 1.0.0.0, played by a person; first checked headless with scripted input past New Game Options."
 
 [[issues]]
 symptom = "After New Game Options the save spinner turns and the game never starts"

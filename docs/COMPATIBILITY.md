@@ -44,8 +44,9 @@ Current launcher: [0.1.22](RELEASE-0.1.22.md), using runtime **11.0.20261107.1**
 | Title | Store id | State | Notes | Verified |
 |---|---|---|---|---|
 | Age of Empires: Definitive Edition | `9NJWTJSVGVLJ` | Playable | Boots, starts a custom game and plays. | 2026-09-06 |
-| Batman: Arkham Knight | `BSLX1RNXR6H7` | Playable | Signs in, creates its save and starts the campaign; checked headless, not yet played through by a person. | 2026-11-22 |
+| Batman: Arkham Knight | `BSLX1RNXR6H7` | Playable | Signs in, creates its save and plays; checked by a person. | 2026-11-22 |
 | Clair Obscur: Expedition 33 | `9PPT8K6GQHRZ` | Playable | Playable start to finish, with working saves and video. | 2026-09-06 |
+| Control Standard Edition | `9PL1J8PJKH29` | Playable | Starts and plays; checked by a person. | 2026-11-22 |
 | DOOM 64 | `9MXND4PQLK3W` | Playable | Plays. | 2026-09-06 |
 | DREDGE | `9MSVVM5NS9L6` | Playable | Plays. | 2026-09-06 |
 | Dune: Awakening | `9PJ6FV3130QZ` | Playable | Gameplay confirmed by the player. | 2026-10-13 |
