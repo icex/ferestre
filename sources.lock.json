@@ -105,7 +105,7 @@
     },
     "xgameruntime": {
       "repository": "https://github.com/icex/xgameruntime.git",
-      "commit": "1c06f97fea8a16dbd1386d2a0a91c4bc836ab024",
+      "commit": "c93cb86d5ca6082e58c309d32e6600857941350a",
       "upstream": "https://github.com/xodus-gaming/xgameruntime.git",
       "upstream_commit": "64aebcabb8c66121eae25d3bf0ace4b582ebb0da",
       "modified_paths": [
@@ -156,7 +156,7 @@
     },
     "wine": {
       "repository": "https://github.com/icex/wine.git",
-      "commit": "bee0dc6024f22f8e69c7540d543eb130fcd47761",
+      "commit": "f79155c7363000de53e6dc6894d3c4ab04d0cf97",
       "upstream": "https://github.com/xodus-gaming/wine.git",
       "upstream_commit": "b1dd32734a34472a28eb5be9922df06e07ac0834",
       "modified_paths": [
@@ -266,7 +266,7 @@
     },
     "proton": {
       "repository": "https://github.com/icex/Proton-UWP.git",
-      "commit": "1845bdca2f7ba253d2f54da270db51ace69c616d",
+      "commit": "e43e75e29431a87190a61cf0bce1acf4e496d979",
       "upstream": "https://github.com/xodus-gaming/Proton.git",
       "upstream_commit": "7c0b435495814349735c913fde78da906aecea52",
       "modified_paths": [
