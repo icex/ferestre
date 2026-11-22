@@ -1399,18 +1399,20 @@ fn draw_list(
     };
     // Bundle rows install a child product. They still need to show the active
     // download on their own row, regardless of which model branch built it.
+    // Built once for the list: per row, these lookups scanned the whole Game
+    // Pass listing and every owned entry, twice.
+    let access = model::AccessIndex::new(&model.ownership, &model.catalog, &model.gamepass);
+    let store = model
+        .account
+        .as_ref()
+        .map_or("this Store account", |a| a.label());
     for row in &mut rows {
         // An installed title says when the selected Store account cannot play
         // it, before Play fails at the licence step.
-        let store = model
-            .account
-            .as_ref()
-            .map_or("this Store account", |a| a.label());
-        let gap = model::subscription_gap(
+        let access_source = access.source(&row.product_id, &model.tiers, &model.subscriptions);
+        let gap = access.gap(
             &row.product_id,
-            &model.ownership,
-            &model.catalog,
-            &model.gamepass,
+            access_source,
             &model.tiers,
             &model.subscriptions,
         );
@@ -1423,15 +1425,7 @@ fn draw_list(
             } else if installed_here && gap == Some(model::SubscriptionGap::OutsideTier) {
                 format!("Not available to {store}: outside its Game Pass tier")
             } else {
-                model::access_source(
-                    &row.product_id,
-                    &model.ownership,
-                    &model.catalog,
-                    &model.gamepass,
-                    &model.tiers,
-                    &model.subscriptions,
-                )
-                .to_string()
+                access_source.to_string()
             };
         // The chip beside Play says this; the subtitle need not say it twice.
         let (source, unavailable) = if source.starts_with("Not available to ") {

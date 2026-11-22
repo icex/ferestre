@@ -9,7 +9,7 @@
 //! The rules themselves come from `ferestre-core`, the same code the CLI runs, so
 //! the window and the terminal cannot disagree about what a recipe says.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use ferestre_core::autofix;
@@ -605,9 +605,155 @@ pub fn game_size_label(
     }
 }
 
+/// What [`access_source`] and [`subscription_gap`] look up for every row,
+/// built once per list instead of scanned again for each row. Without it a
+/// list of N Game Pass titles cost N x N case-folded comparisons, twice.
+///
+/// A title's *related* ids are itself and every catalogue product that bundles
+/// it: a purchase or a Game Pass listing of either grants the title.
+pub struct AccessIndex<'a> {
+    known: bool,
+    /// Upper-case child id to the catalogue keys of the bundles holding it.
+    parents: HashMap<String, Vec<&'a str>>,
+    /// Upper-case id to its Game Pass listing entries, as listed.
+    gamepass: HashMap<String, Vec<&'a str>>,
+    /// Upper-case id to the account's title entries for it, with their
+    /// position in the listing: the first related one in listing order wins.
+    entries: HashMap<String, Vec<(usize, &'a Entry)>>,
+}
+
+impl<'a> AccessIndex<'a> {
+    pub fn new(
+        ownership: &'a Ownership,
+        catalog: &'a BTreeMap<String, Product>,
+        gamepass_ids: &'a [String],
+    ) -> Self {
+        let mut parents: HashMap<String, Vec<&str>> = HashMap::new();
+        for (key, product) in catalog {
+            for child in &product.bundled_ids {
+                parents
+                    .entry(child.to_ascii_uppercase())
+                    .or_default()
+                    .push(key.as_str());
+            }
+        }
+        let mut gamepass: HashMap<String, Vec<&str>> = HashMap::new();
+        for id in gamepass_ids {
+            gamepass
+                .entry(id.to_ascii_uppercase())
+                .or_default()
+                .push(id.as_str());
+        }
+        let mut entries: HashMap<String, Vec<(usize, &Entry)>> = HashMap::new();
+        if let Ownership::Known(list) = ownership {
+            for (index, entry) in list.iter().enumerate().filter(|(_, e)| e.is_title()) {
+                entries
+                    .entry(entry.product_id.to_ascii_uppercase())
+                    .or_default()
+                    .push((index, entry));
+            }
+        }
+        Self {
+            known: matches!(ownership, Ownership::Known(_)),
+            parents,
+            gamepass,
+            entries,
+        }
+    }
+
+    /// The title's own id, upper-cased, then the bundles holding it.
+    fn related(&self, product_id: &str) -> Vec<String> {
+        let key = product_id.to_ascii_uppercase();
+        let mut related = vec![key.clone()];
+        if let Some(parents) = self.parents.get(&key) {
+            related.extend(parents.iter().map(|p| (*p).to_string()));
+        }
+        related
+    }
+
+    fn related_gamepass<'s>(&'s self, related: &'s [String]) -> impl Iterator<Item = &'a str> + 's {
+        related
+            .iter()
+            .filter_map(|id| self.gamepass.get(id))
+            .flatten()
+            .copied()
+    }
+
+    /// How the account can access a title. A public catalog entry alone is
+    /// not a subscription grant. Purchases take precedence over subscriptions;
+    /// a full subscription takes precedence over an old trial entry.
+    pub fn source(&self, product_id: &str, tiers: &gamepass::Tiers, held: &[&str]) -> &'static str {
+        let related = self.related(product_id);
+        let is_trial = |e: &Entry| {
+            e.sku_type
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case("Trial"))
+        };
+        let related_entries = || {
+            related
+                .iter()
+                .filter_map(|id| self.entries.get(id))
+                .flatten()
+        };
+        if let Some((_, entry)) = related_entries()
+            .filter(|(_, e)| !is_trial(e))
+            .min_by_key(|(index, _)| *index)
+        {
+            return match entry.ownership_type.as_deref() {
+                Some("OwnedByBeneficiary") | None => "Purchased",
+                Some("Shared") | Some("SharedWithBeneficiary") => "Shared licence",
+                _ => "Owned",
+            };
+        }
+        if tiers.covered(product_id, held) == Some(true)
+            || self
+                .related_gamepass(&related)
+                .any(|id| tiers.covered(id, held) == Some(true))
+        {
+            return "Game Pass";
+        }
+        if related_entries().any(|(_, e)| is_trial(e)) {
+            return "Trial";
+        }
+        if self.related_gamepass(&related).next().is_some() {
+            return GAME_PASS_CATALOGUE;
+        }
+        ACCESS_NOT_CHECKED
+    }
+
+    /// Why the Store account cannot be expected to license a title it
+    /// reached through Game Pass. Only said once the account's library was
+    /// read: an unread library holds no subscriptions, which is not the same
+    /// as holding none. `source` is what [`Self::source`] said for the same
+    /// title, so it is not worked out twice.
+    pub fn gap(
+        &self,
+        product_id: &str,
+        source: &str,
+        tiers: &gamepass::Tiers,
+        held: &[&str],
+    ) -> Option<SubscriptionGap> {
+        if !self.known || source != GAME_PASS_CATALOGUE {
+            return None;
+        }
+        if held.is_empty() {
+            return Some(SubscriptionGap::NoSubscription);
+        }
+        let related = self.related(product_id);
+        let outside = std::iter::once(product_id)
+            .chain(self.related_gamepass(&related))
+            .all(|id| tiers.covered(id, held) == Some(false));
+        outside.then_some(SubscriptionGap::OutsideTier)
+    }
+}
+
 /// Identify how the account can access a title. A public catalog entry alone
 /// is not a subscription grant. Purchases take precedence over subscriptions;
 /// a full subscription takes precedence over an old trial entry.
+///
+/// The window builds one [`AccessIndex`] per list and asks it per row; this
+/// is the one-title form the tests state the rules with.
+#[cfg(test)]
 pub fn access_source(
     product_id: &str,
     ownership: &Ownership,
@@ -616,53 +762,7 @@ pub fn access_source(
     tiers: &gamepass::Tiers,
     held: &[&str],
 ) -> &'static str {
-    let related = |id: &str| {
-        id.eq_ignore_ascii_case(product_id)
-            || catalog.get(&id.to_ascii_uppercase()).is_some_and(|p| {
-                p.bundled_ids
-                    .iter()
-                    .any(|child| child.eq_ignore_ascii_case(product_id))
-            })
-    };
-    if let Ownership::Known(entries) = ownership {
-        if let Some(entry) = entries.iter().find(|entry| {
-            entry.is_title()
-                && related(&entry.product_id)
-                && !entry
-                    .sku_type
-                    .as_deref()
-                    .is_some_and(|s| s.eq_ignore_ascii_case("Trial"))
-        }) {
-            return match entry.ownership_type.as_deref() {
-                Some("OwnedByBeneficiary") | None => "Purchased",
-                Some("Shared") | Some("SharedWithBeneficiary") => "Shared licence",
-                _ => "Owned",
-            };
-        }
-    }
-    if tiers.covered(product_id, held) == Some(true)
-        || gamepass_ids
-            .iter()
-            .filter(|id| related(id))
-            .any(|id| tiers.covered(id, held) == Some(true))
-    {
-        return "Game Pass";
-    }
-    if let Ownership::Known(entries) = ownership {
-        if entries.iter().any(|e| {
-            e.is_title()
-                && related(&e.product_id)
-                && e.sku_type
-                    .as_deref()
-                    .is_some_and(|s| s.eq_ignore_ascii_case("Trial"))
-        }) {
-            return "Trial";
-        }
-    }
-    if gamepass_ids.iter().any(|id| related(id)) {
-        return GAME_PASS_CATALOGUE;
-    }
-    ACCESS_NOT_CHECKED
+    AccessIndex::new(ownership, catalog, gamepass_ids).source(product_id, tiers, held)
 }
 
 const GAME_PASS_CATALOGUE: &str = "Game Pass catalogue";
@@ -682,6 +782,7 @@ pub enum SubscriptionGap {
 
 /// Only said once the account's library was read: an unread library holds no
 /// subscriptions, which is not the same as holding none.
+#[cfg(test)]
 pub fn subscription_gap(
     product_id: &str,
     ownership: &Ownership,
@@ -690,27 +791,9 @@ pub fn subscription_gap(
     tiers: &gamepass::Tiers,
     held: &[&str],
 ) -> Option<SubscriptionGap> {
-    if !matches!(ownership, Ownership::Known(_))
-        || access_source(product_id, ownership, catalog, gamepass_ids, tiers, held)
-            != GAME_PASS_CATALOGUE
-    {
-        return None;
-    }
-    if held.is_empty() {
-        return Some(SubscriptionGap::NoSubscription);
-    }
-    std::iter::once(product_id)
-        .chain(gamepass_ids.iter().map(String::as_str))
-        .filter(|id| {
-            id.eq_ignore_ascii_case(product_id)
-                || catalog.get(&id.to_ascii_uppercase()).is_some_and(|p| {
-                    p.bundled_ids
-                        .iter()
-                        .any(|child| child.eq_ignore_ascii_case(product_id))
-                })
-        })
-        .all(|id| tiers.covered(id, held) == Some(false))
-        .then_some(SubscriptionGap::OutsideTier)
+    let index = AccessIndex::new(ownership, catalog, gamepass_ids);
+    let source = index.source(product_id, tiers, held);
+    index.gap(product_id, source, tiers, held)
 }
 
 /// The licence step's own refusal, as `xodus-cli` reports it.
@@ -1515,6 +1598,100 @@ pub fn unasked(wanted: Vec<String>, asked: &mut BTreeSet<String>) -> Vec<String>
 mod tests {
     use super::*;
 
+    /// The implementation before [`AccessIndex`], kept as the oracle it must
+    /// agree with. Identify how the account can access a title. A public catalog entry alone
+    /// is not a subscription grant. Purchases take precedence over subscriptions;
+    /// a full subscription takes precedence over an old trial entry.
+    fn access_source_scan(
+        product_id: &str,
+        ownership: &Ownership,
+        catalog: &BTreeMap<String, Product>,
+        gamepass_ids: &[String],
+        tiers: &gamepass::Tiers,
+        held: &[&str],
+    ) -> &'static str {
+        let related = |id: &str| {
+            id.eq_ignore_ascii_case(product_id)
+                || catalog.get(&id.to_ascii_uppercase()).is_some_and(|p| {
+                    p.bundled_ids
+                        .iter()
+                        .any(|child| child.eq_ignore_ascii_case(product_id))
+                })
+        };
+        if let Ownership::Known(entries) = ownership {
+            if let Some(entry) = entries.iter().find(|entry| {
+                entry.is_title()
+                    && related(&entry.product_id)
+                    && !entry
+                        .sku_type
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("Trial"))
+            }) {
+                return match entry.ownership_type.as_deref() {
+                    Some("OwnedByBeneficiary") | None => "Purchased",
+                    Some("Shared") | Some("SharedWithBeneficiary") => "Shared licence",
+                    _ => "Owned",
+                };
+            }
+        }
+        if tiers.covered(product_id, held) == Some(true)
+            || gamepass_ids
+                .iter()
+                .filter(|id| related(id))
+                .any(|id| tiers.covered(id, held) == Some(true))
+        {
+            return "Game Pass";
+        }
+        if let Ownership::Known(entries) = ownership {
+            if entries.iter().any(|e| {
+                e.is_title()
+                    && related(&e.product_id)
+                    && e.sku_type
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("Trial"))
+            }) {
+                return "Trial";
+            }
+        }
+        if gamepass_ids.iter().any(|id| related(id)) {
+            return GAME_PASS_CATALOGUE;
+        }
+        ACCESS_NOT_CHECKED
+    }
+
+    /// Only said once the account's library was read: an unread library holds no
+    /// subscriptions, which is not the same as holding none.
+    fn subscription_gap_scan(
+        product_id: &str,
+        ownership: &Ownership,
+        catalog: &BTreeMap<String, Product>,
+        gamepass_ids: &[String],
+        tiers: &gamepass::Tiers,
+        held: &[&str],
+    ) -> Option<SubscriptionGap> {
+        if !matches!(ownership, Ownership::Known(_))
+            || access_source_scan(product_id, ownership, catalog, gamepass_ids, tiers, held)
+                != GAME_PASS_CATALOGUE
+        {
+            return None;
+        }
+        if held.is_empty() {
+            return Some(SubscriptionGap::NoSubscription);
+        }
+        std::iter::once(product_id)
+            .chain(gamepass_ids.iter().map(String::as_str))
+            .filter(|id| {
+                id.eq_ignore_ascii_case(product_id)
+                    || catalog.get(&id.to_ascii_uppercase()).is_some_and(|p| {
+                        p.bundled_ids
+                            .iter()
+                            .any(|child| child.eq_ignore_ascii_case(product_id))
+                    })
+            })
+            .all(|id| tiers.covered(id, held) == Some(false))
+            .then_some(SubscriptionGap::OutsideTier)
+    }
+
     /// Remove passes the prefixes its dialog listed, each by name, and none
     /// when the box was not ticked.
     #[test]
@@ -1974,6 +2151,135 @@ mod tests {
             "{}",
             row.subtitle
         );
+    }
+
+    /// The index must answer exactly as the per-row scans did, on catalogues
+    /// with bundles, mixed-case ids, trials, shared licences, non-title
+    /// entries and every tier combination, signed in and signed out.
+    #[test]
+    fn access_index_agrees_with_the_scans_it_replaced() {
+        let seed = std::cell::Cell::new(0x2545_f491_4f6c_dd1du64);
+        let next = |n: u64| {
+            let mut x = seed.get();
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            seed.set(x);
+            x % n
+        };
+        let pool: Vec<String> = (0..14).map(|i| format!("9ZZACCESS{i:03}")).collect();
+        let cased = |id: &str, flip: bool| {
+            if flip {
+                id.to_ascii_lowercase()
+            } else {
+                id.to_string()
+            }
+        };
+        let helds: [&[&str]; 4] = [&[], &["PC Game Pass"], &["Game Pass Premium"], &["Console"]];
+        let mut compared = 0;
+        let mut seen = BTreeSet::new();
+        for _ in 0..300 {
+            let mut products = Vec::new();
+            for id in &pool {
+                if next(3) == 0 {
+                    continue;
+                }
+                let mut p = product(id, id, &[]);
+                for _ in 0..next(3) {
+                    p.bundled_ids
+                        .push(cased(&pool[next(pool.len() as u64) as usize], next(2) == 0));
+                }
+                products.push(p);
+            }
+            let cat = catalog(products);
+            let gamepass_ids: Vec<String> = pool
+                .iter()
+                .filter(|_| next(2) == 0)
+                .map(|id| cased(id, next(3) == 0))
+                .collect();
+            let tiers_json = pool
+                .iter()
+                .filter(|_| next(2) == 0)
+                .map(|id| {
+                    let key = ["PCSubMetadata", "StandardSubMetadata", "ConsoleSubMetadata"]
+                        [next(3) as usize];
+                    format!(r#""{id}":{{"{key}":{{"Included":{}}}}}"#, next(4) != 0)
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            // A document with nothing included is refused; that is no tiers.
+            let tiers = gamepass::parse_tiers(&format!("{{{tiers_json}}}")).unwrap_or_default();
+            let items = pool
+                .iter()
+                .filter(|_| next(3) == 0)
+                .map(|id| {
+                    let kind = ["Game", "Application", "Durable"][next(3) as usize];
+                    let sku = ["", r#","skuType":"Trial""#, r#","skuType":"Full""#][next(3) as usize];
+                    let owner = [
+                        "",
+                        r#","ownershipType":"Shared""#,
+                        r#","ownershipType":"OwnedByBeneficiary""#,
+                        r#","ownershipType":"Other""#,
+                    ][next(4) as usize];
+                    format!(
+                        r#"{{"productId":"{}","productType":"{kind}","status":"Active"{sku}{owner}}}"#,
+                        cased(id, next(2) == 0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let known =
+                Ownership::Known(ferestre_core::library::parse(&format!("[{items}]")).unwrap());
+            for ownership in [&known, &Ownership::Unknown] {
+                let index = AccessIndex::new(ownership, &cat, &gamepass_ids);
+                for held in helds {
+                    for id in &pool {
+                        let id = cased(id, next(4) == 0);
+                        let source = index.source(&id, &tiers, held);
+                        assert_eq!(
+                            source,
+                            access_source_scan(&id, ownership, &cat, &gamepass_ids, &tiers, held),
+                            "source of {id}"
+                        );
+                        assert_eq!(
+                            index.gap(&id, source, &tiers, held),
+                            subscription_gap_scan(
+                                &id,
+                                ownership,
+                                &cat,
+                                &gamepass_ids,
+                                &tiers,
+                                held
+                            ),
+                            "gap of {id}"
+                        );
+                        seen.insert(format!(
+                            "{source} {:?}",
+                            index.gap(&id, source, &tiers, held)
+                        ));
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(compared, 300 * 2 * 4 * 14);
+        // Every answer was reached, so the comparison covered each branch.
+        for expected in [
+            "Purchased None",
+            "Shared licence None",
+            "Owned None",
+            "Game Pass None",
+            "Trial None",
+            "Game Pass catalogue None",
+            "Game Pass catalogue Some(NoSubscription)",
+            "Game Pass catalogue Some(OutsideTier)",
+            "Access not checked None",
+        ] {
+            assert!(
+                seen.contains(expected),
+                "{expected} never came up: {seen:?}"
+            );
+        }
     }
 
     #[test]
