@@ -521,6 +521,22 @@ verify = [
 ]
 
 [[capability]]
+name = "xgameruntime.package-chunk-availability"
+summary = """
+XPackageEnumerateChunkAvailability calls back with every chunk of the package \
+(the numeric chunk ids of its layout_*.xml) and every Resource language of \
+MicrosoftGame.config, each Ready, synchronously on the calling thread."""
+provided-by = ["https://github.com/icex/xgameruntime/commit/51b23f1003340fac3884bb41efe23c1fb0d7ceba"]
+symptom-if-missing = "Death Stranding Director's Cut shows \"Internal system error occured\" a few seconds after launch and writes error.txt: an access violation at address 0 in a Background thread, after \"Unable to retrieve prefetch list for root asset\""
+note = """
+Titles seed a chunk-id map as not installed and learn which chunks are Ready \
+only from these callbacks; returning S_OK without calling back leaves the \
+whole game looking uninstalled."""
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "chunk %u Ready" },
+]
+
+[[capability]]
 name = "xgameruntime.save-provider-default-scid"
 summary = """
 A save provider initialised with an all-zero configuration id uses the title's \

@@ -65,6 +65,7 @@ Current launcher: [0.1.22](RELEASE-0.1.22.md), using runtime **11.0.20261107.1**
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
 | Retro Classics | `9MTVJ3HHTQGS` | Playable | Playable, confirmed by the player. Signs in, loads the catalogue and streams Tennis; broader game, controller and save-restore coverage is not separately qualified. | 2026-10-10 |
 | Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. From a Steam shortcut, the shortcut's Steam Input controller layout applies, and Steam sees the game exit. | 2026-10-18 |
+| DEATH STRANDING DIRECTOR'S CUT | `9NQGN8TGNT8P` | Playable, with issues | Reaches the title menu, starts a New Game and plays the opening into the world; online features fall back to Offline Mode. | 2026-11-22 |
 | Gears of War: E-Day | `9N4PT8HGCDHQ` | Playable, with issues | Xbox sign-in and tutorial gameplay verified with HTTP/2. Online deployment was observed. An intermittent crash occurred on an earlier lobby entry. | 2026-11-21 |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.
