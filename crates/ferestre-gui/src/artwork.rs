@@ -17,6 +17,10 @@ pub(super) struct Queue {
     pending: VecDeque<Request>,
     visible: BTreeSet<String>,
     attempted: BTreeSet<String>,
+    /// Titles whose landscape art was asked for. Kept apart from `attempted`:
+    /// a title whose cover was fetched before the carousel wanted its banner
+    /// would otherwise never be asked for one.
+    attempted_hero: BTreeSet<String>,
     active: usize,
     generation: u64,
 }
@@ -30,11 +34,16 @@ impl Queue {
         {
             if visible {
                 let mut request = self.pending.remove(index).unwrap();
-                request.cover |= cover;
-                request.hero |= hero;
+                request.cover |= cover && self.attempted.insert(id.clone());
+                request.hero |= hero && self.attempted_hero.insert(id.clone());
                 self.pending.push_front(request);
             }
-        } else if self.attempted.insert(id.clone()) {
+        } else {
+            let cover = cover && self.attempted.insert(id.clone());
+            let hero = hero && self.attempted_hero.insert(id.clone());
+            if !cover && !hero {
+                return;
+            }
             let request = Request {
                 product,
                 cover,
@@ -58,9 +67,23 @@ pub(super) fn refresh(ui: &Ui) {
     queue.generation = queue.generation.wrapping_add(1);
     queue.pending.clear();
     queue.attempted.clear();
+    queue.attempted_hero.clear();
 }
 
 pub(super) fn request(ui: &Ui, ids: Vec<String>, visible: bool) {
+    enqueue(ui, ids, visible, if visible { 3 } else { 0 });
+}
+
+/// Landscape art for the titles the hero carousel would like to show, so a
+/// title can join it once its banner is on disk. Covers missing for them are
+/// fetched too.
+pub(super) fn request_heroes(ui: &Ui, ids: Vec<String>) {
+    let count = ids.len();
+    enqueue(ui, ids, true, count);
+}
+
+/// Queue art for `ids`; the first `heroes` of them also get landscape art.
+fn enqueue(ui: &Ui, ids: Vec<String>, visible: bool, heroes: usize) {
     {
         let model = ui.model.borrow();
         let mut queue = ui.artwork.borrow_mut();
@@ -78,8 +101,7 @@ pub(super) fn request(ui: &Ui, ids: Vec<String>, visible: bool) {
             // together with the cover, so a title whose cover was already
             // cached never got one, and its card stayed blank.
             let cover = !model.icons.contains_key(&key);
-            let hero = visible
-                && index < 3
+            let hero = index < heroes
                 && (product.artwork.landscape.is_some() || product.artwork.hero.is_some())
                 && model
                     .catalog_cache()

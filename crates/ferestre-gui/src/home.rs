@@ -47,9 +47,42 @@ fn tagline(model: &Model, row: &LibraryRow, gamepass: bool) -> String {
     }
 }
 
+/// The titles the carousel would show if their banners were on disk, in the
+/// order [`features`] picks from, so their landscape art can be fetched.
+pub(crate) fn hero_candidates(library: &[LibraryRow], gamepass: &[LibraryRow]) -> Vec<String> {
+    const LOOK_AHEAD: usize = 12;
+    let mut ids: Vec<String> = Vec::new();
+    let mut push = |row: &LibraryRow| {
+        let id = row.product_id.to_ascii_uppercase();
+        if ids.len() < LOOK_AHEAD && !ids.contains(&id) {
+            ids.push(id);
+        }
+    };
+    library
+        .iter()
+        .filter(|r| r.installed)
+        .take(2)
+        .for_each(&mut push);
+    library
+        .iter()
+        .filter(|r| r.has_update())
+        .for_each(&mut push);
+    gamepass.iter().filter(|r| !r.installed).for_each(&mut push);
+    library.iter().for_each(&mut push);
+    ids
+}
+
 fn features(model: &Model, library: &[LibraryRow], gamepass: &[LibraryRow]) -> Vec<Feature> {
     let cache = model.catalog_cache();
-    let hero = |id: &str| cache.as_ref().and_then(|c| c.hero_path(id));
+    // Only art that is on disk: `hero_path` names where a banner would be
+    // kept, whether or not it was ever fetched, and a title shown on a path
+    // with nothing behind it was a blank banner in the carousel.
+    let hero = |id: &str| {
+        cache
+            .as_ref()
+            .and_then(|c| c.hero_path(id))
+            .filter(|path| path.is_file())
+    };
     let mut out: Vec<Feature> = Vec::new();
     let mut add = |row: &LibraryRow, gp: bool, need_art: bool| {
         if out.len() >= HERO_ITEMS
@@ -60,15 +93,21 @@ fn features(model: &Model, library: &[LibraryRow], gamepass: &[LibraryRow]) -> V
             return;
         }
         let art = hero(&row.product_id);
-        if need_art && art.is_none() {
+        let cover = model
+            .icons
+            .get(&row.product_id.to_ascii_uppercase())
+            .filter(|path| path.is_file())
+            .cloned();
+        // Titles chosen to fill the carousel need a banner of their own; the
+        // ones it is about (running, recent, with an update) may stand on
+        // their cover instead. A title with no art at all is left out rather
+        // than shown as an empty card.
+        if (need_art && art.is_none()) || (art.is_none() && cover.is_none()) {
             return;
         }
         out.push(Feature {
             row: row.clone(),
-            cover: model
-                .icons
-                .get(&row.product_id.to_ascii_uppercase())
-                .cloned(),
+            cover,
             art,
             tagline: tagline(model, row, gp),
         });
@@ -851,6 +890,7 @@ pub(crate) fn render_home(ui: &Ui, page: &gtk::Box) -> bool {
         return true;
     }
     let mut seen = std::collections::HashSet::new();
+    artwork::request_heroes(ui, hero_candidates(&library.rows, &gamepass.rows));
     let hero_items = features(&ui.model.borrow(), &library.rows, &gamepass.rows);
     for f in &hero_items {
         seen.insert(f.row.product_id.to_ascii_uppercase());
@@ -1003,6 +1043,7 @@ pub(crate) fn gamepass_hero(ui: &Ui, page: &gtk::Box) {
         Listing::All,
     )
     .rows;
+    artwork::request_heroes(ui, hero_candidates(&[], &rows));
     let items = features(&ui.model.borrow(), &[], &rows);
     hero(ui, page, items);
 }

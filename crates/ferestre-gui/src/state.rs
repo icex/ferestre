@@ -514,11 +514,24 @@ impl Model {
             fresh.refused = std::mem::take(&mut self.refused);
         }
         fresh.profiles = self.profiles.take();
+        // What was fetched is kept, but what the fresh load found on disk is
+        // added to it, not thrown away: a title installed since the window
+        // opened has its catalogue entry and cover in the cache by now, and
+        // replacing the fresh maps with the old ones left it without art
+        // until the window was restarted.
+        let catalog = kept_with_new(
+            std::mem::take(&mut self.catalog),
+            std::mem::take(&mut fresh.catalog),
+        );
+        let icons = kept_with_new(
+            std::mem::take(&mut self.icons),
+            std::mem::take(&mut fresh.icons),
+        );
         *self = Model {
             size_generation: self.size_generation.wrapping_add(1),
             sizes_pending: std::mem::take(&mut self.sizes_pending),
-            catalog: std::mem::take(&mut self.catalog),
-            icons: std::mem::take(&mut self.icons),
+            catalog,
+            icons,
             gamepass: std::mem::take(&mut self.gamepass),
             gamepass_merchandised: std::mem::take(&mut self.gamepass_merchandised),
             tiers: std::mem::take(&mut self.tiers),
@@ -1190,6 +1203,17 @@ fn load_recipes(dirs: &[PathBuf]) -> (Vec<Recipe>, Vec<String>) {
 
 /// Icons already on disk from a previous run. Nothing is fetched here: a window
 /// that waits on a hundred HTTP requests before it appears is not a window.
+/// `kept`, plus every entry of `found` it does not have yet.
+fn kept_with_new<V>(
+    mut kept: BTreeMap<String, V>,
+    found: BTreeMap<String, V>,
+) -> BTreeMap<String, V> {
+    for (key, value) in found {
+        kept.entry(key).or_insert(value);
+    }
+    kept
+}
+
 fn existing_icons(cache: &Cache, catalog: &BTreeMap<String, Product>) -> BTreeMap<String, PathBuf> {
     catalog
         .keys()
@@ -1911,5 +1935,17 @@ mod tests {
         // Already gone is fine: that is what it is for.
         forget_saved_account(&dir);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reload keeps fetched entries and adds the ones found on disk since,
+    /// so a title installed while the window was open gets its art.
+    #[test]
+    fn reload_keeps_fetched_art_and_adds_new() {
+        let kept = BTreeMap::from([("A".to_string(), 1), ("B".to_string(), 2)]);
+        let found = BTreeMap::from([("B".to_string(), 20), ("C".to_string(), 30)]);
+        let merged = kept_with_new(kept, found);
+        assert_eq!(merged.get("A"), Some(&1));
+        assert_eq!(merged.get("B"), Some(&2), "fetched entries win");
+        assert_eq!(merged.get("C"), Some(&30), "new entries are added");
     }
 }
