@@ -1,9 +1,47 @@
 //! A folder browser inside Ferestre, reachable without a desktop file portal.
 use super::*;
 
+/// What the browser picks: a folder, or a file with one of these extensions.
+#[derive(Clone, Copy)]
+enum Pick {
+    Folder,
+    File(&'static [&'static str]),
+}
+
+impl Pick {
+    fn title(self) -> &'static str {
+        match self {
+            Pick::Folder => "Choose library folder",
+            Pick::File(_) => "Choose the game's program",
+        }
+    }
+
+    /// Whether a file of this name is listed: its extension is one wanted,
+    /// compared without case.
+    fn lists_file(self, name: &str) -> bool {
+        match self {
+            Pick::Folder => false,
+            Pick::File(extensions) => Path::new(name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| extensions.iter().any(|x| x.eq_ignore_ascii_case(e))),
+        }
+    }
+}
+
 pub fn open(ui: &Ui, target: &gtk::Editable) {
+    browse_dialog(ui, target, Pick::Folder);
+}
+
+/// The same browser, choosing a file whose extension is one of `extensions`
+/// (without case). Activating a file puts its path in `target`.
+pub fn open_file(ui: &Ui, target: &gtk::Editable, extensions: &'static [&'static str]) {
+    browse_dialog(ui, target, Pick::File(extensions));
+}
+
+fn browse_dialog(ui: &Ui, target: &gtk::Editable, pick: Pick) {
     let dialog = adw::Dialog::builder()
-        .title("Choose library folder")
+        .title(pick.title())
         .content_width(640)
         .content_height(520)
         .build();
@@ -17,7 +55,7 @@ pub fn open(ui: &Ui, target: &gtk::Editable) {
         .build();
     page.append(
         &gtk::Label::builder()
-            .label("Choose library folder")
+            .label(pick.title())
             .xalign(0.0)
             .css_classes(["title-2"])
             .build(),
@@ -50,6 +88,7 @@ pub fn open(ui: &Ui, target: &gtk::Editable) {
     type Browse = Rc<dyn Fn(PathBuf)>;
     let browse_slot = Rc::new(RefCell::new(None::<Browse>));
     let browse: Browse = {
+        let (dialog_ref, target) = (dialog.downgrade(), target.clone());
         let (current, path, folders, up, hidden, generation, slot) = (
             current.clone(),
             path.clone(),
@@ -73,16 +112,19 @@ pub fn open(ui: &Ui, target: &gtk::Editable) {
             }
             folders.append(&gtk::Label::new(Some("Loading folders…")));
             let (folders, generation, slot) = (folders.clone(), generation.clone(), slot.clone());
+            let (dialog_ref, target) = (dialog_ref.clone(), target.clone());
             let show_hidden = hidden.is_active();
             glib::spawn_future_local(async move {
                 let found = gio::spawn_blocking(move || -> std::io::Result<Vec<PathBuf>> {
                     let mut paths = Vec::new();
                     for entry in std::fs::read_dir(dir)?.flatten().take(2000) {
-                        if !show_hidden && entry.file_name().to_string_lossy().starts_with('.') {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        if !show_hidden && name.starts_with('.') {
                             continue;
                         }
-                        if entry.path().is_dir() {
-                            paths.push(entry.path());
+                        let path = entry.path();
+                        if path.is_dir() || (pick.lists_file(&name) && path.is_file()) {
+                            paths.push(path);
                         }
                     }
                     paths
@@ -110,8 +152,14 @@ pub fn open(ui: &Ui, target: &gtk::Editable) {
                                 .tooltip_text(child.to_string_lossy())
                                 .build();
                             let slot = slot.clone();
+                            let (dialog_ref, target) = (dialog_ref.clone(), target.clone());
                             button.connect_clicked(move |_| {
-                                if let Some(browse) =
+                                if !child.is_dir() {
+                                    target.set_text(&child.to_string_lossy());
+                                    if let Some(dialog) = dialog_ref.upgrade() {
+                                        dialog.close();
+                                    }
+                                } else if let Some(browse) =
                                     slot.upgrade().and_then(|s| s.borrow().clone())
                                 {
                                     browse(child.clone());
@@ -120,7 +168,10 @@ pub fn open(ui: &Ui, target: &gtk::Editable) {
                             folders.append(&button);
                         }
                     }
-                    Ok(Ok(_)) => folders.append(&gtk::Label::new(Some("No subfolders"))),
+                    Ok(Ok(_)) => folders.append(&gtk::Label::new(Some(match pick {
+                        Pick::Folder => "No subfolders",
+                        Pick::File(_) => "No subfolders or programs here",
+                    }))),
                     _ => folders.append(&gtk::Label::new(Some(
                         "Cannot read this folder. Choose a different location.",
                     ))),
@@ -172,7 +223,10 @@ pub fn open(ui: &Ui, target: &gtk::Editable) {
         });
     }
     responses.append(&cancel);
-    responses.append(&select);
+    // A file is chosen by pressing it; there is no folder to use.
+    if matches!(pick, Pick::Folder) {
+        responses.append(&select);
+    }
     page.append(&responses);
     // Retain the recursive browser only while this dialog is alive.
     dialog.connect_closed(move |_| {
@@ -180,7 +234,9 @@ pub fn open(ui: &Ui, target: &gtk::Editable) {
     });
     browse(initial);
     dialog.set_child(Some(&page));
-    dialog.set_focus(Some(&select));
+    if matches!(pick, Pick::Folder) {
+        dialog.set_focus(Some(&select));
+    }
     dialog.present(Some(&ui.window));
 }
 fn home_path() -> PathBuf {

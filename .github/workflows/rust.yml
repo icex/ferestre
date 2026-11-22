@@ -48,6 +48,7 @@ on:
       - 'tests/gui_controller_install.py'
       - 'tests/gui_accounts_controller.py'
       - 'tests/gui_runtime_selection.py'
+      - 'tests/gui_local_games.py'
       - 'tests/gui_update_resume.py'
       - 'tests/gui_update_existing.py'
       - 'tests/gui_library_error.py'
@@ -112,6 +113,7 @@ on:
       - 'tests/gui_controller_install.py'
       - 'tests/gui_accounts_controller.py'
       - 'tests/gui_runtime_selection.py'
+      - 'tests/gui_local_games.py'
       - 'tests/gui_update_resume.py'
       - 'tests/gui_update_existing.py'
       - 'tests/gui_library_error.py'
@@ -530,6 +532,11 @@ jobs:
         run: |
           xvfb-run -a --error-file=/dev/stderr --server-num=123 --server-args='-screen 0 1280x720x24 -noreset' \
             dbus-run-session -- python3 tests/gui_runtime_selection.py
+
+      - name: Local games, their menu and forget-only removal (offline)
+        run: |
+          xvfb-run -a --error-file=/dev/stderr --server-num=138 --server-args='-screen 0 1280x720x24 -noreset' \
+            dbus-run-session -- python3 tests/gui_local_games.py
 
       - name: Resume paused updates from the game grid (offline)
         run: |

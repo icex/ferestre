@@ -2610,9 +2610,343 @@ fn render_library_tabs(ui: &Ui, page: &gtk::Box) {
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .vscrollbar_policy(gtk::PolicyType::Never)
+        .hexpand(true)
         .child(&tabs)
         .build();
-    page.append(&scroll);
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    bar.append(&scroll);
+    bar.append(&library_add_menu(ui));
+    page.append(&bar);
+}
+
+/// The library's "+": add a game that is already on disk, or import Steam's
+/// non-Steam shortcuts.
+fn library_add_menu(ui: &Ui) -> gtk::MenuButton {
+    let menu = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    let popover = gtk::Popover::builder().child(&menu).build();
+    let button = gtk::MenuButton::builder()
+        .icon_name("list-add-symbolic")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .tooltip_text("Add games")
+        .popover(&popover)
+        .build();
+    button.set_widget_name("library-add");
+    button.update_property(&[gtk::accessible::Property::Label("Add games")]);
+    type Item = (&'static str, &'static str, fn(&Ui));
+    let items: [Item; 2] = [
+        ("document-open-symbolic", "Add game…", add_game_dialog),
+        (
+            "emblem-shared-symbolic",
+            "Import from Steam",
+            import_from_steam,
+        ),
+    ];
+    for (icon, label, run) in items {
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        content.append(&gtk::Image::from_icon_name(icon));
+        content.append(&gtk::Label::builder().label(label).xalign(0.0).build());
+        let item = gtk::Button::builder()
+            .child(&content)
+            .css_classes(["flat"])
+            .build();
+        item.update_property(&[gtk::accessible::Property::Label(label)]);
+        let (ui, popover) = (ui.clone(), popover.clone());
+        item.connect_clicked(move |_| {
+            popover.popdown();
+            run(&ui);
+        });
+        menu.append(&item);
+    }
+    button
+}
+
+/// Add a Windows game that is already on disk. Its files are only looked at:
+/// the recipe Ferestre writes names them where they are.
+fn add_game_dialog(ui: &Ui) {
+    let Some(paths) = ui.model.borrow().paths.clone() else {
+        ui.toasts
+            .add_toast(toast("Cannot work out where things live: HOME is not set"));
+        return;
+    };
+    let dialog = adw::Dialog::builder()
+        .title("Add game")
+        .content_width(560)
+        .build();
+    let program = adw::EntryRow::builder().title("Program").build();
+    let browse = gtk::Button::builder()
+        .icon_name("folder-open-symbolic")
+        .tooltip_text("Browse…")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .build();
+    browse.update_property(&[gtk::accessible::Property::Label("Browse…")]);
+    program.add_suffix(&browse);
+    let name = adw::EntryRow::builder().title("Name").build();
+    let folder = adw::EntryRow::builder().title("Folder").build();
+    let prefix = adw::EntryRow::builder().title("Wine prefix").build();
+    let group = adw::PreferencesGroup::builder()
+        .description(
+            "A .exe or .bat already on disk. Its files are never moved or deleted. Leave the \
+             Wine prefix empty for one managed by Ferestre.",
+        )
+        .build();
+    group.add(&program);
+    group.add(&name);
+    group.add(&folder);
+    group.add(&prefix);
+    let error = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .visible(false)
+        .css_classes(["error"])
+        .build();
+    let body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(12)
+        .margin_bottom(18)
+        .margin_start(18)
+        .margin_end(18)
+        .build();
+    body.append(&group);
+    body.append(&error);
+    let header = adw::HeaderBar::new();
+    let cancel = gtk::Button::with_label("Cancel");
+    let add = gtk::Button::builder()
+        .label("Add")
+        .css_classes(["suggested-action"])
+        .build();
+    header.pack_start(&cancel);
+    header.pack_end(&add);
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&body));
+    dialog.set_child(Some(&toolbar));
+
+    {
+        let (ui, entry) = (ui.clone(), program.clone());
+        browse.connect_clicked(move |_| {
+            folder_picker::open_file(&ui, entry.upcast_ref(), &["exe", "bat"]);
+        });
+    }
+    // The name and folder follow the program until the person types them.
+    let filling = Rc::new(Cell::new(false));
+    let name_typed = Rc::new(Cell::new(false));
+    let folder_typed = Rc::new(Cell::new(false));
+    for (entry, typed) in [(&name, &name_typed), (&folder, &folder_typed)] {
+        let (filling, typed) = (filling.clone(), typed.clone());
+        entry.connect_changed(move |_| {
+            if !filling.get() {
+                typed.set(true);
+            }
+        });
+    }
+    program.connect_changed(glib::clone!(
+        #[strong]
+        name,
+        #[strong]
+        folder,
+        move |program| {
+            let text = program.text();
+            let exe = Path::new(text.trim());
+            if !exe.is_absolute() {
+                return;
+            }
+            filling.set(true);
+            if !name_typed.get() {
+                name.set_text(&ferestre_core::local::derive_name(exe));
+            }
+            if !folder_typed.get() {
+                if let Some(parent) = exe.parent() {
+                    folder.set_text(&parent.to_string_lossy());
+                }
+            }
+            filling.set(false);
+        }
+    ));
+    {
+        let dialog = dialog.clone();
+        cancel.connect_clicked(move |_| {
+            dialog.close();
+        });
+    }
+    add.connect_clicked(glib::clone!(
+        #[strong]
+        ui,
+        #[strong]
+        dialog,
+        #[strong]
+        error,
+        move |add| {
+            let text = |entry: &adw::EntryRow| {
+                let text = entry.text().trim().to_string();
+                (!text.is_empty()).then_some(text)
+            };
+            let request = ferestre_core::local::AddRequest {
+                exe: PathBuf::from(text(&program).unwrap_or_default()),
+                name: text(&name),
+                dir: text(&folder).map(PathBuf::from),
+                prefix: text(&prefix).map(PathBuf::from),
+                runtime: None,
+            };
+            add.set_sensitive(false);
+            error.set_visible(false);
+            let paths = paths.clone();
+            let (ui, dialog, error, add) = (ui.clone(), dialog.clone(), error.clone(), add.clone());
+            glib::spawn_future_local(async move {
+                let added = gio::spawn_blocking(move || {
+                    let recipe = ferestre_core::local::add(&paths, &request)?;
+                    let found = paths
+                        .install_dir(&recipe)
+                        .map(|dir| {
+                            ferestre_core::anticheat::detect(&dir, &recipe.launch.executable)
+                        })
+                        .unwrap_or_default();
+                    anyhow::Ok((recipe.title.name, found))
+                })
+                .await;
+                add.set_sensitive(true);
+                let (added, found) = match added {
+                    Ok(Ok(done)) => done,
+                    Ok(Err(e)) => {
+                        error.set_text(&format!("{e:#}"));
+                        error.set_visible(true);
+                        return;
+                    }
+                    Err(_) => {
+                        error.set_text("Could not add the game");
+                        error.set_visible(true);
+                        return;
+                    }
+                };
+                dialog.close();
+                ui.model.borrow_mut().reload();
+                render(&ui);
+                ui.toasts.add_toast(toast(format!("Added {added}")));
+                if let Some(line) = ferestre_core::anticheat::describe(&found) {
+                    ui.toasts.add_toast(
+                        adw::Toast::builder()
+                            .title(line)
+                            .use_markup(false)
+                            .timeout(15)
+                            .build(),
+                    );
+                }
+            });
+        }
+    ));
+    dialog.present(Some(&ui.window));
+}
+
+/// Import Steam's non-Steam shortcuts as local games, after saying which.
+/// Steam's files are only read.
+fn import_from_steam(ui: &Ui) {
+    let Some(paths) = ui.model.borrow().paths.clone() else {
+        ui.toasts
+            .add_toast(toast("Cannot work out where things live: HOME is not set"));
+        return;
+    };
+    if !begin(ui, "Reading Steam's shortcuts") {
+        report_busy(ui);
+        return;
+    }
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let planned = gio::spawn_blocking(move || {
+            ferestre_core::steam_import::plan(&paths, None).map(|found| (paths, found))
+        })
+        .await;
+        finish(&ui);
+        let (paths, candidates) = match planned {
+            Ok(Ok(planned)) => planned,
+            Ok(Err(e)) => {
+                ui.toasts
+                    .add_toast(toast(format!("Could not read Steam's shortcuts: {e:#}")));
+                return;
+            }
+            Err(_) => {
+                ui.toasts
+                    .add_toast(toast("Could not read Steam's shortcuts"));
+                return;
+            }
+        };
+        use ferestre_core::steam_import::ImportStatus;
+        let new: Vec<&str> = candidates
+            .iter()
+            .filter(|c| c.status == ImportStatus::New)
+            .map(|c| c.name.as_str())
+            .collect();
+        if new.is_empty() {
+            ui.toasts
+                .add_toast(toast("Nothing new to import from Steam"));
+            return;
+        }
+        let kept = candidates
+            .iter()
+            .filter(|c| c.status == ImportStatus::Kept)
+            .count();
+        let skipped = candidates
+            .iter()
+            .filter(|c| matches!(c.status, ImportStatus::Skipped(_)))
+            .count();
+        let mut body: Vec<String> = new.iter().take(10).map(|n| n.to_string()).collect();
+        if new.len() > 10 {
+            body.push(format!("and {} more", new.len() - 10));
+        }
+        body.push(String::new());
+        body.push(format!(
+            "{kept} already in your library; {skipped} skipped (Ferestre's own shortcuts or not \
+             Windows programs)."
+        ));
+        body.push("Steam's files are only read.".into());
+        let dialog = adw::AlertDialog::new(Some("Import from Steam"), Some(&body.join("\n")));
+        dialog.set_body_use_markup(false);
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("import", "Import");
+        dialog.set_response_appearance("import", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("import"));
+        dialog.set_close_response("cancel");
+        let window = ui.window.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response != "import" {
+                return;
+            }
+            if !begin(&ui, "Importing from Steam") {
+                report_busy(&ui);
+                return;
+            }
+            let (ui, paths, candidates) = (ui.clone(), paths.clone(), candidates.clone());
+            glib::spawn_future_local(async move {
+                let applied = gio::spawn_blocking(move || {
+                    ferestre_core::steam_import::apply(&paths, &candidates)
+                })
+                .await;
+                finish(&ui);
+                ui.model.borrow_mut().reload();
+                render(&ui);
+                ui.toasts.add_toast(toast(match applied {
+                    Ok(Ok(report)) => {
+                        let n = report.added.len();
+                        format!(
+                            "Imported {n} {} from Steam",
+                            if n == 1 { "game" } else { "games" }
+                        )
+                    }
+                    Ok(Err(e)) => format!("Could not import from Steam: {e:#}"),
+                    Err(_) => "Could not import from Steam".to_string(),
+                }));
+            });
+        });
+        dialog.present(Some(&window));
+    });
 }
 fn render_recents(ui: &Ui) {
     sidebar::render_installed(ui);
@@ -2744,7 +3078,13 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
         .catalog
         .get(&key)
         .and_then(|p| p.publisher.clone())
-        .unwrap_or_else(|| "Xbox PC".into());
+        .unwrap_or_else(|| {
+            if row.local {
+                "Local game".into()
+            } else {
+                "Xbox PC".into()
+            }
+        });
     text.append(
         &gtk::Label::builder()
             .label(publisher)
