@@ -299,7 +299,7 @@ pub fn overview(
     let gate = apply::gate(&anticheat, &acknowledged);
     let installed = entry.as_ref().filter(|e| e.enabled).map(|e| {
         match package::unpacked(&ctx.root, &e.package, e.arch) {
-            Some(dir) => apply::verify(&dir, &e.install_dir, e.route),
+            Some(dir) => apply::verify_as(&dir, &e.install_dir, e.route, e.proxy.as_deref()),
             None => Err(format!(
                 "the DLSSNR-AMD {} {} package is not unpacked; run: ferestre neural setup",
                 e.package, e.arch

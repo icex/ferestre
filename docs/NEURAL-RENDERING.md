@@ -104,6 +104,34 @@ At launch Ferestre adds `dxgi=n,b` (or `winevulkan=n,b;vulkan-1=n,b` for the
 Vulkan and Direct3D 9 routes) to `WINEDLLOVERRIDES`. An override you set
 yourself for the same DLL wins, and the launch says the mod may then not load.
 
+### The NR Control menu key
+
+DLSSNR-AMD opens its NR Control menu with End. On a keyboard without one
+(a Mac or iPad keyboard), choose another key for every game:
+
+```sh
+ferestre neural menu-key Ctrl+Y      # or F7; --reset goes back to End
+```
+
+It is kept as `[dlssnr] menu-key` in `~/.config/ferestre/settings.toml` and
+written into each game's `dlssnr-amd.ini` at its next launch, including after
+a reinstall.
+
+### A game that crashes with OptiScaler as dxgi.dll
+
+On the `optiscaler` route OptiScaler goes in as `dxgi.dll`. Some games crash
+at start with a `dxgi.dll` beside them but run with OptiScaler under another
+name it supports: `winmm`, `version`, `dbghelp`, `d3d12`, `wininet` or
+`winhttp`. Call of Duty: Modern Warfare 4 (`sp26-cod.exe`) runs as `winmm`:
+
+```sh
+ferestre neural enable <title> --proxy winmm
+```
+
+The choice is kept per game, also after turning neural rendering off, and the
+launch's `WINEDLLOVERRIDES` follows it. `--proxy dxgi` goes back to the
+default at the next launch.
+
 ## Anti-cheat
 
 - Any anti-cheat, including Easy Anti-Cheat and BattlEye: enabling needs

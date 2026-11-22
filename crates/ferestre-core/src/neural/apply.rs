@@ -600,6 +600,16 @@ pub fn run_remove(package_dir: &Path, exe_dir: &Path, log: &Path) -> Result<()> 
 /// everything it lists exists (logs aside), and the files the route loads
 /// through are the package's.
 pub fn verify(package_dir: &Path, exe_dir: &Path, route: Route) -> Result<(), String> {
+    verify_as(package_dir, exe_dir, route, None)
+}
+
+/// [`verify`] for OptiScaler installed under another DLL name.
+pub fn verify_as(
+    package_dir: &Path,
+    exe_dir: &Path,
+    route: Route,
+    proxy: Option<&str>,
+) -> Result<(), String> {
     let manifest = exe_dir.join(INSTALL_MANIFEST);
     let text =
         std::fs::read_to_string(&manifest).map_err(|e| format!("{}: {e}", manifest.display()))?;
@@ -626,14 +636,23 @@ pub fn verify(package_dir: &Path, exe_dir: &Path, route: Route) -> Result<(), St
             return Err(format!("{relative} is missing from {}", exe_dir.display()));
         }
     }
-    let files = package::route_files(package_dir, route).map_err(|e| format!("{e:#}"))?;
+    let files = package::route_files_as(package_dir, route, proxy).map_err(|e| format!("{e:#}"))?;
     let injectors = package::injectors(route);
-    let compared = injectors.required.iter().chain(
-        injectors
-            .when_listed
-            .iter()
-            .filter(|name| listed.contains(**name)),
-    );
+    let proxy_file = package::proxy_file(route, proxy);
+    let compared = injectors
+        .required
+        .iter()
+        .map(|name| match *name {
+            "dxgi.dll" => proxy_file.as_str(),
+            name => name,
+        })
+        .chain(
+            injectors
+                .when_listed
+                .iter()
+                .copied()
+                .filter(|name| listed.contains(*name)),
+        );
     for name in compared {
         let source = files
             .iter()
@@ -660,7 +679,7 @@ fn install(
     exe_dir: &Path,
     entry: &Entry,
 ) -> Result<()> {
-    let files = package::route_files(package_dir, entry.route)?;
+    let files = files_for(package_dir, entry)?;
     backup(exe_dir, &files, &entry.package, entry.route)?;
     let backup_dir = exe_dir.join(BACKUP_DIR);
     // The ini is the person's settings only when it was not there before the
@@ -687,7 +706,96 @@ fn install(
     };
     installed?;
     kept_back?;
+    use_proxy(exe_dir, entry)?;
+    apply_menu_key(ctx, exe_dir)?;
     record_installed(exe_dir, &files)
+}
+
+/// The files an entry's install writes, OptiScaler under its DLL name.
+fn files_for(package_dir: &Path, entry: &Entry) -> Result<Vec<RouteFile>> {
+    package::route_files_as(package_dir, entry.route, entry.proxy.as_deref())
+}
+
+/// Every name restore may touch for a route, whichever DLL name OptiScaler
+/// was installed as.
+fn allowed_names(package_dir: &Path, route: Route) -> Result<BTreeSet<String>> {
+    let mut allowed = names(&package::route_files(package_dir, route)?);
+    if route == Route::Optiscaler {
+        allowed.extend(package::PROXIES.iter().map(|p| format!("{p}.dll")));
+    }
+    Ok(allowed)
+}
+
+/// After `install.sh`: OptiScaler, which it wrote as `dxgi.dll`, renamed to
+/// the entry's DLL name, and the install manifest saying so, so that
+/// `install.sh remove` takes out the renamed file.
+fn use_proxy(exe_dir: &Path, entry: &Entry) -> Result<()> {
+    let name = package::proxy_file(entry.route, entry.proxy.as_deref());
+    if name == "dxgi.dll" {
+        return Ok(());
+    }
+    let target = exe_dir.join(&name);
+    // Whatever was there is in the backup already.
+    remove_any(&target).with_context(|| format!("cannot replace {}", target.display()))?;
+    std::fs::rename(exe_dir.join("dxgi.dll"), &target)
+        .with_context(|| format!("cannot install OptiScaler as {}", target.display()))?;
+    let manifest = exe_dir.join(INSTALL_MANIFEST);
+    let text =
+        std::fs::read_to_string(&manifest).with_context(|| format!("{}", manifest.display()))?;
+    let renamed: String = text
+        .split_inclusive('\n')
+        .map(|line| {
+            let body = line.trim_end_matches(['\r', '\n']);
+            if body.trim().eq_ignore_ascii_case("dxgi.dll") {
+                format!("{name}{}", &line[body.len()..])
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    crate::cache::write(&manifest, renamed.as_bytes())
+}
+
+/// `[dlssnr] menu-key` written into the game's `dlssnr-amd.ini`, keeping
+/// the file's line endings; nothing when it is unset or already that key.
+fn apply_menu_key(ctx: &Context, exe_dir: &Path) -> Result<()> {
+    let Some(key) = crate::settings::dlssnr_menu_key(&ctx.config_dir)? else {
+        return Ok(());
+    };
+    let ini = exe_dir.join(INI);
+    let Ok(text) = std::fs::read_to_string(&ini) else {
+        return Ok(());
+    };
+    if let Some(changed) = with_menu_key(&text, &key) {
+        crate::cache::write(&ini, changed.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// `text` with `MenuKey` in `[NRControl]` set to `key`, or `None` when it is
+/// already or the ini has no such line.
+fn with_menu_key(text: &str, key: &str) -> Option<String> {
+    let mut section = String::new();
+    let mut changed = false;
+    let out: String = text
+        .split_inclusive('\n')
+        .map(|line| {
+            let body = line.trim_end_matches(['\r', '\n']);
+            let trimmed = body.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                section = trimmed[1..trimmed.len() - 1].trim().to_ascii_lowercase();
+            } else if section == "nrcontrol" {
+                if let Some((name, value)) = trimmed.split_once('=') {
+                    if name.trim().eq_ignore_ascii_case("MenuKey") && value.trim() != key {
+                        changed = true;
+                        return format!("MenuKey = {key}{}", &line[body.len()..]);
+                    }
+                }
+            }
+            line.to_string()
+        })
+        .collect();
+    changed.then_some(out)
 }
 
 /// The model files a network needs.
@@ -866,8 +974,9 @@ fn enable_with(ctx: &Context, req: &EnableRequest, found: &[Detection]) -> Resul
         package: package.version.clone(),
         arch,
         install_dir: dir.clone(),
+        proxy: state::proxy(&ctx.config_dir, req.key)?.filter(|_| route == Route::Optiscaler),
     };
-    let allowed = names(&package::route_files(&package_dir, route)?);
+    let allowed = allowed_names(&package_dir, route)?;
     let undo = |error: anyhow::Error| -> anyhow::Error {
         if !fresh {
             return error.context(format!(
@@ -952,7 +1061,7 @@ fn take_out(ctx: &Context, key: &str, dir: &Path, entry: Option<&Entry>) -> Resu
                 dir.display()
             )
         })?;
-    let allowed = names(&package::route_files(&package_dir, route)?);
+    let allowed = allowed_names(&package_dir, route)?;
     // Checked whole before `install.sh remove` deletes anything.
     let backup = validated(dir, &allowed)?;
     if dir.join(INSTALL_MANIFEST).exists() {
@@ -1047,13 +1156,35 @@ fn ensure_with(
     let same_package = current
         .as_ref()
         .map_or(true, |p| p.version == entry.package);
+    let wanted = match state::proxy(&ctx.config_dir, key) {
+        Ok(proxy) => proxy.filter(|_| entry.route == Route::Optiscaler),
+        Err(e) => return Ensured::Skipped(format!("{e:#}")),
+    };
     let whole = entry.install_dir == dir
         && same_package
+        && entry.proxy == wanted
         && package::unpacked(&ctx.root, &entry.package, entry.arch)
-            .is_some_and(|pkg| verify(&pkg, &dir, entry.route).is_ok());
+            .is_some_and(|pkg| verify_as(&pkg, &dir, entry.route, entry.proxy.as_deref()).is_ok());
     if whole {
+        // A menu key set since the install takes effect now.
+        if let Err(e) = apply_menu_key(ctx, &dir) {
+            eprintln!("-- neural rendering: the menu key was not set: {e:#}");
+        }
         return Ensured::Present(entry);
     }
+    // Another DLL name: the old install comes out whole first, so a file of
+    // the game's under the old name is back before the new one goes in.
+    if entry.proxy != wanted && entry.install_dir == dir && holds_ours(&dir) {
+        if let Err(e) = take_out(ctx, key, &dir, Some(&entry)) {
+            return Ensured::Skipped(format!(
+                "OptiScaler could not be taken out to go in under another name: {e:#}"
+            ));
+        }
+    }
+    let entry = Entry {
+        proxy: wanted,
+        ..entry
+    };
     // The executable moved to another folder: the old install comes out
     // first, so neither it nor the person's files kept beside it are lost.
     if entry.install_dir != dir && holds_ours(&entry.install_dir) {
@@ -1185,7 +1316,14 @@ pub fn launch_env(
 ) -> LaunchEnv {
     let mut env = LaunchEnv::default();
     let existing = current("WINEDLLOVERRIDES");
-    let (merged, theirs) = merge_dll_overrides(existing.as_deref(), dll_overrides(entry.route));
+    let proxy_file = package::proxy_file(entry.route, entry.proxy.as_deref());
+    let proxied = [(proxy_file.trim_end_matches(".dll"), "n,b")];
+    let ours = if proxy_file == "dxgi.dll" {
+        dll_overrides(entry.route)
+    } else {
+        &proxied[..]
+    };
+    let (merged, theirs) = merge_dll_overrides(existing.as_deref(), ours);
     env.set.push(("WINEDLLOVERRIDES".to_string(), merged));
     for name in theirs {
         env.notes.push(format!(
@@ -1841,6 +1979,90 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
     }
 
     #[test]
+    fn optiscaler_goes_in_under_the_chosen_name_and_comes_out_whole() {
+        let w = World::new();
+        write(&w.game.join("winmm.dll"), THEIRS);
+        state::set_proxy(&w.ctx.config_dir, "local-game", Some("WinMM.dll")).unwrap();
+        let enabled = w.enable(Route::Optiscaler);
+        assert_eq!(enabled.entry.proxy.as_deref(), Some("winmm"));
+        let optiscaler = read(&w.package_dir().join("optiscaler/release/OptiScaler.dll"));
+        assert_eq!(read(&w.game.join("winmm.dll")), optiscaler);
+        assert!(!w.game.join("dxgi.dll").exists());
+        let listed = std::fs::read_to_string(w.game.join(INSTALL_MANIFEST)).unwrap();
+        assert!(listed.lines().any(|l| l == "winmm.dll"), "{listed}");
+        assert!(!listed.lines().any(|l| l == "dxgi.dll"), "{listed}");
+        assert!(verify_as(&w.package_dir(), &w.game, Route::Optiscaler, Some("winmm")).is_ok());
+        assert!(verify(&w.package_dir(), &w.game, Route::Optiscaler).is_err());
+        assert!(matches!(w.ensure(&[]), Ensured::Present(_)));
+
+        let env = launch_env(&enabled.entry, &w.game, &|_| None);
+        assert_eq!(env.set[0], ("WINEDLLOVERRIDES".into(), "winmm=n,b".into()));
+
+        // Back to dxgi: the next launch installs it under that name.
+        state::set_proxy(&w.ctx.config_dir, "local-game", Some("dxgi")).unwrap();
+        match w.ensure(&[]) {
+            Ensured::Reinstalled(entry) => assert_eq!(entry.proxy, None),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(read(&w.game.join("dxgi.dll")), optiscaler);
+        assert_eq!(read(&w.game.join("winmm.dll")), THEIRS);
+
+        // And to winmm again, then off: the person's winmm.dll is back.
+        state::set_proxy(&w.ctx.config_dir, "local-game", Some("winmm")).unwrap();
+        assert!(matches!(w.ensure(&[]), Ensured::Reinstalled(_)));
+        assert_eq!(read(&w.game.join("winmm.dll")), optiscaler);
+        disable(&w.ctx, "local-game", &w.game, "Game.exe").unwrap();
+        assert_eq!(read(&w.game.join("winmm.dll")), THEIRS);
+        assert_eq!(listing(&w.game), vec!["Game.exe", "winmm.dll"]);
+        assert_eq!(
+            state::proxy(&w.ctx.config_dir, "local-game")
+                .unwrap()
+                .as_deref(),
+            Some("winmm"),
+            "the choice outlives turning it off"
+        );
+    }
+
+    #[test]
+    fn a_proxy_name_is_one_optiscaler_loads_as() {
+        let config = tempfile::tempdir().unwrap();
+        for bad in ["kernel32", "../dxgi", "", "dxgi.exe"] {
+            assert!(
+                state::set_proxy(config.path(), "g", Some(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+        state::set_proxy(config.path(), "g", Some("VERSION.DLL")).unwrap();
+        assert_eq!(
+            state::proxy(config.path(), "G").unwrap().as_deref(),
+            Some("version")
+        );
+    }
+
+    #[test]
+    fn the_menu_key_is_set_only_in_nr_control_keeping_line_endings() {
+        let ini =
+            "[Other]\r\nMenuKey = End\r\n[NRControl]\r\n; MenuKey = x\r\nMenuKey = End\r\nX=1\r\n";
+        let changed = with_menu_key(ini, "Ctrl+Y").unwrap();
+        assert_eq!(
+            changed,
+            "[Other]\r\nMenuKey = End\r\n[NRControl]\r\n; MenuKey = x\r\nMenuKey = Ctrl+Y\r\nX=1\r\n"
+        );
+        assert_eq!(with_menu_key(&changed, "Ctrl+Y"), None);
+        assert_eq!(with_menu_key("[NRControl]\nOther = 1\n", "F7"), None);
+    }
+
+    #[test]
+    fn the_configured_menu_key_reaches_an_installed_game() {
+        let w = World::new();
+        w.enable(Route::Optiscaler);
+        write(&w.game.join(INI), b"[NRControl]\nMenuKey = End\n");
+        crate::settings::set_dlssnr_menu_key(&w.ctx.config_dir, Some("Ctrl+Y")).unwrap();
+        assert!(matches!(w.ensure(&[]), Ensured::Present(_)));
+        assert_eq!(read(&w.game.join(INI)), b"[NRControl]\nMenuKey = Ctrl+Y\n");
+    }
+
+    #[test]
     fn optiscaler_refuses_a_32_bit_executable() {
         let w = World::new();
         write(
@@ -2111,6 +2333,7 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
             package: "0.0.9".into(),
             arch: Arch::X86_64,
             install_dir: PathBuf::from("/g"),
+            proxy: None,
         };
         let env = launch_env(&entry, Path::new("/g"), &|k| {
             (k == "WINEDLLOVERRIDES").then(|| "dxgi=b".to_string())
@@ -2143,6 +2366,7 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
             package: "0.0.9".into(),
             arch: Arch::X86_64,
             install_dir: dir.path().to_path_buf(),
+            proxy: None,
         };
         let none = |_: &str| None;
         let keys = |env: &LaunchEnv| env.set.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();

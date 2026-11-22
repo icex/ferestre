@@ -368,6 +368,51 @@ pub fn route_files(package_dir: &Path, route: Route) -> Result<Vec<RouteFile>> {
     Ok(files)
 }
 
+/// The names OptiScaler loads as (its own list), `dxgi` the default. A game
+/// that crashes with a `dxgi.dll` beside it may take another.
+pub const PROXIES: &[&str] = &[
+    "dxgi", "winmm", "version", "dbghelp", "d3d12", "wininet", "winhttp",
+];
+
+/// `name` (with or without `.dll`, any case) as one of [`PROXIES`].
+pub fn check_proxy(name: &str) -> Result<&'static str> {
+    let lower = name.trim().to_ascii_lowercase();
+    let bare = lower.strip_suffix(".dll").unwrap_or(&lower);
+    PROXIES.iter().copied().find(|p| *p == bare).ok_or_else(|| {
+        anyhow!(
+            "{name:?} is not a name OptiScaler loads as; one of {}",
+            PROXIES.join(", ")
+        )
+    })
+}
+
+/// The OptiScaler injector's file name for a proxy choice.
+pub fn proxy_file(route: Route, proxy: Option<&str>) -> String {
+    match proxy {
+        Some(p) if route == Route::Optiscaler && p != "dxgi" => format!("{p}.dll"),
+        _ => "dxgi.dll".to_string(),
+    }
+}
+
+/// [`route_files`] with OptiScaler under another DLL name. `dxgi.dll` stays
+/// listed: `install.sh` writes it before it is renamed, so a game's own is
+/// still backed up and comes back.
+pub fn route_files_as(
+    package_dir: &Path,
+    route: Route,
+    proxy: Option<&str>,
+) -> Result<Vec<RouteFile>> {
+    let mut files = route_files(package_dir, route)?;
+    let name = proxy_file(route, proxy);
+    if name != "dxgi.dll" {
+        if let Some(injector) = files.iter_mut().find(|f| f.name == "dxgi.dll") {
+            injector.name = name;
+        }
+        put(&mut files, written("dxgi.dll", false));
+    }
+    Ok(files)
+}
+
 /// The files a route loads through: what `verify` compares with the package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Injectors {

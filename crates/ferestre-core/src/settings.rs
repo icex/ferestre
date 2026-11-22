@@ -1,8 +1,9 @@
 //! `settings.toml`: the person's own settings that are not per game.
 //!
-//! Today only `[dlssnr] dll-url`, the one place a download URL for
-//! `nvngx_dlssnr.dll` may come from besides [`DLL_URL_ENV`]. This repository
-//! never holds such a URL.
+//! Today `[dlssnr] dll-url`, the one place a download URL for
+//! `nvngx_dlssnr.dll` may come from besides [`DLL_URL_ENV`] (this repository
+//! never holds such a URL), and `[dlssnr] menu-key`, the key that opens
+//! DLSSNR-AMD's NR Control menu in every game.
 //!
 //! The file is edited as a plain TOML table, so tables and keys this build
 //! does not know survive a write.
@@ -17,6 +18,7 @@ pub const DLL_URL_ENV: &str = "FERESTRE_DLSSNR_DLL_URL";
 
 const TABLE: &str = "dlssnr";
 const DLL_URL: &str = "dll-url";
+const MENU_KEY: &str = "menu-key";
 
 fn file(config_dir: &Path) -> PathBuf {
     config_dir.join(FILE)
@@ -71,26 +73,67 @@ pub fn file_dlssnr_dll_url(config_dir: &Path) -> Result<Option<String>> {
     Ok(Some(url.to_string()))
 }
 
+/// A menu key as DLSSNR-AMD's ini takes it: a key name, optionally after
+/// modifiers, such as `End`, `F7` or `Ctrl+Y`.
+fn check_menu_key(key: &str) -> Result<()> {
+    let plain = |part: &str| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric());
+    if key.len() > 40 || !key.split('+').all(plain) {
+        bail!("{key:?} is not a key such as End, F7 or Ctrl+Y");
+    }
+    Ok(())
+}
+
+/// `[dlssnr] menu-key`: the key that opens NR Control, written into each
+/// game's `dlssnr-amd.ini`; `None` keeps upstream's (End).
+pub fn dlssnr_menu_key(config_dir: &Path) -> Result<Option<String>> {
+    let table = read(config_dir)?;
+    let Some(value) = table.get(TABLE).and_then(|t| t.get(MENU_KEY)) else {
+        return Ok(None);
+    };
+    let path = file(config_dir);
+    let key = value
+        .as_str()
+        .ok_or_else(|| anyhow!("{}: [{TABLE}] {MENU_KEY} is not a string", path.display()))?;
+    if key.is_empty() {
+        return Ok(None);
+    }
+    check_menu_key(key).map_err(|e| anyhow!("{}: [{TABLE}] {MENU_KEY}: {e}", path.display()))?;
+    Ok(Some(key.to_string()))
+}
+
+/// Set or, with `None`, remove `[dlssnr] menu-key`.
+pub fn set_dlssnr_menu_key(config_dir: &Path, key: Option<&str>) -> Result<()> {
+    if let Some(key) = key {
+        check_menu_key(key)?;
+    }
+    set(config_dir, MENU_KEY, key)
+}
+
 /// Set or, with `None`, remove `[dlssnr] dll-url`. Only `https://` URLs.
 pub fn set_dlssnr_dll_url(config_dir: &Path, url: Option<&str>) -> Result<()> {
     if let Some(url) = url {
         check_https(url)?;
     }
+    set(config_dir, DLL_URL, url)
+}
+
+/// Set or, with `None`, remove one key of `[dlssnr]`, keeping the rest.
+fn set(config_dir: &Path, name: &str, value: Option<&str>) -> Result<()> {
     let mut table = read(config_dir)?;
-    match url {
-        Some(url) => {
+    match value {
+        Some(value) => {
             let section = table
                 .entry(TABLE)
                 .or_insert_with(|| toml::Value::Table(toml::Table::new()));
             let Some(section) = section.as_table_mut() else {
                 bail!("{}: {TABLE} is not a table", file(config_dir).display());
             };
-            section.insert(DLL_URL.into(), toml::Value::String(url.into()));
+            section.insert(name.into(), toml::Value::String(value.into()));
         }
         None => {
             let now_empty = match table.get_mut(TABLE).and_then(toml::Value::as_table_mut) {
                 Some(section) => {
-                    section.remove(DLL_URL);
+                    section.remove(name);
                     section.is_empty()
                 }
                 None => false,
@@ -174,6 +217,23 @@ mod tests {
         assert_eq!(table["other"]["x"].as_integer(), Some(1));
         assert!(table["dlssnr"].get(DLL_URL).is_none());
         assert_eq!(file_dlssnr_dll_url(config.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn the_menu_key_is_kept_beside_the_url_and_checked() {
+        let config = tempfile::tempdir().unwrap();
+        let c = config.path();
+        assert_eq!(dlssnr_menu_key(c).unwrap(), None);
+        set_dlssnr_dll_url(c, Some("https://example.invalid/x.zip")).unwrap();
+        set_dlssnr_menu_key(c, Some("Ctrl+Y")).unwrap();
+        assert_eq!(dlssnr_menu_key(c).unwrap().as_deref(), Some("Ctrl+Y"));
+        assert!(file_dlssnr_dll_url(c).unwrap().is_some());
+        for bad in ["", "Ctrl+", "End\nX", "a b", "../x"] {
+            assert!(set_dlssnr_menu_key(c, Some(bad)).is_err(), "{bad:?}");
+        }
+        set_dlssnr_menu_key(c, None).unwrap();
+        assert_eq!(dlssnr_menu_key(c).unwrap(), None);
+        assert!(file_dlssnr_dll_url(c).unwrap().is_some());
     }
 
     #[test]

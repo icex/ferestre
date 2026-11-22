@@ -317,6 +317,22 @@ enum NeuralCmd {
             requires = "accept_anticheat_risk"
         )]
         anticheat_shown: Vec<String>,
+        /// The DLL name OptiScaler loads as for this game: dxgi (the
+        /// default), winmm, version, dbghelp, d3d12, wininet or winhttp. A
+        /// game that crashes with OptiScaler as dxgi.dll may run with
+        /// another. Remembered per game, also after turning it off.
+        #[arg(long, value_name = "NAME")]
+        proxy: Option<String>,
+    },
+    /// The key that opens the NR Control menu in every game (upstream: End),
+    /// e.g. Ctrl+Y for a keyboard without End. Applied at each game's next launch.
+    MenuKey {
+        /// A key such as F7 or Ctrl+Y; without one, print the current key.
+        #[arg(value_name = "KEY", conflicts_with = "reset")]
+        key: Option<String>,
+        /// Go back to upstream's End.
+        #[arg(long)]
+        reset: bool,
     },
     /// Take DLSSNR-AMD out of a game and put back the files it replaced.
     Disable {
@@ -510,9 +526,17 @@ fn cmd_neural(cli: &Cli, command: &NeuralCmd) -> Result<ExitCode> {
             model,
             accept_anticheat_risk,
             anticheat_shown,
+            proxy,
         } => {
             let route = parse_route(route.as_deref())?;
             let model = parse_network(model.as_deref())?;
+            if let Some(proxy) = proxy {
+                let (dir, recipes) = recipes_from(cli, &paths)?;
+                let (_, product_id, _) = neural_title(&paths, &dir, &recipes, title)?;
+                let proxy = neural::package::check_proxy(proxy)
+                    .map_err(|e| usage(&format!("--proxy: {e}")))?;
+                neural::state::set_proxy(&ctx.config_dir, &product_id, Some(proxy))?;
+            }
             neural_enable(
                 cli,
                 &paths,
@@ -524,6 +548,23 @@ fn cmd_neural(cli: &Cli, command: &NeuralCmd) -> Result<ExitCode> {
             )
         }
         NeuralCmd::Disable { title } => neural_disable(cli, &paths, &ctx, title),
+        NeuralCmd::MenuKey { key, reset } => {
+            let config = paths.config_dir();
+            if *reset || key.is_some() {
+                ferestre_core::settings::set_dlssnr_menu_key(config, key.as_deref())
+                    .map_err(|e| usage(&format!("{e:#}")))?;
+            }
+            let current = ferestre_core::settings::dlssnr_menu_key(config)?;
+            if cli.json {
+                print_json(&json!({"schema": JSON_SCHEMA, "menu_key": current}));
+            } else {
+                println!(
+                    "{}",
+                    current.as_deref().unwrap_or("End (upstream's default)")
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
@@ -9628,6 +9669,7 @@ fi
                 package: "0.0.9".into(),
                 arch: neural::Arch::X86_64,
                 install_dir: dir.clone(),
+                proxy: None,
             },
         )
         .unwrap();
@@ -9830,9 +9872,11 @@ fi
                         model,
                         accept_anticheat_risk,
                         anticheat_shown,
+                        proxy,
                     },
             } => {
                 assert_eq!(title, "bedrock");
+                assert_eq!(proxy, None);
                 assert_eq!(route.as_deref(), Some("reshade-feeder"));
                 assert_eq!(model.as_deref(), Some("CC_SMALL_FP8"));
                 assert!(accept_anticheat_risk);
@@ -9965,6 +10009,7 @@ fi
                 package: "0.0.9".into(),
                 arch: neural::Arch::X86_64,
                 install_dir: dir.clone(),
+                proxy: None,
             },
         )
         .unwrap();

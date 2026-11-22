@@ -38,6 +38,10 @@ pub struct Entry {
     pub arch: Arch,
     /// The executable's folder the mod went into.
     pub install_dir: PathBuf,
+    /// The DLL name OptiScaler is installed as when not `dxgi`, such as
+    /// `winmm`: what [`proxy`] asked for when it was installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -46,6 +50,11 @@ struct Document {
     titles: BTreeMap<String, Entry>,
     #[serde(default)]
     acknowledged: BTreeMap<String, BTreeSet<String>>,
+    /// The DLL name OptiScaler goes in as, per game, when not `dxgi`: a game
+    /// that crashes with a `dxgi.dll` beside it may load it as `winmm.dll`.
+    /// Kept when neural rendering is turned off, like the acknowledgements.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    proxies: BTreeMap<String, String>,
     /// Whatever a newer build added.
     #[serde(flatten)]
     other: toml::Table,
@@ -115,6 +124,29 @@ pub fn acknowledge(config_dir: &Path, product_id: &str, names: &[&str]) -> Resul
     })
 }
 
+/// The DLL name OptiScaler is to be installed as for a game; `None` is
+/// `dxgi`.
+pub fn proxy(config_dir: &Path, product_id: &str) -> Result<Option<String>> {
+    Ok(read(config_dir)?.proxies.remove(&key(product_id)))
+}
+
+/// Choose the DLL name OptiScaler goes in as (one of
+/// [`super::package::PROXIES`]); `None` or `dxgi` goes back to `dxgi`.
+pub fn set_proxy(config_dir: &Path, product_id: &str, proxy: Option<&str>) -> Result<()> {
+    let proxy = proxy
+        .map(super::package::check_proxy)
+        .transpose()?
+        .filter(|p| *p != "dxgi");
+    update(config_dir, |d| match proxy {
+        Some(p) => {
+            d.proxies.insert(key(product_id), p.to_string());
+        }
+        None => {
+            d.proxies.remove(&key(product_id));
+        }
+    })
+}
+
 /// The entry and any new acknowledgements, in one write: an acknowledgement
 /// is only ever stored together with a successful enable.
 pub fn record(
@@ -152,12 +184,16 @@ pub fn forget(config_dir: &Path, product_id: &str) -> Result<()> {
 pub fn forget_game(config_dir: &Path, product_id: &str) -> Result<()> {
     let k = key(product_id);
     let document = read(config_dir)?;
-    if !document.titles.contains_key(&k) && !document.acknowledged.contains_key(&k) {
+    if !document.titles.contains_key(&k)
+        && !document.acknowledged.contains_key(&k)
+        && !document.proxies.contains_key(&k)
+    {
         return Ok(());
     }
     update(config_dir, |d| {
         d.titles.remove(&k);
         d.acknowledged.remove(&k);
+        d.proxies.remove(&k);
     })
 }
 
@@ -177,6 +213,7 @@ mod tests {
             package: "0.0.9".into(),
             arch: Arch::I686,
             install_dir: PathBuf::from(dir),
+            proxy: None,
         }
     }
 
