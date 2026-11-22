@@ -3012,9 +3012,13 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
             .css_classes(["flat"])
             .build();
         button.update_property(&[gtk::accessible::Property::Label(label)]);
-        let popover = popover.clone();
+        // Weak: the popover owns this button, so a strong reference here
+        // would keep the whole row alive after the page is torn down.
+        let popover = popover.downgrade();
         button.connect_clicked(move |_| {
-            popover.popdown();
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
             run();
         });
         menu.append(&button);
@@ -3037,11 +3041,16 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
         }),
     );
     let store_url = format!("{STORE_PAGE}{}", row.product_id);
-    let anchor = action_row.clone();
+    // Weak for the same reason: the row holds the menu that holds this.
+    let anchor = action_row.downgrade();
     item(
         "web-browser-symbolic",
         "Open Store page",
-        Box::new(move || open_link(&anchor, &store_url)),
+        Box::new(move || {
+            if let Some(anchor) = anchor.upgrade() {
+                open_link(&anchor, &store_url);
+            }
+        }),
     );
     // A shortcut needs something that will launch. A recipe is one; a title on
     // disk is another, because `run` writes a recipe from the package manifest
