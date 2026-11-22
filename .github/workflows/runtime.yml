@@ -2,43 +2,56 @@
 #
 # Builds the patched Proton -- Wine, the from-scratch Xbox GDK runtime
 # (xgameruntime.dll), and everything Proton wraps around them -- and publishes
-# the compatibility tool as one tarball. Measured on a free four-core runner:
-# 2h09m wall clock and 300 MB compressed. That is why it is a separate train
-# from the launcher rather than a step in it.
-#
-# The compiler cache is kept between runs. Proton's build already runs its
-# compilers through ccache inside its container (--enable-ccache mounts
-# $CCACHE_DIR); the job restores that directory before configuring and, on
-# main only, saves it afterwards. GitHub scopes a cache to the ref that saved
-# it, and a tag may read the caches main saved but no other tag's, so main is
-# where it has to be saved: a push to main that changes what goes into the
-# runtime builds it too, unsigned, which keeps the cache warm and finds a
-# broken runtime build before a tag does. A tag restores and saves nothing, and
-# so does a manual run, which may build a Proton ref nobody reviewed.
-# Only one copy is kept (the prune job deletes older ones) because the whole
-# repository shares 10 GB.
+# the compatibility tool as one tarball. On a hosted four-core runner a build
+# takes about two hours cold and 12-15 minutes with a warm compiler cache.
+# That is why it is a separate train from the launcher, and why a release
+# reuses what main already built instead of building it again.
 #
 # Runtime sources are public icex forks, locked in sources.lock.json:
 #   icex/Proton-UWP -> icex/wine -> icex/xgameruntime
 #                  -> icex/vkd3d-proton
 # Recursive submodules resolve the same commits checked by source-pins.py.
 #
-# Two jobs. `build` compiles a third-party tree of millions of lines with a
-# read-only token that is not written to any checkout; `publish` runs only on a
-# tag, after `build` succeeded, and only checks, signs and uploads the tarball
-# it is handed. It is the one job that can write a release and the only one
-# that sees the minisign key: the MINISIGN_SECRET_KEY and MINISIGN_PASSWORD
-# secrets of the `release` GitHub Environment, as in release.yml. Each
-# signature's trusted comment is `file:<name> version:<version>`. The launcher
-# refuses a runtime whose signature does not verify against the public key
-# built into ferestre-core.
+# Jobs, all on GitHub-hosted runners (never the shared self-hosted host, whose
+# runner users also run pull request jobs -- docs/RELEASING.md):
 #
-# A workflow_dispatch run builds the same tarball and attaches it to the run
-# UNSIGNED, and says so; the launcher will not install it. That holds for a
-# manual run started on a tag ref too: signing and publishing ask for a push. See
-# docs/RELEASING.md.
+#   plan     The inputs digest (scripts/runtime-inputs.py): the four runtime
+#            pins and scripts/build-runtime.sh. Then whether a push to main
+#            already built exactly these inputs; if so, nothing is compiled.
+#            A tag waits for a main build of the same inputs that is still
+#            running. Read-only token (contents, actions).
+#   build    Only when nothing can be reused: scripts/build-runtime.sh, with
+#            the compiler cache main saved. Uploads dist.tar.zst and its
+#            manifest. A push to main names the artefact runtime-dist-<digest>
+#            and saves the cache; nothing else does either.
+#   package  Downloads the dist (this run's, or the main run's that `plan`
+#            found), checks the zip against the digest GitHub recorded at
+#            upload and the manifest against the run, then runs every check on
+#            those bytes, writes the capability manifest and makes the .tar.xz.
+#   publish  A tag push only: checks, signs and uploads. The one job that can
+#            write a release and the only one that sees the minisign key (the
+#            `release` environment's MINISIGN_SECRET_KEY and
+#            MINISIGN_PASSWORD), as in release.yml. Each signature's trusted
+#            comment is `file:<name> version:<version>`. The launcher refuses
+#            a runtime whose signature does not verify against the public key
+#            built into ferestre-core.
 #
-# Cutting a runtime release:
+# What may be promoted to a tag (runtime-inputs.py `find`, unit-tested in
+# tests/test_runtime_inputs.py): only the output of a push to main of this
+# workflow, in this repository, whose build job succeeded, at a commit that is
+# an ancestor of the tag, whose own sources hash to the tag's digest, from an
+# unexpired artefact with a recorded digest. A manual run, a pull request, a
+# tag or another workflow never is. So a release ships only what was compiled
+# from main-merged sources with a cache only main saved -- the same basis a tag
+# build has.
+#
+# A workflow_dispatch run builds (or reuses) the same tarball and attaches it
+# to the run UNSIGNED, and says so; the launcher will not install it. That
+# holds for a manual run started on a tag ref too: signing and publishing ask
+# for a push. See docs/RELEASING.md.
+#
+# Cutting a runtime release, after the pins are on main and main's build
+# finished:
 #
 #   git tag -a runtime-11.0.20260907 -m 'what changed' && git push origin runtime-11.0.20260907
 #
@@ -52,13 +65,19 @@ on:
   push:
     tags:
       - 'runtime-*'
-    # Source pins, verification, capability measurement and build instructions.
+    # What the runtime is built from, and what checks and describes it. A
+    # change that leaves the inputs digest alone costs only `plan` and
+    # `package`.
     branches: [main]
     paths:
       - 'sources.lock.json'
       - '.gitmodules'
       - 'scripts/source-pins.py'
+      - 'scripts/build-runtime.sh'
+      - 'scripts/runtime-inputs.py'
       - 'scripts/write-capabilities.sh'
+      - 'scripts/xodus-env.sh'
+      - 'titles/capabilities.toml'
       - 'tests/runtime-display-modes.c'
       - 'tests/check-runtime-modes.sh'
       - '.github/workflows/runtime.yml'
@@ -73,62 +92,46 @@ on:
 permissions:
   contents: read
 
-# A newer push to main makes an older main build pointless; a tag build is a
-# release and always runs to the end.
+# Never cancelled: a main build is what a release promotes and what fills the
+# compiler cache, and a tag is a release. Runs on the same ref queue; GitHub
+# keeps only the newest waiting one.
 concurrency:
   group: runtime-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+  cancel-in-progress: false
 
 jobs:
-  build:
-    # Keep runtime compilation and 32-bit prefix creation on the tested baseline.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, x64, icex-ci]
-    # An hour and a quarter cold, and a runner that dies at the default six
-    # hours mid-link wastes the whole build rather than reporting anything.
+  plan:
+    runs-on: ubuntu-24.04
+    # A tag may wait for main's build of the same inputs.
     timeout-minutes: 330
-    env:
-      # Proton's Makefile mounts this into its container and passes every
-      # CCACHE_* variable through.
-      CCACHE_DIR: ${{ github.workspace }}/.ccache
-      CCACHE_MAXSIZE: 4G
+    permissions:
+      contents: read
+      actions: read
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      proton: ${{ steps.commits.outputs.proton }}
-      wine: ${{ steps.commits.outputs.wine }}
-      xgameruntime: ${{ steps.commits.outputs.xgameruntime }}
+      digest: ${{ steps.digest.outputs.digest }}
+      proton_ref: ${{ steps.ref.outputs.proton }}
+      pinned: ${{ steps.ref.outputs.pinned }}
+      build: ${{ steps.find.outputs.found != 'true' }}
+      source_run: ${{ steps.find.outputs.run_id }}
+      artifact_id: ${{ steps.find.outputs.artifact_id }}
+      artifact_digest: ${{ steps.find.outputs.artifact_digest }}
+      source_sha: ${{ steps.find.outputs.head_sha }}
     steps:
-      # A Proton build tree is ~26 GB and a stock runner has about 25 GB free.
-      # The pre-installed toolchains nothing here uses are worth ~30 GB, so
-      # this is the difference between building and running out of disk two
-      # thirds of the way in -- which presents as a link error, not as a disk
-      # error.
-      - name: Make room
-        if: runner.environment != 'self-hosted'
-        run: |
-          df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-                      /usr/local/share/boost /usr/local/.ghcup \
-                      /usr/share/swift /usr/local/lib/node_modules
-          sudo docker image prune --all --force || true
-          df -h /
-
+      # All of history: `find` recomputes each candidate commit's inputs and
+      # checks it is an ancestor of this one.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          path: ferestre
-          # Every configure script and Makefile in the Proton tree runs in
-          # this job; none of them needs the token, so none of them gets it.
+          fetch-depth: 0
           persist-credentials: false
 
       # A tag can be created on any branch, and a release cut from dev would
-      # publish work that never reached main. Now that there are two branches
-      # this is worth one fetch to be sure of.
+      # publish work that never reached main.
       - name: The tag must be on main
         if: github.event_name == 'push' && github.ref_type == 'tag'
         run: |
           set -euo pipefail
-          git -C "ferestre" fetch --quiet --depth=100 origin main
-          if ! git -C "ferestre" merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
               echo "::error::$GITHUB_REF_NAME is not on main -- merge to main and tag there"
               exit 1
           fi
@@ -145,7 +148,7 @@ jobs:
           set -euo pipefail
           # Through the environment, not interpolated: a dispatch input is text
           # somebody typed.
-          PINNED_REF=$(python3 ferestre/scripts/source-pins.py get proton commit)
+          PINNED_REF=$(python3 scripts/source-pins.py get proton commit)
           ref=$PINNED_REF
           if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ -n "$INPUT_REF" ]; then
               if [ "$GITHUB_REF_TYPE" != tag ]; then
@@ -156,66 +159,80 @@ jobs:
               fi
           fi
           echo "proton=$ref" >> "$GITHUB_OUTPUT"
+          if [ "$ref" = "$PINNED_REF" ]; then echo "pinned=true"; else echo "pinned=false"; fi >> "$GITHUB_OUTPUT"
 
-      - name: Clone Proton, Wine and the GDK runtime
+      - name: Inputs digest
+        id: digest
+        run: |
+          set -euo pipefail
+          python3 scripts/runtime-inputs.py digest --json
+          echo "digest=$(python3 scripts/runtime-inputs.py digest)" >> "$GITHUB_OUTPUT"
+
+      # Only for the pinned Proton: another ref always builds. A tag waits up
+      # to five hours for a main build of the same inputs that is running.
+      - name: Find a main build of these inputs
+        id: find
+        if: steps.ref.outputs.pinned == 'true'
         env:
-          PROTON_REF: ${{ steps.ref.outputs.proton }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          WAIT: ${{ github.ref_type == 'tag' && '300' || '0' }}
         run: |
-          set -euo pipefail
-          PROTON_URL=$(python3 ferestre/scripts/source-pins.py get proton repository)
-          git clone --quiet "$PROTON_URL" proton
-          cd proton
-          git checkout --quiet "$PROTON_REF"
-          # Resolve the complete locked source graph without applying local changes.
-          git submodule update --init --recursive --depth 1
-          echo ":: proton   $(git rev-parse --short HEAD)"
-          echo ":: wine     $(git -C wine rev-parse --short HEAD)"
-          echo ":: xgr      $(git -C wine/dlls/xgameruntime rev-parse --short HEAD)"
+          python3 scripts/runtime-inputs.py find --digest "$DIGEST" --tag-sha "$GITHUB_SHA" \
+              --repo "$REPO" --wait-minutes "$WAIT"
 
-      # For the release notes, which the publish job writes without a Proton
-      # tree of its own.
-      - name: Record the commits
-        id: commits
+  build:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    # The same image the runtime has always been built and tested on.
+    runs-on: ubuntu-24.04
+    # Two hours cold on a hosted runner; a runner that dies at the default six
+    # hours mid-link wastes the whole build rather than reporting anything.
+    timeout-minutes: 300
+    env:
+      # The same absolute path on every hosted runner, which actions/cache
+      # needs to find a cache at all and ccache needs to hit: Proton's
+      # Makefile mounts this into its container and passes every CCACHE_*
+      # variable through.
+      CCACHE_DIR: /home/runner/.ccache
+      CCACHE_MAXSIZE: 5G
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      # A Proton build tree is ~26 GB and a stock runner has about 25 GB free.
+      # The pre-installed toolchains nothing here uses are worth ~30 GB, so
+      # this is the difference between building and running out of disk two
+      # thirds of the way in -- which presents as a link error, not as a disk
+      # error.
+      - name: Make room
         run: |
-          set -euo pipefail
-          {
-              echo "proton=$(git -C proton rev-parse HEAD)"
-              echo "wine=$(git -C proton/wine rev-parse HEAD)"
-              echo "xgameruntime=$(git -C proton/wine/dlls/xgameruntime rev-parse HEAD)"
-          } >> "$GITHUB_OUTPUT"
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/share/boost /usr/local/.ghcup \
+                      /usr/share/swift /usr/local/lib/node_modules
+          sudo docker image prune --all --force || true
+          df -h /
 
-      # Refuse a source graph that differs from the lock before compilation.
-      #
-      # Note for anyone reading a failure further down: Wine's configure turns
-      # on -Werror when it finds a .git, so this clone compiles more strictly
-      # than the local build tree does (which works from a copy with no .git).
-      # scripts/check-werror.sh reproduces that locally in about a minute --
-      # run it before pushing a change that touches C.
-      - name: Verify the source lock
-        env:
-          PROTON_REF: ${{ steps.ref.outputs.proton }}
-        run: |
-          set -euo pipefail
-          pinned=$(python3 ferestre/scripts/source-pins.py get proton commit)
-          if [ "$PROTON_REF" = "$pinned" ]; then
-              python3 ferestre/scripts/source-pins.py verify proton --directory proton
-              python3 ferestre/scripts/source-pins.py verify wine --directory proton/wine
-              python3 ferestre/scripts/source-pins.py verify xgameruntime --directory proton/wine/dlls/xgameruntime
-              python3 ferestre/scripts/source-pins.py verify vkd3d-proton --directory proton/vkd3d-proton
-          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: ferestre
+          # Every configure script and Makefile in the Proton tree runs in
+          # this job; none of them needs the token, so none of them gets it.
+          persist-credentials: false
 
-      # Keyed on what the objects are compiled from. An exact match is only
-      # likely for a rebuild; the fallbacks are what make the usual case, a
-      # source commit that moved since the last build, mostly hits.
+      # Keyed on the inputs digest. An exact match is only likely for a
+      # rebuild; the fallback is what makes the usual case, a pin that moved
+      # since the last build, mostly hits.
       - name: Restore the compiler cache
         id: ccache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ${{ env.CCACHE_DIR }}
-          key: runtime-ccache-v2-${{ steps.commits.outputs.proton }}
+          path: /home/runner/.ccache
+          key: runtime-ccache-v3-${{ needs.plan.outputs.digest }}
           restore-keys: |
-            runtime-ccache-v2-
-            runtime-ccache-v1-
+            runtime-ccache-v3-
 
       # Only to read the statistics; the compilers run inside Proton's
       # container, with its own ccache.
@@ -223,24 +240,13 @@ jobs:
         run: |
           mkdir -p "$CCACHE_DIR"
           du -sh "$CCACHE_DIR"
-          if [ "$RUNNER_ENVIRONMENT" != self-hosted ]; then
-            sudo apt-get install -y -qq ccache >/dev/null || echo "::notice::no host ccache; no statistics"
-          fi
+          sudo apt-get install -y -qq ccache >/dev/null || echo "::notice::no host ccache; no statistics"
           ccache --zero-stats || true
 
-      - name: Configure
-        run: |
-          set -euo pipefail
-          mkdir -p proton/build
-          cd proton/build
-          ../configure.sh --enable-ccache --build-name=ferestre
-
       - name: Build
-        run: |
-          set -euo pipefail
-          cd proton/build
-          make -j"$(nproc)" dist
-          df -h /
+        env:
+          PROTON_REF: ${{ needs.plan.outputs.proton_ref }}
+        run: ferestre/scripts/build-runtime.sh "$GITHUB_WORKSPACE/work" "$PROTON_REF"
 
       - name: Compiler cache statistics, after
         if: always()
@@ -254,14 +260,125 @@ jobs:
       # Only from a push to main, which always builds the pinned Proton. A
       # manual run may build any Proton ref somebody typed, and that tree's
       # build scripts can write anything into the cache directory; a release
-      # restores this cache before it is signed, so only reviewed sources may
-      # ever fill it. Manual runs restore it and save nothing.
+      # build restores this cache, so only reviewed sources may ever fill it.
+      # Tags and manual runs restore it and save nothing.
       - name: Save the compiler cache
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.ccache.outputs.cache-hit != 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ${{ env.CCACHE_DIR }}
+          path: /home/runner/.ccache
           key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      # What was built, from what, by which run: package checks every field
+      # before it uses the dist, and a tag only promotes a main build's.
+      - name: Manifest
+        env:
+          DIGEST: ${{ needs.plan.outputs.digest }}
+        run: |
+          set -euo pipefail
+          python3 ferestre/scripts/runtime-inputs.py manifest --out work/out/manifest.json \
+              --digest "$DIGEST" --sdk "$(cat work/out/sdk-image)" --dist work/out/dist.tar.zst \
+              --built-proton "$(git -C work/proton rev-parse HEAD)"
+
+      # Only a push to main makes an artefact a tag may promote; any other
+      # run's is named after the run and kept a week.
+      - name: Upload the dist
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && format('runtime-dist-{0}', needs.plan.outputs.digest) || format('runtime-dist-run-{0}', github.run_id) }}
+          path: |
+            work/out/dist.tar.zst
+            work/out/manifest.json
+          if-no-files-found: error
+          # Already zstd.
+          compression-level: 0
+          retention-days: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 30 || 7 }}
+
+  # Every check on the exact bytes that ship, whether this run built them or a
+  # main run did, then the tarball.
+  package:
+    needs: [plan, build]
+    if: always() && needs.plan.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      proton: ${{ steps.dist.outputs.proton }}
+      wine: ${{ steps.dist.outputs.wine }}
+      xgameruntime: ${{ steps.dist.outputs.xgameruntime }}
+      source_run: ${{ steps.dist.outputs.run_id }}
+      digest: ${{ needs.plan.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: ferestre
+          persist-credentials: false
+
+      # Downloaded through the API rather than download-artifact, so that the
+      # zip is checked against the SHA-256 GitHub recorded when it was
+      # uploaded, and the manifest against the run that uploaded it.
+      - name: Fetch and check the dist
+        id: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BUILT_HERE: ${{ needs.plan.outputs.build }}
+          DIGEST: ${{ needs.plan.outputs.digest }}
+          PINNED: ${{ needs.plan.outputs.pinned }}
+          THIS_ARTIFACT: ${{ needs.build.outputs.artifact_id }}
+          THIS_ARTIFACT_DIGEST: ${{ needs.build.outputs.artifact_digest }}
+          SOURCE_RUN: ${{ needs.plan.outputs.source_run }}
+          SOURCE_ARTIFACT: ${{ needs.plan.outputs.artifact_id }}
+          SOURCE_ARTIFACT_DIGEST: ${{ needs.plan.outputs.artifact_digest }}
+          SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$BUILT_HERE" = true ]; then
+              run=$GITHUB_RUN_ID artifact=$THIS_ARTIFACT api_digest=sha256:${THIS_ARTIFACT_DIGEST#sha256:}
+              sha=$GITHUB_SHA ref=$GITHUB_REF
+          else
+              run=$SOURCE_RUN artifact=$SOURCE_ARTIFACT api_digest=$SOURCE_ARTIFACT_DIGEST
+              sha=$SOURCE_SHA ref=refs/heads/main
+              echo "::notice::promoting the dist main built in run $run at $sha (artefact $artifact)"
+          fi
+          # GitHub's own record, not the value passed between jobs.
+          recorded=$(gh api "repos/$REPO/actions/artifacts/$artifact" --jq .digest)
+          if [ "$recorded" != "$api_digest" ]; then
+              echo "::error::artefact $artifact is recorded as $recorded, expected $api_digest"
+              exit 1
+          fi
+          mkdir -p dl
+          gh api "repos/$REPO/actions/artifacts/$artifact/zip" > dl/dist.zip
+          unzip -q dl/dist.zip -d dl
+          expect=()
+          if [ "$PINNED" = true ]; then
+              expect=(--expect-proton "$(python3 ferestre/scripts/source-pins.py get proton commit)")
+          fi
+          python3 ferestre/scripts/runtime-inputs.py check --zip dl/dist.zip --api-digest "$recorded" \
+              --manifest dl/manifest.json --dist dl/dist.tar.zst --digest "$DIGEST" \
+              --run-id "$run" --head-sha "$sha" --ref "$ref" --repo "$REPO" "${expect[@]}"
+          {
+              echo "run_id=$run"
+              python3 - dl/manifest.json <<'PY'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          c = m['inputs']['components']
+          print(f"proton={m['built_proton']}")
+          print(f"wine={c['wine']['commit']}")
+          print(f"xgameruntime={c['xgameruntime']['commit']}")
+          print(f"sdk={m['sdk_image']}")
+          PY
+          } >> "$GITHUB_OUTPUT"
+          mkdir -p tree
+          zstd -dc dl/dist.tar.zst | tar -x -C tree
+          {
+              echo "### Runtime dist"
+              echo "Built by run $run at \`$sha\`, artefact $artifact (\`$recorded\`), inputs digest \`$DIGEST\`."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # The `proton` script Valve ships closes inherited descriptors before
       # exec, and the client hands Wine a memfd holding the decrypted
@@ -271,15 +388,12 @@ jobs:
       # The pinned fork already contains inherited-descriptor support; verify
       # that the build copied that script into the distribution.
       - name: Keep inherited descriptors
-        run: |
-          set -euo pipefail
-          cd proton/build/dist
-          grep -q close_fds=False proton
+        run: grep -q close_fds=False tree/dist/proton
 
       - name: Verify native Wayland drivers and prefix templates
         run: |
           set -euo pipefail
-          cd proton/build/dist/files
+          cd tree/dist/files
           for arch in x86_64 i386; do
               test -s "lib/wine/$arch-unix/winewayland.so"
               test -s "lib/wine/$arch-windows/winewayland.drv"
@@ -290,21 +404,18 @@ jobs:
           test -s share/default_pfx/drive_c/windows/syswow64/winewayland.drv
 
       - name: Verify practical resolutions through Wine's display API
+        env:
+          SDK: ${{ steps.dist.outputs.sdk }}
         run: |
           set -euo pipefail
-          sdk=$(sed -n 's/^STEAMRT_IMAGE[[:space:]]*:=[[:space:]]*//p' proton/build/Makefile | tail -n 1)
-          test -n "$sdk"
-          container_user="$(id -u):$(id -g)"
-          if docker info --format '{{json .SecurityOptions}}' | grep -q rootless; then
-            container_user=0:0
-          fi
-          docker run --rm --network none --user "$container_user" \
-              -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" "$sdk" \
+          test -n "$SDK"
+          docker run --rm --network none --user "$(id -u):$(id -g)" \
+              -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" "$SDK" \
               bash "$GITHUB_WORKSPACE/ferestre/tests/check-runtime-modes.sh" \
-              "$GITHUB_WORKSPACE/proton/build/dist"
+              "$GITHUB_WORKSPACE/tree/dist"
 
-      # What the runtime can do, measured against the tree that was just built
-      # rather than asserted from the source manifest. The launcher reads this to
+      # What the runtime can do, measured against the tree that ships rather
+      # than asserted from the source manifest. The launcher reads this to
       # decide whether a title can run at all; a runtime that ships without it
       # makes the launcher fall back to probing, which finds a third of the
       # capabilities and tells the user every title "may not start".
@@ -312,19 +423,20 @@ jobs:
         run: |
           set -euo pipefail
           cd ferestre
-          XODUS_PROTON_DIR="$GITHUB_WORKSPACE/proton/build/dist" \
-              scripts/write-capabilities.sh
-          cat "$GITHUB_WORKSPACE/proton/build/dist/files/share/ferestre/capabilities.json"
+          XODUS_PROTON_DIR="$GITHUB_WORKSPACE/tree/dist" scripts/write-capabilities.sh
+          cat "$GITHUB_WORKSPACE/tree/dist/files/share/ferestre/capabilities.json"
           python3 -c 'import json, sys; assert "graphics.native-wayland" in json.load(open(sys.argv[1]))["capabilities"], "built runtime lacks native Wayland capability"' \
-              "$GITHUB_WORKSPACE/proton/build/dist/files/share/ferestre/capabilities.json"
+              "$GITHUB_WORKSPACE/tree/dist/files/share/ferestre/capabilities.json"
 
       - name: Version
         id: version
+        env:
+          PROTON: ${{ steps.dist.outputs.proton }}
         run: |
           if [ "${GITHUB_REF_TYPE}" = tag ]; then
               version=${GITHUB_REF_NAME#runtime-}
           else
-              version="0.0.$(date -u +%Y%m%d)+$(git -C proton rev-parse --short HEAD)"
+              version="0.0.$(date -u +%Y%m%d)+${PROTON:0:7}"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo ":: runtime $version"
@@ -332,17 +444,17 @@ jobs:
       # xz rather than zstd, because ferestre-runtime-bin's PKGBUILD names a
       # .tar.xz and makepkg unpacks by extension. The directory inside is
       # ferestre-runtime-<version>, which that PKGBUILD checks for by name and
-      # complains about clearly when it is missing.
+      # complains about clearly when it is missing. Multi-threaded xz: one
+      # thread took eight and a half minutes.
       - name: Package
-        id: package
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          mkdir -p out stage
-          cp -a proton/build/dist "stage/ferestre-runtime-$VERSION"
-          tar --sort=name --owner=0 --group=0 --numeric-owner \
-              -C stage -cJf "out/ferestre-runtime-$VERSION.tar.xz" \
+          mkdir -p out
+          mv tree/dist "tree/ferestre-runtime-$VERSION"
+          XZ_OPT=-T0 tar --sort=name --owner=0 --group=0 --numeric-owner \
+              -C tree -cJf "out/ferestre-runtime-$VERSION.tar.xz" \
               "ferestre-runtime-$VERSION"
           cd out
           sha256sum ./*.tar.xz > SHA256SUMS
@@ -363,8 +475,9 @@ jobs:
           name: ferestre-runtime-${{ steps.version.outputs.version }}
           path: out/*
           if-no-files-found: error
-          # A 300 MB artefact on every manual run adds up; a tag's copy lives
-          # on the release instead.
+          compression-level: 0
+          # A 300 MB artefact on every run adds up; a tag's copy lives on the
+          # release instead.
           retention-days: 14
 
   # One compiler cache is enough, and two would crowd out everything else
@@ -372,8 +485,8 @@ jobs:
   # token can delete caches and nothing else, and it runs no build.
   prune-ccache:
     needs: build
-    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, linux, x64, icex-ci]
+    if: always() && needs.build.result != 'skipped' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
     permissions:
       actions: write
     steps:
@@ -391,9 +504,9 @@ jobs:
           done
 
   publish:
-    needs: build
+    needs: [plan, package]
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    runs-on: [self-hosted, linux, x64, icex-ci]
+    runs-on: ubuntu-24.04
     # Where the signing secrets live; see release.yml and docs/RELEASING.md.
     environment: release
     permissions:
@@ -410,11 +523,10 @@ jobs:
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: ferestre-runtime-${{ needs.build.outputs.version }}
+          name: ferestre-runtime-${{ needs.package.outputs.version }}
           path: out
 
       - name: minisign
-        if: runner.environment != 'self-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y minisign
@@ -429,7 +541,7 @@ jobs:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
           FERESTRE_EXPECT_PUBKEY_IN: crates/ferestre-core/src/signing.rs
-          VERSION: ${{ needs.build.outputs.version }}
+          VERSION: ${{ needs.package.outputs.version }}
         run: |
           set -euo pipefail
           tag_version=${GITHUB_REF_NAME#runtime-}
@@ -444,10 +556,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          VERSION: ${{ needs.build.outputs.version }}
-          PROTON_COMMIT: ${{ needs.build.outputs.proton }}
-          WINE_COMMIT: ${{ needs.build.outputs.wine }}
-          XGR_COMMIT: ${{ needs.build.outputs.xgameruntime }}
+          VERSION: ${{ needs.package.outputs.version }}
+          PROTON_COMMIT: ${{ needs.package.outputs.proton }}
+          WINE_COMMIT: ${{ needs.package.outputs.wine }}
+          XGR_COMMIT: ${{ needs.package.outputs.xgameruntime }}
+          SOURCE_RUN: ${{ needs.package.outputs.source_run }}
+          DIGEST: ${{ needs.package.outputs.digest }}
         run: |
           set -euo pipefail
           gh release create "$GITHUB_REF_NAME" out/* \
@@ -472,4 +586,6 @@ jobs:
           with the fork commits in \`sources.lock.json\` at this tag. \`capabilities.json\`
           inside the tarball says what this build actually provides, measured
           against the built tree rather than taken from source history.
+
+          Compiled by run $SOURCE_RUN of this workflow (inputs digest \`$DIGEST\`).
           "
