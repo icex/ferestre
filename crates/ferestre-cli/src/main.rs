@@ -43,13 +43,16 @@ use ferestre_core::launch;
 use ferestre_core::library;
 use ferestre_core::paths::Paths;
 use ferestre_core::recipe::Recipe;
+use ferestre_core::running;
 use ferestre_core::runtime::{self, Assessment, InstalledRuntime, Registry};
 use ferestre_core::winrt;
 use serde::Serialize;
 use serde_json::{json, Value};
 
 /// `2` is also what clap exits with on a bad command line, so a usage failure
-/// looks the same whether clap or we caught it.
+/// looks the same whether clap or we caught it. `3` is a refused runtime
+/// downgrade (`runtime::EXIT_DOWNGRADE_REFUSED`) and `4` a title already
+/// running in its prefix (`running::EXIT_ALREADY_RUNNING`).
 const EXIT_FAILURE: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 
@@ -257,6 +260,8 @@ fn print_error(err: &anyhow::Error) {
 fn exit_code_for(err: &anyhow::Error) -> u8 {
     if err.downcast_ref::<UsageError>().is_some() {
         EXIT_USAGE
+    } else if err.downcast_ref::<AlreadyRunning>().is_some() {
+        running::EXIT_ALREADY_RUNNING
     } else {
         EXIT_FAILURE
     }
@@ -800,6 +805,20 @@ fn prepare_launch(
             eprintln!(":: Store: {}; Player: {}", store.label, player.label);
         } else {
             eprintln!(":: using the selected Store and Player accounts");
+        }
+    }
+    // The prefix is final now: the Player's, when roles chose one. A second
+    // copy in a prefix where the title still runs exits at once with a code
+    // that says nothing about why (Hogwarts Legacy: 5). The window asks what
+    // to do about the first one; `run` is mostly started by a Steam shortcut,
+    // with nobody to ask, so it refuses and says so. `--force` is about
+    // missing runtime capabilities and does not get past this: there is no
+    // way a second copy works, and closing the first is the person's call.
+    // Not for a dry run, which starts nothing.
+    if !request.dry_run {
+        let images = running::running_in(&prefix.join("pfx"));
+        if !images.is_empty() {
+            return Err(AlreadyRunning(running::refusal(&recipe.title.name, &images)).into());
         }
     }
     let options = launch::Options {
@@ -5000,6 +5019,19 @@ impl std::fmt::Display for UsageError {
 
 impl std::error::Error for UsageError {}
 
+/// `run` refused because the title is already running in its prefix. Exits
+/// with [`running::EXIT_ALREADY_RUNNING`].
+#[derive(Debug)]
+struct AlreadyRunning(String);
+
+impl std::fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for AlreadyRunning {}
+
 fn print_json(value: &Value) {
     // Pretty, because a person reads this as often as a program does and jq is
     // not always installed.
@@ -5810,6 +5842,28 @@ summary = "Runs."
     fn a_usage_error_from_us_exits_2_and_everything_else_exits_1() {
         assert_eq!(exit_code_for(&usage("wrong")), EXIT_USAGE);
         assert_eq!(exit_code_for(&anyhow!("the disk is full")), EXIT_FAILURE);
+    }
+
+    /// A title already running in its prefix has a code of its own, so a
+    /// Steam shortcut or a script can tell it from a failure; every code is
+    /// distinct.
+    #[test]
+    fn a_title_already_running_exits_with_its_own_code() {
+        let refused: anyhow::Error =
+            AlreadyRunning(running::refusal("Game", &["Game.exe".into()])).into();
+        assert_eq!(exit_code_for(&refused), running::EXIT_ALREADY_RUNNING);
+        let codes = [
+            EXIT_FAILURE,
+            EXIT_USAGE,
+            runtime::EXIT_DOWNGRADE_REFUSED,
+            running::EXIT_ALREADY_RUNNING,
+        ];
+        for (i, code) in codes.iter().enumerate() {
+            assert!(
+                !codes[i + 1..].contains(code),
+                "exit code {code} is used twice"
+            );
+        }
     }
 
     // -- the capability gate ------------------------------------------------

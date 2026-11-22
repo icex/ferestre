@@ -3882,21 +3882,9 @@ fn confirm_already_running(
         let name = name.clone();
         let (wineserver, prefix) = (wineserver.clone(), prefix.clone());
         glib::spawn_future_local(async move {
-            let closed = gio::spawn_blocking(move || {
-                stop::ask_to_close(&wineserver, &prefix, None);
-                let started = std::time::Instant::now();
-                while started.elapsed() < stop::CLOSE_WAIT {
-                    if stop::running_in(&prefix).is_empty() {
-                        return true;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
-                stop::kill_prefix(&wineserver, &prefix);
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                stop::running_in(&prefix).is_empty()
-            })
-            .await
-            .unwrap_or(false);
+            let closed = gio::spawn_blocking(move || stop::close_running(&wineserver, &prefix))
+                .await
+                .unwrap_or(false);
             if !closed {
                 ui.toasts.add_toast(toast(format!(
                     "{name} is still running and could not be closed"
