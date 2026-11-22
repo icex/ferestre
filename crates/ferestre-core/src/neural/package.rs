@@ -147,6 +147,16 @@ pub fn installed(root: &Path, package: &Package) -> Option<PathBuf> {
     (stamp.trim() == package.sha256 && complete(&dir)).then_some(dir)
 }
 
+/// The unpacked directory of a package version, whichever asset it came
+/// from, if it is complete: what an existing install is removed with.
+pub fn unpacked(root: &Path, version: &str, arch: Arch) -> Option<PathBuf> {
+    if !plain_version(version) {
+        return None;
+    }
+    let dir = root.join("packages").join(format!("{version}-{arch}"));
+    complete(&dir).then_some(dir)
+}
+
 /// The package's directory, downloading and unpacking it first if needed.
 pub fn ensure(root: &Path, package: &Package) -> Result<PathBuf> {
     if !plain_version(&package.version) {

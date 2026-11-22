@@ -5,10 +5,13 @@
 //! feature shares. The NVIDIA model is never part of a package; it comes from
 //! the person's own `nvngx_dlssnr.dll`, accepted only by the hashes below.
 
+use crate::anticheat::Detection;
+use crate::paths::Paths;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub mod apply;
 pub mod detect;
 pub mod dll;
 pub mod hardware;
@@ -235,6 +238,87 @@ impl Expect {
 /// Where neural rendering keeps its packages, downloads and models.
 pub fn root(state_dir: &Path) -> PathBuf {
     state_dir.join("dlssnr")
+}
+
+/// What enabling, disabling and the launch check work with. Tests build one
+/// with a fake package and their own model hashes.
+pub struct Context {
+    /// [`root`] of the state directory.
+    pub root: PathBuf,
+    /// Where `neural-rendering.toml` is.
+    pub config_dir: PathBuf,
+    /// The package to install for an architecture.
+    pub packages: Box<dyn Fn(Arch) -> Result<package::Package>>,
+    pub expect: Expect,
+}
+
+impl Context {
+    pub fn from_paths(paths: &Paths) -> Self {
+        let owned = paths.clone();
+        Context {
+            root: root(paths.state_dir()),
+            config_dir: paths.config_dir().to_path_buf(),
+            packages: Box::new(move |arch| package::current(&owned, arch)),
+            expect: Expect::pinned(),
+        }
+    }
+}
+
+/// Everything about neural rendering for one game, read without changing
+/// anything.
+#[derive(Debug, Clone)]
+pub struct Overview {
+    pub entry: Option<state::Entry>,
+    pub detected: detect::Detected,
+    pub anticheat: Vec<Detection>,
+    pub gate: apply::Gate,
+    /// For an enabled entry: whether its install is whole.
+    pub installed: Option<Result<(), String>>,
+    pub models: Vec<ModelFile>,
+    /// Whether the x86_64 package to use is unpacked.
+    pub package_ready: bool,
+    pub hardware: Vec<String>,
+    pub dll_url_configured: bool,
+}
+
+pub fn overview(
+    ctx: &Context,
+    paths: &Paths,
+    key: &str,
+    game_dir: &Path,
+    executable: &str,
+) -> Overview {
+    let entry = state::get(&ctx.config_dir, key).ok().flatten();
+    let detected = detect::detect(game_dir, Path::new(&executable.replace('\\', "/")));
+    let anticheat = crate::anticheat::detect(game_dir, executable);
+    let acknowledged = state::acknowledged(&ctx.config_dir, key).unwrap_or_default();
+    let gate = apply::gate(&anticheat, &acknowledged);
+    let installed = entry.as_ref().filter(|e| e.enabled).map(|e| {
+        match package::unpacked(&ctx.root, &e.package, e.arch) {
+            Some(dir) => apply::verify(&dir, &e.install_dir, e.route),
+            None => Err(format!(
+                "the DLSSNR-AMD {} {} package is not unpacked; run: ferestre neural setup",
+                e.package, e.arch
+            )),
+        }
+    });
+    let package_ready = (ctx.packages)(Arch::X86_64)
+        .ok()
+        .is_some_and(|p| package::installed(&ctx.root, &p).is_some());
+    Overview {
+        entry,
+        detected,
+        anticheat,
+        gate,
+        installed,
+        models: models::cached(&ctx.root, &ctx.expect),
+        package_ready,
+        hardware: hardware::check(),
+        dll_url_configured: crate::settings::dlssnr_dll_url(paths)
+            .ok()
+            .flatten()
+            .is_some(),
+    }
 }
 
 #[cfg(test)]
