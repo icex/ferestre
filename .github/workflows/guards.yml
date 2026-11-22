@@ -16,6 +16,13 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request, or to a branch other than main and dev,
+# cancels the older run. Main, dev, tags and manual runs each get a group of
+# their own (the run id) and are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref_type == 'branch' && github.ref != 'refs/heads/main' && github.ref != 'refs/heads/dev')) && format('{0}-{1}', github.event_name, github.ref) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref_type == 'branch' && github.ref != 'refs/heads/main' && github.ref != 'refs/heads/dev') }}
+
 jobs:
   no-nvidia-urls:
     runs-on: ubuntu-24.04

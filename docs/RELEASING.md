@@ -15,13 +15,18 @@ runtime that is unsigned or signed by any other key.
 
 ## How signing is wired
 
-- Each workflow has two jobs. `build` compiles everything with a read-only
-  token and never sees the key. `publish` runs only for a tag push
-  (`github.event_name == 'push' && github.ref_type == 'tag'`), after `build`
-  succeeded. It is the only job with `contents: write` and the only job that
-  names the `release` environment, so it is the only job that can read the
-  signing secrets. It runs no build and no third-party action apart from
-  checkout and download-artifact. All actions are pinned to a commit.
+- Every job that compiles or packages runs with a read-only token and never
+  sees the key: `build` in the DLSSNR workflow; `test`, `launcher`, `client`
+  and `build` in the launcher's; `plan`, `build` and `package` in the
+  runtime's. `publish` runs only for a tag push
+  (`github.event_name == 'push' && github.ref_type == 'tag'`), after the job
+  that made the artefacts succeeded (`build`, or the runtime's `package`). It
+  is the only job with `contents: write` and the only job that names the
+  `release` environment, so it is the only job that can read the signing
+  secrets. It runs no build and no third-party action apart from checkout and
+  download-artifact. All actions are pinned to a commit.
+- All of these jobs run on GitHub-hosted `ubuntu-24.04` runners, never on the
+  self-hosted host (see "Runner policy").
 - The `Sign` step has the same condition, and
   `packaging/sign-release.sh` checks that every file matches `SHA256SUMS`
   before it signs anything.
@@ -123,20 +128,50 @@ Rulesets**: a tag ruleset for `v*`, `runtime-*` and `dlssnr-*` that limits who c
 move or delete them. The environment controls who can use the key; the
 ruleset controls who can start a release at all.
 
-## Runner fallback
+**Checked on 2026-11-22, the repository does not yet fully match this
+section.** The `release` environment has the three tag rules but no required
+reviewer, so every `publish` runs without an approval. There is no tag
+ruleset, and `main` has no branch protection. The "tag must be on main" check
+lives in the tagged commit's own workflow, so it holds only for tags of
+commits whose workflow has it; a ruleset that limits who may create release
+tags is what makes it binding. Add the reviewer and the ruleset.
 
-Application CI, compatibility checks and application releases default to the
-isolated self-hosted runners. If that infrastructure is unavailable, set the
-repository Actions variable `FERESTRE_RUNNER_LABELS` to the JSON array
-`["ubuntu-24.04"]` before starting the checks. Delete the variable afterward
-to restore the self-hosted default. Hosted runners install the existing system
-dependencies; self-hosted runners retain their administrator-managed setup.
-The runtime workflow keeps its separate runner policy.
+## Runner policy
+
+The self-hosted runners share one host with four build slots, and every
+runner user there also runs same-repository pull request jobs, which can write
+anything in that user's home: `~/.cargo/bin`, `~/.rustup`, the rootless
+Docker image store. A job that signs, or builds what is signed, must not
+start from that state. So:
+
+- **Hosted `ubuntu-24.04`:** every job in `release.yml`, `runtime.yml` and
+  `dlssnr.yml`, the compatibility matrix and guards, and the Rust workflow's
+  `preflight`, `msrv`, `sources`, `gui-build` and `gui` jobs.
+  `tests/test_workflows.py` checks that no other job may run self-hosted.
+- **Self-hosted (`FERESTRE_RUNNER_LABELS`):** only the Rust workflow's `test`
+  job, in a build directory that outlives the job (see "Build caches"). It
+  produces test results and nothing else. To run it hosted as well, set the
+  repository Actions variable `FERESTRE_RUNNER_LABELS` to the JSON array
+  `["ubuntu-24.04"]`; delete it to go back.
+
+### Merge gating
+
+The Rust workflow ends in one job, `ci-ok`, that needs every other job and
+fails unless `preflight` and `test` succeeded and every other job succeeded
+or was skipped by the path filters. A skipped job shows as passing, and the
+GUI checks are named per shard, so `ci-ok` is the one check to require in a
+branch ruleset for `main` (Settings > Rules > Rulesets > New branch ruleset >
+Require status checks to pass > `ci-ok`). A pull request from a fork runs
+nothing (`preflight` refuses it) and so fails `ci-ok`; push its branch here to
+test it.
 
 ## Cutting a release
 
-1. Merge to `main`. Both workflows refuse a tag that is not reachable from
-   `main`.
+1. Merge to `main`. Every release workflow refuses a tag that is not
+   reachable from `main`. For a runtime release, wait for the runtime build
+   that the merge started on `main` to finish (Actions, *Runtime*): the tag
+   then promotes its output and takes minutes (see "Runtime promotion"). A
+   tag pushed while that build is still running waits for it.
 2. For the launcher, check that `docs/RELEASE-<version>.md` exists. It is the
    release text, and the build stops early without it.
 3. Tag and push:
@@ -163,8 +198,9 @@ branch, and published under its own tag so the launcher can pin it:
    commit hash, version); `python3 tests/test_source_pins.py` checks the
    shape. Optionally build it locally first with
    `scripts/build-dlssnr.sh <empty dir>` (Docker or Podman, network, tens of
-   minutes). Note that any change to `sources.lock.json` on `main` also
-   starts a runtime build.
+   minutes). A change to `sources.lock.json` on `main` also starts the
+   runtime workflow, but when the runtime pins did not move it only checks
+   and repackages the dist main already built (a few minutes).
 2. Merge to `main`, then tag `dlssnr-<version>` with exactly the pinned
    version; the build refuses a tag that disagrees with the lock:
 
@@ -186,34 +222,119 @@ holding a model or a weight file derived from one, and
 guard runs in `.github/workflows/guards.yml` on every push and pull request,
 with no path filter, so a docs-only change is checked too.
 
+### Runtime promotion
+
+A runtime tag normally ships the dist a push to `main` compiled, instead of
+compiling it again. `scripts/runtime-inputs.py` makes that decision, and
+`tests/test_runtime_inputs.py` tests every rule against API responses
+recorded from this repository.
+
+- **What the runtime is built from.** The *inputs digest* is a SHA-256 over a
+  canonical JSON of the repository and commit of Proton, Wine, xgameruntime
+  and vkd3d-proton from `sources.lock.json`, and the git blob id of
+  `scripts/build-runtime.sh`, which holds every clone, configure and make
+  step. Proton's commit pins its SDK image and every other submodule. A lock
+  edit that leaves those four pins alone (a dlssnr or client pin) and a change
+  to the workflow file keep the digest, so they do not compile anything.
+- **`plan`** computes the digest and looks for a run that may be promoted. It
+  accepts only a run of `.github/workflows/runtime.yml` in this repository
+  that was a `push` to `main` (never a pull request, tag, manual run or other
+  workflow), whose `build` job succeeded, at a commit that is an ancestor of
+  the tag, whose own `sources.lock.json` and build script hash to the same
+  digest (recomputed from that commit, not read from the artefact's name),
+  with exactly one unexpired artefact named `runtime-dist-<digest>` that has a
+  recorded SHA-256. The newest such run wins. If none has finished but one is
+  still running with the same digest, a tag waits for it (up to five hours).
+  Otherwise the tag builds the runtime itself, from main's compiler cache.
+- **`build`** (only when nothing was found) runs `scripts/build-runtime.sh` and
+  uploads `dist.tar.zst` with a `manifest.json`: the digest and its inputs,
+  the Proton commit actually built, the SDK image, and the run id, commit,
+  ref, event and repository it was built by. Only a push to `main` names the
+  artefact `runtime-dist-<digest>` (kept 30 days); any other run names it
+  `runtime-dist-run-<run id>`, which `plan` never accepts.
+- **`package`** downloads the zip through the API, checks its SHA-256
+  against the digest GitHub recorded at upload (read from the API, not passed
+  between jobs), and checks every manifest field against the run it came from
+  and the pinned Proton commit. Only then does it unpack, run the checks on
+  those exact bytes (inherited descriptors, Wayland drivers, display modes in
+  the SDK image), write the capability manifest from the tag's
+  `titles/capabilities.toml`, and make the `.tar.xz` with `SHA256SUMS`.
+- **`publish`** signs that, as before. The release notes name the run that
+  compiled the dist and the inputs digest. Its condition checks that `plan`
+  and `package` succeeded itself (`always() && ...`): on the promotion path
+  `build` is skipped, and GitHub skips every job downstream of a skipped one
+  unless its condition carries a status function, which would end the tag run
+  green with nothing published.
+- **For a tag, `plan` also runs `scripts/check-sources.sh --remote`** against
+  the tag's own `sources.lock.json`: every fork commit public, its modified
+  paths and nested gitlinks. A promoted tag compiles nothing, so this is
+  where the full lock check happens for it.
+
+So a promoted dist was compiled from `main`-merged sources, by a `main` push,
+restoring only a cache `main` saved: the same basis a tag build has.
+`main` itself reuses a dist the same way, so a push that only moves the
+dlssnr pin costs `plan` and `package`, a few minutes.
+
 ### Build caches
 
-A cold runtime build takes a little over two hours. To avoid paying that on
-every release, the runtime workflow keeps Proton's compiler cache (ccache)
-between runs:
+A cold runtime build takes about two hours on a hosted runner, and 12-15
+minutes with a warm compiler cache. The runtime workflow keeps Proton's
+compiler cache (ccache) between runs:
 
-- A push to `main` that changes `sources.lock.json`, `.gitmodules`,
-  `scripts/source-pins.py`, `scripts/write-capabilities.sh` or
-  the workflow itself builds the runtime on
-  `main`, unsigned. That build saves the cache, and a newer push cancels an
-  older one still running.
-- Only that automatic `main` build saves the cache. It always builds the
-  pinned Proton commit, from reviewed fork sources. A manual run may build any
-  Proton ref, whose build scripts could write anything into the cache, so it
-  restores the cache and saves nothing. What a signed release restores was
-  therefore compiled only from sources that were merged to `main`.
-- A `runtime-*` tag restores the cache `main` saved and saves nothing. GitHub
-  lets a tag read the caches of the default branch but not another tag's, so
-  merging the runtime changes to `main` before tagging is what makes the
-  release fast. Tagging straight after the merge still works; the tag just
-  finds the cache from the previous `main` build.
+- Only a push to `main` that compiles the runtime saves the cache, under
+  `runtime-ccache-v3-<digest>-<run id>-<attempt>`, also after a failed or
+  timed-out build: the objects that compiled are good, and since the key
+  carries the run, a retry saves its own fuller cache rather than finding the
+  partial one under the same key and saving nothing. A build restores the
+  newest cache of its digest, else the newest of any (the usual case, a pin
+  that moved). It always builds the pinned Proton commit, from
+  reviewed fork sources. A manual run may build any Proton ref, whose build
+  scripts could write anything into the cache, so it restores the cache and
+  saves nothing; so does a tag. What a signed release restores was therefore
+  compiled only from sources that were merged to `main`.
+- `main` runtime builds are never cancelled: a cancelled build saves no cache
+  and leaves nothing to promote. Pushes queue, and GitHub keeps only the
+  newest waiting run of a concurrency group. The group is
+  `runtime-<event>-<ref>` (and `release-<event>-<ref>`, `dlssnr-<event>-<ref>`),
+  so a manual run on `main` or on a tag ref queues apart and can never
+  replace a waiting push run, the only kind that saves the cache or makes a
+  promotable dist.
+- GitHub drops a cache not restored for seven days, and evicts the least
+  recently used first when the repository passes 10 GB. The runtime cache
+  (4-5 GB) is restored only when the pins move, while the Rust caches are
+  restored on every push, so it would be the first to go.
+  `runtime-cache-keepalive.yml` restores it on Monday and Thursday mornings
+  (UTC), which counts as a use; it builds and saves nothing.
+- `CCACHE_DIR` is `/home/runner/.ccache` and the build tree is under the
+  workspace, the same paths on every hosted runner. Both matter: the cache
+  service only finds a cache saved at the same path, and ccache misses
+  every object compiled in a build tree at another path (Proton sets
+  `CCACHE_BASEDIR` to each source directory, but the object directories stay
+  absolute). This is why the self-hosted runners, one Unix user and home
+  directory each, never hit.
 - Only the newest runtime cache is kept: the `prune-ccache` job deletes older
   ones. Its token can delete caches and nothing else.
 
-The Rust jobs work the same way. They restore their caches everywhere, but
-only save them on `main`, because a cache saved for a pull request, another
-branch or a tag can only be read there, and every copy counts against the
-repository's 10 GB.
+The Rust workflow's `test` job, the only one on the self-hosted host, does
+not use the GitHub cache there. Each runner is its own user, its `CARGO_HOME`
+goes into every cache key and version, and so no runner ever restored what
+another saved. Instead it builds in a directory in the runner's home that
+outlives the job, `~/.cache/ferestre-ci/<name>`
+(`.github/scripts/ci-target-dir.sh`), through a `target` symlink at the top of
+the checkout, which checkout's clean step removes before the next job. It is
+emptied when it grows past its cap or the disk runs low.
+
+- Pull requests build in `~/.cache/ferestre-ci/ferestre-pr`, pushes to `main`
+  and `dev` in `~/.cache/ferestre-ci/ferestre-push`, so nothing a pull request
+  compiled is ever reused by a `main` build. Either only ever feeds CI test
+  results.
+- The release and runtime workflows never use it, and never run on that host.
+  `tests/test_workflows.py` checks both.
+- Hosted Rust jobs restore the GitHub cache everywhere and save it only on
+  `main`, because a cache saved for a pull request, another branch or a tag
+  can only be read there, and every copy counts against the repository's
+  10 GB. The launcher release does not use it: a tag cannot read a cache
+  keyed to another job, and saving one per tag would only take space.
 
 ## Verifying a download by hand
 

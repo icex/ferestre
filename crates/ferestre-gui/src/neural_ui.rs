@@ -360,12 +360,19 @@ fn present(ui: &Ui, product_id: &str, name: &str, v: &View) {
         cancel_dialog.close();
     });
     content.append(&cancel);
-    dialog.set_child(Some(
+    // A header bar, as the accounts dialog has: it shows the title, which
+    // libadwaita 1.5 (GTK 4.14, CI's) otherwise neither draws nor gives the
+    // dialog as its accessible name.
+    let view = adw::ToolbarView::new();
+    view.add_top_bar(&adw::HeaderBar::new());
+    view.set_content(Some(
         &gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
             .child(&content)
             .build(),
     ));
+    dialog.set_child(Some(&view));
     dialog.present(Some(&ui.window));
     cancel.grab_focus();
 }

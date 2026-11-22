@@ -13,6 +13,31 @@
 # with the wrong label or a button wired to nothing, and it is worth the extra
 # minute of setup.
 #
+# Where each job runs, and why:
+#
+# - The self-hosted runners share one host that lets four jobs build at once,
+#   and every job there is a slot another pull request waits for. Only `test`
+#   runs there (FERESTRE_RUNNER_LABELS), in a build directory that outlives
+#   the job (.github/scripts/ci-target-dir.sh), so only what changed is
+#   rebuilt. Set the variable to '["ubuntu-24.04"]' and it runs hosted, with
+#   the GitHub cache instead.
+# - Everything else is hosted and never waits for a slot: `preflight`
+#   (rustfmt, and on a pull request which of msrv, gui and sources the change
+#   can affect -- .github/scripts/ci-changes.sh; a push to main or dev, or a
+#   manual run, runs them all), `msrv`, `sources`, and the window, which is
+#   built once (`gui-build`) and tested in four shards at once (`gui`,
+#   tests/run_gui_ci.py). Hosted jobs restore the GitHub cache and save it
+#   from main only.
+# - On a pull request, msrv type-checks with the old compiler instead of
+#   building and running every test a second time. The full msrv test runs on
+#   every push to main and dev.
+# - A newer push to a pull request cancels its older run. Main, dev, tags and
+#   manual runs are never cancelled.
+#
+# Neither the persistent directory nor these caches reach a release: release
+# and runtime builds run on hosted runners in a clean checkout
+# (docs/RELEASING.md).
+#
 # Every job here runs with a read-only token that is not written to the
 # checkout, and every third-party action is pinned to a commit, because a tag
 # or a branch can be moved to code nobody reviewed. Every cargo call is
@@ -54,6 +79,9 @@ on:
       - 'tests/gui_library_error.py'
       - 'tests/gui_controller_focus.py'
       - 'tests/gui_window_controls.py'
+      - 'tests/gui_move.py'
+      - 'tests/run_gui_ci.py'
+      - 'tests/gui_ci.json'
       - 'tests/controller_driver.py'
       - 'tests/test_gui_actions.py'
       - 'tests/run_wayland_gui.py'
@@ -90,11 +118,17 @@ on:
       - 'tests/test_workflows.py'
       - 'tests/test_no_nvidia_urls.py'
       - 'tests/test_build_dlssnr.py'
+      - 'tests/test_ci_changes.py'
+      - 'tests/test_runtime_inputs.py'
+      - 'tests/fixtures/runtime-inputs/**'
       # The native harnesses and fixtures: the shell syntax step and the
       # `sources` job check these.
       - 'tests/*.sh'
       - 'tests/license_token_fixture.py'
+      # The pinned forks: a gitlink bump is what the `sources` job checks.
+      - 'third_party/**'
       - '.github/workflows/**'
+      - '.github/scripts/ci-*.sh'
   pull_request:
     paths:
       - 'crates/**'
@@ -121,6 +155,9 @@ on:
       - 'tests/gui_library_error.py'
       - 'tests/gui_controller_focus.py'
       - 'tests/gui_window_controls.py'
+      - 'tests/gui_move.py'
+      - 'tests/run_gui_ci.py'
+      - 'tests/gui_ci.json'
       - 'tests/controller_driver.py'
       - 'tests/test_gui_actions.py'
       - 'tests/run_wayland_gui.py'
@@ -157,22 +194,75 @@ on:
       - 'tests/test_workflows.py'
       - 'tests/test_no_nvidia_urls.py'
       - 'tests/test_build_dlssnr.py'
+      - 'tests/test_ci_changes.py'
+      - 'tests/test_runtime_inputs.py'
+      - 'tests/fixtures/runtime-inputs/**'
       # The native harnesses and fixtures: the shell syntax step and the
       # `sources` job check these.
       - 'tests/*.sh'
       - 'tests/license_token_fixture.py'
+      # The pinned forks: a gitlink bump is what the `sources` job checks.
+      - 'third_party/**'
       - '.github/workflows/**'
+      - '.github/scripts/ci-*.sh'
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# One run per pull request: a newer push, or the second event a stacked
+# force-push fires for the same commit, cancels the run before it. Pushes to
+# main and dev, tags and manual runs each get a group of their own (the run
+# id), so they never cancel or queue behind one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
+  # Incremental data is large and CI rebuilds whole crates anyway; the hosted
+  # cache would drop it, and the persistent self-hosted directory would only
+  # fill up with it.
+  CARGO_INCREMENTAL: '0'
+  # Line tables are what a test failure's backtrace needs; full debug info
+  # only makes the target directory bigger and every link slower.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
-  test:
+  # On a hosted runner, so it never waits for a build slot: formatting, which
+  # fails fast and costs nothing, and the paths that decide which of the
+  # heavier jobs a pull request needs.
+  preflight:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    outputs:
+      rust: ${{ steps.changes.outputs.rust }}
+      gui: ${{ steps.changes.outputs.gui }}
+      sources: ${{ steps.changes.outputs.sources }}
+    steps:
+      # Two commits: a pull request's checkout is GitHub's merge commit, and
+      # its first parent is the base branch it would merge into.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Which jobs this change needs
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+        run: .github/scripts/ci-changes.sh "$EVENT"
+
+  test:
+    needs: preflight
     runs-on: ${{ fromJSON(vars.FERESTRE_RUNNER_LABELS || '["self-hosted", "linux", "x64", "icex-ci"]') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -192,19 +282,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
           toolchain: stable
-          components: clippy, rustfmt
+          components: clippy
 
-      # Restored everywhere, saved only from main: a cache saved for a pull
-      # request or another branch is visible to that ref alone, and every
-      # copy counts against the repository's 10 GB.
+      # Self-hosted: a build directory that outlives the job, so only what
+      # changed is rebuilt (see the script). Hosted: the GitHub cache,
+      # restored everywhere and saved only from main, because a cache saved
+      # for a pull request or another branch is visible to that ref alone,
+      # and every copy counts against the repository's 10 GB.
+      #
+      # Pull requests and pushes build in separate directories, so nothing a
+      # pull request compiled is ever reused by a main or dev build.
+      - name: Persistent build directory
+        if: runner.environment == 'self-hosted'
+        env:
+          TRUST: ${{ github.event_name == 'pull_request' && 'pr' || 'push' }}
+        run: .github/scripts/ci-target-dir.sh target "ferestre-$TRUST" 12
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: runner.environment != 'self-hosted'
         with:
           key: ubuntu-24.04
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Format
-        run: cargo fmt --all --check
-
+      # Formatting is checked in `preflight`.
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
@@ -264,7 +364,7 @@ jobs:
               esac
               "$shell" -n "$f" || status=1
               shellcheck --severity=error --shell="$shell" "$f" || status=1
-          done < <(find scripts packaging tests -type f \( -name '*.sh' -o -name AppRun \) -print0)
+          done < <(find scripts packaging tests .github/scripts -type f \( -name '*.sh' -o -name AppRun \) -print0)
           exit "$status"
 
       - name: Packaging and release tests
@@ -272,10 +372,12 @@ jobs:
           FERESTRE_REQUIRE_MINISIGN: '1'
         run: |
           python3 tests/test_workflows.py
+          python3 tests/test_ci_changes.py
           python3 tests/test_source_pins.py
           python3 tests/test_no_nvidia_urls.py
           python3 tests/test_build_dlssnr.py
           python3 tests/test_runtime_staging.py
+          python3 tests/test_runtime_inputs.py
           python3 tests/test_release_signing.py
           python3 tests/test_build_appimage.py
 
@@ -287,16 +389,21 @@ jobs:
   # (zopfli, under zip's deflate feature, is the newest at 1.88). Raise this
   # together with `rust-version` in Cargo.toml, in the commit that moves the
   # lock; tests/test_workflows.py checks the two agree.
+  #
+  # On a pull request it type-checks every target, tests included, which is
+  # what catches a newer std or language feature; a push to main or dev
+  # builds and runs the whole test suite with it. Pull requests that touch
+  # no Rust skip it. Hosted, so it never waits for a build slot.
   msrv:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ${{ fromJSON(vars.FERESTRE_RUNNER_LABELS || '["self-hosted", "linux", "x64", "icex-ci"]') }}
+    needs: preflight
+    if: needs.preflight.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
       - name: System libraries
-        if: runner.environment != 'self-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
@@ -315,19 +422,22 @@ jobs:
 
       # As in `test`: the namespace tests must run, not skip.
       - name: Allow unprivileged user namespaces
-        env:
-          RUNNER_KIND: ${{ runner.environment }}
         run: |
-          # Self-hosted isolation is configured by the runner administrator;
-          # its no-new-privileges boundary deliberately rejects sudo.
-          if [ "$RUNNER_KIND" != self-hosted ] && [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
               sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           unshare --user --map-root-user --mount true
 
       # Named explicitly, so a runner image with a different default compiler
       # cannot make this job test something else.
+      - name: Type-check with the minimum supported Rust
+        if: github.event_name == 'pull_request'
+        run: |
+          rustc +1.88 --version
+          cargo +1.88 check --locked --workspace --all-targets
+
       - name: Test with the minimum supported Rust
+        if: github.event_name != 'pull_request'
         env:
           FERESTRE_REQUIRE_USERNS: '1'
         run: |
@@ -335,10 +445,13 @@ jobs:
           cargo +1.88 test --locked --workspace
 
   # Verify all five immutable fork commits and their nested gitlinks without
-  # checking out the complete Wine tree, then run the client’s offline tests.
+  # checking out the complete Wine tree, then run the client's offline tests.
+  # A pull request that touches none of the pins, the forks or the scripts
+  # and fixtures they use skips it (.github/scripts/ci-changes.sh). Hosted.
   sources:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ${{ fromJSON(vars.FERESTRE_RUNNER_LABELS || '["self-hosted", "linux", "x64", "icex-ci"]') }}
+    needs: preflight
+    if: needs.preflight.outputs.sources == 'true'
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -357,7 +470,6 @@ jobs:
       # WebKitGTK, GTK 3 and libsoup because xodus-cli links wry for the
       # sign-in window, and its tests link the binary's crate.
       - name: Client test dependencies
-        if: runner.environment != 'self-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev libdbus-1-dev protobuf-compiler \
@@ -382,18 +494,17 @@ jobs:
       # ignored),
       # the presence runner (a local server and a fake token provider; it
       # never signs in), the profile store and the file-backed key chain.
+      #
+      # Three cargo calls rather than one per filter: every call re-checks the
+      # graph and relinks each test binary, and the xodus filters go to one
+      # call together (libtest runs a test that matches any of them).
       - name: Test the pinned client fork offline
         run: |
           set -euo pipefail
           python3 scripts/source-pins.py verify xodus --directory third_party/xodus-cli
           cd third_party/xodus-cli
-          cargo test --locked -p xodus-service
-          cargo test --locked -p xodus profile
-          cargo test --locked -p xodus api::xbox::auth
-          cargo test --locked -p xodus device_response_
-          cargo test --locked -p xodus licensing::store_ticket
-          cargo test --locked -p msixvc
-          cargo test --locked -p xodus-cli
+          cargo test --locked -p xodus-service -p msixvc -p xodus-cli
+          cargo test --locked -p xodus -- profile api::xbox::auth device_response_ licensing::store_ticket
           cargo test --locked -p xodus --features key-chain-file --test key_chain_file
 
       - name: Runtime refresh correction unit tests
@@ -411,32 +522,29 @@ jobs:
           done
           python3 "$scratch/check/tools/ferestre/test_desktop_refresh.py"
 
-  gui:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ${{ fromJSON(vars.FERESTRE_RUNNER_LABELS || '["self-hosted", "linux", "x64", "icex-ci"]') }}
-    env:
-      GDK_BACKEND: x11
-      GSK_RENDERER: cairo
+  # The window, built once for the four GUI shards. A pull request that
+  # touches neither the crates nor the window's tests, fixtures or recipes
+  # skips it (.github/scripts/ci-changes.sh). Hosted.
+  gui-build:
+    needs: preflight
+    if: needs.preflight.outputs.gui == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
+      # The Atspi bindings for the action-export unit tests.
       - name: System libraries
-        if: runner.environment != 'self-hosted'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-4-dev libadwaita-1-dev \
-            at-spi2-core gir1.2-atspi-2.0 python3-gi openbox \
-            xvfb dbus-x11
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev gir1.2-atspi-2.0 python3-gi
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
           toolchain: stable
-      # Restored everywhere, saved only from main: a cache saved for a pull
-      # request or another branch is visible to that ref alone, and every
-      # copy counts against the repository's 10 GB.
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ubuntu-24.04
@@ -448,128 +556,83 @@ jobs:
       - name: Accessibility action-export unit tests
         run: python3 tests/test_gui_actions.py
 
-      # A session bus for the accessibility bus to live on, a display for the
-      # window to map into, and then the test drives it by pressing things.
-      # Keep virtual displays running across transient periods with no clients;
-      # retain server diagnostics if a window cannot connect. Use the same X11
-      # software renderer as the local headless checks.
-      # Do not reuse a display while the preceding Xvfb is shutting down.
-      - name: Smoke test
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=110 --server-args='-screen 0 1280x900x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_smoke.py
+      # Only the two binaries the tests start. The ferestre CLI must sit
+      # beside ferestre-gui: the tests find it there.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gui-binaries
+          path: |
+            target/debug/ferestre-gui
+            target/debug/ferestre
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Move location and automatic space checks (offline)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=111 --server-args='-screen 0 1280x900x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_move.py --binary target/debug/ferestre-gui
+  # The window driven through AT-SPI, in four shards that run at once. Each
+  # test gets its own Xvfb and session bus (tests/run_gui_ci.py); the split
+  # is by the measured weights in tests/gui_ci.json, and gui_smoke.py alone
+  # (about 150 s) is the floor. Every test in a shard runs even after one
+  # fails, and the step summary lists each test's time.
+  gui:
+    needs: gui-build
+    runs-on: ubuntu-24.04
+    # run_gui_ci.py gives each test ten minutes; a shard is about three.
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      GDK_BACKEND: x11
+      GSK_RENDERER: cairo
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - name: Desktop window controls and fullscreen (offline)
+      # The packages the unsharded job installed, so the window runs
+      # against exactly the libraries, themes and fonts it was tested with.
+      - name: System libraries
         run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=136 --server-args='-screen 0 1280x800x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_window_controls.py --binary target/debug/ferestre-gui
-          xvfb-run -a --error-file=/dev/stderr --server-num=137 --server-args='-screen 0 800x720x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_window_controls.py --binary target/debug/ferestre-gui --narrow
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev libadwaita-1-dev \
+            at-spi2-core gir1.2-atspi-2.0 python3-gi openbox \
+            xvfb dbus-x11
 
-      - name: Separate Store and Player accounts (offline)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=112 --server-args='-screen 0 1280x900x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_accounts.py
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: gui-binaries
+          path: target/debug
 
-      # The client is a script that advertises presence-v1 and plays back
-      # runner events, so this signs nothing in and posts nothing.
-      - name: Online status while a game runs (offline)
+      # Artifacts do not keep the executable bit.
+      - name: GUI tests, shard ${{ matrix.shard }} of 4
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=113 --server-args='-screen 0 1280x900x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_presence.py
+          chmod +x target/debug/ferestre-gui target/debug/ferestre
+          python3 tests/run_gui_ci.py --shard "$SHARD/4"
 
-      # PackageKit is a fake on a private bus standing in for the system one,
-      # and the missing library is a fixture, so this installs nothing.
-      - name: Secure application and runtime updater (offline)
+  # The one check to require before merging. Every other job is either
+  # skipped by design (a path the change does not touch) or has to pass, and
+  # a skipped job shows as passing, so this says which: preflight and test
+  # must succeed, and the rest must succeed or have been skipped. A pull
+  # request from a fork runs nothing (preflight's `if`), and fails here.
+  ci-ok:
+    needs: [preflight, test, msrv, sources, gui-build, gui]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Every job passed or was not needed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
         run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=114 --server-args='-screen 0 1280x900x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_updater.py
-
-      - name: Game Pass artwork and handheld fullscreen (loopback)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=115 --server-args='-screen 0 1280x720x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_artwork.py --fullscreen
-      - name: Controller adapter, button glyphs and focus indicator (offline)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=116 --server-args='-screen 0 1280x900x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_controller.py
-
-      - name: Game launch loading, running state and background Home (offline)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=117 --server-args='-screen 0 1280x720x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_launch.py
-
-      - name: Controller Resume and confirmed Stop (offline)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=120 --server-args='-screen 0 1280x720x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_running.py
-
-      - name: Play on a title already running, and Reset to defaults (offline)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=129 --server-args='-screen 0 1280x900x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_already_running.py
-
-      - name: Notifications stack, dismiss and take keyboard focus (offline)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=138 --server-args='-screen 0 1280x900x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_notifications.py
-
-      - name: Controller keyboard, install destination and queue (offline)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=121 --server-args='-screen 0 1280x720x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_controller_install.py
-
-      - name: Controller download controls at desktop height (offline)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=126 --server-args='-screen 0 1280x900x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_controller_install.py
-
-      - name: Controller account selection (offline)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=122 --server-args='-screen 0 1280x720x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_accounts_controller.py
-
-      - name: Controller global and per-game runtime selection (offline)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=123 --server-args='-screen 0 1280x720x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_runtime_selection.py
-
-      - name: Local games, their menu and forget-only removal (offline)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=138 --server-args='-screen 0 1280x720x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_local_games.py
-
-      - name: Resume paused updates from the game grid (offline)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=124 --server-args='-screen 0 1280x720x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_update_resume.py
-
-      - name: Update installed games in place without an install prompt (offline)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=127 --server-args='-screen 0 1280x720x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_update_existing.py
-
-      - name: Library authentication errors and recovery (offline)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=128 --server-args='-screen 0 1280x720x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_library_error.py
-
-      - name: Controller tab focus and single selection outline (offline)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=125 --server-args='-screen 0 1280x720x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_controller_focus.py
-
-      - name: Persistent install queue and pause controls (offline)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=118 --server-args='-screen 0 1280x900x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_transfers.py
-
-      - name: Missing WebKitGTK offered for install (offline)
-        run: |
-          xvfb-run -a --error-file=/dev/stderr --server-num=119 --server-args='-screen 0 1280x900x24 -noreset' \
-            dbus-run-session -- python3 tests/gui_client_deps.py
+          python3 - <<'PY'
+          import json, os, sys
+          needs = {name: job['result'] for name, job in json.loads(os.environ['NEEDS']).items()}
+          bad = {name: result for name, result in needs.items()
+                 if result != 'success' and (name in ('preflight', 'test') or result != 'skipped')}
+          for name, result in sorted(needs.items()):
+              print(f'{name}: {result}')
+          if bad:
+              sys.exit(f'not passed: {bad}')
+          PY

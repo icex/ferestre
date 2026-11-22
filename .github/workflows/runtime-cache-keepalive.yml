@@ -1,0 +1,52 @@
+# Keeps the runtime's compiler cache from being evicted.
+#
+# GitHub drops a cache nobody has restored for seven days, and when the
+# repository passes its 10 GB it drops the least recently used first. The
+# runtime cache (runtime.yml, 4-5 GB) is restored only when the runtime pins
+# move, which is about weekly, while the Rust caches are restored on every
+# push -- so without this it is the first to go, and the next pin change costs
+# a two-hour cold build instead of 15 minutes.
+#
+# Twice a week it restores the newest runtime cache, which counts as a use,
+# and does nothing with it. Scheduled runs run on main, so they see main's
+# cache and nothing else; restoring saves nothing and builds nothing.
+name: Runtime cache keepalive
+
+on:
+  schedule:
+    - cron: '17 4 * * 1,4'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-cache-keepalive
+  cancel-in-progress: false
+
+jobs:
+  touch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # A key that never exists, so the newest cache under the prefix is the
+      # one restored. The path must be the one runtime.yml saves, or the
+      # cache's version differs and nothing matches.
+      - name: Restore the newest runtime compiler cache
+        id: ccache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /home/runner/.ccache
+          key: runtime-ccache-keepalive-${{ github.run_id }}
+          restore-keys: |
+            runtime-ccache-v3-
+
+      - name: Report
+        env:
+          RESTORED: ${{ steps.ccache.outputs.cache-matched-key }}
+        run: |
+          if [ -n "$RESTORED" ]; then
+              echo ":: kept $RESTORED ($(du -sh /home/runner/.ccache | cut -f1))"
+          else
+              echo "::notice::no runtime compiler cache to keep; the next runtime build is cold"
+          fi

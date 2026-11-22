@@ -1,0 +1,280 @@
+{
+ "artifacts": {
+  "42404010296": [],
+  "44962698296": [],
+  "44962707713": [
+   {
+    "created_at": "2026-11-22T08:41:04Z",
+    "digest": "sha256:69ed9295dad46863190d6f1eec4ab0585ebd4a5b98dfbf754431198534efa382",
+    "expired": false,
+    "expires_at": "2026-12-06T08:40:50Z",
+    "id": 14746504919,
+    "name": "ferestre-runtime-11.0.20261122.1",
+    "size_in_bytes": 314829626,
+    "workflow_run": {
+     "head_branch": "runtime-11.0.20261122.1",
+     "head_repository_id": 1359090188,
+     "head_sha": "fe895f63532ebbc4c478a00fb69eb4a8940652c5",
+     "id": 44962707713,
+     "repository_id": 1359090188
+    }
+   }
+  ]
+ },
+ "jobs": {
+  "42404010296": [
+   {
+    "conclusion": "success",
+    "name": "build",
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "name": "prune-ccache",
+    "status": "completed"
+   },
+   {
+    "conclusion": "skipped",
+    "name": "publish",
+    "status": "completed"
+   }
+  ],
+  "44962698296": [
+   {
+    "conclusion": "cancelled",
+    "name": "build",
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "name": "prune-ccache",
+    "status": "completed"
+   },
+   {
+    "conclusion": "skipped",
+    "name": "publish",
+    "status": "completed"
+   }
+  ],
+  "44962707713": [
+   {
+    "conclusion": "success",
+    "name": "build",
+    "status": "completed"
+   },
+   {
+    "conclusion": "success",
+    "name": "publish",
+    "status": "completed"
+   },
+   {
+    "conclusion": "skipped",
+    "name": "prune-ccache",
+    "status": "completed"
+   }
+  ]
+ },
+ "runs": [
+  {
+   "conclusion": "cancelled",
+   "created_at": "2026-11-22T20:55:11Z",
+   "event": "push",
+   "head_branch": "main",
+   "head_repository": {
+    "full_name": "icex/ferestre"
+   },
+   "head_sha": "9bfc71956c201eaca17ffad9f44f4373abf7bfe6",
+   "html_url": "https://github.com/icex/ferestre/actions/runs/45069130546",
+   "id": 45069130546,
+   "name": "Runtime",
+   "path": ".github/workflows/runtime.yml",
+   "repository": {
+    "full_name": "icex/ferestre"
+   },
+   "run_attempt": 1,
+   "run_number": 31,
+   "status": "completed"
+  },
+  {
+   "conclusion": "cancelled",
+   "created_at": "2026-11-22T18:49:37Z",
+   "event": "push",
+   "head_branch": "main",
+   "head_repository": {
+    "full_name": "icex/ferestre"
+   },
+   "head_sha": "bfac45c46238ac00f7c74deb2fd9d669e59a5434",
+   "html_url": "https://github.com/icex/ferestre/actions/runs/45057262523",
+   "id": 45057262523,
+   "name": "Runtime",
+   "path": ".github/workflows/runtime.yml",
+   "repository": {
+    "full_name": "icex/ferestre"
+   },
+   "run_attempt": 1,
+   "run_number": 30,
+   "status": "completed"
+  },
+  {
+   "conclusion": "success",
+   "created_at": "2026-11-21T23:37:31Z",
+   "event": "push",
+   "head_branch": "runtime-11.0.20261122.1",
+   "head_repository": {
+    "full_name": "icex/ferestre"
+   },
+   "head_sha": "fe895f63532ebbc4c478a00fb69eb4a8940652c5",
+   "html_url": "https://github.com/icex/ferestre/actions/runs/44962707713",
+   "id": 44962707713,
+   "name": "Runtime",
+   "path": ".github/workflows/runtime.yml",
+   "repository": {
+    "full_name": "icex/ferestre"
+   },
+   "run_attempt": 2,
+   "run_number": 29,
+   "status": "completed"
+  },
+  {
+   "conclusion": "cancelled",
+   "created_at": "2026-11-21T23:37:24Z",
+   "event": "push",
+   "head_branch": "main",
+   "head_repository": {
+    "full_name": "icex/ferestre"
+   },
+   "head_sha": "fe895f63532ebbc4c478a00fb69eb4a8940652c5",
+   "html_url": "https://github.com/icex/ferestre/actions/runs/44962698296",
+   "id": 44962698296,
+   "name": "Runtime",
+   "path": ".github/workflows/runtime.yml",
+   "repository": {
+    "full_name": "icex/ferestre"
+   },
+   "run_attempt": 1,
+   "run_number": 28,
+   "status": "completed"
+  },
+  {
+   "conclusion": "success",
+   "created_at": "2026-11-21T19:04:05Z",
+   "event": "workflow_dispatch",
+   "head_branch": "release/gears-compatibility-0.1.23",
+   "head_repository": {
+    "full_name": "icex/ferestre"
+   },
+   "head_sha": "6542d1780e2b8efdda0bf817e36fb3f94bdeac65",
+   "html_url": "https://github.com/icex/ferestre/actions/runs/44938914187",
+   "id": 44938914187,
+   "name": "Runtime",
+   "path": ".github/workflows/runtime.yml",
+   "repository": {
+    "full_name": "icex/ferestre"
+   },
+   "run_attempt": 1,
+   "run_number": 27,
+   "status": "completed"
+  },
+  {
+   "conclusion": "failure",
+   "created_at": "2026-11-21T18:19:40Z",
+   "event": "workflow_dispatch",
+   "head_branch": "release/gears-compatibility-0.1.23",
+   "head_repository": {
+    "full_name": "icex/ferestre"
+   },
+   "head_sha": "eae02a03089183d03d36787dfe70a7dc080b3cdb",
+   "html_url": "https://github.com/icex/ferestre/actions/runs/44934904415",
+   "id": 44934904415,
+   "name": "Runtime",
+   "path": ".github/workflows/runtime.yml",
+   "repository": {
+    "full_name": "icex/ferestre"
+   },
+   "run_attempt": 1,
+   "run_number": 26,
+   "status": "completed"
+  },
+  {
+   "conclusion": "failure",
+   "created_at": "2026-11-20T22:24:36Z",
+   "event": "workflow_dispatch",
+   "head_branch": "release/gears-compatibility-0.1.23",
+   "head_repository": {
+    "full_name": "icex/ferestre"
+   },
+   "head_sha": "272ea5a7590ac9ddfacff811183c566464471713",
+   "html_url": "https://github.com/icex/ferestre/actions/runs/44828715772",
+   "id": 44828715772,
+   "name": "Runtime",
+   "path": ".github/workflows/runtime.yml",
+   "repository": {
+    "full_name": "icex/ferestre"
+   },
+   "run_attempt": 1,
+   "run_number": 25,
+   "status": "completed"
+  },
+  {
+   "conclusion": "cancelled",
+   "created_at": "2026-11-11T15:13:21Z",
+   "event": "push",
+   "head_branch": "main",
+   "head_repository": {
+    "full_name": "icex/ferestre"
+   },
+   "head_sha": "6f0b93e6f07b96c8b124b85af63cd4fc89fab1b3",
+   "html_url": "https://github.com/icex/ferestre/actions/runs/43046171845",
+   "id": 43046171845,
+   "name": "Runtime",
+   "path": ".github/workflows/runtime.yml",
+   "repository": {
+    "full_name": "icex/ferestre"
+   },
+   "run_attempt": 1,
+   "run_number": 24,
+   "status": "completed"
+  },
+  {
+   "conclusion": "success",
+   "created_at": "2026-11-07T19:00:04Z",
+   "event": "push",
+   "head_branch": "runtime-11.0.20261107.1",
+   "head_repository": {
+    "full_name": "icex/ferestre"
+   },
+   "head_sha": "b5d75bdf73718e91c72b8248dee881db17e36147",
+   "html_url": "https://github.com/icex/ferestre/actions/runs/42404027678",
+   "id": 42404027678,
+   "name": "Runtime",
+   "path": ".github/workflows/runtime.yml",
+   "repository": {
+    "full_name": "icex/ferestre"
+   },
+   "run_attempt": 1,
+   "run_number": 23,
+   "status": "completed"
+  },
+  {
+   "conclusion": "success",
+   "created_at": "2026-11-07T18:59:52Z",
+   "event": "push",
+   "head_branch": "main",
+   "head_repository": {
+    "full_name": "icex/ferestre"
+   },
+   "head_sha": "b5d75bdf73718e91c72b8248dee881db17e36147",
+   "html_url": "https://github.com/icex/ferestre/actions/runs/42404010296",
+   "id": 42404010296,
+   "name": "Runtime",
+   "path": ".github/workflows/runtime.yml",
+   "repository": {
+    "full_name": "icex/ferestre"
+   },
+   "run_attempt": 1,
+   "run_number": 22,
+   "status": "completed"
+  }
+ ],
+ "source": "GET repos/icex/ferestre/actions/workflows/runtime.yml/runs?per_page=10, 2026-11-22, trimmed to the fields runtime-inputs.py reads"
+}

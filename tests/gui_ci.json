@@ -1,0 +1,29 @@
+{
+  "comment": "The GUI tests CI runs, split into shards by weight (seconds measured in CI, run 45054085396). tests/run_gui_ci.py reads this; tests/test_workflows.py checks that every tests/gui_*.py is listed. Update a weight when a test gets much slower, so the shards stay even.",
+  "tests": [
+    {"name": "smoke", "script": "tests/gui_smoke.py", "screen": "1280x900", "weight": 151},
+    {"name": "move", "script": "tests/gui_move.py", "screen": "1280x900", "weight": 22},
+    {"name": "window-controls", "script": "tests/gui_window_controls.py", "screen": "1280x800", "weight": 36},
+    {"name": "window-controls-narrow", "script": "tests/gui_window_controls.py", "args": ["--narrow"], "screen": "800x720", "weight": 37},
+    {"name": "accounts", "script": "tests/gui_accounts.py", "screen": "1280x900", "weight": 29},
+    {"name": "presence", "script": "tests/gui_presence.py", "screen": "1280x900", "weight": 28},
+    {"name": "updater", "script": "tests/gui_updater.py", "screen": "1280x900", "weight": 28},
+    {"name": "artwork-fullscreen", "script": "tests/gui_artwork.py", "args": ["--fullscreen"], "screen": "1280x720", "weight": 11},
+    {"name": "controller", "script": "tests/gui_controller.py", "screen": "1280x900", "weight": 8},
+    {"name": "launch", "script": "tests/gui_launch.py", "screen": "1280x720", "weight": 21},
+    {"name": "running", "script": "tests/gui_running.py", "screen": "1280x720", "weight": 16},
+    {"name": "already-running", "script": "tests/gui_already_running.py", "screen": "1280x900", "weight": 22},
+    {"name": "notifications", "script": "tests/gui_notifications.py", "screen": "1280x900", "weight": 7},
+    {"name": "controller-install", "script": "tests/gui_controller_install.py", "screen": "1280x720", "weight": 57},
+    {"name": "controller-install-desktop", "script": "tests/gui_controller_install.py", "screen": "1280x900", "weight": 57},
+    {"name": "accounts-controller", "script": "tests/gui_accounts_controller.py", "screen": "1280x720", "weight": 30},
+    {"name": "runtime-selection", "script": "tests/gui_runtime_selection.py", "screen": "1280x720", "weight": 13},
+    {"name": "local-games", "script": "tests/gui_local_games.py", "screen": "1280x720", "weight": 20},
+    {"name": "update-resume", "script": "tests/gui_update_resume.py", "screen": "1280x720", "weight": 5},
+    {"name": "update-existing", "script": "tests/gui_update_existing.py", "screen": "1280x720", "weight": 7},
+    {"name": "library-error", "script": "tests/gui_library_error.py", "screen": "1280x720", "weight": 6},
+    {"name": "controller-focus", "script": "tests/gui_controller_focus.py", "screen": "1280x720", "weight": 15},
+    {"name": "transfers", "script": "tests/gui_transfers.py", "screen": "1280x900", "weight": 13},
+    {"name": "client-deps", "script": "tests/gui_client_deps.py", "screen": "1280x900", "weight": 2}
+  ]
+}
