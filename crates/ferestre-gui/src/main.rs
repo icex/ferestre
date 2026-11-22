@@ -313,6 +313,18 @@ struct Ui {
     split: adw::NavigationSplitView,
     install_queue: Rc<RefCell<ferestre_core::transfers::Queue>>,
     queue_error: Rc<RefCell<Option<String>>>,
+    /// A redraw asked for by background work and not yet done. Many results
+    /// landing in one main-loop turn become one [`render`].
+    render_dirty: Rc<Cell<bool>>,
+    /// Pictures showing a title's art, by `ArtSlot` key, so artwork that
+    /// arrives later updates them in place instead of redrawing the page.
+    art_slots: Rc<RefCell<textures::Slots>>,
+    /// The last page showed "Looking up N title names…", which only a redraw
+    /// takes away once the lookup ends.
+    showed_pending_names: Rc<Cell<bool>>,
+    /// A name lookup was asked for while one was running, so the running one
+    /// must redraw when it ends to start the next.
+    names_requeued: Rc<Cell<bool>>,
 }
 
 fn main() -> glib::ExitCode {
@@ -645,6 +657,10 @@ fn build_ui(app: &adw::Application) {
         split: split.clone(),
         install_queue: Rc::new(RefCell::new(install_queue)),
         queue_error: Rc::new(RefCell::new(queue_error)),
+        render_dirty: Rc::new(Cell::new(false)),
+        art_slots: Rc::new(RefCell::new(textures::Slots::default())),
+        showed_pending_names: Rc::new(Cell::new(false)),
+        names_requeued: Rc::new(Cell::new(false)),
         window: window.clone(),
         toasts,
         content,
@@ -965,7 +981,26 @@ fn named_widget(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
     None
 }
 
+/// Redraw once the main loop is idle: below input, layout and paint, so a
+/// burst of background results (names, sizes, updates, an account) becomes
+/// one redraw rather than one each. A [`render`] that runs first does it.
+fn render_soon(ui: &Ui) {
+    if ui.render_dirty.replace(true) {
+        return;
+    }
+    let ui = ui.clone();
+    glib::idle_add_local_full(glib::Priority::DEFAULT_IDLE, move || {
+        if ui.render_dirty.get() && !*ui.closing.borrow() {
+            render(&ui);
+        }
+        ui.render_dirty.set(false);
+        glib::ControlFlow::Break
+    });
+}
+
 fn render(ui: &Ui) {
+    ui.render_dirty.set(false);
+    ui.art_slots.borrow_mut().prune();
     app_updates::render(ui);
     handheld::render_navigation(ui);
     ui.game_actions.borrow_mut().clear();
@@ -1702,6 +1737,7 @@ fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
         if let Ok(scanned) = scanned {
             let mut model = ui.model.borrow_mut();
             let current = model.size_generation == generation;
+            let mut changed = false;
             for (key, bytes) in scanned {
                 model.sizes_pending.remove(&key);
                 let bytes = if current {
@@ -1717,12 +1753,16 @@ fn fetch_disk_usage(ui: &Ui, rows: &[LibraryRow]) {
                     }
                 };
                 // Keep an expired measurement if the new walk failed.
-                if bytes.is_some() || !model.disk_usage.contains_key(&key) {
-                    model.disk_usage.insert(key, bytes);
+                if (bytes.is_some() || !model.disk_usage.contains_key(&key))
+                    && model.disk_usage.insert(key, bytes) != Some(bytes)
+                {
+                    changed = true;
                 }
             }
             drop(model);
-            render(&ui);
+            if changed {
+                render_soon(&ui);
+            }
         } else {
             let mut model = ui.model.borrow_mut();
             for key in &keys {
@@ -1862,6 +1902,8 @@ fn render_rows(
         page.append(&grid);
     }
 
+    ui.showed_pending_names
+        .set(drawn.pending_names > 0 && !drawn.rows.is_empty());
     if drawn.pending_names > 0 && !drawn.rows.is_empty() {
         let progress = gtk::Label::builder()
             .label(format!("Looking up {} title names…", drawn.pending_names))
@@ -2217,6 +2259,9 @@ fn render_recents(ui: &Ui) {
         if let Some(path) = model.icons.get(&id) {
             textures::set_image(&image, path, textures::Size::Icon);
         }
+        ui.art_slots
+            .borrow_mut()
+            .add_image(id.clone(), &image, textures::Size::Icon);
         content.append(&image);
         let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
         text.append(
@@ -2306,6 +2351,11 @@ fn render_featured(ui: &Ui, page: &gtk::Box, rows: &[LibraryRow]) {
         if let Some(path) = path {
             textures::set_picture(&art, &path, textures::Size::Hero);
         }
+        ui.art_slots.borrow_mut().add_picture(
+            format!("hero-{}", row.product_id.to_ascii_uppercase()),
+            &art,
+            textures::Size::Hero,
+        );
         overlay.set_child(Some(&art));
         let caption = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -2453,6 +2503,9 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
     if let Some(path) = ui.model.borrow().icons.get(&key) {
         textures::set_picture(&art, path, textures::Size::Cover);
     }
+    ui.art_slots
+        .borrow_mut()
+        .add_picture(key.clone(), &art, textures::Size::Cover);
     let cover = gtk::Overlay::new();
     cover.set_child(Some(&art));
     if row.has_update() {
@@ -2721,6 +2774,11 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
         {
             textures::set_image(&icon, path, textures::Size::Icon);
         }
+        ui.art_slots.borrow_mut().add_image(
+            row.product_id.to_ascii_uppercase(),
+            &icon,
+            textures::Size::Icon,
+        );
         action_row.add_prefix(&icon);
     }
 
@@ -5644,7 +5702,7 @@ fn refresh_account(ui: &Ui) {
                 Answer::Unknown => {}
             }
         }
-        render(&ui);
+        render_soon(&ui);
         refresh_entitlements(&ui, false);
         refresh_updates(&ui, false);
         presence_ui::refresh(&ui, true);
@@ -5741,17 +5799,23 @@ fn refresh_updates(ui: &Ui, force: bool) {
         }
         if let Ok(available) = checked {
             let mut model = ui.model.borrow_mut();
+            let mut changed = false;
             for (record, version) in available {
                 let key = record.product_id.to_ascii_uppercase();
                 if model.records.get(&key) != Some(&record) {
                     continue;
                 }
                 if let Some(version) = version {
-                    model.available.insert(key, version);
+                    if model.available.get(&key) != Some(&version) {
+                        model.available.insert(key, version);
+                        changed = true;
+                    }
                 }
             }
             drop(model);
-            render(&ui);
+            if changed {
+                render_soon(&ui);
+            }
         }
     });
 }
@@ -5865,7 +5929,7 @@ fn refresh_entitlements(ui: &Ui, force: bool) {
             ui.model.borrow_mut().set_ownership(entries);
             if changed {
                 fetch_gamepass(&ui, subscriptions_changed);
-                render(&ui);
+                render_soon(&ui);
             }
         }
     });
@@ -6070,7 +6134,7 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
             }
             preload_gamepass_art(&ui);
             if ui.model.borrow().section == Section::GamePass {
-                render(&ui);
+                render_soon(&ui);
             }
         });
     }
@@ -6081,6 +6145,14 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
 /// off-page, so failures cannot become a request loop on every redraw.
 fn fetch_names(ui: &Ui, product_ids: Vec<String>) {
     if ui.fetching_names.get() {
+        // Only ids nothing has asked about yet need another round.
+        let asked = ui.asked_names.borrow();
+        if product_ids
+            .iter()
+            .any(|id| !asked.contains(&id.to_ascii_uppercase()))
+        {
+            ui.names_requeued.set(true);
+        }
         return;
     }
     let (cache, market, wanted) = {
@@ -6098,6 +6170,7 @@ fn fetch_names(ui: &Ui, product_ids: Vec<String>) {
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let (market, language) = market;
+        let mut any_changed = false;
         // In chunks, so filling in five hundred names shows rows as they land
         // rather than after every request has finished. Each chunk is several
         // batched lookups, so this is not a request per await.
@@ -6120,19 +6193,30 @@ fn fetch_names(ui: &Ui, product_ids: Vec<String>) {
             if found.is_empty() {
                 continue;
             }
+            // Revalidating a warm cache mostly answers what the model already
+            // has. Redraw only for a name or detail that is actually new.
+            let mut changed = false;
             {
                 let mut model = ui.model.borrow_mut();
                 for product in found {
-                    model
-                        .catalog
-                        .insert(product.product_id.to_ascii_uppercase(), product);
+                    let key = product.product_id.to_ascii_uppercase();
+                    if model.catalog.get(&key) != Some(&product) {
+                        model.catalog.insert(key, product);
+                        changed = true;
+                    }
                 }
             }
-            render(&ui);
+            if changed {
+                any_changed = true;
+                render_soon(&ui);
+            }
         }
         ui.fetching_names.set(false);
-        // A section change or explicit refresh may have queued more ids.
-        render(&ui);
+        // A section change or explicit refresh may have queued more ids, and
+        // a "Looking up" line has to go now that nothing is.
+        if any_changed || ui.names_requeued.replace(false) || ui.showed_pending_names.get() {
+            render_soon(&ui);
+        }
     });
 }
 

@@ -344,6 +344,76 @@ fn decode(path: &Path, size: Size) -> Option<(Stamp, Option<gdk::Texture>)> {
     Some((stamp, Some(texture.upcast())))
 }
 
+/// A picture or icon showing a title's art, held weakly.
+enum Slot {
+    Picture(glib::WeakRef<gtk::Picture>, Size),
+    Image(glib::WeakRef<gtk::Image>, Size),
+}
+
+impl Slot {
+    fn alive(&self) -> bool {
+        match self {
+            Slot::Picture(w, _) => w.upgrade().is_some(),
+            Slot::Image(w, _) => w.upgrade().is_some(),
+        }
+    }
+}
+
+/// Where each title's art is on screen, so art that arrives later is put
+/// straight into those widgets. Keys are the upper-case product id for a
+/// cover or icon, and `hero-<ID>` for a banner.
+#[derive(Default)]
+pub(crate) struct Slots(HashMap<String, Vec<Slot>>);
+
+impl Slots {
+    pub(crate) fn add_picture(&mut self, key: String, picture: &gtk::Picture, size: Size) {
+        self.0
+            .entry(key)
+            .or_default()
+            .push(Slot::Picture(picture.downgrade(), size));
+    }
+
+    pub(crate) fn add_image(&mut self, key: String, image: &gtk::Image, size: Size) {
+        self.0
+            .entry(key)
+            .or_default()
+            .push(Slot::Image(image.downgrade(), size));
+    }
+
+    /// Forget widgets that were destroyed.
+    pub(crate) fn prune(&mut self) {
+        self.0.retain(|_, slots| {
+            slots.retain(Slot::alive);
+            !slots.is_empty()
+        });
+    }
+
+    /// Show `path` in every live widget for `key`. False if there is none,
+    /// so the caller knows whether a redraw is still needed.
+    pub(crate) fn fill(&mut self, key: &str, path: &Path) -> bool {
+        let Some(slots) = self.0.get_mut(key) else {
+            return false;
+        };
+        slots.retain(Slot::alive);
+        let targets: Vec<_> = slots
+            .iter()
+            .filter_map(|slot| match slot {
+                Slot::Picture(w, size) => w.upgrade().map(|p| (Some(p), None, *size)),
+                Slot::Image(w, size) => w.upgrade().map(|i| (None, Some(i), *size)),
+            })
+            .collect();
+        for (picture, image, size) in &targets {
+            if let Some(picture) = picture {
+                set_picture(picture, path, *size);
+            }
+            if let Some(image) = image {
+                set_image(image, path, *size);
+            }
+        }
+        !targets.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
