@@ -9774,10 +9774,16 @@ fi
             keep_files: true,
             ..YES
         };
-        uninstall(&paths, GAME, keep).unwrap();
+        assert_eq!(
+            code(uninstall(&paths, GAME, keep).unwrap()),
+            code(ExitCode::SUCCESS)
+        );
         assert!(neural_state::get(&ctx.config_dir, GAME).unwrap().is_some());
         record(&paths, GAME, &dir);
-        uninstall(&paths, GAME, YES).unwrap();
+        assert_eq!(
+            code(uninstall(&paths, GAME, YES).unwrap()),
+            code(ExitCode::SUCCESS)
+        );
         assert!(!dir.exists());
         assert_eq!(neural_state::get(&ctx.config_dir, GAME).unwrap(), None);
     }
@@ -9794,7 +9800,10 @@ fi
         let paths = home.paths();
         neural_turn_on(&ctx, "LOCAL-TEST", &game, Network::SilverAardwold);
         assert_ne!(std::fs::read(game.join("dxgi.dll")).unwrap(), THEIRS);
-        uninstall(&paths, "local-test", YES).unwrap();
+        assert_eq!(
+            code(uninstall(&paths, "local-test", YES).unwrap()),
+            code(ExitCode::SUCCESS)
+        );
         assert_eq!(std::fs::read(game.join("dxgi.dll")).unwrap(), THEIRS);
         assert!(!game.join(apply::INSTALL_MANIFEST).exists());
         assert!(!game.join(apply::BACKUP_DIR).exists());
@@ -9807,7 +9816,10 @@ fi
         // anti-cheat again.
         neural_state::acknowledge(&ctx.config_dir, "LOCAL-TEST", &["BattlEye"]).unwrap();
         local_game_recipe(&home, &game, "", "");
-        uninstall(&paths, "local-test", YES).unwrap();
+        assert_eq!(
+            code(uninstall(&paths, "local-test", YES).unwrap()),
+            code(ExitCode::SUCCESS)
+        );
         assert!(neural_state::acknowledged(&ctx.config_dir, "LOCAL-TEST")
             .unwrap()
             .is_empty());
@@ -9970,7 +9982,7 @@ fi
         let (home, ctx, dir) = neural_xbox_home("neural-enable-cmd");
         std::fs::write(dir.join("dxgi.dll"), THEIRS).unwrap();
         let paths = home.paths();
-        neural_enable(
+        let outcome = neural_enable(
             &cli(),
             &paths,
             &ctx,
@@ -9980,13 +9992,17 @@ fi
             None,
         )
         .unwrap();
+        assert_eq!(code(outcome), code(ExitCode::SUCCESS));
         let entry = neural_state::get(&ctx.config_dir, GAME).unwrap().unwrap();
         assert_eq!(
             (entry.route, entry.model),
             (Route::ReshadeFeeder, Network::SmallFp8)
         );
         assert!(dir.join(apply::INSTALL_MANIFEST).is_file());
-        neural_disable(&cli(), &paths, &ctx, "testgame").unwrap();
+        assert_eq!(
+            code(neural_disable(&cli(), &paths, &ctx, "testgame").unwrap()),
+            code(ExitCode::SUCCESS)
+        );
         assert_eq!(std::fs::read(dir.join("dxgi.dll")).unwrap(), THEIRS);
         assert_eq!(neural_state::get(&ctx.config_dir, GAME).unwrap(), None);
         let error = neural_enable(&cli(), &paths, &ctx, "nothing", None, None, None).unwrap_err();
@@ -10018,7 +10034,7 @@ fi
         assert_eq!(doc["models"].as_array().unwrap().len(), 2);
         assert_eq!(doc["package"]["version"], "0.0.9");
 
-        neural_enable(
+        let outcome = neural_enable(
             &cli(),
             &paths,
             &ctx,
@@ -10028,6 +10044,7 @@ fi
             None,
         )
         .unwrap();
+        assert_eq!(code(outcome), code(ExitCode::SUCCESS));
         let doc = neural_status(&cli(), &paths, &ctx, Some("testgame")).unwrap();
         assert_eq!(doc["product_id"], GAME);
         assert_eq!(doc["entry"]["route"], "reshade-feeder");
