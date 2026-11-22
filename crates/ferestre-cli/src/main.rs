@@ -191,9 +191,10 @@ enum Cmd {
     RollbackAppUpdate,
 
     /// Remove an installed title: its files and the launcher's record of it.
+    /// A local game is only forgotten; its files and prefix are kept.
     #[command(alias = "remove")]
     Uninstall {
-        /// The 12-character Store product id.
+        /// The 12-character Store product id, or a local game's id or slug.
         #[arg(value_name = "PRODUCT-ID")]
         product_id: String,
         /// Forget the record but leave the files where they are.
@@ -1588,6 +1589,46 @@ fn uninstall_title(
     answers: &mut dyn BufRead,
 ) -> Result<ExitCode> {
     let recipes = recipes_for_change(cli, paths)?;
+    // A local game's folder and prefix are the person's, or Steam's
+    // `compatdata`: Remove forgets the game and deletes nothing on disk, so
+    // there is nothing to ask about. `--keep-files` changes nothing.
+    if let Some(recipe) = recipes
+        .iter()
+        .find(|r| r.matches(title))
+        .filter(|r| r.is_local())
+    {
+        let dir = paths.install_dir(recipe)?;
+        if removal.remove_prefix {
+            bail!(
+                "Ferestre never deletes a local game's files or prefix; remove {} yourself if \
+                 you mean to",
+                dir.display()
+            );
+        }
+        let product_id = recipe.title.product_id.to_ascii_uppercase();
+        let _lock = TitleLock::take(paths, &product_id, LockMode::Change)?;
+        let forgotten = ferestre_core::local::forget(paths, &product_id)?;
+        if cli.json {
+            print_json(&json!({
+                "schema": JSON_SCHEMA,
+                "product_id": product_id,
+                "local": true,
+                "forgot": true,
+                "kept": [
+                    forgotten.kept_dir.display().to_string(),
+                    forgotten.kept_prefix.display().to_string(),
+                ],
+            }));
+        } else {
+            eprintln!(
+                "-- forgot {}; its files in {} and its Wine prefix {} are kept",
+                recipe.title.name,
+                forgotten.kept_dir.display(),
+                forgotten.kept_prefix.display()
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     // Only a product id or a recipe's slug. Anything else used to fall
     // through to `<games dir>/<what was typed>`: an empty id named the games
     // directory itself, and `..` named the home directory.
@@ -6973,6 +7014,50 @@ summary = "Runs."
         let outcome = uninstall_title(&cli(), &paths, GAME, removal, &mut yes).unwrap();
         assert_eq!(code(outcome), code(ExitCode::SUCCESS));
         assert!(!prefix.exists());
+    }
+
+    /// A local game's folder and prefix are the person's, or Steam's: Remove
+    /// only forgets the game, and asking for the prefix too is refused.
+    #[test]
+    fn removing_a_local_game_deletes_nothing_on_disk() {
+        let home = Home::new("uninstall-local");
+        let game = home.root().join("drive/Game");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("Game.exe"), b"").unwrap();
+        let prefix = home.root().join("steam/steamapps/compatdata/3000000001");
+        std::fs::create_dir_all(prefix.join("pfx")).unwrap();
+        local_game_recipe(
+            &home,
+            &game,
+            &format!("prefix = \"{}\"", prefix.display()),
+            "",
+        );
+        let paths = home.paths();
+        let with_prefix = Removal {
+            remove_prefix: true,
+            ..YES
+        };
+        assert!(uninstall(&paths, "LOCAL-TEST", with_prefix)
+            .unwrap_err()
+            .to_string()
+            .contains("never deletes"));
+        let listed = [prefix.clone()];
+        let with_listed = Removal {
+            remove_prefix: true,
+            listed: Some(&listed),
+            ..YES
+        };
+        assert!(uninstall(&paths, "LOCAL-TEST", with_listed)
+            .unwrap_err()
+            .to_string()
+            .contains("never deletes"));
+        assert!(paths.user_titles_dir().join("LOCAL-TEST.toml").exists());
+        assert_eq!(
+            uninstall(&paths, "local-test", YES).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert!(game.join("Game.exe").is_file() && prefix.join("pfx").is_dir());
+        assert!(!paths.user_titles_dir().join("LOCAL-TEST.toml").exists());
     }
 
     // -- install ------------------------------------------------------------
