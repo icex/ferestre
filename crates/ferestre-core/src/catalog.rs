@@ -1331,6 +1331,24 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).expect("cleans up");
     }
+    #[test]
+    fn a_local_id_never_reaches_the_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path());
+        let seen = std::cell::RefCell::new(Vec::new());
+        let lookup = |ids: &[&str]| {
+            let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+            resolve_using(&cache, &ids, "US", "en-us", false, |wanted| {
+                seen.borrow_mut().push(wanted.to_vec());
+                (vec![], vec![])
+            })
+        };
+        lookup(&["LOCAL-STEAM-1", "9NBLGGH2JHXJ"]);
+        assert_eq!(*seen.borrow(), [vec!["9NBLGGH2JHXJ".to_string()]]);
+        seen.borrow_mut().clear();
+        lookup(&["LOCAL-STEAM-1"]);
+        assert!(seen.borrow().is_empty(), "{:?}", seen.borrow());
+    }
 }
 
 /// Fetching. Kept apart from everything above so the parsing, the batching, the
@@ -1393,6 +1411,14 @@ fn resolve_using(
     force: bool,
     fetch: impl FnOnce(&[String]) -> (Vec<Product>, Vec<String>),
 ) -> (Vec<Product>, Vec<String>) {
+    // A local game's id is not the Store's, and asking the display catalog
+    // about it would tell Microsoft what someone has on their disk.
+    let ids: Vec<String> = ids
+        .iter()
+        .filter(|id| crate::recipe::is_store_product_id(id))
+        .cloned()
+        .collect();
+    let ids = ids.as_slice();
     let (mut products, _) = cache.split(ids);
     let wanted: Vec<String> = ids
         .iter()

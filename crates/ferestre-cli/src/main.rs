@@ -5036,7 +5036,7 @@ fn shell_quote(s: &str) -> String {
 /// and so the failure names the format instead of coming back from a network
 /// call two minutes later.
 fn is_product_id(s: &str) -> bool {
-    s.len() == 12 && s.chars().all(|c| c.is_ascii_alphanumeric())
+    ferestre_core::recipe::is_store_product_id(s)
 }
 
 fn normalise_product_id(s: &str) -> String {
@@ -6133,6 +6133,7 @@ summary = "Runs."
         assert!(!is_product_id("9NBLGGH2JHX"));
         assert!(!is_product_id("../../etc/passwd"));
         assert!(!is_product_id("--refresh"));
+        assert!(!is_product_id("LOCAL-STEAM-1"));
         assert_eq!(normalise_product_id("9nblggh2jhxj"), "9NBLGGH2JHXJ");
     }
 

@@ -422,7 +422,7 @@ fn matching_entry(entries: &[(String, Value)], shortcut: &Shortcut) -> Option<us
             // a name, and each keeps its own shortcut.
             let product = launched_product(&shortcut.launch_options);
             entries.iter().position(|(_, entry)| {
-                is_ferestre_entry(entry)
+                is_ferestre_shortcut(entry)
                     && entry.get("AppName").and_then(Value::as_str)
                         == Some(shortcut.app_name.as_str())
                     && entry
@@ -480,8 +480,10 @@ fn launched_product(options: &str) -> Option<&str> {
 
 /// Whether an entry was written by Ferestre: it starts the launcher (`Exe` is
 /// `ferestre` or a Ferestre AppImage), or it runs a product the way the
-/// launcher's shortcuts do (`run <product id>`).
-fn is_ferestre_entry(entry: &Value) -> bool {
+/// launcher's shortcuts do (`run <product id>`, or `run <local id>` for a
+/// game Ferestre did not install). Steam import uses it to skip the
+/// launcher's own shortcuts.
+pub fn is_ferestre_shortcut(entry: &Value) -> bool {
     let exe = entry.get("Exe").and_then(Value::as_str).unwrap_or_default();
     let program = Path::new(exe.trim().trim_matches('"'))
         .file_name()
@@ -496,7 +498,7 @@ fn is_ferestre_entry(entry: &Value) -> bool {
         .is_some_and(|options| {
             let words: Vec<&str> = options.split_whitespace().collect();
             matches!(words.as_slice(), ["run", id]
-                if id.len() == 12 && id.bytes().all(|b| b.is_ascii_alphanumeric()))
+                if crate::recipe::is_store_product_id(id) || crate::local::is_local_id(id))
         });
     launcher || runs_a_product
 }
@@ -1422,5 +1424,18 @@ mod tests {
             .as_map()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn a_shortcut_that_runs_a_local_game_is_ferestres() {
+        let entry = |options: &str| {
+            Value::Map(vec![
+                ("Exe".into(), Value::Str("\"/usr/bin/env\"".into())),
+                ("LaunchOptions".into(), Value::Str(options.into())),
+            ])
+        };
+        assert!(is_ferestre_shortcut(&entry("run LOCAL-STEAM-12")));
+        assert!(is_ferestre_shortcut(&entry("run 9NBLGGH2JHXJ")));
+        assert!(!is_ferestre_shortcut(&entry("%command% -dx12")));
     }
 }
