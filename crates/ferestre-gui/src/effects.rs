@@ -179,11 +179,6 @@ window.blur-ok .notification, window.blur-ok .notification-more {
   background-color: alpha(#24272d, 0.68);
   backdrop-filter: blur(18px);
 }
-window.blur-ok .hero-caption {
-  background-image: none;
-  background-color: alpha(#15171b, 0.45);
-  backdrop-filter: blur(16px);
-}
 window.blur-ok .search-pill {
   background-color: alpha(#2a2d33, 0.7);
   backdrop-filter: blur(14px);

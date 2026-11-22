@@ -283,8 +283,11 @@ fn navigation_buttons(ui: &Ui) -> Vec<gtk::Widget> {
         }
         recent = widget.next_sibling();
     }
-    if let Some(button) = named_widget(ui.window.upcast_ref(), "navigation-settings") {
-        items.push(button);
+    for name in ["navigation-downloads", "navigation-settings"] {
+        if let Some(button) = named_widget(ui.window.upcast_ref(), name).filter(|b| b.is_visible())
+        {
+            items.push(button);
+        }
     }
     items
 }
@@ -472,6 +475,26 @@ fn move_main(ui: &Ui, action: Action) -> bool {
         focus_content(ui);
         return true;
     };
+    // Left and Right on the Home hero turn it; Left on its first title goes
+    // to the navigation, as Left from the first column does.
+    if focus.has_css_class("hero-centre") && matches!(action, Action::Left | Action::Right) {
+        if action == Action::Left && focus.has_css_class("hero-first") {
+            focus_navigation(ui);
+            return true;
+        }
+        let name = if action == Action::Left {
+            "hero-previous"
+        } else {
+            "hero-next"
+        };
+        if let Some(button) = named_widget(ui.content.upcast_ref(), name)
+            .filter(|b| b.is_visible())
+            .and_then(|b| b.downcast::<gtk::Button>().ok())
+        {
+            button.emit_clicked();
+            return true;
+        }
+    }
     let buttons = main_controls(ui);
     let Some(index) = buttons
         .iter()
