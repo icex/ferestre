@@ -200,6 +200,7 @@ window.fullscreen-browser button, window.fullscreen-browser menubutton > button 
 .ferestre-window .navigation-sidebar row { min-height: 44px; border-radius: 8px; margin: 2px 8px; font-size: 14px; font-weight: 600; }
 .ferestre-window .navigation-sidebar row:selected { background-color: #3a3e46; color: #ffffff; }
 .ferestre-window .navigation-sidebar row:hover:not(:selected) { background-color: alpha(#ffffff, 0.05); }
+.ferestre-window button.current-page { background-color: #3a3e46; color: #ffffff; }
 .sidebar-heading { font-size: 12px; letter-spacing: 0.4px; }
 .sidebar-recents button { padding: 6px 8px; border-radius: 8px; min-height: 0; }
 .sidebar-recents button:hover { background-color: alpha(#ffffff, 0.06); }
@@ -670,6 +671,8 @@ fn build_ui(app: &adw::Application) {
     content_header.set_title_widget(Some(&search_slot));
     let back = gtk::Button::from_icon_name("go-previous-symbolic");
     back.set_tooltip_text(Some("Back to Home"));
+    // Shown away from Home only: on Home it would lead nowhere.
+    back.set_widget_name("content-back");
     content_header.pack_start(&back);
     content_header.pack_end(&refresh);
     content_header.pack_end(&spinner);
@@ -1355,6 +1358,20 @@ fn render(ui: &Ui) {
     ));
     render_account_button(ui);
     render_recents(ui);
+    if let Some(back) = named_widget(ui.window.upcast_ref(), "content-back") {
+        back.set_visible(section != Section::Home);
+    }
+    // Settings is a footer button, not a sidebar row: mark it as the current
+    // page the way the selected row is.
+    if let Some(settings) = named_widget(ui.window.upcast_ref(), "navigation-settings") {
+        if section == Section::Runtime {
+            settings.add_css_class("current-page");
+            settings.update_state(&[gtk::accessible::State::Selected(Some(true))]);
+        } else {
+            settings.remove_css_class("current-page");
+            settings.reset_state(gtk::AccessibleState::Selected);
+        }
+    }
 
     // PreferencesPage owns a second ScrolledWindow. Recreating it for a
     // title action resets that inner viewport to zero. Keep one persistent
@@ -1534,6 +1551,22 @@ fn reset_account_roles(ui: &Ui) {
     }
 }
 
+/// Turn compact mode on or off from the account menu or Settings, and
+/// remember it.
+fn choose_compact(ui: &Ui, on: bool) {
+    if ui.compact.get() == on {
+        return;
+    }
+    if let Err(error) = handheld::save_preference(ui, "compact", on) {
+        ui.toasts.add_toast(toast(format!(
+            "Could not save the sidebar setting: {error}"
+        )));
+    }
+    let ui = ui.clone();
+    // After the switch has drawn its new state.
+    glib::idle_add_local_once(move || sidebar::set_compact(&ui, on));
+}
+
 fn render_runtime(ui: &Ui, page: &gtk::Box) {
     let packaged = std::env::var("FERESTRE_PACKAGE_VERSION").ok();
     let release = adw::PreferencesGroup::new();
@@ -1560,6 +1593,21 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
     release_row.add_suffix(&quit);
     release.add(&release_row);
     page.append(&release);
+
+    // Here as well as in the account menu, which needs a signed-in account.
+    let appearance = adw::PreferencesGroup::builder().title("Appearance").build();
+    let compact = adw::SwitchRow::builder()
+        .title("Compact sidebar")
+        .subtitle("Show the sidebar as a rail of icons")
+        .active(ui.compact.get())
+        .build();
+    compact.connect_active_notify(glib::clone!(
+        #[strong]
+        ui,
+        move |row| choose_compact(&ui, row.is_active())
+    ));
+    appearance.add(&compact);
+    page.append(&appearance);
 
     let model = ui.model.borrow();
     let (title, subtitle) = model::runtime_summary(model.runtime.as_ref());
@@ -3599,20 +3647,7 @@ fn account_menu(ui: &Ui) {
     compact.connect_active_notify(glib::clone!(
         #[strong]
         ui,
-        move |switch| {
-            let on = switch.is_active();
-            if ui.compact.get() == on {
-                return;
-            }
-            if let Err(error) = handheld::save_preference(&ui, "compact", on) {
-                ui.toasts.add_toast(toast(format!(
-                    "Could not save the sidebar setting: {error}"
-                )));
-            }
-            let ui = ui.clone();
-            // After the switch has drawn its new state.
-            glib::idle_add_local_once(move || sidebar::set_compact(&ui, on));
-        }
+        move |switch| choose_compact(&ui, switch.is_active())
     ));
     compact_row.append(&compact);
     items.append(&compact_row);
