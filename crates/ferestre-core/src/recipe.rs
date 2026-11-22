@@ -415,7 +415,7 @@ impl Recipe {
             ),
         }
         if let Some(prefix) = self.install.prefix.as_deref() {
-            if prefix.starts_with('/') && has_parent(prefix) {
+            if has_parent(prefix) {
                 anyhow::bail!("[install].prefix of a local game must not contain `..`");
             }
             if prefix.starts_with('/') && !deep_enough(prefix) {
@@ -1466,6 +1466,20 @@ summary = "Imported from Steam"
             );
             let text = good.replace(from, to);
             assert!(Recipe::parse(&text).is_err(), "accepted: {from} -> {to}");
+        }
+    }
+
+    #[test]
+    fn a_local_prefix_never_climbs_out_relative_or_absolute() {
+        let good = local("").unwrap().to_toml().unwrap();
+        for prefix in [
+            "../outside-proton",
+            "games/../../etc",
+            "/run/media/me/../etc/pfx",
+        ] {
+            let text = good.replace("[launch]", &format!("prefix = \"{prefix}\"\n[launch]"));
+            let err = Recipe::parse(&text).expect_err(prefix).to_string();
+            assert!(err.contains("must not contain `..`"), "{prefix}: {err}");
         }
     }
 
