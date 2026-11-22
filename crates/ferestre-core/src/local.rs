@@ -45,6 +45,172 @@ pub fn new_id(name: &str, taken: &dyn Fn(&str) -> bool) -> String {
         .expect("some suffix is free")
 }
 
+/// Folder names that say where a game keeps its binaries, not what it is.
+const BINARY_FOLDERS: [&str; 10] = [
+    "bin", "binaries", "win64", "win32", "x64", "x86", "x64_dx12", "retail", "shipping", "game",
+];
+
+/// A game's name from its executable: the first folder above it that is not
+/// a binaries folder (`bin`, `x64`, `Binaries`...), else the program's own
+/// name.
+pub fn derive_name(exe: &Path) -> String {
+    exe.ancestors()
+        .skip(1)
+        .map_while(|dir| dir.file_name().and_then(|n| n.to_str()))
+        .find(|name| {
+            !BINARY_FOLDERS
+                .iter()
+                .any(|known| name.eq_ignore_ascii_case(known))
+        })
+        .map(str::to_owned)
+        .or_else(|| exe.file_stem().and_then(|s| s.to_str()).map(str::to_owned))
+        .unwrap_or_else(|| "Game".to_owned())
+}
+
+/// A game to add by hand.
+#[derive(Debug, Clone, Default)]
+pub struct AddRequest {
+    /// The program to start: absolute, existing, `.exe` or `.bat`.
+    pub exe: PathBuf,
+    /// Defaults to [`derive_name`].
+    pub name: Option<String>,
+    /// The game's folder; defaults to the program's folder.
+    pub dir: Option<PathBuf>,
+    /// Its Wine prefix: absolute as it is, relative under the games
+    /// directory, `None` for a managed one.
+    pub prefix: Option<PathBuf>,
+    /// A runtime's path, or the name Steam gives one of its tools.
+    pub runtime: Option<String>,
+}
+
+/// Add a local game: write its user recipe and, when one is named, its
+/// runtime choice. The game's files are only looked at.
+pub fn add(paths: &Paths, request: &AddRequest) -> anyhow::Result<Recipe> {
+    let exe = &request.exe;
+    let lower = exe.to_string_lossy().to_ascii_lowercase();
+    if !exe.is_absolute() {
+        anyhow::bail!("{}: give the program's full path", exe.display());
+    }
+    if !(lower.ends_with(".exe") || lower.ends_with(".bat")) {
+        anyhow::bail!("{}: not a Windows program (.exe or .bat)", exe.display());
+    }
+    if !exe.is_file() {
+        anyhow::bail!("{}: no such file", exe.display());
+    }
+    let dir = match &request.dir {
+        Some(dir) => dir.clone(),
+        None => exe
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| anyhow::anyhow!("{}: has no folder", exe.display()))?,
+    };
+    if !dir.is_absolute() || !dir.is_dir() {
+        anyhow::bail!(
+            "{}: the game's folder must be an existing absolute folder",
+            dir.display()
+        );
+    }
+    if let Some(why) = too_broad(paths, &dir) {
+        anyhow::bail!("{why}; choose the game's own folder");
+    }
+    if let Some(why) = request
+        .prefix
+        .as_deref()
+        .filter(|p| p.is_absolute())
+        .and_then(|p| too_broad(paths, p))
+    {
+        anyhow::bail!("{why}; choose a folder for this game's prefix alone");
+    }
+    let name = request
+        .name
+        .clone()
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| derive_name(exe));
+
+    let (recipes, _) = Recipe::load_layered_report(&paths.title_dirs());
+    let id = new_id(&name, &|id| {
+        recipes
+            .iter()
+            .any(|r| r.title.product_id.eq_ignore_ascii_case(id))
+    });
+    let executable = match exe.strip_prefix(&dir) {
+        Ok(inside) => inside.display().to_string(),
+        Err(_) => exe.display().to_string(),
+    };
+    let mut recipe = Recipe::blank(&id, &name);
+    recipe.title.kind = crate::recipe::TitleKind::Local;
+    recipe.title.slug = id.to_ascii_lowercase();
+    recipe.install.dir = Some(dir.display().to_string());
+    recipe.install.prefix = request.prefix.as_ref().map(|p| p.display().to_string());
+    recipe.launch.executable = executable;
+    recipe.status.summary = "Added by hand".into();
+    let recipe = Recipe::parse(&recipe.to_toml()?)?;
+
+    let chosen = match &request.runtime {
+        None => None,
+        Some(wanted) => {
+            let available = crate::runtime::for_recipe(paths, &recipe);
+            let tools = crate::runtime::steam_tools(paths);
+            let path = match crate::runtime::steam_tool(&tools, wanted) {
+                Some(tool) if !wanted.contains('/') => tool.dir.clone(),
+                _ => PathBuf::from(wanted),
+            };
+            let resolve = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            let found = available
+                .iter()
+                .find(|rt| rt.path == path || resolve(&rt.path) == resolve(&path));
+            match found {
+                Some(rt) => Some(rt.path.clone()),
+                None => {
+                    let mut names: Vec<String> = available
+                        .iter()
+                        .map(|rt| rt.path.display().to_string())
+                        .collect();
+                    names.extend(
+                        tools
+                            .iter()
+                            .filter(|t| available.iter().any(|rt| rt.path == t.dir))
+                            .map(|t| t.name.clone()),
+                    );
+                    anyhow::bail!(
+                        "{wanted} is not an installed runtime; available: {}",
+                        if names.is_empty() {
+                            "none".to_owned()
+                        } else {
+                            names.join(", ")
+                        }
+                    );
+                }
+            }
+        }
+    };
+
+    if recipe.save_new_to(&paths.user_titles_dir())?.is_none() {
+        anyhow::bail!("{id} was added at the same moment by something else; try again");
+    }
+    if let Some(path) = chosen {
+        crate::runtime::set_selected(paths.config_dir(), &id, Some(&path))?;
+    }
+    Ok(recipe)
+}
+
+/// Where a local game's program is: its folder joined with its executable,
+/// `\` read as `/` (an absolute executable is used as it is). `None` for a
+/// Store title.
+pub fn executable_path(recipe: &Recipe) -> Option<PathBuf> {
+    if !recipe.is_local() {
+        return None;
+    }
+    let dir = recipe.install.dir.as_deref()?;
+    Some(Path::new(dir).join(recipe.launch.executable.replace('\\', "/")))
+}
+
+/// Whether a local game's program is on disk. A game on a drive that is not
+/// mounted is not.
+pub fn is_present(recipe: &Recipe) -> bool {
+    executable_path(recipe).is_some_and(|p| p.is_file())
+}
+
 /// What forgetting a local game removed, and the folders it left alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Forgotten {
@@ -374,5 +540,142 @@ mod tests {
         );
         assert!(!art.join("portrait.jpeg").exists());
         assert!(save_artwork(&paths, "9NBLGGH2JHXJ", &files).is_err());
+    }
+
+    #[test]
+    fn names_come_from_the_games_folder_not_its_binaries_folder() {
+        assert_eq!(
+            derive_name(Path::new("/g/Cyberpunk 2077/bin/x64/Cyberpunk2077.exe")),
+            "Cyberpunk 2077"
+        );
+        assert_eq!(
+            derive_name(Path::new("/g/Witcher 3/bin/x64_dx12/witcher3.exe")),
+            "Witcher 3"
+        );
+        assert_eq!(
+            derive_name(Path::new("/g/Gears/Game/Binaries/Win64/Shipping/G.exe")),
+            "Gears"
+        );
+        assert_eq!(derive_name(Path::new("/x64/Game.exe")), "Game");
+    }
+
+    fn local_recipe_at(dir: &Path, executable: &str) -> Recipe {
+        Recipe::parse(&format!(
+            "schema = 1\n[title]\nproduct-id = \"LOCAL-T\"\nname = \"T\"\n\
+             slug = \"local-t\"\nkind = \"local\"\n[install]\ndir = \"{}\"\n\
+             [launch]\nexecutable = '{executable}'\n[status]\nstate = \"untested\"\n\
+             summary = \"Added by hand\"\n",
+            dir.display()
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_backslash_executable_is_found_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("D");
+        std::fs::create_dir_all(dir.join("bin/x64")).unwrap();
+        std::fs::write(dir.join("bin/x64/Game.exe"), b"").unwrap();
+        let recipe = local_recipe_at(&dir, r"bin\x64\Game.exe");
+        assert_eq!(
+            executable_path(&recipe).unwrap(),
+            dir.join("bin/x64/Game.exe")
+        );
+        assert!(is_present(&recipe));
+        let missing = local_recipe_at(&dir, "bin/x64/Missing.exe");
+        assert!(!is_present(&missing));
+        let elsewhere = tmp.path().join("Other/Launcher.exe");
+        std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+        std::fs::write(&elsewhere, b"").unwrap();
+        let absolute = local_recipe_at(&dir, elsewhere.to_str().unwrap());
+        assert_eq!(executable_path(&absolute), Some(elsewhere));
+        let xbox = Recipe::blank("9NBLGGH2JHXJ", "Xbox Game");
+        assert_eq!(executable_path(&xbox), None);
+        assert!(!is_present(&xbox));
+    }
+
+    #[test]
+    fn adding_twice_gives_two_ids_and_an_unknown_runtime_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = test_paths(home.path());
+        let exe = home.path().join("Games/RDR2/RDR2.exe");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"").unwrap();
+        let request = |runtime: Option<&str>| AddRequest {
+            exe: exe.clone(),
+            name: None,
+            dir: None,
+            prefix: None,
+            runtime: runtime.map(String::from),
+        };
+        let first = add(&paths, &request(None)).unwrap();
+        assert_eq!(
+            (first.title.product_id.as_str(), first.title.name.as_str()),
+            ("LOCAL-RDR2", "RDR2")
+        );
+        assert_eq!(first.install.dir.as_deref(), exe.parent().unwrap().to_str());
+        assert_eq!(first.launch.executable, "RDR2.exe");
+        assert_eq!(first.status.summary, "Added by hand");
+        assert!(paths.user_titles_dir().join("LOCAL-RDR2.toml").is_file());
+        let second = add(&paths, &request(None)).unwrap();
+        assert_eq!(second.title.product_id, "LOCAL-RDR2-2");
+
+        let e = add(&paths, &request(Some("GE-Proton99"))).unwrap_err();
+        assert!(format!("{e:#}").contains("GE-Proton99"), "{e:#}");
+        assert!(!paths.user_titles_dir().join("LOCAL-RDR2-3.toml").exists());
+        for bad in ["relative.exe", "/nonexistent/ferestre/Game.exe"] {
+            let request = AddRequest {
+                exe: bad.into(),
+                name: None,
+                dir: None,
+                prefix: None,
+                runtime: None,
+            };
+            assert!(add(&paths, &request).is_err(), "{bad}");
+        }
+        let not_windows = home.path().join("Games/RDR2/run.sh");
+        std::fs::write(&not_windows, b"").unwrap();
+        let request = AddRequest {
+            exe: not_windows,
+            name: None,
+            dir: None,
+            prefix: None,
+            runtime: None,
+        };
+        assert!(add(&paths, &request).is_err());
+    }
+
+    #[test]
+    fn a_steam_proton_is_chosen_by_name_with_a_named_prefix() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = test_paths(home.path());
+        let ge = home
+            .path()
+            .join(".local/share/Steam/compatibilitytools.d/GE-Proton10-25");
+        std::fs::create_dir_all(&ge).unwrap();
+        std::fs::write(ge.join("proton"), b"#!/usr/bin/env python3\n").unwrap();
+        let exe = home.path().join("drive/Witcher 3/bin/x64/witcher3.exe");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"").unwrap();
+        let game = home.path().join("drive/Witcher 3");
+        let recipe = add(
+            &paths,
+            &AddRequest {
+                exe,
+                name: Some("The Witcher 3".into()),
+                dir: Some(game.clone()),
+                prefix: Some("witcher-prefix".into()),
+                runtime: Some("GE-Proton10-25".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(recipe.title.product_id, "LOCAL-THE-WITCHER-3");
+        assert_eq!(recipe.install.dir.as_deref(), game.to_str());
+        assert_eq!(recipe.launch.executable, "bin/x64/witcher3.exe");
+        assert_eq!(recipe.install.prefix.as_deref(), Some("witcher-prefix"));
+        assert_eq!(
+            runtime::selected(paths.config_dir(), "LOCAL-THE-WITCHER-3"),
+            Some(ge)
+        );
     }
 }
