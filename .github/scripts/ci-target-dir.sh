@@ -10,7 +10,8 @@
 # and cache version, is its own, and none of them has ever hit. So the CI jobs
 # build into ~/.cache/ferestre-ci/<name> instead, through a symlink at the
 # usual path, which the tests that look for target/debug/... still find. Only
-# what changed is rebuilt.
+# what changed is rebuilt. rust.yml names it ferestre-pr for pull requests and
+# ferestre-push for main and dev, so the two never share build output.
 #
 # The symlink only ever goes at the top of the checkout, where checkout's
 # clean step removes it before the next job, a release included. Inside a
