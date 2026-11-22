@@ -1,0 +1,28 @@
+schema = 1
+
+[title]
+product-id = "BSLX1RNXR6H7"
+name = "Batman: Arkham Knight"
+slug = "batman-arkham-knight"
+
+[launch]
+executable = 'Binaries\Win64\BatmanAK.exe'
+
+[runtime]
+requires = [
+    "loader.memfd-main-image",
+    "xgameruntime.user",
+    "xgameruntime.default-save-configuration",
+]
+wants = ["appmodel.package-identity"]
+
+[status]
+state = "playable"
+summary = "Signs in, creates its save and starts the campaign; checked headless, not yet played through by a person."
+last-verified = 2026-11-22
+verified-with = "Xbox PC package 1.0.0.0, tools/headless-title.sh with scripted input past New Game Options to the opening scene."
+
+[[issues]]
+symptom = "After New Game Options the save spinner turns and the game never starts"
+cause = "The game opens its save provider with no configuration id, which older runtimes refused, so it has nowhere to save."
+fix = "Use a runtime advertising xgameruntime.default-save-configuration."

@@ -259,9 +259,18 @@ verify = [
 ]
 
 [[capability]]
+name = "xgameruntime.default-save-configuration"
+summary = "XGameSave opens a provider for a null configuration id, using the SCID MicrosoftGame.config names under SaveGameStorage."
+provided-by = ["https://github.com/icex/xgameruntime/commit/28bbbac2c83acd7ecb42121db69842fcb6672cc0"]
+symptom-if-missing = "Batman: Arkham Knight never finishes its first save after New Game Options; the save spinner turns for good."
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "no configuration id" },
+]
+
+[[capability]]
 name = "xgameruntime.async-callback-wait"
 summary = "Blocking XAsync status waits can include thread pool completion callbacks."
-provided-by = ["https://github.com/icex/xgameruntime/commit/c93cb86d5ca6082e58c309d32e6600857941350a"]
+provided-by = ["https://github.com/icex/xgameruntime/commit/be80c97d34e09340f4bf955d740fa03d1b073dab"]
 symptom-if-missing = "Hogwarts Legacy reads its Xbox user or Store license token before the callback supplies it."
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "XGR_WAIT_FOR_ASYNC_CALLBACKS" },

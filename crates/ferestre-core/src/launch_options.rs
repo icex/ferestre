@@ -157,6 +157,14 @@ pub const OPTIONS: &[LaunchOption] = &[
         capability: None,
     },
     LaunchOption {
+        key: "XGR_WAIT_FOR_ASYNC_CALLBACKS",
+        section: Section::Compatibility,
+        title: "Wait for completion callbacks",
+        help: "A blocking status check also waits for the operation's callback, for titles that read what it set straight after.",
+        kind: SWITCH_ON,
+        capability: Some("xgameruntime.async-callback-wait"),
+    },
+    LaunchOption {
         key: "XGR_STORE_CATALOG",
         section: Section::Compatibility,
         title: "Live Store catalog",
