@@ -22,5 +22,7 @@ requires = [
 ]
 
 [status]
-state = "untested"
-summary = "Package 1.0.22.0 launched with a local runtime build that waits for the Xbox callbacks."
+state = "playable"
+summary = "Player confirmed Xbox sign-in and two hours of gameplay with callback waits enabled, following an earlier startup crash that cleared on retry."
+last-verified = 2026-11-22
+verified-with = "Xbox PC package 1.0.22.0 with the locally patched runtime."
