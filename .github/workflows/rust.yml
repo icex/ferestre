@@ -535,10 +535,11 @@ jobs:
         with:
           persist-credentials: false
 
+      # The Atspi bindings for the action-export unit tests.
       - name: System libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev gir1.2-atspi-2.0 python3-gi
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
