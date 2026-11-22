@@ -1,0 +1,22 @@
+schema = 1
+
+[title]
+product-id = "9NJ2FD5HJ7SB"
+name = "Crash Bandicoot N. Sane Trilogy"
+slug = "crash-bandicoot-n-sane-trilogy"
+
+[launch]
+executable = "CrashBandicootNSaneTrilogy.exe"
+
+[runtime]
+requires = [
+    "loader.memfd-main-image",
+    "xgameruntime.user",
+]
+wants = ["appmodel.package-identity"]
+
+[status]
+state = "playable"
+summary = "Starts and plays; checked by a person."
+last-verified = 2026-11-22
+verified-with = "Xbox PC package 1.0.3.0, played by a person; three minutes headless on the title screen first."
