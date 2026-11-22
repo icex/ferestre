@@ -125,6 +125,71 @@ fn user_recipe_files(paths: &Paths, id: &str) -> Vec<PathBuf> {
     files
 }
 
+/// The picture slots a local game's art fills, as `ArtworkFiles` names them.
+const ART_SLOTS: [&str; 5] = ["portrait", "landscape", "hero", "logo", "icon"];
+const ART_EXTENSIONS: [&str; 3] = ["png", "jpg", "jpeg"];
+
+fn art_slot<'a>(files: &'a mut crate::steam::ArtworkFiles, slot: &str) -> &'a mut Option<PathBuf> {
+    match slot {
+        "portrait" => &mut files.portrait,
+        "landscape" => &mut files.landscape,
+        "hero" => &mut files.hero,
+        "logo" => &mut files.logo,
+        _ => &mut files.icon,
+    }
+}
+
+/// The art Ferestre keeps for a local game: whichever of
+/// `portrait|landscape|hero|logo|icon.{png,jpg,jpeg}` is in its art folder.
+pub fn artwork(paths: &Paths, product_id: &str) -> crate::steam::ArtworkFiles {
+    let mut files = crate::steam::ArtworkFiles::default();
+    let Some(dir) = paths.local_art_dir(product_id) else {
+        return files;
+    };
+    for slot in ART_SLOTS {
+        *art_slot(&mut files, slot) = ART_EXTENSIONS
+            .iter()
+            .map(|ext| dir.join(format!("{slot}.{ext}")))
+            .find(|p| p.is_file());
+    }
+    files
+}
+
+/// Copy a local game's art into its art folder, each picture as
+/// `<slot>.<its extension>`. A slot that already has a picture keeps it, so
+/// art the person chose is never replaced by an import.
+pub fn save_artwork(
+    paths: &Paths,
+    product_id: &str,
+    files: &crate::steam::ArtworkFiles,
+) -> anyhow::Result<()> {
+    let dir = paths
+        .local_art_dir(product_id)
+        .ok_or_else(|| anyhow::anyhow!("{product_id} is not a local game's id"))?;
+    let mut have = artwork(paths, product_id);
+    let mut wanted = files.clone();
+    for slot in ART_SLOTS {
+        if art_slot(&mut have, slot).is_some() {
+            continue;
+        }
+        let Some(source) = art_slot(&mut wanted, slot).clone() else {
+            continue;
+        };
+        let Some(ext) = source
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .filter(|e| ART_EXTENSIONS.contains(&e.as_str()))
+        else {
+            continue;
+        };
+        let bytes =
+            std::fs::read(&source).map_err(|e| anyhow::anyhow!("{}: {e}", source.display()))?;
+        crate::cache::write(&dir.join(format!("{slot}.{ext}")), &bytes)?;
+    }
+    Ok(())
+}
+
 /// Why `dir` is too broad to be one local game's folder or prefix: it is, or
 /// holds, the home directory, the games directory or another directory the
 /// launcher never removes. `None` when it is narrow enough.
@@ -273,5 +338,41 @@ mod tests {
             assert!(too_broad(&paths, &broad).is_some(), "{}", broad.display());
         }
         assert_eq!(too_broad(&paths, &home.path().join("drive/Game")), None);
+    }
+
+    #[test]
+    fn artwork_is_copied_once_and_never_over_a_slot() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = test_paths(home.path());
+        let src = home.path().join("grid");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("1p.PNG"), b"portrait").unwrap();
+        std::fs::write(src.join("1_hero.jpg"), b"hero").unwrap();
+        let files = crate::steam::ArtworkFiles {
+            portrait: Some(src.join("1p.PNG")),
+            hero: Some(src.join("1_hero.jpg")),
+            ..Default::default()
+        };
+        assert!(artwork(&paths, "LOCAL-STEAM-1").portrait.is_none());
+        save_artwork(&paths, "LOCAL-STEAM-1", &files).unwrap();
+        let art = paths.local_art_dir("LOCAL-STEAM-1").unwrap();
+        let found = artwork(&paths, "LOCAL-STEAM-1");
+        assert_eq!(found.portrait, Some(art.join("portrait.png")));
+        assert_eq!(found.hero, Some(art.join("hero.jpg")));
+        assert!(found.landscape.is_none() && found.logo.is_none() && found.icon.is_none());
+
+        // A second copy, from another picture, keeps the first.
+        std::fs::write(src.join("other.jpeg"), b"other").unwrap();
+        let other = crate::steam::ArtworkFiles {
+            portrait: Some(src.join("other.jpeg")),
+            ..Default::default()
+        };
+        save_artwork(&paths, "LOCAL-STEAM-1", &other).unwrap();
+        assert_eq!(
+            std::fs::read(art.join("portrait.png")).unwrap(),
+            b"portrait"
+        );
+        assert!(!art.join("portrait.jpeg").exists());
+        assert!(save_artwork(&paths, "9NBLGGH2JHXJ", &files).is_err());
     }
 }
