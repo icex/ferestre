@@ -10,6 +10,30 @@ pub(super) const SECTIONS: [(&str, Section); 6] = [
     ("Install Queue", Section::Downloads),
 ];
 
+/// A saved window preference (`window.json`), such as `fullscreen` or
+/// `compact`.
+pub(super) fn read_preference(ui: &Ui, key: &str) -> Option<bool> {
+    preference(ui)
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get(key).and_then(|v| v.as_bool()))
+}
+
+/// Save one window preference, keeping the others.
+pub(super) fn save_preference(ui: &Ui, key: &str, value: bool) -> anyhow::Result<()> {
+    let Some(path) = preference(ui) else {
+        return Ok(());
+    };
+    let mut saved = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    saved[key] = serde_json::Value::Bool(value);
+    ferestre_core::cache::write(&path, &serde_json::to_vec(&saved)?)?;
+    Ok(())
+}
+
 fn preference(ui: &Ui) -> Option<PathBuf> {
     ui.model
         .borrow()
@@ -77,15 +101,10 @@ pub(super) fn install(
         };
         button.set_tooltip_text(Some(&format!("{label} (F11)")));
         button.update_property(&[gtk::accessible::Property::Label(label)]);
-        if let Some(path) = preference(ui) {
-            if let Err(error) = ferestre_core::cache::write(
-                &path,
-                &serde_json::to_vec(&serde_json::json!({"fullscreen": fullscreen})).unwrap(),
-            ) {
-                ui.toasts.add_toast(toast(format!(
-                    "Could not save fullscreen preference: {error}"
-                )));
-            }
+        if let Err(error) = save_preference(ui, "fullscreen", fullscreen) {
+            ui.toasts.add_toast(toast(format!(
+                "Could not save fullscreen preference: {error}"
+            )));
         }
         render(ui);
         if fullscreen {
@@ -101,12 +120,7 @@ pub(super) fn install(
             split.set_collapsed(true);
         }
     });
-    if preference(ui)
-        .and_then(|p| std::fs::read(p).ok())
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|v| v.get("fullscreen").and_then(|v| v.as_bool()))
-        == Some(true)
-    {
+    if read_preference(ui, "fullscreen") == Some(true) {
         ui.window.fullscreen();
     }
 }

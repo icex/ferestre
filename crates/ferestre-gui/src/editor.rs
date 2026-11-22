@@ -382,11 +382,11 @@ pub fn present(
         .build();
     header.pack_start(&reset);
 
-    let toasts = adw::ToastOverlay::new();
+    let toasts = crate::notifications::Toasts::new();
     toasts.set_child(Some(&page));
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&toasts));
+    toolbar.set_content(Some(toasts.widget()));
     dialog.set_child(Some(&toolbar));
 
     {

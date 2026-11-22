@@ -44,6 +44,7 @@ on:
       - 'tests/gui_launch.py'
       - 'tests/gui_running.py'
       - 'tests/gui_already_running.py'
+      - 'tests/gui_notifications.py'
       - 'tests/gui_controller_install.py'
       - 'tests/gui_accounts_controller.py'
       - 'tests/gui_runtime_selection.py'
@@ -107,6 +108,7 @@ on:
       - 'tests/gui_launch.py'
       - 'tests/gui_running.py'
       - 'tests/gui_already_running.py'
+      - 'tests/gui_notifications.py'
       - 'tests/gui_controller_install.py'
       - 'tests/gui_accounts_controller.py'
       - 'tests/gui_runtime_selection.py'
@@ -503,6 +505,11 @@ jobs:
         run: |
           xvfb-run -a --error-file=/dev/stderr --server-num=129 --server-args='-screen 0 1280x900x24 -noreset' \
             dbus-run-session -- python3 tests/gui_already_running.py
+
+      - name: Notifications stack, dismiss and take keyboard focus (offline)
+        run: |
+          xvfb-run -a --error-file=/dev/stderr --server-num=138 --server-args='-screen 0 1280x900x24 -noreset' \
+            dbus-run-session -- python3 tests/gui_notifications.py
 
       - name: Controller keyboard, install destination and queue (offline)
         run: |

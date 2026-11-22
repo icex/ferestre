@@ -19,7 +19,6 @@ pub(super) struct Queue {
     attempted: BTreeSet<String>,
     active: usize,
     generation: u64,
-    redraw_pending: bool,
 }
 impl Queue {
     fn add(&mut self, product: catalog::Product, visible: bool, cover: bool, hero: bool) {
@@ -129,17 +128,26 @@ fn kick(ui: &Ui) {
             if current {
                 if let Some(Ok(Ok(path))) = result {
                     let visible = ui.artwork.borrow().visible.contains(&key);
-                    ui.model.borrow_mut().icons.insert(key, path);
-                    if visible {
-                        schedule_redraw(&ui);
+                    ui.model
+                        .borrow_mut()
+                        .icons
+                        .insert(key.clone(), path.clone());
+                    // Straight into the cards that show it. Only a visible
+                    // title nothing is holding a picture for needs a redraw.
+                    let filled = ui.art_slots.borrow_mut().fill(&key, &path);
+                    if visible && !filled {
+                        render_soon(&ui);
                     }
                 }
                 if let Some((cache, product)) = hero {
                     let fetched =
                         gio::spawn_blocking(move || catalog::hero(&cache, &product)).await;
-                    if matches!(fetched, Ok(Ok(_))) && ui.artwork.borrow().generation == generation
-                    {
-                        schedule_redraw(&ui);
+                    if let Ok(Ok(path)) = fetched {
+                        if ui.artwork.borrow().generation == generation {
+                            ui.art_slots
+                                .borrow_mut()
+                                .fill(&format!("hero-{key}"), &path);
+                        }
                     }
                 }
             }
@@ -147,20 +155,6 @@ fn kick(ui: &Ui) {
             kick(&ui);
         });
     }
-}
-
-fn schedule_redraw(ui: &Ui) {
-    if ui.artwork.borrow_mut().redraw_pending {
-        return;
-    }
-    ui.artwork.borrow_mut().redraw_pending = true;
-    let ui = ui.clone();
-    glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
-        ui.artwork.borrow_mut().redraw_pending = false;
-        if ui.window.is_visible() && !*ui.closing.borrow() {
-            render(&ui);
-        }
-    });
 }
 
 #[cfg(test)]
