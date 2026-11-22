@@ -31,6 +31,7 @@ pub mod launch_options;
 pub mod library;
 pub mod local;
 pub mod media;
+pub mod neural;
 pub mod paths;
 pub mod playfab;
 pub mod presence;

@@ -62,7 +62,7 @@ pub fn image_command(image: &Path) -> std::process::Command {
 /// Bind a later UI action to the executable present when this window opened.
 pub fn image_fingerprint(path: &Path) -> Result<String> {
     let target = AppImageTarget::inspect(path)?;
-    let digest = sha256(&target.path)?;
+    let digest = sha256_file(&target.path)?;
     anyhow::ensure!(
         AppImageTarget::inspect(path)?.identity == target.identity,
         "the installed AppImage changed while it was checked"
@@ -381,14 +381,14 @@ fn check_with(
 
 pub fn verify_checksum(path: &Path, expected: &str) -> Result<()> {
     anyhow::ensure!(
-        sha256(path)? == expected,
+        sha256_file(path)? == expected,
         "{} does not match its signed checksum",
         path.display()
     );
     Ok(())
 }
 
-fn sha256(path: &Path) -> Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
     let mut hash = Sha256::new();
     let mut buf = vec![0; 256 * 1024];
@@ -641,7 +641,7 @@ impl PreparedAppImage {
             "the installed AppImage changed during the download; nothing was replaced"
         );
         let backup = crate::cache::temporary_beside(&self.target.path, "previous");
-        let previous_sha256 = sha256(&self.target.path)?;
+        let previous_sha256 = sha256_file(&self.target.path)?;
         std::fs::hard_link(&self.target.path, &backup)
             .context("could not keep the previous AppImage")?;
         let applied = AppliedAppImage {
@@ -961,7 +961,7 @@ mod tests {
     fn prepared(path: &Path, source: &Path) -> PreparedAppImage {
         let mut staged = PreparedAppImage::reserve(AppImageTarget::inspect(path).unwrap()).unwrap();
         staged.copy_verified(source).unwrap();
-        staged.expected_checksum = Some(sha256(source).unwrap());
+        staged.expected_checksum = Some(sha256_file(source).unwrap());
         staged
     }
 
@@ -990,12 +990,12 @@ mod tests {
     fn failed_or_cancelled_preparation_never_replaces_the_installed_image() {
         let dir = tempfile::tempdir().unwrap();
         let old = image(dir.path(), "Ferestre.AppImage", b"old");
-        let original = sha256(&old).unwrap();
+        let original = sha256_file(&old).unwrap();
         let staged = PreparedAppImage::reserve(AppImageTarget::inspect(&old).unwrap()).unwrap();
         let path = staged.staged.clone();
         assert!(staged.apply().is_err());
         assert!(!path.exists());
-        assert_eq!(sha256(&old).unwrap(), original);
+        assert_eq!(sha256_file(&old).unwrap(), original);
         let release = Available {
             component: Component::Launcher,
             version: "0.1.16".into(),
@@ -1013,7 +1013,7 @@ mod tests {
             |_, _| panic!("cancelled update must not execute anything")
         )
         .is_err());
-        assert_eq!(sha256(&old).unwrap(), original);
+        assert_eq!(sha256_file(&old).unwrap(), original);
         assert!(!dir.path().join("cache").exists());
     }
 
@@ -1026,13 +1026,13 @@ mod tests {
         assert!(PreparedAppImage::reserve(AppImageTarget::inspect(&old).unwrap()).is_err());
         let external = image(dir.path(), "external.AppImage", b"independent update");
         std::fs::rename(&external, &old).unwrap();
-        let expected = sha256(&old).unwrap();
+        let expected = sha256_file(&old).unwrap();
         assert!(first.apply().is_err());
-        assert_eq!(sha256(&old).unwrap(), expected);
+        assert_eq!(sha256_file(&old).unwrap(), expected);
         let next = prepared(&old, &new);
         std::fs::write(&next.staged, b"tampered").unwrap();
         assert!(next.apply().is_err());
-        assert_eq!(sha256(&old).unwrap(), expected);
+        assert_eq!(sha256_file(&old).unwrap(), expected);
     }
 
     #[test]
@@ -1073,9 +1073,9 @@ mod tests {
         let result = prepared(&old, &new).apply().unwrap();
         let later = image(dir.path(), "later.AppImage", b"later");
         std::fs::rename(&later, &old).unwrap();
-        let expected = sha256(&old).unwrap();
+        let expected = sha256_file(&old).unwrap();
         assert!(rollback(&result).is_err());
-        assert_eq!(sha256(&old).unwrap(), expected);
+        assert_eq!(sha256_file(&old).unwrap(), expected);
         assert!(result.backup.exists());
     }
 
@@ -1091,13 +1091,13 @@ mod tests {
         assert_eq!(stored.installed_sha256, applied.installed_sha256);
         assert_eq!(std::fs::metadata(&receipt).unwrap().mode() & 0o777, 0o600);
         rollback(&stored).unwrap();
-        let original = sha256(&old).unwrap();
+        let original = sha256_file(&old).unwrap();
         let blocker = dir.path().join("not-a-directory");
         std::fs::write(&blocker, b"keep").unwrap();
         assert!(prepared(&old, &new)
             .apply_with_receipt(&blocker.join("receipt"))
             .is_err());
-        assert_eq!(sha256(&old).unwrap(), original);
+        assert_eq!(sha256_file(&old).unwrap(), original);
     }
 
     #[test]
