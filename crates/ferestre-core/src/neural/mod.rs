@@ -11,9 +11,11 @@ use std::path::{Path, PathBuf};
 
 pub mod detect;
 pub mod dll;
+pub mod hardware;
 pub mod models;
 pub mod package;
 pub mod pe;
+pub mod state;
 
 /// A package's architecture, as its file name spells it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
