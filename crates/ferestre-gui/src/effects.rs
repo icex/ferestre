@@ -7,8 +7,9 @@
 //!
 //! - `blur-ok`: blur is affordable. A blurred frame costs about 1-3 ms on a
 //!   GPU even at 32:9, but 15-800 ms on cairo or software GL, so it is set
-//!   only on a hardware renderer, and taken away for the session if the first
-//!   transition's frames come in slow (llvmpipe reports itself as GL).
+//!   only on a hardware renderer, and taken away for the session if two of
+//!   the first transitions' frames come in slow, or one frame is very slow
+//!   (llvmpipe reports itself as GL).
 //! - `reduced-motion`: the desktop asked for no animation
 //!   (`gtk-enable-animations` false). GTK already skips CSS animations and
 //!   transitions then; the class makes that explicit and also keeps the
@@ -28,12 +29,32 @@ const DIALOG_OPEN: &str = "dialog-open";
 pub(crate) const PAGE_ENTER: &str = "page-enter";
 
 thread_local! {
-    /// Set once frames during a transition were too slow for blur: kept for
+    /// Set once frames during transitions were too slow for blur: kept for
     /// the rest of the session, so it does not flicker on and off.
     static SLOW: Cell<bool> = const { Cell::new(false) };
-    /// Whether the frame-time check has run.
-    static MEASURED: Cell<bool> = const { Cell::new(false) };
+    /// Transitions measured so far, and how many of them were slow.
+    static MEASURED: Cell<u32> = const { Cell::new(0) };
+    static SLOW_SAMPLES: Cell<u32> = const { Cell::new(0) };
+    /// A measurement is running (its tick callback is on the window).
+    static MEASURING: Cell<bool> = const { Cell::new(false) };
 }
+
+/// How many transitions are timed before blur is trusted for the session.
+const MEASURE_TRANSITIONS: u32 = 4;
+/// Frames skipped at the start of a transition: they carry the new page's
+/// build and layout, which is not what blur costs.
+const SKIP_FRAMES: i64 = 2;
+/// Frames timed after those.
+const SAMPLE_FRAMES: i64 = 4;
+/// A transition is slow when its frames average more than this (µs)...
+const SLOW_FRAME: i64 = 25_000;
+/// ...and blur goes after this many slow ones, or at once for a single frame
+/// this long, which only a software rasteriser takes.
+const SLOW_TRANSITIONS: u32 = 2;
+const HOPELESS_FRAME: i64 = 120_000;
+/// Long enough for the page animation to have finished: the window's classes
+/// change only then, so a running animation is not swapped and restarted.
+const AFTER_ANIMATION_MS: u64 = 260;
 
 fn animations_enabled() -> bool {
     gtk::Settings::default().is_none_or(|s| s.is_gtk_enable_animations())
@@ -115,36 +136,78 @@ pub(crate) fn install_secondary(window: &adw::Window, main: &adw::ApplicationWin
 }
 
 /// Mark a freshly built page root to animate in, when it replaced a different
-/// section (a redraw of the same page must not flash). The first transition
-/// with blur also times its frames.
+/// section (a redraw of the same page must not flash). The first few
+/// transitions with blur also time their frames.
 pub(crate) fn enter(page: &impl IsA<gtk::Widget>, window: &adw::ApplicationWindow) {
-    page.add_css_class(PAGE_ENTER);
-    if !window.has_css_class(BLUR_OK) || MEASURED.with(Cell::get) {
+    // Software rendering at 32:9 draws a full-window fade at a few frames
+    // per second: a choppy fade is worse than none.
+    if (software_renderer(window) || SLOW.with(Cell::get)) && window.width() > 2560 {
         return;
     }
-    MEASURED.with(|m| m.set(true));
+    page.add_css_class(PAGE_ENTER);
+    if !window.has_css_class(BLUR_OK)
+        || MEASURING.with(Cell::get)
+        || MEASURED.with(Cell::get) >= MEASURE_TRANSITIONS
+    {
+        return;
+    }
+    MEASURING.with(|m| m.set(true));
     let last = Cell::new(0i64);
-    let frames = Cell::new(0i64);
+    let seen = Cell::new(0i64);
     let total = Cell::new(0i64);
-    let weak = window.downgrade();
-    page.add_tick_callback(move |_, clock| {
+    let longest = Cell::new(0i64);
+    // On the window, not the page: a redraw replaces the page, and a callback
+    // on it would go with it before it had decided anything.
+    window.add_tick_callback(move |window, clock| {
         let now = clock.frame_time();
-        if last.get() != 0 {
-            total.set(total.get() + now - last.get());
-            frames.set(frames.get() + 1);
-        }
-        last.set(now);
-        if frames.get() < 6 {
+        let previous = last.replace(now);
+        if previous == 0 {
             return glib::ControlFlow::Continue;
         }
-        if total.get() / frames.get() > 25_000 {
+        seen.set(seen.get() + 1);
+        if seen.get() <= SKIP_FRAMES {
+            return glib::ControlFlow::Continue;
+        }
+        let interval = now - previous;
+        total.set(total.get() + interval);
+        longest.set(longest.get().max(interval));
+        let sampled = seen.get() - SKIP_FRAMES;
+        if sampled < SAMPLE_FRAMES && longest.get() < HOPELESS_FRAME {
+            return glib::ControlFlow::Continue;
+        }
+        MEASURING.with(|m| m.set(false));
+        MEASURED.with(|m| m.set(m.get() + 1));
+        let verdict = slow_verdict(
+            total.get() / sampled,
+            longest.get(),
+            SLOW_SAMPLES.with(Cell::get),
+        );
+        if verdict.is_some() {
+            SLOW_SAMPLES.with(|s| s.set(s.get() + 1));
+        }
+        if verdict == Some(true) {
             SLOW.with(|s| s.set(true));
-            if let Some(window) = weak.upgrade() {
-                sync(window.upcast_ref());
-            }
+            let weak = window.downgrade();
+            glib::timeout_add_local_once(
+                std::time::Duration::from_millis(AFTER_ANIMATION_MS),
+                move || {
+                    if let Some(window) = weak.upgrade() {
+                        sync(window.upcast_ref());
+                    }
+                },
+            );
         }
         glib::ControlFlow::Break
     });
+}
+
+/// For one timed transition: `None` when it was fast, `Some(false)` when it
+/// was slow but blur gets another chance, `Some(true)` when blur should go.
+fn slow_verdict(average: i64, longest: i64, slow_before: u32) -> Option<bool> {
+    if longest >= HOPELESS_FRAME {
+        return Some(true);
+    }
+    (average > SLOW_FRAME).then_some(slow_before + 1 >= SLOW_TRANSITIONS)
 }
 
 /// Duration for a widget's own transition (a revealer or a stack): none when
@@ -184,3 +247,21 @@ window.blur-ok .search-pill {
   backdrop-filter: blur(14px);
 }
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_slow_transition_is_not_enough() {
+        assert_eq!(slow_verdict(16_700, 20_000, 0), None);
+        assert_eq!(slow_verdict(30_000, 40_000, 0), Some(false));
+        assert_eq!(slow_verdict(30_000, 40_000, 1), Some(true));
+    }
+
+    #[test]
+    fn a_software_frame_decides_at_once() {
+        assert_eq!(slow_verdict(16_700, HOPELESS_FRAME, 0), Some(true));
+        assert_eq!(slow_verdict(900_000, 900_000, 0), Some(true));
+    }
+}
