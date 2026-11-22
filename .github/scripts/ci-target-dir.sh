@@ -34,6 +34,9 @@ link=$1 name=$2 cap_gib=$3
 case "$name" in
     ''|*/*|.*) printf 'bad name: %s\n' "$name" >&2; exit 2 ;;
 esac
+case "$link" in
+    */*) printf 'the link goes at the top of the checkout: %s\n' "$link" >&2; exit 2 ;;
+esac
 
 root="${XDG_CACHE_HOME:-$HOME/.cache}/ferestre-ci"
 dir="$root/$name"
@@ -58,9 +61,6 @@ if [ "$link" = --env ]; then
     echo "CARGO_TARGET_DIR=$dir" >> "${GITHUB_ENV:?}"
     echo "CARGO_TARGET_DIR=$dir ($(du -sh "$dir" | cut -f1))"
 else
-    case "$link" in
-        */*) printf 'the link goes at the top of the checkout: %s\n' "$link" >&2; exit 2 ;;
-    esac
     # A real directory left at the link path (an older job, or a build run
     # before this step) is replaced; a symlink is only the link.
     rm -rf "$link"
