@@ -6,6 +6,22 @@ for Bedrock on Android, for Microsoft Store titles on Linux.
 
 ## Current qualification
 
+Release 0.1.24 pairs with runtime 11.0.20261122.2. Hogwarts Legacy, Batman:
+Arkham Knight, Control, Crash Bandicoot N. Sane Trilogy and Dead by Daylight
+play, each checked by a person; Death Stranding Director's Cut plays its
+opening offline, checked headless. The runtime waits, with a time limit, for
+the completion callbacks Hogwarts Legacy reads straight after a blocking
+XAsync wait; opens saves for a null configuration id; returns the Store's
+Collections ID key, which the client service now issues; reports every package
+chunk as ready, which Death Stranding needs before it loads anything; and
+WinHTTP accepts Dead by Daylight's repeated first web socket receive. The
+window was reworked for speed and around the art: cached off-thread artwork,
+fewer redraws, a Home carousel and shelves, an Installed sidebar with a compact
+mode, stacked notifications and blur behind dialogs. A title runs once per
+prefix: Play on a running title asks first, and `ferestre run` exits 4 for a
+second copy. The launch settings editor has Reset to defaults. See
+[release qualification](RELEASE-0.1.24.md).
+
 Release 0.1.23 pairs with runtime 11.0.20261122.1. Gears 5 (Xbox PC) plays,
 campaign and multiplayer, with Easy Anti-Cheat. Two gaps stood in the way. The
 runtime lacked the legacy GDK XPackage interface Gears 5 asks for at startup,
@@ -284,7 +300,21 @@ honestly marked as unproven rather than planned.
 
 - [x] **A sidebar, and a layout that survives a hundred titles.** One flat
       preferences page was right for three recipes and is wrong for a library.
-      Library / Installed / Updates / Runtime as sidebar sections.
+      Library / Installed / Updates / Runtime as sidebar sections. Since then
+      the window is laid out around the art: Home is a carousel, quick links,
+      Jump back in and shelves; the sidebar lists every installed title with
+      its state, or folds into a rail of icons (Compact sidebar); results stack
+      in a corner instead of queueing one at a time; and the window blurs
+      behind dialogs where the renderer can afford it.
+
+- [x] **One copy of a title at a time.** A second copy started into a prefix
+      that already runs the title exits at once with a code nobody can read.
+      Play now offers to leave the running copy, close it, or close it and
+      start again, and `ferestre run` refuses with exit code 4, holding
+      `<prefix>/.ferestre-run.lock` from before it changes the prefix until the
+      title ends, so a Steam shortcut and the window a moment apart cannot
+      both get through. Steam shows neither stderr nor the exit code, so the
+      refusal also goes to the launch log and a desktop notification.
 
 - [x] **A library you can find seven titles in.** Measured on the development
       account: of 102 owned games and apps, **7** ship as MSIXVC and the other

@@ -1,0 +1,39 @@
+# Death Stranding Director's Cut -- Microsoft Store / Xbox PC.
+schema = 1
+
+[title]
+product-id = "9NQGN8TGNT8P"
+name = "DEATH STRANDING DIRECTOR'S CUT"
+slug = "death-stranding-director-s-cut"
+publisher = "505 Games"
+package-identity = "KOJIMAPRODUCTIONSCo.Ltd.DSDC"
+title-id = "60C7C4ED"
+
+[install]
+
+[launch]
+executable = "ds.exe"
+
+[runtime]
+requires = [
+    "loader.memfd-main-image",
+    "xgameruntime.user",
+    "xgameruntime.package-chunk-availability",
+]
+wants = ["appmodel.package-identity"]
+
+[status]
+state = "playable-with-issues"
+summary = "Reaches the title menu, starts a New Game and plays the opening into the world; online features fall back to Offline Mode."
+last-verified = 2026-11-22
+verified-with = "Xbox PC package 1.4.1961.0 (game version 1.004), headless at 1280x720 with scripted input through New Game, the HDR and brightness screens and the opening; not yet played by a person."
+
+[[issues]]
+symptom = "\"Internal system error occured\" a few seconds after launch, before any frame; error.txt in the install folder reports an access violation at 0x141AF37C5 in a Background thread"
+cause = "XPackageEnumerateChunkAvailability returned without reporting any chunk, so the game treats chunks 1-3 as not installed, finds no prefetch list for its root asset and stops itself."
+fix = "Use a runtime advertising xgameruntime.package-chunk-availability."
+
+[[issues]]
+symptom = "\"Network features cannot be used. Launching in Offline Mode... Error Code: 10000\" when the game reaches the world, and \"A network error has occurred\" while checking for additional content"
+cause = "The token request for the game's own server (https://prod-pc-15.wws-gs2.com/auth/ds) gets no token from xodus-service (E_GAMEUSER_NO_AUTH_USER); Xbox Live tokens for the same account succeed. Not yet investigated further."
+fix = "None yet; the game plays offline, without the shared online structures."

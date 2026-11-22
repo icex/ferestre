@@ -7,6 +7,8 @@ const WORKERS: usize = 4;
 #[derive(Clone)]
 struct Request {
     product: catalog::Product,
+    /// The cover still has to be fetched; false when only the hero is missing.
+    cover: bool,
     hero: bool,
 }
 
@@ -15,12 +17,15 @@ pub(super) struct Queue {
     pending: VecDeque<Request>,
     visible: BTreeSet<String>,
     attempted: BTreeSet<String>,
+    /// Titles whose landscape art was asked for. Kept apart from `attempted`:
+    /// a title whose cover was fetched before the carousel wanted its banner
+    /// would otherwise never be asked for one.
+    attempted_hero: BTreeSet<String>,
     active: usize,
     generation: u64,
-    redraw_pending: bool,
 }
 impl Queue {
-    fn add(&mut self, product: catalog::Product, visible: bool, hero: bool) {
+    fn add(&mut self, product: catalog::Product, visible: bool, cover: bool, hero: bool) {
         let id = &product.product_id;
         if let Some(index) = self
             .pending
@@ -29,11 +34,21 @@ impl Queue {
         {
             if visible {
                 let mut request = self.pending.remove(index).unwrap();
-                request.hero |= hero;
+                request.cover |= cover && self.attempted.insert(id.clone());
+                request.hero |= hero && self.attempted_hero.insert(id.clone());
                 self.pending.push_front(request);
             }
-        } else if self.attempted.insert(id.clone()) {
-            let request = Request { product, hero };
+        } else {
+            let cover = cover && self.attempted.insert(id.clone());
+            let hero = hero && self.attempted_hero.insert(id.clone());
+            if !cover && !hero {
+                return;
+            }
+            let request = Request {
+                product,
+                cover,
+                hero,
+            };
             if visible {
                 self.pending.push_front(request);
             } else {
@@ -52,9 +67,23 @@ pub(super) fn refresh(ui: &Ui) {
     queue.generation = queue.generation.wrapping_add(1);
     queue.pending.clear();
     queue.attempted.clear();
+    queue.attempted_hero.clear();
 }
 
 pub(super) fn request(ui: &Ui, ids: Vec<String>, visible: bool) {
+    enqueue(ui, ids, visible, if visible { 3 } else { 0 });
+}
+
+/// Landscape art for the titles the hero carousel would like to show, so a
+/// title can join it once its banner is on disk. Covers missing for them are
+/// fetched too.
+pub(super) fn request_heroes(ui: &Ui, ids: Vec<String>) {
+    let count = ids.len();
+    enqueue(ui, ids, true, count);
+}
+
+/// Queue art for `ids`; the first `heroes` of them also get landscape art.
+fn enqueue(ui: &Ui, ids: Vec<String>, visible: bool, heroes: usize) {
     {
         let model = ui.model.borrow();
         let mut queue = ui.artwork.borrow_mut();
@@ -67,10 +96,21 @@ pub(super) fn request(ui: &Ui, ids: Vec<String>, visible: bool) {
             if product.artwork.portrait.is_none() && product.image.is_none() {
                 continue;
             }
-            if model.icons.contains_key(&key) {
+            // A cover fetched on an earlier day is no reason to skip the
+            // landscape art a featured card needs: it used to be fetched only
+            // together with the cover, so a title whose cover was already
+            // cached never got one, and its card stayed blank.
+            let cover = !model.icons.contains_key(&key);
+            let hero = index < heroes
+                && (product.artwork.landscape.is_some() || product.artwork.hero.is_some())
+                && model
+                    .catalog_cache()
+                    .and_then(|cache| cache.hero_path(&key))
+                    .is_some_and(|path| !path.exists());
+            if !cover && !hero {
                 continue;
             }
-            queue.add(product.clone(), visible, visible && index < 3);
+            queue.add(product.clone(), visible, cover, hero);
         }
     }
     kick(ui);
@@ -101,23 +141,35 @@ fn kick(ui: &Ui) {
             let hero = request
                 .hero
                 .then(|| (cache.clone(), request.product.clone()));
-            let result =
-                gio::spawn_blocking(move || catalog::cover(&cache, &request.product)).await;
+            let result = if request.cover {
+                Some(gio::spawn_blocking(move || catalog::cover(&cache, &request.product)).await)
+            } else {
+                None
+            };
             let current = ui.artwork.borrow().generation == generation;
             if current {
-                if let Ok(Ok(path)) = result {
+                if let Some(Ok(Ok(path))) = result {
                     let visible = ui.artwork.borrow().visible.contains(&key);
-                    ui.model.borrow_mut().icons.insert(key, path);
-                    if visible {
-                        schedule_redraw(&ui);
+                    ui.model
+                        .borrow_mut()
+                        .icons
+                        .insert(key.clone(), path.clone());
+                    // Straight into the cards that show it. Only a visible
+                    // title nothing is holding a picture for needs a redraw.
+                    let filled = ui.art_slots.borrow_mut().fill(&key, &path);
+                    if visible && !filled {
+                        render_soon(&ui);
                     }
                 }
                 if let Some((cache, product)) = hero {
                     let fetched =
                         gio::spawn_blocking(move || catalog::hero(&cache, &product)).await;
-                    if matches!(fetched, Ok(Ok(_))) && ui.artwork.borrow().generation == generation
-                    {
-                        schedule_redraw(&ui);
+                    if let Ok(Ok(path)) = fetched {
+                        if ui.artwork.borrow().generation == generation {
+                            ui.art_slots
+                                .borrow_mut()
+                                .fill(&format!("hero-{key}"), &path);
+                        }
                     }
                 }
             }
@@ -125,20 +177,6 @@ fn kick(ui: &Ui) {
             kick(&ui);
         });
     }
-}
-
-fn schedule_redraw(ui: &Ui) {
-    if ui.artwork.borrow_mut().redraw_pending {
-        return;
-    }
-    ui.artwork.borrow_mut().redraw_pending = true;
-    let ui = ui.clone();
-    glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
-        ui.artwork.borrow_mut().redraw_pending = false;
-        if ui.window.is_visible() && !*ui.closing.borrow() {
-            render(&ui);
-        }
-    });
 }
 
 #[cfg(test)]
@@ -154,18 +192,29 @@ mod tests {
     fn paging_promotes_pending_covers_without_duplicate_requests() {
         let mut queue = Queue::default();
         for id in ["9ZZART000001", "9ZZART000002", "9ZZART000003"] {
-            queue.add(product(id), false, false);
+            queue.add(product(id), false, true, false);
         }
-        queue.add(product("9ZZART000003"), true, true);
+        queue.add(product("9ZZART000003"), true, true, true);
         assert_eq!(queue.pending.len(), 3);
         let first = queue.pending.pop_front().unwrap();
         assert_eq!(first.product.product_id, "9ZZART000003");
         assert!(first.hero);
-        queue.add(product("9ZZART000003"), true, true);
+        queue.add(product("9ZZART000003"), true, true, true);
         assert_eq!(
             queue.pending.len(),
             2,
             "in-flight/attempted work is deduplicated"
         );
+    }
+
+    /// A title whose cover is already cached still gets its landscape art
+    /// queued, without fetching the cover again.
+    #[test]
+    fn hero_alone_is_queued_for_a_cached_cover() {
+        let mut queue = Queue::default();
+        queue.add(product("9ZZART000004"), true, false, true);
+        let request = queue.pending.front().expect("queued");
+        assert!(!request.cover);
+        assert!(request.hero);
     }
 }

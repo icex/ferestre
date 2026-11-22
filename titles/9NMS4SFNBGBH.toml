@@ -1,0 +1,42 @@
+schema = 1
+
+[title]
+product-id = "9NMS4SFNBGBH"
+name = "Dead by Daylight Windows"
+slug = "dead-by-daylight-windows"
+
+[launch]
+executable = "DeadByDaylight.exe"
+
+[runtime]
+requires = [
+    "loader.memfd-main-image",
+    "xgameruntime.user",
+    "winhttp.websocket-repeated-first-receive",
+]
+wants = [
+    "appmodel.package-identity",
+    "xgameruntime.store-collections-id",
+]
+
+[status]
+state = "playable"
+summary = "Signs in, loads its Store content and plays; checked by a person. Real-money purchases are not supported."
+last-verified = 2026-11-22
+verified-with = "Played by a person on Xbox PC package of game version 10.2.2; first with Easy Anti-Cheat, run headless on a local runtime with xgameruntime 9de84aa, the matching xodus-service and winhttp 72ad515: three launches of 300-420 s reached the main menu and the Store's Featured page with no crash. No match was joined."
+
+[[issues]]
+symptom = "CANNOT CONNECT TO STORE: Cannot retrieve the list of available content, on the splash screen about a minute after launch"
+cause = "XStoreGetUserCollectionsIdAsync returned an empty key, and the game's backend refuses an empty key (owned-products/get-update-entitlements answers 400)."
+fix = "Use a runtime advertising xgameruntime.store-collections-id with its matching xodus-service."
+
+[[issues]]
+symptom = "Crash reporter (EXCEPTION_ACCESS_VIOLATION) while the splash screen says Loading Characters, or stuck on Connecting to RTM server..."
+cause = "The game issues its first WinHTTP websocket receive on rtm-v3.live.bhvrdbd.com twice with the same buffer; Wine refused the repeat with ERROR_INVALID_OPERATION and the game then dropped a buffer the pending receive still wrote into."
+fix = "Use a runtime advertising winhttp.websocket-repeated-first-receive."
+log-match = "Attempt to queue receive while another is pending"
+
+[[issues]]
+symptom = "Opening the Store may show NOTICE: The Microsoft Store user is not the same as the user logged into the game"
+cause = "Seen in headless test runs only, with the same account as Store and Player; a person's launch the same day did not show it, so it is probably transient. Real-money purchases are unsupported either way (XStoreShowPurchaseUIAsync is a stub)."
+fix = "Press OK; the Store lists its items and in-game currency works."

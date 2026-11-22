@@ -74,6 +74,13 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.1.24" date="2026-11-22">
+      <description>
+        <p>Hogwarts Legacy, Batman: Arkham Knight, Control, Crash Bandicoot N. Sane Trilogy and Dead by Daylight are playable, and Death Stranding Director's Cut plays offline, with the matching Proton runtime.</p>
+        <p>A faster window with a new layout: cached artwork, a Home carousel and shelves, an Installed sidebar with a compact mode, stacked notifications and blur behind dialogs.</p>
+        <p>Reset a title's launch settings to defaults, and get asked before a second copy of a running title starts.</p>
+      </description>
+    </release>
     <release version="0.1.23" date="2026-11-21">
       <description>
         <p>Choose a destination drive or a custom folder for new installations. Queued drive installs wait for their selected drive to be available.</p>

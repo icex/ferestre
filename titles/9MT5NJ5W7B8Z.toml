@@ -1,0 +1,35 @@
+schema = 1
+
+[title]
+product-id = "9MT5NJ5W7B8Z"
+name = "Hogwarts Legacy"
+slug = "hogwarts-legacy"
+
+[launch]
+executable = 'Phoenix\Binaries\WinGDK\HogwartsLegacy.exe'
+
+[launch.env]
+XGR_WAIT_FOR_ASYNC_CALLBACKS = "1"
+
+[runtime]
+requires = [
+    "loader.memfd-main-image",
+    "xgameruntime.user",
+    "xgameruntime.async-callback-wait",
+]
+
+[status]
+state = "playable"
+summary = "Xbox sign-in and two hours of play confirmed by the player with callback waits enabled. A first launch can close while it prepares shaders; see the issues below."
+last-verified = 2026-11-22
+verified-with = "Xbox PC package 1.0.22.0 with a runtime carrying icex/xgameruntime#1; tests/account_roles.c --callback-order."
+
+[[issues]]
+symptom = "Signs in or checks the licence and then closes, or reads an empty Xbox user"
+cause = "The game reads the user and licence its completion callbacks set as soon as its blocking XAsyncGetStatus returns; without the wait the callbacks have not run yet."
+fix = "Use a runtime advertising xgameruntime.async-callback-wait with this recipe's XGR_WAIT_FOR_ASYNC_CALLBACKS=1 setting."
+
+[[issues]]
+symptom = "The first launch closes within half a minute, sometimes while Preparing Shaders"
+cause = "The game crashes now and then (access violations on several of its own threads) while it builds its first shader pre-cache. Seen in 5 of 15 headless starts without a pre-cache and in none of 9 with one."
+fix = "Start the game again. The shader work already done is kept, and later starts are unaffected."

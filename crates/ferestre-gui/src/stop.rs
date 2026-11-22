@@ -14,6 +14,8 @@
 //! which is the image name `taskkill /IM` matches. The `taskkill` itself runs
 //! with the environment of one of those processes, so it joins the running
 //! wineserver with the same synchronisation settings and paths as the title.
+//! The search is `ferestre_core::running`'s, which `ferestre run` uses too, to
+//! refuse a second copy.
 //!
 //! A title launched through the real-path image view
 //! (`scripts/real-path-image-view.py`, Halo Infinite) runs in user and mount
@@ -27,7 +29,7 @@
 //! never enters those namespaces itself, and only ever talks to the launch
 //! it started.
 
-use std::ffi::{OsStr, OsString};
+use ferestre_core::running::own_uid;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
@@ -51,9 +53,6 @@ const ASK_LIMIT: Duration = Duration::from_secs(10);
 /// How long the image view may take to answer a close request: its own
 /// `taskkill` has [`ASK_LIMIT`], and finding what to ask takes a moment more.
 const VIEW_ANSWER: Duration = Duration::from_secs(15);
-/// The variable that names the launch's end of its [`Channel`], by
-/// descriptor number.
-pub const CHANNEL_FD: &str = "FERESTRE_STOP_FD";
 
 /// A title this window started and has not seen exit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,130 +114,25 @@ pub fn confirmed(current: Option<&Launch>, shown: &Launch) -> Option<Press> {
     }
 }
 
-/// One Windows process in the title's prefix.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WineProcess {
-    pub pid: u32,
-    /// The executable's file name, as `taskkill /IM` matches it.
-    pub image: String,
-    pub env: Vec<(OsString, OsString)>,
-}
+/// One Windows process in the title's prefix, and how the prefix is
+/// searched: shared with `ferestre run`, which refuses a second copy.
+pub use ferestre_core::running::{processes_in, running_in, WineProcess, CHANNEL_FD};
 
-/// Wine's own processes, and Proton's launcher, which own no window a person
-/// would close. Asking them is noise in the best case. The image view keeps
-/// the same list (`scripts/real-path-image-view.py`).
-const SYSTEM_IMAGES: &[&str] = &[
-    "conhost.exe",
-    "explorer.exe",
-    "plugplay.exe",
-    "rpcss.exe",
-    "rundll32.exe",
-    "services.exe",
-    "start.exe",
-    "steam.exe",
-    "svchost.exe",
-    "tabtip.exe",
-    "taskkill.exe",
-    "wineboot.exe",
-    "winedevice.exe",
-    "winemenubuilder.exe",
-];
+/// How long processes get to go after `wineserver -k`, or a signal, before
+/// the next step.
+const AFTER_KILL: Duration = Duration::from_secs(3);
 
-/// The image name in a Wine process's command line: the last component of its
-/// first argument, which Wine sets to the Windows path of the executable.
-fn image_name(cmdline: &[u8]) -> Option<String> {
-    let first = cmdline.split(|b| *b == 0).next()?;
-    let first = String::from_utf8_lossy(first);
-    let name = first.rsplit(['\\', '/']).next()?.trim();
-    let lower = name.to_ascii_lowercase();
-    (lower.ends_with(".exe") && !SYSTEM_IMAGES.contains(&lower.as_str())).then(|| name.to_string())
-}
-
-/// What Wine's loader hands one process of its own when it starts it: the
-/// file descriptor of that process's connection to the wineserver, and where
-/// its preloader reserved memory. Copied into another process they point at
-/// nothing, and that process cannot reach the server at all. The launch's
-/// [`Channel`] descriptor is the same kind of thing.
-const LOADER_PRIVATE: &[&str] = &[
-    "WINESERVERSOCKET",
-    "WINEPRELOADRESERVE",
-    "WINELOADERNOEXEC",
-    CHANNEL_FD,
-];
-
-fn environment(bytes: &[u8]) -> Vec<(OsString, OsString)> {
-    bytes
-        .split(|b| *b == 0)
-        .filter_map(|pair| {
-            let at = pair.iter().position(|b| *b == b'=')?;
-            Some((
-                OsStr::from_bytes(&pair[..at]).to_os_string(),
-                OsStr::from_bytes(&pair[at + 1..]).to_os_string(),
-            ))
-        })
-        .filter(|(key, _)| !LOADER_PRIVATE.iter().any(|private| key == private))
-        .collect()
-}
-
-/// The same directory, however the two spellings differ: a trailing slash
-/// (Proton writes one), or a symlink on the way.
-fn same_dir(a: &Path, b: &Path) -> bool {
-    let trim = |p: &Path| PathBuf::from(p.as_os_str().to_string_lossy().trim_end_matches('/'));
-    let (a, b) = (trim(a), trim(b));
-    a == b
-        || matches!(
-            (a.canonicalize(), b.canonicalize()),
-            (Ok(a), Ok(b)) if a == b
-        )
-}
-
-fn owner(status: &str) -> Option<u32> {
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("Uid:"))?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()
-}
-
-/// Whether the process at `dir` runs in the window's own user and mount
-/// namespaces. One that does not -- a title in the real-path image view --
-/// has a Wine server this window cannot reach: a `taskkill` started out here
-/// for it would start a second server and Wine session on the live prefix.
-/// Its view asks it through the launch's [`Channel`] instead.
-fn in_own_namespaces(proc_root: &Path, dir: &Path) -> bool {
-    let links = |at: &Path| ["ns/user", "ns/mnt"].map(|ns| std::fs::read_link(at.join(ns)).ok());
-    links(&proc_root.join("self")) == links(dir)
-}
-
-/// Every Windows process of `uid` running in `prefix` in the window's own
-/// namespaces, read from `proc_root` (`/proc`, or a fixture in a test).
-pub fn processes_in(proc_root: &Path, uid: u32, prefix: &Path) -> Vec<WineProcess> {
-    let Ok(entries) = std::fs::read_dir(proc_root) else {
-        return Vec::new();
-    };
-    let mut found: Vec<WineProcess> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
-            let dir = entry.path();
-            if owner(&std::fs::read_to_string(dir.join("status")).ok()?)? != uid {
-                return None;
-            }
-            let env = environment(&std::fs::read(dir.join("environ")).ok()?);
-            let in_prefix = env
-                .iter()
-                .any(|(key, value)| key == "WINEPREFIX" && same_dir(Path::new(value), prefix));
-            if !in_prefix || !in_own_namespaces(proc_root, &dir) {
-                return None;
-            }
-            let image = image_name(&std::fs::read(dir.join("cmdline")).ok()?)?;
-            Some(WineProcess { pid, image, env })
-        })
-        .collect();
-    found.sort_by_key(|p| p.pid);
-    found
+/// End everything in `prefix` now, without a launch of this window's to
+/// signal: `wineserver -k`. Blocking, bounded by [`ASK_LIMIT`].
+fn kill_prefix(server: &Path, prefix: &Path) {
+    let mut command = Command::new(server);
+    command
+        .env("WINEPREFIX", prefix)
+        .arg("-k")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _ = crate::deadline::status(&mut command, ASK_LIMIT);
 }
 
 /// The `taskkill` that asks every one of `found` to close, run as the first of
@@ -386,9 +280,7 @@ pub fn ask_to_close(server: &Path, prefix: &Path, channel: Option<&Channel>) -> 
     let Some(wine) = wine_beside(server) else {
         return false;
     };
-    // Safety: getuid cannot fail.
-    let uid = unsafe { libc::getuid() };
-    let found = processes_in(Path::new("/proc"), uid, prefix);
+    let found = processes_in(Path::new("/proc"), own_uid(), prefix);
     let mut asked = false;
     if let Some(mut command) = close_command(&wine, &found) {
         // taskkill exits non-zero when one of the images has no window to
@@ -399,6 +291,70 @@ pub fn ask_to_close(server: &Path, prefix: &Path, channel: Option<&Channel>) -> 
         asked |= channel.ask(&wine, VIEW_ANSWER) == Some(true);
     }
     asked
+}
+
+/// Whether nothing of a title is left in `prefix` by the time `limit` is up.
+fn gone_within(prefix: &Path, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        if running_in(prefix).is_empty() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Whether a title in a prefix of `server`'s runtime can be asked to close,
+/// rather than only ended: there is a `wine` beside the server to ask it with.
+pub fn can_ask(server: &Path) -> bool {
+    wine_beside(server).is_some()
+}
+
+/// Close a title running in `prefix` that this window did not start, so has
+/// no launch of to signal. Blocking; returns whether nothing of it is left.
+///
+/// First it is asked, the way closing its window would, and given
+/// [`CLOSE_WAIT`] to go. It gets the wait whenever there was a `wine` to ask
+/// with, even if `taskkill` did not finish in time: the close may already be
+/// on its way, and a save being written. With no `wine` beside `server` there
+/// is nothing to ask, and it is not waited for ([`can_ask`] tells the window
+/// to say so). Then `wineserver -k` ends the prefix: it signals whichever
+/// server holds the prefix's lock, from any Wine build, and that server ends
+/// its processes. What is left after that is a title whose server is already
+/// gone, which nothing else will end: it is sent SIGKILL. Only the processes
+/// that were in the prefix when the close began are signalled, so a copy
+/// started meanwhile is never the target, and only this user's, in this
+/// prefix and these namespaces.
+pub fn close_running(server: &Path, prefix: &Path) -> bool {
+    close_running_within(server, prefix, CLOSE_WAIT)
+}
+
+fn close_running_within(server: &Path, prefix: &Path, wait: Duration) -> bool {
+    let first: Vec<u32> = processes_in(Path::new("/proc"), own_uid(), prefix)
+        .iter()
+        .map(|process| process.pid)
+        .collect();
+    if can_ask(server) {
+        ask_to_close(server, prefix, None);
+        if gone_within(prefix, wait) {
+            return true;
+        }
+    }
+    kill_prefix(server, prefix);
+    if gone_within(prefix, AFTER_KILL) {
+        return true;
+    }
+    for process in processes_in(Path::new("/proc"), own_uid(), prefix) {
+        if first.contains(&process.pid) {
+            // Safety: a signal to a process found in this title's prefix,
+            // owned by this user, both when the close began and a moment ago.
+            unsafe { libc::kill(process.pid as i32, libc::SIGKILL) };
+        }
+    }
+    gone_within(prefix, AFTER_KILL)
 }
 
 /// End the title now: the launcher's process group, then every process in
@@ -422,6 +378,7 @@ pub fn end(pgid: u32, server: Option<&(PathBuf, PathBuf)>) -> Option<std::proces
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use std::os::fd::FromRawFd;
 
     #[test]
@@ -471,99 +428,19 @@ mod tests {
         assert_eq!(press(&launch, asked + CLOSE_WAIT), Press::End);
     }
 
-    fn fake_process(root: &Path, pid: u32, uid: u32, cmdline: &[u8], env: &[u8]) {
-        let dir = root.join(pid.to_string());
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("status"),
-            format!("Name:\tx\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
-        )
-        .unwrap();
-        std::fs::write(dir.join("cmdline"), cmdline).unwrap();
-        std::fs::write(dir.join("environ"), env).unwrap();
-    }
-
+    /// The `taskkill` asks, never forces, every image found, and runs with
+    /// the environment of the first process (its prefix included).
     #[test]
-    fn the_title_is_found_by_its_prefix_and_named_by_its_image() {
-        let root = std::env::temp_dir().join(format!("ferestre-gui-proc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let prefix = root.join("games/fh5-proton/pfx");
-        std::fs::create_dir_all(&prefix).unwrap();
-        let env = |pfx: &str| {
-            format!(
-                "HOME=/home/u\0WINEPREFIX={pfx}\0WINEFSYNC=1\0WINESERVERSOCKET=16\0\
-                 WINEPRELOADRESERVE=140000000-140043000\0WINELOADERNOEXEC=1\0"
-            )
-            .into_bytes()
-        };
-        let ours = format!("{}/", prefix.display());
-        fake_process(
-            &root,
-            300,
-            1000,
-            b"C:\\Games\\FH5\\ForzaHorizon5.exe\0-x\0",
-            &env(&ours),
-        );
-        fake_process(
-            &root,
-            200,
-            1000,
-            b"C:\\windows\\system32\\services.exe\0",
-            &env(&ours),
-        );
-        fake_process(
-            &root,
-            201,
-            1000,
-            b"C:\\windows\\system32\\steam.exe\0",
-            &env(&ours),
-        );
-        fake_process(
-            &root,
-            250,
-            1000,
-            b"/opt/proton/files/bin/wineserver\0",
-            &env(&ours),
-        );
-        // Another title, another user, and a process that is not Wine.
-        fake_process(
-            &root,
-            400,
-            1000,
-            b"Z:\\other\\Other.exe\0",
-            &env("/elsewhere/pfx"),
-        );
-        fake_process(
-            &root,
-            500,
-            1001,
-            b"C:\\Games\\FH5\\ForzaHorizon5.exe\0",
-            &env(&ours),
-        );
-        fake_process(&root, 600, 1000, b"/usr/bin/bash\0", b"PATH=/usr/bin\0");
-        std::fs::create_dir_all(root.join("self")).unwrap();
-
-        let found = processes_in(&root, 1000, &prefix);
-        assert_eq!(
-            found
-                .iter()
-                .map(|p| (p.pid, p.image.as_str()))
-                .collect::<Vec<_>>(),
-            vec![(300, "ForzaHorizon5.exe")]
-        );
-        assert!(found[0]
-            .env
-            .contains(&(OsString::from("WINEFSYNC"), OsString::from("1"))));
-        // The loader's own per-process variables are not passed on: with the
-        // title's server socket number in it, taskkill could not reach the
-        // server at all.
-        for private in LOADER_PRIVATE {
-            assert!(
-                !found[0].env.iter().any(|(key, _)| key == private),
-                "{private} was copied"
-            );
-        }
-
+    fn the_close_command_asks_every_image_in_the_titles_own_environment() {
+        let prefix = "/var/tmp/ferestre-unit/fh5-proton/pfx/";
+        let found = [WineProcess {
+            pid: 300,
+            image: "ForzaHorizon5.exe".into(),
+            env: vec![
+                ("WINEPREFIX".into(), prefix.into()),
+                ("WINEFSYNC".into(), "1".into()),
+            ],
+        }];
         let command = close_command(Path::new("/opt/proton/files/bin/wine"), &found).unwrap();
         let args: Vec<_> = command
             .get_args()
@@ -575,39 +452,8 @@ mod tests {
             "asking must not force"
         );
         let env: Vec<_> = command.get_envs().collect();
-        assert!(env.contains(&(OsStr::new("WINEPREFIX"), Some(OsStr::new(&ours)))));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A title in the real-path view's namespaces has a Wine server this
-    /// window cannot reach: a `taskkill` from out here would start a second
-    /// Wine session on its prefix. It is left out of the search, for its view
-    /// to ask.
-    #[test]
-    fn a_title_in_another_namespace_is_left_to_its_view() {
-        let root =
-            std::env::temp_dir().join(format!("ferestre-gui-proc-ns-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let prefix = root.join("games/halo-proton/pfx");
-        std::fs::create_dir_all(&prefix).unwrap();
-        std::fs::create_dir_all(root.join("self/ns")).unwrap();
-        std::os::unix::fs::symlink("user:[4026531837]", root.join("self/ns/user")).unwrap();
-        std::os::unix::fs::symlink("mnt:[4026531841]", root.join("self/ns/mnt")).unwrap();
-        let env = format!("WINEPREFIX={}\0", prefix.display()).into_bytes();
-        for (pid, user, mnt) in [
-            (300, "user:[4026533000]", "mnt:[4026533001]"),
-            (301, "user:[4026531837]", "mnt:[4026533001]"),
-            (400, "user:[4026531837]", "mnt:[4026531841]"),
-        ] {
-            fake_process(&root, pid, 1000, b"C:\\Game\\HaloInfinite.exe\0", &env);
-            let ns = root.join(pid.to_string()).join("ns");
-            std::fs::create_dir_all(&ns).unwrap();
-            std::os::unix::fs::symlink(user, ns.join("user")).unwrap();
-            std::os::unix::fs::symlink(mnt, ns.join("mnt")).unwrap();
-        }
-        let found = processes_in(&root, 1000, &prefix);
-        assert_eq!(found.iter().map(|p| p.pid).collect::<Vec<_>>(), [400]);
-        std::fs::remove_dir_all(&root).unwrap();
+        assert!(env.contains(&(OsStr::new("WINEPREFIX"), Some(OsStr::new(prefix)))));
+        assert!(env.contains(&(OsStr::new("WINEFSYNC"), Some(OsStr::new("1")))));
     }
 
     /// What an image view does with its end: say it is listening, then
@@ -731,39 +577,6 @@ mod tests {
         assert!(child.wait().unwrap().success());
     }
 
-    /// The image view keeps its own copy of what is asked and what is left
-    /// alone; the two must not drift apart.
-    #[test]
-    fn the_image_view_skips_the_same_images_and_variables() {
-        let script = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/real-path-image-view.py"),
-        )
-        .unwrap();
-        let listed = |name: &str| -> Vec<String> {
-            let start = script
-                .find(&format!("\n{name} = ("))
-                .unwrap_or_else(|| panic!("{name} is not in the script"));
-            let block = &script[start..];
-            let block = &block[..block.find(')').unwrap()];
-            let mut names: Vec<String> = block
-                .split('"')
-                .skip(1)
-                .step_by(2)
-                .map(str::to_string)
-                .collect();
-            names.sort();
-            names
-        };
-        let sorted = |list: &[&str]| {
-            let mut list: Vec<String> = list.iter().map(|s| s.to_string()).collect();
-            list.sort();
-            list
-        };
-        assert_eq!(listed("SYSTEM_IMAGES"), sorted(SYSTEM_IMAGES));
-        assert_eq!(listed("LOADER_PRIVATE"), sorted(LOADER_PRIVATE));
-        assert!(script.contains(&format!("CHANNEL_FD = \"{CHANNEL_FD}\"")));
-    }
-
     /// Whether this machine lets an unprivileged user make user and mount
     /// namespaces, which the real-path image view needs. Where it is meant
     /// to (FERESTRE_REQUIRE_USERNS=1), not being able to is a failure.
@@ -867,8 +680,7 @@ mod tests {
         }
 
         let result = std::panic::catch_unwind(|| {
-            // Safety: getuid cannot fail.
-            let uid = unsafe { libc::getuid() };
+            let uid = own_uid();
             assert_eq!(
                 processes_in(Path::new("/proc"), uid, &prefix),
                 [],
@@ -935,6 +747,197 @@ mod tests {
         assert!(close_command(Path::new("wine"), &[]).is_none());
     }
 
+    /// A fake game, `sleep` under the image name Wine gives a Windows
+    /// executable, in a prefix under the test's own folder in /var/tmp.
+    fn fake_game(prefix: &Path) -> std::process::Child {
+        let child = Command::new("bash")
+            .args(["-c", "exec -a 'C:\\Game\\FakeGame.exe' sleep 120"])
+            .env("WINEPREFIX", format!("{}/", prefix.display()))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !processes_in(Path::new("/proc"), own_uid(), prefix)
+            .iter()
+            .any(|p| p.pid == child.id())
+        {
+            assert!(Instant::now() < deadline, "the fake game never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        child
+    }
+
+    /// The signal a fake game was ended with, reaping it.
+    fn ended_by(child: &mut std::process::Child) -> Option<i32> {
+        use std::os::unix::process::ExitStatusExt;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status.signal();
+            }
+            if Instant::now() > deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A folder of the test's own, removed when it is dropped.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Fixture {
+        // Dropped after the children: fields drop in order, and `Drop for
+        // Fixture` runs first.
+        root: Scratch,
+        prefix: PathBuf,
+        server: PathBuf,
+        children: Vec<std::process::Child>,
+    }
+
+    impl Fixture {
+        /// A throwaway runtime and prefix under /var/tmp, where no real
+        /// prefix is. `kill` is what the fake `wineserver -k` does to the
+        /// pids in `game-pids` besides writing down that it ran.
+        fn new(kill: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let root = Scratch(PathBuf::from(format!(
+                "/var/tmp/ferestre-close-running-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            )));
+            let prefix = root.path().join("fake-proton/pfx");
+            std::fs::create_dir_all(&prefix).unwrap();
+            let server = root.path().join("runtime/files/bin/wineserver");
+            std::fs::create_dir_all(server.parent().unwrap()).unwrap();
+            let pids = root.path().join("game-pids");
+            let calls = root.path().join("calls");
+            std::fs::write(
+                &server,
+                format!(
+                    "#!/bin/sh\necho \"$WINEPREFIX $*\" >> {calls}\n\
+                     {kill}\nexit 0\n",
+                    calls = calls.display(),
+                    kill = kill.replace("PIDS", &pids.display().to_string())
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&server, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+            Fixture {
+                root,
+                prefix,
+                server,
+                children: Vec::new(),
+            }
+        }
+
+        fn game_in(&mut self, prefix: &Path) -> usize {
+            let child = fake_game(prefix);
+            let mut pids =
+                std::fs::read_to_string(self.root.path().join("game-pids")).unwrap_or_default();
+            if prefix == self.prefix {
+                pids.push_str(&format!("{}\n", child.id()));
+            }
+            std::fs::write(self.root.path().join("game-pids"), pids).unwrap();
+            self.children.push(child);
+            self.children.len() - 1
+        }
+
+        fn calls(&self) -> String {
+            std::fs::read_to_string(self.root.path().join("calls")).unwrap_or_default()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            for child in &mut self.children {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// `wineserver -k` ends the title, as it does for whatever server holds
+    /// the prefix: nothing is sent SIGKILL after it, and with no `wine` to ask
+    /// with there is no wait first. A title in another prefix is untouched.
+    #[test]
+    fn close_running_leaves_it_to_wineserver_when_that_works() {
+        let mut fixture = Fixture::new("xargs -r kill -TERM < PIDS");
+        let game = fixture.game_in(&fixture.prefix.clone());
+        let sibling = fixture.root.path().join("other-proton/pfx");
+        let other = fixture.game_in(&sibling);
+        let started = Instant::now();
+        assert!(close_running_within(
+            &fixture.server,
+            &fixture.prefix,
+            Duration::from_secs(30)
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "it waited for a title nothing asked to close"
+        );
+        assert_eq!(ended_by(&mut fixture.children[game]), Some(libc::SIGTERM));
+        assert_eq!(
+            fixture.calls(),
+            format!("{} -k\n", fixture.prefix.display())
+        );
+        assert!(
+            fixture.children[other].try_wait().unwrap().is_none(),
+            "a title in another prefix was ended"
+        );
+    }
+
+    /// When the prefix's server is gone and its processes are not, `-k` ends
+    /// nothing: what was in the prefix is sent SIGKILL, and only that.
+    #[test]
+    fn close_running_ends_what_wineserver_left_and_nothing_else() {
+        let mut fixture = Fixture::new(":");
+        let game = fixture.game_in(&fixture.prefix.clone());
+        let sibling = fixture.root.path().join("other-proton/pfx");
+        let other = fixture.game_in(&sibling);
+        assert!(close_running_within(
+            &fixture.server,
+            &fixture.prefix,
+            Duration::from_secs(30)
+        ));
+        assert_eq!(ended_by(&mut fixture.children[game]), Some(libc::SIGKILL));
+        assert!(
+            fixture.children[other].try_wait().unwrap().is_none(),
+            "a title in another prefix was ended"
+        );
+    }
+
+    /// With a `wine` to ask with, the title gets its full wait even when the
+    /// asking did not end it, before `-k`.
+    #[test]
+    fn close_running_waits_for_a_title_it_asked() {
+        let mut fixture = Fixture::new("xargs -r kill -TERM < PIDS");
+        let wine = fixture.server.with_file_name("wine");
+        std::fs::write(&wine, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&wine, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let game = fixture.game_in(&fixture.prefix.clone());
+        let started = Instant::now();
+        assert!(close_running_within(
+            &fixture.server,
+            &fixture.prefix,
+            Duration::from_secs(2)
+        ));
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert_eq!(ended_by(&mut fixture.children[game]), Some(libc::SIGTERM));
+    }
+
     /// Against a real Wine, opt-in: `FERESTRE_STOP_WINESERVER` names a
     /// runtime's wineserver and `FERESTRE_STOP_PREFIX` a prefix in which a
     /// windowed program that closes on WM_CLOSE (notepad) is running.
@@ -943,8 +946,7 @@ mod tests {
     fn a_running_wine_program_closes_when_asked() {
         let var = |name: &str| PathBuf::from(std::env::var_os(name).expect(name));
         let (server, prefix) = (var("FERESTRE_STOP_WINESERVER"), var("FERESTRE_STOP_PREFIX"));
-        // Safety: getuid cannot fail.
-        let uid = unsafe { libc::getuid() };
+        let uid = own_uid();
         let before = processes_in(Path::new("/proc"), uid, &prefix);
         assert!(
             !before.is_empty(),

@@ -222,6 +222,16 @@ verify = [
 ]
 
 [[capability]]
+name = "winhttp.websocket-repeated-first-receive"
+summary = "An asynchronous web socket's first WinHttpWebSocketReceive, repeated with the same buffer while it is pending, is taken as the same request instead of failing."
+provided-by = ["https://github.com/icex/wine/commit/4bc2e4819a6f91cb0664816af5f245f786c52132"]
+symptom-if-missing = "Dead by Daylight crashes on Loading Characters (EXCEPTION_ACCESS_VIOLATION), or stays on Connecting to RTM server..., right after its rtm-v3.live.bhvrdbd.com websocket connects; the log shows Attempt to queue receive while another is pending."
+note = "Only the socket's first receive is affected; any other receive while one is pending still fails with ERROR_INVALID_OPERATION, as on Windows. Completing receives on the calling thread instead was tried and left the game stuck on Connecting to RTM server..."
+verify = [
+    { file = "files/lib/wine/x86_64-windows/winhttp.dll", contains = "Repeated first receive while it is pending" },
+]
+
+[[capability]]
 name = "winhttp.http2"
 summary = "WinHTTP can negotiate HTTP/2 over TLS and use HTTP/1.1 when selected by the server."
 provided-by = [
@@ -256,6 +266,24 @@ symptom-if-missing = "\"Failed to Register TaskQueue Monitor\", or async work th
 note = "Required by every GDK title; nothing else in the runtime completes without it."
 verify = [
     { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "XTaskQueueDispatch" },
+]
+
+[[capability]]
+name = "xgameruntime.default-save-configuration"
+summary = "XGameSave opens a provider for a null configuration id, using the SCID MicrosoftGame.config names under SaveGameStorage."
+provided-by = ["https://github.com/icex/xgameruntime/commit/28bbbac2c83acd7ecb42121db69842fcb6672cc0"]
+symptom-if-missing = "Batman: Arkham Knight never finishes its first save after New Game Options; the save spinner turns for good."
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "no configuration id" },
+]
+
+[[capability]]
+name = "xgameruntime.async-callback-wait"
+summary = "Blocking XAsync status waits can include thread pool completion callbacks."
+provided-by = ["https://github.com/icex/xgameruntime/commit/be80c97d34e09340f4bf955d740fa03d1b073dab"]
+symptom-if-missing = "Hogwarts Legacy reads its Xbox user or Store license token before the callback supplies it."
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "XGR_WAIT_FOR_ASYNC_CALLBACKS" },
 ]
 
 [[capability]]
@@ -493,6 +521,22 @@ verify = [
 ]
 
 [[capability]]
+name = "xgameruntime.package-chunk-availability"
+summary = """
+XPackageEnumerateChunkAvailability calls back with every chunk of the package \
+(the numeric chunk ids of its layout_*.xml) and every Resource language of \
+MicrosoftGame.config, each Ready, synchronously on the calling thread."""
+provided-by = ["https://github.com/icex/xgameruntime/commit/51b23f1003340fac3884bb41efe23c1fb0d7ceba"]
+symptom-if-missing = "Death Stranding Director's Cut shows \"Internal system error occured\" a few seconds after launch and writes error.txt: an access violation at address 0 in a Background thread, after \"Unable to retrieve prefetch list for root asset\""
+note = """
+Titles seed a chunk-id map as not installed and learn which chunks are Ready \
+only from these callbacks; returning S_OK without calling back leaves the \
+whole game looking uninstalled."""
+verify = [
+    { file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "chunk %u Ready" },
+]
+
+[[capability]]
 name = "xgameruntime.save-provider-default-scid"
 summary = """
 A save provider initialised with an all-zero configuration id uses the title's \
@@ -689,6 +733,14 @@ provided-by = ["https://github.com/icex/xgameruntime/commit/468d0ecaa3037de9d8f5
 symptom-if-missing = "Forza Horizon 6 receives empty marketplace product listings"
 note = "Enable XGR_STORE_CATALOG=1 per title. Catalog data does not grant DLC ownership; purchasing remains unsupported."
 verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "catalog snapshot:" }, { file = "files/lib/wine/x86_64-unix/xgameruntime.so", contains = "CSDX" }]
+
+[[capability]]
+name = "xgameruntime.store-collections-id"
+summary = "XStoreGetUserCollectionsIdAsync returns the Store's Collections ID key for the title service's ticket, fetched through the service."
+provided-by = ["https://github.com/icex/xgameruntime/commit/9de84aa985536fbf65015fb9da82ea0b9f77efb5", "https://github.com/icex/xodus/commit/536871bf0939dce66ae1fc6906290949fc629aa0"]
+symptom-if-missing = "Dead by Daylight shows CANNOT CONNECT TO STORE (Cannot retrieve the list of available content) on its splash screen; its get-update-entitlements request is refused with 400."
+note = "Requires the matching xodus-service (KSDX request); an older service makes the call fail rather than return an empty key. XStoreGetUserPurchaseIdAsync is still a stub."
+verify = [{ file = "files/lib/wine/x86_64-windows/xgameruntime.dll", contains = "Collections ID key: status" }, { file = "files/lib/wine/x86_64-unix/xgameruntime.so", contains = "Store ID key" }]
 
 [[capability]]
 name = "xgameruntime.store-player-accounts"
