@@ -423,13 +423,21 @@ fn local_plan(recipe: &Recipe, dirs: &Dirs, options: &Options) -> Plan {
     };
     args.push(windows_path(&executable));
     args.extend(recipe.launch.args.iter().cloned());
+    // Started in its own folder, as Windows starts a program: a game behind a
+    // launcher in the top folder (GOG's REDprelauncher, say) was always
+    // started by it from its own folder, and run directly from the top one it
+    // cannot find its files and exits at once.
+    let cwd = executable
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or(game_dir);
 
     Plan {
         program,
         args,
         env_set,
         env_unset,
-        cwd: Some(game_dir),
+        cwd: Some(cwd),
     }
 }
 
@@ -825,7 +833,11 @@ summary = "Added by hand"
             PathBuf::from("/usr/lib/ferestre/scripts/proton-wine-shim.sh")
         );
         assert_eq!(plan.args, vec![r"Z:\drive\My Game\bin\Game.exe", "-dx12"]);
-        assert_eq!(plan.cwd.as_deref(), Some(Path::new("/drive/My Game")));
+        assert_eq!(
+            plan.cwd.as_deref(),
+            Some(Path::new("/drive/My Game/bin")),
+            "started in the executable's own folder, as Windows does"
+        );
         assert_eq!(plan.get("STEAM_COMPAT_DATA_PATH"), Some("/pfx/game"));
         assert_eq!(plan.get("FERESTRE_LOCAL_GAME"), Some("1"));
         for absent in ["WINE_GAMEINPUT", "XODUS_CLI_DIR", "XGR_XUID"] {
@@ -865,7 +877,7 @@ summary = "Added by hand"
         recipe.launch.executable = "/other/Launcher.exe".into();
         let plan = plan(&recipe, &dirs(), &Options::default());
         assert_eq!(plan.args, vec![r"Z:\other\Launcher.exe"]);
-        assert_eq!(plan.cwd.as_deref(), Some(Path::new("/drive/My Game")));
+        assert_eq!(plan.cwd.as_deref(), Some(Path::new("/other")));
     }
 
     #[test]
