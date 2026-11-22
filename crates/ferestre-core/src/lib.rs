@@ -42,6 +42,7 @@ pub mod runtime;
 pub mod sdl;
 pub mod signing;
 pub mod steam;
+pub mod steam_import;
 pub mod transfers;
 pub mod updater;
 pub mod updates;
