@@ -29,7 +29,7 @@ or in the account menu) turns the sidebar into a rail of icons with tooltips;
 names and controller order stay the same, and the choice is remembered with
 fullscreen. The account button opens a menu: a card with your name and
 role, Show me online, Accounts, Reload library, links to your profile and the
-Microsoft Store, Settings and Sign out. On narrow windows, Show navigation
+Microsoft Store, Settings, a Compact sidebar switch and Sign out. On narrow windows, Show navigation
 opens the sidebar. Touch controls have at least 44 logical pixels; scrolling uses GTK's touch and
 kinetic scrolling support.
 
@@ -69,7 +69,7 @@ It Running is the default. Closing asks the game to quit and ends it if it has
 not after 15 seconds, so unsaved progress may be lost; when the runtime cannot
 ask, the dialog says the game will be ended at once. Without a runtime to close
 it with, only Leave It Running is offered. While a close runs, Play on that
-title waits for it.
+title says it is closing and asks you to press Play again once it has closed.
 
 Edit launch settings opens the title's recipe editor. Settings Ferestre and its
 runtime understand appear as switches and menus in four groups (Display and
@@ -127,7 +127,7 @@ next launch; Exit fullscreen remains available by touch.
 
 ## Queue and pause
 
-Install and Update add a game to Install Queue. Only one queued transfer runs at a
+Install and Update add a game to the Install queue. Only one queued transfer runs at a
 time. Pause closes the backend's HTTP stream and checkpoints completed data;
 Resume obtains the remaining ranges. Stop retains checkpointed data. Queued
 and active entries become paused after restarting Ferestre: a saved queue

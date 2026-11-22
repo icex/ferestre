@@ -271,6 +271,9 @@ def build_template(repo, scratch, catalog):
         wanted |= set(r.get("runtime", {}).get("requires", [])) | set(r.get("runtime", {}).get("wants", []))
     write(rt / "files/share/ferestre/capabilities.json", json.dumps({"capabilities": sorted(wanted)}))
     write(rt / "files/bin/wineserver", "#!/bin/sh\nexit 0\n", True)
+    # A wine beside wineserver lets the already-running dialog describe the usual
+    # close (ask the game, then end it after the wait), not the rare fallback.
+    write(rt / "files/bin/wine", "#!/bin/sh\nexit 0\n", True)
     write(t / ".fixture/client/xodus-cli", CLIENT, True)
     write(t / ".fixture/bin/ferestre", CLI, True)
     write(t / ".fixture/executables.json", json.dumps(
