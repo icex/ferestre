@@ -913,6 +913,21 @@ fn launch_noise(line: &str) -> bool {
         || WINE_DEBUG.iter().any(|d| line.contains(d))
 }
 
+/// Whether launching this title involves the Store and Player accounts. A
+/// local game has no licence and no Xbox saves, so it never does; a title
+/// with no recipe is an Xbox title.
+pub fn launch_uses_accounts(recipe: Option<&Recipe>) -> bool {
+    !recipe.is_some_and(Recipe::is_local)
+}
+
+/// The ids among `ids` that the Store catalog can be asked about, in order.
+pub fn store_ids(ids: &[String]) -> Vec<String> {
+    ids.iter()
+        .filter(|id| ferestre_core::recipe::is_store_product_id(id))
+        .cloned()
+        .collect()
+}
+
 /// One row of the library: something owned, something described, or both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryRow {
@@ -4135,6 +4150,19 @@ HTTP 401 Unauthorized",
             rows[0].subtitle.contains("kernel driver"),
             "{}",
             rows[0].subtitle
+        );
+    }
+
+    #[test]
+    fn local_games_skip_accounts_and_the_store_catalog() {
+        let local = local_recipe("/g/Local Test");
+        let xbox = recipe("9ZZTESTGAME1", "playable", &[]);
+        assert!(!launch_uses_accounts(Some(&local)));
+        assert!(launch_uses_accounts(Some(&xbox)));
+        assert!(launch_uses_accounts(None));
+        assert_eq!(
+            store_ids(&["LOCAL-STEAM-1".to_string(), "9NBLGGH2JHXJ".to_string()]),
+            ["9NBLGGH2JHXJ"]
         );
     }
 }
