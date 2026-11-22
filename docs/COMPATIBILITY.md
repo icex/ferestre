@@ -50,6 +50,7 @@ Current launcher: [0.1.22](RELEASE-0.1.22.md), using runtime **11.0.20261107.1**
 | Crash Bandicoot N. Sane Trilogy | `9NJ2FD5HJ7SB` | Playable | Starts and plays; checked by a person. | 2026-11-22 |
 | DOOM 64 | `9MXND4PQLK3W` | Playable | Plays. | 2026-09-06 |
 | DREDGE | `9MSVVM5NS9L6` | Playable | Plays. | 2026-09-06 |
+| Dead by Daylight Windows | `9NMS4SFNBGBH` | Playable | Signs in, loads its Store content and plays; checked by a person. Real-money purchases are not supported. | 2026-11-22 |
 | Dune: Awakening | `9PJ6FV3130QZ` | Playable | Gameplay confirmed by the player. | 2026-10-13 |
 | Forza Horizon 5 | `9NNX1VVR3KNQ` | Playable | Plays with a restored Windows career; title services and the live Festival Playlist load after generic authentication and endpoint-discovery fixes. Player confirmed the online fix. | 2026-09-07 |
 | Forza Horizon 6 | `9NR1R1XWLCNB` | Playable | Gameplay and Continue with saved progress confirmed by the player. Also plays with separate Store and Player accounts: the Store account's Game Pass licence, the Player account's gamertag, profile and saves. The in-game marketplace is currently unavailable. | 2026-10-17 |
@@ -64,7 +65,6 @@ Current launcher: [0.1.22](RELEASE-0.1.22.md), using runtime **11.0.20261107.1**
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
 | Retro Classics | `9MTVJ3HHTQGS` | Playable | Playable, confirmed by the player. Signs in, loads the catalogue and streams Tennis; broader game, controller and save-restore coverage is not separately qualified. | 2026-10-10 |
 | Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. From a Steam shortcut, the shortcut's Steam Input controller layout applies, and Steam sees the game exit. | 2026-10-18 |
-| Dead by Daylight Windows | `9NMS4SFNBGBH` | Playable, with issues | Signs in, passes Loading Characters, reaches the main menu and opens the Store with its items; real-money purchases are refused by the game. Matches not tried. | 2026-11-22 |
 | Gears of War: E-Day | `9N4PT8HGCDHQ` | Playable, with issues | Xbox sign-in and tutorial gameplay verified with HTTP/2. Online deployment was observed. An intermittent crash occurred on an earlier lobby entry. | 2026-11-21 |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.
