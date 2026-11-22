@@ -460,18 +460,26 @@ impl Model {
     /// enough on its own -- wineserver detaches, so the game is reparented and
     /// survives, and the row would say stopped while it kept running.
     pub fn wineserver(&self, recipe: &Recipe) -> Option<(PathBuf, PathBuf)> {
-        let paths = self.paths.as_ref()?;
         let runtime = self.launch_runtime(recipe).ok()?;
         let server = runtime.path.join("files/bin/wineserver");
         if !server.is_file() {
             return None;
         }
+        Some((server, self.title_prefix(recipe)?))
+    }
+
+    /// The `WINEPREFIX` a launch of this recipe runs in, the `pfx` folder of
+    /// its Proton prefix: the Player's, when account roles chose one. Known
+    /// without a runtime, so a title running there is found even when the
+    /// runtime that would launch it is missing.
+    pub fn title_prefix(&self, recipe: &Recipe) -> Option<PathBuf> {
+        let paths = self.paths.as_ref()?;
         let mut prefix = paths.prefix_dir(recipe).ok()?;
         if let Some(roles) = &self.roles {
             let (_, player) = roles.selected(self.profiles.as_ref()?).ok()?;
             prefix = accounts::player_prefix(&prefix, player).ok()?;
         }
-        Some((server, prefix.join("pfx")))
+        Some(prefix.join("pfx"))
     }
 
     /// The runtime a launch of this recipe would use, judged the way its row is.

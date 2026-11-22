@@ -165,31 +165,20 @@ pub fn processes_in(proc_root: &Path, uid: u32, prefix: &Path) -> Vec<WineProces
     found
 }
 
-/// Wine's own processes, which start with any title and can outlive it by a
-/// few seconds; none of them means a title is running.
-const WINE_HELPERS: &[&str] = &[
-    "conhost.exe",
-    "explorer.exe",
-    "plugplay.exe",
-    "rpcss.exe",
-    "rundll32.exe",
-    "services.exe",
-    "start.exe",
-    "steam.exe",
-    "svchost.exe",
-    "tabtip.exe",
-    "winedevice.exe",
-    "wineboot.exe",
-    "xalia.exe",
-];
+/// Wine's own processes start with any title and can outlive it by a few
+/// seconds; none of them means a title is running. They are the
+/// [`SYSTEM_IMAGES`], which [`processes_in`] already leaves out, and Proton's
+/// accessibility bridge, which is asked to close with the title but is not it.
+const WINE_HELPERS: &[&str] = &["xalia.exe"];
 
 /// The image names of a title's own processes among `found`: everything that
 /// is not one of Wine's helpers, each name once.
 pub fn title_images(found: &[WineProcess]) -> Vec<String> {
     let mut images: Vec<String> = Vec::new();
     for process in found {
-        let helper = WINE_HELPERS
+        let helper = SYSTEM_IMAGES
             .iter()
+            .chain(WINE_HELPERS)
             .any(|h| h.eq_ignore_ascii_case(&process.image));
         if !helper
             && !images
@@ -216,13 +205,61 @@ pub fn running_in(prefix: &Path) -> Vec<String> {
     title_images(&processes_in(Path::new("/proc"), own_uid(), prefix))
 }
 
-/// What `ferestre run` says when it will not start a second copy.
+/// What `ferestre run` says when it will not start a second copy. A copy
+/// started from Steam shows Play, not Stop, in the window, so the way to it
+/// from there is Play's "Close It".
 pub fn refusal(name: &str, images: &[String]) -> String {
     format!(
-        "{name} is already running in its prefix ({}). Close it, or stop it from Ferestre, \
-         then start it again.",
+        "{name} is already running in its prefix ({}). Close the game, or press Play in \
+         Ferestre and choose Close It, then start it again.",
         images.join(", ")
     )
+}
+
+/// What `ferestre run` says when another `run` is still starting the title in
+/// the same prefix: Proton's launcher and `wineboot` are all there is of it
+/// yet, and none of them counts as the title (see [`title_images`]).
+pub fn refusal_starting(name: &str) -> String {
+    format!(
+        "{name} is already starting in its prefix, from another launch. Wait for it, or \
+         close it, then start it again."
+    )
+}
+
+/// The file a launch holds a lock on, beside the `pfx` folder of the Proton
+/// prefix it runs in, from before it changes anything in the prefix until the
+/// title has ended.
+pub const RUN_LOCK: &str = ".ferestre-run.lock";
+
+/// Claim `prefix` (the Proton prefix: the folder holding `pfx`) for one
+/// launch. `Ok(None)` when another launch holds it. The claim lasts as long
+/// as the returned file is open, and no longer than this process: a launch
+/// that crashes cannot leave it behind. The descriptor is close-on-exec, so
+/// the title and its wineserver do not keep it.
+///
+/// The scan alone cannot stop two launches at once: until the title's own
+/// executable starts, only Wine's helpers are in the prefix, and two scans a
+/// moment apart both find nothing.
+pub fn claim_prefix(prefix: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    std::fs::create_dir_all(prefix)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(prefix.join(RUN_LOCK))?;
+    loop {
+        // Safety: a plain flock on a descriptor owned here.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(file));
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EWOULDBLOCK) => return Ok(None),
+            _ => return Err(error),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -370,6 +407,7 @@ mod tests {
             process(1, "services.exe"),
             process(2, "Explorer.exe"),
             process(3, "steam.exe"),
+            process(7, "xalia.exe"),
         ];
         assert!(title_images(&helpers).is_empty());
         let game = [
@@ -421,8 +459,27 @@ mod tests {
                 &["HogwartsLegacy.exe".into(), "CrashReportClient.exe".into()]
             ),
             "Hogwarts Legacy is already running in its prefix (HogwartsLegacy.exe, \
-             CrashReportClient.exe). Close it, or stop it from Ferestre, then start it again."
+             CrashReportClient.exe). Close the game, or press Play in Ferestre and choose \
+             Close It, then start it again."
         );
+    }
+
+    /// One launch holds a prefix at a time; the claim ends with the file.
+    #[test]
+    fn one_launch_claims_a_prefix_at_a_time() {
+        let tmp = tempfile::Builder::new()
+            .prefix("ferestre-claim-")
+            .tempdir_in("/var/tmp")
+            .unwrap();
+        let prefix = tmp.path().join("fake-proton");
+        let first = claim_prefix(&prefix).unwrap();
+        assert!(first.is_some());
+        assert!(claim_prefix(&prefix).unwrap().is_none());
+        assert!(claim_prefix(&tmp.path().join("other-proton"))
+            .unwrap()
+            .is_some());
+        drop(first);
+        assert!(claim_prefix(&prefix).unwrap().is_some());
     }
 
     /// The image view keeps its own copy of what is asked and what is left

@@ -121,6 +121,11 @@ enum Cmd {
     },
 
     /// Launch a title by product id or slug.
+    #[command(
+        after_help = "Exit status: the title's own, once it has started. Before that: \
+        1 a failure, 2 a usage error, 3 a refused runtime downgrade, 4 the title is already \
+        running or starting in its prefix. A title that exits 1 to 4 itself looks the same."
+    )]
     Run {
         /// Product id or slug, as `ferestre titles` lists them.
         #[arg(value_name = "TITLE")]
@@ -818,7 +823,11 @@ fn prepare_launch(
     if !request.dry_run {
         let images = running::running_in(&prefix.join("pfx"));
         if !images.is_empty() {
-            return Err(AlreadyRunning(running::refusal(&recipe.title.name, &images)).into());
+            return Err(already_running(
+                paths,
+                &recipe,
+                running::refusal(&recipe.title.name, &images),
+            ));
         }
     }
     let options = launch::Options {
@@ -960,11 +969,43 @@ fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Resu
         );
     }
     let prefix = launch::prefix_dir(&recipe, &dirs, &options);
+    std::fs::create_dir_all(&prefix).context("creating the Wine prefix directory")?;
+    // Held until the title ends, from before anything in the prefix changes.
+    // The scan in `prepare_launch` cannot see a launch still starting -- only
+    // Proton's launcher and Wine's helpers are in the prefix yet -- and two
+    // launches a moment apart, a Steam shortcut and the window, would both
+    // get past it. Scanned again once held: one may have finished starting
+    // since.
+    let _prefix_claim = match running::claim_prefix(&prefix) {
+        Ok(Some(claim)) => Some(claim),
+        Ok(None) => {
+            return Err(already_running(
+                paths,
+                &recipe,
+                running::refusal_starting(&recipe.title.name),
+            ))
+        }
+        Err(error) => {
+            eprintln!(
+                "-- {} cannot be locked ({error}); nothing stops two launches of {} at once",
+                prefix.join(running::RUN_LOCK).display(),
+                recipe.title.name
+            );
+            None
+        }
+    };
+    let images = running::running_in(&prefix.join("pfx"));
+    if !images.is_empty() {
+        return Err(already_running(
+            paths,
+            &recipe,
+            running::refusal(&recipe.title.name, &images),
+        ));
+    }
     if let Some(registry) = &registry {
         register_winrt_classes(&prefix, registry, &runtime);
     }
     run_setup(&recipe, "every-launch", &dirs.scripts_dir, &game_dir)?;
-    std::fs::create_dir_all(&prefix).context("creating the Wine prefix directory")?;
     if runtime.provides("xgameruntime.playfab-file-saves") {
         if let Some(identity) = install::package_identity(&game_dir) {
             let backups = paths
@@ -5019,6 +5060,78 @@ impl std::fmt::Display for UsageError {
 
 impl std::error::Error for UsageError {}
 
+/// The variable the window sets on every `run` it starts
+/// (`ferestre-gui`'s `launch_state::TAG`). The window says why a launch of its
+/// own was refused; nothing else does for one started elsewhere.
+const WINDOW_LAUNCH_TAG: &str = "FERESTRE_LAUNCH_ID";
+
+/// Refuse a launch because the title is already running, or starting, in its
+/// prefix, and make sure the person hears why. A Steam shortcut shows neither
+/// stderr nor the exit status: Steam says "Running" for a moment and goes back
+/// to Play. So the refusal is also added to the title's launch log -- appended,
+/// because the running copy may still be writing to it -- and, for a launch
+/// the window did not start and no terminal shows, sent to the desktop as a
+/// notification.
+fn already_running(paths: &Paths, recipe: &Recipe, message: String) -> anyhow::Error {
+    if let Ok(log) = paths.log_file(recipe) {
+        let appended = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .or_else(|_| {
+                std::fs::create_dir_all(log.parent().unwrap_or(Path::new("/")))?;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log)
+            });
+        if let Ok(mut file) = appended {
+            let _ = writeln!(
+                file,
+                "=== launch refused (unix {}) ===\n!! {message}",
+                unix_seconds()
+            );
+        }
+    }
+    if std::env::var_os(WINDOW_LAUNCH_TAG).is_none() && !std::io::stderr().is_terminal() {
+        notify_desktop(&format!("{} did not start", recipe.title.name), &message);
+    }
+    AlreadyRunning(message).into()
+}
+
+/// A text as a GVariant string literal, for `gdbus call`.
+fn gvariant_string(text: &str) -> String {
+    format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// Show a desktop notification, if there is a session bus with a notification
+/// service on it. Best effort: nothing is said when there is none, and it
+/// waits at most a few seconds.
+fn notify_desktop(summary: &str, body: &str) {
+    let _ = Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--timeout",
+            "5",
+            "--dest",
+            "org.freedesktop.Notifications",
+            "--object-path",
+            "/org/freedesktop/Notifications",
+            "--method",
+            "org.freedesktop.Notifications.Notify",
+            "Ferestre",
+            "0",
+            "dialog-information",
+        ])
+        .arg(gvariant_string(summary))
+        .arg(gvariant_string(body))
+        .args(["[]", "{}", "-1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// `run` refused because the title is already running in its prefix. Exits
 /// with [`running::EXIT_ALREADY_RUNNING`].
 #[derive(Debug)]
@@ -5842,6 +5955,14 @@ summary = "Runs."
     fn a_usage_error_from_us_exits_2_and_everything_else_exits_1() {
         assert_eq!(exit_code_for(&usage("wrong")), EXIT_USAGE);
         assert_eq!(exit_code_for(&anyhow!("the disk is full")), EXIT_FAILURE);
+    }
+
+    #[test]
+    fn notification_text_is_quoted_for_gdbus() {
+        assert_eq!(
+            gvariant_string(r"Assassin's Creed \ C:\Game"),
+            r"'Assassin\'s Creed \\ C:\\Game'"
+        );
     }
 
     /// A title already running in its prefix has a code of its own, so a

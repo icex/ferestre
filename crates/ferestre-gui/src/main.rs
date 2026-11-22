@@ -279,6 +279,10 @@ struct Ui {
     /// a game runs for hours and must not hold the window's other work.
     running: Rc<RefCell<BTreeMap<String, stop::Launch>>>,
     running_servers: Rc<RefCell<BTreeMap<String, (PathBuf, PathBuf)>>>,
+    /// Titles started elsewhere that "Close It" is closing right now. Play
+    /// waits for that to finish: a copy started meanwhile would be in the
+    /// prefix the close is ending.
+    closing_titles: Rc<RefCell<std::collections::BTreeSet<String>>>,
     /// Each running launch's stop channel, through which an image view asks
     /// a title in its namespaces to close (see [`stop::Channel`]).
     running_channels: Rc<RefCell<BTreeMap<String, std::sync::Arc<stop::Channel>>>>,
@@ -663,6 +667,7 @@ fn build_ui(app: &adw::Application) {
         download_control: Rc::new(RefCell::new(None)),
         running: Rc::new(RefCell::new(BTreeMap::new())),
         running_servers: Rc::new(RefCell::new(BTreeMap::new())),
+        closing_titles: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
         running_channels: Rc::new(RefCell::new(BTreeMap::new())),
         asked_names: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
         artwork: Rc::new(RefCell::new(artwork::Queue::default())),
@@ -3538,16 +3543,26 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
             .add_toast(toast(format!("{name} is already running")));
         return;
     }
+    if ui.closing_titles.borrow().contains(&key) {
+        ui.toasts.add_toast(toast(format!(
+            "{name} is closing. Press Play again once it has closed."
+        )));
+        return;
+    }
     // One this window did not start -- an earlier window, a Steam shortcut, a
     // terminal -- is just as much in the way: a second copy in the same prefix
-    // closes at once with a code that says nothing about why.
-    let found_server = {
+    // closes at once with a code that says nothing about why. Looked for even
+    // without a runtime to close it with: then only "Leave It Running" is
+    // offered.
+    let found = {
         let model = ui.model.borrow();
-        model
-            .recipe_for(product_id)
-            .and_then(|r| model.wineserver(r))
+        model.recipe_for(product_id).and_then(|r| {
+            let prefix = model.title_prefix(r)?;
+            let server = model.wineserver(r).map(|(server, _)| server);
+            Some((server, prefix))
+        })
     };
-    if let Some((wineserver, prefix)) = found_server {
+    if let Some((wineserver, prefix)) = found {
         let images = stop::running_in(&prefix);
         if !images.is_empty() {
             confirm_already_running(ui, product_id, name, wineserver, prefix, &images);
@@ -3772,9 +3787,14 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
                 let code = status
                     .code()
                     .map_or_else(|| status.to_string(), |c| format!("with code {c}"));
+                // `run` refused: the title is already running or starting in
+                // its prefix, and the reason already names it.
+                let refused =
+                    status.code() == Some(i32::from(ferestre_core::running::EXIT_ALREADY_RUNNING));
                 ui.toasts.add_toast(
                     adw::Toast::builder()
                         .title(match reason {
+                            Some(reason) if refused => reason,
                             Some(reason) => format!("{name} stopped: {reason}"),
                             None => format!("{name} exited {code}"),
                         })
@@ -3840,34 +3860,49 @@ fn confirm_stop_title(ui: &Ui, product_id: &str, name: &str) {
 
 /// A title is already running in its prefix, started outside this window:
 /// leave it, close it, or close it and start it again. Never a second copy.
+/// Without a `wineserver` to close it with, only leaving it is offered.
 fn confirm_already_running(
     ui: &Ui,
     product_id: &str,
     name: &str,
-    wineserver: PathBuf,
+    wineserver: Option<PathBuf>,
     prefix: PathBuf,
     images: &[String],
 ) {
-    let dialog = adw::AlertDialog::new(
-        Some(&format!("{name} is already running")),
-        Some(&format!(
-            "A copy started earlier is still running ({}), perhaps from another \
-             window or one that never closed. A second copy would close at once.\n\n\
-             Closing it asks it to quit the way closing its window does, and ends \
-             it after {} seconds if it does not.",
-            images.join(", "),
-            stop::CLOSE_WAIT.as_secs()
-        )),
+    let running = format!(
+        "A copy started earlier is still running ({}), perhaps from Steam, another \
+         window, or one that never closed. A second copy would close at once.",
+        images.join(", ")
     );
+    let body = match &wineserver {
+        None => format!(
+            "{running}\n\nFerestre cannot close it: the runtime it would use is missing. \
+             Close the game itself, then start it again."
+        ),
+        Some(server) if stop::can_ask(server) => format!(
+            "{running}\n\nUnsaved progress may be lost. Ferestre asks the game to close \
+             first, and ends it if it has not after {} seconds.",
+            stop::CLOSE_WAIT.as_secs()
+        ),
+        Some(_) => format!(
+            "{running}\n\nUnsaved progress will be lost. This runtime cannot ask the game \
+             to close, so closing it ends it at once."
+        ),
+    };
+    let dialog = adw::AlertDialog::new(Some(&format!("{name} is already running")), Some(&body));
     dialog.add_response("leave", "Leave It Running");
-    dialog.add_response("close", "Close It");
-    dialog.add_response("restart", "Close and Start Again");
-    dialog.set_response_appearance("close", adw::ResponseAppearance::Destructive);
-    dialog.set_response_appearance("restart", adw::ResponseAppearance::Suggested);
+    if wineserver.is_some() {
+        dialog.add_response("close", "Close It");
+        dialog.add_response("restart", "Close and Start Again");
+        // Both end the running game; neither is the suggested way out.
+        dialog.set_response_appearance("close", adw::ResponseAppearance::Destructive);
+        dialog.set_response_appearance("restart", adw::ResponseAppearance::Destructive);
+    }
     dialog.set_default_response(Some("leave"));
     dialog.set_close_response("leave");
     let window = ui.window.clone();
     let ui = ui.clone();
+    let key = product_id.to_ascii_uppercase();
     let product_id = product_id.to_string();
     let name = name.to_string();
     dialog.connect_response(None, move |_, response| {
@@ -3876,15 +3911,24 @@ fn confirm_already_running(
             "restart" => true,
             _ => return,
         };
+        let Some(wineserver) = wineserver.clone() else {
+            return;
+        };
+        // One close at a time, and no Play while it runs.
+        if !ui.closing_titles.borrow_mut().insert(key.clone()) {
+            return;
+        }
         ui.toasts.add_toast(toast(format!("Closing {name}…")));
         let ui = ui.clone();
+        let key = key.clone();
         let product_id = product_id.clone();
         let name = name.clone();
-        let (wineserver, prefix) = (wineserver.clone(), prefix.clone());
+        let prefix = prefix.clone();
         glib::spawn_future_local(async move {
             let closed = gio::spawn_blocking(move || stop::close_running(&wineserver, &prefix))
                 .await
                 .unwrap_or(false);
+            ui.closing_titles.borrow_mut().remove(&key);
             if !closed {
                 ui.toasts.add_toast(toast(format!(
                     "{name} is still running and could not be closed"

@@ -403,13 +403,20 @@ pub fn present(
         let name = recipe.borrow().title.name.clone();
         let on_reset = Rc::new(on_reset);
         reset.connect_clicked(move |button| {
+            // The file the reset sets aside, named in full: it is where the edit
+            // can be got back from by hand.
+            let kept = Recipe::path_for(&product_id, &titles_dir)
+                .map(|path| path.with_extension("toml.bak").display().to_string())
+                .unwrap_or_else(|_| "a .bak file".into());
             let confirm = adw::AlertDialog::new(
                 Some(&format!("Reset {name} to its defaults?")),
-                Some(
-                    "Every launch setting changed here for this title is undone, and \
-                     it uses the settings Ferestre ships for it again. Your edit is \
-                     kept beside it as a .bak file.",
-                ),
+                Some(&format!(
+                    "Every launch setting changed here for this title is undone. It uses \
+                     the settings Ferestre ships for it again, or, for a title Ferestre has \
+                     none for, works them out again the next time it starts.\n\n\
+                     The settings it has now are kept in {kept}, replacing an older copy \
+                     there."
+                )),
             );
             confirm.add_response("cancel", "Cancel");
             confirm.add_response("reset", "Reset");

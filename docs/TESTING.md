@@ -61,7 +61,7 @@ game. Each is `python3 tests/<name>.py`; CI's `test` job lists them all.
 | `test_media_dependencies.py`, `test_client_dependencies.py` | `ferestre doctor` names a missing library |
 | `test_real_path_image_view.py`, `test_caller_ids_image_view.py` | the private real-path view of a licensed image (needs unprivileged user namespaces) |
 | `test_proton_wine_shim.py`, `test_launch_gdk.py`, `test_fix_xcurl.py`, `test_install_xodus_proton.py` | the launch scripts in `scripts/` |
-| `test_run_already_running.py` | `ferestre run` refuses, with exit code 4, a title already running in its prefix (a fake `FakeGame.exe` in a throwaway prefix under `/var/tmp`); `--force` does not get past it, `--dry-run` does not check |
+| `test_run_already_running.py` | `ferestre run` refuses, with exit code 4, a title already running in its prefix (a fake `FakeGame.exe` in a throwaway prefix under `/var/tmp`), or one another `run` is still starting (it holds `<prefix>/.ferestre-run.lock`); `--force` does not get past it, `--dry-run` does not check; the refusal is appended to the launch log and, outside the window, sent to a fake `gdbus` as a desktop notification |
 | `test_game_session.py` | display path, HDR and performance-profile selection |
 | `test_workflows.py`, `test_source_pins.py`, `test_runtime_staging.py`, `test_release_signing.py`, `test_build_appimage.py` | CI/release invariants, source pins, signing, the AppImage build |
 | `tools/test_tool_hygiene.py`, `tools/test_xsts_probe.py` | the developer tools below (`python3 -m unittest discover -s tools -p 'test_*.py'`) |
@@ -91,7 +91,7 @@ also runs there where there is no Xvfb; `gui_smoke.py` needs X.
 | `gui_accounts.py`, `gui_accounts_controller.py` | separate Store and Player accounts |
 | `gui_presence.py` | "Show me online" while a game runs |
 | `gui_launch.py`, `gui_running.py` | the launch spinner, the running state, Resume and Stop |
-| `gui_already_running.py` | Play on a title already running in its prefix, started elsewhere: Leave It Running, Close It and Close and Start Again, against a fake game, `wine` and `wineserver`; and the editor's Reset to defaults |
+| `gui_already_running.py` | Play on a title already running in its prefix, started elsewhere: Leave It Running, Close It and Close and Start Again, against a fake game, `wine` and `wineserver`, with a second fake game in another prefix that must be left alone; and the editor's Reset to defaults |
 | `gui_transfers.py`, `gui_update_existing.py`, `gui_update_resume.py` | the install/update queue |
 | `gui_move.py` | moving an installation between drives |
 | `gui_controller*.py` | controller navigation, glyphs, focus, the on-screen keyboard |
