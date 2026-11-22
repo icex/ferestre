@@ -308,6 +308,15 @@ enum NeuralCmd {
         /// game.
         #[arg(long)]
         accept_anticheat_risk: bool,
+        /// With --accept-anticheat-risk: an anti-cheat the person was shown
+        /// (repeatable). Accepting then covers only these, so one detected
+        /// since refuses instead of being accepted unseen.
+        #[arg(
+            long = "anticheat-shown",
+            value_name = "NAME",
+            requires = "accept_anticheat_risk"
+        )]
+        anticheat_shown: Vec<String>,
     },
     /// Take DLSSNR-AMD out of a game and put back the files it replaced.
     Disable {
@@ -500,6 +509,7 @@ fn cmd_neural(cli: &Cli, command: &NeuralCmd) -> Result<ExitCode> {
             route,
             model,
             accept_anticheat_risk,
+            anticheat_shown,
         } => {
             let route = parse_route(route.as_deref())?;
             let model = parse_network(model.as_deref())?;
@@ -510,7 +520,7 @@ fn cmd_neural(cli: &Cli, command: &NeuralCmd) -> Result<ExitCode> {
                 title,
                 route,
                 model,
-                *accept_anticheat_risk,
+                accept_anticheat_risk.then_some(anticheat_shown.as_slice()),
             )
         }
         NeuralCmd::Disable { title } => neural_disable(cli, &paths, &ctx, title),
@@ -643,7 +653,9 @@ fn neural_enable(
     title: &str,
     route: Option<neural::Route>,
     model: Option<neural::Network>,
-    accept_anticheat_risk: bool,
+    // `None` when the risk was not accepted; otherwise the anti-cheats the
+    // person was shown, an empty list accepting whatever is found.
+    accept_anticheat_risk: Option<&[String]>,
 ) -> Result<ExitCode> {
     let (dir, recipes) = recipes_from(cli, paths)?;
     let (recipe, product_id, game_dir) = neural_title(paths, &dir, &recipes, title)?;
@@ -664,7 +676,8 @@ fn neural_enable(
             executable: &recipe.launch.executable,
             route,
             model,
-            accept_anticheat_risk,
+            accept_anticheat_risk: accept_anticheat_risk.is_some(),
+            shown_anticheat: accept_anticheat_risk.filter(|shown| !shown.is_empty()),
         },
     )?;
     for warning in &enabled.warnings {
@@ -9481,6 +9494,7 @@ fi
                 route: Some(Route::ReshadeFeeder),
                 model: Some(model),
                 accept_anticheat_risk: false,
+                shown_anticheat: None,
             },
         )
         .unwrap();
@@ -9766,15 +9780,45 @@ fi
                         route,
                         model,
                         accept_anticheat_risk,
+                        anticheat_shown,
                     },
             } => {
                 assert_eq!(title, "bedrock");
                 assert_eq!(route.as_deref(), Some("reshade-feeder"));
                 assert_eq!(model.as_deref(), Some("CC_SMALL_FP8"));
                 assert!(accept_anticheat_risk);
+                assert!(anticheat_shown.is_empty());
             }
             other => panic!("{other:?}"),
         }
+        match parse(&[
+            "ferestre",
+            "neural",
+            "enable",
+            "bedrock",
+            "--accept-anticheat-risk",
+            "--anticheat-shown",
+            "Easy Anti-Cheat",
+            "--anticheat-shown",
+            "BattlEye",
+        ]) {
+            Cmd::Neural {
+                command:
+                    NeuralCmd::Enable {
+                        anticheat_shown, ..
+                    },
+            } => assert_eq!(anticheat_shown, ["Easy Anti-Cheat", "BattlEye"]),
+            other => panic!("{other:?}"),
+        }
+        assert!(Cli::try_parse_from([
+            "ferestre",
+            "neural",
+            "enable",
+            "bedrock",
+            "--anticheat-shown",
+            "BattlEye",
+        ])
+        .is_err());
         match parse(&["ferestre", "neural", "disable", "bedrock"]) {
             Cmd::Neural {
                 command: NeuralCmd::Disable { title },
@@ -9821,7 +9865,7 @@ fi
             "testgame",
             Some(Route::ReshadeFeeder),
             None,
-            false,
+            None,
         )
         .unwrap_err();
         let text = format!("{error:#}");
@@ -9843,7 +9887,7 @@ fi
             "testgame",
             Some(Route::ReshadeFeeder),
             None,
-            false,
+            None,
         )
         .unwrap();
         let entry = neural_state::get(&ctx.config_dir, GAME).unwrap().unwrap();
@@ -9855,7 +9899,7 @@ fi
         neural_disable(&cli(), &paths, &ctx, "testgame").unwrap();
         assert_eq!(std::fs::read(dir.join("dxgi.dll")).unwrap(), THEIRS);
         assert_eq!(neural_state::get(&ctx.config_dir, GAME).unwrap(), None);
-        let error = neural_enable(&cli(), &paths, &ctx, "nothing", None, None, false).unwrap_err();
+        let error = neural_enable(&cli(), &paths, &ctx, "nothing", None, None, None).unwrap_err();
         assert!(error.to_string().contains("no recipe"), "{error}");
     }
 
@@ -9890,7 +9934,7 @@ fi
             "testgame",
             Some(Route::ReshadeFeeder),
             None,
-            false,
+            None,
         )
         .unwrap();
         let doc = neural_status(&cli(), &paths, &ctx, Some("testgame")).unwrap();

@@ -121,6 +121,38 @@ pub(crate) fn enable_args(
     args
 }
 
+/// `--anticheat-shown` for each anti-cheat the dialog named, so accepting
+/// covers only those: one detected since refuses instead of riding along.
+pub(crate) fn shown_args(names: &[&str]) -> Vec<String> {
+    names
+        .iter()
+        .flat_map(|name| ["--anticheat-shown".to_string(), name.to_string()])
+        .collect()
+}
+
+/// The route dropdown's choice: index 0 is "Automatic", then [`Route::ALL`].
+pub(crate) fn chosen_route(index: u32) -> Option<Route> {
+    (index as usize)
+        .checked_sub(1)
+        .and_then(|i| Route::ALL.get(i).copied())
+}
+
+/// The network dropdown's choice: index 0 is "Automatic", then [`Network::ALL`].
+pub(crate) fn chosen_network(index: u32) -> Option<Network> {
+    (index as usize)
+        .checked_sub(1)
+        .and_then(|i| Network::ALL.get(i).copied())
+}
+
+/// Whether Enable can be pressed: never on a refusal, only with a route
+/// (detected, or chosen in place of "Automatic (none detected)"), and with
+/// the acknowledgement box ticked when there is one.
+pub(crate) fn enable_sensitive(v: &View, route_index: u32, acknowledged: Option<bool>) -> bool {
+    v.can_enable
+        && (v.route.is_some() || chosen_route(route_index).is_some())
+        && acknowledged.unwrap_or(true)
+}
+
 /// Reads the game's neural rendering state off the main loop, then shows
 /// the dialog.
 pub fn open(ui: &Ui, product_id: &str, name: &str) {
@@ -254,13 +286,13 @@ fn present(ui: &Ui, product_id: &str, name: &str, v: &View) {
     // person has not acknowledged, the box ticked. A refusal has no override.
     let sensitivity = {
         let (enable, routes, check) = (enable.clone(), routes.clone(), acknowledged.clone());
-        let (can_enable, detected) = (v.can_enable, v.route.is_some());
+        let v = v.clone();
         move || {
-            enable.set_sensitive(
-                can_enable
-                    && (detected || routes.selected() != 0)
-                    && check.as_ref().is_none_or(|c| c.is_active()),
-            );
+            enable.set_sensitive(enable_sensitive(
+                &v,
+                routes.selected(),
+                check.as_ref().map(|c| c.is_active()),
+            ));
         }
     };
     sensitivity();
@@ -275,15 +307,15 @@ fn present(ui: &Ui, product_id: &str, name: &str, v: &View) {
         let (ui, dialog, product_id) = (ui.clone(), dialog.clone(), product_id.to_string());
         let (routes, networks, acknowledged) =
             (routes.clone(), networks.clone(), acknowledged.clone());
+        let shown = v.acknowledge.clone();
         enable.connect_clicked(move |_| {
-            let route = (routes.selected() as usize)
-                .checked_sub(1)
-                .and_then(|i| Route::ALL.get(i).copied());
-            let model = (networks.selected() as usize)
-                .checked_sub(1)
-                .and_then(|i| Network::ALL.get(i).copied());
+            let route = chosen_route(routes.selected());
+            let model = chosen_network(networks.selected());
             let ack = acknowledged.as_ref().is_some_and(|c| c.is_active());
-            let args = enable_args(&product_id, route, model, ack);
+            let mut args = enable_args(&product_id, route, model, ack);
+            if ack {
+                args.extend(shown_args(&shown));
+            }
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             dialog.close();
             spawn_cli_tracked(&ui, &args, "Enabling neural rendering");
@@ -319,6 +351,12 @@ fn present(ui: &Ui, product_id: &str, name: &str, v: &View) {
     cancel.grab_focus();
 }
 
+thread_local! {
+    /// The download address as typed but not yet applied, kept across the
+    /// redraws that rebuild the Settings group.
+    static DLL_URL_DRAFT: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
 /// The Settings group: the DLL's download address (from the settings file,
 /// never the environment) and which models are cached.
 pub(crate) fn settings_group(
@@ -337,13 +375,24 @@ pub(crate) fn settings_group(
         .title("nvngx_dlssnr.dll download address")
         .show_apply_button(true)
         .build();
-    match ferestre_core::settings::file_dlssnr_dll_url(&config_dir) {
-        Ok(Some(url)) => entry.set_text(&url),
-        Ok(None) => {}
-        Err(error) => ui
-            .toasts
-            .add_toast(toast(format!("Could not read settings: {error:#}"))),
-    }
+    // This group is rebuilt on every redraw, which follows every finished
+    // background job: an unreadable file is said in place rather than as a
+    // toast per redraw, and an address typed but not yet applied survives.
+    let saved = match ferestre_core::settings::file_dlssnr_dll_url(&config_dir) {
+        Ok(url) => url.unwrap_or_default(),
+        Err(error) => {
+            let row = plain_row("Could not read settings", Some(&format!("{error:#}")));
+            row.add_css_class("error");
+            group.add(&row);
+            String::new()
+        }
+    };
+    let draft = DLL_URL_DRAFT.with_borrow(Clone::clone);
+    entry.set_text(draft.as_deref().unwrap_or(&saved));
+    entry.connect_changed(move |entry| {
+        let text = entry.text().to_string();
+        DLL_URL_DRAFT.set((text != saved).then_some(text));
+    });
     {
         let ui = ui.clone();
         entry.connect_apply(move |entry| {
@@ -351,11 +400,14 @@ pub(crate) fn settings_group(
             let text = text.trim();
             let url = (!text.is_empty()).then_some(text);
             match ferestre_core::settings::set_dlssnr_dll_url(&config_dir, url) {
-                Ok(()) => ui.toasts.add_toast(toast(if url.is_some() {
-                    "Download address saved"
-                } else {
-                    "Download address cleared"
-                })),
+                Ok(()) => {
+                    DLL_URL_DRAFT.set(None);
+                    ui.toasts.add_toast(toast(if url.is_some() {
+                        "Download address saved"
+                    } else {
+                        "Download address cleared"
+                    }))
+                }
                 Err(error) => ui
                     .toasts
                     .add_toast(toast(format!("Could not save the address: {error:#}"))),
@@ -459,6 +511,60 @@ mod tests {
         assert_eq!(v.route, None);
         assert!(v.can_enable);
         assert!(!v.enabled);
+    }
+
+    #[test]
+    fn dropdown_indexes_map_to_automatic_then_each_choice() {
+        assert_eq!(chosen_route(0), None);
+        for (i, route) in Route::ALL.iter().enumerate() {
+            assert_eq!(chosen_route(i as u32 + 1), Some(*route));
+        }
+        assert_eq!(chosen_route(Route::ALL.len() as u32 + 1), None);
+        assert_eq!(chosen_network(0), None);
+        for (i, network) in Network::ALL.iter().enumerate() {
+            assert_eq!(chosen_network(i as u32 + 1), Some(*network));
+        }
+        assert_eq!(chosen_network(Network::ALL.len() as u32 + 1), None);
+    }
+
+    #[test]
+    fn enable_is_pressable_only_with_a_route_a_tick_and_no_refusal() {
+        let refused = view(&overview(
+            vec![det("Ricochet", true, false)],
+            Gate::Refused(vec!["Ricochet"]),
+            Some(Route::ReshadeFeeder),
+        ));
+        assert!(!enable_sensitive(&refused, 0, None));
+        assert!(!enable_sensitive(&refused, 1, None));
+
+        let ask = view(&overview(
+            vec![det("BattlEye", true, true)],
+            Gate::NeedsAcknowledgement(vec!["BattlEye"]),
+            Some(Route::Optiscaler),
+        ));
+        assert!(!enable_sensitive(&ask, 0, Some(false)));
+        assert!(enable_sensitive(&ask, 0, Some(true)));
+
+        let undetected = view(&overview(Vec::new(), Gate::Allowed, None));
+        assert!(
+            !enable_sensitive(&undetected, 0, None),
+            "Automatic (none detected)"
+        );
+        assert!(enable_sensitive(&undetected, 2, None));
+    }
+
+    #[test]
+    fn accepting_names_each_anti_cheat_that_was_shown() {
+        assert!(shown_args(&[]).is_empty());
+        assert_eq!(
+            shown_args(&["Easy Anti-Cheat", "BattlEye"]),
+            [
+                "--anticheat-shown",
+                "Easy Anti-Cheat",
+                "--anticheat-shown",
+                "BattlEye"
+            ]
+        );
     }
 
     #[test]

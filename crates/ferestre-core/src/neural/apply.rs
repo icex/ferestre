@@ -680,6 +680,10 @@ pub struct EnableRequest<'a> {
     pub route: Option<Route>,
     pub model: Option<Network>,
     pub accept_anticheat_risk: bool,
+    /// The anti-cheats the person was shown when they accepted the risk.
+    /// When given, accepting covers only these: one found now that is not
+    /// among them refuses, so nobody acknowledges a name they never saw.
+    pub shown_anticheat: Option<&'a [String]>,
 }
 
 #[derive(Debug, Clone)]
@@ -712,7 +716,26 @@ fn enable_with(ctx: &Context, req: &EnableRequest, found: &[Detection]) -> Resul
              to enable neural rendering anyway, pass --accept-anticheat-risk",
             names.join(", ")
         ),
-        Gate::NeedsAcknowledgement(names) => names,
+        Gate::NeedsAcknowledgement(names) => {
+            let unseen: Vec<&str> = req
+                .shown_anticheat
+                .map(|shown| {
+                    names
+                        .iter()
+                        .copied()
+                        .filter(|name| !shown.iter().any(|s| s == name))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !unseen.is_empty() {
+                bail!(
+                    "{name} now also uses {}, which was not shown when the risk was accepted; \
+                     look again before enabling neural rendering",
+                    unseen.join(", ")
+                );
+            }
+            names
+        }
     };
     let dir = exe_dir(req.game_dir, req.executable);
     if !dir.is_dir() {
@@ -1276,6 +1299,7 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
                 route,
                 model: None,
                 accept_anticheat_risk: accept,
+                shown_anticheat: None,
             }
         }
 
@@ -1382,6 +1406,35 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
             .unwrap()
             .contains("Easy Anti-Cheat"));
         enable_with(&w.ctx, &w.req(Some(Route::ReshadeFeeder), false), &eac).unwrap();
+        assert!(w.entry().unwrap().enabled);
+    }
+
+    #[test]
+    fn accepting_covers_only_the_anti_cheats_that_were_shown() {
+        let w = World::new();
+        let found = [
+            det("Easy Anti-Cheat", true, true),
+            det("BattlEye", true, true),
+        ];
+        let shown = ["Easy Anti-Cheat".to_string()];
+        let req = EnableRequest {
+            shown_anticheat: Some(&shown),
+            ..w.req(Some(Route::ReshadeFeeder), true)
+        };
+        let error = enable_with(&w.ctx, &req, &found).unwrap_err().to_string();
+        assert!(error.contains("BattlEye"), "{error}");
+        assert!(!error.contains("Easy Anti-Cheat,"), "{error}");
+        assert!(!w.game.join(INSTALL_MANIFEST).exists());
+        assert!(state::acknowledged(&w.ctx.config_dir, "local-game")
+            .unwrap()
+            .is_empty());
+
+        let shown = ["Easy Anti-Cheat".to_string(), "BattlEye".to_string()];
+        let req = EnableRequest {
+            shown_anticheat: Some(&shown),
+            ..w.req(Some(Route::ReshadeFeeder), true)
+        };
+        enable_with(&w.ctx, &req, &found).unwrap();
         assert!(w.entry().unwrap().enabled);
     }
 
@@ -1723,6 +1776,7 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
             route: None,
             model: None,
             accept_anticheat_risk: false,
+            shown_anticheat: None,
         };
         let enabled = enable_with(&w.ctx, &req, &[]).unwrap();
         let bin = game.join("Bin 64");
