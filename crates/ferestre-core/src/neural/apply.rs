@@ -19,7 +19,7 @@ use super::{hardware, models, Arch, Context, Expect, ModelFile, Network, Route};
 use crate::anticheat::{self, Detection};
 use anyhow::{anyhow, bail, Context as _, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -176,6 +176,11 @@ struct BackupManifest {
     saved: Vec<Saved>,
     /// What was not there before.
     absent: Vec<String>,
+    /// The sha256 of each file the last install copied from the package, so
+    /// a reinstall from another package still knows Ferestre's own older
+    /// copy from the game's. Never used to decide what to delete.
+    #[serde(default)]
+    installed: BTreeMap<String, String>,
 }
 
 fn read_backup(exe_dir: &Path) -> Result<Option<BackupManifest>> {
@@ -195,6 +200,13 @@ fn read_backup(exe_dir: &Path) -> Result<Option<BackupManifest>> {
         );
     }
     Ok(Some(manifest))
+}
+
+fn write_backup(exe_dir: &Path, manifest: &BackupManifest) -> Result<()> {
+    crate::cache::write(
+        &exe_dir.join(BACKUP_DIR).join(BACKUP_MANIFEST),
+        &serde_json::to_vec_pretty(manifest)?,
+    )
 }
 
 /// The top-level names upstream's install manifest lists.
@@ -289,7 +301,9 @@ pub fn backup(exe_dir: &Path, files: &[RouteFile], package: &str, route: Route) 
             );
         }
     }
-    let (mut saved, mut absent) = previous.map(|p| (p.saved, p.absent)).unwrap_or_default();
+    let (mut saved, mut absent, installed) = previous
+        .map(|p| (p.saved, p.absent, p.installed))
+        .unwrap_or_default();
     let listed = installed_names(exe_dir);
     let fresh = !dir.exists();
     std::fs::create_dir_all(&dir).with_context(|| format!("{}", dir.display()))?;
@@ -307,10 +321,17 @@ pub fn backup(exe_dir: &Path, files: &[RouteFile], package: &str, route: Route) 
                 continue;
             };
             let copies_this_file = !file.dir && file.source.is_some();
-            let ours = file
-                .source
-                .as_deref()
-                .is_some_and(|source| copies_this_file && same_bytes(&here, source));
+            // The package's copy, or the one an earlier install wrote (the
+            // package may have changed since).
+            let ours = copies_this_file
+                && (file
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| same_bytes(&here, source))
+                    || installed.get(&file.name).is_some_and(|hash| {
+                        meta.is_file()
+                            && crate::updater::sha256_file(&here).is_ok_and(|h| &h == hash)
+                    }));
             let foreign = if was_absent {
                 copies_this_file && !listed.contains(&file.name) && !ours
             } else if file.only_if_absent {
@@ -347,16 +368,34 @@ pub fn backup(exe_dir: &Path, files: &[RouteFile], package: &str, route: Route) 
             route,
             saved: saved.clone(),
             absent: absent.clone(),
+            installed: installed.clone(),
         };
-        crate::cache::write(
-            &dir.join(BACKUP_MANIFEST),
-            &serde_json::to_vec_pretty(&manifest)?,
-        )
+        write_backup(exe_dir, &manifest)
     })();
     if result.is_err() && fresh {
         let _ = std::fs::remove_dir_all(&dir);
     }
     result
+}
+
+/// Remember the sha256 of each file the install just copied from the
+/// package, in the backup manifest.
+fn record_installed(exe_dir: &Path, files: &[RouteFile]) -> Result<()> {
+    let Some(mut manifest) = read_backup(exe_dir)? else {
+        return Ok(());
+    };
+    manifest.installed.clear();
+    for file in files {
+        let Some(source) = file.source.as_deref().filter(|_| !file.dir) else {
+            continue;
+        };
+        if same_bytes(&exe_dir.join(&file.name), source) {
+            manifest
+                .installed
+                .insert(file.name.clone(), crate::updater::sha256_file(source)?);
+        }
+    }
+    write_backup(exe_dir, &manifest)
 }
 
 /// Why a name in the backup manifest is not one restore may touch.
@@ -395,6 +434,7 @@ fn validated(exe_dir: &Path, allowed: &BTreeSet<String>) -> Result<Option<Backup
     let manifest = read_backup(exe_dir)
         .map_err(|e| refuse(format!("{e:#}")))?
         .ok_or_else(|| refuse("the backup has no manifest".to_string()))?;
+    let mut seen = BTreeSet::new();
     for name in manifest
         .saved
         .iter()
@@ -402,6 +442,9 @@ fn validated(exe_dir: &Path, allowed: &BTreeSet<String>) -> Result<Option<Backup
         .chain(manifest.absent.iter())
     {
         check_name(name, allowed).map_err(&refuse)?;
+        if !seen.insert(name) {
+            return Err(refuse(format!("{name:?} is listed more than once")));
+        }
     }
     for saved in &manifest.saved {
         match std::fs::symlink_metadata(dir.join(&saved.path)) {
@@ -580,8 +623,8 @@ pub fn verify(package_dir: &Path, exe_dir: &Path, route: Route) -> Result<(), St
 }
 
 /// Back up, run `install.sh`, and keep the person's `dlssnr-amd.ini` from an
-/// earlier install. On failure `install.sh`'s partial files are gone; the
-/// backup is left for the caller.
+/// earlier install. On failure `install.sh`'s partial files are gone and the
+/// person's ini is back; the backup is left for the caller.
 fn install(
     ctx: &Context,
     key: &str,
@@ -600,18 +643,23 @@ fn install(
     if ini_is_ours && std::fs::symlink_metadata(&ini).is_ok_and(|m| m.is_file()) {
         std::fs::copy(&ini, &kept).with_context(|| format!("cannot keep {}", ini.display()))?;
     }
-    run_install(
+    let installed = run_install(
         package_dir,
         exe_dir,
         entry.route,
         entry.model,
         &log_file(ctx, key),
-    )?;
-    if kept.is_file() {
+    );
+    // Whether or not it worked: a failed run removed the ini with the rest.
+    let kept_back = if kept.is_file() {
         std::fs::rename(&kept, &ini)
-            .with_context(|| format!("cannot put back your {}", ini.display()))?;
-    }
-    Ok(())
+            .with_context(|| format!("cannot put back your {}", ini.display()))
+    } else {
+        Ok(())
+    };
+    installed?;
+    kept_back?;
+    record_installed(exe_dir, &files)
 }
 
 /// The model files a network needs.
@@ -698,6 +746,28 @@ fn enable_with(ctx: &Context, req: &EnableRequest, found: &[Detection]) -> Resul
             req.executable
         );
     }
+    // Refused before anything is written: one install per game, one route.
+    if let Some(previous) = read_backup(&dir)? {
+        if previous.route != route {
+            bail!(
+                "neural rendering is installed in {} with the {} route; turn it off before choosing another",
+                dir.display(),
+                previous.route
+            );
+        }
+    }
+    if let Some(old) = state::get(&ctx.config_dir, req.key)? {
+        if old.install_dir != dir && holds_ours(&old.install_dir) {
+            bail!(
+                "neural rendering for {name} is installed in {}; turn it off before installing it in {}",
+                old.install_dir.display(),
+                dir.display()
+            );
+        }
+    }
+    // Only a backup this call starts is rolled back on failure: an earlier
+    // one belongs to the install already there.
+    let fresh = std::fs::symlink_metadata(dir.join(BACKUP_DIR)).is_err();
     let arch = if detected.bits == 32 {
         Arch::I686
     } else {
@@ -738,6 +808,14 @@ fn enable_with(ctx: &Context, req: &EnableRequest, found: &[Detection]) -> Resul
     };
     let allowed = names(&package::route_files(&package_dir, route)?);
     let undo = |error: anyhow::Error| -> anyhow::Error {
+        if !fresh {
+            return error.context(format!(
+                "the earlier install in {} was not removed and your files are still kept in {}; \
+                 the next launch installs it again, or turn neural rendering off",
+                dir.display(),
+                dir.join(BACKUP_DIR).display()
+            ));
+        }
         if let Err(e) = restore(&dir, &allowed) {
             return error.context(format!("{e:#}"));
         }
@@ -747,7 +825,9 @@ fn enable_with(ctx: &Context, req: &EnableRequest, found: &[Detection]) -> Resul
         return Err(undo(error));
     }
     if let Err(error) = state::record(&ctx.config_dir, req.key, &entry, &newly) {
-        let _ = run_remove(&package_dir, &dir, &log_file(ctx, req.key));
+        if fresh {
+            let _ = run_remove(&package_dir, &dir, &log_file(ctx, req.key));
+        }
         return Err(undo(error));
     }
     let mut warnings = hardware::check();
@@ -777,20 +857,30 @@ fn disable_locked(ctx: &Context, key: &str, game_dir: &Path, executable: &str) -
         .as_ref()
         .map(|e| e.install_dir.clone())
         .unwrap_or_else(|| exe_dir(game_dir, executable));
-    if !dir.is_dir() {
-        return state::forget(&ctx.config_dir, key);
+    take_out(ctx, key, &dir, entry.as_ref())?;
+    state::forget(&ctx.config_dir, key)
+}
+
+/// Whether a folder holds any of Ferestre's install or backup.
+fn holds_ours(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join(INSTALL_MANIFEST)).is_ok()
+        || std::fs::symlink_metadata(dir.join(BACKUP_DIR)).is_ok()
+}
+
+/// `install.sh remove` in `dir` and the person's files back, leaving the
+/// state alone. `entry` names the package and route; without one the backup
+/// manifest does.
+fn take_out(ctx: &Context, key: &str, dir: &Path, entry: Option<&Entry>) -> Result<()> {
+    if !dir.is_dir() || !holds_ours(dir) {
+        return Ok(());
     }
-    let (version, arches, route) = match &entry {
+    let (version, arches, route) = match entry {
         Some(e) => (e.package.clone(), vec![e.arch], e.route),
-        None => match read_backup(&dir)? {
+        None => match read_backup(dir)? {
             Some(m) => (m.package, Arch::ALL.to_vec(), m.route),
             None => return Ok(()),
         },
     };
-    let ours_here = dir.join(INSTALL_MANIFEST).exists() || dir.join(BACKUP_DIR).exists();
-    if !ours_here {
-        return state::forget(&ctx.config_dir, key);
-    }
     let package_dir = arches
         .iter()
         .find_map(|&arch| package::unpacked(&ctx.root, &version, arch))
@@ -803,14 +893,14 @@ fn disable_locked(ctx: &Context, key: &str, game_dir: &Path, executable: &str) -
         })?;
     let allowed = names(&package::route_files(&package_dir, route)?);
     // Checked whole before `install.sh remove` deletes anything.
-    let backup = validated(&dir, &allowed)?;
+    let backup = validated(dir, &allowed)?;
     if dir.join(INSTALL_MANIFEST).exists() {
-        run_remove(&package_dir, &dir, &log_file(ctx, key))?;
+        run_remove(&package_dir, dir, &log_file(ctx, key))?;
     }
     if let Some(manifest) = backup {
-        put_back(&dir, &manifest)?;
+        put_back(dir, &manifest)?;
     }
-    state::forget(&ctx.config_dir, key)
+    Ok(())
 }
 
 /// What [`ensure_installed`] found or did before a launch.
@@ -861,8 +951,7 @@ fn ensure_with(
     };
     let dir = exe_dir(game_dir, executable);
     if let Some(reason) = gate_reason(&gate(found, &acknowledged)) {
-        let ours = |d: &Path| d.join(INSTALL_MANIFEST).exists() || d.join(BACKUP_DIR).exists();
-        if !ours(&dir) && !ours(&entry.install_dir) {
+        if !holds_ours(&dir) && !holds_ours(&entry.install_dir) {
             return Ensured::Skipped(reason);
         }
         return match disable_locked(ctx, key, game_dir, executable) {
@@ -884,6 +973,18 @@ fn ensure_with(
             .is_some_and(|pkg| verify(&pkg, &dir, entry.route).is_ok());
     if whole {
         return Ensured::Present(entry);
+    }
+    // The executable moved to another folder: the old install comes out
+    // first, so neither it nor the person's files kept beside it are lost.
+    if entry.install_dir != dir && holds_ours(&entry.install_dir) {
+        if let Err(e) = take_out(ctx, key, &entry.install_dir, Some(&entry)) {
+            return Ensured::Skipped(format!(
+                "the executable is now in {}, and neural rendering's earlier install in {} \
+                 could not be taken out: {e:#}",
+                dir.display(),
+                entry.install_dir.display()
+            ));
+        }
     }
     match reinstall(ctx, key, &dir, &entry, current) {
         Ok(entry) => Ensured::Reinstalled(entry),
@@ -1345,23 +1446,48 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
         w.enable(Route::ReshadeFeeder);
         let manifest = w.game.join(BACKUP_DIR).join("manifest.json");
         let original = std::fs::read_to_string(&manifest).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&original).unwrap();
+        assert_eq!(json["saved"][0]["path"], "dxgi.dll");
+        assert!(json["absent"].as_array().unwrap().len() > 1);
+        let mut tampered = Vec::new();
         for bad in ["..", "/tmp/x", "", "a/b", ".", "Game.exe", BACKUP_DIR] {
-            let mut json: serde_json::Value = serde_json::from_str(&original).unwrap();
-            json["saved"][0]["path"] = serde_json::Value::String(bad.to_string());
+            let mut saved = json.clone();
+            saved["saved"][0]["path"] = serde_json::Value::String(bad.to_string());
+            tampered.push((format!("saved {bad:?}"), saved));
+            let mut absent = json.clone();
+            absent["absent"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::Value::String(bad.to_string()));
+            tampered.push((format!("absent {bad:?}"), absent));
+        }
+        // A name both saved and absent would be put back, then deleted.
+        let mut both = json.clone();
+        both["absent"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::Value::String("dxgi.dll".into()));
+        tampered.push(("saved and absent".into(), both));
+        let mut twice = json.clone();
+        let first = twice["absent"][0].clone();
+        twice["absent"].as_array_mut().unwrap().push(first);
+        tampered.push(("absent twice".into(), twice));
+        for (bad, json) in tampered {
             std::fs::write(&manifest, json.to_string()).unwrap();
             let before = listing(&w.game);
             let error = disable(&w.ctx, "local-game", &w.game, "Game.exe").unwrap_err();
             assert!(
                 format!("{error:#}").contains(BACKUP_DIR),
-                "{bad:?}: {error:#}"
+                "{bad}: {error:#}"
             );
-            assert_eq!(listing(&w.game), before, "{bad:?}");
-            assert!(w.game.join(BACKUP_DIR).is_dir(), "{bad:?}");
+            assert_eq!(listing(&w.game), before, "{bad}");
+            assert!(w.game.join(BACKUP_DIR).is_dir(), "{bad}");
             assert_eq!(read(&canary), b"alive");
-            assert!(w.entry().is_some(), "{bad:?}: the entry stays");
+            assert_eq!(read(&w.game.join(BACKUP_DIR).join("dxgi.dll")), THEIRS);
+            assert!(w.entry().is_some(), "{bad}: the entry stays");
             assert!(
                 w.game.join(INSTALL_MANIFEST).is_file(),
-                "{bad:?}: not removed"
+                "{bad}: not removed"
             );
             std::fs::write(&manifest, &original).unwrap();
         }
@@ -1369,8 +1495,141 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
         let copy = w.game.join(BACKUP_DIR).join("dxgi.dll");
         std::fs::remove_file(&copy).unwrap();
         std::os::unix::fs::symlink(&canary, &copy).unwrap();
+        let before = listing(&w.game);
+        let backup_before = listing(&w.game.join(BACKUP_DIR));
         assert!(disable(&w.ctx, "local-game", &w.game, "Game.exe").is_err());
         assert_eq!(read(&canary), b"alive");
+        assert_eq!(listing(&w.game), before);
+        assert_eq!(listing(&w.game.join(BACKUP_DIR)), backup_before);
+        assert!(w.game.join(INSTALL_MANIFEST).is_file());
+        assert!(w.entry().is_some());
+    }
+
+    #[test]
+    fn choosing_another_route_is_refused_without_changes() {
+        let w = World::new();
+        write(&w.game.join("winevulkan.dll"), THEIRS);
+        w.enable(Route::ReshadeFeederVulkan);
+        write(&w.game.join(INI), b"mine");
+        let before = listing(&w.game);
+        let backup_before = listing(&w.game.join(BACKUP_DIR));
+        let lines = w.log_lines();
+        let error = enable_with(&w.ctx, &w.req(Some(Route::ReshadeFeederDx9), false), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("turn it off before choosing another"),
+            "{error}"
+        );
+        assert_eq!(listing(&w.game), before);
+        assert_eq!(listing(&w.game.join(BACKUP_DIR)), backup_before);
+        assert_eq!(read(&w.game.join(INI)), b"mine");
+        assert_eq!(w.log_lines(), lines, "install.sh did not run");
+        assert_eq!(w.entry().unwrap().route, Route::ReshadeFeederVulkan);
+        assert!(verify(&w.package_dir(), &w.game, Route::ReshadeFeederVulkan).is_ok());
+        disable(&w.ctx, "local-game", &w.game, "Game.exe").unwrap();
+        assert_eq!(listing(&w.game), vec!["Game.exe", "winevulkan.dll"]);
+        assert_eq!(read(&w.game.join("winevulkan.dll")), THEIRS);
+    }
+
+    #[test]
+    fn a_failed_reenable_keeps_the_backup_and_the_persons_ini() {
+        let w = World::new();
+        write(&w.game.join("dxgi.dll"), THEIRS);
+        w.enable(Route::ReshadeFeeder);
+        write(&w.game.join(INI), b"mine");
+        let fail = w.package_dir().join("fail-with");
+        write(&fail, b"1");
+        let error =
+            enable_with(&w.ctx, &w.req(Some(Route::ReshadeFeeder), false), &[]).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("was not removed"),
+            "{error:#}"
+        );
+        assert_eq!(read(&w.game.join(INI)), b"mine");
+        assert_eq!(read(&w.game.join(BACKUP_DIR).join("dxgi.dll")), THEIRS);
+        assert!(!w.game.join(BACKUP_DIR).join(KEPT_INI).exists());
+        assert!(w.entry().unwrap().enabled);
+
+        std::fs::remove_file(&fail).unwrap();
+        assert!(matches!(w.ensure(&[]), Ensured::Reinstalled(_)));
+        assert_eq!(read(&w.game.join(INI)), b"mine");
+        assert_eq!(read(&w.game.join("dxgi.dll")), b"reshade dxgi");
+        disable(&w.ctx, "local-game", &w.game, "Game.exe").unwrap();
+        assert_eq!(listing(&w.game), vec!["Game.exe", "dxgi.dll"]);
+        assert_eq!(read(&w.game.join("dxgi.dll")), THEIRS);
+    }
+
+    #[test]
+    fn a_changed_package_with_a_wiped_manifest_never_saves_our_old_files() {
+        let w = World::new();
+        w.enable(Route::ReshadeFeeder);
+        std::fs::remove_file(w.game.join(INSTALL_MANIFEST)).unwrap();
+        write(
+            &w.package_dir().join("reshade/dxgi.dll"),
+            b"newer reshade dxgi",
+        );
+        match w.ensure(&[]) {
+            Ensured::Reinstalled(entry) => assert_eq!(entry.route, Route::ReshadeFeeder),
+            other => panic!("{other:?}"),
+        }
+        assert!(!w.game.join(BACKUP_DIR).join("dxgi.dll").exists());
+        assert_eq!(read(&w.game.join("dxgi.dll")), b"newer reshade dxgi");
+        disable(&w.ctx, "local-game", &w.game, "Game.exe").unwrap();
+        assert_eq!(listing(&w.game), vec!["Game.exe"]);
+    }
+
+    #[test]
+    fn a_moved_executable_takes_the_old_install_out_first() {
+        let w = World::new();
+        write(&w.game.join("dxgi.dll"), THEIRS);
+        w.enable(Route::ReshadeFeeder);
+        let bin = w.game.join("Bin");
+        write(
+            &bin.join("Game.exe"),
+            &crate::neural::pe::tiny_pe(0x8664, 0x20b, &["d3d12.dll"]),
+        );
+        // Enable refuses a second folder while the first holds the mod.
+        let req = EnableRequest {
+            executable: "Bin/Game.exe",
+            ..w.req(Some(Route::ReshadeFeeder), false)
+        };
+        let error = enable_with(&w.ctx, &req, &[]).unwrap_err().to_string();
+        assert!(error.contains("turn it off"), "{error}");
+        assert_eq!(listing(&bin), vec!["Game.exe"]);
+
+        match ensure_with(&w.ctx, "local-game", &w.game, "Bin/Game.exe", &[]) {
+            Ensured::Reinstalled(entry) => assert_eq!(entry.install_dir, bin),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(listing(&w.game), vec!["Bin", "Game.exe", "dxgi.dll"]);
+        assert_eq!(read(&w.game.join("dxgi.dll")), THEIRS);
+        assert!(verify(&w.package_dir(), &bin, Route::ReshadeFeeder).is_ok());
+        disable(&w.ctx, "local-game", &w.game, "Bin/Game.exe").unwrap();
+        assert_eq!(listing(&bin), vec!["Game.exe"]);
+        assert_eq!(w.entry(), None);
+    }
+
+    #[test]
+    fn a_moved_executable_whose_old_install_cannot_come_out_is_skipped() {
+        let w = World::new();
+        w.enable(Route::ReshadeFeeder);
+        let mut entry = w.entry().unwrap();
+        entry.package = "0.0.8".into();
+        state::put(&w.ctx.config_dir, "local-game", &entry).unwrap();
+        let bin = w.game.join("Bin");
+        write(
+            &bin.join("Game.exe"),
+            &crate::neural::pe::tiny_pe(0x8664, 0x20b, &["d3d12.dll"]),
+        );
+        let before = listing(&w.game);
+        match ensure_with(&w.ctx, "local-game", &w.game, "Bin/Game.exe", &[]) {
+            Ensured::Skipped(reason) => assert!(reason.contains("taken out"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(listing(&w.game), before);
+        assert_eq!(listing(&bin), vec!["Game.exe"]);
+        assert_eq!(w.entry().unwrap().install_dir, w.game);
     }
 
     #[test]

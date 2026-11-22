@@ -275,7 +275,8 @@ pub struct Overview {
     /// For an enabled entry: whether its install is whole.
     pub installed: Option<Result<(), String>>,
     pub models: Vec<ModelFile>,
-    /// Whether the x86_64 package to use is unpacked.
+    /// Whether the package to use is unpacked, for the entry's architecture
+    /// or else the executable's.
     pub package_ready: bool,
     pub hardware: Vec<String>,
     pub dll_url_configured: bool,
@@ -302,7 +303,13 @@ pub fn overview(
             )),
         }
     });
-    let package_ready = (ctx.packages)(Arch::X86_64)
+    // The entry's architecture, else the one the executable needs.
+    let arch = match (&entry, detected.bits) {
+        (Some(e), _) => e.arch,
+        (None, 32) => Arch::I686,
+        (None, _) => Arch::X86_64,
+    };
+    let package_ready = (ctx.packages)(arch)
         .ok()
         .is_some_and(|p| package::installed(&ctx.root, &p).is_some());
     Overview {
