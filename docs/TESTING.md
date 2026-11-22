@@ -92,6 +92,7 @@ also runs there where there is no Xvfb; `gui_smoke.py` needs X.
 | `gui_presence.py` | "Show me online" while a game runs |
 | `gui_launch.py`, `gui_running.py` | the launch spinner, the running state, Resume and Stop |
 | `gui_already_running.py` | Play on a title already running in its prefix, started elsewhere: Leave It Running, Close It and Close and Start Again, against a fake game, `wine` and `wineserver`; and the editor's Reset to defaults |
+| `gui_notifications.py` | notifications stack: three fired together are all on screen at once in a 1280x900 window, newest at the bottom; Dismiss notification, a failed launch replacing its own "Starting", and F6 then Escape from the keyboard |
 | `gui_transfers.py`, `gui_update_existing.py`, `gui_update_resume.py` | the install/update queue |
 | `gui_move.py` | moving an installation between drives |
 | `gui_controller*.py` | controller navigation, glyphs, focus, the on-screen keyboard |

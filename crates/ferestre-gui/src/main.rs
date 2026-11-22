@@ -23,6 +23,7 @@ mod handheld;
 mod install_drives;
 mod launch_state;
 mod model;
+mod notifications;
 mod packagekit;
 mod presence_ui;
 mod progress;
@@ -188,6 +189,21 @@ window.fullscreen-browser button, window.fullscreen-browser menubutton > button 
 .fullscreen-browser .game-meta { font-size: 14px; }
 .fullscreen-browser button:focus-visible, .fullscreen-browser button.game-tile:focus { outline: 4px solid #8bd77b; outline-offset: 3px; }
 .fullscreen-browser .game-grid flowboxchild:focus-visible { outline: none; }
+/* Notifications stack at the bottom of the content (notifications.rs). */
+.notification {
+  background-color: alpha(#24272d, 0.94); color: #f4f4f5;
+  border: 1px solid alpha(#ffffff, 0.09); border-radius: 14px;
+  padding: 6px 6px 6px 16px; min-height: 44px;
+  box-shadow: 0 8px 22px alpha(black, 0.38), 0 1px 2px alpha(black, 0.3);
+}
+.notification.high { border-left: 3px solid #ff7b72; padding-left: 14px; }
+.notification label { color: #f4f4f5; }
+.notification .notification-count { font-weight: 700; color: #b3b6bd; }
+window.ferestre-window .notification button.flat { min-width: 32px; min-height: 32px; color: alpha(#ffffff, 0.8); }
+window.ferestre-window .notification-more { min-height: 30px; border-radius: 999px; padding: 2px 14px; background-color: alpha(#24272d, 0.92); color: #f4f4f5; box-shadow: 0 4px 12px alpha(black, 0.3); }
+.bell .unread-dot { min-width: 8px; min-height: 8px; border-radius: 999px; background-color: #ff5f57; margin: 0; }
+.history-item { padding: 6px 2px; border-bottom: 1px solid alpha(#ffffff, 0.06); }
+popover.glass-menu > contents { background-color: alpha(#24272d, 0.96); border: 1px solid alpha(#ffffff, 0.08); border-radius: 16px; box-shadow: 0 12px 32px alpha(black, 0.45); }
 /* Page switches: a page that replaced another settles in. Blur only where it
    is cheap (see effects.rs); otherwise an opacity fade; nothing at all when
    the desktop asks for reduced motion. */
@@ -236,7 +252,7 @@ fn plain_row(title: &str, subtitle: Option<&str>) -> adw::ActionRow {
 struct Ui {
     model: Rc<RefCell<Model>>,
     window: adw::ApplicationWindow,
-    toasts: adw::ToastOverlay,
+    toasts: notifications::Toasts,
     content: gtk::Box,
     scroll: gtk::ScrolledWindow,
     account_button: gtk::Button,
@@ -446,9 +462,14 @@ fn build_ui(app: &adw::Application) {
         .build();
 
     account_button.set_widget_name("navigation-account");
+    account_button.set_hexpand(true);
     let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
     sidebar_box.set_margin_top(18);
-    sidebar_box.append(&account_button);
+    // The account, and beside it the notification history.
+    let sidebar_top = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    sidebar_top.set_margin_end(8);
+    sidebar_top.append(&account_button);
+    sidebar_box.append(&sidebar_top);
     sidebar_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     sidebar_box.append(
         &gtk::ScrolledWindow::builder()
@@ -542,7 +563,7 @@ fn build_ui(app: &adw::Application) {
         .hscrollbar_policy(gtk::PolicyType::Never)
         .child(&content)
         .build();
-    let toasts = adw::ToastOverlay::new();
+    let toasts = notifications::Toasts::new();
     toasts.set_child(Some(&scroll));
 
     // Below the content and outside it, because `render` empties the content
@@ -607,7 +628,7 @@ fn build_ui(app: &adw::Application) {
         .visible(false)
         .build();
     content_view.add_bottom_bar(&controller_hints);
-    content_view.set_content(Some(&toasts));
+    content_view.set_content(Some(toasts.widget()));
 
     let split = adw::NavigationSplitView::builder()
         .min_sidebar_width(250.0)
@@ -731,6 +752,7 @@ fn build_ui(app: &adw::Application) {
         presence: Rc::new(RefCell::new(Default::default())),
     };
 
+    sidebar_top.append(&notification_bell(&ui));
     settings_link.connect_clicked(glib::clone!(
         #[strong]
         ui,
@@ -953,6 +975,133 @@ fn build_ui(app: &adw::Application) {
             }
         ),
     );
+}
+
+/// The bell beside the account: what the notifications said this session,
+/// for the ones that went by while nobody was looking.
+fn notification_bell(ui: &Ui) -> gtk::Button {
+    let icon = gtk::Image::from_icon_name("preferences-system-notifications-symbolic");
+    let dot = gtk::Box::builder()
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Start)
+        .css_classes(["unread-dot"])
+        .can_target(false)
+        .visible(false)
+        .build();
+    let face = gtk::Overlay::new();
+    face.set_child(Some(&icon));
+    face.add_overlay(&dot);
+    let bell = gtk::Button::builder()
+        .child(&face)
+        .valign(gtk::Align::Center)
+        .css_classes(["flat", "bell"])
+        .tooltip_text("Notifications")
+        .build();
+    bell.set_widget_name("navigation-notifications");
+    bell.update_property(&[gtk::accessible::Property::Label("Notifications")]);
+    let list = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .build();
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .max_content_height(420)
+        .min_content_width(320)
+        .child(&list)
+        .build();
+    let clear = gtk::Button::builder()
+        .label("Clear")
+        .halign(gtk::Align::End)
+        .css_classes(["flat"])
+        .build();
+    let body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    heading.append(
+        &gtk::Label::builder()
+            .label("Notifications")
+            .xalign(0.0)
+            .hexpand(true)
+            .css_classes(["heading"])
+            .build(),
+    );
+    heading.append(&clear);
+    body.append(&heading);
+    body.append(&scroller);
+    let popover = gtk::Popover::builder()
+        .child(&body)
+        .css_classes(["glass-menu"])
+        .build();
+    popover.set_parent(&bell);
+    let fill = {
+        let (toasts, list, clear) = (ui.toasts.clone(), list.clone(), clear.clone());
+        move || {
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+            let history = toasts.history();
+            clear.set_sensitive(!history.is_empty());
+            if history.is_empty() {
+                list.append(
+                    &gtk::Label::builder()
+                        .label("Nothing yet this session")
+                        .xalign(0.0)
+                        .css_classes(["dim-label"])
+                        .build(),
+                );
+            }
+            for text in history {
+                list.append(
+                    &gtk::Label::builder()
+                        .label(&text)
+                        .xalign(0.0)
+                        .wrap(true)
+                        .max_width_chars(44)
+                        .css_classes(["history-item"])
+                        .build(),
+                );
+            }
+        }
+    };
+    let refresh = {
+        let (toasts, bell, dot, popover, fill) = (
+            ui.toasts.clone(),
+            bell.clone(),
+            dot.clone(),
+            popover.clone(),
+            fill.clone(),
+        );
+        move || {
+            let unread = toasts.unread();
+            dot.set_visible(unread > 0);
+            let label = match unread {
+                0 => "Notifications".to_string(),
+                n => format!("Notifications, {n} unread"),
+            };
+            bell.update_property(&[gtk::accessible::Property::Label(&label)]);
+            bell.set_tooltip_text(Some(&label));
+            if popover.is_visible() {
+                fill();
+            }
+        }
+    };
+    ui.toasts.connect_changed(refresh);
+    let toasts = ui.toasts.clone();
+    clear.connect_clicked(move |_| toasts.clear_history());
+    let (toasts, popover_open) = (ui.toasts.clone(), popover.clone());
+    bell.connect_clicked(move |_| {
+        fill();
+        popover_open.popup();
+        toasts.mark_read();
+    });
+    bell
 }
 
 // --- rendering ------------------------------------------------------------
@@ -3799,7 +3948,8 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
     // The launch log was just written: the title is now the most recent.
     ui.model.borrow().forget_probes();
     render(ui);
-    ui.toasts.add_toast(toast(format!("Starting {name}")));
+    ui.toasts
+        .add_toast_replacing(product_id, toast(format!("Starting {name}")));
 
     // Wait off the main thread, and deliberately without the `busy` flag: a
     // game runs for hours and must not hold up the rest of the window.
@@ -3849,7 +3999,8 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
                 let code = status
                     .code()
                     .map_or_else(|| status.to_string(), |c| format!("with code {c}"));
-                ui.toasts.add_toast(
+                ui.toasts.add_toast_replacing(
+                    &key,
                     adw::Toast::builder()
                         .title(match reason {
                             Some(reason) => format!("{name} stopped: {reason}"),
@@ -6677,6 +6828,7 @@ mod catalog_regressions {
             ("accounts_ui.rs", include_str!("accounts_ui.rs")),
             ("client_check.rs", include_str!("client_check.rs")),
             ("editor.rs", include_str!("editor.rs")),
+            ("notifications.rs", include_str!("notifications.rs")),
         ];
         let forbidden = ["adw::Toast", "::new("].concat();
         let builder = ["Toast", "::builder()"].concat();

@@ -268,6 +268,9 @@ pub(super) fn focus_content(ui: &Ui) {
 }
 fn navigation_buttons(ui: &Ui) -> Vec<gtk::Widget> {
     let mut items: Vec<gtk::Widget> = vec![ui.account_button.clone().upcast()];
+    if let Some(bell) = named_widget(ui.window.upcast_ref(), "navigation-notifications") {
+        items.push(bell);
+    }
     for index in 0..Section::NAV.len() {
         if let Some(row) = ui.sidebar.row_at_index(index as i32) {
             items.push(row.upcast());
@@ -437,9 +440,12 @@ fn move_dialog(dialog: &adw::Dialog, action: Action) {
 }
 fn main_controls(ui: &Ui) -> Vec<gtk::Widget> {
     fn collect(ui: &Ui, root: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+        // A subtree that cannot take focus (the notifications, until F6) is
+        // not somewhere the D-pad can go.
         if !root.is_visible()
             || !root.is_mapped()
             || !root.is_sensitive()
+            || !root.can_focus()
             || root.is_ancestor(&ui.sidebar)
             || root.is_ancestor(&ui.recent_games)
             || root.widget_name().starts_with("navigation-")
@@ -1199,6 +1205,11 @@ fn dispatch(ui: &Ui, action: Action) {
                 }
                 ancestor = widget.parent();
             }
+            if ui.toasts.has_focus() {
+                ui.toasts.dismiss_focused();
+                focus_content(ui);
+                return;
+            }
             if navigation_focus(ui) {
                 focus_content(ui);
             } else {
@@ -1276,8 +1287,16 @@ pub(super) fn install(ui: &Ui) {
             return glib::Propagation::Stop;
         }
         if key == gdk::Key::F6 {
+            // Content, then navigation, then the notifications when there are
+            // any, then content again.
             if GtkWindowExt::focus(&key_ui.window).is_some_and(|w| w.is_ancestor(&key_ui.content)) {
                 focus_navigation(&key_ui);
+            } else if navigation_focus(&key_ui)
+                && !key_ui.toasts.is_empty()
+                && key_ui.toasts.focus_newest()
+            {
+                key_ui.window.set_focus_visible(true);
+                update_hints(&key_ui);
             } else {
                 focus_content(&key_ui);
             }

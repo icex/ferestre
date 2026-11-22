@@ -147,6 +147,16 @@ pub(crate) fn enter(page: &impl IsA<gtk::Widget>, window: &adw::ApplicationWindo
     });
 }
 
+/// Duration for a widget's own transition (a revealer or a stack): none when
+/// the desktop asked for reduced motion.
+pub(crate) fn duration(ms: u32) -> u32 {
+    if animations_enabled() {
+        ms
+    } else {
+        0
+    }
+}
+
 /// Frosted glass on surfaces drawn inside the window, where GTK can do it:
 /// `backdrop-filter` arrived in GTK 4.22, and an older GTK would only print a
 /// parse warning for it, so this is a second stylesheet loaded on 4.22 and
