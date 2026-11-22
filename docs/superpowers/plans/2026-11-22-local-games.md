@@ -285,7 +285,7 @@ Expected: PASS, including `a_recipe_cannot_escape_the_games_directory`.
 - Produces:
   - `install::check_removable(dir, paths)` additionally bails with "`<dir>` belongs to `<name>`, a game Ferestre did not install; Ferestre never deletes it" when, for any local recipe in `Recipe::load_layered_report(&paths.title_dirs())`, the resolved `dir` equals, contains, or lies inside that recipe's install dir or its **absolute** prefix. (A managed relative prefix under the games directory stays removable by the normal rules — it is Ferestre's.) `safe_to_remove` inherits this, so `relocation` is covered too.
   - `pub struct Forgotten { pub recipe_file: Option<PathBuf>, pub kept_dir: PathBuf, pub kept_prefix: PathBuf }`
-  - `pub fn forget(paths: &Paths, product_id: &str) -> anyhow::Result<Forgotten>` — refuses non-local ids; removes `user_titles_dir()/<ID>.toml`, the title's entry via `runtime::set_selected(config, id, None)`, and `local_art_dir(id)` (a directory Ferestre created); touches nothing else.
+  - `pub fn forget(paths: &Paths, product_id: &str) -> anyhow::Result<Forgotten>` — refuses non-local ids; removes the file(s) in `user_titles_dir()` that hold the id, whatever they are called (fails if there are none), the title's entry via `runtime::set_selected(config, id, None)`, and `local_art_dir(id)` (a directory Ferestre created); touches nothing else.
 
 - [ ] **Step 1: Write the failing tests**
 

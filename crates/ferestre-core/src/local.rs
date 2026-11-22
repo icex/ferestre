@@ -7,7 +7,7 @@
 
 use crate::paths::Paths;
 use crate::recipe::Recipe;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// What every local game's id starts with.
 pub const ID_PREFIX: &str = "LOCAL-";
@@ -74,12 +74,23 @@ pub fn forget(paths: &Paths, product_id: &str) -> anyhow::Result<Forgotten> {
     let kept_dir = paths.install_dir(recipe)?;
     let kept_prefix = paths.prefix_dir(recipe)?;
 
-    let file = paths.user_titles_dir().join(format!("{id}.toml"));
-    let recipe_file = match std::fs::remove_file(&file) {
-        Ok(()) => Some(file),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => anyhow::bail!("{}: {e}", file.display()),
-    };
+    // The loader reads every `*.toml` whatever its name, so the file to
+    // remove is the one that holds this id, not `<ID>.toml`.
+    let files = user_recipe_files(paths, &id);
+    if files.is_empty() {
+        anyhow::bail!(
+            "{id}'s recipe is not in {}; Ferestre only removes recipes kept there",
+            paths.user_titles_dir().display()
+        );
+    }
+    for file in &files {
+        match std::fs::remove_file(file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => anyhow::bail!("{}: {e}", file.display()),
+        }
+    }
+    let recipe_file = files.into_iter().next();
     crate::runtime::set_selected(paths.config_dir(), &id, None)?;
     if let Some(art) = paths.local_art_dir(&id) {
         match std::fs::remove_dir_all(&art) {
@@ -93,6 +104,49 @@ pub fn forget(paths: &Paths, product_id: &str) -> anyhow::Result<Forgotten> {
         kept_dir,
         kept_prefix,
     })
+}
+
+/// Every file in the user's titles directory whose recipe is `id`'s.
+fn user_recipe_files(paths: &Paths, id: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(paths.user_titles_dir()) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("toml"))
+        .filter(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|text| Recipe::parse(&text).ok())
+                .is_some_and(|r| r.title.product_id.eq_ignore_ascii_case(id))
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Why `dir` is too broad to be one local game's folder or prefix: it is, or
+/// holds, the home directory, the games directory or another directory the
+/// launcher never removes. `None` when it is narrow enough.
+///
+/// Such a folder is not protected by the removal guard -- it would shield
+/// every Store title -- and adding or importing a game should refuse it.
+pub fn too_broad(paths: &Paths, dir: &Path) -> Option<String> {
+    let resolve = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let dir = resolve(dir);
+    if dir.components().count() < 3 {
+        return Some(format!("{} is too close to the root", dir.display()));
+    }
+    crate::install::protected_dirs(paths)
+        .into_iter()
+        .find(|(_, protected)| resolve(protected).starts_with(&dir))
+        .map(|(what, protected)| {
+            format!(
+                "{} is or holds {what} ({})",
+                dir.display(),
+                protected.display()
+            )
+        })
 }
 
 #[cfg(test)]
@@ -169,5 +223,55 @@ mod tests {
             Some(paths.user_titles_dir().join("LOCAL-T.toml"))
         );
         assert!(forget(&paths, "9NBLGGH2JHXJ").is_err());
+    }
+
+    fn test_paths(home: &Path) -> Paths {
+        Paths::resolve(&crate::paths::Env::from_map([(
+            "HOME",
+            home.to_str().unwrap(),
+        )]))
+        .unwrap()
+    }
+
+    #[test]
+    fn forgetting_removes_the_recipe_whatever_its_file_is_called() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = test_paths(home.path());
+        let dir = home.path().join("drive/Witcher");
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = format!(
+            "schema = 1\n[title]\nproduct-id = \"LOCAL-W\"\nname = \"W\"\n\
+             slug = \"local-w\"\nkind = \"local\"\n[install]\ndir = \"{}\"\n\
+             [launch]\nexecutable = \"W.exe\"\n[status]\nstate = \"untested\"\n\
+             summary = \"Hand written\"\n",
+            dir.display()
+        );
+        std::fs::create_dir_all(paths.user_titles_dir()).unwrap();
+        let file = paths.user_titles_dir().join("witcher.toml");
+        std::fs::write(&file, text).unwrap();
+
+        let gone = forget(&paths, "LOCAL-W").unwrap();
+        assert_eq!(gone.recipe_file, Some(file.clone()));
+        assert!(!file.exists() && dir.is_dir());
+        let (left, _) = Recipe::load_layered_report(&paths.title_dirs());
+        assert!(left.iter().all(|r| r.title.product_id != "LOCAL-W"));
+        // Nothing left to forget is an error, not a quiet success.
+        assert!(forget(&paths, "LOCAL-W").is_err());
+    }
+
+    #[test]
+    fn a_folder_holding_home_or_the_games_dir_is_too_broad() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = test_paths(home.path());
+        for broad in [
+            PathBuf::from("/"),
+            PathBuf::from("/mnt"),
+            home.path().to_path_buf(),
+            paths.games_dir().to_path_buf(),
+            home.path().parent().unwrap().to_path_buf(),
+        ] {
+            assert!(too_broad(&paths, &broad).is_some(), "{}", broad.display());
+        }
+        assert_eq!(too_broad(&paths, &home.path().join("drive/Game")), None);
     }
 }

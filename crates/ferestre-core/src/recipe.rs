@@ -398,15 +398,30 @@ impl Recipe {
                 .components()
                 .any(|c| c == std::path::Component::ParentDir)
         };
+        // A folder this broad (`/`, `/home`, `/mnt`) is never one game's, and
+        // the removal guard protects whatever a local game names.
+        let deep_enough = |path: &str| {
+            Path::new(path)
+                .components()
+                .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                .count()
+                >= 2
+        };
         match self.install.dir.as_deref() {
-            Some(dir) if dir.starts_with('/') && !has_parent(dir) => {}
+            Some(dir) if dir.starts_with('/') && !has_parent(dir) && deep_enough(dir) => {}
             _ => anyhow::bail!(
-                "[install].dir of a local game must be the game's absolute folder, with no `..`"
+                "[install].dir of a local game must be the game's absolute folder, at least two \
+                 levels below `/`, with no `..`"
             ),
         }
         if let Some(prefix) = self.install.prefix.as_deref() {
             if prefix.starts_with('/') && has_parent(prefix) {
                 anyhow::bail!("[install].prefix of a local game must not contain `..`");
+            }
+            if prefix.starts_with('/') && !deep_enough(prefix) {
+                anyhow::bail!(
+                    "[install].prefix of a local game must be at least two levels below `/`"
+                );
             }
         }
         if !self.install.content.is_empty() {
@@ -1382,7 +1397,7 @@ summary = "Imported from Steam"
     fn bare(id: &str, kind: &str) -> String {
         format!(
             "schema = 1\n[title]\nproduct-id = \"{id}\"\nname = \"G\"\nslug = \"{}\"\n{kind}\
-             [install]\ndir = \"/g\"\n[launch]\nexecutable = \"G.exe\"\n\
+             [install]\ndir = \"/g/h\"\n[launch]\nexecutable = \"G.exe\"\n\
              [status]\nstate = \"untested\"\nsummary = \"s\"\n",
             id.to_ascii_lowercase()
         )
@@ -1415,6 +1430,15 @@ summary = "Imported from Steam"
             (
                 "dir = \"/run/media/me/Games/Cyberpunk 2077\"",
                 "dir = \"/run/media/../etc\"",
+            ),
+            // never the root or one level below it, which hold every game
+            (
+                "dir = \"/run/media/me/Games/Cyberpunk 2077\"",
+                "dir = \"/\"",
+            ),
+            (
+                "dir = \"/run/media/me/Games/Cyberpunk 2077\"",
+                "dir = \"/home\"",
             ),
             (
                 "executable = \"bin/x64/Cyberpunk2077.exe\"",

@@ -258,27 +258,25 @@ pub fn check_removable(dir: &Path, paths: &crate::paths::Paths) -> Result<()> {
     // absolute path (Steam's `compatdata/<app id>`, say), belong to someone
     // else. A relative prefix is one Ferestre made in the games directory,
     // and the rules above and below decide about it as for any title.
-    let (recipes, _) = crate::Recipe::load_layered_report(&paths.title_dirs());
-    for recipe in recipes.iter().filter(|r| r.is_local()) {
-        let mut theirs = Vec::new();
-        if let Ok(game) = paths.install_dir(recipe) {
-            theirs.push(game);
+    //
+    // A folder that is or holds the home or games directory (see
+    // [`crate::local::too_broad`]) is no one game's and is not protected:
+    // otherwise one careless recipe would block removing every Store title.
+    //
+    // A local recipe that no longer parses still protects its folders: its
+    // raw TOML is read for them, and if even that fails, the removal is
+    // refused while the broken file is named.
+    for (name, kept) in local_folders(paths)? {
+        if crate::local::too_broad(paths, &kept).is_some() {
+            continue;
         }
-        if let Some(prefix) = recipe.install.prefix.as_deref() {
-            if prefix.starts_with('/') {
-                theirs.push(PathBuf::from(prefix));
-            }
-        }
-        for kept in theirs {
-            let kept = resolve(&kept);
-            if kept.starts_with(&resolved) || resolved.starts_with(&kept) {
-                bail!(
-                    "{} belongs to {}, a game Ferestre did not install; Ferestre never \
-                     deletes it",
-                    dir.display(),
-                    recipe.title.name
-                );
-            }
+        let kept = resolve(&kept);
+        if kept.starts_with(&resolved) || resolved.starts_with(&kept) {
+            bail!(
+                "{} belongs to {name}, a game Ferestre did not install; Ferestre never \
+                 deletes it",
+                dir.display(),
+            );
         }
     }
 
@@ -420,9 +418,71 @@ pub fn library_evidence(
     None
 }
 
+/// Every local game's folder and absolute prefix, with the game's name.
+///
+/// Recipes that do not load are read as plain TOML for the same two keys when
+/// they are a local game's; one that is not even TOML but mentions a local
+/// game is an error, so the caller refuses rather than guessing.
+fn local_folders(paths: &crate::paths::Paths) -> Result<Vec<(String, PathBuf)>> {
+    let mut found = Vec::new();
+    let mut add = |name: &str, dir: Option<&str>, prefix: Option<&str>| {
+        for path in [dir, prefix].into_iter().flatten() {
+            if path.starts_with('/') {
+                found.push((name.to_string(), PathBuf::from(path)));
+            }
+        }
+    };
+    let (recipes, problems) = crate::Recipe::load_layered_report(&paths.title_dirs());
+    for recipe in recipes.iter().filter(|r| r.is_local()) {
+        add(
+            &recipe.title.name,
+            recipe.install.dir.as_deref(),
+            recipe.install.prefix.as_deref(),
+        );
+    }
+    for problem in problems {
+        let Ok(text) = std::fs::read_to_string(&problem.path) else {
+            continue; // a directory that could not be listed, or a vanished file
+        };
+        match toml::from_str::<toml::Value>(&text) {
+            Ok(value) => {
+                let title = value.get("title");
+                fn field<'a>(table: Option<&'a toml::Value>, key: &str) -> Option<&'a str> {
+                    table.and_then(|t| t.get(key)).and_then(|v| v.as_str())
+                }
+                let local = field(title, "kind") == Some("local")
+                    || field(title, "product-id").is_some_and(|id| {
+                        id.len() >= crate::local::ID_PREFIX.len()
+                            && id.is_char_boundary(crate::local::ID_PREFIX.len())
+                            && id[..crate::local::ID_PREFIX.len()]
+                                .eq_ignore_ascii_case(crate::local::ID_PREFIX)
+                    });
+                if local {
+                    let install = value.get("install");
+                    let name = field(title, "name")
+                        .map(str::to_string)
+                        .unwrap_or_else(|| problem.path.display().to_string());
+                    add(&name, field(install, "dir"), field(install, "prefix"));
+                }
+            }
+            Err(_) => {
+                let lower = text.to_ascii_lowercase();
+                if lower.contains("local-") || lower.contains("\"local\"") {
+                    anyhow::bail!(
+                        "{} looks like a local game's recipe but cannot be read, so the \
+                         folders it protects are unknown; fix or remove it first",
+                        problem.path.display()
+                    );
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// The directories nothing may remove, or remove the parent of, with what to
 /// call each in a refusal.
-fn protected_dirs(paths: &crate::paths::Paths) -> Vec<(&'static str, PathBuf)> {
+pub(crate) fn protected_dirs(paths: &crate::paths::Paths) -> Vec<(&'static str, PathBuf)> {
     let home = paths.home().to_path_buf();
     let mut dirs = vec![
         ("the home directory", home.clone()),
@@ -2236,5 +2296,40 @@ mod tests {
         // The guard is about that game's folders, not every folder.
         let other = home.game("other-title");
         check_removable(&other, &home.paths).unwrap();
+    }
+
+    #[test]
+    fn a_local_game_naming_home_does_not_block_store_removals() {
+        let home = Home::new("local-broad");
+        let title = home.game("some-title");
+        write_local_recipe(&home.paths, &home.root, None);
+        check_removable(&title, &home.paths).unwrap();
+        // `/` itself never gets as far as a recipe.
+        let text = std::fs::read_to_string(home.paths.user_titles_dir().join("LOCAL-T.toml"))
+            .unwrap()
+            .replace(&format!("\"{}\"", home.root.display()), "\"/\"");
+        assert!(crate::Recipe::parse(&text).is_err());
+    }
+
+    #[test]
+    fn a_broken_local_recipe_still_protects_its_folders() {
+        let home = Home::new("local-broken");
+        let game = home.root.join("drive/Game");
+        std::fs::create_dir_all(game.join("x")).unwrap();
+        write_local_recipe(&home.paths, &game, None);
+        let file = home.paths.user_titles_dir().join("LOCAL-T.toml");
+        // Valid TOML, but no longer a recipe: the folder is still read from it.
+        let text = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(&file, text.replace("schema = 1", "schema = \"one\"")).unwrap();
+        assert!(crate::Recipe::load(&file).is_err());
+        let err = check_removable(&game, &home.paths).unwrap_err().to_string();
+        assert!(err.contains("never deletes"), "{err}");
+        // Not even TOML: refused, naming the file.
+        std::fs::write(&file, "product-id = \"LOCAL-T\" [[[").unwrap();
+        let err = check_removable(&game, &home.paths).unwrap_err().to_string();
+        assert!(err.contains("LOCAL-T.toml"), "{err}");
+        // A broken file that is not a local game's changes nothing.
+        std::fs::write(&file, "[title\nproduct-id = \"9ZZTESTNEW1\"").unwrap();
+        check_removable(&home.game("some-title"), &home.paths).unwrap();
     }
 }
