@@ -12,6 +12,8 @@ Ferestre builds the components it modifies directly from forks. Fixes live as co
 
 [`sources.lock.json`](../sources.lock.json) records full commit hashes, upstream bases and the source files changed relative to those bases. The launcher submodules pin Xodus and Proton. Proton in turn pins Wine and vkd3d-proton; Wine pins xgameruntime. Other, unmodified runtime dependencies retain their existing upstream submodule pins.
 
+`sources.lock.json` also pins, under `packages`, the unmodified upstream commit of [DLSSNR-AMD](https://github.com/TheAutomatic/DLSSNR-AMD) that `scripts/build-dlssnr.sh` builds into the neural rendering package (see [Neural rendering](NEURAL-RENDERING.md)). It is not a fork: Ferestre builds it as released, and `.github/workflows/dlssnr.yml` publishes the result on a `dlssnr-<version>` tag.
+
 The existing `Proton-UWP` default branch is preserved. Ferestre uses its separate `ferestre` branch. Builds use the locked commit, even after that branch advances.
 
 ## Build from a checkout

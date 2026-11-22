@@ -1021,6 +1021,19 @@ impl Model {
         self.executable(&record.dir)
     }
 
+    /// A title's wide art that is on disk: the Store banner once fetched
+    /// (`hero_path` names where it would be kept, fetched or not), else a
+    /// local game's own landscape or hero picture.
+    pub fn wide_art(&self, product_id: &str) -> Option<PathBuf> {
+        self.catalog_cache()
+            .and_then(|c| c.hero_path(product_id))
+            .filter(|path| path.is_file())
+            .or_else(|| {
+                let art = self.local_art.get(&product_id.to_ascii_uppercase())?;
+                art.landscape.clone().or_else(|| art.hero.clone())
+            })
+    }
+
     pub fn catalog_cache(&self) -> Option<Cache> {
         self.paths.as_ref().map(Paths::catalog_cache)
     }
@@ -2112,6 +2125,30 @@ mod tests {
         m.reload_from(Model::load_from(Ok(paths)));
         assert_eq!(m.local_art["LOCAL-T"].portrait, Some(portrait.clone()));
         assert_eq!(m.icons.get("LOCAL-T"), Some(&portrait));
+    }
+
+    #[test]
+    fn wide_art_is_only_a_picture_on_disk() {
+        let tmp = Scratch::new("wide-art");
+        let paths = paths_at(&tmp.0);
+        let dir = tmp.0.join("drive/Local Test");
+        write(&dir.join("Game.exe"), "");
+        write(
+            &paths.user_titles_dir().join("LOCAL-T.toml"),
+            &local_recipe(&dir, None).to_toml().unwrap(),
+        );
+        let art = paths.local_art_dir("LOCAL-T").unwrap();
+        write(&art.join("portrait.png"), "png");
+        let m = Model::load_from(Ok(paths.clone()));
+        assert_eq!(m.wide_art("LOCAL-T"), None, "a portrait is not wide art");
+        assert_eq!(m.wide_art("9NOTFETCHED1"), None, "a banner never fetched");
+
+        write(&art.join("hero.jpg"), "jpg");
+        let m = Model::load_from(Ok(paths.clone()));
+        assert_eq!(m.wide_art("local-t"), Some(art.join("hero.jpg")));
+        write(&art.join("landscape.png"), "png");
+        let m = Model::load_from(Ok(paths));
+        assert_eq!(m.wide_art("LOCAL-T"), Some(art.join("landscape.png")));
     }
 
     #[test]

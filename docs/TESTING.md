@@ -63,6 +63,8 @@ game. Each is `python3 tests/<name>.py`; CI's `test` job lists them all.
 | `test_proton_wine_shim.py`, `test_launch_gdk.py`, `test_fix_xcurl.py`, `test_install_xodus_proton.py` | the launch scripts in `scripts/` |
 | `test_run_already_running.py` | `ferestre run` refuses, with exit code 4, a title already running in its prefix (a fake `FakeGame.exe` in a throwaway prefix under `/var/tmp`), or one another `run` is still starting (it holds `<prefix>/.ferestre-run.lock`); `--force` does not get past it, `--dry-run` does not check; the refusal is appended to the launch log and, outside the window, sent to a fake `gdbus` as a desktop notification |
 | `test_game_session.py` | display path, HDR and performance-profile selection |
+| `test_no_nvidia_urls.py` | no address of an NVIDIA file anywhere in the repository (also its own `guards` workflow) |
+| `test_build_dlssnr.py` | `scripts/build-dlssnr.sh`: the pinned DLSSNR-AMD commit, the packaged layout, and no NVIDIA model in it |
 | `test_workflows.py`, `test_source_pins.py`, `test_runtime_staging.py`, `test_release_signing.py`, `test_build_appimage.py` | CI/release invariants, source pins, signing, the AppImage build |
 | `tools/test_tool_hygiene.py`, `tools/test_xsts_probe.py` | the developer tools below (`python3 -m unittest discover -s tools -p 'test_*.py'`) |
 
@@ -88,6 +90,7 @@ also runs there where there is no Xvfb; `gui_smoke.py` needs X.
 | Script | Covers |
 |---|---|
 | `gui_smoke.py` | the main window end to end, including the recipe editor and its launch settings |
+| `gui_local_games.py` | a local game's row, menu, anti-cheat caution, Add to Steam and forget-only removal |
 | `gui_accounts.py`, `gui_accounts_controller.py` | separate Store and Player accounts |
 | `gui_presence.py` | "Show me online" while a game runs |
 | `gui_launch.py`, `gui_running.py` | the launch spinner, the running state, Resume and Stop |

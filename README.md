@@ -147,6 +147,10 @@ Windows games Ferestre did not install (GOG, other stores, Steam non-Steam short
 
 Local games start through Ferestre's Proton shim without any Xbox service, licence or account. **Remove from library** only forgets a local game: its folder and its Wine prefix are never deleted. Games with anti-cheat files are flagged in the library. See [local games in recipes](titles/SCHEMA.md#local-games-user-recipes-only).
 
+### Try neural rendering (experimental)
+
+On an AMD Radeon RX 9000 card, a game can run NVIDIA's DLSS 5 neural rendering network through [DLSSNR-AMD](https://github.com/TheAutomatic/DLSSNR-AMD). Choose **Neural rendering…** in a game's menu, or `./ferestre.AppImage neural enable <id>`. It needs your own `nvngx_dlssnr.dll` (Ferestre ships no NVIDIA file), and in game the game's upscaler set to DLSS. **Ctrl+Y** opens the NR Control menu. Turning it off puts every replaced file back. See [Neural rendering](docs/NEURAL-RENDERING.md) for requirements, anti-cheat and troubleshooting.
+
 ### Refresh your library
 
 Use the top-right **Refresh** button, or **Reload library** in the profile menu, after purchases or subscription changes. Lists open from cache for speed; refresh checks them again. A failed refresh retains the last complete library.
@@ -177,6 +181,7 @@ The AppImage also accepts CLI commands:
 ./ferestre.AppImage run PRODUCT-ID
 ./ferestre.AppImage add /path/to/Game.exe
 ./ferestre.AppImage import-steam --dry-run
+./ferestre.AppImage neural status
 ./ferestre.AppImage updates
 ./ferestre.AppImage check-app-updates
 ```
@@ -194,6 +199,7 @@ Use `./ferestre.AppImage --help` for all commands. `run` refuses to start a game
 | [Desktop integration](docs/DESKTOP-INTEGRATION.md) | HDR, scaling, refresh rate, window controls and performance helpers |
 | [Accounts](docs/ACCOUNTS.md) | Sign-in, Store/Player selection, saves and sign-out |
 | [Online presence](docs/PRESENCE.md) | What Xbox friends see while you play |
+| [Neural rendering](docs/NEURAL-RENDERING.md) | Experimental DLSS 5 neural rendering on RX 9000 cards, per game |
 | [Pinned source forks](docs/SOURCES.md) | Component repositories, commits and source verification |
 | [Package verification](docs/PACKAGE-SIGNATURES.md) | Microsoft package signatures and download integrity |
 | [Contributing](CONTRIBUTING.md) | Build, test and add game recipes |
