@@ -34,10 +34,16 @@ pub const LOCAL_ENV: &str = "FERESTRE_DLSSNR_PACKAGE_DIR";
 
 /// The upstream release the pinned assets were built from.
 const PINNED_VERSION: &str = "0.0.9";
-/// `(url, sha256)` of the published assets. Empty until the `dlssnr-0.0.9`
-/// release is published and pinned; until then only [`LOCAL_ENV`] works.
-const PINNED_X86_64: (&str, &str) = ("", "");
-const PINNED_I686: (&str, &str) = ("", "");
+/// `(url, sha256)` of the published `dlssnr-0.0.9` assets, checked against
+/// the release's signed `SHA256SUMS`.
+const PINNED_X86_64: (&str, &str) = (
+    "https://github.com/icex/ferestre/releases/download/dlssnr-0.0.9/ferestre-dlssnr-0.0.9-x86_64.tar.gz",
+    "629bc699c9437c61e336be56a255000da9981b2d6a72178986a8aafa9c3a311e",
+);
+const PINNED_I686: (&str, &str) = (
+    "https://github.com/icex/ferestre/releases/download/dlssnr-0.0.9/ferestre-dlssnr-0.0.9-i686.tar.gz",
+    "ede9787f4ca679b546b2e4dff3f2a4f36a4d7c686a714a00ade54483c263fdf1",
+);
 
 const STAMP: &str = ".ferestre-sha256";
 /// A package is never this large; a wrong URL that streams forever stops here.

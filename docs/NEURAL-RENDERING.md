@@ -29,9 +29,9 @@ model from your DLL once and keeps it in
 
 The DLSSNR-AMD package itself is built by Ferestre from a pinned upstream
 commit (`scripts/build-dlssnr.sh`) and published as a Ferestre release asset,
-checked by its SHA-256. Until that release is pinned, set
-`FERESTRE_DLSSNR_PACKAGE_DIR` to the output folder of a local
-`scripts/build-dlssnr.sh` run.
+checked by its SHA-256 (the `dlssnr-0.0.9` release). To use a package you
+built yourself instead, set `FERESTRE_DLSSNR_PACKAGE_DIR` to the output folder
+of a local `scripts/build-dlssnr.sh` run.
 
 ## Setting it up
 
