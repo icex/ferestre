@@ -141,7 +141,8 @@ enum Cmd {
         /// Input controller layout, which works without it.
         #[arg(long)]
         steam: bool,
-        /// Arguments for the title. Not supported yet; see the error.
+        /// Arguments for a local game, after its recipe's own. A Store title
+        /// takes none.
         #[arg(last = true, value_name = "ARG")]
         args: Vec<String>,
     },
@@ -647,23 +648,37 @@ fn cmd_run(
     steam: bool,
     args: &[String],
 ) -> Result<ExitCode> {
-    if !args.is_empty() {
-        // Better than passing them somewhere they will be ignored: `xodus-cli
-        // run` takes the executable and the game directory, and has nowhere to
-        // put a title's own arguments.
-        return Err(usage(
-            "passing arguments to a title is not supported yet: the client's run command takes none",
-        ));
-    }
-
     let paths = Paths::from_env()?;
     let request = LaunchRequest {
         dry_run,
         force,
         steam,
     };
-    let mut prepared = prepare_launch(cli, &paths, title, request)?;
-    if dry_run {
+    run_title(cli, &paths, title, request, args)
+}
+
+/// `run` against these paths.
+fn run_title(
+    cli: &Cli,
+    paths: &Paths,
+    title: &str,
+    request: LaunchRequest,
+    args: &[String],
+) -> Result<ExitCode> {
+    if !args.is_empty() {
+        // First, before anything is read for the launch or written: a title
+        // that cannot take them must not get as far as a recipe being written
+        // or the client being asked anything.
+        let (_, recipes) = recipes_from(cli, paths)?;
+        title_args_allowed(&recipes, title, args)?;
+    }
+
+    let mut prepared = prepare_launch(cli, paths, title, request)?;
+    let local = prepared.recipe.is_local();
+    if local {
+        prepared.plan.args.extend(args.iter().cloned());
+    }
+    if request.dry_run {
         // Nothing has been started or written: a dry run prints and stops.
         if cli.json {
             print_json(&json!({
@@ -675,18 +690,39 @@ fn cmd_run(
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let game = launch::game_dir(&prepared.recipe, &prepared.dirs, &prepared.options);
-    if prepare_content(
-        cli,
-        &paths,
-        &prepared.recipe,
-        &game,
-        &cancel::Cancellation::default(),
-    )? {
-        // New installations must enter the immutable runtime/service inventory.
-        prepared = prepare_launch(cli, &paths, title, request)?;
+    if !local {
+        let game = launch::game_dir(&prepared.recipe, &prepared.dirs, &prepared.options);
+        if prepare_content(
+            cli,
+            paths,
+            &prepared.recipe,
+            &game,
+            &cancel::Cancellation::default(),
+        )? {
+            // New installations must enter the immutable runtime/service inventory.
+            prepared = prepare_launch(cli, paths, title, request)?;
+        }
     }
-    launch_prepared(&paths, prepared, force)
+    launch_prepared(paths, prepared, request.force)
+}
+
+/// Whether `title` may be given arguments of its own. Only a local game can:
+/// it is started directly, while `xodus-cli run` takes the executable and the
+/// game directory and has nowhere to put a Store title's arguments.
+fn title_args_allowed(recipes: &[Recipe], title: &str, args: &[String]) -> Result<()> {
+    // The recipe a launch would use: the first that matches, as in
+    // `prepare_launch`.
+    let local = recipes
+        .iter()
+        .find(|r| r.matches(title))
+        .is_some_and(Recipe::is_local);
+    if args.is_empty() || local {
+        return Ok(());
+    }
+    // Better than passing them somewhere they will be ignored.
+    Err(usage(
+        "passing arguments to a title is not supported yet: the client's run command takes none",
+    ))
 }
 
 /// What `run` was asked for, beyond the title.
@@ -732,7 +768,9 @@ fn prepare_launch(
     // one thing a person would otherwise have to go and find in a tree of
     // thousands of files. Writing it down means the answer survives, and stays
     // editable when a title turns out to need something else.
-    if !recipes.iter().any(|r| r.matches(title)) {
+    // A local id never names a package on disk, so there is nothing to
+    // describe: no recipe means the game was forgotten or never added.
+    if !recipes.iter().any(|r| r.matches(title)) && !ferestre_core::local::is_local_id(title) {
         if let Some((detected, written)) = describe_from_disk(paths, title, !request.dry_run)? {
             match written {
                 Some(written) => eprintln!(
@@ -754,14 +792,26 @@ fn prepare_launch(
         )
     })?;
 
+    // A local game is not a Store package: no account, service, related
+    // content or client takes part in its launch, and its launch options are
+    // the person's own, so nothing is inferred for it.
+    let local = recipe.is_local();
+
     // A title without a tested recipe can still share an engine with one that
     // has been debugged. The same inference feeds the window's verdict.
-    let inferred = autofix::infer(recipe, Some(&paths.install_dir(recipe)?));
+    let inferred = if local {
+        autofix::Inferred {
+            recipe: std::borrow::Cow::Borrowed(recipe),
+            profile: None,
+        }
+    } else {
+        autofix::infer(recipe, Some(&paths.install_dir(recipe)?))
+    };
 
     // Checked before anything is started, because the alternative is a title
     // that exits 1 with an empty log and someone guessing which of eleven
-    // patches is missing.
-    let runtimes = runtime::all(paths);
+    // patches is missing. A local game may also use Steam's own Protons.
+    let runtimes = runtime::for_recipe(paths, recipe);
     // Per-game override, then the Settings default, then the environment override.
     let requested_runtime = runtime::requested(paths, &recipe.title.product_id)?;
     let registry = registry_for(paths);
@@ -781,8 +831,12 @@ fn prepare_launch(
         eprintln!("{line}");
     }
 
-    let dirs = launch_dirs_for_runtime(paths, &runtime.path)?;
-    let roles = accounts::launch_selection(paths.config_dir())?;
+    let dirs = launch_dirs_for_runtime(paths, &runtime.path, local)?;
+    let roles = if local {
+        None
+    } else {
+        accounts::launch_selection(paths.config_dir())?
+    };
     let mut prefix = paths.prefix_dir(&recipe)?;
     // `XGR_XUID` is the Windows install's XUID, so it names the imported
     // player's save folders. Another player has their own prefix and their own
@@ -834,7 +888,7 @@ fn prepare_launch(
         steam_integration: request.steam,
         xuid: paths
             .var("XGR_XUID")
-            .filter(|_| own_xuid)
+            .filter(|_| own_xuid && !local)
             .map(str::to_string),
         game_dir: Some(paths.install_dir(&recipe)?),
         prefix_dir: Some(prefix),
@@ -869,18 +923,23 @@ fn prepare_launch(
             &launch::game_dir(&recipe, &dirs, &options),
         )?;
     }
-    let related = ferestre_core::related::installed(
-        paths.state_dir(),
-        &recipe.title.product_id,
-        &launch::game_dir(&recipe, &dirs, &options),
-    );
-    let package_paths = ferestre_core::related::environment(&related);
-    plan.env_set
-        .insert("XGR_RELATED_PACKAGE_PATHS".into(), package_paths);
-    plan.env_set.insert(
-        "XODUS_RELATED_CONTENT".into(),
-        ferestre_core::related::service_binding(&related),
-    );
+    let related = if local {
+        Vec::new()
+    } else {
+        let related = ferestre_core::related::installed(
+            paths.state_dir(),
+            &recipe.title.product_id,
+            &launch::game_dir(&recipe, &dirs, &options),
+        );
+        let package_paths = ferestre_core::related::environment(&related);
+        plan.env_set
+            .insert("XGR_RELATED_PACKAGE_PATHS".into(), package_paths);
+        plan.env_set.insert(
+            "XODUS_RELATED_CONTENT".into(),
+            ferestre_core::related::service_binding(&related),
+        );
+        related
+    };
     add_anticheat_runtimes(
         &mut plan,
         paths.state_dir(),
@@ -888,7 +947,20 @@ fn prepare_launch(
         &recipe.launch.executable,
         request.dry_run,
     );
-    let service_socket = plan_service_socket(&mut plan, &dirs, runtime, roles.as_ref())?;
+    if local {
+        let found = ferestre_core::anticheat::detect(
+            &launch::game_dir(&recipe, &dirs, &options),
+            &recipe.launch.executable,
+        );
+        if let Some(line) = ferestre_core::anticheat::describe(&found) {
+            eprintln!("-- {line}");
+        }
+    }
+    let service_socket = if local {
+        None
+    } else {
+        plan_service_socket(&mut plan, &dirs, runtime, roles.as_ref())?
+    };
     Ok(PreparedLaunch {
         runtime: runtime.clone(),
         recipe,
@@ -940,10 +1012,26 @@ fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Resu
     // created wherever this says.
     let log = paths.log_file(&recipe)?;
 
+    // A local game is an ordinary Windows program: no client, service,
+    // WinRT classes, PlayFab saves or presence take part in its launch.
+    let local = recipe.is_local();
+
     // The three things a Plan deliberately does not model, in the order
     // launch-gdk.sh does them.
     let game_dir = launch::game_dir(&recipe, &dirs, &options);
-    if !game_dir.is_dir() {
+    if local {
+        // Checked before the prefix is created: a game on a drive that is
+        // not mounted must not leave an empty prefix or folder behind.
+        let executable = ferestre_core::local::executable_path(&recipe)
+            .unwrap_or_else(|| game_dir.join(&recipe.launch.executable));
+        if !executable.is_file() {
+            bail!(
+                "{}'s executable is not at {}; is its drive mounted?",
+                recipe.title.name,
+                executable.display()
+            );
+        }
+    } else if !game_dir.is_dir() {
         bail!(
             "{} is not installed at {} -- download it: ferestre install {}",
             recipe.title.name,
@@ -953,7 +1041,7 @@ fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Resu
     }
     // A download that stopped partway leaves the client's working container;
     // the tree beside it is part old build, part new, and part missing.
-    if install::is_partial(&game_dir) {
+    if !local && install::is_partial(&game_dir) {
         if !force {
             bail!(
                 "{} did not finish downloading at {} -- finish it: ferestre install {} \
@@ -1002,11 +1090,11 @@ fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Resu
             running::refusal(&recipe.title.name, &images),
         ));
     }
-    if let Some(registry) = &registry {
+    if let Some(registry) = registry.as_ref().filter(|_| !local) {
         register_winrt_classes(&prefix, registry, &runtime);
     }
     run_setup(&recipe, "every-launch", &dirs.scripts_dir, &game_dir)?;
-    if runtime.provides("xgameruntime.playfab-file-saves") {
+    if !local && runtime.provides("xgameruntime.playfab-file-saves") {
         if let Some(identity) = install::package_identity(&game_dir) {
             let backups = paths
                 .state_dir()
@@ -1030,8 +1118,13 @@ fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Resu
     ))));
     // Before the service is looked for: a launch finishing now must not stop a
     // service this one is about to reuse.
-    let _service_use = ServiceUse::begin(service_socket.as_deref())?;
-    start_service(&dirs, service_socket.as_deref(), paths.cache_dir(), &plan)?;
+    let _service_use = if local {
+        None
+    } else {
+        let claim = ServiceUse::begin(service_socket.as_deref())?;
+        start_service(&dirs, service_socket.as_deref(), paths.cache_dir(), &plan)?;
+        claim
+    };
     if let Some(signal) = forwarding.received() {
         eprintln!("-- stopped before {} started", recipe.title.name);
         return Ok(ExitCode::from(exit_code_from(None, Some(signal))));
@@ -1040,18 +1133,20 @@ fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Resu
     // Player. Without roles the client's default account is the Player, and
     // only the profile listing says which one that is. A client that cannot
     // answer goes without, quietly.
-    if roles.is_none() {
+    if !local && roles.is_none() {
         profiles = accounts::fetch(&dirs.xodus_cli()).ok();
     }
     // Dropped when this returns, once the title has exited: the runner then
     // tells Xbox the game has stopped.
-    let _presence = presence::Presence::start(presence::setup(
-        &dirs.xodus_cli(),
-        paths.config_dir(),
-        roles.as_ref(),
-        profiles.as_ref(),
-        &game_dir,
-    ));
+    let _presence = (!local).then(|| {
+        presence::Presence::start(presence::setup(
+            &dirs.xodus_cli(),
+            paths.config_dir(),
+            roles.as_ref(),
+            profiles.as_ref(),
+            &game_dir,
+        ))
+    });
 
     if let Ok(missing) = ferestre_core::media::missing_libav_dependencies(
         &dirs.proton_dir,
@@ -2792,13 +2887,18 @@ fn registry_for(paths: &Paths) -> Option<Registry> {
     Registry::load(&file).ok()
 }
 
-fn launch_dirs_for_runtime(paths: &Paths, runtime: &Path) -> Result<launch::Dirs> {
+/// The directories a launch with `runtime` uses. A local game never runs the
+/// client, so for one (`local`) a machine without it is not an error and the
+/// client directory is left empty.
+fn launch_dirs_for_runtime(paths: &Paths, runtime: &Path, local: bool) -> Result<launch::Dirs> {
+    let cli_dir = match paths.cli_dir() {
+        Some(dir) => dir.to_path_buf(),
+        None if local => PathBuf::new(),
+        None => bail!("no xodus-cli found; set XODUS_CLI_DIR (see: ferestre doctor)"),
+    };
     Ok(launch::Dirs {
         games_dir: paths.games_dir().to_path_buf(),
-        cli_dir: paths
-            .cli_dir()
-            .ok_or_else(|| anyhow!("no xodus-cli found; set XODUS_CLI_DIR (see: ferestre doctor)"))?
-            .to_path_buf(),
+        cli_dir,
         proton_dir: runtime.to_path_buf(),
         // launch-gdk.sh falls back to the conventional path rather than leaving
         // STEAM_COMPAT_CLIENT_INSTALL_PATH empty, and Proton wants *something*.
@@ -4249,7 +4349,9 @@ fn warnings(recipe: &Recipe, assessment: &Assessment, verdict: Gate, forced: boo
         )),
         Gate::Refused => {}
     }
-    if !recipe.status.state.is_runnable() {
+    // A local game's status is only how it got here ("Added by hand"), not
+    // a verdict anyone recorded.
+    if !recipe.status.state.is_runnable() && !recipe.is_local() {
         lines.push(format!(
             "-- {} is recorded as {}: {}",
             recipe.title.name,
@@ -7302,6 +7404,162 @@ summary = "Runs."
             .and_then(|prepared| launch_prepared(&paths, prepared, false));
         assert!(launched.is_err());
         assert!(!home.root().join("escaped-launch.log").exists());
+    }
+
+    // -- local games ---------------------------------------------------------
+
+    /// A local game's user recipe. `install_extra` lands in `[install]`
+    /// (e.g. `prefix = "/abs"`), `launch_extra` in `[launch]`.
+    fn local_game_recipe(home: &Home, dir: &Path, install_extra: &str, launch_extra: &str) {
+        home.recipe(
+            "config/ferestre/titles",
+            "LOCAL-TEST.toml",
+            &format!(
+                r#"schema = 1
+[title]
+product-id = "LOCAL-TEST"
+name = "Local Test"
+slug = "local-test"
+kind = "local"
+[install]
+dir = "{}"
+{install_extra}
+[launch]
+executable = "Game.exe"
+{launch_extra}
+[status]
+state = "untested"
+summary = "Added by hand"
+"#,
+                dir.display()
+            ),
+        );
+    }
+
+    #[test]
+    fn a_local_game_launches_through_the_shim_without_the_client_or_the_service() {
+        let home = Home::new("run-local");
+        let game = home.root().join("drive/Local Game");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("Game.exe"), b"").unwrap();
+        std::fs::write(game.join("Randgrid.sys"), b"").unwrap();
+        local_game_recipe(&home, &game, "", "args = [\"-x\"]");
+        home.runtime("ferestre-11.0.2", Some(&["loader.memfd-main-image"]));
+        home.script(
+            "proton-wine-shim.sh",
+            r#"{ pwd -P; printf '%s\n' "$@"; } > "$XODUS_GAMES_DIR/shim-args""#,
+        );
+        let paths = home.paths();
+        let prepared =
+            prepare_launch(&cli(), &paths, "local-test", LaunchRequest::default()).unwrap();
+        assert!(prepared.service_socket.is_none() && prepared.roles.is_none());
+        assert!(prepared.plan.get("XGR_RELATED_PACKAGE_PATHS").is_none());
+        assert_eq!(
+            launch_prepared(&paths, prepared, false).unwrap(),
+            ExitCode::SUCCESS
+        );
+        let seen = std::fs::read_to_string(home.games().join("shim-args")).unwrap();
+        let real = game.canonicalize().unwrap();
+        assert_eq!(
+            seen.lines().collect::<Vec<_>>(),
+            [
+                real.to_str().unwrap(),
+                &launch::windows_path(&game.join("Game.exe")),
+                "-x"
+            ]
+        );
+        assert!(
+            !home.client_ran(),
+            "xodus-cli must never run for a local game"
+        );
+        assert!(home.games().join("local-test-proton").is_dir());
+    }
+
+    #[test]
+    fn a_local_game_whose_drive_is_gone_is_not_launched() {
+        let home = Home::new("run-local-gone");
+        let gone = home.root().join("unmounted/Game");
+        local_game_recipe(&home, &gone, "", "");
+        home.runtime("ferestre-11.0.2", Some(&["loader.memfd-main-image"]));
+        let paths = home.paths();
+        let prepared =
+            prepare_launch(&cli(), &paths, "LOCAL-TEST", LaunchRequest::default()).unwrap();
+        let err = launch_prepared(&paths, prepared, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("drive mounted"), "{err}");
+        assert!(!gone.exists() && !home.games().join("local-test-proton").exists());
+        assert!(!home.client_ran());
+    }
+
+    #[test]
+    fn a_local_game_needs_no_xbox_client() {
+        let mut home = Home::new("run-local-no-client");
+        let game = home.root().join("drive/Game");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("Game.exe"), b"").unwrap();
+        local_game_recipe(&home, &game, "", "");
+        home.recipe("titles", "game.toml", &game_recipe(""));
+        home.runtime("ferestre-11.0.2", Some(&["loader.memfd-main-image"]));
+        home.extra.push(("XODUS_CLI_DIR".into(), String::new()));
+        let paths = home.paths();
+        assert!(paths.cli_dir().is_none());
+        let request = LaunchRequest {
+            dry_run: true,
+            ..LaunchRequest::default()
+        };
+        prepare_launch(&cli(), &paths, "LOCAL-TEST", request).unwrap();
+        let error = prepare_launch(&cli(), &paths, "testgame", request)
+            .err()
+            .expect("an Xbox title needs the client");
+        assert!(error.to_string().contains("no xodus-cli found"), "{error}");
+    }
+
+    #[test]
+    fn arguments_after_dashes_reach_a_local_game_only() {
+        let home = Home::new("run-local-args");
+        let game = home.root().join("drive/Game");
+        local_game_recipe(&home, &game, "", "");
+        home.recipe("titles", "game.toml", &game_recipe(""));
+        let paths = home.paths();
+        let (_, recipes) = recipes_from(&cli(), &paths).unwrap();
+        let args = vec!["-x".to_string()];
+        title_args_allowed(&recipes, "LOCAL-TEST", &args).unwrap();
+        title_args_allowed(&recipes, "local-test", &args).unwrap();
+        for title in ["testgame", "9ZZUNKNOWN12"] {
+            let error = title_args_allowed(&recipes, title, &args).unwrap_err();
+            assert!(error.downcast_ref::<UsageError>().is_some(), "{error}");
+            assert!(error.to_string().contains("passing arguments"), "{error}");
+        }
+        // No arguments is fine for any title.
+        title_args_allowed(&recipes, "testgame", &[]).unwrap();
+    }
+
+    #[test]
+    fn arguments_to_an_xbox_title_are_refused_before_anything_happens() {
+        let home = Home::new("run-xbox-args");
+        home.recipe("titles", "game.toml", &game_recipe(""));
+        home.client("");
+        let paths = home.paths();
+        let before: Vec<_> = std::fs::read_dir(paths.user_titles_dir())
+            .map(|d| d.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        for title in ["testgame", "9ZZUNKNOWN12"] {
+            let error = run_title(
+                &cli(),
+                &paths,
+                title,
+                LaunchRequest::default(),
+                &["-x".into()],
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("passing arguments"), "{error}");
+        }
+        assert!(!home.client_ran());
+        let after: Vec<_> = std::fs::read_dir(paths.user_titles_dir())
+            .map(|d| d.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert_eq!(before, after);
     }
 
     // -- the launch log and the end of a launch ------------------------------
