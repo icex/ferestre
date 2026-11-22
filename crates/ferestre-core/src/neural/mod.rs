@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub mod detect;
+pub mod dll;
+pub mod models;
 pub mod package;
 pub mod pe;
 
