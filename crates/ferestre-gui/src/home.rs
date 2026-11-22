@@ -122,15 +122,15 @@ pub(crate) fn hero(ui: &Ui, page: &gtk::Box, items: Vec<Feature>) {
         return;
     }
     let items = Rc::new(items);
-    let height = (f64::from(ui.window.width()) * 0.24).clamp(280.0, 440.0) as i32;
     let index = ui.hero_index.get() % items.len();
     ui.hero_index.set(index);
     let stage = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(16)
-        .halign(gtk::Align::Center)
+        .hexpand(true)
         .css_classes(["hero-stage"])
         .build();
+    // Sizes follow the allocated width, so a resize needs no rebuild.
+    stage.set_layout_manager(Some(HeroLayout::default()));
     let dots = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -175,12 +175,12 @@ pub(crate) fn hero(ui: &Ui, page: &gtk::Box, items: Vec<Feature>) {
             }
             let n = items.len();
             if n > 1 {
-                stage.append(&peek(ui, &items[(index + n - 1) % n], false, height));
+                stage.append(&peek(ui, &items[(index + n - 1) % n], false));
             }
-            let centre = centre(ui, &items[index], index == 0, height);
+            let centre = centre(ui, &items[index], index == 0);
             stage.append(&centre);
             if n > 1 {
-                stage.append(&peek(ui, &items[(index + 1) % n], true, height));
+                stage.append(&peek(ui, &items[(index + 1) % n], true));
             }
             for i in 0..n {
                 let dot = gtk::Box::builder()
@@ -234,27 +234,137 @@ fn art_picture(path: Option<&Path>, fallback: Option<&Path>, size: textures::Siz
     picture
 }
 
-/// How wide the centre banner and each peeking neighbour are: the centre at
-/// most 1400 px, the neighbours at least a tenth of the content each, and on
-/// a very wide window the neighbours take what the centre leaves.
-fn hero_widths(ui: &Ui) -> (i32, i32) {
-    let sidebar = if ui.split.is_collapsed() {
-        0
-    } else if ui.compact.get() {
-        72
-    } else {
-        270
-    };
-    let margin = if ui.window.width() > 2560 { 48 } else { 32 };
-    let content = f64::from((ui.window.width() - sidebar - 2 * margin).max(320));
-    let gaps = 32.0;
-    let centre = 1400f64.min(content - 2.0 * (content * 0.1).max(56.0) - gaps);
-    let peek = ((content - centre - gaps) / 2.0).max(56.0);
-    (centre.max(200.0) as i32, peek as i32)
+/// Lays out the hero stage: the centre banner at most [`HERO_MAX`] wide and
+/// centred, each neighbour a fixed share of it at either side, and the height
+/// from the centre's width. Whatever is left on a very wide window stays empty
+/// margin, so the neighbours never outgrow the banner they frame.
+mod hero_layout {
+    use gtk::{glib, prelude::*, subclass::prelude::*};
+
+    #[derive(Default)]
+    pub struct Imp;
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for Imp {
+        const NAME: &'static str = "FerestreHeroLayout";
+        type Type = super::HeroLayout;
+        type ParentType = gtk::LayoutManager;
+    }
+
+    impl ObjectImpl for Imp {}
+
+    fn children(widget: &gtk::Widget) -> Vec<gtk::Widget> {
+        let mut out = Vec::new();
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            child = c.next_sibling();
+            if c.should_layout() {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    impl LayoutManagerImpl for Imp {
+        fn request_mode(&self, _widget: &gtk::Widget) -> gtk::SizeRequestMode {
+            gtk::SizeRequestMode::HeightForWidth
+        }
+
+        fn measure(
+            &self,
+            widget: &gtk::Widget,
+            orientation: gtk::Orientation,
+            for_size: i32,
+        ) -> (i32, i32, i32, i32) {
+            let kids = children(widget);
+            let peeks = kids.len() > 1;
+            match orientation {
+                gtk::Orientation::Horizontal => {
+                    let min = kids
+                        .iter()
+                        .map(|c| c.measure(orientation, -1).0)
+                        .sum::<i32>()
+                        + super::HERO_GAP * (kids.len().max(1) as i32 - 1);
+                    let (_, _, natural) = super::hero_geometry(i32::MAX, peeks);
+                    (min, natural.max(min), -1, -1)
+                }
+                gtk::Orientation::Vertical => {
+                    let (centre, _, _) =
+                        super::hero_geometry(if for_size < 0 { i32::MAX } else { for_size }, peeks);
+                    let height = super::hero_height(centre);
+                    let min = kids
+                        .iter()
+                        .map(|c| c.measure(orientation, -1).0)
+                        .max()
+                        .unwrap_or(0);
+                    (height.max(min), height.max(min), -1, -1)
+                }
+                _ => (0, 0, -1, -1),
+            }
+        }
+
+        fn allocate(&self, widget: &gtk::Widget, width: i32, height: i32, _baseline: i32) {
+            let kids = children(widget);
+            let (centre, peek, total) = super::hero_geometry(width, kids.len() > 1);
+            let mut x = ((width - total) / 2).max(0);
+            for (i, child) in kids.iter().enumerate() {
+                let wanted = if kids.len() > 1 && i != 1 {
+                    peek
+                } else {
+                    centre
+                };
+                let w = wanted.max(child.measure(gtk::Orientation::Horizontal, height).0);
+                let h = height.max(child.measure(gtk::Orientation::Vertical, w).0);
+                child.size_allocate(&gtk::Allocation::new(x, 0, w, h), -1);
+                x += w + super::HERO_GAP;
+            }
+        }
+    }
+}
+
+glib::wrapper! {
+    pub struct HeroLayout(ObjectSubclass<hero_layout::Imp>) @extends gtk::LayoutManager;
+}
+
+impl Default for HeroLayout {
+    fn default() -> Self {
+        glib::Object::new()
+    }
+}
+
+const HERO_MAX: i32 = 1400;
+const HERO_GAP: i32 = 16;
+/// Each neighbour is this share of the centre banner's width.
+const HERO_PEEK: f64 = 0.16;
+
+/// For a stage `width` wide: the centre's width, each neighbour's, and the
+/// width of the three together.
+fn hero_geometry(width: i32, peeks: bool) -> (i32, i32, i32) {
+    let width = f64::from(width.max(0));
+    if !peeks {
+        let centre = width.min(f64::from(HERO_MAX)) as i32;
+        return (centre, 0, centre);
+    }
+    let gaps = f64::from(2 * HERO_GAP);
+    let centre = ((width - gaps) / (1.0 + 2.0 * HERO_PEEK))
+        .min(f64::from(HERO_MAX))
+        .max(0.0);
+    let peek = (centre * HERO_PEEK).floor();
+    let centre = centre.floor();
+    (
+        centre as i32,
+        peek as i32,
+        (centre + 2.0 * peek + gaps) as i32,
+    )
+}
+
+/// A wide banner, between 220 and 440 px tall.
+fn hero_height(centre: i32) -> i32 {
+    (f64::from(centre) / 2.6).clamp(220.0, 440.0) as i32
 }
 
 /// The centre banner: one button, the title's main action.
-fn centre(ui: &Ui, feature: &Feature, first: bool, height: i32) -> gtk::Widget {
+fn centre(ui: &Ui, feature: &Feature, first: bool) -> gtk::Widget {
     let row = &feature.row;
     let art = art_picture(
         feature.art.as_deref(),
@@ -267,7 +377,7 @@ fn centre(ui: &Ui, feature: &Feature, first: bool, height: i32) -> gtk::Widget {
         textures::Size::Hero,
     );
     let overlay = gtk::Overlay::builder().css_classes(["hero-art"]).build();
-    overlay.set_child(Some(&sized(&art, None, height)));
+    overlay.set_child(Some(&art));
     let caption = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(6)
@@ -300,30 +410,19 @@ fn centre(ui: &Ui, feature: &Feature, first: bool, height: i32) -> gtk::Widget {
     if first {
         button.add_css_class("hero-first");
     }
-    button.set_hexpand(true);
-    let (centre_width, _) = hero_widths(ui);
-    let clamp = adw::Clamp::builder()
-        .maximum_size(centre_width)
-        .tightening_threshold(centre_width)
-        .hexpand(true)
-        .child(&button)
-        .build();
-    clamp.set_size_request(-1, 0);
-    clamp.upcast()
+    button.upcast()
 }
 
 /// A dimmed neighbour; clicking it turns the carousel. Never focused: the
 /// controller turns it with Left and Right on the centre instead.
-fn peek(ui: &Ui, feature: &Feature, next: bool, height: i32) -> gtk::Widget {
+fn peek(ui: &Ui, feature: &Feature, next: bool) -> gtk::Widget {
     let art = art_picture(
         feature.art.as_deref(),
         feature.cover.as_deref(),
         textures::Size::Hero,
     );
-    // A sliver of the neighbour, wider on a wide window.
-    let (_, width) = hero_widths(ui);
     let button = gtk::Button::builder()
-        .child(&sized(&art, Some(width), height))
+        .child(&art)
         .can_focus(false)
         .overflow(gtk::Overflow::Hidden)
         .css_classes(["hero-peek"])
