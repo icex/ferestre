@@ -18,6 +18,7 @@ use std::rc::Rc;
 
 use ferestre_core::launch_options::{self, Kind, LaunchOption, Section};
 use ferestre_core::recipe::Recipe;
+use ferestre_core::steam_import;
 use std::collections::BTreeMap;
 
 /// The fields worth putting in front of someone, in the order they matter.
@@ -35,6 +36,10 @@ pub struct Draft {
     pub chosen: BTreeMap<&'static str, String>,
     /// Every other variable, in the order the editor lists them.
     pub other: Vec<(String, String)>,
+    /// A local game's arguments, as words a shell would split.
+    pub arguments: String,
+    /// The programs a local game is run through (`gamemoderun mangohud`).
+    pub wrapper: String,
 }
 
 impl Draft {
@@ -47,6 +52,8 @@ impl Draft {
             prefix_dir: recipe.prefix_dir(),
             chosen: split.chosen,
             other: split.other,
+            arguments: steam_import::quote_words(&recipe.launch.args),
+            wrapper: steam_import::quote_words(&recipe.launch.wrapper),
         }
     }
 
@@ -60,7 +67,28 @@ impl Draft {
         if executable.is_empty() {
             return Err("The executable is the one thing a recipe cannot do without.".into());
         }
-        if executable.starts_with('/') || executable.contains("..") {
+        let local = recipe.is_local();
+        if local {
+            // A local game's paths are where its files are: absolute is fine,
+            // climbing out with `..` is not.
+            let climbs = |path: &str| {
+                std::path::Path::new(&path.replace('\\', "/"))
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+            };
+            if climbs(executable) {
+                return Err("The executable must not contain \"..\".".into());
+            }
+            let dir = self.install_dir.trim();
+            if !dir.starts_with('/') || climbs(dir) {
+                return Err(
+                    "The game's folder is its full path, like \"/run/media/games/Game\".".into(),
+                );
+            }
+            if climbs(self.prefix_dir.trim()) {
+                return Err("The Wine prefix must not contain \"..\".".into());
+            }
+        } else if executable.starts_with('/') || executable.contains("..") {
             return Err(
                 "The executable is a path inside the installed title, like \"Game/Game.exe\"."
                     .into(),
@@ -68,6 +96,11 @@ impl Draft {
         }
 
         let environment = launch_options::join(&self.chosen, &self.other)?;
+        let launch_words = if local {
+            Some(self.launch_words()?)
+        } else {
+            None
+        };
 
         let name = self.name.trim();
         if !name.is_empty() {
@@ -75,6 +108,15 @@ impl Draft {
         }
         recipe.launch.executable = executable.to_string();
         recipe.launch.env = environment;
+        if let Some(words) = launch_words {
+            recipe.launch.args = words.args;
+            recipe.launch.wrapper = words.wrapper;
+            // A local game's folder is its own, not a default to follow.
+            recipe.install.dir = non_empty(&self.install_dir);
+            recipe.install.prefix = non_empty(&self.prefix_dir)
+                .filter(|d| *d != format!("{}-proton", recipe.title.slug));
+            return Ok(());
+        }
         // Empty means "the default", which is the slug -- storing the computed
         // default would freeze it, so a later rename would not follow.
         recipe.install.dir = non_empty(&self.install_dir).filter(|d| *d != recipe.title.slug);
@@ -82,6 +124,40 @@ impl Draft {
             non_empty(&self.prefix_dir).filter(|d| *d != format!("{}-proton", recipe.title.slug));
         Ok(())
     }
+}
+
+impl Draft {
+    /// The arguments and wrappers, split by the rules Steam's launch options
+    /// are split by, so there is one set of quoting rules.
+    fn launch_words(&self) -> Result<steam_import::LaunchOptions, String> {
+        let wrapper = self.wrapper.trim();
+        let first = wrapper.split_whitespace().next().unwrap_or("");
+        if is_assignment(first) {
+            return Err("Put environment variables in Environment, not Wrapper commands.".into());
+        }
+        if wrapper.contains("%command%") {
+            return Err("Wrapper commands run the game themselves; leave out %command%.".into());
+        }
+        let text = format!("{wrapper} %command% {}", self.arguments.trim());
+        let words = steam_import::parse_launch_options(&text)
+            .map_err(|e| format!("Arguments or wrapper commands: {e}"))?;
+        if !words.env.is_empty() {
+            return Err("Put environment variables in Environment, not Wrapper commands.".into());
+        }
+        Ok(words)
+    }
+}
+
+/// Whether `word` is `NAME=value` with `NAME` matching `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// A title's folder as a recipe's `install.dir`: relative to the games
@@ -300,6 +376,7 @@ pub fn present(
     on_reset: impl Fn() + 'static,
 ) {
     let draft = Draft::from_recipe(&recipe);
+    let local = recipe.is_local();
     let recipe = Rc::new(RefCell::new(recipe));
 
     let dialog = adw::Dialog::builder()
@@ -313,12 +390,32 @@ pub fn present(
         .text(&draft.name)
         .build();
     let executable = adw::EntryRow::builder()
-        .title("Executable, inside the installed title")
+        .title(if local {
+            "Executable, inside the game's folder or a full path"
+        } else {
+            "Executable, inside the installed title"
+        })
         .text(&draft.executable)
         .build();
     let install_dir = adw::EntryRow::builder()
-        .title("Install directory")
+        .title(if local {
+            "Game folder"
+        } else {
+            "Install directory"
+        })
         .text(&draft.install_dir)
+        .build();
+    // Only a local game takes arguments and wrappers: the client's run
+    // command takes neither.
+    let arguments = adw::EntryRow::builder()
+        .title("Arguments")
+        .text(&draft.arguments)
+        .visible(local)
+        .build();
+    let wrapper = adw::EntryRow::builder()
+        .title("Wrapper commands")
+        .text(&draft.wrapper)
+        .visible(local)
         .build();
     let prefix_dir = adw::EntryRow::builder()
         .title("Wine prefix directory")
@@ -348,6 +445,10 @@ pub fn present(
     identity.add(&executable);
     identity.add(&install_dir);
     identity.add(&prefix_dir);
+    if local {
+        identity.add(&arguments);
+        identity.add(&wrapper);
+    }
 
     let page = adw::PreferencesPage::new();
     page.add(&identity);
@@ -463,6 +564,10 @@ pub fn present(
         controls,
         #[strong]
         others,
+        #[strong]
+        arguments,
+        #[strong]
+        wrapper,
         move |_| {
             let draft = Draft {
                 name: name.text().to_string(),
@@ -471,6 +576,8 @@ pub fn present(
                 prefix_dir: prefix_dir.text().to_string(),
                 chosen: controls.iter().filter_map(OptionControl::value).collect(),
                 other: others.values(),
+                arguments: arguments.text().to_string(),
+                wrapper: wrapper.text().to_string(),
             };
             let mut edited = recipe.borrow().clone();
             if let Err(complaint) = draft.apply(&mut edited) {
@@ -541,6 +648,8 @@ mod tests {
             prefix_dir: String::new(),
             chosen: BTreeMap::new(),
             other: Vec::new(),
+            arguments: String::new(),
+            wrapper: String::new(),
         };
         assert!(draft.apply(&mut blank()).is_err());
     }
@@ -557,6 +666,8 @@ mod tests {
                 prefix_dir: String::new(),
                 chosen: BTreeMap::new(),
                 other: Vec::new(),
+                arguments: String::new(),
+                wrapper: String::new(),
             };
             assert!(
                 draft.apply(&mut blank()).is_err(),
@@ -653,5 +764,70 @@ mod tests {
         assert_eq!(draft.install_dir, "9nr1r1xwlcnb");
         draft.apply(&mut recipe).expect("applies");
         assert_eq!(recipe.install_dir(), "9nr1r1xwlcnb");
+    }
+
+    fn local() -> Recipe {
+        Recipe::parse(
+            "schema = 1\n[title]\nproduct-id = \"LOCAL-T\"\nname = \"Local Test\"\n\
+             slug = \"local-t\"\nkind = \"local\"\n[install]\ndir = \"/run/media/d/Local Test\"\n\
+             [launch]\nexecutable = 'Game.exe'\n[status]\nstate = \"untested\"\n\
+             summary = \"Added by hand\"\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_local_draft_keeps_absolute_paths_arguments_and_wrappers() {
+        let recipe = local();
+        let draft = Draft {
+            executable: "/run/media/d/Local Test/bin/Game.exe".into(),
+            prefix_dir: "/run/media/d/prefixes/Local Test".into(),
+            arguments: "-dx12 \"a b\"".into(),
+            wrapper: "gamemoderun".into(),
+            ..Draft::from_recipe(&recipe)
+        };
+        assert_eq!(draft.install_dir, "/run/media/d/Local Test");
+        let mut applied = recipe.clone();
+        draft.apply(&mut applied).expect("applies");
+        assert_eq!(applied.launch.args, ["-dx12", "a b"]);
+        assert_eq!(applied.launch.wrapper, ["gamemoderun"]);
+        assert_eq!(
+            applied.install.dir.as_deref(),
+            Some("/run/media/d/Local Test")
+        );
+        assert_eq!(
+            applied.launch.executable,
+            "/run/media/d/Local Test/bin/Game.exe"
+        );
+        assert_eq!(
+            applied.install.prefix.as_deref(),
+            Some("/run/media/d/prefixes/Local Test")
+        );
+        // And back: the words are shown so they parse the same again.
+        let again = Draft::from_recipe(&applied);
+        assert_eq!(again.arguments, "-dx12 'a b'");
+        assert_eq!(again.wrapper, "gamemoderun");
+
+        let climbing = Draft {
+            executable: "/run/media/d/../../etc/x.exe".into(),
+            ..Draft::from_recipe(&recipe)
+        };
+        assert!(climbing.apply(&mut recipe.clone()).is_err());
+
+        let xbox = Draft {
+            executable: "/usr/bin/id".into(),
+            ..Draft::from_recipe(&blank())
+        };
+        assert!(xbox.apply(&mut blank()).is_err());
+    }
+
+    #[test]
+    fn an_environment_word_is_not_a_wrapper() {
+        let draft = Draft {
+            wrapper: "DXVK_HDR=1 gamemoderun".into(),
+            ..Draft::from_recipe(&local())
+        };
+        let complaint = draft.apply(&mut local()).expect_err("refuses");
+        assert!(complaint.contains("Environment"), "{complaint}");
     }
 }

@@ -41,6 +41,7 @@ use ferestre_core::http;
 use ferestre_core::install;
 use ferestre_core::launch;
 use ferestre_core::library;
+use ferestre_core::neural;
 use ferestre_core::paths::Paths;
 use ferestre_core::recipe::Recipe;
 use ferestre_core::running;
@@ -141,7 +142,8 @@ enum Cmd {
         /// Input controller layout, which works without it.
         #[arg(long)]
         steam: bool,
-        /// Arguments for the title. Not supported yet; see the error.
+        /// Arguments for a local game, after its recipe's own. A Store title
+        /// takes none.
         #[arg(last = true, value_name = "ARG")]
         args: Vec<String>,
     },
@@ -190,9 +192,10 @@ enum Cmd {
     RollbackAppUpdate,
 
     /// Remove an installed title: its files and the launcher's record of it.
+    /// A local game is only forgotten; its files and prefix are kept.
     #[command(alias = "remove")]
     Uninstall {
-        /// The 12-character Store product id.
+        /// The 12-character Store product id, or a local game's id or slug.
         #[arg(value_name = "PRODUCT-ID")]
         product_id: String,
         /// Forget the record but leave the files where they are.
@@ -214,6 +217,39 @@ enum Cmd {
         yes: bool,
     },
 
+    /// Add a Windows game that is already on disk. Its files are never moved
+    /// or deleted.
+    Add {
+        /// The game's program, an .exe or .bat.
+        #[arg(value_name = "EXE")]
+        exe: PathBuf,
+        /// Its name. Defaults to the game's folder name.
+        #[arg(long)]
+        name: Option<String>,
+        /// The game's folder. Defaults to the program's folder.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// Its Wine prefix: an absolute path is used as it is, a relative one
+        /// is inside the games directory. Defaults to one of its own there.
+        #[arg(long, value_name = "DIR")]
+        prefix: Option<PathBuf>,
+        /// The runtime to start it with: a runtime's folder, or the name of a
+        /// Proton Steam has.
+        #[arg(long, value_name = "RUNTIME")]
+        runtime: Option<String>,
+    },
+
+    /// Import non-Steam shortcuts from Steam as local games. Steam's files are
+    /// only read.
+    ImportSteam {
+        /// Show what would be imported, and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Only this Steam user's shortcuts (the number under userdata/).
+        #[arg(long, value_name = "ID")]
+        user: Option<String>,
+    },
+
     /// Build and install the patched Proton runtime.
     InstallRuntime {
         /// Install the newest published runtime even when it is older than
@@ -230,11 +266,79 @@ enum Cmd {
         path: PathBuf,
     },
 
+    /// Experimental: NVIDIA's DLSS 5 neural rendering on AMD RX 9000 cards, through DLSSNR-AMD.
+    Neural {
+        #[command(subcommand)]
+        command: NeuralCmd,
+    },
+
     /// Print the resolved XODUS_* paths.
     Env,
 
     /// Print the version.
     Version,
+}
+
+#[derive(Subcommand, Debug)]
+enum NeuralCmd {
+    /// What is set up, and per game what is enabled; with a title, its route, anti-cheat and checks.
+    Status {
+        #[arg(value_name = "TITLE")]
+        title: Option<String>,
+    },
+    /// Download the package and extract the model from nvngx_dlssnr.dll (found, or given with --dll).
+    Setup {
+        /// The DLL, or a .zip holding exactly one.
+        #[arg(long, value_name = "PATH")]
+        dll: Option<PathBuf>,
+    },
+    /// Install DLSSNR-AMD into a game's executable folder, backing up what it replaces.
+    Enable {
+        #[arg(value_name = "TITLE")]
+        title: String,
+        /// optiscaler, reshade-feeder, reshade-feeder-vulkan or reshade-feeder-dx9;
+        /// detected from the game's files when not given.
+        #[arg(long, value_name = "ROUTE")]
+        route: Option<String>,
+        /// The network it starts with, e.g. CC_SMALL_FP8.
+        #[arg(long, value_name = "NETWORK")]
+        model: Option<String>,
+        /// Enable it on a game whose anti-cheat may ban accounts that load
+        /// mods (never a kernel-level one Proton cannot run). Remembered per
+        /// game.
+        #[arg(long)]
+        accept_anticheat_risk: bool,
+        /// With --accept-anticheat-risk: an anti-cheat the person was shown
+        /// (repeatable). Accepting then covers only these, so one detected
+        /// since refuses instead of being accepted unseen.
+        #[arg(
+            long = "anticheat-shown",
+            value_name = "NAME",
+            requires = "accept_anticheat_risk"
+        )]
+        anticheat_shown: Vec<String>,
+        /// The DLL name OptiScaler loads as for this game: dxgi (the
+        /// default), winmm, version, dbghelp, d3d12, wininet or winhttp. A
+        /// game that crashes with OptiScaler as dxgi.dll may run with
+        /// another. Remembered per game, also after turning it off.
+        #[arg(long, value_name = "NAME")]
+        proxy: Option<String>,
+    },
+    /// The key that opens the NR Control menu in every game: Ctrl+Y unless
+    /// set (End is upstream's, missing from many compact keyboards). Applied at each game's next launch.
+    MenuKey {
+        /// A key such as F7 or Ctrl+Y; without one, print the current key.
+        #[arg(value_name = "KEY", conflicts_with = "reset")]
+        key: Option<String>,
+        /// Go back to the default, Ctrl+Y.
+        #[arg(long)]
+        reset: bool,
+    },
+    /// Take DLSSNR-AMD out of a game and put back the files it replaced.
+    Disable {
+        #[arg(value_name = "TITLE")]
+        title: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -334,8 +438,26 @@ fn dispatch(cli: &Cli) -> Result<ExitCode> {
                 yes: *yes,
             },
         ),
+        Cmd::Add {
+            exe,
+            name,
+            dir,
+            prefix,
+            runtime,
+        } => cmd_add(
+            cli,
+            ferestre_core::local::AddRequest {
+                exe: exe.clone(),
+                name: name.clone(),
+                dir: dir.clone(),
+                prefix: prefix.clone(),
+                runtime: runtime.clone(),
+            },
+        ),
+        Cmd::ImportSteam { dry_run, user } => cmd_import_steam(cli, *dry_run, user.as_deref()),
         Cmd::InstallRuntime { allow_downgrade } => cmd_install_runtime(cli, *allow_downgrade),
         Cmd::InspectPackage { path } => cmd_inspect_package(cli, path),
+        Cmd::Neural { command } => cmd_neural(cli, command),
         Cmd::Env => cmd_env(cli),
         Cmd::Version => cmd_version(cli),
     }
@@ -376,6 +498,534 @@ fn cmd_inspect_package(cli: &Cli, path: &Path) -> Result<ExitCode> {
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// neural rendering
+// ---------------------------------------------------------------------------
+
+/// `neural …`: everything is decided in `ferestre_core::neural`; this finds
+/// the title, takes its lock and prints.
+fn cmd_neural(cli: &Cli, command: &NeuralCmd) -> Result<ExitCode> {
+    let paths = Paths::from_env()?;
+    let ctx = neural::Context::from_paths(&paths);
+    match command {
+        NeuralCmd::Status { title } => {
+            let doc = neural_status(cli, &paths, &ctx, title.as_deref())?;
+            if cli.json {
+                print_json(&doc);
+            } else {
+                print!("{}", render_neural_status(&doc));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        NeuralCmd::Setup { dll } => neural_setup(cli, &paths, &ctx, dll.as_deref()),
+        NeuralCmd::Enable {
+            title,
+            route,
+            model,
+            accept_anticheat_risk,
+            anticheat_shown,
+            proxy,
+        } => {
+            let route = parse_route(route.as_deref())?;
+            let model = parse_network(model.as_deref())?;
+            if let Some(proxy) = proxy {
+                let (dir, recipes) = recipes_from(cli, &paths)?;
+                let (_, product_id, _) = neural_title(&paths, &dir, &recipes, title)?;
+                let proxy = neural::package::check_proxy(proxy)
+                    .map_err(|e| usage(&format!("--proxy: {e}")))?;
+                neural::state::set_proxy(&ctx.config_dir, &product_id, Some(proxy))?;
+            }
+            neural_enable(
+                cli,
+                &paths,
+                &ctx,
+                title,
+                route,
+                model,
+                accept_anticheat_risk.then_some(anticheat_shown.as_slice()),
+            )
+        }
+        NeuralCmd::Disable { title } => neural_disable(cli, &paths, &ctx, title),
+        NeuralCmd::MenuKey { key, reset } => {
+            let config = paths.config_dir();
+            if *reset || key.is_some() {
+                ferestre_core::settings::set_dlssnr_menu_key(config, key.as_deref())
+                    .map_err(|e| usage(&format!("{e:#}")))?;
+            }
+            let current = ferestre_core::settings::dlssnr_menu_key(config)?;
+            if cli.json {
+                print_json(&json!({"schema": JSON_SCHEMA, "menu_key": current}));
+            } else {
+                println!("{}", current);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// `--route`, a usage error naming every route when it is none of them.
+fn parse_route(text: Option<&str>) -> Result<Option<neural::Route>> {
+    text.map(|t| {
+        t.parse()
+            .map_err(|e: anyhow::Error| usage(&format!("--route: {e}")))
+    })
+    .transpose()
+}
+
+/// `--model`, a usage error naming every network when it is none of them.
+fn parse_network(text: Option<&str>) -> Result<Option<neural::Network>> {
+    text.map(|t| {
+        t.parse()
+            .map_err(|e: anyhow::Error| usage(&format!("--model: {e}")))
+    })
+    .transpose()
+}
+
+/// The recipe `title` names, with its state key, game folder and executable.
+fn neural_title<'a>(
+    paths: &Paths,
+    dir: &Path,
+    recipes: &'a [Recipe],
+    title: &str,
+) -> Result<(&'a Recipe, String, PathBuf)> {
+    let recipe = recipes.iter().find(|r| r.matches(title)).ok_or_else(|| {
+        anyhow!(
+            "no recipe for '{title}' in {} (see: ferestre titles)",
+            dir.display()
+        )
+    })?;
+    Ok((
+        recipe,
+        recipe.title.product_id.to_ascii_uppercase(),
+        paths.install_dir(recipe)?,
+    ))
+}
+
+/// The model part of `setup`: the x86_64 package (its extraction script),
+/// then, unless a model is cached and no DLL was given, the DLL found in the
+/// fixed discovery order and its models extracted.
+fn neural_models(
+    cli: &Cli,
+    paths: &Paths,
+    ctx: &neural::Context,
+    explicit: Option<&Path>,
+) -> Result<Vec<neural::ModelFile>> {
+    let package = (ctx.packages)(neural::Arch::X86_64)?;
+    if neural::package::installed(&ctx.root, &package).is_none() {
+        eprintln!(
+            ":: fetching the DLSSNR-AMD {} {} package",
+            package.version, package.arch
+        );
+    }
+    let package_dir = neural::package::ensure(&ctx.root, &package)?;
+    let cached = neural::models::verify(&ctx.root, &ctx.expect)?;
+    if !cached.is_empty() && explicit.is_none() {
+        return Ok(cached);
+    }
+    // Game folders are only looked through: a recipe that cannot be read
+    // narrows the scan, it does not stop it.
+    let recipes = recipes_from(cli, paths)
+        .map(|(_, recipes)| recipes)
+        .unwrap_or_default();
+    let locations = neural::dll::locations(paths, &recipes);
+    let url = ferestre_core::settings::dlssnr_dll_url(paths)?;
+    let work = ctx.root.join("work");
+    let (dll, step) = neural::dll::find(
+        &locations,
+        explicit,
+        url.as_deref(),
+        &work,
+        &ctx.expect,
+        &mut |line| eprintln!(":: {line}"),
+    )?;
+    // The URL is the person's own and is never printed.
+    let source = match step {
+        neural::dll::Step::Url => "the configured URL".to_string(),
+        _ => dll.found_at.display().to_string(),
+    };
+    eprintln!(
+        ":: extracting the model from {} {} ({source})",
+        neural::dll::DLL_NAME,
+        dll.version.version
+    );
+    neural::models::extract(&package_dir, &dll, &ctx.root, &ctx.expect)
+}
+
+fn models_json(models: &[neural::ModelFile]) -> Value {
+    Value::Array(
+        models
+            .iter()
+            .map(|m| json!({"file": m.file, "sha256": m.sha256, "size": m.size}))
+            .collect(),
+    )
+}
+
+fn neural_setup(
+    cli: &Cli,
+    paths: &Paths,
+    ctx: &neural::Context,
+    dll: Option<&Path>,
+) -> Result<ExitCode> {
+    let models = neural_models(cli, paths, ctx, dll)?;
+    if cli.json {
+        print_json(&json!({"schema": JSON_SCHEMA, "models": models_json(&models)}));
+    } else {
+        eprintln!(
+            ":: neural rendering is set up; cached: {}",
+            models
+                .iter()
+                .map(|m| m.file.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn neural_enable(
+    cli: &Cli,
+    paths: &Paths,
+    ctx: &neural::Context,
+    title: &str,
+    route: Option<neural::Route>,
+    model: Option<neural::Network>,
+    // `None` when the risk was not accepted; otherwise the anti-cheats the
+    // person was shown, an empty list accepting whatever is found.
+    accept_anticheat_risk: Option<&[String]>,
+) -> Result<ExitCode> {
+    let (dir, recipes) = recipes_from(cli, paths)?;
+    let (recipe, product_id, game_dir) = neural_title(paths, &dir, &recipes, title)?;
+    // Outside the title's lock: this may download and scan for a while.
+    if neural::models::verify(&ctx.root, &ctx.expect)?.is_empty() {
+        eprintln!(":: no model is cached yet; setting up first");
+        neural_models(cli, paths, ctx, None).context(
+            "no model is cached and none could be extracted; run: ferestre neural setup \
+             --dll <path to nvngx_dlssnr.dll>",
+        )?;
+    }
+    let _lock = TitleLock::take(paths, &product_id, LockMode::Change)?;
+    let enabled = neural::apply::enable(
+        ctx,
+        &neural::apply::EnableRequest {
+            key: &product_id,
+            game_dir: &game_dir,
+            executable: &recipe.launch.executable,
+            route,
+            model,
+            accept_anticheat_risk: accept_anticheat_risk.is_some(),
+            shown_anticheat: accept_anticheat_risk.filter(|shown| !shown.is_empty()),
+        },
+    )?;
+    for warning in &enabled.warnings {
+        eprintln!("-- {warning}");
+    }
+    let entry = &enabled.entry;
+    if cli.json {
+        print_json(&json!({
+            "schema": JSON_SCHEMA,
+            "product_id": product_id,
+            "entry": entry,
+            "warnings": enabled.warnings,
+        }));
+    }
+    eprintln!(
+        ":: neural rendering enabled for {} ({}, {})",
+        recipe.title.name, entry.route, entry.model
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn neural_disable(
+    cli: &Cli,
+    paths: &Paths,
+    ctx: &neural::Context,
+    title: &str,
+) -> Result<ExitCode> {
+    let (dir, recipes) = recipes_from(cli, paths)?;
+    let (name, product_id, game_dir, executable) = match neural_title(paths, &dir, &recipes, title)
+    {
+        Ok((recipe, product_id, game_dir)) => (
+            recipe.title.name.clone(),
+            product_id,
+            game_dir,
+            recipe.launch.executable.clone(),
+        ),
+        // A game whose recipe is gone still has its entry, which names
+        // the folder the mod is in.
+        Err(e) => {
+            let key = title.to_ascii_uppercase();
+            let entry = neural::state::get(&ctx.config_dir, &key)?.ok_or(e)?;
+            (key.clone(), key, entry.install_dir, String::new())
+        }
+    };
+    let _lock = TitleLock::take(paths, &product_id, LockMode::Change)?;
+    neural::apply::disable(ctx, &product_id, &game_dir, &executable)?;
+    if cli.json {
+        print_json(&json!({
+            "schema": JSON_SCHEMA,
+            "product_id": product_id,
+            "disabled": true,
+        }));
+    }
+    eprintln!(":: neural rendering disabled for {name}");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn api_name(api: neural::detect::Api) -> &'static str {
+    use neural::detect::Api;
+    match api {
+        Api::Dx10To12 => "d3d10-12",
+        Api::Vulkan => "vulkan",
+        Api::Dx9 => "d3d9",
+        Api::OpenGl => "opengl",
+        Api::Unknown => "unknown",
+    }
+}
+
+fn gate_json(gate: &neural::apply::Gate) -> Value {
+    use neural::apply::Gate;
+    match gate {
+        Gate::Allowed => json!({"state": "allowed", "names": []}),
+        Gate::NeedsAcknowledgement(names) => {
+            json!({"state": "needs-acknowledgement", "names": names})
+        }
+    }
+}
+
+/// `neural status` as a document. Never holds the DLL URL, only whether one
+/// is configured.
+fn neural_status(
+    cli: &Cli,
+    paths: &Paths,
+    ctx: &neural::Context,
+    title: Option<&str>,
+) -> Result<Value> {
+    let Some(title) = title else {
+        let package = match (ctx.packages)(neural::Arch::X86_64) {
+            Ok(p) => json!({
+                "version": p.version,
+                "arch": p.arch,
+                "ready": neural::package::installed(&ctx.root, &p).is_some(),
+            }),
+            Err(e) => json!({
+                "version": null,
+                "arch": neural::Arch::X86_64,
+                "ready": false,
+                "error": format!("{e:#}"),
+            }),
+        };
+        let titles: serde_json::Map<String, Value> = neural::state::all(&ctx.config_dir)?
+            .into_iter()
+            .map(|(key, entry)| Ok((key, serde_json::to_value(&entry)?)))
+            .collect::<Result<_>>()?;
+        return Ok(json!({
+            "schema": JSON_SCHEMA,
+            "package": package,
+            "models": models_json(&neural::models::cached(&ctx.root, &ctx.expect)),
+            "dll_url_configured": ferestre_core::settings::dlssnr_dll_url(paths)
+                .ok()
+                .flatten()
+                .is_some(),
+            "hardware": hardware_json(&neural::hardware::check(&ctx.drm)),
+            "titles": titles,
+        }));
+    };
+    let (dir, recipes) = recipes_from(cli, paths)?;
+    let (recipe, product_id, game_dir) = neural_title(paths, &dir, &recipes, title)?;
+    let o = neural::overview(
+        ctx,
+        paths,
+        &product_id,
+        &game_dir,
+        &recipe.launch.executable,
+    );
+    Ok(json!({
+        "schema": JSON_SCHEMA,
+        "product_id": product_id,
+        "name": recipe.title.name,
+        "entry": o.entry,
+        "detected": {
+            "bits": o.detected.bits,
+            "api": api_name(o.detected.api),
+            "upscalers": o.detected.upscalers,
+            "assumed": o.detected.assumed,
+            "route": o.detected.route,
+        },
+        "anticheat": o.anticheat.iter().map(|d| json!({
+            "name": d.name,
+            "kernel": d.kernel,
+            "proton_runtime": d.proton_runtime,
+            "evidence": d.evidence.display().to_string(),
+        })).collect::<Vec<_>>(),
+        "gate": gate_json(&o.gate),
+        "installed": match &o.installed {
+            None => Value::Null,
+            Some(Ok(())) => json!({"ok": true}),
+            Some(Err(e)) => json!({"ok": false, "error": e}),
+        },
+        "models": models_json(&o.models),
+        "package_ready": o.package_ready,
+        "hardware": hardware_json(&o.hardware),
+        "dll_url_configured": o.dll_url_configured,
+    }))
+}
+
+fn hardware_json(hardware: &neural::hardware::Hardware) -> Value {
+    json!({
+        "supported": hardware.unsupported.is_none(),
+        "unsupported": hardware.unsupported,
+        "warnings": hardware.warnings,
+    })
+}
+
+/// `neural status` for a person, from its document.
+fn render_neural_status(doc: &Value) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let text = |v: &Value| v.as_str().unwrap_or("").to_string();
+    let names = |v: &Value| {
+        v.as_array()
+            .map(|a| a.iter().map(text).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default()
+    };
+    let models = doc["models"]
+        .as_array()
+        .map(|a| a.iter().map(|m| text(&m["file"])).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let models = if models.is_empty() {
+        "none cached (run: ferestre neural setup)".to_string()
+    } else {
+        models.join(", ")
+    };
+    if let Some(product_id) = doc["product_id"].as_str() {
+        let _ = writeln!(out, "{} ({product_id})", text(&doc["name"]));
+        match doc["entry"].as_object() {
+            Some(entry) if entry["enabled"] == true => {
+                let _ = writeln!(
+                    out,
+                    "  neural rendering: on ({}, {}) in {}",
+                    text(&entry["route"]),
+                    text(&entry["model"]),
+                    text(&entry["install-dir"])
+                );
+            }
+            _ => {
+                let _ = writeln!(out, "  neural rendering: off");
+            }
+        }
+        match &doc["installed"] {
+            Value::Null => {}
+            installed if installed["ok"] == true => {
+                let _ = writeln!(out, "  install: whole");
+            }
+            installed => {
+                let _ = writeln!(
+                    out,
+                    "  install: incomplete ({}); the next launch installs it again",
+                    text(&installed["error"])
+                );
+            }
+        }
+        let detected = &doc["detected"];
+        let route = detected["route"].as_str().unwrap_or("none; pass --route");
+        let _ = writeln!(
+            out,
+            "  game: {}-bit {}{}; route: {route}",
+            detected["bits"],
+            text(&detected["api"]),
+            if detected["assumed"] == true {
+                " (assumed)"
+            } else {
+                ""
+            }
+        );
+        if let Some(upscalers) = detected["upscalers"].as_array().filter(|a| !a.is_empty()) {
+            let _ = writeln!(
+                out,
+                "  upscalers: {}",
+                names(&Value::Array(upscalers.clone()))
+            );
+        }
+        let gate = &doc["gate"];
+        let anticheat = doc["anticheat"]
+            .as_array()
+            .map(|a| a.iter().map(|d| text(&d["name"])).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "  anti-cheat: {}",
+            match gate["state"].as_str() {
+                Some("refused") => format!(
+                    "{} (kernel-level; neural rendering is never enabled)",
+                    names(&gate["names"])
+                ),
+                Some("needs-acknowledgement") => format!(
+                    "{} (enable needs --accept-anticheat-risk)",
+                    names(&gate["names"])
+                ),
+                _ if anticheat.is_empty() => "none found".to_string(),
+                _ => format!("{} (acknowledged)", anticheat.join(", ")),
+            }
+        );
+        let _ = writeln!(
+            out,
+            "  package: {}",
+            if doc["package_ready"] == true {
+                "ready"
+            } else {
+                "not fetched yet"
+            }
+        );
+    } else {
+        let package = &doc["package"];
+        let _ = writeln!(
+            out,
+            "DLSSNR-AMD package: {}",
+            match package["version"].as_str() {
+                Some(version) if package["ready"] == true => format!("{version} (ready)"),
+                Some(version) => format!("{version} (not fetched yet)"),
+                None => format!("unavailable: {}", text(&package["error"])),
+            }
+        );
+    }
+    let _ = writeln!(out, "  models: {models}");
+    let _ = writeln!(
+        out,
+        "  nvngx_dlssnr.dll download address: {}",
+        if doc["dll_url_configured"] == true {
+            "configured"
+        } else {
+            "not configured"
+        }
+    );
+    if let Some(reason) = doc["hardware"]["unsupported"].as_str() {
+        let _ = writeln!(out, "!! {reason}");
+    }
+    for warning in doc["hardware"]["warnings"].as_array().into_iter().flatten() {
+        let _ = writeln!(out, "-- {}", text(warning));
+    }
+    if let Some(titles) = doc["titles"].as_object() {
+        if titles.is_empty() {
+            let _ = writeln!(out, "no game has neural rendering on");
+        }
+        for (key, entry) in titles {
+            let _ = writeln!(
+                out,
+                "{key}  {}  {}  {}{}",
+                text(&entry["route"]),
+                text(&entry["model"]),
+                text(&entry["install-dir"]),
+                if entry["enabled"] == true {
+                    ""
+                } else {
+                    "  (off)"
+                }
+            );
+        }
+    }
+    out
 }
 
 fn cmd_version(cli: &Cli) -> Result<ExitCode> {
@@ -647,23 +1297,37 @@ fn cmd_run(
     steam: bool,
     args: &[String],
 ) -> Result<ExitCode> {
-    if !args.is_empty() {
-        // Better than passing them somewhere they will be ignored: `xodus-cli
-        // run` takes the executable and the game directory, and has nowhere to
-        // put a title's own arguments.
-        return Err(usage(
-            "passing arguments to a title is not supported yet: the client's run command takes none",
-        ));
-    }
-
     let paths = Paths::from_env()?;
     let request = LaunchRequest {
         dry_run,
         force,
         steam,
     };
-    let mut prepared = prepare_launch(cli, &paths, title, request)?;
-    if dry_run {
+    run_title(cli, &paths, title, request, args)
+}
+
+/// `run` against these paths.
+fn run_title(
+    cli: &Cli,
+    paths: &Paths,
+    title: &str,
+    request: LaunchRequest,
+    args: &[String],
+) -> Result<ExitCode> {
+    if !args.is_empty() {
+        // First, before anything is read for the launch or written: a title
+        // that cannot take them must not get as far as a recipe being written
+        // or the client being asked anything.
+        let (_, recipes) = recipes_from(cli, paths)?;
+        title_args_allowed(&recipes, title, args)?;
+    }
+
+    let mut prepared = prepare_launch(cli, paths, title, request)?;
+    let local = prepared.recipe.is_local();
+    if local {
+        prepared.plan.args.extend(args.iter().cloned());
+    }
+    if request.dry_run {
         // Nothing has been started or written: a dry run prints and stops.
         if cli.json {
             print_json(&json!({
@@ -675,18 +1339,39 @@ fn cmd_run(
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let game = launch::game_dir(&prepared.recipe, &prepared.dirs, &prepared.options);
-    if prepare_content(
-        cli,
-        &paths,
-        &prepared.recipe,
-        &game,
-        &cancel::Cancellation::default(),
-    )? {
-        // New installations must enter the immutable runtime/service inventory.
-        prepared = prepare_launch(cli, &paths, title, request)?;
+    if !local {
+        let game = launch::game_dir(&prepared.recipe, &prepared.dirs, &prepared.options);
+        if prepare_content(
+            cli,
+            paths,
+            &prepared.recipe,
+            &game,
+            &cancel::Cancellation::default(),
+        )? {
+            // New installations must enter the immutable runtime/service inventory.
+            prepared = prepare_launch(cli, paths, title, request)?;
+        }
     }
-    launch_prepared(&paths, prepared, force)
+    launch_prepared(paths, prepared, request.force)
+}
+
+/// Whether `title` may be given arguments of its own. Only a local game can:
+/// it is started directly, while `xodus-cli run` takes the executable and the
+/// game directory and has nowhere to put a Store title's arguments.
+fn title_args_allowed(recipes: &[Recipe], title: &str, args: &[String]) -> Result<()> {
+    // The recipe a launch would use: the first that matches, as in
+    // `prepare_launch`.
+    let local = recipes
+        .iter()
+        .find(|r| r.matches(title))
+        .is_some_and(Recipe::is_local);
+    if args.is_empty() || local {
+        return Ok(());
+    }
+    // Better than passing them somewhere they will be ignored.
+    Err(usage(
+        "passing arguments to a title is not supported yet: the client's run command takes none",
+    ))
 }
 
 /// What `run` was asked for, beyond the title.
@@ -732,7 +1417,9 @@ fn prepare_launch(
     // one thing a person would otherwise have to go and find in a tree of
     // thousands of files. Writing it down means the answer survives, and stays
     // editable when a title turns out to need something else.
-    if !recipes.iter().any(|r| r.matches(title)) {
+    // A local id never names a package on disk, so there is nothing to
+    // describe: no recipe means the game was forgotten or never added.
+    if !recipes.iter().any(|r| r.matches(title)) && !ferestre_core::local::is_local_id(title) {
         if let Some((detected, written)) = describe_from_disk(paths, title, !request.dry_run)? {
             match written {
                 Some(written) => eprintln!(
@@ -754,14 +1441,26 @@ fn prepare_launch(
         )
     })?;
 
+    // A local game is not a Store package: no account, service, related
+    // content or client takes part in its launch, and its launch options are
+    // the person's own, so nothing is inferred for it.
+    let local = recipe.is_local();
+
     // A title without a tested recipe can still share an engine with one that
     // has been debugged. The same inference feeds the window's verdict.
-    let inferred = autofix::infer(recipe, Some(&paths.install_dir(recipe)?));
+    let inferred = if local {
+        autofix::Inferred {
+            recipe: std::borrow::Cow::Borrowed(recipe),
+            profile: None,
+        }
+    } else {
+        autofix::infer(recipe, Some(&paths.install_dir(recipe)?))
+    };
 
     // Checked before anything is started, because the alternative is a title
     // that exits 1 with an empty log and someone guessing which of eleven
-    // patches is missing.
-    let runtimes = runtime::all(paths);
+    // patches is missing. A local game may also use Steam's own Protons.
+    let runtimes = runtime::for_recipe(paths, recipe);
     // Per-game override, then the Settings default, then the environment override.
     let requested_runtime = runtime::requested(paths, &recipe.title.product_id)?;
     let registry = registry_for(paths);
@@ -781,8 +1480,12 @@ fn prepare_launch(
         eprintln!("{line}");
     }
 
-    let dirs = launch_dirs_for_runtime(paths, &runtime.path)?;
-    let roles = accounts::launch_selection(paths.config_dir())?;
+    let dirs = launch_dirs_for_runtime(paths, &runtime.path, local)?;
+    let roles = if local {
+        None
+    } else {
+        accounts::launch_selection(paths.config_dir())?
+    };
     let mut prefix = paths.prefix_dir(&recipe)?;
     // `XGR_XUID` is the Windows install's XUID, so it names the imported
     // player's save folders. Another player has their own prefix and their own
@@ -834,7 +1537,7 @@ fn prepare_launch(
         steam_integration: request.steam,
         xuid: paths
             .var("XGR_XUID")
-            .filter(|_| own_xuid)
+            .filter(|_| own_xuid && !local)
             .map(str::to_string),
         game_dir: Some(paths.install_dir(&recipe)?),
         prefix_dir: Some(prefix),
@@ -869,18 +1572,23 @@ fn prepare_launch(
             &launch::game_dir(&recipe, &dirs, &options),
         )?;
     }
-    let related = ferestre_core::related::installed(
-        paths.state_dir(),
-        &recipe.title.product_id,
-        &launch::game_dir(&recipe, &dirs, &options),
-    );
-    let package_paths = ferestre_core::related::environment(&related);
-    plan.env_set
-        .insert("XGR_RELATED_PACKAGE_PATHS".into(), package_paths);
-    plan.env_set.insert(
-        "XODUS_RELATED_CONTENT".into(),
-        ferestre_core::related::service_binding(&related),
-    );
+    let related = if local {
+        Vec::new()
+    } else {
+        let related = ferestre_core::related::installed(
+            paths.state_dir(),
+            &recipe.title.product_id,
+            &launch::game_dir(&recipe, &dirs, &options),
+        );
+        let package_paths = ferestre_core::related::environment(&related);
+        plan.env_set
+            .insert("XGR_RELATED_PACKAGE_PATHS".into(), package_paths);
+        plan.env_set.insert(
+            "XODUS_RELATED_CONTENT".into(),
+            ferestre_core::related::service_binding(&related),
+        );
+        related
+    };
     add_anticheat_runtimes(
         &mut plan,
         paths.state_dir(),
@@ -888,7 +1596,35 @@ fn prepare_launch(
         &recipe.launch.executable,
         request.dry_run,
     );
-    let service_socket = plan_service_socket(&mut plan, &dirs, runtime, roles.as_ref())?;
+    // A dry run shows what a launch would add, reading only; a real launch
+    // decides in `launch_prepared`, after its check.
+    if request.dry_run {
+        let game_dir = launch::game_dir(&recipe, &dirs, &options);
+        let ctx = neural::Context::from_paths(paths);
+        if let Some(entry) = neural::apply::preview(
+            &ctx,
+            &recipe.title.product_id,
+            &game_dir,
+            &recipe.launch.executable,
+        ) {
+            let exe_dir = neural::apply::exe_dir(&game_dir, &recipe.launch.executable);
+            add_neural_rendering(&mut plan, &entry, &exe_dir);
+        }
+    }
+    if local {
+        let found = ferestre_core::anticheat::detect(
+            &launch::game_dir(&recipe, &dirs, &options),
+            &recipe.launch.executable,
+        );
+        if let Some(line) = ferestre_core::anticheat::describe(&found) {
+            eprintln!("-- {line}");
+        }
+    }
+    let service_socket = if local {
+        None
+    } else {
+        plan_service_socket(&mut plan, &dirs, runtime, roles.as_ref())?
+    };
     Ok(PreparedLaunch {
         runtime: runtime.clone(),
         recipe,
@@ -905,13 +1641,23 @@ fn prepare_launch(
 
 /// Start a prepared launch and wait for the title.
 fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Result<ExitCode> {
+    launch_prepared_with(paths, prepared, force, &neural::Context::from_paths(paths))
+}
+
+/// [`launch_prepared`] with the neural rendering context to check against.
+fn launch_prepared_with(
+    paths: &Paths,
+    prepared: PreparedLaunch,
+    force: bool,
+    neural: &neural::Context,
+) -> Result<ExitCode> {
     let PreparedLaunch {
         recipe,
         runtime,
         registry,
         dirs,
         options,
-        plan,
+        mut plan,
         service_socket,
         roles,
         mut profiles,
@@ -940,10 +1686,26 @@ fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Resu
     // created wherever this says.
     let log = paths.log_file(&recipe)?;
 
+    // A local game is an ordinary Windows program: no client, service,
+    // WinRT classes, PlayFab saves or presence take part in its launch.
+    let local = recipe.is_local();
+
     // The three things a Plan deliberately does not model, in the order
     // launch-gdk.sh does them.
     let game_dir = launch::game_dir(&recipe, &dirs, &options);
-    if !game_dir.is_dir() {
+    if local {
+        // Checked before the prefix is created: a game on a drive that is
+        // not mounted must not leave an empty prefix or folder behind.
+        let executable = ferestre_core::local::executable_path(&recipe)
+            .unwrap_or_else(|| game_dir.join(&recipe.launch.executable));
+        if !executable.is_file() {
+            bail!(
+                "{}'s executable is not at {}; is its drive mounted?",
+                recipe.title.name,
+                executable.display()
+            );
+        }
+    } else if !game_dir.is_dir() {
         bail!(
             "{} is not installed at {} -- download it: ferestre install {}",
             recipe.title.name,
@@ -953,7 +1715,7 @@ fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Resu
     }
     // A download that stopped partway leaves the client's working container;
     // the tree beside it is part old build, part new, and part missing.
-    if install::is_partial(&game_dir) {
+    if !local && install::is_partial(&game_dir) {
         if !force {
             bail!(
                 "{} did not finish downloading at {} -- finish it: ferestre install {} \
@@ -1002,11 +1764,20 @@ fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Resu
             running::refusal(&recipe.title.name, &images),
         ));
     }
-    if let Some(registry) = &registry {
+    if let Some(registry) = registry.as_ref().filter(|_| !local) {
         register_winrt_classes(&prefix, registry, &runtime);
     }
     run_setup(&recipe, "every-launch", &dirs.scripts_dir, &game_dir)?;
-    if runtime.provides("xgameruntime.playfab-file-saves") {
+    // After the game's own setup, before anything starts: re-check the
+    // anti-cheat gate and the install, and only then add the launch env.
+    neural_before_launch(
+        &mut plan,
+        neural,
+        &recipe.title.product_id,
+        &game_dir,
+        &recipe.launch.executable,
+    )?;
+    if !local && runtime.provides("xgameruntime.playfab-file-saves") {
         if let Some(identity) = install::package_identity(&game_dir) {
             let backups = paths
                 .state_dir()
@@ -1030,8 +1801,13 @@ fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Resu
     ))));
     // Before the service is looked for: a launch finishing now must not stop a
     // service this one is about to reuse.
-    let _service_use = ServiceUse::begin(service_socket.as_deref())?;
-    start_service(&dirs, service_socket.as_deref(), paths.cache_dir(), &plan)?;
+    let _service_use = if local {
+        None
+    } else {
+        let claim = ServiceUse::begin(service_socket.as_deref())?;
+        start_service(&dirs, service_socket.as_deref(), paths.cache_dir(), &plan)?;
+        claim
+    };
     if let Some(signal) = forwarding.received() {
         eprintln!("-- stopped before {} started", recipe.title.name);
         return Ok(ExitCode::from(exit_code_from(None, Some(signal))));
@@ -1040,18 +1816,20 @@ fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Resu
     // Player. Without roles the client's default account is the Player, and
     // only the profile listing says which one that is. A client that cannot
     // answer goes without, quietly.
-    if roles.is_none() {
+    if !local && roles.is_none() {
         profiles = accounts::fetch(&dirs.xodus_cli()).ok();
     }
     // Dropped when this returns, once the title has exited: the runner then
     // tells Xbox the game has stopped.
-    let _presence = presence::Presence::start(presence::setup(
-        &dirs.xodus_cli(),
-        paths.config_dir(),
-        roles.as_ref(),
-        profiles.as_ref(),
-        &game_dir,
-    ));
+    let _presence = (!local).then(|| {
+        presence::Presence::start(presence::setup(
+            &dirs.xodus_cli(),
+            paths.config_dir(),
+            roles.as_ref(),
+            profiles.as_ref(),
+            &game_dir,
+        ))
+    });
 
     if let Ok(missing) = ferestre_core::media::missing_libav_dependencies(
         &dirs.proton_dir,
@@ -1493,6 +2271,63 @@ fn uninstall_title(
     answers: &mut dyn BufRead,
 ) -> Result<ExitCode> {
     let recipes = recipes_for_change(cli, paths)?;
+    // A local game's folder and prefix are the person's, or Steam's
+    // `compatdata`: Remove forgets the game and deletes nothing on disk, so
+    // there is nothing to ask about. `--keep-files` changes nothing.
+    if let Some(recipe) = recipes
+        .iter()
+        .find(|r| r.matches(title))
+        .filter(|r| r.is_local())
+    {
+        let dir = paths.install_dir(recipe)?;
+        if removal.remove_prefix {
+            bail!(
+                "Ferestre never deletes a local game's files or prefix; remove {} yourself if \
+                 you mean to",
+                dir.display()
+            );
+        }
+        let product_id = recipe.title.product_id.to_ascii_uppercase();
+        let _lock = TitleLock::take(paths, &product_id, LockMode::Change)?;
+        // The mod comes out and the person's files go back before the game
+        // is forgotten; nothing would take them out afterwards.
+        if neural::state::get(paths.config_dir(), &product_id)?.is_some_and(|e| e.enabled) {
+            let ctx = neural::Context::from_paths(paths);
+            neural::apply::disable(&ctx, &product_id, &dir, &recipe.launch.executable)
+                .with_context(|| {
+                    format!(
+                        "{} still has neural rendering on; turn it off first: ferestre neural \
+                         disable {}",
+                        recipe.title.name, recipe.title.slug
+                    )
+                })?;
+            eprintln!("-- neural rendering removed from {}", recipe.title.name);
+        }
+        let forgotten = ferestre_core::local::forget(paths, &product_id)?;
+        // Its id comes from its name: a game added later under the same name
+        // must be asked about its anti-cheat again.
+        neural::state::forget_game(paths.config_dir(), &product_id)?;
+        if cli.json {
+            print_json(&json!({
+                "schema": JSON_SCHEMA,
+                "product_id": product_id,
+                "local": true,
+                "forgot": true,
+                "kept": [
+                    forgotten.kept_dir.display().to_string(),
+                    forgotten.kept_prefix.display().to_string(),
+                ],
+            }));
+        } else {
+            eprintln!(
+                "-- forgot {}; its files in {} and its Wine prefix {} are kept",
+                recipe.title.name,
+                forgotten.kept_dir.display(),
+                forgotten.kept_prefix.display()
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     // Only a product id or a recipe's slug. Anything else used to fall
     // through to `<games dir>/<what was typed>`: an empty id named the games
     // directory itself, and `..` named the home directory.
@@ -1636,8 +2471,181 @@ fn uninstall_title(
 
     install::forget(paths.state_dir(), &product_id)?;
     eprintln!("-- forgot the install record for {product_id}");
+    // The mod went with the files.
+    if !removal.keep_files {
+        neural::state::forget(paths.config_dir(), &product_id)?;
+    }
     if removal.keep_files {
         eprintln!("   the files are still in {}", dir.display());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// local games
+// ---------------------------------------------------------------------------
+
+/// `add`: a game already on disk becomes a local game. Only its recipe and
+/// runtime choice are written.
+fn cmd_add(cli: &Cli, mut request: ferestre_core::local::AddRequest) -> Result<ExitCode> {
+    let paths = Paths::from_env()?;
+    // Typed paths are relative to where the command was run. The prefix is
+    // not: a relative prefix is the games directory's, as in a recipe.
+    let cwd = std::env::current_dir().context("reading the current directory")?;
+    if request.exe.is_relative() {
+        request.exe = cwd.join(&request.exe);
+    }
+    if let Some(dir) = request.dir.as_mut().filter(|d| d.is_relative()) {
+        *dir = cwd.join(&*dir);
+    }
+    let recipe = ferestre_core::local::add(&paths, &request)?;
+    let id = &recipe.title.product_id;
+    let dir = paths.install_dir(&recipe)?;
+    let prefix = paths.prefix_dir(&recipe)?;
+    let found = ferestre_core::anticheat::detect(&dir, &recipe.launch.executable);
+    if cli.json {
+        print_json(&json!({
+            "schema": JSON_SCHEMA,
+            "product_id": id,
+            "name": recipe.title.name,
+            "dir": dir.display().to_string(),
+            "executable": recipe.launch.executable,
+            "prefix": prefix.display().to_string(),
+            "anticheat": anticheat_json(&found),
+        }));
+    } else {
+        eprintln!(
+            "-- added {} as {id}; start it with: ferestre run {id}",
+            recipe.title.name
+        );
+    }
+    if let Some(line) = ferestre_core::anticheat::describe(&found) {
+        eprintln!("-- {line}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Anti-cheat evidence as the `--json` documents carry it.
+fn anticheat_json(found: &[ferestre_core::anticheat::Detection]) -> Value {
+    found
+        .iter()
+        .map(|d| {
+            json!({
+                "name": d.name,
+                "kernel": d.kernel,
+                "proton_runtime": d.proton_runtime,
+                "evidence": d.evidence.display().to_string(),
+            })
+        })
+        .collect()
+}
+
+fn cmd_import_steam(cli: &Cli, dry_run: bool, user: Option<&str>) -> Result<ExitCode> {
+    let paths = Paths::from_env()?;
+    import_steam(cli, &paths, dry_run, user)
+}
+
+/// `import-steam`: every non-Steam shortcut of every Steam install becomes a
+/// local game. Nothing under a Steam root is written; with `dry_run`,
+/// nothing at all.
+fn import_steam(cli: &Cli, paths: &Paths, dry_run: bool, user: Option<&str>) -> Result<ExitCode> {
+    use ferestre_core::steam_import::{self, ImportStatus, RuntimeFound};
+    let candidates = steam_import::plan(paths, user)?;
+    let status = |c: &steam_import::Candidate| match &c.status {
+        ImportStatus::New => "new".to_owned(),
+        ImportStatus::Kept => "kept".to_owned(),
+        ImportStatus::Skipped(why) => format!("skipped: {why}"),
+    };
+    let prefix = |c: &steam_import::Candidate| match &c.recipe {
+        None => "-".to_owned(),
+        Some(r) => r
+            .install
+            .prefix
+            .clone()
+            .unwrap_or_else(|| "managed".to_owned()),
+    };
+    let runtime = |c: &steam_import::Candidate| match &c.runtime {
+        RuntimeFound::Tool(dir) => dir.display().to_string(),
+        RuntimeFound::Missing(name) => format!("missing: {name}"),
+        RuntimeFound::Unset => "Ferestre".to_owned(),
+    };
+    let report = if dry_run {
+        None
+    } else {
+        Some(steam_import::apply(paths, &candidates)?)
+    };
+
+    if cli.json {
+        let rows: Vec<Value> = candidates
+            .iter()
+            .map(|c| {
+                json!({
+                    "id": c.id,
+                    "name": c.name,
+                    "user": c.user,
+                    "status": status(c),
+                    "prefix": c.recipe.as_ref().map(|_| prefix(c)),
+                    "dir": c.recipe.as_ref().and_then(|r| r.install.dir.clone()),
+                    "executable": c.recipe.as_ref().map(|r| r.launch.executable.clone()),
+                    "env": c.recipe.as_ref().map(|r| r.launch.env.clone()),
+                    "wrapper": c.recipe.as_ref().map(|r| r.launch.wrapper.clone()),
+                    "args": c.recipe.as_ref().map(|r| r.launch.args.clone()),
+                    "runtime": runtime(c),
+                    "anticheat": anticheat_json(&c.anticheat),
+                    "warnings": c.warnings,
+                })
+            })
+            .collect();
+        print_json(&json!({
+            "schema": JSON_SCHEMA,
+            "dry_run": dry_run,
+            "candidates": rows,
+        }));
+    } else if candidates.is_empty() {
+        println!("no non-Steam shortcuts found");
+    } else {
+        let mut rows = vec![vec![
+            "STATUS".to_owned(),
+            "ID".to_owned(),
+            "NAME".to_owned(),
+            "PREFIX".to_owned(),
+            "RUNTIME".to_owned(),
+        ]];
+        rows.extend(candidates.iter().map(|c| {
+            vec![
+                status(c),
+                c.id.clone(),
+                c.name.clone(),
+                prefix(c),
+                runtime(c),
+            ]
+        }));
+        print!("{}", table(&rows));
+    }
+    if !cli.json {
+        for c in &candidates {
+            for warning in &c.warnings {
+                eprintln!("-- {warning}");
+            }
+            if let Some(line) = ferestre_core::anticheat::describe(&c.anticheat) {
+                eprintln!("-- {}: {line}", c.name);
+            }
+        }
+    }
+    match &report {
+        None => eprintln!(
+            "-- would import {}",
+            candidates
+                .iter()
+                .filter(|c| c.status == ImportStatus::New)
+                .count()
+        ),
+        Some(report) => eprintln!(
+            "-- imported {}, kept {}, skipped {}",
+            report.added.len(),
+            report.kept.len(),
+            report.skipped.len()
+        ),
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -2792,13 +3800,18 @@ fn registry_for(paths: &Paths) -> Option<Registry> {
     Registry::load(&file).ok()
 }
 
-fn launch_dirs_for_runtime(paths: &Paths, runtime: &Path) -> Result<launch::Dirs> {
+/// The directories a launch with `runtime` uses. A local game never runs the
+/// client, so for one (`local`) a machine without it is not an error and the
+/// client directory is left empty.
+fn launch_dirs_for_runtime(paths: &Paths, runtime: &Path, local: bool) -> Result<launch::Dirs> {
+    let cli_dir = match paths.cli_dir() {
+        Some(dir) => dir.to_path_buf(),
+        None if local => PathBuf::new(),
+        None => bail!("no xodus-cli found; set XODUS_CLI_DIR (see: ferestre doctor)"),
+    };
     Ok(launch::Dirs {
         games_dir: paths.games_dir().to_path_buf(),
-        cli_dir: paths
-            .cli_dir()
-            .ok_or_else(|| anyhow!("no xodus-cli found; set XODUS_CLI_DIR (see: ferestre doctor)"))?
-            .to_path_buf(),
+        cli_dir,
         proton_dir: runtime.to_path_buf(),
         // launch-gdk.sh falls back to the conventional path rather than leaving
         // STEAM_COMPAT_CLIENT_INSTALL_PATH empty, and Proton wants *something*.
@@ -3338,6 +4351,74 @@ fn scoped_service_directory(supported: bool, id: &str, root: &Path) -> Result<Op
     // Keep the Unix socket path below sun_path limits (the full SHA remains
     // in SERVICE_ID; 128 bits identify the namespace).
     Ok(Some(root.join("ferestre-services").join(&id[..32])))
+}
+
+/// Add neural rendering's launch env for an installed entry. A key's current
+/// value is the plan's, else the inherited one unless the plan strips it, so
+/// Steam's inherited `VK_INSTANCE_LAYERS` never comes back; every key set
+/// here leaves `env_unset`, or `to_command` would remove it again.
+fn add_neural_rendering(plan: &mut launch::Plan, entry: &neural::state::Entry, exe_dir: &Path) {
+    let env = {
+        let current = |key: &str| {
+            plan.env_set.get(key).cloned().or_else(|| {
+                if plan.is_unset(key) {
+                    None
+                } else {
+                    std::env::var(key).ok()
+                }
+            })
+        };
+        neural::apply::launch_env(entry, exe_dir, &current)
+    };
+    for (key, value) in env.set {
+        plan.env_unset.retain(|k| k != &key);
+        plan.env_set.insert(key, value);
+    }
+    for note in env.notes {
+        eprintln!("{note}");
+    }
+}
+
+/// Before a launch: the anti-cheat gate and the install check, then the
+/// launch env only when the mod is present and allowed. Only a mod that an
+/// anti-cheat now forbids and that could not be taken out stops the launch.
+fn neural_before_launch(
+    plan: &mut launch::Plan,
+    ctx: &neural::Context,
+    product_id: &str,
+    game_dir: &Path,
+    executable: &str,
+) -> Result<()> {
+    use neural::apply::Ensured;
+    let exe_dir = neural::apply::exe_dir(game_dir, executable);
+    match neural::apply::ensure_installed(ctx, product_id, game_dir, executable) {
+        Ensured::NotEnabled => {}
+        Ensured::Present(entry) => add_neural_rendering(plan, &entry, &exe_dir),
+        Ensured::Reinstalled(entry) => {
+            eprintln!(":: neural rendering: reinstalled");
+            add_neural_rendering(plan, &entry, &exe_dir);
+        }
+        Ensured::Skipped(reason) => {
+            eprintln!("-- neural rendering is off for this launch: {reason}")
+        }
+        Ensured::TakenOut(reason) => eprintln!(
+            "-- neural rendering was turned off for {}: {reason}",
+            game_name(game_dir, product_id)
+        ),
+        Ensured::Paused(reason) => {
+            eprintln!("-- neural rendering is off for this launch: {reason}")
+        }
+        Ensured::Blocked(reason) => bail!("{reason}"),
+    }
+    Ok(())
+}
+
+/// A game's name for a message: its folder's.
+fn game_name(game_dir: &Path, product_id: &str) -> String {
+    game_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| product_id.to_string())
 }
 
 /// Point Proton at the EAC and BattlEye runtimes, fetching them on first use
@@ -4249,7 +5330,9 @@ fn warnings(recipe: &Recipe, assessment: &Assessment, verdict: Gate, forced: boo
         )),
         Gate::Refused => {}
     }
-    if !recipe.status.state.is_runnable() {
+    // A local game's status is only how it got here ("Added by hand"), not
+    // a verdict anyone recorded.
+    if !recipe.status.state.is_runnable() && !recipe.is_local() {
         lines.push(format!(
             "-- {} is recorded as {}: {}",
             recipe.title.name,
@@ -5036,7 +6119,7 @@ fn shell_quote(s: &str) -> String {
 /// and so the failure names the format instead of coming back from a network
 /// call two minutes later.
 fn is_product_id(s: &str) -> bool {
-    s.len() == 12 && s.chars().all(|c| c.is_ascii_alphanumeric())
+    ferestre_core::recipe::is_store_product_id(s)
 }
 
 fn normalise_product_id(s: &str) -> String {
@@ -5849,6 +6932,24 @@ summary = "Runs."
             vec!["ferestre", "inspect-package", "/tmp/example.appx"],
             vec!["ferestre", "env"],
             vec!["ferestre", "version"],
+            vec![
+                "ferestre",
+                "add",
+                "/g/Game.exe",
+                "--name",
+                "G",
+                "--prefix",
+                "/p",
+                "--runtime",
+                "GE-Proton10-25",
+            ],
+            vec![
+                "ferestre",
+                "import-steam",
+                "--dry-run",
+                "--user",
+                "12345678",
+            ],
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }
@@ -6133,6 +7234,7 @@ summary = "Runs."
         assert!(!is_product_id("9NBLGGH2JHX"));
         assert!(!is_product_id("../../etc/passwd"));
         assert!(!is_product_id("--refresh"));
+        assert!(!is_product_id("LOCAL-STEAM-1"));
         assert_eq!(normalise_product_id("9nblggh2jhxj"), "9NBLGGH2JHXJ");
     }
 
@@ -6872,6 +7974,50 @@ summary = "Runs."
         assert!(!prefix.exists());
     }
 
+    /// A local game's folder and prefix are the person's, or Steam's: Remove
+    /// only forgets the game, and asking for the prefix too is refused.
+    #[test]
+    fn removing_a_local_game_deletes_nothing_on_disk() {
+        let home = Home::new("uninstall-local");
+        let game = home.root().join("drive/Game");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("Game.exe"), b"").unwrap();
+        let prefix = home.root().join("steam/steamapps/compatdata/3000000001");
+        std::fs::create_dir_all(prefix.join("pfx")).unwrap();
+        local_game_recipe(
+            &home,
+            &game,
+            &format!("prefix = \"{}\"", prefix.display()),
+            "",
+        );
+        let paths = home.paths();
+        let with_prefix = Removal {
+            remove_prefix: true,
+            ..YES
+        };
+        assert!(uninstall(&paths, "LOCAL-TEST", with_prefix)
+            .unwrap_err()
+            .to_string()
+            .contains("never deletes"));
+        let listed = [prefix.clone()];
+        let with_listed = Removal {
+            remove_prefix: true,
+            listed: Some(&listed),
+            ..YES
+        };
+        assert!(uninstall(&paths, "LOCAL-TEST", with_listed)
+            .unwrap_err()
+            .to_string()
+            .contains("never deletes"));
+        assert!(paths.user_titles_dir().join("LOCAL-TEST.toml").exists());
+        assert_eq!(
+            uninstall(&paths, "local-test", YES).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert!(game.join("Game.exe").is_file() && prefix.join("pfx").is_dir());
+        assert!(!paths.user_titles_dir().join("LOCAL-TEST.toml").exists());
+    }
+
     // -- install ------------------------------------------------------------
 
     /// "Install to" is a library: the title gets its own folder in it, and its
@@ -7301,6 +8447,224 @@ summary = "Runs."
             .and_then(|prepared| launch_prepared(&paths, prepared, false));
         assert!(launched.is_err());
         assert!(!home.root().join("escaped-launch.log").exists());
+    }
+
+    // -- local games ---------------------------------------------------------
+
+    /// A local game's user recipe. `install_extra` lands in `[install]`
+    /// (e.g. `prefix = "/abs"`), `launch_extra` in `[launch]`.
+    fn local_game_recipe(home: &Home, dir: &Path, install_extra: &str, launch_extra: &str) {
+        home.recipe(
+            "config/ferestre/titles",
+            "LOCAL-TEST.toml",
+            &format!(
+                r#"schema = 1
+[title]
+product-id = "LOCAL-TEST"
+name = "Local Test"
+slug = "local-test"
+kind = "local"
+[install]
+dir = "{}"
+{install_extra}
+[launch]
+executable = "Game.exe"
+{launch_extra}
+[status]
+state = "untested"
+summary = "Added by hand"
+"#,
+                dir.display()
+            ),
+        );
+    }
+
+    #[test]
+    fn a_local_game_launches_through_the_shim_without_the_client_or_the_service() {
+        let home = Home::new("run-local");
+        let game = home.root().join("drive/Local Game");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("Game.exe"), b"").unwrap();
+        std::fs::write(game.join("Randgrid.sys"), b"").unwrap();
+        local_game_recipe(&home, &game, "", "args = [\"-x\"]");
+        home.runtime("ferestre-11.0.2", Some(&["loader.memfd-main-image"]));
+        home.script(
+            "proton-wine-shim.sh",
+            r#"{ pwd -P; printf '%s\n' "$@"; } > "$XODUS_GAMES_DIR/shim-args""#,
+        );
+        let paths = home.paths();
+        let prepared =
+            prepare_launch(&cli(), &paths, "local-test", LaunchRequest::default()).unwrap();
+        assert!(prepared.service_socket.is_none() && prepared.roles.is_none());
+        assert!(prepared.plan.get("XGR_RELATED_PACKAGE_PATHS").is_none());
+        assert_eq!(
+            launch_prepared(&paths, prepared, false).unwrap(),
+            ExitCode::SUCCESS
+        );
+        let seen = std::fs::read_to_string(home.games().join("shim-args")).unwrap();
+        let real = game.canonicalize().unwrap();
+        assert_eq!(
+            seen.lines().collect::<Vec<_>>(),
+            [
+                real.to_str().unwrap(),
+                &launch::windows_path(&game.join("Game.exe")),
+                "-x"
+            ]
+        );
+        assert!(
+            !home.client_ran(),
+            "xodus-cli must never run for a local game"
+        );
+        assert!(home.games().join("local-test-proton").is_dir());
+    }
+
+    #[test]
+    fn a_local_game_whose_drive_is_gone_is_not_launched() {
+        let home = Home::new("run-local-gone");
+        let gone = home.root().join("unmounted/Game");
+        local_game_recipe(&home, &gone, "", "");
+        home.runtime("ferestre-11.0.2", Some(&["loader.memfd-main-image"]));
+        let paths = home.paths();
+        let prepared =
+            prepare_launch(&cli(), &paths, "LOCAL-TEST", LaunchRequest::default()).unwrap();
+        let err = launch_prepared(&paths, prepared, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("drive mounted"), "{err}");
+        assert!(!gone.exists() && !home.games().join("local-test-proton").exists());
+        assert!(!home.client_ran());
+    }
+
+    #[test]
+    fn a_local_game_needs_no_xbox_client() {
+        let mut home = Home::new("run-local-no-client");
+        let game = home.root().join("drive/Game");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("Game.exe"), b"").unwrap();
+        local_game_recipe(&home, &game, "", "");
+        home.recipe("titles", "game.toml", &game_recipe(""));
+        home.runtime("ferestre-11.0.2", Some(&["loader.memfd-main-image"]));
+        home.extra.push(("XODUS_CLI_DIR".into(), String::new()));
+        let paths = home.paths();
+        assert!(paths.cli_dir().is_none());
+        let request = LaunchRequest {
+            dry_run: true,
+            ..LaunchRequest::default()
+        };
+        prepare_launch(&cli(), &paths, "LOCAL-TEST", request).unwrap();
+        let error = prepare_launch(&cli(), &paths, "testgame", request)
+            .err()
+            .expect("an Xbox title needs the client");
+        assert!(error.to_string().contains("no xodus-cli found"), "{error}");
+    }
+
+    #[test]
+    fn arguments_after_dashes_reach_a_local_game_only() {
+        let home = Home::new("run-local-args");
+        let game = home.root().join("drive/Game");
+        local_game_recipe(&home, &game, "", "");
+        home.recipe("titles", "game.toml", &game_recipe(""));
+        let paths = home.paths();
+        let (_, recipes) = recipes_from(&cli(), &paths).unwrap();
+        let args = vec!["-x".to_string()];
+        title_args_allowed(&recipes, "LOCAL-TEST", &args).unwrap();
+        title_args_allowed(&recipes, "local-test", &args).unwrap();
+        for title in ["testgame", "9ZZUNKNOWN12"] {
+            let error = title_args_allowed(&recipes, title, &args).unwrap_err();
+            assert!(error.downcast_ref::<UsageError>().is_some(), "{error}");
+            assert!(error.to_string().contains("passing arguments"), "{error}");
+        }
+        // No arguments is fine for any title.
+        title_args_allowed(&recipes, "testgame", &[]).unwrap();
+    }
+
+    #[test]
+    fn arguments_to_an_xbox_title_are_refused_before_anything_happens() {
+        let home = Home::new("run-xbox-args");
+        home.recipe("titles", "game.toml", &game_recipe(""));
+        home.client("");
+        let paths = home.paths();
+        let before: Vec<_> = std::fs::read_dir(paths.user_titles_dir())
+            .map(|d| d.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        for title in ["testgame", "9ZZUNKNOWN12"] {
+            let error = run_title(
+                &cli(),
+                &paths,
+                title,
+                LaunchRequest::default(),
+                &["-x".into()],
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("passing arguments"), "{error}");
+        }
+        assert!(!home.client_ran());
+        let after: Vec<_> = std::fs::read_dir(paths.user_titles_dir())
+            .map(|d| d.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert_eq!(before, after);
+    }
+
+    /// Every `LOCAL-STEAM-*.toml` among the user's recipes.
+    fn imported(paths: &Paths) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(paths.user_titles_dir()) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("LOCAL-STEAM-") && n.ends_with(".toml"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn import_steam_dry_run_writes_nothing() {
+        use ferestre_core::steam::{self, Value};
+        let mut home = Home::new("import-steam");
+        let steam_root = home.root().join("steam");
+        let game = home.root().join("drive/Game");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("Game.exe"), b"").unwrap();
+        let shortcut = Value::Map(vec![
+            ("appid".into(), Value::Int(-1_000_000_001)),
+            ("AppName".into(), Value::Str("Imported Game".into())),
+            (
+                "Exe".into(),
+                Value::Str(format!("\"{}\"", game.join("Game.exe").display())),
+            ),
+            (
+                "StartDir".into(),
+                Value::Str(format!("\"{}\"", game.display())),
+            ),
+            ("LaunchOptions".into(), Value::Str(String::new())),
+        ]);
+        let document = Value::Map(vec![(
+            "shortcuts".into(),
+            Value::Map(vec![("0".into(), shortcut)]),
+        )]);
+        let file = steam_root.join("userdata/12345678/config/shortcuts.vdf");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, steam::serialise(&document).unwrap()).unwrap();
+        let before = std::fs::read(&file).unwrap();
+        home.extra
+            .push(("XODUS_STEAM_DIR".into(), steam_root.display().to_string()));
+        let paths = home.paths();
+
+        assert_eq!(
+            import_steam(&cli(), &paths, true, None).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert!(imported(&paths).is_empty());
+        assert_eq!(
+            import_steam(&cli(), &paths, false, Some("12345678")).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(imported(&paths).len(), 1);
+        assert_eq!(std::fs::read(&file).unwrap(), before);
     }
 
     // -- the launch log and the end of a launch ------------------------------
@@ -8072,6 +9436,632 @@ printf fixture > "$3/.xodus-streaming.msixvc"
             install::load(paths.state_dir(), "9TESTADDON03").is_some(),
             "actual JSON runs still prepare their missing content"
         );
+    }
+
+    // -- neural rendering ------------------------------------------------------
+
+    use ferestre_core::neural::{apply, state as neural_state, Network, Route};
+
+    /// Emulates upstream `install.sh` for the ReShade route: `remove` deletes
+    /// what the manifest lists; a route first removes a previous install,
+    /// writes the manifest, then the files.
+    const FAKE_INSTALL_SH: &str = r#"#!/bin/bash
+set -euo pipefail
+model_sha256=@AARDWOLD@
+small_sha256=@SMALL@
+pkg="$(cd "$(dirname "$0")" && pwd)"
+dir="$1"
+route="$2"
+model="${4:-}"
+manifest="$dir/dlssnr-amd-install.txt"
+remove() {
+  if [ -f "$manifest" ]; then
+    while IFS= read -r p; do
+      [ -n "$p" ] && rm -rf "${dir:?}/$p"
+    done < "$manifest"
+    rm -f "$manifest"
+  fi
+}
+if [ "$route" = remove ]; then remove; exit 0; fi
+remove
+pairs=("$pkg/dlssnr-amd|dlssnr-amd")
+for f in "$pkg"/reshade/*; do pairs+=("$f|$(basename "$f")"); done
+{ for p in "${pairs[@]}"; do echo "${p#*|}"; done; echo dlssnr-amd.ini; } > "$manifest"
+for p in "${pairs[@]}"; do
+  src="${p%%|*}"; dst="${p#*|}"
+  if [ -d "$src" ]; then mkdir -p "$dir/$dst"; cp -r "$src/." "$dir/$dst/"; else cp "$src" "$dir/$dst"; fi
+done
+printf 'default\n' > "$dir/dlssnr-amd.ini"
+if [ "$model" = CC_SILVER_AARDWOLD_OPTIMIZED ]; then
+  printf int4 > "$dir/dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin"
+fi
+"#;
+
+    const THEIRS: &[u8] = b"theirs";
+
+    fn sha256_hex(path: &Path) -> String {
+        let out = Command::new("sha256sum").arg(path).output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()[..64].to_string()
+    }
+
+    fn write_file(path: &Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// A fake DLSSNR-AMD package named by `FERESTRE_DLSSNR_PACKAGE_DIR`, and
+    /// both models cached; the returned `Context` expects exactly those
+    /// models.
+    fn neural_setup(home: &mut Home) -> neural::Context {
+        let models = neural::models::dir(&neural::root(home.paths().state_dir()));
+        write_file(&models.join("CC_SILVER_AARDWOLD.bin"), b"aardwold");
+        write_file(&models.join("CC_SMALL_FP8.bin"), b"small");
+        let model = |file: &str| neural::ModelFile {
+            file: file.to_string(),
+            sha256: sha256_hex(&models.join(file)),
+            size: std::fs::metadata(models.join(file)).unwrap().len(),
+        };
+        let expect = neural::Expect {
+            dlls: Vec::new(),
+            aardwold: model("CC_SILVER_AARDWOLD.bin"),
+            small: model("CC_SMALL_FP8.bin"),
+        };
+        let src = home.root().join("pkg-src");
+        let script = FAKE_INSTALL_SH
+            .replace("@AARDWOLD@", &expect.aardwold.sha256)
+            .replace("@SMALL@", &expect.small.sha256);
+        write_file(&src.join("install.sh"), script.as_bytes());
+        write_file(&src.join("model-tools/extract_model.sh"), b"#!/bin/bash\n");
+        write_file(&src.join("dlssnr-amd/shader.spv"), b"spv");
+        write_file(&src.join("reshade/dxgi.dll"), b"reshade dxgi");
+        write_file(&src.join("reshade/ReShade.ini"), b"package ini");
+        write_file(&src.join("vulkan/vulkan-1.dll"), b"loader");
+        let pkgs = home.root().join("pkgs");
+        std::fs::create_dir_all(&pkgs).unwrap();
+        let ok = Command::new("tar")
+            .arg("-czf")
+            .arg(pkgs.join(neural::package::asset_name("0.0.9", neural::Arch::X86_64)))
+            .arg("-C")
+            .arg(&src)
+            .arg(".")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        home.extra.push((
+            neural::package::LOCAL_ENV.into(),
+            pkgs.display().to_string(),
+        ));
+        // An RX 9070 XT, whatever this machine has.
+        let drm = home.root().join("drm");
+        write_file(&drm.join("card0/device/vendor"), b"0x1002\n");
+        write_file(&drm.join("card0/device/device"), b"0x7550\n");
+        home.extra
+            .push((neural::hardware::DRM_ENV.into(), drm.display().to_string()));
+        let mut ctx = neural::Context::from_paths(&home.paths());
+        ctx.expect = expect;
+        ctx
+    }
+
+    fn neural_turn_on(ctx: &neural::Context, key: &str, game_dir: &Path, model: Network) {
+        apply::enable(
+            ctx,
+            &apply::EnableRequest {
+                key,
+                game_dir,
+                executable: "Game.exe",
+                route: Some(Route::ReshadeFeeder),
+                model: Some(model),
+                accept_anticheat_risk: false,
+                shown_anticheat: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// An installed Xbox title with a runtime, and its game folder.
+    fn neural_xbox_home(name: &str) -> (Home, neural::Context, PathBuf) {
+        let mut home = Home::new(name);
+        home.recipe("titles", "game.toml", &game_recipe(""));
+        home.runtime("ferestre-11.0.2", Some(&["loader.memfd-main-image"]));
+        let dir = home.games().join("testgame");
+        installed_package(&dir, GAME);
+        std::fs::write(dir.join("Game.exe"), b"").unwrap();
+        let ctx = neural_setup(&mut home);
+        (home, ctx, dir)
+    }
+
+    fn empty_plan(env: &[(&str, &str)], unset: &[&str]) -> launch::Plan {
+        launch::Plan {
+            program: PathBuf::from("/bin/true"),
+            args: Vec::new(),
+            env_set: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            env_unset: unset.iter().map(|k| k.to_string()).collect(),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn an_enabled_title_gets_its_dll_overrides_merged_into_the_plan() {
+        let (_home, ctx, dir) = neural_xbox_home("neural-merge");
+        neural_turn_on(&ctx, GAME, &dir, Network::SilverAardwold);
+        let mut plan = empty_plan(&[("WINEDLLOVERRIDES", "d3d11=n")], &[]);
+        neural_before_launch(&mut plan, &ctx, GAME, &dir, "Game.exe").unwrap();
+        assert_eq!(plan.get("WINEDLLOVERRIDES"), Some("d3d11=n;dxgi=n,b"));
+        assert!(plan.get("VK_INSTANCE_LAYERS").is_none());
+    }
+
+    #[test]
+    fn an_nvidia_launch_gets_no_overrides_and_the_game_its_own_files() {
+        let (home, ctx, dir) = neural_xbox_home("neural-nvidia");
+        neural_turn_on(&ctx, GAME, &dir, Network::SilverAardwold);
+        let drm = home.root().join("drm");
+        write_file(&drm.join("card0/device/vendor"), b"0x10de\n");
+        write_file(&drm.join("card0/device/device"), b"0x2684\n");
+        let mut plan = empty_plan(&[("WINEDLLOVERRIDES", "d3d11=n")], &[]);
+        neural_before_launch(&mut plan, &ctx, GAME, &dir, "Game.exe").unwrap();
+        assert_eq!(plan.get("WINEDLLOVERRIDES"), Some("d3d11=n"));
+        assert!(!dir.join("dxgi.dll").exists());
+        assert!(
+            neural::state::get(&ctx.config_dir, GAME)
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+    }
+
+    #[test]
+    fn the_int4_layer_survives_the_steam_environment_strip() {
+        let (home, ctx, dir) = neural_xbox_home("neural-int4");
+        neural_turn_on(&ctx, GAME, &dir, Network::SilverAardwoldOptimized);
+        assert!(dir
+            .join("dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin")
+            .is_file());
+        let paths = home.paths();
+        let mut plan = prepare_launch(&cli(), &paths, "testgame", LaunchRequest::default())
+            .unwrap()
+            .plan;
+        assert!(
+            plan.is_unset("VK_INSTANCE_LAYERS"),
+            "launch::plan strips Steam's layers without Steam integration"
+        );
+        neural_before_launch(&mut plan, &ctx, GAME, &dir, "Game.exe").unwrap();
+        assert!(!plan.is_unset("VK_INSTANCE_LAYERS"));
+        let command = plan.to_command();
+        let envs: Vec<_> = command.get_envs().collect();
+        let value = |key: &str| {
+            envs.iter()
+                .rev()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+                .and_then(|(_, v)| *v)
+                .map(|v| v.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            value("VK_INSTANCE_LAYERS").as_deref(),
+            Some("VK_LAYER_DLSSNR_int4")
+        );
+        assert!(value("VK_ADD_LAYER_PATH")
+            .unwrap()
+            .ends_with("dlssnr-amd/int4/layer"));
+    }
+
+    #[test]
+    fn a_disabled_or_unknown_title_leaves_the_plan_alone() {
+        let (_home, ctx, dir) = neural_xbox_home("neural-alone");
+        let before = empty_plan(&[("WINEDLLOVERRIDES", "d3d11=n")], &["VK_INSTANCE_LAYERS"]);
+        let mut plan = before.clone();
+        neural_before_launch(&mut plan, &ctx, GAME, &dir, "Game.exe").unwrap();
+        assert_eq!(plan, before);
+        neural_state::put(
+            &ctx.config_dir,
+            GAME,
+            &neural_state::Entry {
+                enabled: false,
+                route: Route::ReshadeFeeder,
+                model: Network::SilverAardwold,
+                package: "0.0.9".into(),
+                arch: neural::Arch::X86_64,
+                install_dir: dir.clone(),
+                proxy: None,
+            },
+        )
+        .unwrap();
+        neural_before_launch(&mut plan, &ctx, GAME, &dir, "Game.exe").unwrap();
+        assert_eq!(plan, before);
+        assert!(!dir.join(apply::INSTALL_MANIFEST).exists());
+    }
+
+    #[test]
+    fn a_new_kernel_anti_cheat_leaves_no_neural_override_in_the_launch() {
+        let (_home, ctx, dir) = neural_xbox_home("neural-kernel");
+        std::fs::write(dir.join("dxgi.dll"), THEIRS).unwrap();
+        neural_turn_on(&ctx, GAME, &dir, Network::SilverAardwoldOptimized);
+        // A game update adds a kernel anti-cheat Proton cannot run.
+        std::fs::write(dir.join("Randgrid.sys"), b"").unwrap();
+        let mut plan = empty_plan(&[], &["VK_INSTANCE_LAYERS"]);
+        neural_before_launch(&mut plan, &ctx, GAME, &dir, "Game.exe").unwrap();
+        assert!(!plan
+            .get("WINEDLLOVERRIDES")
+            .unwrap_or("")
+            .contains("dxgi=n,b"));
+        assert!(plan.get("VK_INSTANCE_LAYERS").is_none());
+        assert!(plan.is_unset("VK_INSTANCE_LAYERS"));
+        assert!(!dir.join(apply::INSTALL_MANIFEST).exists());
+        assert!(!dir.join(apply::BACKUP_DIR).exists());
+        assert_eq!(std::fs::read(dir.join("dxgi.dll")).unwrap(), THEIRS);
+        assert_eq!(neural_state::get(&ctx.config_dir, GAME).unwrap(), None);
+    }
+
+    fn listing(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn walk(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    out.push((path.clone(), Vec::new()));
+                    walk(&path, out);
+                } else {
+                    out.push((path.clone(), std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_dry_run_reinstalls_nothing() {
+        let (home, ctx, dir) = neural_xbox_home("neural-dry-run");
+        neural_turn_on(&ctx, GAME, &dir, Network::SilverAardwold);
+        std::fs::remove_file(dir.join(apply::INSTALL_MANIFEST)).unwrap();
+        std::fs::remove_dir_all(dir.join("dlssnr-amd")).unwrap();
+        let before = listing(&dir);
+        let paths = home.paths();
+        let dry_run = LaunchRequest {
+            dry_run: true,
+            ..LaunchRequest::default()
+        };
+        assert_eq!(
+            code(run_title(&cli(), &paths, "testgame", dry_run, &[]).unwrap()),
+            code(ExitCode::SUCCESS)
+        );
+        assert_eq!(listing(&dir), before, "a dry run writes nothing");
+        // It shows what a launch would add.
+        let prepared = prepare_launch(&cli(), &paths, "testgame", dry_run).unwrap();
+        assert!(prepared
+            .plan
+            .get("WINEDLLOVERRIDES")
+            .unwrap()
+            .contains("dxgi=n,b"));
+        assert_eq!(listing(&dir), before);
+        // A real launch adds nothing before its check.
+        let real = prepare_launch(&cli(), &paths, "testgame", LaunchRequest::default()).unwrap();
+        assert!(!real
+            .plan
+            .get("WINEDLLOVERRIDES")
+            .unwrap_or("")
+            .contains("dxgi=n,b"));
+    }
+
+    #[test]
+    fn a_launch_reinstalls_neural_rendering_that_an_update_removed() {
+        let (home, ctx, dir) = neural_xbox_home("neural-reinstall");
+        neural_turn_on(&ctx, GAME, &dir, Network::SilverAardwold);
+        std::fs::remove_file(dir.join(apply::INSTALL_MANIFEST)).unwrap();
+        std::fs::remove_dir_all(dir.join("dlssnr-amd")).unwrap();
+        let paths = home.paths();
+        let prepared =
+            prepare_launch(&cli(), &paths, "testgame", LaunchRequest::default()).unwrap();
+        // Home has no xodus-service, so the launch stops after the check,
+        // before anything starts.
+        assert!(launch_prepared_with(&paths, prepared, false, &ctx).is_err());
+        assert!(dir.join(apply::INSTALL_MANIFEST).is_file());
+        assert!(dir.join("dlssnr-amd").is_dir());
+    }
+
+    #[test]
+    fn removing_a_title_forgets_its_neural_rendering() {
+        let (home, ctx, dir) = neural_xbox_home("neural-uninstall");
+        let paths = home.paths();
+        record(&paths, GAME, &dir);
+        neural_turn_on(&ctx, GAME, &dir, Network::SilverAardwold);
+        let keep = Removal {
+            keep_files: true,
+            ..YES
+        };
+        uninstall(&paths, GAME, keep).unwrap();
+        assert!(neural_state::get(&ctx.config_dir, GAME).unwrap().is_some());
+        record(&paths, GAME, &dir);
+        uninstall(&paths, GAME, YES).unwrap();
+        assert!(!dir.exists());
+        assert_eq!(neural_state::get(&ctx.config_dir, GAME).unwrap(), None);
+    }
+
+    #[test]
+    fn removing_a_local_game_takes_neural_rendering_out_first() {
+        let mut home = Home::new("neural-local-uninstall");
+        let game = home.root().join("drive/Local Game");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("Game.exe"), b"").unwrap();
+        std::fs::write(game.join("dxgi.dll"), THEIRS).unwrap();
+        local_game_recipe(&home, &game, "", "");
+        let ctx = neural_setup(&mut home);
+        let paths = home.paths();
+        neural_turn_on(&ctx, "LOCAL-TEST", &game, Network::SilverAardwold);
+        assert_ne!(std::fs::read(game.join("dxgi.dll")).unwrap(), THEIRS);
+        uninstall(&paths, "local-test", YES).unwrap();
+        assert_eq!(std::fs::read(game.join("dxgi.dll")).unwrap(), THEIRS);
+        assert!(!game.join(apply::INSTALL_MANIFEST).exists());
+        assert!(!game.join(apply::BACKUP_DIR).exists());
+        assert_eq!(
+            neural_state::get(&ctx.config_dir, "LOCAL-TEST").unwrap(),
+            None
+        );
+        assert!(game.join("Game.exe").is_file());
+        // Another game added under the same name is asked about its
+        // anti-cheat again.
+        neural_state::acknowledge(&ctx.config_dir, "LOCAL-TEST", &["BattlEye"]).unwrap();
+        local_game_recipe(&home, &game, "", "");
+        uninstall(&paths, "local-test", YES).unwrap();
+        assert!(neural_state::acknowledged(&ctx.config_dir, "LOCAL-TEST")
+            .unwrap()
+            .is_empty());
+
+        // With the package gone the mod cannot come out: nothing is forgotten.
+        local_game_recipe(&home, &game, "", "");
+        neural_turn_on(&ctx, "LOCAL-TEST", &game, Network::SilverAardwold);
+        std::fs::remove_dir_all(neural::root(paths.state_dir()).join("packages")).unwrap();
+        let error = format!("{:#}", uninstall(&paths, "local-test", YES).unwrap_err());
+        assert!(error.contains("ferestre neural disable"), "{error}");
+        assert!(home
+            .root()
+            .join("config/ferestre/titles/LOCAL-TEST.toml")
+            .is_file());
+        assert!(neural_state::get(&ctx.config_dir, "LOCAL-TEST")
+            .unwrap()
+            .is_some());
+        assert!(game.join(apply::INSTALL_MANIFEST).is_file());
+    }
+    // -- ferestre neural -------------------------------------------------------
+
+    #[test]
+    fn the_neural_commands_parse() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
+        assert!(matches!(
+            parse(&["ferestre", "neural", "status"]),
+            Cmd::Neural {
+                command: NeuralCmd::Status { title: None }
+            }
+        ));
+        match parse(&[
+            "ferestre",
+            "neural",
+            "setup",
+            "--dll",
+            "/x/nvngx_dlssnr.dll",
+        ]) {
+            Cmd::Neural {
+                command: NeuralCmd::Setup { dll },
+            } => assert_eq!(dll, Some(PathBuf::from("/x/nvngx_dlssnr.dll"))),
+            other => panic!("{other:?}"),
+        }
+        match parse(&[
+            "ferestre",
+            "neural",
+            "enable",
+            "bedrock",
+            "--route",
+            "reshade-feeder",
+            "--model",
+            "CC_SMALL_FP8",
+            "--accept-anticheat-risk",
+        ]) {
+            Cmd::Neural {
+                command:
+                    NeuralCmd::Enable {
+                        title,
+                        route,
+                        model,
+                        accept_anticheat_risk,
+                        anticheat_shown,
+                        proxy,
+                    },
+            } => {
+                assert_eq!(title, "bedrock");
+                assert_eq!(proxy, None);
+                assert_eq!(route.as_deref(), Some("reshade-feeder"));
+                assert_eq!(model.as_deref(), Some("CC_SMALL_FP8"));
+                assert!(accept_anticheat_risk);
+                assert!(anticheat_shown.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(&[
+            "ferestre",
+            "neural",
+            "enable",
+            "bedrock",
+            "--accept-anticheat-risk",
+            "--anticheat-shown",
+            "Easy Anti-Cheat",
+            "--anticheat-shown",
+            "BattlEye",
+        ]) {
+            Cmd::Neural {
+                command:
+                    NeuralCmd::Enable {
+                        anticheat_shown, ..
+                    },
+            } => assert_eq!(anticheat_shown, ["Easy Anti-Cheat", "BattlEye"]),
+            other => panic!("{other:?}"),
+        }
+        assert!(Cli::try_parse_from([
+            "ferestre",
+            "neural",
+            "enable",
+            "bedrock",
+            "--anticheat-shown",
+            "BattlEye",
+        ])
+        .is_err());
+        match parse(&["ferestre", "neural", "disable", "bedrock"]) {
+            Cmd::Neural {
+                command: NeuralCmd::Disable { title },
+            } => assert_eq!(title, "bedrock"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_route_is_a_usage_error_naming_the_routes() {
+        let error = parse_route(Some("dxgi")).unwrap_err();
+        assert_eq!(exit_code_for(&error), EXIT_USAGE, "{error}");
+        let text = error.to_string();
+        for route in Route::ALL {
+            assert!(text.contains(route.as_str()), "{text}");
+        }
+        let error = parse_network(Some("CC_HUGE")).unwrap_err();
+        assert_eq!(exit_code_for(&error), EXIT_USAGE, "{error}");
+        for network in Network::ALL {
+            assert!(error.to_string().contains(network.as_str()), "{error}");
+        }
+        assert_eq!(
+            parse_route(Some("optiscaler")).unwrap(),
+            Some(Route::Optiscaler)
+        );
+        assert_eq!(parse_network(None).unwrap(), None);
+    }
+
+    #[test]
+    fn enabling_without_a_model_says_how_to_get_one() {
+        let (home, mut ctx, dir) = neural_xbox_home("neural-no-model");
+        // Nothing cached, no URL, nothing to find.
+        std::fs::remove_dir_all(neural::models::dir(&ctx.root)).unwrap();
+        ctx.expect.dlls = vec![neural::DllVersion {
+            version: "310.9.16".into(),
+            sha256: "0".repeat(64),
+            small_model: true,
+        }];
+        let paths = home.paths();
+        let error = neural_enable(
+            &cli(),
+            &paths,
+            &ctx,
+            "testgame",
+            Some(Route::ReshadeFeeder),
+            None,
+            None,
+        )
+        .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("ferestre neural setup"), "{text}");
+        assert!(text.contains("dll-url"), "{text}");
+        assert!(!dir.join(apply::INSTALL_MANIFEST).exists());
+        assert_eq!(neural_state::get(&ctx.config_dir, GAME).unwrap(), None);
+    }
+
+    #[test]
+    fn enabling_and_disabling_by_title_installs_and_takes_out() {
+        let (home, ctx, dir) = neural_xbox_home("neural-enable-cmd");
+        std::fs::write(dir.join("dxgi.dll"), THEIRS).unwrap();
+        let paths = home.paths();
+        neural_enable(
+            &cli(),
+            &paths,
+            &ctx,
+            "testgame",
+            Some(Route::ReshadeFeeder),
+            None,
+            None,
+        )
+        .unwrap();
+        let entry = neural_state::get(&ctx.config_dir, GAME).unwrap().unwrap();
+        assert_eq!(
+            (entry.route, entry.model),
+            (Route::ReshadeFeeder, Network::SmallFp8)
+        );
+        assert!(dir.join(apply::INSTALL_MANIFEST).is_file());
+        neural_disable(&cli(), &paths, &ctx, "testgame").unwrap();
+        assert_eq!(std::fs::read(dir.join("dxgi.dll")).unwrap(), THEIRS);
+        assert_eq!(neural_state::get(&ctx.config_dir, GAME).unwrap(), None);
+        let error = neural_enable(&cli(), &paths, &ctx, "nothing", None, None, None).unwrap_err();
+        assert!(error.to_string().contains("no recipe"), "{error}");
+    }
+
+    #[test]
+    fn status_json_reports_an_enabled_title() {
+        let (home, ctx, dir) = neural_xbox_home("neural-status");
+        neural_state::put(
+            &ctx.config_dir,
+            "9NBLGGH2JHXJ",
+            &neural_state::Entry {
+                enabled: true,
+                route: Route::Optiscaler,
+                model: Network::SmallFp8,
+                package: "0.0.9".into(),
+                arch: neural::Arch::X86_64,
+                install_dir: dir.clone(),
+                proxy: None,
+            },
+        )
+        .unwrap();
+        let paths = home.paths();
+        let doc = neural_status(&cli(), &paths, &ctx, None).unwrap();
+        assert_eq!(doc["schema"], JSON_SCHEMA);
+        assert_eq!(doc["titles"]["9NBLGGH2JHXJ"]["route"], "optiscaler");
+        assert_eq!(doc["titles"]["9NBLGGH2JHXJ"]["model"], "CC_SMALL_FP8");
+        assert_eq!(doc["models"].as_array().unwrap().len(), 2);
+        assert_eq!(doc["package"]["version"], "0.0.9");
+
+        neural_enable(
+            &cli(),
+            &paths,
+            &ctx,
+            "testgame",
+            Some(Route::ReshadeFeeder),
+            None,
+            None,
+        )
+        .unwrap();
+        let doc = neural_status(&cli(), &paths, &ctx, Some("testgame")).unwrap();
+        assert_eq!(doc["product_id"], GAME);
+        assert_eq!(doc["entry"]["route"], "reshade-feeder");
+        assert_eq!(doc["installed"]["ok"], true);
+        assert_eq!(doc["gate"]["state"], "allowed");
+        let text = render_neural_status(&doc);
+        assert!(
+            text.contains("neural rendering: on (reshade-feeder"),
+            "{text}"
+        );
+        assert!(text.contains("install: whole"), "{text}");
+        let text = render_neural_status(&neural_status(&cli(), &paths, &ctx, None).unwrap());
+        assert!(text.contains("9NBLGGH2JHXJ  optiscaler"), "{text}");
+        assert!(text.contains("0.0.9 (ready)"), "{text}");
+    }
+
+    #[test]
+    fn status_never_prints_a_dll_url_it_was_not_given() {
+        let (mut home, ctx, _dir) = neural_xbox_home("neural-status-url");
+        let paths = home.paths();
+        let doc = neural_status(&cli(), &paths, &ctx, None).unwrap();
+        assert_eq!(doc["dll_url_configured"], false);
+        assert!(!doc.to_string().contains("https://"), "{doc}");
+        let doc = neural_status(&cli(), &paths, &ctx, Some("testgame")).unwrap();
+        assert_eq!(doc["dll_url_configured"], false);
+        // One that was given is reported as configured, never printed.
+        home.extra.push((
+            ferestre_core::settings::DLL_URL_ENV.into(),
+            "https://example.invalid/dll.zip".into(),
+        ));
+        let paths = home.paths();
+        let doc = neural_status(&cli(), &paths, &ctx, None).unwrap();
+        assert_eq!(doc["dll_url_configured"], true);
+        assert!(!doc.to_string().contains("example.invalid"), "{doc}");
     }
 }
 

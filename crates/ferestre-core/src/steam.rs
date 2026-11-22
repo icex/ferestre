@@ -422,7 +422,7 @@ fn matching_entry(entries: &[(String, Value)], shortcut: &Shortcut) -> Option<us
             // a name, and each keeps its own shortcut.
             let product = launched_product(&shortcut.launch_options);
             entries.iter().position(|(_, entry)| {
-                is_ferestre_entry(entry)
+                is_ferestre_shortcut(entry)
                     && entry.get("AppName").and_then(Value::as_str)
                         == Some(shortcut.app_name.as_str())
                     && entry
@@ -480,8 +480,10 @@ fn launched_product(options: &str) -> Option<&str> {
 
 /// Whether an entry was written by Ferestre: it starts the launcher (`Exe` is
 /// `ferestre` or a Ferestre AppImage), or it runs a product the way the
-/// launcher's shortcuts do (`run <product id>`).
-fn is_ferestre_entry(entry: &Value) -> bool {
+/// launcher's shortcuts do (`run <product id>`, or `run <local id>` for a
+/// game Ferestre did not install). Steam import uses it to skip the
+/// launcher's own shortcuts.
+pub fn is_ferestre_shortcut(entry: &Value) -> bool {
     let exe = entry.get("Exe").and_then(Value::as_str).unwrap_or_default();
     let program = Path::new(exe.trim().trim_matches('"'))
         .file_name()
@@ -496,7 +498,7 @@ fn is_ferestre_entry(entry: &Value) -> bool {
         .is_some_and(|options| {
             let words: Vec<&str> = options.split_whitespace().collect();
             matches!(words.as_slice(), ["run", id]
-                if id.len() == 12 && id.bytes().all(|b| b.is_ascii_alphanumeric()))
+                if crate::recipe::is_store_product_id(id) || crate::local::is_local_id(id))
         });
     launcher || runs_a_product
 }
@@ -754,6 +756,40 @@ pub fn shortcut_files(steam_dir: &Path) -> Vec<PathBuf> {
         }
     }
     found.into_values().collect()
+}
+
+/// Every Steam library of the install at `root`: `root` itself first, then
+/// each library named in `steamapps/libraryfolders.vdf` (the current
+/// `"N" { "path" "…" }` shape and the older `"N" "…"` one). Only directories
+/// that exist, each once by its real path. Read only.
+pub fn libraries(root: &Path) -> Vec<PathBuf> {
+    let mut found = vec![root.to_path_buf()];
+    let file = root.join("steamapps").join("libraryfolders.vdf");
+    if let Some(folders) = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|text| crate::vdf::parse(&text).ok())
+        .and_then(|doc| doc.get("libraryfolders").cloned())
+    {
+        for (key, value) in folders.as_map().unwrap_or_default() {
+            if key.is_empty() || !key.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let path = match value {
+                Value::Str(path) => Some(path.as_str()),
+                Value::Map(_) => value.get("path").and_then(Value::as_str),
+                _ => None,
+            };
+            if let Some(path) = path.filter(|p| !p.is_empty()) {
+                found.push(PathBuf::from(path));
+            }
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    found
+        .into_iter()
+        .filter(|dir| dir.is_dir())
+        .filter(|dir| seen.insert(dir.canonicalize().unwrap_or_else(|_| dir.clone())))
+        .collect()
 }
 
 /// Read a shortcuts file, or hand back an empty document when there is none.
@@ -1422,5 +1458,62 @@ mod tests {
             .as_map()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn a_shortcut_that_runs_a_local_game_is_ferestres() {
+        let entry = |options: &str| {
+            Value::Map(vec![
+                ("Exe".into(), Value::Str("\"/usr/bin/env\"".into())),
+                ("LaunchOptions".into(), Value::Str(options.into())),
+            ])
+        };
+        assert!(is_ferestre_shortcut(&entry("run LOCAL-STEAM-12")));
+        assert!(is_ferestre_shortcut(&entry("run 9NBLGGH2JHXJ")));
+        assert!(!is_ferestre_shortcut(&entry("%command% -dx12")));
+    }
+
+    #[test]
+    fn libraries_come_from_both_libraryfolders_formats() {
+        let root = tempfile::tempdir().unwrap();
+        let new_lib = tempfile::tempdir().unwrap();
+        let old_lib = tempfile::tempdir().unwrap();
+        let steamapps = root.path().join("steamapps");
+        std::fs::create_dir_all(&steamapps).unwrap();
+        std::fs::write(
+            steamapps.join("libraryfolders.vdf"),
+            format!(
+                "\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\t\"{root}\"\n\t}}\n\
+                 \t\"1\"\n\t{{\n\t\t\"path\"\t\t\"{new}\"\n\t\t\"apps\" {{ \"10\" \"1\" }}\n\t}}\n\
+                 \t\"2\" {{ \"path\" \"/nonexistent/ferestre/library\" }}\n\
+                 \t\"contentstatsid\" \"-123\"\n}}\n",
+                root = root.path().display(),
+                new = new_lib.path().display()
+            ),
+        )
+        .unwrap();
+        let found = libraries(root.path());
+        assert_eq!(
+            found,
+            [root.path().to_path_buf(), new_lib.path().to_path_buf()]
+        );
+
+        std::fs::write(
+            steamapps.join("libraryfolders.vdf"),
+            format!(
+                "\"LibraryFolders\"\n{{\n\t\"TimeNextStatsReport\"\t\"1\"\n\
+                 \t\"ContentStatsID\"\t\"-1\"\n\t\"1\"\t\"{old}\"\n\
+                 \t\"2\"\t\"/nonexistent/ferestre/old\"\n}}\n",
+                old = old_lib.path().display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            libraries(root.path()),
+            [root.path().to_path_buf(), old_lib.path().to_path_buf()]
+        );
+        // No file: the root alone.
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(libraries(bare.path()), [bare.path().to_path_buf()]);
     }
 }

@@ -46,12 +46,33 @@ impl TitleState {
     }
 }
 
+/// Where a title comes from. A Store title is installed and run through the
+/// client; a local one is a Windows program Ferestre did not install, run
+/// through the Proton shim with no Xbox service involved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TitleKind {
+    #[default]
+    Xbox,
+    Local,
+}
+
+impl TitleKind {
+    pub fn is_xbox(&self) -> bool {
+        *self == TitleKind::Xbox
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Title {
     pub product_id: String,
     pub name: String,
     pub slug: String,
+    /// `local` for a game Ferestre did not install. Absent for a Store title,
+    /// so every existing recipe reads and writes as it did.
+    #[serde(default, skip_serializing_if = "TitleKind::is_xbox")]
+    pub kind: TitleKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publisher: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,6 +117,20 @@ pub struct Launch {
         skip_serializing_if = "std::collections::BTreeMap::is_empty"
     )]
     pub env: std::collections::BTreeMap<String, String>,
+    /// Arguments after the executable. Local games only: the client's run
+    /// command takes none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Programs the launch runs through, as a flat argv prefix
+    /// (`["gamemoderun", "mangohud"]`) -- what Steam puts before `%command%`.
+    /// Local games only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wrapper: Vec<String>,
+    /// The folder the game starts in, relative to `[install].dir` or
+    /// absolute; the game folder when unset, as Steam starts a shortcut in its
+    /// start folder. Local games only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -273,6 +308,12 @@ pub fn is_slug(slug: &str) -> bool {
         && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// Whether `id` has the shape of a Microsoft Store product id: 12 ASCII
+/// letters and digits. A local id has a dash, so it never does.
+pub fn is_store_product_id(id: &str) -> bool {
+    id.len() == 12 && id.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 /// The schema version this build understands. A recipe from the future is
 /// refused rather than half-read.
 pub const SCHEMA: u32 = 1;
@@ -324,7 +365,92 @@ impl Recipe {
                 }
             }
         }
+        recipe.check_kind()?;
         Ok(recipe)
+    }
+
+    /// The rules that tie `[title].kind` to the rest of the recipe.
+    fn check_kind(&self) -> anyhow::Result<()> {
+        let id = &self.title.product_id;
+        let local = self.title.kind == TitleKind::Local;
+        if local && !crate::local::is_local_id(id) {
+            anyhow::bail!(
+                "[title].kind is \"local\", but \"{id}\" is not a local id: one starts with \
+                 {} and has only letters, digits and dashes",
+                crate::local::ID_PREFIX
+            );
+        }
+        if !local && crate::local::is_local_id(id) {
+            anyhow::bail!("\"{id}\" is a local id, so [title].kind must be \"local\"");
+        }
+        if !local {
+            if !self.launch.args.is_empty() || !self.launch.wrapper.is_empty() {
+                anyhow::bail!(
+                    "[launch].args and [launch].wrapper: only local games take arguments or \
+                     wrappers: the client's run command takes none"
+                );
+            }
+            if self.launch.working_dir.is_some() {
+                anyhow::bail!(
+                    "[launch].working-dir: only a local game chooses the folder it starts in"
+                );
+            }
+            return Ok(());
+        }
+        if self.title.slug != id.to_ascii_lowercase() {
+            anyhow::bail!(
+                "[title].slug of a local game must be its id in lowercase, \"{}\"",
+                id.to_ascii_lowercase()
+            );
+        }
+        let has_parent = |path: &str| {
+            Path::new(&path.replace('\\', "/"))
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+        };
+        // A folder this broad (`/`, `/home`, `/mnt`) is never one game's, and
+        // the removal guard protects whatever a local game names.
+        let deep_enough = |path: &str| {
+            Path::new(path)
+                .components()
+                .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                .count()
+                >= 2
+        };
+        match self.install.dir.as_deref() {
+            Some(dir) if dir.starts_with('/') && !has_parent(dir) && deep_enough(dir) => {}
+            _ => anyhow::bail!(
+                "[install].dir of a local game must be the game's absolute folder, at least two \
+                 levels below `/`, with no `..`"
+            ),
+        }
+        if self.launch.working_dir.as_deref().is_some_and(has_parent) {
+            anyhow::bail!("[launch].working-dir of a local game must not contain `..`");
+        }
+        if let Some(prefix) = self.install.prefix.as_deref() {
+            if has_parent(prefix) {
+                anyhow::bail!("[install].prefix of a local game must not contain `..`");
+            }
+            if prefix.starts_with('/') && !deep_enough(prefix) {
+                anyhow::bail!(
+                    "[install].prefix of a local game must be at least two levels below `/`"
+                );
+            }
+        }
+        if !self.install.content.is_empty() {
+            anyhow::bail!("[install].content: a local game has no companion Store content");
+        }
+        if self.install.dir_env.is_some() || self.install.prefix_env.is_some() {
+            anyhow::bail!(
+                "[install].dir-env and [install].prefix-env: a local game's folders are written \
+                 in its recipe"
+            );
+        }
+        let executable = &self.launch.executable;
+        if executable.is_empty() || has_parent(executable) {
+            anyhow::bail!("[launch].executable of a local game must name a program, with no `..`");
+        }
+        Ok(())
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -476,6 +602,7 @@ impl Recipe {
                 product_id: product_id.to_ascii_uppercase(),
                 name: name.to_string(),
                 slug,
+                kind: TitleKind::Xbox,
                 publisher: None,
                 package_identity: None,
                 title_id: None,
@@ -485,6 +612,9 @@ impl Recipe {
             launch: Launch {
                 executable: String::new(),
                 env: Default::default(),
+                args: Vec::new(),
+                wrapper: Vec::new(),
+                working_dir: None,
             },
             runtime: Runtime::default(),
             status: Status {
@@ -604,6 +734,11 @@ impl Recipe {
             || self.title.slug.eq_ignore_ascii_case(needle)
     }
 
+    /// Whether this is a game Ferestre did not install.
+    pub fn is_local(&self) -> bool {
+        self.title.kind == TitleKind::Local
+    }
+
     /// Where the package lives, relative to the games directory.
     pub fn install_dir(&self) -> &str {
         self.install.dir.as_deref().unwrap_or(&self.title.slug)
@@ -631,7 +766,7 @@ impl Recipe {
 ///
 /// Falls back to the product id, because a name can be entirely non-ASCII and
 /// an empty slug would put the install at the root of the games directory.
-fn slugify(name: &str, product_id: &str) -> String {
+pub(crate) fn slugify(name: &str, product_id: &str) -> String {
     let mut slug = String::new();
     let mut pending_dash = false;
     for c in name.chars() {
@@ -1227,5 +1362,195 @@ summary = "Runs."
             None
         );
         assert!(Recipe::reset_in("../etc", dir.path()).is_err());
+    }
+
+    fn local(extra: &str) -> anyhow::Result<Recipe> {
+        Recipe::parse(&format!(
+            r#"schema = 1
+[title]
+product-id = "LOCAL-STEAM-3000000001"
+name = "Cyberpunk 2077"
+slug = "local-steam-3000000001"
+kind = "local"
+[install]
+dir = "/run/media/me/Games/Cyberpunk 2077"
+[launch]
+executable = 'bin/x64/Cyberpunk2077.exe'
+args = ["--launcher-skip"]
+wrapper = ["gamemoderun"]
+[status]
+state = "untested"
+summary = "Imported from Steam"
+{extra}"#
+        ))
+    }
+
+    #[test]
+    fn a_local_recipe_parses_and_round_trips() {
+        let recipe = local("").unwrap();
+        assert!(recipe.is_local());
+        assert_eq!(recipe.launch.args, ["--launcher-skip"]);
+        assert_eq!(recipe.launch.wrapper, ["gamemoderun"]);
+        let again = Recipe::parse(&recipe.to_toml().unwrap()).unwrap();
+        assert!(again.is_local());
+        assert_eq!(
+            again.install.dir.as_deref(),
+            Some("/run/media/me/Games/Cyberpunk 2077")
+        );
+    }
+
+    #[test]
+    fn an_xbox_recipe_serialises_without_the_new_keys() {
+        let text = Recipe::blank("9ZZTESTNEW1", "Test").to_toml().unwrap();
+        for key in ["kind", "args", "wrapper"] {
+            assert!(!text.contains(&format!("{key} =")), "{text}");
+        }
+    }
+
+    /// No args, no wrapper, slug = lowercase id: only the kind/id rule can refuse it.
+    fn bare(id: &str, kind: &str) -> String {
+        format!(
+            "schema = 1\n[title]\nproduct-id = \"{id}\"\nname = \"G\"\nslug = \"{}\"\n{kind}\
+             [install]\ndir = \"/g/h\"\n[launch]\nexecutable = \"G.exe\"\n\
+             [status]\nstate = \"untested\"\nsummary = \"s\"\n",
+            id.to_ascii_lowercase()
+        )
+    }
+
+    #[test]
+    fn kind_and_id_must_agree_both_ways() {
+        assert!(Recipe::parse(&bare("LOCAL-G", "kind = \"local\"\n")).is_ok());
+        for text in [
+            bare("LOCAL-G", ""),
+            bare("9ZZTESTNEW1", "kind = \"local\"\n"),
+        ] {
+            let err = Recipe::parse(&text).unwrap_err().to_string();
+            assert!(err.contains("kind"), "{err}\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_local_recipe_is_refused_unless_every_local_rule_holds() {
+        let good = local("").unwrap().to_toml().unwrap();
+        // toml writes plain strings double-quoted; every `from` below must occur in `good`.
+        for (from, to) in [
+            // slug must be the lowercase id
+            ("slug = \"local-steam-3000000001\"", "slug = \"cyberpunk\""),
+            // folder must be absolute
+            (
+                "dir = \"/run/media/me/Games/Cyberpunk 2077\"",
+                "dir = \"Cyberpunk\"",
+            ),
+            (
+                "dir = \"/run/media/me/Games/Cyberpunk 2077\"",
+                "dir = \"/run/media/../etc\"",
+            ),
+            // never the root or one level below it, which hold every game
+            (
+                "dir = \"/run/media/me/Games/Cyberpunk 2077\"",
+                "dir = \"/\"",
+            ),
+            (
+                "dir = \"/run/media/me/Games/Cyberpunk 2077\"",
+                "dir = \"/home\"",
+            ),
+            (
+                "executable = \"bin/x64/Cyberpunk2077.exe\"",
+                "executable = \"../x.exe\"",
+            ),
+            // `\` counts as a separator
+            (
+                "executable = \"bin/x64/Cyberpunk2077.exe\"",
+                "executable = '..\\x.exe'",
+            ),
+            // no companion content
+            ("[launch]", "content = [\"9NBLGGH2JHXJ\"]\n[launch]"),
+            (
+                "[launch]",
+                "dir-env = \"LOCAL_STEAM_3000000001_DIR\"\n[launch]",
+            ),
+            (
+                "[launch]",
+                "prefix-env = \"LOCAL_STEAM_3000000001_PREFIX\"\n[launch]",
+            ),
+        ] {
+            assert!(
+                good.contains(from),
+                "fixture no longer serialises {from:?}:\n{good}"
+            );
+            let text = good.replace(from, to);
+            assert!(Recipe::parse(&text).is_err(), "accepted: {from} -> {to}");
+        }
+    }
+
+    #[test]
+    fn a_local_prefix_never_climbs_out_relative_or_absolute() {
+        let good = local("").unwrap().to_toml().unwrap();
+        for prefix in [
+            "../outside-proton",
+            "games/../../etc",
+            "/run/media/me/../etc/pfx",
+        ] {
+            let text = good.replace("[launch]", &format!("prefix = \"{prefix}\"\n[launch]"));
+            let err = Recipe::parse(&text).expect_err(prefix).to_string();
+            assert!(err.contains("must not contain `..`"), "{prefix}: {err}");
+        }
+    }
+
+    #[test]
+    fn working_dir_is_local_only_and_never_climbs_out() {
+        let good = local("").unwrap().to_toml().unwrap();
+        let with = |dir: &str| {
+            good.replace(
+                "executable = ",
+                &format!("working-dir = '{dir}'\nexecutable = "),
+            )
+        };
+        let recipe = Recipe::parse(&with(r"bin\x64")).unwrap();
+        assert_eq!(recipe.launch.working_dir.as_deref(), Some(r"bin\x64"));
+        let again = Recipe::parse(&recipe.to_toml().unwrap()).unwrap();
+        assert_eq!(again.launch.working_dir.as_deref(), Some(r"bin\x64"));
+        for bad in ["../x", r"bin\..\..\x", "/run/media/me/../etc"] {
+            let err = Recipe::parse(&with(bad)).unwrap_err().to_string();
+            assert!(err.contains("working-dir"), "{bad}: {err}");
+        }
+        let store = Recipe::blank("9ZZTESTNEW1", "Test")
+            .to_toml()
+            .unwrap()
+            .replace(
+                "executable = \"\"",
+                "executable = \"Game.exe\"\nworking-dir = \"bin\"",
+            );
+        assert!(Recipe::parse(&store)
+            .unwrap_err()
+            .to_string()
+            .contains("working-dir"));
+    }
+
+    #[test]
+    fn only_local_recipes_take_arguments_or_wrappers() {
+        let mut text = Recipe::blank("9ZZTESTNEW1", "Test").to_toml().unwrap();
+        text = text.replace(
+            "executable = \"\"",
+            "executable = \"Game.exe\"\nargs = [\"-x\"]",
+        );
+        assert!(Recipe::parse(&text)
+            .unwrap_err()
+            .to_string()
+            .contains("local"));
+    }
+
+    #[test]
+    fn store_ids_and_local_ids_never_overlap() {
+        assert!(is_store_product_id("9NBLGGH2JHXJ"));
+        for id in [
+            "LOCAL-STEAM-1",
+            "LOCAL-ABCDEFG",
+            "local-x",
+            "9NBLGGH2JHX",
+            "../../etc",
+        ] {
+            assert!(!is_store_product_id(id), "{id}");
+        }
     }
 }

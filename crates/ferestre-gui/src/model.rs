@@ -227,6 +227,13 @@ pub struct Inputs<'a> {
     /// The engine [`autofix::detect`] finds in a title's install folder. A
     /// parameter so the window can remember the answer between redraws.
     pub engine: &'a dyn Fn(&Recipe, &Path) -> Option<autofix::Profile>,
+    /// The runtimes a local game may use: every runtime above and the Proton
+    /// builds Steam has (`runtime::for_recipe` of a local recipe). An Xbox
+    /// title is never judged against these.
+    pub local_runtimes: &'a [InstalledRuntime],
+    /// The anti-cheat files found in a local game's folder. Evidence, shown as
+    /// a caution; it never blocks a launch.
+    pub anticheat: &'a dyn Fn(&Recipe) -> Vec<ferestre_core::anticheat::Detection>,
 }
 
 /// Work out the button and the words for one recipe.
@@ -300,20 +307,35 @@ fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
     // Access source is labelled separately from runtime compatibility.
     let mut caution = broken;
 
-    let game_dir = (inputs.game_dir)(recipe);
-    let inferred = autofix::infer_detected(
-        recipe,
-        game_dir
-            .as_deref()
-            .and_then(|dir| (inputs.engine)(recipe, dir)),
-    );
+    // A local game is run as it is described: no engine defaults are
+    // inferred for it, and it may use the Proton builds Steam has.
+    let local = recipe.is_local();
+    // A local game is never installed from here: its files are somewhere
+    // Ferestre did not put them, and when they are not there, that is what
+    // to say, whatever the runtime would have made of it.
+    if local && !(inputs.installed)(recipe) {
+        let program = ferestre_core::local::executable_path(recipe)
+            .unwrap_or_else(|| PathBuf::from(&recipe.launch.executable));
+        return blocked(format!(
+            "Not found: {} — is its drive mounted?",
+            program.display()
+        ));
+    }
+    let inferred;
+    let (judged, runtimes) = if local {
+        (recipe, inputs.local_runtimes)
+    } else {
+        let game_dir = (inputs.game_dir)(recipe);
+        inferred = autofix::infer_detected(
+            recipe,
+            game_dir
+                .as_deref()
+                .and_then(|dir| (inputs.engine)(recipe, dir)),
+        );
+        (&*inferred.recipe, inputs.runtimes)
+    };
     let requested = (inputs.selected_runtime)(&recipe.title.product_id);
-    let assessment = match launch_runtime(
-        &inferred.recipe,
-        inputs.runtimes,
-        requested.as_deref(),
-        inputs.registry,
-    ) {
+    let assessment = match launch_runtime(judged, runtimes, requested.as_deref(), inputs.registry) {
         Ok((_, assessment)) => assessment,
         Err(why) => return blocked(why),
     };
@@ -329,6 +351,14 @@ fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
             return blocked(line);
         }
         caution = Some(join(caution, &line));
+    }
+
+    // Its files were found above, so a local game plays.
+    if local {
+        if let Some(found) = ferestre_core::anticheat::describe(&(inputs.anticheat)(recipe)) {
+            caution = Some(join(caution, &found));
+        }
+        return (Action::Play, caution);
     }
 
     let action = if (inputs.installed)(recipe) {
@@ -576,6 +606,7 @@ pub fn gamepass(
                 unavailable: None,
                 install_as: bundle_child(inputs, product)
                     .map(|c| (c.product_id.clone(), c.name.clone())),
+                local: false,
                 action,
             }
         })
@@ -883,6 +914,39 @@ fn launch_noise(line: &str) -> bool {
         || WINE_DEBUG.iter().any(|d| line.contains(d))
 }
 
+/// Whether launching this title involves the Store and Player accounts. A
+/// local game has no licence and no Xbox saves, so it never does; a title
+/// with no recipe is an Xbox title.
+pub fn launch_uses_accounts(recipe: Option<&Recipe>) -> bool {
+    !recipe.is_some_and(Recipe::is_local)
+}
+
+/// What the person should know before importing these shortcuts: each new
+/// one's warnings (launch options left behind, a prefix another Proton will
+/// start) and the anti-cheat found in its folder. The ones already in the
+/// library or skipped are not being imported, so their notes are not shown.
+pub fn steam_import_notes(candidates: &[ferestre_core::steam_import::Candidate]) -> Vec<String> {
+    use ferestre_core::steam_import::ImportStatus;
+    candidates
+        .iter()
+        .filter(|c| c.status == ImportStatus::New)
+        .flat_map(|c| {
+            c.warnings.iter().cloned().chain(
+                ferestre_core::anticheat::describe(&c.anticheat)
+                    .map(|line| format!("{}: {line}", c.name)),
+            )
+        })
+        .collect()
+}
+
+/// The ids among `ids` that the Store catalog can be asked about, in order.
+pub fn store_ids(ids: &[String]) -> Vec<String> {
+    ids.iter()
+        .filter(|id| ferestre_core::recipe::is_store_product_id(id))
+        .cloned()
+        .collect()
+}
+
 /// One row of the library: something owned, something described, or both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryRow {
@@ -925,6 +989,9 @@ pub struct LibraryRow {
     /// child that does. Without this the row could only say which child to go
     /// and find, which is an instruction to do the launcher's job by hand.
     pub install_as: Option<(String, String)>,
+    /// A game Ferestre did not install: no Store page, no move, and Remove
+    /// forgets it without deleting anything.
+    pub local: bool,
     pub action: Action,
 }
 
@@ -932,6 +999,13 @@ impl LibraryRow {
     /// Positive update evidence only; unknown checks are not update badges.
     pub fn has_update(&self) -> bool {
         self.installed && self.update == Some(true)
+    }
+
+    /// Whether a blocked row's reason is about the runtime, so that choosing
+    /// another one is the fix to offer. A local game whose files are missing
+    /// is blocked by its drive, which no runtime brings back.
+    pub fn blocked_by_runtime(&self) -> bool {
+        matches!(self.action, Action::Blocked(_)) && !(self.local && !self.installed)
     }
 
     /// Whether the catalog has been asked about this row yet. A row still
@@ -973,7 +1047,8 @@ pub fn library(inputs: &Inputs) -> Vec<LibraryRow> {
     // be managed. Transfers and running games must not disappear on refresh.
     for recipe in inputs.recipes {
         let key = recipe.title.product_id.to_ascii_uppercase();
-        if owned.contains(&key)
+        if recipe.is_local()
+            || owned.contains(&key)
             || (inputs.installed)(recipe)
             || inputs.records.contains_key(&key)
             || (inputs.installing)(&key)
@@ -1053,6 +1128,9 @@ fn sort_key(a: &LibraryRow, b: &LibraryRow) -> std::cmp::Ordering {
 
 fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
     let view = row(inputs, recipe);
+    if recipe.is_local() {
+        return local_row(inputs, recipe, view);
+    }
     let product = inputs.catalog.get(key);
     let installed = (inputs.installed)(recipe);
     let record = inputs.records.get(key);
@@ -1104,7 +1182,38 @@ fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
         outside_tier: false,
         unavailable: None,
         install_as: None,
+        local: false,
         action,
+    }
+}
+
+/// A local game's row: its own name and badge, no Store art, no update check.
+fn local_row(inputs: &Inputs, recipe: &Recipe, view: TitleView) -> LibraryRow {
+    let installed = (inputs.installed)(recipe);
+    let subtitle = match &view.action {
+        Action::Blocked(reason) => reason.clone(),
+        Action::Stop => "Local game  ·  running".to_string(),
+        _ => match &view.caution {
+            Some(caution) => format!("Local game  ·  {caution}"),
+            None => "Local game".to_string(),
+        },
+    };
+    LibraryRow {
+        product_id: recipe.title.product_id.clone(),
+        name: recipe.title.name.clone(),
+        subtitle,
+        badge: Some(("Local", "dim-label")),
+        image: None,
+        owned: false,
+        has_recipe: true,
+        installed,
+        update: None,
+        unsupported: false,
+        outside_tier: false,
+        unavailable: None,
+        install_as: None,
+        local: true,
+        action: view.action,
     }
 }
 
@@ -1175,6 +1284,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
         outside_tier: false,
         unavailable: None,
         install_as: None,
+        local: false,
         action: Action::Blocked(reason),
     };
 
@@ -1205,6 +1315,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
                 outside_tier: false,
                 unavailable: None,
                 install_as: Some((child.product_id.clone(), child.name.clone())),
+                local: false,
                 action: Action::Install,
             },
             None => unrunnable(
@@ -1248,6 +1359,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
             outside_tier: false,
             unavailable: None,
             install_as: None,
+            local: false,
             action: Action::Blocked(format!(
                 "this is a {container} package; the runtime here opens MSIXVC packages"
             )),
@@ -1302,6 +1414,7 @@ fn undescribed_row(inputs: &Inputs, product_id: &str, key: &str) -> LibraryRow {
         outside_tier: false,
         unavailable: None,
         install_as: None,
+        local: false,
         // Install, unless it is already here -- and then Play, not "set up",
         // whenever the package names its own entry point. That is the common
         // case, and asking someone to go and find an .exe in a tree of
@@ -1813,9 +1926,10 @@ mod tests {
         ownership: &'a Ownership,
         installed: &'a dyn Fn(&Recipe) -> bool,
     ) -> Inputs<'a> {
+        let runtimes = runtime.map(std::slice::from_ref).unwrap_or(&[]);
         Inputs {
             recipes,
-            runtimes: runtime.map(std::slice::from_ref).unwrap_or(&[]),
+            runtimes,
             selected_runtime: NO_SELECTION,
             incomplete: NOTHING_INCOMPLETE,
             registry: None,
@@ -1832,6 +1946,9 @@ mod tests {
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
+            // Every runtime here is one a local game may use too.
+            local_runtimes: runtimes,
+            anticheat: NO_ANTICHEAT,
         }
     }
 
@@ -1904,6 +2021,9 @@ mod tests {
     const NOTHING_RUNNING: &dyn Fn(&str) -> bool = &|_| false;
     /// And where no installed engine shapes the recipe.
     const NO_GAME_DIR: &dyn Fn(&Recipe) -> Option<PathBuf> = &|_| None;
+    /// And where no game ships anti-cheat files.
+    const NO_ANTICHEAT: &dyn Fn(&Recipe) -> Vec<ferestre_core::anticheat::Detection> =
+        &|_| Vec::new();
     /// And where an undescribed title is not on disk either.
     const NOT_ON_DISK: &dyn Fn(&str) -> bool = &|_| false;
     /// And so nothing on disk describes itself.
@@ -2114,6 +2234,8 @@ mod tests {
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
+            local_runtimes: &[],
+            anticheat: NO_ANTICHEAT,
         });
         assert_eq!(rows[0].action, Action::Update);
         assert!(
@@ -2484,6 +2606,8 @@ HTTP 401 Unauthorized",
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
+            local_runtimes: &[],
+            anticheat: NO_ANTICHEAT,
         });
 
         let by_id: BTreeMap<&str, &LibraryRow> =
@@ -2615,6 +2739,8 @@ HTTP 401 Unauthorized",
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
+            local_runtimes: &[],
+            anticheat: NO_ANTICHEAT,
         });
         assert_eq!(
             rows.iter()
@@ -2664,6 +2790,8 @@ HTTP 401 Unauthorized",
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
+            local_runtimes: &[],
+            anticheat: NO_ANTICHEAT,
         });
         let by_id: BTreeMap<&str, &LibraryRow> =
             rows.iter().map(|r| (r.product_id.as_str(), r)).collect();
@@ -2727,6 +2855,8 @@ HTTP 401 Unauthorized",
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
+            local_runtimes: &[],
+            anticheat: NO_ANTICHEAT,
         });
         assert!(
             rows[0].subtitle.contains("No PC version"),
@@ -2779,6 +2909,8 @@ HTTP 401 Unauthorized",
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
+            local_runtimes: &[],
+            anticheat: NO_ANTICHEAT,
         });
         let row = rows
             .iter()
@@ -2844,6 +2976,8 @@ HTTP 401 Unauthorized",
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
+            local_runtimes: &[],
+            anticheat: NO_ANTICHEAT,
         });
         assert!(
             rows[0].subtitle.contains("Bundle of 1 title"),
@@ -2897,6 +3031,8 @@ HTTP 401 Unauthorized",
                 installing: NOTHING_INSTALLING,
                 running: NOTHING_RUNNING,
                 game_dir: NO_GAME_DIR,
+                local_runtimes: &[],
+                anticheat: NO_ANTICHEAT,
             },
             &listing,
             None,
@@ -2967,6 +3103,8 @@ HTTP 401 Unauthorized",
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
+            local_runtimes: &[],
+            anticheat: NO_ANTICHEAT,
         });
         assert_eq!(rows.len(), 1, "the row exists at all");
         assert_eq!(rows[0].name, "Only On Disk");
@@ -3007,6 +3145,8 @@ HTTP 401 Unauthorized",
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
+            local_runtimes: &[],
+            anticheat: NO_ANTICHEAT,
         });
         assert_eq!(rows[0].action, Action::Play);
 
@@ -3029,6 +3169,8 @@ HTTP 401 Unauthorized",
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
+            local_runtimes: &[],
+            anticheat: NO_ANTICHEAT,
         });
         assert_eq!(
             rows[0].action,
@@ -3160,6 +3302,8 @@ HTTP 401 Unauthorized",
                 installing: NOTHING_INSTALLING,
                 running: NOTHING_RUNNING,
                 game_dir: NO_GAME_DIR,
+                local_runtimes: &[],
+                anticheat: NO_ANTICHEAT,
             },
             &listing,
             None,
@@ -3219,6 +3363,8 @@ HTTP 401 Unauthorized",
             installing: downloading,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
+            local_runtimes: &[],
+            anticheat: NO_ANTICHEAT,
         });
         assert_eq!(rows[0].action, Action::Installing);
         assert_eq!(rows[0].action.label(), "Installing..");
@@ -3263,6 +3409,8 @@ HTTP 401 Unauthorized",
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
+            local_runtimes: &[],
+            anticheat: NO_ANTICHEAT,
         });
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["aardvark", "Zebra", "9ZZTESTNEW3"]);
@@ -3300,6 +3448,8 @@ HTTP 401 Unauthorized",
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
+            local_runtimes: &[],
+            anticheat: NO_ANTICHEAT,
         };
         let rows = library(&inputs);
         assert_eq!(rows[0].action, Action::Update);
@@ -3358,6 +3508,8 @@ HTTP 401 Unauthorized",
             installing: NOTHING_INSTALLING,
             running: NOTHING_RUNNING,
             game_dir: NO_GAME_DIR,
+            local_runtimes: &[],
+            anticheat: NO_ANTICHEAT,
         });
         assert_eq!(rows[0].update, None);
         assert_eq!(rows[0].action, Action::Play, "not nagged, not hidden");
@@ -3480,6 +3632,8 @@ HTTP 401 Unauthorized",
             installing: NOTHING_INSTALLING,
             running,
             game_dir: NO_GAME_DIR,
+            local_runtimes: &[],
+            anticheat: NO_ANTICHEAT,
         });
         assert_eq!(rows[0].action, Action::Stop);
         assert_eq!(rows[0].action.label(), "Stop");
@@ -3514,6 +3668,7 @@ HTTP 401 Unauthorized",
                 outside_tier: false,
                 unavailable: None,
                 install_as: None,
+                local: false,
                 action: Action::Adopt,
             })
             .collect()
@@ -3910,5 +4065,184 @@ HTTP 401 Unauthorized",
         assert!(!rows[0].action.is_enabled());
         assert!(rows[0].action.command("9TESTADDON01").is_none());
         assert!(rows[0].subtitle.contains("Content for Collection"));
+    }
+
+    // --- local games ----------------------------------------------------------
+
+    fn local_recipe(dir: &str) -> Recipe {
+        Recipe::parse(&format!(
+            "schema = 1\n[title]\nproduct-id = \"LOCAL-T\"\nname = \"Local Test\"\n\
+             slug = \"local-t\"\nkind = \"local\"\n[install]\ndir = \"{dir}\"\n\
+             [launch]\nexecutable = 'Game.exe'\n[status]\nstate = \"untested\"\n\
+             summary = \"Added by hand\"\n"
+        ))
+        .expect("local fixture parses")
+    }
+
+    #[test]
+    fn a_local_game_is_listed_and_plays_without_ownership_or_a_record() {
+        let recipes = vec![local_recipe("/g/Local Test")];
+        let rt = runtime_with(&[], CapabilitySource::Manifest);
+        let own = Ownership::Unknown;
+        let rows = library(&inputs(&recipes, Some(&rt), &own, ALL_INSTALLED));
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].local);
+        assert_eq!(rows[0].action, Action::Play);
+        assert_eq!(rows[0].badge, Some(("Local", "dim-label")));
+        assert_eq!(rows[0].image, None);
+        assert_eq!(rows[0].update, None);
+        assert_eq!(rows[0].subtitle, "Local game");
+        assert!(!rows.iter().any(|r| r.action == Action::Install));
+    }
+
+    #[test]
+    fn a_missing_local_executable_blocks_play_without_offering_install() {
+        let recipes = vec![local_recipe("/run/media/gone/Local Test")];
+        let rt = runtime_with(&[], CapabilitySource::Manifest);
+        let own = Ownership::Unknown;
+        let rows = library(&inputs(&recipes, Some(&rt), &own, NOTHING_INSTALLED));
+        assert_eq!(rows.len(), 1, "a local game is a row even when not found");
+        match &rows[0].action {
+            Action::Blocked(reason) => {
+                assert!(reason.contains("drive mounted"), "{reason}");
+                assert!(
+                    reason.contains("/run/media/gone/Local Test/Game.exe"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+        assert!(rows[0].local);
+    }
+
+    #[test]
+    fn steam_import_notes_name_what_a_new_shortcut_loses() {
+        use ferestre_core::steam_import::{Candidate, ImportStatus, RuntimeFound};
+        let candidate = |name: &str, status: ImportStatus, warning: &str| Candidate {
+            id: format!("LOCAL-STEAM-{name}"),
+            app_id: 1,
+            name: name.into(),
+            user: "1".into(),
+            status,
+            recipe: None,
+            runtime: RuntimeFound::Unset,
+            artwork: Default::default(),
+            anticheat: vec![ferestre_core::anticheat::Detection {
+                name: "EasyAntiCheat",
+                kernel: false,
+                proton_runtime: true,
+                evidence: PathBuf::from("/g/EasyAntiCheat"),
+            }],
+            warnings: vec![warning.into()],
+        };
+        let notes = steam_import_notes(&[
+            candidate(
+                "New",
+                ImportStatus::New,
+                "New: launch options not imported (shell operator); add them in Edit launch settings",
+            ),
+            candidate("Old", ImportStatus::Kept, "Old: should not be shown"),
+        ]);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(
+            notes[0].contains("launch options not imported"),
+            "{notes:?}"
+        );
+        assert!(
+            notes[1].starts_with("New: ") && notes[1].contains("EasyAntiCheat"),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_local_executable_says_not_found_even_without_a_runtime() {
+        // No runtime at all for local games: the row must still blame the
+        // drive, not the runtime, and must not offer a runtime as the fix.
+        let recipes = vec![local_recipe("/run/media/gone/Local Test")];
+        let own = Ownership::Unknown;
+        let rows = library(&inputs(&recipes, None, &own, NOTHING_INSTALLED));
+        assert_eq!(rows.len(), 1);
+        match &rows[0].action {
+            Action::Blocked(reason) => assert!(reason.contains("drive mounted"), "{reason}"),
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+        assert!(!rows[0].blocked_by_runtime());
+    }
+
+    #[test]
+    fn a_local_game_may_use_a_steam_proton_and_an_xbox_title_may_not() {
+        let ge = runtime_at("/steam/compatibilitytools.d/GE-Proton10-25", "ge", &[]);
+        let local_runtimes = vec![ge.clone()];
+        let recipes = vec![
+            local_recipe("/g/Local Test"),
+            recipe("9ZZTESTGAME1", "playable", &[]),
+        ];
+        let selected: &dyn Fn(&str) -> Option<PathBuf> = &|_| Some(ge.path.clone());
+        let own = Ownership::Unknown;
+        let rows = library(&Inputs {
+            runtimes: &[],
+            local_runtimes: &local_runtimes,
+            selected_runtime: selected,
+            ..inputs(&recipes, None, &own, ALL_INSTALLED)
+        });
+        let local = rows.iter().find(|r| r.product_id == "LOCAL-T").unwrap();
+        let xbox = rows
+            .iter()
+            .find(|r| r.product_id == "9ZZTESTGAME1")
+            .unwrap();
+        assert_eq!(local.action, Action::Play);
+        assert!(
+            matches!(xbox.action, Action::Blocked(_)),
+            "{:?}",
+            xbox.action
+        );
+    }
+
+    #[test]
+    fn anti_cheat_shows_as_a_caution_on_a_local_row() {
+        let recipes = vec![local_recipe("/g/Local Test")];
+        let rt = runtime_with(&[], CapabilitySource::Manifest);
+        let own = Ownership::Unknown;
+        let anticheat: &dyn Fn(&Recipe) -> Vec<ferestre_core::anticheat::Detection> = &|_| {
+            vec![ferestre_core::anticheat::Detection {
+                name: "Ricochet",
+                kernel: true,
+                proton_runtime: false,
+                evidence: PathBuf::from("/g/Local Test/Randgrid.sys"),
+            }]
+        };
+        let rows = library(&Inputs {
+            anticheat,
+            ..inputs(&recipes, Some(&rt), &own, ALL_INSTALLED)
+        });
+        assert_eq!(rows[0].action, Action::Play);
+        assert!(
+            rows[0].subtitle.starts_with("Local game  ·  "),
+            "{}",
+            rows[0].subtitle
+        );
+        assert!(
+            rows[0].subtitle.contains("Ricochet"),
+            "{}",
+            rows[0].subtitle
+        );
+        assert!(
+            rows[0].subtitle.contains("kernel driver"),
+            "{}",
+            rows[0].subtitle
+        );
+    }
+
+    #[test]
+    fn local_games_skip_accounts_and_the_store_catalog() {
+        let local = local_recipe("/g/Local Test");
+        let xbox = recipe("9ZZTESTGAME1", "playable", &[]);
+        assert!(!launch_uses_accounts(Some(&local)));
+        assert!(launch_uses_accounts(Some(&xbox)));
+        assert!(launch_uses_accounts(None));
+        assert_eq!(
+            store_ids(&["LOCAL-STEAM-1".to_string(), "9NBLGGH2JHXJ".to_string()]),
+            ["9NBLGGH2JHXJ"]
+        );
     }
 }

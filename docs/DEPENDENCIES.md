@@ -36,6 +36,15 @@ image view shows it in the game's `EasyAntiCheat` directory through a
 read-only overlay; the installed package is not changed. To use your own copy
 instead, set `FERESTRE_EAC_LINUX_LIBRARY` to its path.
 
+## Neural rendering (optional)
+
+Only for the experimental [neural rendering](NEURAL-RENDERING.md): an AMD
+Radeon RX 9000 card with Mesa 26.2 or newer. Ferestre reads the Mesa version
+from `vulkaninfo` (the `vulkan-tools` package on Debian, Ubuntu, Fedora and
+Arch); without it, it warns that it cannot tell and lets you go on.
+Installing the package into a game runs DLSSNR-AMD's own `install.sh`, which
+needs `bash` and `python3`.
+
 ## WebKitGTK for sign-in
 
 The Xbox client (`xodus-cli`) shows Microsoft's sign-in page in a WebKitGTK

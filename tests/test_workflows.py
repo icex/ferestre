@@ -82,7 +82,8 @@ class WorkflowTests(unittest.TestCase):
 
     def test_only_a_tag_push_signs_or_publishes(self):
         for path in (REPO / '.github/workflows/release.yml',
-                     REPO / '.github/workflows/runtime.yml'):
+                     REPO / '.github/workflows/runtime.yml',
+                     REPO / '.github/workflows/dlssnr.yml'):
             text = path.read_text()
             conditions = [c for c in re.findall(r'^\s*if: (.*)$', text, re.M)
                           if 'ref_type' in c]
@@ -117,7 +118,7 @@ class WorkflowTests(unittest.TestCase):
                                              f'{path.name}/{name}/{step.get("name")}')
 
     def test_releases_are_signed_before_they_are_published(self):
-        for wf in ('release.yml', 'runtime.yml'):
+        for wf in ('release.yml', 'runtime.yml', 'dlssnr.yml'):
             workflow = load(REPO / '.github/workflows' / wf)
             publishing = [(n, j) for n, j in workflow['jobs'].items()
                           if any('gh release create' in t for t in runs(j))]
@@ -132,7 +133,8 @@ class WorkflowTests(unittest.TestCase):
             self.assertFalse(can_write(workflow['jobs']['build'], workflow), wf)
 
     def test_signatures_carry_the_tags_version_and_manual_runs_say_they_are_unsigned(self):
-        for wf, prefix in (('release.yml', 'v'), ('runtime.yml', 'runtime-')):
+        for wf, prefix in (('release.yml', 'v'), ('runtime.yml', 'runtime-'),
+                           ('dlssnr.yml', 'dlssnr-')):
             workflow = load(REPO / '.github/workflows' / wf)
             sign = next(t for t in runs(workflow['jobs']['publish'])
                         if 'packaging/sign-release.sh out' in t)
@@ -144,6 +146,26 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(unsigned[0].get('if'), NOT_TAG_PUSH, wf)
             self.assertIn('UNSIGNED', unsigned[0]['run'], wf)
             self.assertIn('GITHUB_STEP_SUMMARY', unsigned[0]['run'], wf)
+
+    def test_the_dlssnr_package_is_built_from_the_lock_and_never_becomes_latest(self):
+        workflow = load(REPO / '.github/workflows/dlssnr.yml')
+        text = '\n'.join(runs(workflow['jobs']['build']))
+        self.assertIn('scripts/build-dlssnr.sh out', text)
+        self.assertIn('The tag must be on main',
+                      [s.get('name') for s in workflow['jobs']['build']['steps']])
+        self.assertNotIn('${{', text)
+        publish = next(t for t in runs(workflow['jobs']['publish']) if 'gh release create' in t)
+        # The README's "latest release" link must keep pointing at the AppImage.
+        self.assertIn('--latest=false', publish)
+
+    def test_the_dlssnr_build_sums_every_file_it_writes(self):
+        text = (REPO / 'scripts/build-dlssnr.sh').read_text()
+        sums = [i for i, l in enumerate(text.splitlines()) if 'SHA256SUMS' in l and 'sha256sum' in l]
+        self.assertEqual(len(sums), 1)
+        line = text.splitlines()[sums[0]]
+        self.assertIn('sha256sum -- *', line)  # every file in the output dir, SOURCES.txt included
+        # Nothing is written into the output dir after the sums.
+        self.assertNotRegex('\n'.join(text.splitlines()[sums[0] + 1:]), r'>\s*"?\$out')
 
     def test_the_msrv_job_builds_with_the_declared_rust_version(self):
         declared = re.search(r'^rust-version = "([0-9.]+)"$',
@@ -179,8 +201,23 @@ class WorkflowTests(unittest.TestCase):
         triggers = load(REPO / '.github/workflows/rust.yml')[True]
         for event in ('push', 'pull_request'):
             for pattern in ('scripts/**', 'packaging/**', 'Cargo.lock', '.github/workflows/**',
-                            'tests/*.sh', 'tests/license_token_fixture.py'):
+                            'tests/*.sh', 'tests/license_token_fixture.py',
+                            'tests/test_no_nvidia_urls.py', 'tests/test_build_dlssnr.py'):
                 self.assertIn(pattern, triggers[event]['paths'], event)
+
+    def test_the_nvidia_url_guard_runs_on_every_change(self):
+        # rust.yml is path-filtered, and a docs- or README-only change is the
+        # likeliest place for such a URL, so the guard has an unfiltered home.
+        workflow = load(REPO / '.github/workflows/guards.yml')
+        triggers = workflow[True]
+        for event in ('push', 'pull_request'):
+            self.assertIn(event, triggers)
+            self.assertFalse(triggers[event], f'{event} must not be filtered by path or branch')
+        job = workflow['jobs']['no-nvidia-urls']
+        self.assertNotIn('if', job)
+        self.assertIn('python3 tests/test_no_nvidia_urls.py', list(runs(job)))
+        for step in job['steps']:
+            self.assertNotIn('if', step, step.get('name'))
 
     def test_namespace_tests_cannot_skip_in_ci(self):
         # stop.rs and the image-view tests skip where unprivileged user

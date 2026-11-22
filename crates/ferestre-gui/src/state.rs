@@ -87,6 +87,14 @@ pub struct Model {
     pub runtime: Option<InstalledRuntime>,
     /// Every runtime the person can choose from on this machine.
     pub runtimes: Vec<InstalledRuntime>,
+    /// The runtimes a local game may use: `runtimes` and the Proton builds
+    /// Steam has. Never offered to an Xbox title.
+    pub local_runtimes: Vec<InstalledRuntime>,
+    /// Anti-cheat files found in each local game's folder, by uppercase
+    /// product id. Read once per load: it is a directory listing per game.
+    pub anticheat: BTreeMap<String, Vec<ferestre_core::anticheat::Detection>>,
+    /// The art Ferestre keeps for each local game, by uppercase product id.
+    pub local_art: BTreeMap<String, ferestre_core::steam::ArtworkFiles>,
     pub registry: Option<Registry>,
     pub records: BTreeMap<String, Record>,
     pub disk_usage: BTreeMap<String, Option<u64>>,
@@ -291,8 +299,13 @@ impl Model {
     }
 
     pub fn load() -> Self {
+        Self::load_from(Paths::from_env())
+    }
+
+    /// [`Model::load`] from the given paths, so a test can load a temp root.
+    pub(crate) fn load_from(paths: anyhow::Result<Paths>) -> Self {
         let mut problem = None;
-        let paths = match Paths::from_env() {
+        let paths = match paths {
             Ok(p) => Some(p),
             Err(e) => {
                 problem = Some(format!("Cannot work out where things live: {e}"));
@@ -336,6 +349,28 @@ impl Model {
             .and_then(|dir| Registry::load(&dir.join("capabilities.toml")).ok());
         let runtimes = paths.as_ref().map(runtime::all).unwrap_or_default();
         let runtime = runtimes.first().cloned();
+        // What a local game may use: these, and the Proton builds Steam has.
+        let mut local_runtimes = runtimes.clone();
+        if let Some(paths) = &paths {
+            local_runtimes.extend(runtime::external(paths));
+        }
+        let mut anticheat = BTreeMap::new();
+        let mut local_art = BTreeMap::new();
+        if let Some(paths) = &paths {
+            for recipe in recipes.iter().filter(|r| r.is_local()) {
+                let key = recipe.title.product_id.to_ascii_uppercase();
+                if let Ok(dir) = paths.install_dir(recipe) {
+                    anticheat.insert(
+                        key.clone(),
+                        ferestre_core::anticheat::detect(&dir, &recipe.launch.executable),
+                    );
+                }
+                local_art.insert(
+                    key,
+                    ferestre_core::local::artwork(paths, &recipe.title.product_id),
+                );
+            }
+        }
         let records = paths
             .as_ref()
             .map(|p| recorded_installs(p.state_dir()))
@@ -417,7 +452,7 @@ impl Model {
             Ownership::Unknown => Vec::new(),
         };
 
-        let icons = paths
+        let mut icons = paths
             .as_ref()
             .map(|p| {
                 existing_icons(
@@ -426,6 +461,7 @@ impl Model {
                 )
             })
             .unwrap_or_default();
+        icons.extend(local_icons(&local_art));
         if problem.is_none() {
             problem = match skipped.as_slice() {
                 [] if recipes.is_empty() => Some(
@@ -465,6 +501,9 @@ impl Model {
             recipes,
             runtime,
             runtimes,
+            local_runtimes,
+            anticheat,
+            local_art,
             registry,
             records,
             disk_usage: BTreeMap::new(),
@@ -502,7 +541,11 @@ impl Model {
     /// of the same hundred gigabytes on every Refresh would only race the first.
     /// The new generation tells their results to re-check the install first.
     pub fn reload(&mut self) {
-        let mut fresh = Model::load();
+        self.reload_from(Model::load());
+    }
+
+    /// [`Model::reload`] with a model already loaded.
+    pub(crate) fn reload_from(&mut self, mut fresh: Model) {
         let same_store =
             self.roles.as_ref().map(|s| &s.store) == fresh.roles.as_ref().map(|s| &s.store);
         if same_store {
@@ -523,10 +566,13 @@ impl Model {
             std::mem::take(&mut self.catalog),
             std::mem::take(&mut fresh.catalog),
         );
-        let icons = kept_with_new(
+        let mut icons = kept_with_new(
             std::mem::take(&mut self.icons),
             std::mem::take(&mut fresh.icons),
         );
+        // A local game's art is on disk, so it is put back from the fresh
+        // load: it may have changed.
+        icons.extend(local_icons(&fresh.local_art));
         *self = Model {
             size_generation: self.size_generation.wrapping_add(1),
             sizes_pending: std::mem::take(&mut self.sizes_pending),
@@ -546,12 +592,19 @@ impl Model {
     /// Whether the title is installed, not merely started: a folder appears
     /// the moment a download begins, and a stopped one is not a title to play.
     pub fn is_installed(&self, recipe: &Recipe) -> bool {
+        if recipe.is_local() {
+            return ferestre_core::local::is_present(recipe);
+        }
         self.game_dir(recipe).is_some_and(|dir| self.complete(&dir))
     }
 
     /// Whether a download of this product stopped and left files where the
     /// title goes, so the row offers to resume it rather than to play it.
     pub fn incomplete(&self, product_id: &str) -> bool {
+        // A local game was never downloaded, so it cannot have stopped halfway.
+        if ferestre_core::local::is_local_id(product_id) {
+            return false;
+        }
         let dir = match self.recipe_for(product_id) {
             Some(recipe) => self.game_dir(recipe),
             None => self
@@ -590,6 +643,10 @@ impl Model {
 
     fn find_game_dir(&self, recipe: &Recipe) -> Option<PathBuf> {
         let paths = self.paths.as_ref()?;
+        // A local game is where its recipe says, whatever a record claims.
+        if recipe.is_local() {
+            return paths.install_dir(recipe).ok();
+        }
         let from_env = recipe
             .install
             .dir_env
@@ -612,6 +669,9 @@ impl Model {
     /// A title installed outside this launcher has a version and no record;
     /// reading it costs one small file and is better than showing "Installed".
     pub fn installed_version(&self, recipe: &Recipe) -> Option<String> {
+        if recipe.is_local() {
+            return None;
+        }
         let dir = self.game_dir(recipe)?;
         probe(
             &self.probes,
@@ -641,7 +701,9 @@ impl Model {
     pub fn title_prefix(&self, recipe: &Recipe) -> Option<PathBuf> {
         let paths = self.paths.as_ref()?;
         let mut prefix = paths.prefix_dir(recipe).ok()?;
-        if let Some(roles) = &self.roles {
+        // A local game runs in its own prefix, never a player's copy of it:
+        // Stop must reach the server of the prefix the game is in.
+        if let Some(roles) = self.roles.as_ref().filter(|_| !recipe.is_local()) {
             let (_, player) = roles.selected(self.profiles.as_ref()?).ok()?;
             prefix = accounts::player_prefix(&prefix, player).ok()?;
         }
@@ -651,13 +713,20 @@ impl Model {
     /// The runtime a launch of this recipe would use, judged the way its row is.
     pub fn launch_runtime(&self, recipe: &Recipe) -> Result<&InstalledRuntime, String> {
         let paths = self.paths.as_ref().ok_or("nowhere to look for a runtime")?;
-        let inferred = ferestre_core::autofix::infer(recipe, self.game_dir(recipe).as_deref());
+        // A local game is run as described: nothing is inferred for it.
+        let inferred;
+        let judged = if recipe.is_local() {
+            recipe
+        } else {
+            inferred = ferestre_core::autofix::infer(recipe, self.game_dir(recipe).as_deref());
+            &*inferred.recipe
+        };
         // The title's own choice, else XODUS_PROTON_DIR, as `ferestre run`.
         let selected =
             runtime::requested(paths, &recipe.title.product_id).map_err(|e| format!("{e:#}"))?;
         crate::model::launch_runtime(
-            &inferred.recipe,
-            &self.runtimes,
+            judged,
+            self.runtimes_for(&recipe.title.product_id),
             selected.as_deref(),
             self.registry.as_ref(),
         )
@@ -952,6 +1021,19 @@ impl Model {
         self.executable(&record.dir)
     }
 
+    /// A title's wide art that is on disk: the Store banner once fetched
+    /// (`hero_path` names where it would be kept, fetched or not), else a
+    /// local game's own landscape or hero picture.
+    pub fn wide_art(&self, product_id: &str) -> Option<PathBuf> {
+        self.catalog_cache()
+            .and_then(|c| c.hero_path(product_id))
+            .filter(|path| path.is_file())
+            .or_else(|| {
+                let art = self.local_art.get(&product_id.to_ascii_uppercase())?;
+                art.landscape.clone().or_else(|| art.hero.clone())
+            })
+    }
+
     pub fn catalog_cache(&self) -> Option<Cache> {
         self.paths.as_ref().map(Paths::catalog_cache)
     }
@@ -981,6 +1063,15 @@ impl Model {
     /// Where an edited recipe goes. Never the packaged directory.
     pub fn user_titles_dir(&self) -> Option<PathBuf> {
         self.paths.as_ref().map(Paths::user_titles_dir)
+    }
+
+    /// The runtimes a title may use: Steam's Protons too for a local game.
+    pub fn runtimes_for(&self, product_id: &str) -> &[InstalledRuntime] {
+        if ferestre_core::local::is_local_id(product_id) {
+            &self.local_runtimes
+        } else {
+            &self.runtimes
+        }
     }
 
     pub fn recipe_for(&self, product_id: &str) -> Option<&Recipe> {
@@ -1214,6 +1305,21 @@ fn kept_with_new<V>(
     kept
 }
 
+/// Each local game's portrait, else its icon, as the picture its row shows.
+fn local_icons(
+    art: &BTreeMap<String, ferestre_core::steam::ArtworkFiles>,
+) -> impl Iterator<Item = (String, PathBuf)> + '_ {
+    art.iter().filter_map(|(key, files)| {
+        files
+            .portrait
+            .clone()
+            .or_else(|| files.icon.clone())
+            .map(|path| (key.clone(), path))
+    })
+}
+
+/// Icons already on disk from a previous run. Nothing is fetched here: a window
+/// that waits on a hundred HTTP requests before it appears is not a window.
 fn existing_icons(cache: &Cache, catalog: &BTreeMap<String, Product>) -> BTreeMap<String, PathBuf> {
     catalog
         .keys()
@@ -1314,16 +1420,20 @@ mod tests {
         .unwrap()
     }
 
-    fn model_at(root: &Path) -> Model {
+    fn paths_at(root: &Path) -> Paths {
         let root = root.display().to_string();
-        let paths = Paths::resolve(&Env::from_map([
+        Paths::resolve(&Env::from_map([
             ("HOME", format!("{root}/home")),
             ("XODUS_GAMES_DIR", format!("{root}/games")),
             ("XDG_STATE_HOME", format!("{root}/state")),
             ("XDG_CONFIG_HOME", format!("{root}/config")),
             ("XDG_CACHE_HOME", format!("{root}/cache")),
         ]))
-        .unwrap();
+        .unwrap()
+    }
+
+    fn model_at(root: &Path) -> Model {
+        let paths = paths_at(root);
         Model {
             roles: None,
             roles_error: None,
@@ -1333,6 +1443,9 @@ mod tests {
             recipes: Vec::new(),
             runtime: None,
             runtimes: Vec::new(),
+            local_runtimes: Vec::new(),
+            anticheat: BTreeMap::new(),
+            local_art: BTreeMap::new(),
             registry: None,
             records: BTreeMap::new(),
             disk_usage: BTreeMap::new(),
@@ -1947,5 +2060,150 @@ mod tests {
         assert_eq!(merged.get("A"), Some(&1));
         assert_eq!(merged.get("B"), Some(&2), "fetched entries win");
         assert_eq!(merged.get("C"), Some(&30), "new entries are added");
+    }
+
+    // --- local games ----------------------------------------------------------
+
+    fn local_recipe(dir: &Path, prefix: Option<&Path>) -> Recipe {
+        let prefix = prefix.map_or(String::new(), |p| format!("prefix = \"{}\"\n", p.display()));
+        Recipe::parse(&format!(
+            "schema = 1\n[title]\nproduct-id = \"LOCAL-T\"\nname = \"Local Test\"\n\
+             slug = \"local-t\"\nkind = \"local\"\n[install]\ndir = \"{}\"\n{prefix}\
+             [launch]\nexecutable = 'Game.exe'\n[status]\nstate = \"untested\"\n\
+             summary = \"Added by hand\"\n",
+            dir.display()
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_local_game_is_installed_when_its_executable_exists() {
+        let tmp = Scratch::new("local-installed");
+        let dir = tmp.0.join("drive/Local Test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let local = local_recipe(&dir, None);
+        let mut model = model_at(&tmp.0);
+        model.recipes = vec![local.clone()];
+        // A stale record for the same id, pointing at a real folder.
+        let stale = tmp.0.join("games/elsewhere");
+        std::fs::create_dir_all(&stale).unwrap();
+        model
+            .records
+            .insert("LOCAL-T".into(), record("LOCAL-T", &stale));
+
+        assert!(!model.is_installed(&local));
+        write(&dir.join("Game.exe"), "");
+        assert!(model.is_installed(&local));
+        assert!(!model.incomplete("LOCAL-T"));
+        assert_eq!(model.game_dir(&local), Some(dir.clone()));
+        assert_eq!(model.installed_version(&local), None);
+    }
+
+    #[test]
+    fn local_art_survives_a_reload() {
+        let tmp = Scratch::new("local-art");
+        let paths = paths_at(&tmp.0);
+        let dir = tmp.0.join("drive/Local Test");
+        write(&dir.join("Game.exe"), "");
+        let local = local_recipe(&dir, None);
+        write(
+            &paths.user_titles_dir().join("LOCAL-T.toml"),
+            &local.to_toml().unwrap(),
+        );
+        let art = paths.local_art_dir("LOCAL-T").unwrap();
+        let icon = art.join("icon.png");
+        write(&icon, "png");
+
+        let mut m = Model::load_from(Ok(paths.clone()));
+        assert!(m.recipes.iter().any(|r| r.is_local()), "{:?}", m.problem);
+        assert_eq!(m.icons.get("LOCAL-T"), Some(&icon));
+
+        // A portrait chosen after the window opened: the reload must show it,
+        // not the icon carried over from the first load.
+        let portrait = art.join("portrait.png");
+        write(&portrait, "png");
+        m.reload_from(Model::load_from(Ok(paths)));
+        assert_eq!(m.local_art["LOCAL-T"].portrait, Some(portrait.clone()));
+        assert_eq!(m.icons.get("LOCAL-T"), Some(&portrait));
+    }
+
+    #[test]
+    fn wide_art_is_only_a_picture_on_disk() {
+        let tmp = Scratch::new("wide-art");
+        let paths = paths_at(&tmp.0);
+        let dir = tmp.0.join("drive/Local Test");
+        write(&dir.join("Game.exe"), "");
+        write(
+            &paths.user_titles_dir().join("LOCAL-T.toml"),
+            &local_recipe(&dir, None).to_toml().unwrap(),
+        );
+        let art = paths.local_art_dir("LOCAL-T").unwrap();
+        write(&art.join("portrait.png"), "png");
+        let m = Model::load_from(Ok(paths.clone()));
+        assert_eq!(m.wide_art("LOCAL-T"), None, "a portrait is not wide art");
+        assert_eq!(m.wide_art("9NOTFETCHED1"), None, "a banner never fetched");
+
+        write(&art.join("hero.jpg"), "jpg");
+        let m = Model::load_from(Ok(paths.clone()));
+        assert_eq!(m.wide_art("local-t"), Some(art.join("hero.jpg")));
+        write(&art.join("landscape.png"), "png");
+        let m = Model::load_from(Ok(paths));
+        assert_eq!(m.wide_art("LOCAL-T"), Some(art.join("landscape.png")));
+    }
+
+    #[test]
+    fn stop_targets_a_local_games_own_prefix_even_with_account_roles() {
+        const OWNER: &str = "11111111111111111111111111111111";
+        const PLAYER: &str = "22222222222222222222222222222222";
+        let tmp = Scratch::new("local-wineserver");
+        let rt = tmp.0.join("runtimes/test");
+        write(&rt.join("files/bin/wineserver"), "");
+        let runtime = InstalledRuntime {
+            path: rt.clone(),
+            version: Some("test".into()),
+            provides: Default::default(),
+            source: runtime::CapabilitySource::Manifest,
+        };
+        let prefix = tmp.0.join("drive/prefixes/Local Test");
+        let local = local_recipe(&tmp.0.join("drive/Local Test"), Some(&prefix));
+        let xbox = recipe("9ZZTESTGAME1", None);
+
+        let mut model = model_at(&tmp.0);
+        model.recipes = vec![local.clone(), xbox.clone()];
+        model.runtimes = vec![runtime.clone()];
+        model.local_runtimes = vec![runtime];
+        model.roles = Some(accounts::Selection {
+            store: OWNER.into(),
+            player: PLAYER.into(),
+            generation: 1,
+        });
+        let json = serde_json::json!({
+            "schema": 1,
+            "capabilities": [accounts::CLIENT_CAPABILITY],
+            "default_profile": OWNER,
+            "profiles": [
+                {"id": OWNER, "label": "Owner fixture", "signed_in": true,
+                 "legacy_saves": false, "save_namespace": "a".repeat(64)},
+                {"id": PLAYER, "label": "Player fixture", "signed_in": true,
+                 "legacy_saves": false, "save_namespace": "b".repeat(64)},
+            ],
+        });
+        model.profiles =
+            Some(accounts::parse_profiles(&serde_json::to_vec(&json).unwrap()).unwrap());
+
+        let (server, pfx) = model
+            .wineserver(&local)
+            .expect("a server for the local game");
+        assert_eq!(server, rt.join("files/bin/wineserver"));
+        assert_eq!(pfx, prefix.join("pfx"));
+
+        let (_, xbox_pfx) = model
+            .wineserver(&xbox)
+            .expect("a server for the Xbox title");
+        assert!(
+            xbox_pfx.starts_with(tmp.0.join("games/players").join("b".repeat(64))),
+            "{}",
+            xbox_pfx.display()
+        );
     }
 }

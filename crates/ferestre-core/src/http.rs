@@ -333,6 +333,68 @@ pub fn download_pinned(url: &str, dest: &Path, sha256: &str, limit: u64) -> Resu
     Ok(())
 }
 
+/// Fetch a large file over HTTPS to `dest`, keeping it only when `check`
+/// accepts it. For downloads whose trust is something the caller checks, such
+/// as a pinned SHA-256, and that are too large for [`download_pinned`]'s
+/// single time budget.
+///
+/// Resumable like the runtime download (see [`Patience`]); written to a
+/// temporary beside `dest` and renamed in only after `check` passes, so
+/// nothing unchecked is ever at `dest` or left beside it. At most `limit`
+/// bytes.
+pub fn download_large_checked(
+    url: &str,
+    dest: &Path,
+    limit: u64,
+    cancelled: impl Fn() -> bool,
+    check: impl Fn(&Path) -> Result<()>,
+) -> Result<()> {
+    download_checked(
+        url,
+        dest,
+        limit,
+        &cancelled,
+        &Patience {
+            https_only: true,
+            ..LARGE
+        },
+        &check,
+    )
+}
+
+fn download_checked(
+    url: &str,
+    dest: &Path,
+    limit: u64,
+    cancelled: &dyn Fn() -> bool,
+    patience: &Patience,
+    check: &dyn Fn(&Path) -> Result<()>,
+) -> Result<()> {
+    anyhow::ensure!(!cancelled(), "Download stopped");
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::cache::sweep_stale_temporaries(dest, "part");
+    let (temporary, mut file) = create_temporary(dest)?;
+    let result = (|| -> Result<()> {
+        fetch_resumable(url, &mut file, limit, cancelled, patience)?;
+        file.sync_all()?;
+        anyhow::ensure!(!cancelled(), "Download stopped");
+        check(&temporary)?;
+        std::fs::rename(&temporary, dest)?;
+        if let Some(parent) = dest.parent() {
+            crate::cache::sync_directory(parent);
+        }
+        Ok(())
+    })();
+    drop(file);
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(anyhow!("{url}: {e:#}"));
+    }
+    Ok(())
+}
+
 fn download_release(
     url: &str,
     signature_url: &str,
@@ -1053,6 +1115,49 @@ mod tests {
             let error = result.unwrap_err().to_string();
             assert!(error.contains("no release signing key"), "{error}");
         }
+        assert!(leftovers(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_checked_download_is_kept_only_when_the_check_passes() {
+        let data = runtime_bytes();
+        let (base, _) = serve(vec![("/pkg.tar.gz", Served::file(&data))]);
+        let url = format!("{base}/pkg.tar.gz");
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("pkg.tar.gz");
+        download_checked(&url, &dest, 1 << 20, &|| false, &QUICK, &|_| Ok(())).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+        std::fs::remove_file(&dest).unwrap();
+
+        let error = download_checked(&url, &dest, 1 << 20, &|| false, &QUICK, &|_| {
+            bail!("not the pinned package")
+        })
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not the pinned package"),
+            "{error:#}"
+        );
+        assert!(
+            leftovers(dir.path()).is_empty(),
+            "nothing unchecked is kept"
+        );
+    }
+
+    #[test]
+    fn a_checked_download_past_its_limit_is_refused() {
+        let (base, _) = serve(vec![("/big", Served::file(&[7u8; 20]))]);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("big");
+        let error = download_checked(
+            &format!("{base}/big"),
+            &dest,
+            10,
+            &|| false,
+            &QUICK,
+            &|_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("larger than"), "{error:#}");
         assert!(leftovers(dir.path()).is_empty());
     }
 

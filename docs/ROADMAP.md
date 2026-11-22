@@ -397,6 +397,17 @@ honestly marked as unproven rather than planned.
       See [RELEASING.md](RELEASING.md) and
       [PACKAGE-SIGNATURES.md](PACKAGE-SIGNATURES.md).
 
+- [x] **Neural rendering (experimental).** DLSSNR-AMD, built from a pinned
+      upstream commit, installed per game into the executable's folder with
+      the model taken from the person's own `nvngx_dlssnr.dll`; backed up and
+      reversible, gated on anti-cheat and re-checked before every launch. See
+      [NEURAL-RENDERING.md](NEURAL-RENDERING.md).
+
+- [ ] **Fetch `nvngx_dlssnr.dll` from an installed Xbox package** through
+      `xodus-cli streaming --only <path>` (needs the `icex/xodus` fork
+      change). Today discovery only reads the files an install already
+      decrypted, so a DLL kept encrypted on disk is skipped.
+
 - [ ] **Appx and Msix packages.** This runtime opens MSIXVC, the container Xbox
       GDK titles ship in. The rest of a Store library is `Appx`, `AppxBundle`,
       `Msix`, `MsixBundle` and their `E`-prefixed encrypted variants, and the

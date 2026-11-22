@@ -74,6 +74,13 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.1.25" date="2026-11-22">
+      <description>
+        <p>Play the Windows games you already have from one library: import Steam's non-Steam shortcuts with their prefixes, Proton builds, launch options and artwork, or add any game by its executable. Saves and prefixes are reused, and removing a game never deletes it.</p>
+        <p>Anti-cheat files in a game's folder are named before you play, with a caution for kernel-level ones.</p>
+        <p>Experimental neural rendering on AMD Radeon RX 9000 cards through DLSSNR-AMD, per game, with your own copy of NVIDIA's model.</p>
+      </description>
+    </release>
     <release version="0.1.24" date="2026-11-22">
       <description>
         <p>Hogwarts Legacy, Batman: Arkham Knight, Control, Crash Bandicoot N. Sane Trilogy and Dead by Daylight are playable, and Death Stranding Director's Cut plays offline, with the matching Proton runtime.</p>

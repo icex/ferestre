@@ -80,8 +80,9 @@ that. Any other variable, or a value no control can show, stays a plain row, so
 the editor never rewrites what a recipe says. Reset to defaults renames the
 user's copy to `<PRODUCT-ID>.toml.bak`.
 
-There is no way to pass arguments to the title: the client starts the
+There is no way to pass arguments to a Store title: the client starts the
 executable with none, so a key for them would be a promise nothing keeps.
+Local games can take them; see [Local games](#local-games-user-recipes-only).
 
 The executable named in `MicrosoftGame.Config` is not always the one to run —
 Expedition 33 declares a wrapper — so this is the observed path, not a copy of
@@ -238,3 +239,42 @@ must not be in the future.
   the implementing fork commits. A title should not have to care how a capability is implemented.
 - **Anything per-machine.** Paths are relative and resolved from `XODUS_*`
   environment variables, so a recipe is the same file on everyone's disk.
+
+## Local games (user recipes only)
+
+A Windows game Ferestre did not install -- added by hand, or imported from a
+Steam non-Steam shortcut -- is a recipe in the user's titles directory, never
+in this one. `titles/validate.py` refuses one here, because it does not know
+the keys below. Such a recipe differs from a Store title's in these ways:
+
+- `[title].kind = "local"` marks it. It is set exactly when the product id
+  starts with `LOCAL-` (`LOCAL-STEAM-<app id>` for a Steam shortcut,
+  `LOCAL-<NAME>` for one added by hand): the dash means it can never be a
+  Store product id, and a recipe with one but not the other is refused.
+- `[title].slug` must be the id in lowercase.
+- `[install].dir` is the game's **absolute** folder, at least two levels
+  below `/`, with no `..`. It is not inside the games directory and Ferestre
+  never deletes it. Adding or importing a game also refuses a folder that is
+  or holds the home directory, the games directory, a Steam install or a
+  Steam library.
+- `[install].prefix` is optional: an absolute prefix (Steam's own
+  `compatdata/<app id>`, say), at least two levels below `/` with no `..`,
+  is used as it is and never deleted;
+  a relative one, or none, gives a prefix in the games directory as for any
+  title.
+- `[install].content`, `dir-env` and `prefix-env` are refused.
+- `[launch].executable` is relative to that folder or absolute, with either
+  `/` or `\` as the separator, and no `..`.
+- `[launch].args` (array of strings) are passed to the game after the
+  executable.
+- `[launch].wrapper` (array of strings) is a flat argv prefix the launch runs
+  through, such as `["gamemoderun", "mangohud"]` -- what Steam puts before
+  `%command%`.
+
+- `[launch].working-dir` (string) is the folder the game starts in, relative
+  to `[install].dir` (either separator) or absolute, with no `..`. Unset, the
+  game starts in `[install].dir`, as Steam starts a shortcut in its start
+  folder. Set it when the executable skips a launcher that used to start the
+  game from another folder (GOG's Witcher 3: `'bin\x64_dx12'`).
+
+A Store title's recipe with `args`, `wrapper` or `working-dir` is refused.

@@ -1,0 +1,193 @@
+# The DLSSNR-AMD package's release train: rare, and never the "latest" release.
+#
+# Builds the Linux package of DLSSNR-AMD (x86_64 and i686) from the upstream
+# commit pinned in sources.lock.json (`packages.dlssnr-amd`), with
+# scripts/build-dlssnr.sh, in the container image upstream's own release job
+# uses. ferestre-core downloads these tarballs by a SHA-256 pinned in its
+# source, so the signature is a second check, not the only one.
+#
+# No NVIDIA file is in either tarball: the build refuses a tarball holding a
+# model, and the launcher extracts the model from the person's own
+# nvngx_dlssnr.dll at install time.
+#
+# Two jobs, as in runtime.yml. `build` runs upstream's build scripts with a
+# read-only token that is not written to any checkout; `publish` runs only on
+# a tag push, after `build` succeeded, and only checks, signs and uploads what
+# it is handed. It is the one job that can write a release and the only one
+# that sees the minisign key (the `release` environment's secrets). Each
+# signature's trusted comment is `file:<name> version:<version>`.
+#
+# A workflow_dispatch run builds the same files and attaches them to the run
+# UNSIGNED, and says so. That holds for a manual run started on a tag ref too:
+# signing and publishing ask for a push.
+#
+# Cutting a package release, after the pin in sources.lock.json is on main:
+#
+#   git tag -a dlssnr-0.0.9 -m 'DLSSNR-AMD 0.0.9 (9503f6b) for Ferestre' && git push origin dlssnr-0.0.9
+#
+# The tag's version must be the pinned `version`. The release is created with
+# --latest=false so the README's "latest release" link stays on the launcher.
+name: DLSSNR-AMD package
+
+on:
+  push:
+    tags:
+      - 'dlssnr-*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dlssnr-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    outputs:
+      version: ${{ steps.build.outputs.version }}
+      commit: ${{ steps.build.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Upstream's build scripts run in this job; none of them needs the
+          # token, so none of them gets it.
+          persist-credentials: false
+
+      # A tag can be created on any branch, and a release cut from dev would
+      # publish work that never reached main.
+      - name: The tag must be on main
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          git fetch --quiet --depth=100 origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "::error::$GITHUB_REF_NAME is not on main -- merge to main and tag there"
+              exit 1
+          fi
+          echo ":: $GITHUB_REF_NAME is on main"
+
+      - name: Build
+        id: build
+        run: |
+          set -euo pipefail
+          version=$(python3 scripts/source-pins.py package dlssnr-amd version)
+          commit=$(python3 scripts/source-pins.py package dlssnr-amd commit)
+          # A tag names the version it publishes; it must be the pinned one,
+          # or the signatures would carry a version the tarballs do not.
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+              tag_version=${GITHUB_REF_NAME#dlssnr-}
+              if [ "$tag_version" != "$version" ]; then
+                  echo "::error::the tag $GITHUB_REF_NAME says $tag_version, but sources.lock.json pins DLSSNR-AMD $version"
+                  exit 1
+              fi
+          fi
+          bash scripts/build-dlssnr.sh out
+          (cd out && sha256sum --strict -c SHA256SUMS)
+          ls -lh out
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Unsigned build
+        if: github.event_name != 'push' || github.ref_type != 'tag'
+        env:
+          VERSION: ${{ steps.build.outputs.version }}
+        run: |
+          msg="DLSSNR-AMD $VERSION was built by a manual run and is UNSIGNED and unpublished. Only a dlssnr-* tag signs and publishes."
+          echo "::notice::$msg"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ferestre-dlssnr-${{ steps.build.outputs.version }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: build
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    # Where the signing secrets live; see release.yml and docs/RELEASING.md.
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          # The signing script, and the key the launcher at this commit
+          # trusts.
+          sparse-checkout: |
+            packaging
+            crates/ferestre-core/src
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ferestre-dlssnr-${{ needs.build.outputs.version }}
+          path: out
+
+      - name: minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+      # Checks SHA256SUMS (which lists both tarballs and SOURCES.txt), then
+      # signs every file. The key has to be the one ferestre-core's signing.rs
+      # carries; a placeholder there stops the release here.
+      - name: Sign
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          FERESTRE_EXPECT_PUBKEY_IN: crates/ferestre-core/src/signing.rs
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag_version=${GITHUB_REF_NAME#dlssnr-}
+          if [ "$tag_version" != "$VERSION" ]; then
+              echo "::error::built as $VERSION, but the tag $GITHUB_REF_NAME says $tag_version"
+              exit 1
+          fi
+          packaging/sign-release.sh out "$tag_version"
+          ls -lh out
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
+          COMMIT: ${{ needs.build.outputs.commit }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" out/* \
+            --latest=false \
+            --title "DLSSNR-AMD $VERSION for Ferestre" \
+            --notes "
+          The Linux package of DLSSNR-AMD $VERSION that Ferestre's experimental
+          neural rendering installs (\`ferestre neural\`). Ferestre downloads
+          these tarballs itself and checks them against a SHA-256 built into
+          the launcher; each file also has a minisign signature beside it
+          (\`.minisig\`).
+
+          Built from the upstream commit
+          \`$COMMIT\` of https://github.com/TheAutomatic/DLSSNR-AMD, pinned in
+          \`sources.lock.json\` at this tag, by \`scripts/build-dlssnr.sh\`.
+          \`SOURCES.txt\` lists the sources.
+
+          **No NVIDIA file is included.** The model is extracted at install
+          time from your own \`nvngx_dlssnr.dll\`.
+
+          Licences of what is inside:
+
+          | Component | Licence |
+          |---|---|
+          | DLSSNR-AMD | MIT |
+          | OptiScaler (nightly-20261030, unmodified) | GPL-3.0; source: https://github.com/optiscaler/OptiScaler at \`e7e3872d410f704479d94d318d68d163b6b58947\` |
+          | ReShade 6.8.0 | BSD-3-Clause |
+          | Vulkan-Loader v1.4.357 | Apache-2.0; the changes are in \`vulkan/PATCHES.diff\` |
+
+          Each licence text is inside the tarball beside the component.
+          "

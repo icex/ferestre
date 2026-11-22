@@ -53,6 +53,9 @@ TIMEOUT = 20.0
 POLL = 0.2
 
 
+SMOKE_APP_ID = "io.github.icex.ferestre.SmokeTest"
+
+
 class Failure(Exception):
     pass
 
@@ -488,7 +491,7 @@ def toggle_row_menu(app, frame, title, want_open):
     raise Failure(f"timed out waiting for {title}'s menu to " + ("open" if want_open else "close"))
 
 
-MENU_ITEMS = {"Game details", "Move location", "Open Store page", "Choose runtime", "Add to Steam", "Edit launch settings", "Remove from disk"}
+MENU_ITEMS = {"Game details", "Move location", "Open Store page", "Choose runtime", "Add to Steam", "Edit launch settings", "Neural rendering…", "Remove from disk"}
 
 
 def row_menu_offers(app, frame, title):
@@ -689,19 +692,21 @@ def main():
 
     # GApplication is single-instance by design -- opening the launcher twice
     # should raise the window you already have, not give you a second one -- so
-    # a window left open from a manual test makes the run under test exit at
-    # once, having handed its arguments to that other process. The symptom is
-    # "no accessible application with pid N", which describes none of that.
+    # a window left open would make the run under test exit at once, having
+    # handed its arguments to that other process. The run takes an application
+    # id of its own, as the other GUI tests do, so a Ferestre someone is using
+    # neither blocks it nor gets driven by it. Only a leftover smoke run can
+    # hold this name, and that one is reported rather than attached to.
     owner = subprocess.run(
         ["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
          "--object-path", "/org/freedesktop/DBus",
-         "--method", "org.freedesktop.DBus.NameHasOwner", "io.github.icex.ferestre"],
+         "--method", "org.freedesktop.DBus.NameHasOwner", SMOKE_APP_ID],
         capture_output=True, text=True,
     )
     if "true" in owner.stdout:
         raise Failure(
-            "a ferestre-gui is already running and owns io.github.icex.ferestre on this "
-            "session bus; close it first, or this run exits into it instead of starting"
+            f"an earlier smoke run still owns {SMOKE_APP_ID} on this session bus; "
+            "close it first, or this run exits into it instead of starting"
         )
 
     # A throwaway HOME, so the test cannot read a real account's cached library
@@ -736,6 +741,7 @@ last-verified = 2026-10-10
             "XDG_STATE_HOME": os.path.join(home, "state"),
             "XDG_CONFIG_HOME": os.path.join(home, "config"),
             "GTK_A11Y": "atspi",
+            "FERESTRE_APPLICATION_ID": SMOKE_APP_ID,
             # Startup now refreshes the public catalog. Keep this fixture
             # offline: a refused local proxy exercises cached fallback and
             # prevents real Microsoft data from replacing its seeded rows.
@@ -1200,25 +1206,33 @@ print(":: done", flush=True)
         # With the pointer, not an action: the click focuses the button, the
         # redraw destroys it, and GTK hands the focus to the first widget left
         # in the list -- scrolling the library to the top to show it.
-        press(play, gui.pid)
-        wait_for(
-            frame,
-            lambda root: row_button(root, "Minecraft for Windows", "Stop"),
-            "the row to say the title is running",
-            time.monotonic() + TIMEOUT,
-        )
-        time.sleep(0.5)
-        after = scroll_value().get_current_value()
-        check(abs(after - position) < 2, f"starting a title keeps the scroll position ({position} -> {after})", frame)
-        wait_for(
-            frame,
-            lambda root: row_button(root, "Minecraft for Windows", "Play"),
-            "the title to exit",
-            time.monotonic() + TIMEOUT,
-        )
-        time.sleep(0.5)
-        after = scroll_value().get_current_value()
-        check(abs(after - position) < 2, f"and so does its exit ({position} -> {after})", frame)
+        #
+        # A synthetic click needs an X server that accepts XTest. A nested
+        # Xwayland (the way to run this without driving the real desktop's
+        # pointer) ignores it, so FERESTRE_SMOKE_NO_POINTER=1 skips this one
+        # step there and says so; CI's Xvfb runs it.
+        if os.environ.get("FERESTRE_SMOKE_NO_POINTER") == "1":
+            print("  SKIPPED: the pointer click (FERESTRE_SMOKE_NO_POINTER=1)")
+        else:
+            press(play, gui.pid)
+            wait_for(
+                frame,
+                lambda root: row_button(root, "Minecraft for Windows", "Stop"),
+                "the row to say the title is running",
+                time.monotonic() + TIMEOUT,
+            )
+            time.sleep(0.5)
+            after = scroll_value().get_current_value()
+            check(abs(after - position) < 2, f"starting a title keeps the scroll position ({position} -> {after})", frame)
+            wait_for(
+                frame,
+                lambda root: row_button(root, "Minecraft for Windows", "Play"),
+                "the title to exit",
+                time.monotonic() + TIMEOUT,
+            )
+            time.sleep(0.5)
+            after = scroll_value().get_current_value()
+            check(abs(after - position) < 2, f"and so does its exit ({position} -> {after})", frame)
 
         select_in_list(frame, "Runtime")
         wait_for(frame, lambda root: "Ferestre release" in texts(root), "section navigation", time.monotonic() + TIMEOUT)
@@ -1352,6 +1366,16 @@ print(":: done", flush=True)
 
         check("Installed versions" not in labels and "Capabilities" not in labels,
               "Settings omits redundant versions and technical capability lists", frame)
+        check("Neural rendering (experimental)" in labels,
+              "Settings has the neural rendering group", frame)
+        check("nvngx_dlssnr.dll download address" in labels,
+              "with a field for the DLL's download address", frame)
+        check("Models" in labels and "None cached" in labels,
+              "and says no model is cached yet", frame)
+        check(not any("Could not read settings" in t for t in labels),
+              "a missing settings file is not an error", frame)
+        check(bool(find_all(frame, role="button", name="Set up")),
+              "the models row offers Set up", frame)
 
         print("installed section")
         select_in_list(frame, "Installed")
@@ -1670,6 +1694,38 @@ print(":: done", flush=True)
             time.monotonic() + TIMEOUT,
         )
         check(True, "and closing it leaves the library where it was")
+
+        print("neural rendering dialog")
+        # Minecraft is the fixture on disk; the item is only offered for one.
+        row_action(app, frame, "Neural rendering…", "Minecraft for Windows")
+        labels = wait_for(
+            app,
+            lambda root: texts(root) if any(t.startswith("Neural rendering for") for t in texts(root)) else None,
+            "the neural rendering dialog to open",
+            time.monotonic() + TIMEOUT,
+        )
+        check(any(t.startswith("Experimental: DLSSNR-AMD") for t in labels),
+              "the dialog says it is experimental", frame)
+        check(any(t.startswith("Off") for t in labels),
+              "and that neural rendering is off for this game", frame)
+        check("Route" in labels and "Starting network" in labels,
+              "it offers a route and a starting network", frame)
+        check(any(t.startswith("Automatic (") for t in labels),
+              "the route starts on the detected one", frame)
+        enable = next(iter(find_all(app, role="button", name="Enable")), None)
+        check(enable is not None, "it has an Enable button", frame)
+        check(not find_all(app, role="button", name="Disable"),
+              "and no Disable while it is off", frame)
+        click_named(app, "Cancel")
+        wait_for(
+            app,
+            lambda root: not any(t.startswith("Neural rendering for") for t in texts(root)),
+            "the neural rendering dialog to close",
+            time.monotonic() + TIMEOUT,
+        )
+        check(True, "Cancel closes it without enabling anything")
+        check(not os.path.exists(os.path.join(home, "config", "ferestre", "neural-rendering.toml")),
+              "and nothing about neural rendering was written")
 
         print("saving an edit")
         user_titles = os.path.join(home, "config", "ferestre", "titles")

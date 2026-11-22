@@ -35,7 +35,7 @@ real contribution even — especially — when the answer is that it does not ru
 **Before you paste anything: a session log contains your gamertag, your XUID and
 your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 
-Current launcher: [0.1.24](RELEASE-0.1.24.md), using runtime **11.0.20261122.2**. The release notes describe the runtime fixes behind Hogwarts Legacy, Batman: Arkham Knight, Dead by Daylight and Death Stranding Director's Cut; the detailed [0.1.16 qualification](RELEASE-0.1.16.md) describes earlier launcher and controller fixture coverage. The title-specific results and dates below come from the recipes; they are not refreshed merely because the launcher changes.
+Current launcher: [0.1.25](RELEASE-0.1.25.md), using runtime **11.0.20261122.2**. The [0.1.24 notes](RELEASE-0.1.24.md) describe the runtime fixes behind Hogwarts Legacy, Batman: Arkham Knight, Dead by Daylight and Death Stranding Director's Cut; the detailed [0.1.16 qualification](RELEASE-0.1.16.md) describes earlier launcher and controller fixture coverage. The title-specific results and dates below come from the recipes; they are not refreshed merely because the launcher changes.
 
 ## The matrix
 

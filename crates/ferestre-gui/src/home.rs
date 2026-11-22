@@ -73,16 +73,9 @@ pub(crate) fn hero_candidates(library: &[LibraryRow], gamepass: &[LibraryRow]) -
 }
 
 fn features(model: &Model, library: &[LibraryRow], gamepass: &[LibraryRow]) -> Vec<Feature> {
-    let cache = model.catalog_cache();
-    // Only art that is on disk: `hero_path` names where a banner would be
-    // kept, whether or not it was ever fetched, and a title shown on a path
-    // with nothing behind it was a blank banner in the carousel.
-    let hero = |id: &str| {
-        cache
-            .as_ref()
-            .and_then(|c| c.hero_path(id))
-            .filter(|path| path.is_file())
-    };
+    // Only art that is on disk: a title shown on a path with nothing behind
+    // it was a blank banner in the carousel.
+    let hero = |id: &str| model.wide_art(id);
     let mut out: Vec<Feature> = Vec::new();
     let mut add = |row: &LibraryRow, gp: bool, need_art: bool| {
         if out.len() >= HERO_ITEMS
@@ -539,11 +532,10 @@ fn landscape(ui: &Ui, row: &LibraryRow) -> gtk::Widget {
         return game_card(ui, row).upcast();
     }
     let key = row.product_id.to_ascii_uppercase();
-    let hero = ui
-        .model
-        .borrow()
-        .catalog_cache()
-        .and_then(|c| c.hero_path(&row.product_id));
+    // Only a banner on disk. A path to one never fetched (only featured
+    // titles' are) was a blank tile in Jump back in, waiting on a slot
+    // nothing fills; the cover's slot is filled once it arrives.
+    let hero = ui.model.borrow().wide_art(&row.product_id);
     let cover = ui.model.borrow().icons.get(&key).cloned();
     let art = art_picture(hero.as_deref(), cover.as_deref(), textures::Size::Hero);
     if hero.is_some() {

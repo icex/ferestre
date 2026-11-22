@@ -13,6 +13,9 @@
 //! (`easyanticheat_x64.so`) next to its Windows one; Wine's load order checks
 //! for it. A title without it loads its own Windows EAC library exactly as
 //! before, so setting the variable is safe for every title.
+//!
+//! [`detect`] looks for any known anti-cheat's files in a game's folder, so a
+//! local game can say what it ships before it is started.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -107,6 +110,211 @@ fn has_child_dir(dir: &Path, name: &str) -> bool {
                 && e.file_type().is_ok_and(|t| t.is_dir())
         })
     })
+}
+
+/// An anti-cheat whose files were found in a game's folder.
+///
+/// A file on disk is evidence, not proof: a build may ship a driver it never
+/// starts (publicly modded builds keep it next to a Steam emulator).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Detection {
+    pub name: &'static str,
+    /// It ships a Windows kernel driver.
+    pub kernel: bool,
+    /// Proton has a bridge for it (one of [`ALL`]).
+    pub proton_runtime: bool,
+    /// The first file or folder found, as it is on disk.
+    pub evidence: PathBuf,
+}
+
+/// The files and folders that give an anti-cheat away. Patterns are
+/// lowercase, compared without case, with at most one `*`.
+pub struct Signature {
+    pub name: &'static str,
+    /// It ships a Windows kernel driver.
+    pub kernel: bool,
+    /// Proton has a bridge for it (one of [`ALL`]).
+    pub proton_runtime: bool,
+    pub files: &'static [&'static str],
+    pub dirs: &'static [&'static str],
+}
+
+pub const SIGNATURES: &[Signature] = &[
+    Signature {
+        name: "Easy Anti-Cheat",
+        kernel: true,
+        proton_runtime: true,
+        files: &[
+            "start_protected_game.exe",
+            "easyanticheat_x64.dll",
+            "easyanticheat_eos_setup.exe",
+            "eaclaunch.exe",
+        ],
+        dirs: &["easyanticheat", "easyanticheat_eos"],
+    },
+    Signature {
+        name: "BattlEye",
+        kernel: true,
+        proton_runtime: true,
+        files: &["beservice*.exe", "beclient*.dll", "bedaisy.sys"],
+        dirs: &["battleye"],
+    },
+    Signature {
+        name: "Ricochet",
+        kernel: true,
+        proton_runtime: false,
+        files: &["randgrid.sys"],
+        dirs: &[],
+    },
+    Signature {
+        name: "Riot Vanguard",
+        kernel: true,
+        proton_runtime: false,
+        files: &["vgk.sys", "vgc.exe"],
+        dirs: &[],
+    },
+    Signature {
+        name: "EA AntiCheat",
+        kernel: true,
+        proton_runtime: false,
+        files: &[
+            "eaanticheat.gameservicelauncher.exe",
+            "eaanticheat.gameservicelauncher.dll",
+            "eaanticheat.installer.exe",
+        ],
+        dirs: &[],
+    },
+    Signature {
+        name: "nProtect GameGuard",
+        kernel: true,
+        proton_runtime: false,
+        files: &["npggsvc.exe", "gameguard.des"],
+        dirs: &["gameguard"],
+    },
+    Signature {
+        name: "ACE",
+        kernel: true,
+        proton_runtime: false,
+        files: &["sguard64.exe", "ace-base*"],
+        dirs: &["ace-base*"],
+    },
+    Signature {
+        name: "XIGNCODE3",
+        kernel: true,
+        proton_runtime: false,
+        files: &["x3.xem"],
+        dirs: &["xigncode"],
+    },
+    Signature {
+        name: "mhyprot",
+        kernel: true,
+        proton_runtime: false,
+        files: &["mhyprot*.sys"],
+        dirs: &[],
+    },
+];
+
+/// Whether a lowercase `name` matches a lowercase `pattern` with at most one
+/// `*`, which stands for any run of characters (`beservice*.exe`).
+fn matches(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) => {
+            name.len() >= prefix.len() + suffix.len()
+                && name.starts_with(prefix)
+                && name.ends_with(suffix)
+        }
+        None => name == pattern,
+    }
+}
+
+/// The anti-cheats whose files are in `game_dir` or beside `executable` (a
+/// path relative to `game_dir`, `\` read as `/`, or absolute), one per
+/// signature, in [`SIGNATURES`] order.
+pub fn detect(game_dir: &Path, executable: &str) -> Vec<Detection> {
+    let executable = executable.replace('\\', "/");
+    let beside = Path::new(&executable).parent().map(|p| game_dir.join(p));
+    let mut entries: Vec<(String, bool, PathBuf)> = Vec::new();
+    let mut seen = Vec::new();
+    for dir in [Some(game_dir.to_path_buf()), beside].into_iter().flatten() {
+        if seen.contains(&dir) {
+            continue;
+        }
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            seen.push(dir);
+            continue;
+        };
+        let mut found: Vec<(String, bool, PathBuf)> = read
+            .flatten()
+            .map(|e| {
+                let is_dir = e.path().is_dir();
+                (
+                    e.file_name().to_string_lossy().to_lowercase(),
+                    is_dir,
+                    e.path(),
+                )
+            })
+            .collect();
+        found.sort_by(|a, b| a.2.cmp(&b.2));
+        entries.extend(found);
+        seen.push(dir);
+    }
+    SIGNATURES
+        .iter()
+        .filter_map(|signature| {
+            let evidence = entries.iter().find(|(name, is_dir, _)| {
+                let patterns = if *is_dir {
+                    signature.dirs
+                } else {
+                    signature.files
+                };
+                patterns.iter().any(|p| matches(p, name))
+            })?;
+            Some(Detection {
+                name: signature.name,
+                kernel: signature.kernel,
+                proton_runtime: signature.proton_runtime,
+                evidence: evidence.2.clone(),
+            })
+        })
+        .collect()
+}
+
+/// One line for the CLI and the GUI saying which anti-cheat files were found.
+/// It states evidence, not a verdict. `None` when nothing was found.
+pub fn describe(found: &[Detection]) -> Option<String> {
+    if found.is_empty() {
+        return None;
+    }
+    let items: Vec<String> = found
+        .iter()
+        .map(|d| {
+            let mut evidence = d
+                .evidence
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| d.evidence.display().to_string());
+            if d.evidence.is_dir() {
+                evidence.push('/');
+            }
+            let mut notes = Vec::new();
+            if d.kernel {
+                notes.push("a kernel driver");
+            }
+            if d.proton_runtime {
+                notes.push("Proton has a runtime for it");
+            }
+            if notes.is_empty() {
+                format!("{} ({evidence})", d.name)
+            } else {
+                format!("{} ({evidence}, {})", d.name, notes.join("; "))
+            }
+        })
+        .collect();
+    Some(format!(
+        "anti-cheat files found: {}. If this build uses them, play single-player offline only; \
+         online play may be refused or lead to a ban.",
+        items.join(", ")
+    ))
 }
 
 /// Where the runtimes live, under the launcher's state directory.
@@ -366,6 +574,78 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains("unpack"))
             .collect();
         assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn a_kernel_anti_cheat_is_reported_once_as_evidence_even_where_the_build_is_modded() {
+        // The CoD sp26 layout: the driver at the root and beside the exe, plus a Steam emulator.
+        let game = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(game.path().join("sp26/steam_settings")).unwrap();
+        for f in ["Randgrid.sys", "sp26/Randgrid.sys", "sp26/sp26-cod.exe"] {
+            std::fs::write(game.path().join(f), b"").unwrap();
+        }
+        let found = detect(game.path(), "sp26/sp26-cod.exe");
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (found[0].name, found[0].kernel, found[0].proton_runtime),
+            ("Ricochet", true, false)
+        );
+        let line = describe(&found).unwrap();
+        assert!(
+            line.contains("Randgrid.sys") && line.contains("If this build uses them"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("will not run"),
+            "evidence, not a verdict: {line}"
+        );
+    }
+
+    #[test]
+    fn every_signature_is_recognised_by_its_file_or_folder() {
+        for (layout, name) in [
+            ("EasyAntiCheat/", "Easy Anti-Cheat"),
+            ("BEService_x64.exe", "BattlEye"),
+            ("vgc.exe", "Riot Vanguard"),
+            ("EAAntiCheat.GameServiceLauncher.exe", "EA AntiCheat"),
+            ("GameGuard/", "nProtect GameGuard"),
+            ("SGuard64.exe", "ACE"),
+            ("ACE-Base64.sys", "ACE"),
+            ("x3.xem", "XIGNCODE3"),
+            ("mhyprot3.sys", "mhyprot"),
+        ] {
+            let game = tempfile::tempdir().unwrap();
+            match layout.strip_suffix('/') {
+                Some(dir) => std::fs::create_dir(game.path().join(dir)).unwrap(),
+                None => std::fs::write(game.path().join(layout), b"").unwrap(),
+            }
+            let found = detect(game.path(), "Game.exe");
+            assert_eq!(found.len(), 1, "{layout}");
+            assert_eq!(found[0].name, name, "{layout}");
+        }
+        assert!(SIGNATURES.iter().all(|s| s.kernel));
+        assert!(SIGNATURES
+            .iter()
+            .filter(|s| s.proton_runtime)
+            .map(|s| s.name)
+            .eq(["Easy Anti-Cheat", "BattlEye"]));
+        assert!(detect(tempfile::tempdir().unwrap().path(), "Game.exe").is_empty());
+        assert!(describe(&[]).is_none());
+    }
+
+    #[test]
+    fn a_folder_is_named_as_a_folder_and_an_absolute_executable_is_honoured() {
+        let game = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::create_dir(other.path().join("EasyAntiCheat")).unwrap();
+        let exe = other.path().join("Launcher.exe");
+        let found = detect(game.path(), exe.to_str().unwrap());
+        assert_eq!(found.len(), 1);
+        let line = describe(&found).unwrap();
+        assert!(
+            line.contains("EasyAntiCheat/") && line.contains("Proton has a runtime for it"),
+            "{line}"
+        );
     }
 }
 

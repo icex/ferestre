@@ -73,10 +73,30 @@ Upstream projects
                   These changes are not submitted upstream: Xodus operates a
                   clean-room policy that excludes AI-assisted contributions.
 
+DLSSNR-AMD package (released as dlssnr-<version>, not in this tree)
+--------------------------------------------------------------------
+  https://github.com/TheAutomatic/DLSSNR-AMD         MIT
+
+  scripts/build-dlssnr.sh builds DLSSNR-AMD's Linux package from the upstream
+  commit pinned in sources.lock.json (`packages`), unmodified, and the
+  dlssnr-* releases host it. The package bundles, each with its licence text
+  beside it:
+    OptiScaler      GPL-3.0, shipped unmodified from its nightly-20261030
+                    release; source:
+                    https://github.com/optiscaler/OptiScaler
+                    at e7e3872d410f704479d94d318d68d163b6b58947
+    ReShade         BSD-3-Clause
+    Vulkan-Loader   Apache-2.0, with its changes in vulkan/PATCHES.diff
+    DLSS5-Feeder, vort_Shaders, Dear ImGui, Inter   their own licences
+  Its SOURCES.txt lists the sources. No NVIDIA file is in the package or in
+  this repository: the model is extracted on the person's machine from their
+  own nvngx_dlssnr.dll, whose download URL, if any, comes only from their own
+  settings.
+
 Trademarks
 ----------
-  Xbox, Microsoft, the Microsoft Store, Minecraft and the titles named in the
-  documentation are trademarks of their respective owners. This project is not
+  Xbox, Microsoft, the Microsoft Store, Minecraft, NVIDIA, DLSS and the titles
+  named in the documentation are trademarks of their respective owners. This project is not
   affiliated with, endorsed by, or connected to Microsoft, Mojang, Valve or the
   Xodus project. Names are used only to describe what the software is
   compatible with.

@@ -6,7 +6,7 @@ Play compatible **Xbox PC and Microsoft Store games on Linux** using your Micros
 
 <br clear="left">
 
-**[Download the AppImage](https://github.com/icex/ferestre/releases/download/v0.1.24/ferestre-0.1.24-x86_64.AppImage)** · [Compatible games](docs/COMPATIBILITY.md#the-matrix) · [Quick start](#quick-start) · [Report a problem](https://github.com/icex/ferestre/issues)
+**[Download the AppImage](https://github.com/icex/ferestre/releases/download/v0.1.25/ferestre-0.1.25-x86_64.AppImage)** · [Compatible games](docs/COMPATIBILITY.md#the-matrix) · [Quick start](#quick-start) · [Report a problem](https://github.com/icex/ferestre/issues)
 
 ![Ferestre's Home: a featured-game carousel, quick links and a Jump back in shelf, with installed games and their status in the sidebar](docs/screenshots/home.png)
 
@@ -138,6 +138,19 @@ Open the game's **More actions → Edit launch settings**. Settings such as nati
 - **Move:** open the game's **More actions → Move location**, choose an existing library folder and confirm after the space check. Ferestre verifies the move, and keeps the original if it fails or is cancelled. Saves and prefixes retain their existing locations.
 - **Steam:** close Steam, then choose **Add to Steam** in the game's menu. **Add All to Steam** in the Installed list adds all installed games. Shortcuts include available artwork and retain their identity when updated.
 
+### Play games you already have
+
+Windows games Ferestre did not install (GOG, other stores, Steam non-Steam shortcuts) can live in the same library as **local games**:
+
+- **Add a game:** choose **+ → Add game…** in the library and pick its `.exe`; the name and folder are filled in and can be edited. Or `./ferestre.AppImage add /path/to/Game.exe`.
+- **Import from Steam:** choose **+ → Import from Steam**, or `./ferestre.AppImage import-steam --dry-run` to see what would come in, then without `--dry-run`. Each non-Steam shortcut keeps its executable, launch options (environment, wrappers such as `gamemoderun`, arguments), Wine prefix, Proton build and grid art. Steam's files are only read; Ferestre's own shortcuts are skipped.
+
+Local games start through Ferestre's Proton shim without any Xbox service, licence or account. **Remove from library** only forgets a local game: its folder and its Wine prefix are never deleted. Games with anti-cheat files are flagged in the library. See [local games in recipes](titles/SCHEMA.md#local-games-user-recipes-only).
+
+### Try neural rendering (experimental)
+
+On an AMD Radeon RX 9000 card, a game can run NVIDIA's DLSS 5 neural rendering network through [DLSSNR-AMD](https://github.com/TheAutomatic/DLSSNR-AMD). Choose **Neural rendering…** in a game's menu, or `./ferestre.AppImage neural enable <id>`. It needs your own `nvngx_dlssnr.dll` (Ferestre ships no NVIDIA file), and in game the game's upscaler set to DLSS. **Ctrl+Y** opens the NR Control menu. Turning it off puts every replaced file back. See [Neural rendering](docs/NEURAL-RENDERING.md) for requirements, anti-cheat and troubleshooting.
+
 ### Refresh your library
 
 Use the top-right **Refresh** button, or **Reload library** in the profile menu, after purchases or subscription changes. Lists open from cache for speed; refresh checks them again. A failed refresh retains the last complete library.
@@ -166,6 +179,9 @@ The AppImage also accepts CLI commands:
 ./ferestre.AppImage library
 ./ferestre.AppImage install PRODUCT-ID
 ./ferestre.AppImage run PRODUCT-ID
+./ferestre.AppImage add /path/to/Game.exe
+./ferestre.AppImage import-steam --dry-run
+./ferestre.AppImage neural status
 ./ferestre.AppImage updates
 ./ferestre.AppImage check-app-updates
 ```
@@ -183,6 +199,7 @@ Use `./ferestre.AppImage --help` for all commands. `run` refuses to start a game
 | [Desktop integration](docs/DESKTOP-INTEGRATION.md) | HDR, scaling, refresh rate, window controls and performance helpers |
 | [Accounts](docs/ACCOUNTS.md) | Sign-in, Store/Player selection, saves and sign-out |
 | [Online presence](docs/PRESENCE.md) | What Xbox friends see while you play |
+| [Neural rendering](docs/NEURAL-RENDERING.md) | Experimental DLSS 5 neural rendering on RX 9000 cards, per game |
 | [Pinned source forks](docs/SOURCES.md) | Component repositories, commits and source verification |
 | [Package verification](docs/PACKAGE-SIGNATURES.md) | Microsoft package signatures and download integrity |
 | [Contributing](CONTRIBUTING.md) | Build, test and add game recipes |
@@ -190,7 +207,7 @@ Use `./ferestre.AppImage --help` for all commands. `run` refuses to start a game
 | [Releasing](docs/RELEASING.md) | Release builds and signing |
 | [Debugging notes](notes/) | Technical investigations |
 
-Current releases: **[Ferestre 0.1.24](https://github.com/icex/ferestre/releases/tag/v0.1.24)** and **[runtime 11.0.20261122.2](https://github.com/icex/ferestre/releases/tag/runtime-11.0.20261122.2)**. Read the [release notes](docs/RELEASE-0.1.24.md) for tested scope.
+Current releases: **[Ferestre 0.1.25](https://github.com/icex/ferestre/releases/tag/v0.1.25)** and **[runtime 11.0.20261122.2](https://github.com/icex/ferestre/releases/tag/runtime-11.0.20261122.2)**. Read the [release notes](docs/RELEASE-0.1.25.md) for tested scope.
 
 ## About the project
 

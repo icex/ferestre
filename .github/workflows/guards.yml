@@ -1,0 +1,28 @@
+# Repository-wide guards that must see every change, so this workflow has no
+# path filter: a README- or docs-only push or pull request runs it too, and
+# that is exactly where a forbidden URL would most likely be pasted.
+#
+# `no-nvidia-urls`: no committed file may hold a URL of an NVIDIA file (the
+# nvngx_dlssnr.dll download comes only from the person's own settings or
+# environment). The check only reads the checkout; it builds and runs nothing
+# else, so it runs on a GitHub-hosted runner, for pull requests from forks too.
+name: Guards
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  no-nvidia-urls:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: No URL of an NVIDIA file
+        run: python3 tests/test_no_nvidia_urls.py

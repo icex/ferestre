@@ -1,11 +1,12 @@
 # Releasing
 
-Two release trains, both driven by tags and nothing else:
+Three release trains, all driven by tags and nothing else:
 
 | Tag | Workflow | Publishes |
 |---|---|---|
 | `v<version>`, e.g. `v0.1.14` | `.github/workflows/release.yml` | the launcher: `ferestre-<version>-x86_64.tar.zst`, `ferestre-<version>-x86_64.AppImage`, `SHA256SUMS` |
 | `runtime-<version>`, e.g. `runtime-11.0.20260907` | `.github/workflows/runtime.yml` | the patched Proton: `ferestre-runtime-<version>.tar.xz`, `SHA256SUMS` |
+| `dlssnr-<version>`, e.g. `dlssnr-0.0.9` | `.github/workflows/dlssnr.yml` | the DLSSNR-AMD Linux package: `ferestre-dlssnr-<version>-x86_64.tar.gz`, `ferestre-dlssnr-<version>-i686.tar.gz`, `SOURCES.txt`, `SHA256SUMS`; never marked latest |
 
 Every published file has a minisign signature beside it, `<file>.minisig`. The
 launcher checks a runtime's signature against the public key built into it
@@ -89,7 +90,7 @@ only once the environment's rules allow it.
 Under **Settings > Environments > New environment**, create `release`:
 
 - **Deployment branches and tags:** choose *Selected branches and tags* and
-  add two tag rules, `v*` and `runtime-*`. Add no branch rules. A run from a
+  add three tag rules, `v*`, `runtime-*` and `dlssnr-*`. Add no branch rules. A run from a
   branch, including a manual run, then cannot reach the key, even if someone
   changes a workflow to try.
 - **Required reviewers:** add yourself, or whoever approves releases. Every
@@ -118,7 +119,7 @@ Create the environment **before** the first tag is pushed. If a job names an
 environment that does not exist, GitHub creates it with no rules.
 
 You can also protect the tags themselves, under **Settings > Rules >
-Rulesets**: a tag ruleset for `v*` and `runtime-*` that limits who can create,
+Rulesets**: a tag ruleset for `v*`, `runtime-*` and `dlssnr-*` that limits who can create,
 move or delete them. The environment controls who can use the key; the
 ruleset controls who can start a release at all.
 
@@ -152,6 +153,38 @@ The runtime workflow keeps its separate runner policy.
 
 To see whether a release would build without publishing anything, start the
 workflow by hand with *Run workflow*. The result is unsigned.
+
+### Bumping DLSSNR-AMD
+
+The neural rendering package is built from an exact upstream commit, never a
+branch, and published under its own tag so the launcher can pin it:
+
+1. Edit `packages.dlssnr-amd` in `sources.lock.json` (repository, full
+   commit hash, version); `python3 tests/test_source_pins.py` checks the
+   shape. Optionally build it locally first with
+   `scripts/build-dlssnr.sh <empty dir>` (Docker or Podman, network, tens of
+   minutes). Note that any change to `sources.lock.json` on `main` also
+   starts a runtime build.
+2. Merge to `main`, then tag `dlssnr-<version>` with exactly the pinned
+   version; the build refuses a tag that disagrees with the lock:
+
+   ```sh
+   git tag -a dlssnr-0.0.9 -m 'DLSSNR-AMD 0.0.9 (9503f6b) for Ferestre' && git push origin dlssnr-0.0.9
+   ```
+
+3. Approve `publish`. The release is created with `--latest=false`, so the
+   README's "latest release" link stays on the launcher.
+4. Download `SHA256SUMS`, check it lists both tarballs and `SOURCES.txt`,
+   verify the `.minisig` files, and put each tarball's URL and SHA-256 into
+   the pinned constants in `crates/ferestre-core/src/neural/package.rs`. The
+   launcher trusts that pinned hash, not a rebuild: the compiled Windows files
+   are not byte-identical between builds.
+
+No NVIDIA file is in the package; `scripts/build-dlssnr.sh` refuses a tarball
+holding a model or a weight file derived from one, and
+`tests/test_no_nvidia_urls.py` keeps any URL of one out of the repository. That
+guard runs in `.github/workflows/guards.yml` on every push and pull request,
+with no path filter, so a docs-only change is checked too.
 
 ### Build caches
 

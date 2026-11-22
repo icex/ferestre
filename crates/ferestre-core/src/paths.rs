@@ -477,6 +477,31 @@ impl Paths {
         &self.cache
     }
 
+    /// Every Steam install on this machine, each once: the resolved Steam
+    /// directory first, then the usual places. `~/.steam/steam` is normally a
+    /// link to `~/.local/share/Steam`, so they are compared by their real
+    /// path, and the first spelling found is the one kept.
+    pub fn steam_roots(&self) -> Vec<PathBuf> {
+        let mut seen = std::collections::BTreeSet::new();
+        self.steam
+            .iter()
+            .cloned()
+            .chain(steam_candidates(&self.home))
+            .filter(|root| root.is_dir())
+            .filter(|root| seen.insert(root.canonicalize().unwrap_or_else(|_| root.clone())))
+            .collect()
+    }
+
+    /// Where art copied for a local game is kept. Only a local id has one, so
+    /// a Store id can never name a directory here.
+    pub fn local_art_dir(&self, product_id: &str) -> Option<PathBuf> {
+        crate::local::is_local_id(product_id).then(|| {
+            self.state
+                .join("local-art")
+                .join(product_id.to_ascii_uppercase())
+        })
+    }
+
     /// Where a title's package is installed.
     ///
     /// `install.dir-env` wins if it is set, and is taken as given -- that
@@ -496,7 +521,16 @@ impl Paths {
     /// anywhere else would start from nothing.
     ///
     /// Only then the recipe's own directory, or the slug.
+    ///
+    /// A local game is the exception to all of this: it lives in the absolute
+    /// folder its recipe names, which [`Recipe::parse`] has checked, and
+    /// nowhere else.
     pub fn install_dir(&self, recipe: &Recipe) -> Result<PathBuf> {
+        if recipe.is_local() {
+            if let Some(dir) = recipe.install.dir.as_deref() {
+                return Ok(PathBuf::from(dir));
+            }
+        }
         if let Some(dir) = self.recipe_env(recipe.install.dir_env.as_deref(), "_DIR", recipe)? {
             return Ok(dir);
         }
@@ -518,7 +552,18 @@ impl Paths {
     /// generated one's prefix is kept while the shipped one's does not exist
     /// yet. The two usually have different slugs, and the prefix is where the
     /// saves are: following the new slug would start the title with none.
+    ///
+    /// A local game may name an absolute prefix, such as the one Steam made
+    /// for its shortcut, and that is used as it is. Otherwise its prefix is
+    /// in the games directory like any other.
     pub fn prefix_dir(&self, recipe: &Recipe) -> Result<PathBuf> {
+        if recipe.is_local() {
+            if let Some(prefix) = recipe.install.prefix.as_deref() {
+                if prefix.starts_with('/') {
+                    return Ok(PathBuf::from(prefix));
+                }
+            }
+        }
         if let Some(dir) =
             self.recipe_env(recipe.install.prefix_env.as_deref(), "_PREFIX", recipe)?
         {
@@ -1310,5 +1355,64 @@ summary = "Runs."
                 games.join(format!("{}-launch.log", r.title.slug))
             );
         }
+    }
+
+    const LOCAL_FIXTURE: &str = r#"schema = 1
+[title]
+product-id = "LOCAL-WITCHER-3"
+name = "The Witcher 3"
+slug = "local-witcher-3"
+kind = "local"
+[install]
+dir = "/mnt/games/Witcher 3"
+[launch]
+executable = 'bin\x64\witcher3.exe'
+[status]
+state = "untested"
+summary = "Added by hand"
+"#;
+
+    #[test]
+    fn a_local_game_lives_where_its_recipe_says_and_nowhere_else() {
+        let p = paths(&[]);
+        let recipe = Recipe::parse(LOCAL_FIXTURE).unwrap();
+        assert_eq!(
+            p.install_dir(&recipe).unwrap(),
+            Path::new("/mnt/games/Witcher 3")
+        );
+        assert_eq!(
+            p.prefix_dir(&recipe).unwrap(),
+            Path::new("/home/tester/xbox-games/local-witcher-3-proton")
+        );
+        let mut own = recipe.clone();
+        own.install.prefix = Some("/home/tester/Games/prefixes/witcher".into());
+        assert_eq!(
+            p.prefix_dir(&own).unwrap(),
+            Path::new("/home/tester/Games/prefixes/witcher")
+        );
+    }
+
+    #[test]
+    fn steam_roots_are_deduplicated_by_their_real_path() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".local/share/Steam")).unwrap();
+        std::fs::create_dir_all(home.path().join(".steam")).unwrap();
+        std::os::unix::fs::symlink(
+            home.path().join(".local/share/Steam"),
+            home.path().join(".steam/steam"),
+        )
+        .unwrap();
+        let p = Paths::resolve(&Env::from_map([("HOME", home.path().to_str().unwrap())])).unwrap();
+        assert_eq!(p.steam_roots(), [home.path().join(".steam/steam")]);
+    }
+
+    #[test]
+    fn local_art_is_kept_per_local_id_only() {
+        let p = paths(&[]);
+        assert!(p
+            .local_art_dir("LOCAL-STEAM-7")
+            .unwrap()
+            .ends_with("local-art/LOCAL-STEAM-7"));
+        assert!(p.local_art_dir("9NBLGGH2JHXJ").is_none());
     }
 }

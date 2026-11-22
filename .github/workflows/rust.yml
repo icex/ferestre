@@ -48,6 +48,7 @@ on:
       - 'tests/gui_controller_install.py'
       - 'tests/gui_accounts_controller.py'
       - 'tests/gui_runtime_selection.py'
+      - 'tests/gui_local_games.py'
       - 'tests/gui_update_resume.py'
       - 'tests/gui_update_existing.py'
       - 'tests/gui_library_error.py'
@@ -87,6 +88,8 @@ on:
       - 'tests/test_build_appimage.py'
       - 'tests/test_release_signing.py'
       - 'tests/test_workflows.py'
+      - 'tests/test_no_nvidia_urls.py'
+      - 'tests/test_build_dlssnr.py'
       # The native harnesses and fixtures: the shell syntax step and the
       # `sources` job check these.
       - 'tests/*.sh'
@@ -112,6 +115,7 @@ on:
       - 'tests/gui_controller_install.py'
       - 'tests/gui_accounts_controller.py'
       - 'tests/gui_runtime_selection.py'
+      - 'tests/gui_local_games.py'
       - 'tests/gui_update_resume.py'
       - 'tests/gui_update_existing.py'
       - 'tests/gui_library_error.py'
@@ -151,6 +155,8 @@ on:
       - 'tests/test_build_appimage.py'
       - 'tests/test_release_signing.py'
       - 'tests/test_workflows.py'
+      - 'tests/test_no_nvidia_urls.py'
+      - 'tests/test_build_dlssnr.py'
       # The native harnesses and fixtures: the shell syntax step and the
       # `sources` job check these.
       - 'tests/*.sh'
@@ -267,6 +273,8 @@ jobs:
         run: |
           python3 tests/test_workflows.py
           python3 tests/test_source_pins.py
+          python3 tests/test_no_nvidia_urls.py
+          python3 tests/test_build_dlssnr.py
           python3 tests/test_runtime_staging.py
           python3 tests/test_release_signing.py
           python3 tests/test_build_appimage.py
@@ -530,6 +538,11 @@ jobs:
         run: |
           xvfb-run -a --error-file=/dev/stderr --server-num=123 --server-args='-screen 0 1280x720x24 -noreset' \
             dbus-run-session -- python3 tests/gui_runtime_selection.py
+
+      - name: Local games, their menu and forget-only removal (offline)
+        run: |
+          xvfb-run -a --error-file=/dev/stderr --server-num=138 --server-args='-screen 0 1280x720x24 -noreset' \
+            dbus-run-session -- python3 tests/gui_local_games.py
 
       - name: Resume paused updates from the game grid (offline)
         run: |

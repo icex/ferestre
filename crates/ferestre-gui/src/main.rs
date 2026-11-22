@@ -25,6 +25,7 @@ mod install_drives;
 mod launch_state;
 mod max_width;
 mod model;
+mod neural_ui;
 mod notifications;
 mod packagekit;
 mod presence_ui;
@@ -1669,6 +1670,10 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
     default_row.add_suffix(&choose);
     group.add(&default_row);
     page.append(&group);
+    if let Some(paths) = model.paths.clone() {
+        drop(model);
+        page.append(&neural_ui::settings_group(ui, &paths));
+    }
 }
 
 /// What one page of the list looks like, lifted out of the borrow so widgets
@@ -1757,6 +1762,13 @@ fn draw_list(
     let installed_product = |id: &str| model.product_is_installed(id);
     let describes_itself = |id: &str| model.product_executable(id).is_some();
     let game_dir = |r: &Recipe| model.game_dir(r);
+    let anticheat = |r: &Recipe| {
+        model
+            .anticheat
+            .get(&r.title.product_id.to_ascii_uppercase())
+            .cloned()
+            .unwrap_or_default()
+    };
     let content_parent = |id: &str| model.content_parent(id);
     let engine = |r: &Recipe, dir: &Path| model.engine(r, dir);
     let inputs = Inputs {
@@ -1780,6 +1792,8 @@ fn draw_list(
         running: &running,
         game_dir: &game_dir,
         engine: &engine,
+        local_runtimes: &model.local_runtimes,
+        anticheat: &anticheat,
     };
     // The Game Pass section is a different list, not a filter over the same
     // one: its rows come from a public catalogue listing rather than from what
@@ -2433,7 +2447,10 @@ fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
         };
         (
             paths.clone(),
-            model.runtimes.clone(),
+            match product_id {
+                Some(id) => model.runtimes_for(id).to_vec(),
+                None => model.runtimes.clone(),
+            },
             match product_id {
                 Some(id) => ferestre_core::runtime::selected(paths.config_dir(), id),
                 None => ferestre_core::runtime::default_selected(paths.config_dir()),
@@ -2598,9 +2615,349 @@ fn render_library_tabs(ui: &Ui, page: &gtk::Box) {
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .vscrollbar_policy(gtk::PolicyType::Never)
+        .hexpand(true)
         .child(&tabs)
         .build();
-    page.append(&scroll);
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    bar.append(&scroll);
+    bar.append(&library_add_menu(ui));
+    page.append(&bar);
+}
+
+/// The library's "+": add a game that is already on disk, or import Steam's
+/// non-Steam shortcuts.
+fn library_add_menu(ui: &Ui) -> gtk::MenuButton {
+    let menu = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    let popover = gtk::Popover::builder().child(&menu).build();
+    let button = gtk::MenuButton::builder()
+        .icon_name("list-add-symbolic")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .tooltip_text("Add games")
+        .popover(&popover)
+        .build();
+    button.set_widget_name("library-add");
+    button.update_property(&[gtk::accessible::Property::Label("Add games")]);
+    type Item = (&'static str, &'static str, fn(&Ui));
+    let items: [Item; 2] = [
+        ("document-open-symbolic", "Add game…", add_game_dialog),
+        (
+            "emblem-shared-symbolic",
+            "Import from Steam",
+            import_from_steam,
+        ),
+    ];
+    for (icon, label, run) in items {
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        content.append(&gtk::Image::from_icon_name(icon));
+        content.append(&gtk::Label::builder().label(label).xalign(0.0).build());
+        let item = gtk::Button::builder()
+            .child(&content)
+            .css_classes(["flat"])
+            .build();
+        item.update_property(&[gtk::accessible::Property::Label(label)]);
+        let (ui, popover) = (ui.clone(), popover.clone());
+        item.connect_clicked(move |_| {
+            popover.popdown();
+            run(&ui);
+        });
+        menu.append(&item);
+    }
+    button
+}
+
+/// Add a Windows game that is already on disk. Its files are only looked at:
+/// the recipe Ferestre writes names them where they are.
+fn add_game_dialog(ui: &Ui) {
+    let Some(paths) = ui.model.borrow().paths.clone() else {
+        ui.toasts
+            .add_toast(toast("Cannot work out where things live: HOME is not set"));
+        return;
+    };
+    let dialog = adw::Dialog::builder()
+        .title("Add game")
+        .content_width(560)
+        .build();
+    let program = adw::EntryRow::builder().title("Program").build();
+    let browse = gtk::Button::builder()
+        .icon_name("folder-open-symbolic")
+        .tooltip_text("Browse…")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .build();
+    browse.update_property(&[gtk::accessible::Property::Label("Browse…")]);
+    program.add_suffix(&browse);
+    let name = adw::EntryRow::builder().title("Name").build();
+    let folder = adw::EntryRow::builder().title("Folder").build();
+    let prefix = adw::EntryRow::builder().title("Wine prefix").build();
+    let group = adw::PreferencesGroup::builder()
+        .description(
+            "A .exe or .bat already on disk. Its files are never moved or deleted. Leave the \
+             Wine prefix empty for one managed by Ferestre.",
+        )
+        .build();
+    group.add(&program);
+    group.add(&name);
+    group.add(&folder);
+    group.add(&prefix);
+    let error = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .visible(false)
+        .css_classes(["error"])
+        .build();
+    let body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(12)
+        .margin_bottom(18)
+        .margin_start(18)
+        .margin_end(18)
+        .build();
+    body.append(&group);
+    body.append(&error);
+    let header = adw::HeaderBar::new();
+    let cancel = gtk::Button::with_label("Cancel");
+    let add = gtk::Button::builder()
+        .label("Add")
+        .css_classes(["suggested-action"])
+        .build();
+    header.pack_start(&cancel);
+    header.pack_end(&add);
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&body));
+    dialog.set_child(Some(&toolbar));
+
+    {
+        let (ui, entry) = (ui.clone(), program.clone());
+        browse.connect_clicked(move |_| {
+            folder_picker::open_file(&ui, entry.upcast_ref(), &["exe", "bat"]);
+        });
+    }
+    // The name and folder follow the program until the person types them.
+    let filling = Rc::new(Cell::new(false));
+    let name_typed = Rc::new(Cell::new(false));
+    let folder_typed = Rc::new(Cell::new(false));
+    for (entry, typed) in [(&name, &name_typed), (&folder, &folder_typed)] {
+        let (filling, typed) = (filling.clone(), typed.clone());
+        entry.connect_changed(move |_| {
+            if !filling.get() {
+                typed.set(true);
+            }
+        });
+    }
+    program.connect_changed(glib::clone!(
+        #[strong]
+        name,
+        #[strong]
+        folder,
+        move |program| {
+            let text = program.text();
+            let exe = Path::new(text.trim());
+            if !exe.is_absolute() {
+                return;
+            }
+            filling.set(true);
+            if !name_typed.get() {
+                name.set_text(&ferestre_core::local::derive_name(exe));
+            }
+            if !folder_typed.get() {
+                if let Some(parent) = exe.parent() {
+                    folder.set_text(&parent.to_string_lossy());
+                }
+            }
+            filling.set(false);
+        }
+    ));
+    {
+        let dialog = dialog.clone();
+        cancel.connect_clicked(move |_| {
+            dialog.close();
+        });
+    }
+    add.connect_clicked(glib::clone!(
+        #[strong]
+        ui,
+        #[strong]
+        dialog,
+        #[strong]
+        error,
+        move |add| {
+            let text = |entry: &adw::EntryRow| {
+                let text = entry.text().trim().to_string();
+                (!text.is_empty()).then_some(text)
+            };
+            let request = ferestre_core::local::AddRequest {
+                exe: PathBuf::from(text(&program).unwrap_or_default()),
+                name: text(&name),
+                dir: text(&folder).map(PathBuf::from),
+                prefix: text(&prefix).map(PathBuf::from),
+                runtime: None,
+            };
+            add.set_sensitive(false);
+            error.set_visible(false);
+            let paths = paths.clone();
+            let (ui, dialog, error, add) = (ui.clone(), dialog.clone(), error.clone(), add.clone());
+            glib::spawn_future_local(async move {
+                let added = gio::spawn_blocking(move || {
+                    let recipe = ferestre_core::local::add(&paths, &request)?;
+                    let found = paths
+                        .install_dir(&recipe)
+                        .map(|dir| {
+                            ferestre_core::anticheat::detect(&dir, &recipe.launch.executable)
+                        })
+                        .unwrap_or_default();
+                    anyhow::Ok((recipe.title.name, found))
+                })
+                .await;
+                add.set_sensitive(true);
+                let (added, found) = match added {
+                    Ok(Ok(done)) => done,
+                    Ok(Err(e)) => {
+                        error.set_text(&format!("{e:#}"));
+                        error.set_visible(true);
+                        return;
+                    }
+                    Err(_) => {
+                        error.set_text("Could not add the game");
+                        error.set_visible(true);
+                        return;
+                    }
+                };
+                dialog.close();
+                ui.model.borrow_mut().reload();
+                render(&ui);
+                ui.toasts.add_toast(toast(format!("Added {added}")));
+                if let Some(line) = ferestre_core::anticheat::describe(&found) {
+                    ui.toasts.add_toast(
+                        adw::Toast::builder()
+                            .title(line)
+                            .use_markup(false)
+                            .timeout(15)
+                            .build(),
+                    );
+                }
+            });
+        }
+    ));
+    dialog.present(Some(&ui.window));
+}
+
+/// Import Steam's non-Steam shortcuts as local games, after saying which.
+/// Steam's files are only read.
+fn import_from_steam(ui: &Ui) {
+    let Some(paths) = ui.model.borrow().paths.clone() else {
+        ui.toasts
+            .add_toast(toast("Cannot work out where things live: HOME is not set"));
+        return;
+    };
+    if !begin(ui, "Reading Steam's shortcuts") {
+        report_busy(ui);
+        return;
+    }
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let planned = gio::spawn_blocking(move || {
+            ferestre_core::steam_import::plan(&paths, None).map(|found| (paths, found))
+        })
+        .await;
+        finish(&ui);
+        let (paths, candidates) = match planned {
+            Ok(Ok(planned)) => planned,
+            Ok(Err(e)) => {
+                ui.toasts
+                    .add_toast(toast(format!("Could not read Steam's shortcuts: {e:#}")));
+                return;
+            }
+            Err(_) => {
+                ui.toasts
+                    .add_toast(toast("Could not read Steam's shortcuts"));
+                return;
+            }
+        };
+        use ferestre_core::steam_import::ImportStatus;
+        let new: Vec<&str> = candidates
+            .iter()
+            .filter(|c| c.status == ImportStatus::New)
+            .map(|c| c.name.as_str())
+            .collect();
+        if new.is_empty() {
+            ui.toasts
+                .add_toast(toast("Nothing new to import from Steam"));
+            return;
+        }
+        let kept = candidates
+            .iter()
+            .filter(|c| c.status == ImportStatus::Kept)
+            .count();
+        let skipped = candidates
+            .iter()
+            .filter(|c| matches!(c.status, ImportStatus::Skipped(_)))
+            .count();
+        let mut body: Vec<String> = new.iter().take(10).map(|n| n.to_string()).collect();
+        if new.len() > 10 {
+            body.push(format!("and {} more", new.len() - 10));
+        }
+        body.push(String::new());
+        body.push(format!(
+            "{kept} already in your library; {skipped} skipped (Ferestre's own shortcuts or not \
+             Windows programs)."
+        ));
+        let notes = model::steam_import_notes(&candidates);
+        if !notes.is_empty() {
+            body.push(String::new());
+            body.extend(notes);
+            body.push(String::new());
+        }
+        body.push("Steam's files are only read.".into());
+        let dialog = adw::AlertDialog::new(Some("Import from Steam"), Some(&body.join("\n")));
+        dialog.set_body_use_markup(false);
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("import", "Import");
+        dialog.set_response_appearance("import", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("import"));
+        dialog.set_close_response("cancel");
+        let window = ui.window.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response != "import" {
+                return;
+            }
+            if !begin(&ui, "Importing from Steam") {
+                report_busy(&ui);
+                return;
+            }
+            let (ui, paths, candidates) = (ui.clone(), paths.clone(), candidates.clone());
+            glib::spawn_future_local(async move {
+                let applied = gio::spawn_blocking(move || {
+                    ferestre_core::steam_import::apply(&paths, &candidates)
+                })
+                .await;
+                finish(&ui);
+                ui.model.borrow_mut().reload();
+                render(&ui);
+                ui.toasts.add_toast(toast(match applied {
+                    Ok(Ok(report)) => {
+                        let n = report.added.len();
+                        format!(
+                            "Imported {n} {} from Steam",
+                            if n == 1 { "game" } else { "games" }
+                        )
+                    }
+                    Ok(Err(e)) => format!("Could not import from Steam: {e:#}"),
+                    Err(_) => "Could not import from Steam".to_string(),
+                }));
+            });
+        });
+        dialog.present(Some(&window));
+    });
 }
 fn render_recents(ui: &Ui) {
     sidebar::render_installed(ui);
@@ -2732,7 +3089,13 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
         .catalog
         .get(&key)
         .and_then(|p| p.publisher.clone())
-        .unwrap_or_else(|| "Xbox PC".into());
+        .unwrap_or_else(|| {
+            if row.local {
+                "Local game".into()
+            } else {
+                "Xbox PC".into()
+            }
+        });
     text.append(
         &gtk::Label::builder()
             .label(publisher)
@@ -3112,18 +3475,21 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
             dialog.present(Some(&detail_ui.window));
         }),
     );
-    let store_url = format!("{STORE_PAGE}{}", row.product_id);
-    // Weak for the same reason: the row holds the menu that holds this.
-    let anchor = action_row.downgrade();
-    item(
-        "web-browser-symbolic",
-        "Open Store page",
-        Box::new(move || {
-            if let Some(anchor) = anchor.upgrade() {
-                open_link(&anchor, &store_url);
-            }
-        }),
-    );
+    // A local game has no Store page, is not moved, and is never deleted.
+    if !row.local {
+        let store_url = format!("{STORE_PAGE}{}", row.product_id);
+        // Weak for the same reason: the row holds the menu that holds this.
+        let anchor = action_row.downgrade();
+        item(
+            "web-browser-symbolic",
+            "Open Store page",
+            Box::new(move || {
+                if let Some(anchor) = anchor.upgrade() {
+                    open_link(&anchor, &store_url);
+                }
+            }),
+        );
+    }
     // A shortcut needs something that will launch. A recipe is one; a title on
     // disk is another, because `run` writes a recipe from the package manifest
     // on its way past.
@@ -3145,7 +3511,17 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
             item(icon, label, Box::new(move || run(&ui, &product_id, &name)));
         }
     }
-    if row.installed && row.action != Action::Stop && row.action != Action::Installing {
+    // Only for a title on disk: the dialog reads its files.
+    if row.installed && row.action != Action::Content {
+        let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
+        item(
+            "video-display-symbolic",
+            "Neural rendering…",
+            Box::new(move || neural_ui::open(&ui, &product_id, &name)),
+        );
+    }
+    if row.installed && !row.local && row.action != Action::Stop && row.action != Action::Installing
+    {
         let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
         item(
             "go-jump-symbolic",
@@ -3158,7 +3534,16 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
     // a failed install leaves exactly that. Not while it runs: its files, and
     // with the box ticked its saves, would go from under it.
     let on_disk = row.installed || row.action == Action::Resume;
-    if on_disk && row.action != Action::Stop {
+    if row.local {
+        if row.action != Action::Stop {
+            let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
+            item(
+                "user-trash-symbolic",
+                "Remove from library",
+                Box::new(move || confirm_forget_local(&ui, &product_id, &name)),
+            );
+        }
+    } else if on_disk && row.action != Action::Stop {
         let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
         item(
             "user-trash-symbolic",
@@ -3185,13 +3570,16 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
             .tooltip_text(reason)
             .build();
         button.set_widget_name(&format!("game-{}-primary", row.product_id));
-        let (ui, product_id, name, reason) = (
+        let (ui, product_id, name, reason, offer_runtime) = (
             ui.clone(),
             row.product_id.clone(),
             row.name.clone(),
             reason.clone(),
+            row.blocked_by_runtime(),
         );
-        button.connect_clicked(move |_| explain_blocked(&ui, &product_id, &name, &reason));
+        button.connect_clicked(move |_| {
+            explain_blocked(&ui, &product_id, &name, &reason, offer_runtime)
+        });
         actions.append(&button);
         return (action_row, actions);
     }
@@ -3853,16 +4241,22 @@ fn warn_about_media(ui: &Ui, product_id: &str) {
 }
 
 /// Why a title with a recipe cannot start, with the fix the window can offer:
-/// its blocked reasons are about the runtime the launch would use.
-fn explain_blocked(ui: &Ui, product_id: &str, name: &str, reason: &str) {
-    let dialog = adw::AlertDialog::new(
-        Some(&format!("{name} cannot start")),
-        Some(&format!(
-            "{reason}\n\nChoose a runtime that provides what it needs, or update the runtime."
-        )),
-    );
+/// most blocked reasons are about the runtime the launch would use. A local
+/// game whose files are missing is not, and gets only the reason.
+fn explain_blocked(ui: &Ui, product_id: &str, name: &str, reason: &str, offer_runtime: bool) {
+    let body = if offer_runtime {
+        format!("{reason}\n\nChoose a runtime that provides what it needs, or update the runtime.")
+    } else {
+        reason.to_string()
+    };
+    let dialog = adw::AlertDialog::new(Some(&format!("{name} cannot start")), Some(&body));
     dialog.set_body_use_markup(false);
     dialog.add_response("close", "Close");
+    if !offer_runtime {
+        dialog.set_close_response("close");
+        dialog.present(Some(&ui.window));
+        return;
+    }
     dialog.add_response("runtime", "Choose runtime");
     dialog.set_response_appearance("runtime", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("runtime"));
@@ -3909,9 +4303,13 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
             return;
         }
     }
+    // A local game has no licence, no Xbox saves and no presence: none of
+    // the account machinery applies to it.
+    let uses_accounts = model::launch_uses_accounts(ui.model.borrow().recipe_for(product_id));
     let (roles, server, state_dir) = {
         let model = ui.model.borrow();
-        if let Some(roles) = &model.roles {
+        let roles = model.roles.as_ref().filter(|_| uses_accounts);
+        if let Some(roles) = roles {
             let result = model
                 .profiles
                 .as_ref()
@@ -3951,7 +4349,7 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
             }
         }
         (
-            model.roles.clone(),
+            roles.cloned(),
             model
                 .recipe_for(product_id)
                 .and_then(|r| model.wineserver(r)),
@@ -3966,13 +4364,16 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
     command.arg("run").arg(product_id);
     let launch_tag = launch_state::tag();
     command.env(launch_state::TAG, &launch_tag);
-    if let Some(roles) = &roles {
-        command.env(
-            "FERESTRE_ACCOUNT_ROLES",
-            serde_json::to_string(roles).unwrap(),
-        );
-    } else {
-        command.env_remove("FERESTRE_ACCOUNT_ROLES");
+    match &roles {
+        Some(roles) => {
+            command.env(
+                "FERESTRE_ACCOUNT_ROLES",
+                serde_json::to_string(roles).unwrap(),
+            );
+        }
+        _ => {
+            command.env_remove("FERESTRE_ACCOUNT_ROLES");
+        }
     }
     // Safety: setsid in the child between fork and exec. Async-signal-safe, and
     // the only thing this closure does.
@@ -4040,7 +4441,9 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
             ui.running_channels.borrow_mut().remove(&key);
         }
     }
-    presence_ui::launch_started(ui, &key, pgid);
+    if uses_accounts {
+        presence_ui::launch_started(ui, &key, pgid);
+    }
     // Set once the launch has exited: the follower reads what is left, then
     // stops.
     let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -4052,7 +4455,8 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
     if let Some(executable) = executable {
         launch_state::watch(ui, &key, pgid, launch_tag, executable, finished.clone());
     }
-    if let Some(path) = output.clone() {
+    // A local game runs no presence runner: there is nothing to follow.
+    if let Some(path) = output.clone().filter(|_| uses_accounts) {
         // The launch's runner reports on its stderr, which goes to the
         // launch's output file; follow it while the launch runs.
         let (sender, mut events) = futures_channel::mpsc::unbounded();
@@ -4112,7 +4516,9 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
             ui.running.borrow_mut().remove(&key);
             ui.running_servers.borrow_mut().remove(&key);
             ui.running_channels.borrow_mut().remove(&key);
-            presence_ui::launch_ended(&ui, &key);
+            if uses_accounts {
+                presence_ui::launch_ended(&ui, &key);
+            }
         }
         ui.model.borrow().forget_probes();
         render(&ui);
@@ -5283,6 +5689,53 @@ fn confirm_forget_library(ui: &Ui, product_id: &str, name: &str, dir: &Path, why
     dialog.present(Some(&window));
 }
 
+/// Remove a local game from the library. Its folder and its prefix are named
+/// and kept: Ferestre did not put them there, and only the recipe goes.
+fn confirm_forget_local(ui: &Ui, product_id: &str, name: &str) {
+    let (dir, prefix) = {
+        let model = ui.model.borrow();
+        let found = model.paths.as_ref().zip(model.recipe_for(product_id));
+        let dir = found.and_then(|(paths, recipe)| paths.install_dir(recipe).ok());
+        let prefix = found.and_then(|(paths, recipe)| paths.prefix_dir(recipe).ok());
+        let shown = |path: Option<PathBuf>| {
+            path.map_or_else(|| "(unknown)".to_string(), |p| p.display().to_string())
+        };
+        (shown(dir), shown(prefix))
+    };
+    let dialog = adw::AlertDialog::new(
+        Some(&format!("Remove {name} from Ferestre?")),
+        Some(&format!(
+            "{name} leaves your library. Nothing is deleted: the game's files in {dir} and \
+             its Wine prefix {prefix} are kept."
+        )),
+    );
+    dialog.set_body_use_markup(false);
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("remove", "Remove");
+    dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let window = ui.window.clone();
+    let ui = ui.clone();
+    let key = product_id.to_ascii_uppercase();
+    let product_id = product_id.to_string();
+    let name = name.to_string();
+    dialog.connect_response(None, move |_, response| {
+        if response != "remove" {
+            return;
+        }
+        if ui.running.borrow().contains_key(&key) {
+            ui.toasts
+                .add_toast(toast(format!("Stop {name} before removing it")));
+            return;
+        }
+        let args = model::forget_args(&product_id);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        spawn_cli_tracked(&ui, &args, &format!("Removing {name}"));
+    });
+    dialog.present(Some(&window));
+}
+
 /// How much room is left where a title would go, in the words a person uses.
 fn free_space_label(dir: &Path) -> Option<String> {
     // The directory itself may not exist yet; ask about the nearest ancestor
@@ -5462,7 +5915,7 @@ fn add_to_steam_titles(ui: &Ui, titles: Vec<(String, String)>) {
     // missing games the person was told were being added.
     *ui.wait_on_close.borrow_mut() = true;
     show_activity(ui);
-    let (cache, market, known) = {
+    let (cache, market, known, paths) = {
         let model = ui.model.borrow();
         let known: Vec<_> = titles
             .iter()
@@ -5474,7 +5927,12 @@ fn add_to_steam_titles(ui: &Ui, titles: Vec<(String, String)>) {
                 )
             })
             .collect();
-        (model.catalog_cache(), model.market(), known)
+        (
+            model.catalog_cache(),
+            model.market(),
+            known,
+            model.paths.clone(),
+        )
     };
     let program = steam::shortcut_program(
         std::env::var_os("APPIMAGE").as_deref(),
@@ -5491,6 +5949,10 @@ fn add_to_steam_titles(ui: &Ui, titles: Vec<(String, String)>) {
                 .iter()
                 .zip(&known)
                 .map(|((product_id, _), (product, _))| {
+                    // A local game has no catalog entry, and is never asked for.
+                    if ferestre_core::local::is_local_id(product_id) {
+                        return None;
+                    }
                     product
                         .clone()
                         .or_else(|| cache.as_ref().and_then(|c| c.get(product_id)))
@@ -5505,6 +5967,7 @@ fn add_to_steam_titles(ui: &Ui, titles: Vec<(String, String)>) {
                     .filter(|(_, product)| product.as_ref().is_none_or(|p| p.artwork.is_empty()))
                     .map(|((product_id, _), _)| product_id.clone())
                     .collect();
+                let stale = model::store_ids(&stale);
                 if !stale.is_empty() {
                     let (found, errors) =
                         catalog::revalidate(cache, &stale, &market.0, &market.1, true);
@@ -5533,17 +5996,30 @@ fn add_to_steam_titles(ui: &Ui, titles: Vec<(String, String)>) {
                         .filter(|n| !n.is_empty())
                         .unwrap_or(name.as_str())
                         .to_string();
-                    let artwork = match (&cache, product) {
-                        (Some(cache), Some(product)) => {
-                            let (files, errors) =
-                                steam::prepare_artwork(cache, &product, fallback_icon.as_deref());
-                            failures.extend(errors);
-                            files
+                    let local_art = paths
+                        .as_ref()
+                        .filter(|_| ferestre_core::local::is_local_id(product_id))
+                        .map(|paths| ferestre_core::local::artwork(paths, product_id));
+                    let artwork = if let Some(mut files) = local_art {
+                        // The art Ferestre keeps for a local game.
+                        files.icon = files.icon.or_else(|| fallback_icon.clone());
+                        files
+                    } else {
+                        match (&cache, product) {
+                            (Some(cache), Some(product)) => {
+                                let (files, errors) = steam::prepare_artwork(
+                                    cache,
+                                    &product,
+                                    fallback_icon.as_deref(),
+                                );
+                                failures.extend(errors);
+                                files
+                            }
+                            _ => steam::ArtworkFiles {
+                                icon: fallback_icon.clone(),
+                                ..Default::default()
+                            },
                         }
-                        _ => steam::ArtworkFiles {
-                            icon: fallback_icon.clone(),
-                            ..Default::default()
-                        },
                     };
                     let shortcut = steam::Shortcut::new(
                         &name,
@@ -6752,6 +7228,9 @@ mod catalog_regressions {
             recipes: Vec::new(),
             runtime: None,
             runtimes: Vec::new(),
+            local_runtimes: Vec::new(),
+            anticheat: BTreeMap::new(),
+            local_art: BTreeMap::new(),
             registry: None,
             records: BTreeMap::new(),
             disk_usage: BTreeMap::new(),

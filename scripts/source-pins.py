@@ -9,6 +9,9 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 NAMES = {'proton', 'wine', 'xgameruntime', 'vkd3d-proton', 'xodus'}
+# Third-party packages Ferestre builds and hosts from an exact upstream commit.
+# Not forks, so they are validated apart from `components`.
+PACKAGES = {'dlssnr-amd'}
 
 
 def load(path=ROOT / 'sources.lock.json'):
@@ -25,6 +28,23 @@ def load(path=ROOT / 'sources.lock.json'):
             if not entry or PurePosixPath(entry).is_absolute() or '..' in PurePosixPath(entry).parts:
                 raise ValueError(name + ': invalid source path')
     return data['components']
+
+
+def load_packages(path=ROOT / 'sources.lock.json'):
+    data = json.loads(path.read_text())
+    packages = data.get('packages')
+    if not isinstance(packages, dict) or set(packages) != PACKAGES:
+        raise ValueError('source lock must name exactly the packages ' + ', '.join(sorted(PACKAGES)))
+    for name, pin in packages.items():
+        if not isinstance(pin, dict) or set(pin) != {'repository', 'commit', 'version'}:
+            raise ValueError(name + ': a package pin has exactly repository, commit and version')
+        if not re.fullmatch(r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git', str(pin['repository'])):
+            raise ValueError(name + ': expected a GitHub repository URL')
+        if not re.fullmatch('[0-9a-f]{40}', str(pin['commit'])):
+            raise ValueError(name + ': pin must be a complete commit hash')
+        if not re.fullmatch(r'\d+(\.\d+){2,3}', str(pin['version'])):
+            raise ValueError(name + ': version must be a release number')
+    return packages
 
 
 def git(repo, *args):
@@ -63,11 +83,22 @@ def verify_launcher(pins, root=ROOT):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['get', 'modified', 'verify', 'verify-remote'])
-    parser.add_argument('component', nargs='?', choices=sorted(NAMES))
-    parser.add_argument('field', nargs='?', choices=['repository', 'commit', 'upstream_commit'])
+    parser.add_argument('command', choices=['get', 'modified', 'verify', 'verify-remote', 'package'])
+    parser.add_argument('component', nargs='?', choices=sorted(NAMES | PACKAGES))
+    parser.add_argument('field', nargs='?', choices=['repository', 'commit', 'upstream_commit', 'version'])
     parser.add_argument('--directory', type=Path)
     args = parser.parse_args()
+    if args.command == 'package':
+        if args.component not in PACKAGES:
+            parser.error('package is one of: ' + ', '.join(sorted(PACKAGES)))
+        if args.field not in ('repository', 'commit', 'version'):
+            parser.error('field is one of: repository, commit, version')
+        print(load_packages()[args.component][args.field])
+        return
+    if args.component is not None and args.component not in NAMES:
+        parser.error('component is one of: ' + ', '.join(sorted(NAMES)))
+    if args.field == 'version':
+        parser.error('version is a package field')
     pins = load()
     if args.command in ('get', 'modified'):
         if not args.component:

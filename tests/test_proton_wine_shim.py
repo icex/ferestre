@@ -36,7 +36,7 @@ class PackageManifestTests(unittest.TestCase):
 class GamingServicesWaitTests(unittest.TestCase):
     """Party waits up to ServiceRetryTimeout for Gaming Services, which Wine lacks."""
 
-    def run_shim(self, root, system_reg=None):
+    def run_shim(self, root, system_reg=None, extra_env=None):
         proton = root / 'runtime'
         proton.mkdir()
         calls = root / 'calls'
@@ -49,10 +49,12 @@ class GamingServicesWaitTests(unittest.TestCase):
         if system_reg is not None:
             (prefix / 'pfx').mkdir(parents=True)
             (prefix / 'pfx/system.reg').write_text(system_reg)
-        env = {k: v for k, v in os.environ.items() if k not in ['FERESTRE_IMAGE_VIEW']}
+        env = {k: v for k, v in os.environ.items()
+               if k not in ['FERESTRE_IMAGE_VIEW', 'FERESTRE_LOCAL_GAME']}
         env.update(PROTON_DIR=str(proton), STEAM_COMPAT_DATA_PATH=str(prefix),
                    XODUS_GAMES_DIR=str(root/'games'), CALLS=str(calls),
                    WINE_DLL_FILE_MAP='Game.exe=3', WINE_PACKAGE_MANIFEST='Z:\\Game.config')
+        env.update(extra_env or {})
         subprocess.run([str(SHIM), 'Game.exe'], env=env, cwd=root, check=True,
                        capture_output=True, text=True)
         return calls.read_text().splitlines()
@@ -82,6 +84,13 @@ class GamingServicesWaitTests(unittest.TestCase):
             calls = self.run_shim(Path(tmp), reg)
         self.assertEqual(len(calls), 2)
         self.assertTrue(calls[0].startswith('run reg add HKLM\\Microsoft\\GamingServices '))
+
+    def test_a_local_game_prefix_is_not_given_the_gaming_services_value(self):
+        # A local game's prefix may be Steam's own compatdata/<appid>; the
+        # value is for GDK titles, so it is not written there.
+        with tempfile.TemporaryDirectory(prefix='ferestre shim ') as tmp:
+            calls = self.run_shim(Path(tmp), extra_env={'FERESTRE_LOCAL_GAME': '1'})
+        self.assertEqual(calls, ['run Game.exe|Game.exe=3|Z:\\Game.config'])
 
 class PlayStationPadTests(unittest.TestCase):
     """Sony pads go through SDL so a GDK title sees them as XInput gamepads (issue 10)."""

@@ -65,6 +65,11 @@ pub(super) struct State {
 }
 
 impl State {
+    /// Forgets the launch under `key`; whether there was one to forget.
+    fn end(&mut self, key: &str) -> bool {
+        self.launches.remove(key).is_some()
+    }
+
     fn mine(&self) -> impl Iterator<Item = &Launch> {
         self.launches
             .values()
@@ -360,7 +365,11 @@ pub(super) fn launch_event(ui: &Ui, key: &str, pid: u32, event: Event) {
 }
 
 pub(super) fn launch_ended(ui: &Ui, key: &str) {
-    ui.presence.borrow_mut().launches.remove(key);
+    // A launch this module never followed, such as a local game's, has
+    // nothing to tell Xbox and must not start xodus-cli.
+    if !ui.presence.borrow_mut().end(key) {
+        return;
+    }
     update(ui);
     // Its last events may not have been read yet; ask Xbox either way.
     refresh(ui, false);
@@ -488,4 +497,30 @@ pub(super) fn dot(badge: &Badge) -> Option<gtk::Box> {
     }
     dot.set_tooltip_text(badge.tooltip().as_deref());
     Some(dot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ending_a_launch_presence_never_followed_is_a_no_op() {
+        // A local game's launch is never registered, so its end must not
+        // count as one: that is what keeps xodus-cli from running for it.
+        let mut state = State::default();
+        assert!(!state.end("LOCAL-GAME"));
+
+        state.launches.insert(
+            "9NBLGGH4R315".into(),
+            Launch {
+                pid: 1,
+                player: None,
+                heard: false,
+                signed_out: false,
+                runner: Runner::Idle,
+            },
+        );
+        assert!(state.end("9NBLGGH4R315"));
+        assert!(!state.end("9NBLGGH4R315"));
+    }
 }
