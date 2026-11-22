@@ -199,16 +199,45 @@ class WorkflowTests(unittest.TestCase):
 
     def test_ci_uses_the_persistent_directory_or_the_cache_never_both(self):
         workflow = load(REPO / '.github/workflows/rust.yml')
-        for name in ('test', 'msrv', 'gui', 'sources'):
-            steps = workflow['jobs'][name]['steps']
+        for name, job in workflow['jobs'].items():
+            steps = job['steps']
             persistent = [s for s in steps if 'ci-target-dir.sh' in s.get('run', '')]
             cached = [s for s in steps if str(s.get('uses', '')).startswith('Swatinem/rust-cache@')]
-            self.assertEqual(len(persistent), 1, name)
-            self.assertEqual(len(cached), 1, name)
-            self.assertEqual(persistent[0].get('if'), "runner.environment == 'self-hosted'", name)
-            self.assertEqual(cached[0].get('if'), "runner.environment != 'self-hosted'", name)
-            self.assertEqual(cached[0]['with'].get('save-if'),
-                             "${{ github.ref == 'refs/heads/main' }}", name)
+            for step in cached:
+                self.assertEqual(step['with'].get('save-if'),
+                                 "${{ github.ref == 'refs/heads/main' }}", name)
+            if name == 'test':
+                # The one job that may run self-hosted (FERESTRE_RUNNER_LABELS).
+                self.assertEqual(len(persistent), 1, name)
+                self.assertEqual(len(cached), 1, name)
+                self.assertEqual(persistent[0].get('if'), "runner.environment == 'self-hosted'", name)
+                self.assertEqual(cached[0].get('if'), "runner.environment != 'self-hosted'", name)
+            else:
+                self.assertEqual(job['runs-on'], 'ubuntu-24.04', name)
+                self.assertEqual(persistent, [], name)
+
+    def test_no_ci_job_can_cancel_or_write(self):
+        # A pull request run gets nothing but a read-only token.
+        workflow = load(REPO / '.github/workflows/rust.yml')
+        for name, job in workflow['jobs'].items():
+            self.assertFalse(can_write(job, workflow), name)
+
+    def test_the_gui_shards_cover_every_gui_test(self):
+        workflow = load(REPO / '.github/workflows/rust.yml')
+        gui = workflow['jobs']['gui']
+        self.assertEqual(gui['strategy']['matrix']['shard'], [1, 2, 3, 4])
+        self.assertIs(gui['strategy']['fail-fast'], False)
+        self.assertEqual(gui['needs'], 'gui-build')
+        self.assertTrue(any('tests/run_gui_ci.py --shard "$SHARD/4"' in t for t in runs(gui)))
+        import json
+        manifest = json.loads((REPO / 'tests/gui_ci.json').read_text())['tests']
+        listed = {t['script'] for t in manifest}
+        on_disk = {f'tests/{p.name}' for p in (REPO / 'tests').glob('gui_*.py')}
+        self.assertEqual(listed, on_disk)
+        # Nothing in the gui jobs still starts a test by hand.
+        for name in ('gui-build', 'gui'):
+            for text in runs(workflow['jobs'][name]):
+                self.assertNotIn('xvfb-run', text, name)
 
     def test_only_pull_request_runs_cancel_one_another(self):
         for wf in ('rust.yml', 'compatibility-matrix.yml'):

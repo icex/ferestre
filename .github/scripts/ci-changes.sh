@@ -39,7 +39,7 @@ while IFS= read -r path; do
         # tests read titles/ through the GUI.
         tests/gui_*.py|tests/controller_driver.py|tests/test_gui_actions.py|\
         tests/run_wayland_gui.py|tests/wayland_focus.py|tests/fake_packagekit.py|\
-        tests/fixtures/*|titles/*)
+        tests/run_gui_ci.py|tests/gui_ci.json|tests/fixtures/*|titles/*)
             gui=true ;;
     esac
     case "$path" in

@@ -7,6 +7,7 @@ jobs name is checked to switch them on. Runs the script against throwaway git
 repositories; nothing is fetched.
 """
 from pathlib import Path
+import json
 import os
 import re
 import subprocess
@@ -78,11 +79,17 @@ class CiChangesTests(unittest.TestCase):
                              'scripts/check-sources.sh']:
             self.assertEqual(decide('pull_request', [path])['sources'], 'true', path)
 
-    def test_every_file_the_gui_job_names_switches_it_on(self):
-        job = yaml.safe_load(RUST.read_text())['jobs']['gui']
-        paths = job_paths(job)
-        self.assertIn('tests/gui_smoke.py', paths)
-        for path in paths + ['tests/controller_driver.py', 'titles/a.toml', 'Cargo.lock']:
+    def test_every_file_the_gui_jobs_name_switches_them_on(self):
+        jobs = yaml.safe_load(RUST.read_text())['jobs']
+        paths = job_paths(jobs['gui-build']) + job_paths(jobs['gui'])
+        self.assertIn('tests/run_gui_ci.py', paths)
+        self.assertIn('tests/test_gui_actions.py', paths)
+        # The runner reads its tests from the manifest.
+        manifest = json.loads((REPO / 'tests/gui_ci.json').read_text())['tests']
+        scripts = sorted({t['script'] for t in manifest})
+        self.assertIn('tests/gui_smoke.py', scripts)
+        for path in paths + scripts + ['tests/gui_ci.json', 'tests/controller_driver.py',
+                                       'titles/a.toml', 'Cargo.lock']:
             self.assertEqual(decide('pull_request', [path])['gui'], 'true', path)
 
 
