@@ -11,8 +11,14 @@ kernel-level one (see [Anti-cheat](#anti-cheat)).
 
 ## What you need
 
-- An AMD Radeon RX 9000 card and Mesa 26.2 or newer. Ferestre warns when it
-  finds neither, but does not stop you.
+- An AMD Radeon RX 9000 (RDNA4) card. On Intel, NVIDIA or an older Radeon
+  the option stays off: Ferestre refuses to enable it, the GUI's Enable
+  button is greyed out with the reason, and a game that already has it on
+  (say an eGPU was unplugged) launches without it, with your own files put
+  back, and gets it again on its next launch on an RX 9000. A machine with an
+  integrated GPU beside an RX 9000 qualifies.
+- Mesa 26.2 or newer. Ferestre warns when it finds an older one, or cannot
+  tell, but does not stop you.
 - Your own copy of `nvngx_dlssnr.dll`, version 310.9.16 or 310.8.0. Ferestre
   checks it by its SHA-256 and accepts no other file. 310.9.16 carries both
   networks' model files; 310.8.0 only `CC_SILVER_AARDWOLD`.

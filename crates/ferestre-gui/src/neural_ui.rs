@@ -56,7 +56,7 @@ pub(crate) fn view(o: &Overview) -> View {
         lines.push(format!("Upscalers: {}", d.upscalers.join(", ")));
     }
 
-    let mut warnings = o.hardware.clone();
+    let mut warnings = o.hardware.warnings.clone();
     if d.assumed {
         warnings.push(
             "The executable is encrypted, so x86-64 Direct3D 12 is assumed (true of Xbox PC games)"
@@ -75,6 +75,13 @@ pub(crate) fn view(o: &Overview) -> View {
     }
 
     let (can_enable, blocked_because, acknowledge) = match &o.gate {
+        // Only an RX 9000 runs it; on Intel, NVIDIA or an older Radeon the
+        // switch stays off whatever the game.
+        _ if o.hardware.unsupported.is_some() => (
+            false,
+            o.hardware.unsupported.clone(),
+            Vec::new(),
+        ),
         Gate::Allowed => (true, None, Vec::new()),
         Gate::NeedsAcknowledgement(names) => (true, None, names.clone()),
         Gate::Refused(names) => (
@@ -475,7 +482,7 @@ mod tests {
             installed: None,
             models: Vec::new(),
             package_ready: false,
-            hardware: Vec::new(),
+            hardware: neural::hardware::Hardware::default(),
             dll_url_configured: false,
         }
     }
@@ -490,6 +497,29 @@ mod tests {
         assert!(!v.can_enable);
         assert!(v.blocked_because.as_deref().unwrap().contains("Ricochet"));
         assert!(v.acknowledge.is_empty());
+    }
+
+    #[test]
+    fn an_unsupported_gpu_disables_enable_for_every_game() {
+        let reason = "Neural rendering needs an AMD Radeon RX 9000 (RDNA4) GPU; \
+                      this machine has an NVIDIA GPU.";
+        for (anticheat, gate) in [
+            (Vec::new(), Gate::Allowed),
+            (
+                vec![det("BattlEye", true, true)],
+                Gate::NeedsAcknowledgement(vec!["BattlEye"]),
+            ),
+        ] {
+            let mut o = overview(anticheat, gate, Some(Route::Optiscaler));
+            o.hardware.unsupported = Some(reason.to_string());
+            let v = view(&o);
+            assert!(!v.can_enable);
+            assert_eq!(v.blocked_because.as_deref(), Some(reason));
+            assert!(v.acknowledge.is_empty());
+            for route in 0..=Route::ALL.len() as u32 {
+                assert!(!enable_sensitive(&v, route, Some(true)));
+            }
+        }
     }
 
     #[test]

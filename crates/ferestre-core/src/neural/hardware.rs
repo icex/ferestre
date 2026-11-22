@@ -1,5 +1,7 @@
-//! Whether this machine can run DLSSNR-AMD: an RDNA4 GPU and Mesa 26.2 or
-//! newer. Only ever warnings; nothing here blocks enabling.
+//! Whether this machine can run DLSSNR-AMD. Without an AMD Radeon RX 9000
+//! (RDNA4) GPU neural rendering is refused: it is never enabled, and an
+//! enabled game launches without it. An old or unknown Mesa is only a
+//! warning, since a driver update fixes it.
 
 use std::io::Read;
 use std::path::Path;
@@ -7,6 +9,12 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const AMD: u16 = 0x1002;
+const NVIDIA: u16 = 0x10de;
+const INTEL: u16 = 0x8086;
+/// The `/sys/class/drm`-shaped directory to read GPUs from instead of the
+/// real one; for tests on machines without an RDNA4 card.
+pub const DRM_ENV: &str = "FERESTRE_DRM_DIR";
+pub const SYS_DRM: &str = "/sys/class/drm";
 /// PCI device ids of RDNA4 (Navi 48 and Navi 44) cards; newer ones are
 /// recognised by their graphics IP version instead.
 pub const RDNA4_DEVICES: &[u16] = &[0x7550, 0x7551, 0x7590];
@@ -80,17 +88,41 @@ pub fn mesa_version(vulkan_summary: &str) -> Option<(u32, u32)> {
         })
 }
 
-/// What to tell the person. `checked_mesa` is whether `vulkaninfo` could be
-/// run at all.
-pub fn warnings(gpus: &[Gpu], mesa: Option<(u32, u32)>, checked_mesa: bool) -> Vec<String> {
-    let mut warnings = Vec::new();
-    if !gpus.iter().any(Gpu::is_rdna4) {
-        warnings.push(
-            "No AMD RX 9000 (RDNA4) GPU was found; DLSSNR-AMD runs only on RDNA4 and stays off \
-             in game without it."
-                .to_string(),
-        );
+fn describe(gpu: &Gpu) -> String {
+    match gpu.vendor {
+        AMD => format!(
+            "an AMD Radeon older than RX 9000 (device {:#06x})",
+            gpu.device
+        ),
+        NVIDIA => "an NVIDIA GPU".to_string(),
+        INTEL => "an Intel GPU".to_string(),
+        vendor => format!("a GPU from PCI vendor {vendor:#06x}"),
     }
+}
+
+/// Why neural rendering cannot run on these GPUs, or `None` when one of
+/// them is an RDNA4 card (any other GPU beside it, such as an integrated
+/// one, does not matter).
+pub fn unsupported(gpus: &[Gpu]) -> Option<String> {
+    if gpus.iter().any(Gpu::is_rdna4) {
+        return None;
+    }
+    let found = if gpus.is_empty() {
+        "no GPU was found".to_string()
+    } else {
+        let mut names: Vec<String> = gpus.iter().map(describe).collect();
+        names.dedup();
+        format!("this machine has {}", names.join(" and "))
+    };
+    Some(format!(
+        "Neural rendering needs an AMD Radeon RX 9000 (RDNA4) GPU; {found}."
+    ))
+}
+
+/// What to tell the person about the driver. `checked_mesa` is whether
+/// `vulkaninfo` could be run at all.
+pub fn mesa_warnings(mesa: Option<(u32, u32)>, checked_mesa: bool) -> Vec<String> {
+    let mut warnings = Vec::new();
     let (min_major, min_minor) = MIN_MESA;
     match (checked_mesa, mesa) {
         (true, Some(version)) if version < MIN_MESA => warnings.push(format!(
@@ -141,15 +173,38 @@ fn vulkan_summary() -> Option<String> {
     Some(reader.join().unwrap_or_default())
 }
 
-/// The warnings for this machine.
-pub fn check() -> Vec<String> {
-    let gpus = gpus(Path::new("/sys/class/drm"));
-    let summary = vulkan_summary();
-    warnings(
-        &gpus,
-        summary.as_deref().and_then(mesa_version),
-        summary.is_some(),
-    )
+/// Why this machine cannot run neural rendering, from the GPUs under `drm`
+/// alone; cheap enough for every launch.
+pub fn gate(drm: &Path) -> Option<String> {
+    unsupported(&gpus(drm))
+}
+
+/// This machine as neural rendering sees it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Hardware {
+    /// Set when there is no RDNA4 GPU: neural rendering is refused.
+    pub unsupported: Option<String>,
+    /// Driver warnings, only looked for on a supported GPU.
+    pub warnings: Vec<String>,
+}
+
+pub fn check(drm: &Path) -> Hardware {
+    match gate(drm) {
+        Some(reason) => Hardware {
+            unsupported: Some(reason),
+            warnings: Vec::new(),
+        },
+        None => {
+            let summary = vulkan_summary();
+            Hardware {
+                unsupported: None,
+                warnings: mesa_warnings(
+                    summary.as_deref().and_then(mesa_version),
+                    summary.is_some(),
+                ),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -173,7 +228,7 @@ mod tests {
         \tdriverInfo         = Mesa 26.2.0-arch1.1 (LLVM 23.1.5)\n";
 
     #[test]
-    fn an_rx_9070_xt_with_mesa_26_2_has_no_warnings() {
+    fn an_rx_9070_xt_with_mesa_26_2_is_supported_without_warnings() {
         let drm = tempfile::tempdir().unwrap();
         card(drm.path(), "card1", "0x1002", "0x7550", Some("12"));
         // A connector is not a GPU.
@@ -187,44 +242,82 @@ mod tests {
                 gfx_major: Some(12)
             }]
         );
+        assert_eq!(unsupported(&gpus), None);
+        assert_eq!(gate(drm.path()), None);
         assert_eq!(mesa_version(SUMMARY), Some((26, 2)));
         assert_eq!(
-            warnings(&gpus, mesa_version(SUMMARY), true),
+            mesa_warnings(mesa_version(SUMMARY), true),
             Vec::<String>::new()
         );
     }
 
     #[test]
-    fn an_rdna3_card_and_old_mesa_both_warn() {
+    fn nvidia_and_intel_are_refused_and_named() {
+        let drm = tempfile::tempdir().unwrap();
+        card(drm.path(), "card0", "0x8086", "0xa7a0", None);
+        card(drm.path(), "card1", "0x10de", "0x2684", None);
+        let reason = gate(drm.path()).expect("refused");
+        assert_eq!(
+            reason,
+            "Neural rendering needs an AMD Radeon RX 9000 (RDNA4) GPU; this machine has \
+             an Intel GPU and an NVIDIA GPU."
+        );
+        assert!(check(drm.path()).unsupported.is_some());
+    }
+
+    #[test]
+    fn an_rdna3_radeon_is_refused() {
         let drm = tempfile::tempdir().unwrap();
         card(drm.path(), "card0", "0x1002", "0x744c", Some("11"));
-        let summary = "\tdriverInfo         = Mesa 25.3.4\n";
-        let warnings = warnings(&gpus(drm.path()), mesa_version(summary), true);
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(warnings[0].contains("RDNA4"), "{warnings:?}");
-        assert_eq!(
-            warnings[1],
-            "Mesa 25.3 is older than 26.2, which DLSSNR-AMD needs."
+        let reason = gate(drm.path()).expect("refused");
+        assert!(
+            reason.contains("older than RX 9000 (device 0x744c)"),
+            "{reason}"
         );
+    }
+
+    #[test]
+    fn an_nvidia_id_that_looks_like_rdna4_is_refused() {
+        let drm = tempfile::tempdir().unwrap();
+        card(drm.path(), "card0", "0x10de", "0x7550", Some("12"));
+        assert!(gate(drm.path()).is_some());
+    }
+
+    #[test]
+    fn no_gpu_at_all_is_refused() {
+        let drm = tempfile::tempdir().unwrap();
+        assert_eq!(
+            gate(drm.path()).as_deref(),
+            Some("Neural rendering needs an AMD Radeon RX 9000 (RDNA4) GPU; no GPU was found.")
+        );
+        assert!(gate(&drm.path().join("missing")).is_some());
+    }
+
+    #[test]
+    fn an_igpu_beside_an_rdna4_card_is_supported() {
+        let drm = tempfile::tempdir().unwrap();
+        card(drm.path(), "card0", "0x8086", "0xa7a0", None);
+        card(drm.path(), "card1", "0x1002", "0x7551", None);
+        assert_eq!(gate(drm.path()), None);
     }
 
     #[test]
     fn a_gfx12_device_id_not_in_the_list_still_counts() {
         let drm = tempfile::tempdir().unwrap();
         card(drm.path(), "card0", "0x1002", "0x75ff", Some("12"));
-        let warnings = warnings(&gpus(drm.path()), Some((27, 0)), true);
-        assert_eq!(warnings, Vec::<String>::new());
+        assert_eq!(gate(drm.path()), None);
     }
 
     #[test]
-    fn an_unchecked_mesa_and_another_vendor_warn() {
-        let drm = tempfile::tempdir().unwrap();
-        card(drm.path(), "card0", "0x10de", "0x7550", None);
-        let warnings = warnings(&gpus(drm.path()), None, false);
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
+    fn old_and_unchecked_mesa_only_warn() {
+        assert_eq!(
+            mesa_warnings(mesa_version("\tdriverInfo         = Mesa 25.3.4\n"), true),
+            vec!["Mesa 25.3 is older than 26.2, which DLSSNR-AMD needs.".to_string()]
+        );
+        let unchecked = mesa_warnings(None, false);
         assert!(
-            warnings[1].contains("vulkaninfo is not installed"),
-            "{warnings:?}"
+            unchecked[0].contains("vulkaninfo is not installed"),
+            "{unchecked:?}"
         );
         assert_eq!(mesa_version("deviceName = AMD\n"), None);
     }

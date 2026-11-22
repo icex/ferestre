@@ -731,6 +731,9 @@ pub fn enable(ctx: &Context, req: &EnableRequest) -> Result<Enabled> {
 }
 
 fn enable_with(ctx: &Context, req: &EnableRequest, found: &[Detection]) -> Result<Enabled> {
+    if let Some(reason) = hardware::gate(&ctx.drm) {
+        bail!("{reason}");
+    }
     let _lock = lock(ctx, req.key)?;
     let name = game_name(req.game_dir, req.key);
     let acknowledged = state::acknowledged(&ctx.config_dir, req.key)?;
@@ -882,7 +885,7 @@ fn enable_with(ctx: &Context, req: &EnableRequest, found: &[Detection]) -> Resul
         }
         return Err(undo(error));
     }
-    let mut warnings = hardware::check();
+    let mut warnings = hardware::check(&ctx.drm).warnings;
     if detected.assumed {
         warnings.push(format!(
             "{} could not be read (an Xbox install keeps it encrypted); assumed x86-64 D3D12",
@@ -969,13 +972,17 @@ pub enum Ensured {
     /// An anti-cheat now forbids it: taken out, the person's files back, the
     /// entry forgotten.
     TakenOut(String),
+    /// No RDNA4 GPU now (an eGPU unplugged, another card in): taken out for
+    /// this launch with the person's files back, the entry kept so the next
+    /// launch on a supported GPU installs it again.
+    Paused(String),
     /// An anti-cheat now forbids it and its files could not be taken out:
     /// the launch must stop.
     Blocked(String),
 }
 
-/// Before every launch: re-run the anti-cheat gate, then make sure an
-/// enabled install is whole, reinstalling it when it is not.
+/// Before every launch: re-run the anti-cheat gate and the GPU check, then
+/// make sure an enabled install is whole, reinstalling it when it is not.
 pub fn ensure_installed(ctx: &Context, key: &str, game_dir: &Path, executable: &str) -> Ensured {
     let found = anticheat::detect(game_dir, executable);
     ensure_with(ctx, key, game_dir, executable, &found)
@@ -1012,6 +1019,21 @@ fn ensure_with(
             )),
             Err(e) => Ensured::Blocked(format!(
                 "{reason}, and its files could not be taken out: {e:#}"
+            )),
+        };
+    }
+    if let Some(reason) = hardware::gate(&ctx.drm) {
+        let mut taken = take_out(ctx, key, &entry.install_dir, Some(&entry));
+        if taken.is_ok() && dir != entry.install_dir {
+            taken = take_out(ctx, key, &dir, None);
+        }
+        return match taken {
+            Ok(()) => Ensured::Paused(format!(
+                "{reason} It stays on for this game and comes back on a supported GPU."
+            )),
+            Err(e) => Ensured::Blocked(format!(
+                "{reason} Its files could not be taken out for this launch: {e:#}; \
+                 turn it off with: ferestre neural disable {key}"
             )),
         };
     }
@@ -1077,11 +1099,14 @@ fn reinstall(
     Ok(entry)
 }
 
-/// The enabled entry when the anti-cheat gate allows it, reading only: what
+/// The enabled entry when the GPU and the anti-cheat gate allow it, reading only: what
 /// a dry run shows a launch would add.
 pub fn preview(ctx: &Context, key: &str, game_dir: &Path, executable: &str) -> Option<Entry> {
     let entry = state::get(&ctx.config_dir, key).ok()??;
     if !entry.enabled {
+        return None;
+    }
+    if hardware::gate(&ctx.drm).is_some() {
         return None;
     }
     let acknowledged = state::acknowledged(&ctx.config_dir, key).ok()?;
@@ -1311,11 +1336,14 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
                 &game.join("Game.exe"),
                 &crate::neural::pe::tiny_pe(0x8664, 0x20b, &["d3d12.dll"]),
             );
+            let drm = tmp.path().join("drm");
+            rdna4_card(&drm);
             let ctx = Context {
                 root,
                 config_dir: tmp.path().join("config"),
                 packages: Box::new(move |arch| package::local(&packages, arch)),
                 expect,
+                drm,
             };
             World { tmp, game, ctx }
         }
@@ -1353,6 +1381,24 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
         fn package_dir(&self) -> PathBuf {
             self.ctx.root.join("packages/0.0.9-x86_64")
         }
+    }
+
+    /// One GPU card under a `/sys/class/drm`-shaped `drm`, replacing any.
+    fn gpu_card(drm: &Path, vendor: &str, device: &str) {
+        let _ = std::fs::remove_dir_all(drm);
+        write(
+            &drm.join("card0/device/vendor"),
+            format!("{vendor}\n").as_bytes(),
+        );
+        write(
+            &drm.join("card0/device/device"),
+            format!("{device}\n").as_bytes(),
+        );
+    }
+
+    /// An RX 9070 XT.
+    fn rdna4_card(drm: &Path) {
+        gpu_card(drm, "0x1002", "0x7550");
     }
 
     fn det(name: &'static str, kernel: bool, proton_runtime: bool) -> Detection {
@@ -1956,6 +2002,74 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
             other => panic!("{other:?}"),
         }
         assert!(w.entry().is_some());
+    }
+
+    #[test]
+    fn intel_nvidia_and_older_radeons_are_refused_without_changes() {
+        for (vendor, device, named) in [
+            ("0x10de", "0x2684", "an NVIDIA GPU"),
+            ("0x8086", "0xa7a0", "an Intel GPU"),
+            ("0x1002", "0x744c", "older than RX 9000"),
+        ] {
+            let w = World::new();
+            gpu_card(&w.ctx.drm, vendor, device);
+            write(&w.game.join("dxgi.dll"), THEIRS);
+            let before = listing(&w.game);
+            let err = enable_with(&w.ctx, &w.req(Some(Route::ReshadeFeeder), true), &[])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("RX 9000 (RDNA4)") && err.contains(named),
+                "{err}"
+            );
+            assert_eq!(listing(&w.game), before);
+            assert_eq!(read(&w.game.join("dxgi.dll")), THEIRS);
+            assert_eq!(w.entry(), None);
+            assert_eq!(w.log_lines(), 0, "install.sh never ran");
+        }
+    }
+
+    #[test]
+    fn a_launch_without_the_rdna4_card_pauses_and_comes_back() {
+        let w = World::new();
+        write(&w.game.join("dxgi.dll"), THEIRS);
+        w.enable(Route::ReshadeFeeder);
+        gpu_card(&w.ctx.drm, "0x10de", "0x2684");
+        assert_eq!(preview(&w.ctx, "local-game", &w.game, "Game.exe"), None);
+        match w.ensure(&[]) {
+            Ensured::Paused(reason) => assert!(reason.contains("NVIDIA"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(read(&w.game.join("dxgi.dll")), THEIRS);
+        assert!(!w.game.join(INSTALL_MANIFEST).exists());
+        assert!(!w.game.join(BACKUP_DIR).exists());
+        assert!(
+            w.entry().unwrap().enabled,
+            "kept for the next supported launch"
+        );
+        // Paused again: nothing of the mod left to take out.
+        assert!(matches!(w.ensure(&[]), Ensured::Paused(_)));
+
+        rdna4_card(&w.ctx.drm);
+        assert!(matches!(w.ensure(&[]), Ensured::Reinstalled(_)));
+        assert_eq!(read(&w.game.join("dxgi.dll")), b"reshade dxgi");
+        assert!(preview(&w.ctx, "local-game", &w.game, "Game.exe").is_some());
+        disable(&w.ctx, "local-game", &w.game, "Game.exe").unwrap();
+        assert_eq!(read(&w.game.join("dxgi.dll")), THEIRS);
+    }
+
+    #[test]
+    fn a_mod_that_cannot_be_paused_on_another_gpu_blocks_the_launch() {
+        let w = World::new();
+        w.enable(Route::ReshadeFeeder);
+        std::fs::remove_dir_all(w.package_dir()).unwrap();
+        gpu_card(&w.ctx.drm, "0x8086", "0xa7a0");
+        match w.ensure(&[]) {
+            Ensured::Blocked(reason) => assert!(reason.contains("Intel"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(w.game.join(INSTALL_MANIFEST).exists());
+        assert!(w.entry().unwrap().enabled);
     }
 
     #[test]

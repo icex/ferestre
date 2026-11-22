@@ -73,7 +73,10 @@ B. Neural rendering
 - Anti-cheat gate: a kernel-level anti-cheat refuses enabling; any other
   detected anti-cheat requires an explicit acknowledgement, remembered per
   game and anti-cheat.
-- Hardware check: warn (not block) when no RDNA4 GPU / Mesa older than 26.2.
+- Hardware gate: only on an AMD Radeon RX 9000 (RDNA4) GPU. On Intel, NVIDIA
+  or an older Radeon, enabling is refused, the GUI switch is off, and an
+  enabled game launches without the mod (taken out, kept enabled, back on a
+  supported GPU). Mesa older than 26.2 only warns.
 
 ## Non-goals
 - Importing from Lutris, Heroic or Epic libraries (later; the recipe format

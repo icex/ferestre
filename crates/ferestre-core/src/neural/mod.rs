@@ -250,6 +250,8 @@ pub struct Context {
     /// The package to install for an architecture.
     pub packages: Box<dyn Fn(Arch) -> Result<package::Package>>,
     pub expect: Expect,
+    /// The `/sys/class/drm`-shaped directory GPUs are read from.
+    pub drm: PathBuf,
 }
 
 impl Context {
@@ -260,6 +262,7 @@ impl Context {
             config_dir: paths.config_dir().to_path_buf(),
             packages: Box::new(move |arch| package::current(&owned, arch)),
             expect: Expect::pinned(),
+            drm: PathBuf::from(paths.var(hardware::DRM_ENV).unwrap_or(hardware::SYS_DRM)),
         }
     }
 }
@@ -278,7 +281,7 @@ pub struct Overview {
     /// Whether the package to use is unpacked, for the entry's architecture
     /// or else the executable's.
     pub package_ready: bool,
-    pub hardware: Vec<String>,
+    pub hardware: hardware::Hardware,
     pub dll_url_configured: bool,
 }
 
@@ -320,7 +323,7 @@ pub fn overview(
         installed,
         models: models::cached(&ctx.root, &ctx.expect),
         package_ready,
-        hardware: hardware::check(),
+        hardware: hardware::check(&ctx.drm),
         dll_url_configured: crate::settings::dlssnr_dll_url(paths)
             .ok()
             .flatten()

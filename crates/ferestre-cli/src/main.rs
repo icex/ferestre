@@ -791,7 +791,7 @@ fn neural_status(
                 .ok()
                 .flatten()
                 .is_some(),
-            "hardware": neural::hardware::check(),
+            "hardware": hardware_json(&neural::hardware::check(&ctx.drm)),
             "titles": titles,
         }));
     };
@@ -830,9 +830,17 @@ fn neural_status(
         },
         "models": models_json(&o.models),
         "package_ready": o.package_ready,
-        "hardware": o.hardware,
+        "hardware": hardware_json(&o.hardware),
         "dll_url_configured": o.dll_url_configured,
     }))
+}
+
+fn hardware_json(hardware: &neural::hardware::Hardware) -> Value {
+    json!({
+        "supported": hardware.unsupported.is_none(),
+        "unsupported": hardware.unsupported,
+        "warnings": hardware.warnings,
+    })
 }
 
 /// `neural status` for a person, from its document.
@@ -955,7 +963,10 @@ fn render_neural_status(doc: &Value) -> String {
             "not configured"
         }
     );
-    for warning in doc["hardware"].as_array().into_iter().flatten() {
+    if let Some(reason) = doc["hardware"]["unsupported"].as_str() {
+        let _ = writeln!(out, "!! {reason}");
+    }
+    for warning in doc["hardware"]["warnings"].as_array().into_iter().flatten() {
         let _ = writeln!(out, "-- {}", text(warning));
     }
     if let Some(titles) = doc["titles"].as_object() {
@@ -4357,6 +4368,9 @@ fn neural_before_launch(
             "-- neural rendering was turned off for {}: {reason}",
             game_name(game_dir, product_id)
         ),
+        Ensured::Paused(reason) => {
+            eprintln!("-- neural rendering is off for this launch: {reason}")
+        }
         Ensured::Blocked(reason) => bail!("{reason}"),
     }
     Ok(())
@@ -9482,6 +9496,12 @@ fi
             neural::package::LOCAL_ENV.into(),
             pkgs.display().to_string(),
         ));
+        // An RX 9070 XT, whatever this machine has.
+        let drm = home.root().join("drm");
+        write_file(&drm.join("card0/device/vendor"), b"0x1002\n");
+        write_file(&drm.join("card0/device/device"), b"0x7550\n");
+        home.extra
+            .push((neural::hardware::DRM_ENV.into(), drm.display().to_string()));
         let mut ctx = neural::Context::from_paths(&home.paths());
         ctx.expect = expect;
         ctx
@@ -9536,6 +9556,25 @@ fi
         neural_before_launch(&mut plan, &ctx, GAME, &dir, "Game.exe").unwrap();
         assert_eq!(plan.get("WINEDLLOVERRIDES"), Some("d3d11=n;dxgi=n,b"));
         assert!(plan.get("VK_INSTANCE_LAYERS").is_none());
+    }
+
+    #[test]
+    fn an_nvidia_launch_gets_no_overrides_and_the_game_its_own_files() {
+        let (home, ctx, dir) = neural_xbox_home("neural-nvidia");
+        neural_turn_on(&ctx, GAME, &dir, Network::SilverAardwold);
+        let drm = home.root().join("drm");
+        write_file(&drm.join("card0/device/vendor"), b"0x10de\n");
+        write_file(&drm.join("card0/device/device"), b"0x2684\n");
+        let mut plan = empty_plan(&[("WINEDLLOVERRIDES", "d3d11=n")], &[]);
+        neural_before_launch(&mut plan, &ctx, GAME, &dir, "Game.exe").unwrap();
+        assert_eq!(plan.get("WINEDLLOVERRIDES"), Some("d3d11=n"));
+        assert!(!dir.join("dxgi.dll").exists());
+        assert!(
+            neural::state::get(&ctx.config_dir, GAME)
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
     }
 
     #[test]
