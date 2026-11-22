@@ -41,6 +41,7 @@ use ferestre_core::http;
 use ferestre_core::install;
 use ferestre_core::launch;
 use ferestre_core::library;
+use ferestre_core::neural;
 use ferestre_core::paths::Paths;
 use ferestre_core::recipe::Recipe;
 use ferestre_core::running;
@@ -998,6 +999,21 @@ fn prepare_launch(
         &recipe.launch.executable,
         request.dry_run,
     );
+    // A dry run shows what a launch would add, reading only; a real launch
+    // decides in `launch_prepared`, after its check.
+    if request.dry_run {
+        let game_dir = launch::game_dir(&recipe, &dirs, &options);
+        let ctx = neural::Context::from_paths(paths);
+        if let Some(entry) = neural::apply::preview(
+            &ctx,
+            &recipe.title.product_id,
+            &game_dir,
+            &recipe.launch.executable,
+        ) {
+            let exe_dir = neural::apply::exe_dir(&game_dir, &recipe.launch.executable);
+            add_neural_rendering(&mut plan, &entry, &exe_dir);
+        }
+    }
     if local {
         let found = ferestre_core::anticheat::detect(
             &launch::game_dir(&recipe, &dirs, &options),
@@ -1028,13 +1044,23 @@ fn prepare_launch(
 
 /// Start a prepared launch and wait for the title.
 fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Result<ExitCode> {
+    launch_prepared_with(paths, prepared, force, &neural::Context::from_paths(paths))
+}
+
+/// [`launch_prepared`] with the neural rendering context to check against.
+fn launch_prepared_with(
+    paths: &Paths,
+    prepared: PreparedLaunch,
+    force: bool,
+    neural: &neural::Context,
+) -> Result<ExitCode> {
     let PreparedLaunch {
         recipe,
         runtime,
         registry,
         dirs,
         options,
-        plan,
+        mut plan,
         service_socket,
         roles,
         mut profiles,
@@ -1145,6 +1171,15 @@ fn launch_prepared(paths: &Paths, prepared: PreparedLaunch, force: bool) -> Resu
         register_winrt_classes(&prefix, registry, &runtime);
     }
     run_setup(&recipe, "every-launch", &dirs.scripts_dir, &game_dir)?;
+    // After the game's own setup, before anything starts: re-check the
+    // anti-cheat gate and the install, and only then add the launch env.
+    neural_before_launch(
+        &mut plan,
+        neural,
+        &recipe.title.product_id,
+        &game_dir,
+        &recipe.launch.executable,
+    )?;
     if !local && runtime.provides("xgameruntime.playfab-file-saves") {
         if let Some(identity) = install::package_identity(&game_dir) {
             let backups = paths
@@ -1657,6 +1692,20 @@ fn uninstall_title(
         }
         let product_id = recipe.title.product_id.to_ascii_uppercase();
         let _lock = TitleLock::take(paths, &product_id, LockMode::Change)?;
+        // The mod comes out and the person's files go back before the game
+        // is forgotten; nothing would take them out afterwards.
+        if neural::state::get(paths.config_dir(), &product_id)?.is_some_and(|e| e.enabled) {
+            let ctx = neural::Context::from_paths(paths);
+            neural::apply::disable(&ctx, &product_id, &dir, &recipe.launch.executable)
+                .with_context(|| {
+                    format!(
+                        "{} still has neural rendering on; turn it off first: ferestre neural \
+                         disable {}",
+                        recipe.title.name, recipe.title.slug
+                    )
+                })?;
+            eprintln!("-- neural rendering removed from {}", recipe.title.name);
+        }
         let forgotten = ferestre_core::local::forget(paths, &product_id)?;
         if cli.json {
             print_json(&json!({
@@ -1822,6 +1871,10 @@ fn uninstall_title(
 
     install::forget(paths.state_dir(), &product_id)?;
     eprintln!("-- forgot the install record for {product_id}");
+    // The mod went with the files.
+    if !removal.keep_files {
+        neural::state::forget(paths.config_dir(), &product_id)?;
+    }
     if removal.keep_files {
         eprintln!("   the files are still in {}", dir.display());
     }
@@ -3698,6 +3751,71 @@ fn scoped_service_directory(supported: bool, id: &str, root: &Path) -> Result<Op
     // Keep the Unix socket path below sun_path limits (the full SHA remains
     // in SERVICE_ID; 128 bits identify the namespace).
     Ok(Some(root.join("ferestre-services").join(&id[..32])))
+}
+
+/// Add neural rendering's launch env for an installed entry. A key's current
+/// value is the plan's, else the inherited one unless the plan strips it, so
+/// Steam's inherited `VK_INSTANCE_LAYERS` never comes back; every key set
+/// here leaves `env_unset`, or `to_command` would remove it again.
+fn add_neural_rendering(plan: &mut launch::Plan, entry: &neural::state::Entry, exe_dir: &Path) {
+    let env = {
+        let current = |key: &str| {
+            plan.env_set.get(key).cloned().or_else(|| {
+                if plan.is_unset(key) {
+                    None
+                } else {
+                    std::env::var(key).ok()
+                }
+            })
+        };
+        neural::apply::launch_env(entry, exe_dir, &current)
+    };
+    for (key, value) in env.set {
+        plan.env_unset.retain(|k| k != &key);
+        plan.env_set.insert(key, value);
+    }
+    for note in env.notes {
+        eprintln!("{note}");
+    }
+}
+
+/// Before a launch: the anti-cheat gate and the install check, then the
+/// launch env only when the mod is present and allowed. Only a mod that an
+/// anti-cheat now forbids and that could not be taken out stops the launch.
+fn neural_before_launch(
+    plan: &mut launch::Plan,
+    ctx: &neural::Context,
+    product_id: &str,
+    game_dir: &Path,
+    executable: &str,
+) -> Result<()> {
+    use neural::apply::Ensured;
+    let exe_dir = neural::apply::exe_dir(game_dir, executable);
+    match neural::apply::ensure_installed(ctx, product_id, game_dir, executable) {
+        Ensured::NotEnabled => {}
+        Ensured::Present(entry) => add_neural_rendering(plan, &entry, &exe_dir),
+        Ensured::Reinstalled(entry) => {
+            eprintln!(":: neural rendering: reinstalled");
+            add_neural_rendering(plan, &entry, &exe_dir);
+        }
+        Ensured::Skipped(reason) => {
+            eprintln!("-- neural rendering is off for this launch: {reason}")
+        }
+        Ensured::TakenOut(reason) => eprintln!(
+            "-- neural rendering was turned off for {}: {reason}",
+            game_name(game_dir, product_id)
+        ),
+        Ensured::Blocked(reason) => bail!("{reason}"),
+    }
+    Ok(())
+}
+
+/// A game's name for a message: its folder's.
+fn game_name(game_dir: &Path, product_id: &str) -> String {
+    game_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| product_id.to_string())
 }
 
 /// Point Proton at the EAC and BattlEye runtimes, fetching them on first use
@@ -8715,6 +8833,361 @@ printf fixture > "$3/.xodus-streaming.msixvc"
             install::load(paths.state_dir(), "9TESTADDON03").is_some(),
             "actual JSON runs still prepare their missing content"
         );
+    }
+
+    // -- neural rendering ------------------------------------------------------
+
+    use ferestre_core::neural::{apply, state as neural_state, Network, Route};
+
+    /// Emulates upstream `install.sh` for the ReShade route: `remove` deletes
+    /// what the manifest lists; a route first removes a previous install,
+    /// writes the manifest, then the files.
+    const FAKE_INSTALL_SH: &str = r#"#!/bin/bash
+set -euo pipefail
+model_sha256=@AARDWOLD@
+small_sha256=@SMALL@
+pkg="$(cd "$(dirname "$0")" && pwd)"
+dir="$1"
+route="$2"
+model="${4:-}"
+manifest="$dir/dlssnr-amd-install.txt"
+remove() {
+  if [ -f "$manifest" ]; then
+    while IFS= read -r p; do
+      [ -n "$p" ] && rm -rf "${dir:?}/$p"
+    done < "$manifest"
+    rm -f "$manifest"
+  fi
+}
+if [ "$route" = remove ]; then remove; exit 0; fi
+remove
+pairs=("$pkg/dlssnr-amd|dlssnr-amd")
+for f in "$pkg"/reshade/*; do pairs+=("$f|$(basename "$f")"); done
+{ for p in "${pairs[@]}"; do echo "${p#*|}"; done; echo dlssnr-amd.ini; } > "$manifest"
+for p in "${pairs[@]}"; do
+  src="${p%%|*}"; dst="${p#*|}"
+  if [ -d "$src" ]; then mkdir -p "$dir/$dst"; cp -r "$src/." "$dir/$dst/"; else cp "$src" "$dir/$dst"; fi
+done
+printf 'default\n' > "$dir/dlssnr-amd.ini"
+if [ "$model" = CC_SILVER_AARDWOLD_OPTIMIZED ]; then
+  printf int4 > "$dir/dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin"
+fi
+"#;
+
+    const THEIRS: &[u8] = b"theirs";
+
+    fn sha256_hex(path: &Path) -> String {
+        let out = Command::new("sha256sum").arg(path).output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()[..64].to_string()
+    }
+
+    fn write_file(path: &Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// A fake DLSSNR-AMD package named by `FERESTRE_DLSSNR_PACKAGE_DIR`, and
+    /// both models cached; the returned `Context` expects exactly those
+    /// models.
+    fn neural_setup(home: &mut Home) -> neural::Context {
+        let models = neural::models::dir(&neural::root(home.paths().state_dir()));
+        write_file(&models.join("CC_SILVER_AARDWOLD.bin"), b"aardwold");
+        write_file(&models.join("CC_SMALL_FP8.bin"), b"small");
+        let model = |file: &str| neural::ModelFile {
+            file: file.to_string(),
+            sha256: sha256_hex(&models.join(file)),
+            size: std::fs::metadata(models.join(file)).unwrap().len(),
+        };
+        let expect = neural::Expect {
+            dlls: Vec::new(),
+            aardwold: model("CC_SILVER_AARDWOLD.bin"),
+            small: model("CC_SMALL_FP8.bin"),
+        };
+        let src = home.root().join("pkg-src");
+        let script = FAKE_INSTALL_SH
+            .replace("@AARDWOLD@", &expect.aardwold.sha256)
+            .replace("@SMALL@", &expect.small.sha256);
+        write_file(&src.join("install.sh"), script.as_bytes());
+        write_file(&src.join("model-tools/extract_model.sh"), b"#!/bin/bash\n");
+        write_file(&src.join("dlssnr-amd/shader.spv"), b"spv");
+        write_file(&src.join("reshade/dxgi.dll"), b"reshade dxgi");
+        write_file(&src.join("reshade/ReShade.ini"), b"package ini");
+        write_file(&src.join("vulkan/vulkan-1.dll"), b"loader");
+        let pkgs = home.root().join("pkgs");
+        std::fs::create_dir_all(&pkgs).unwrap();
+        let ok = Command::new("tar")
+            .arg("-czf")
+            .arg(pkgs.join(neural::package::asset_name("0.0.9", neural::Arch::X86_64)))
+            .arg("-C")
+            .arg(&src)
+            .arg(".")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        home.extra.push((
+            neural::package::LOCAL_ENV.into(),
+            pkgs.display().to_string(),
+        ));
+        let mut ctx = neural::Context::from_paths(&home.paths());
+        ctx.expect = expect;
+        ctx
+    }
+
+    fn neural_enable(ctx: &neural::Context, key: &str, game_dir: &Path, model: Network) {
+        apply::enable(
+            ctx,
+            &apply::EnableRequest {
+                key,
+                game_dir,
+                executable: "Game.exe",
+                route: Some(Route::ReshadeFeeder),
+                model: Some(model),
+                accept_anticheat_risk: false,
+            },
+        )
+        .unwrap();
+    }
+
+    /// An installed Xbox title with a runtime, and its game folder.
+    fn neural_xbox_home(name: &str) -> (Home, neural::Context, PathBuf) {
+        let mut home = Home::new(name);
+        home.recipe("titles", "game.toml", &game_recipe(""));
+        home.runtime("ferestre-11.0.2", Some(&["loader.memfd-main-image"]));
+        let dir = home.games().join("testgame");
+        installed_package(&dir, GAME);
+        std::fs::write(dir.join("Game.exe"), b"").unwrap();
+        let ctx = neural_setup(&mut home);
+        (home, ctx, dir)
+    }
+
+    fn empty_plan(env: &[(&str, &str)], unset: &[&str]) -> launch::Plan {
+        launch::Plan {
+            program: PathBuf::from("/bin/true"),
+            args: Vec::new(),
+            env_set: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            env_unset: unset.iter().map(|k| k.to_string()).collect(),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn an_enabled_title_gets_its_dll_overrides_merged_into_the_plan() {
+        let (_home, ctx, dir) = neural_xbox_home("neural-merge");
+        neural_enable(&ctx, GAME, &dir, Network::SilverAardwold);
+        let mut plan = empty_plan(&[("WINEDLLOVERRIDES", "d3d11=n")], &[]);
+        neural_before_launch(&mut plan, &ctx, GAME, &dir, "Game.exe").unwrap();
+        assert_eq!(plan.get("WINEDLLOVERRIDES"), Some("d3d11=n;dxgi=n,b"));
+        assert!(plan.get("VK_INSTANCE_LAYERS").is_none());
+    }
+
+    #[test]
+    fn the_int4_layer_survives_the_steam_environment_strip() {
+        let (home, ctx, dir) = neural_xbox_home("neural-int4");
+        neural_enable(&ctx, GAME, &dir, Network::SilverAardwoldOptimized);
+        assert!(dir
+            .join("dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin")
+            .is_file());
+        let paths = home.paths();
+        let mut plan = prepare_launch(&cli(), &paths, "testgame", LaunchRequest::default())
+            .unwrap()
+            .plan;
+        assert!(
+            plan.is_unset("VK_INSTANCE_LAYERS"),
+            "launch::plan strips Steam's layers without Steam integration"
+        );
+        neural_before_launch(&mut plan, &ctx, GAME, &dir, "Game.exe").unwrap();
+        assert!(!plan.is_unset("VK_INSTANCE_LAYERS"));
+        let command = plan.to_command();
+        let envs: Vec<_> = command.get_envs().collect();
+        let value = |key: &str| {
+            envs.iter()
+                .rev()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+                .and_then(|(_, v)| *v)
+                .map(|v| v.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            value("VK_INSTANCE_LAYERS").as_deref(),
+            Some("VK_LAYER_DLSSNR_int4")
+        );
+        assert!(value("VK_ADD_LAYER_PATH")
+            .unwrap()
+            .ends_with("dlssnr-amd/int4/layer"));
+    }
+
+    #[test]
+    fn a_disabled_or_unknown_title_leaves_the_plan_alone() {
+        let (_home, ctx, dir) = neural_xbox_home("neural-alone");
+        let before = empty_plan(&[("WINEDLLOVERRIDES", "d3d11=n")], &["VK_INSTANCE_LAYERS"]);
+        let mut plan = before.clone();
+        neural_before_launch(&mut plan, &ctx, GAME, &dir, "Game.exe").unwrap();
+        assert_eq!(plan, before);
+        neural_state::put(
+            &ctx.config_dir,
+            GAME,
+            &neural_state::Entry {
+                enabled: false,
+                route: Route::ReshadeFeeder,
+                model: Network::SilverAardwold,
+                package: "0.0.9".into(),
+                arch: neural::Arch::X86_64,
+                install_dir: dir.clone(),
+            },
+        )
+        .unwrap();
+        neural_before_launch(&mut plan, &ctx, GAME, &dir, "Game.exe").unwrap();
+        assert_eq!(plan, before);
+        assert!(!dir.join(apply::INSTALL_MANIFEST).exists());
+    }
+
+    #[test]
+    fn a_new_kernel_anti_cheat_leaves_no_neural_override_in_the_launch() {
+        let (_home, ctx, dir) = neural_xbox_home("neural-kernel");
+        std::fs::write(dir.join("dxgi.dll"), THEIRS).unwrap();
+        neural_enable(&ctx, GAME, &dir, Network::SilverAardwoldOptimized);
+        // A game update adds a kernel anti-cheat Proton cannot run.
+        std::fs::write(dir.join("Randgrid.sys"), b"").unwrap();
+        let mut plan = empty_plan(&[], &["VK_INSTANCE_LAYERS"]);
+        neural_before_launch(&mut plan, &ctx, GAME, &dir, "Game.exe").unwrap();
+        assert!(!plan
+            .get("WINEDLLOVERRIDES")
+            .unwrap_or("")
+            .contains("dxgi=n,b"));
+        assert!(plan.get("VK_INSTANCE_LAYERS").is_none());
+        assert!(plan.is_unset("VK_INSTANCE_LAYERS"));
+        assert!(!dir.join(apply::INSTALL_MANIFEST).exists());
+        assert!(!dir.join(apply::BACKUP_DIR).exists());
+        assert_eq!(std::fs::read(dir.join("dxgi.dll")).unwrap(), THEIRS);
+        assert_eq!(neural_state::get(&ctx.config_dir, GAME).unwrap(), None);
+    }
+
+    fn listing(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn walk(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    out.push((path.clone(), Vec::new()));
+                    walk(&path, out);
+                } else {
+                    out.push((path.clone(), std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_dry_run_reinstalls_nothing() {
+        let (home, ctx, dir) = neural_xbox_home("neural-dry-run");
+        neural_enable(&ctx, GAME, &dir, Network::SilverAardwold);
+        std::fs::remove_file(dir.join(apply::INSTALL_MANIFEST)).unwrap();
+        std::fs::remove_dir_all(dir.join("dlssnr-amd")).unwrap();
+        let before = listing(&dir);
+        let paths = home.paths();
+        let dry_run = LaunchRequest {
+            dry_run: true,
+            ..LaunchRequest::default()
+        };
+        assert_eq!(
+            code(run_title(&cli(), &paths, "testgame", dry_run, &[]).unwrap()),
+            code(ExitCode::SUCCESS)
+        );
+        assert_eq!(listing(&dir), before, "a dry run writes nothing");
+        // It shows what a launch would add.
+        let prepared = prepare_launch(&cli(), &paths, "testgame", dry_run).unwrap();
+        assert!(prepared
+            .plan
+            .get("WINEDLLOVERRIDES")
+            .unwrap()
+            .contains("dxgi=n,b"));
+        assert_eq!(listing(&dir), before);
+        // A real launch adds nothing before its check.
+        let real = prepare_launch(&cli(), &paths, "testgame", LaunchRequest::default()).unwrap();
+        assert!(!real
+            .plan
+            .get("WINEDLLOVERRIDES")
+            .unwrap_or("")
+            .contains("dxgi=n,b"));
+    }
+
+    #[test]
+    fn a_launch_reinstalls_neural_rendering_that_an_update_removed() {
+        let (home, ctx, dir) = neural_xbox_home("neural-reinstall");
+        neural_enable(&ctx, GAME, &dir, Network::SilverAardwold);
+        std::fs::remove_file(dir.join(apply::INSTALL_MANIFEST)).unwrap();
+        std::fs::remove_dir_all(dir.join("dlssnr-amd")).unwrap();
+        let paths = home.paths();
+        let prepared =
+            prepare_launch(&cli(), &paths, "testgame", LaunchRequest::default()).unwrap();
+        // Home has no xodus-service, so the launch stops after the check,
+        // before anything starts.
+        assert!(launch_prepared_with(&paths, prepared, false, &ctx).is_err());
+        assert!(dir.join(apply::INSTALL_MANIFEST).is_file());
+        assert!(dir.join("dlssnr-amd").is_dir());
+    }
+
+    #[test]
+    fn removing_a_title_forgets_its_neural_rendering() {
+        let (home, ctx, dir) = neural_xbox_home("neural-uninstall");
+        let paths = home.paths();
+        record(&paths, GAME, &dir);
+        neural_enable(&ctx, GAME, &dir, Network::SilverAardwold);
+        let keep = Removal {
+            keep_files: true,
+            ..YES
+        };
+        uninstall(&paths, GAME, keep).unwrap();
+        assert!(neural_state::get(&ctx.config_dir, GAME).unwrap().is_some());
+        record(&paths, GAME, &dir);
+        uninstall(&paths, GAME, YES).unwrap();
+        assert!(!dir.exists());
+        assert_eq!(neural_state::get(&ctx.config_dir, GAME).unwrap(), None);
+    }
+
+    #[test]
+    fn removing_a_local_game_takes_neural_rendering_out_first() {
+        let mut home = Home::new("neural-local-uninstall");
+        let game = home.root().join("drive/Local Game");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("Game.exe"), b"").unwrap();
+        std::fs::write(game.join("dxgi.dll"), THEIRS).unwrap();
+        local_game_recipe(&home, &game, "", "");
+        let ctx = neural_setup(&mut home);
+        let paths = home.paths();
+        neural_enable(&ctx, "LOCAL-TEST", &game, Network::SilverAardwold);
+        assert_ne!(std::fs::read(game.join("dxgi.dll")).unwrap(), THEIRS);
+        uninstall(&paths, "local-test", YES).unwrap();
+        assert_eq!(std::fs::read(game.join("dxgi.dll")).unwrap(), THEIRS);
+        assert!(!game.join(apply::INSTALL_MANIFEST).exists());
+        assert!(!game.join(apply::BACKUP_DIR).exists());
+        assert_eq!(
+            neural_state::get(&ctx.config_dir, "LOCAL-TEST").unwrap(),
+            None
+        );
+        assert!(game.join("Game.exe").is_file());
+
+        // With the package gone the mod cannot come out: nothing is forgotten.
+        local_game_recipe(&home, &game, "", "");
+        neural_enable(&ctx, "LOCAL-TEST", &game, Network::SilverAardwold);
+        std::fs::remove_dir_all(neural::root(paths.state_dir()).join("packages")).unwrap();
+        let error = format!("{:#}", uninstall(&paths, "local-test", YES).unwrap_err());
+        assert!(error.contains("ferestre neural disable"), "{error}");
+        assert!(home
+            .root()
+            .join("config/ferestre/titles/LOCAL-TEST.toml")
+            .is_file());
+        assert!(neural_state::get(&ctx.config_dir, "LOCAL-TEST")
+            .unwrap()
+            .is_some());
+        assert!(game.join(apply::INSTALL_MANIFEST).is_file());
     }
 }
 
