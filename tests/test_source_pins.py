@@ -24,6 +24,26 @@ class SourcePinsTests(unittest.TestCase):
                 if change=='missing':del data['components']['wine']
                 path=Path(tmp)/'lock.json';path.write_text(json.dumps(data))
                 with self.assertRaises(ValueError):pins_module.load(path)
+    def test_packages_pin_an_exact_commit_and_version(self):
+        pkgs=pins_module.load_packages()
+        self.assertEqual(pkgs['dlssnr-amd']['commit'],'9503f6b180df45305b38fbd21cd9f705164f2ab1')
+        self.assertEqual(pkgs['dlssnr-amd']['version'],'0.0.9')
+        original=json.loads((ROOT/'sources.lock.json').read_text())
+        for change in ('branch','version','url','extra','missing'):
+            with self.subTest(change=change),tempfile.TemporaryDirectory() as tmp:
+                data=copy.deepcopy(original)
+                if change=='branch':data['packages']['dlssnr-amd']['commit']='main'
+                if change=='version':data['packages']['dlssnr-amd']['version']='latest'
+                if change=='url':data['packages']['dlssnr-amd']['repository']='http://x/y.git'
+                if change=='extra':data['packages']['other']=dict(data['packages']['dlssnr-amd'])
+                if change=='missing':del data['packages']
+                path=Path(tmp)/'lock.json';path.write_text(json.dumps(data))
+                with self.assertRaises(ValueError):pins_module.load_packages(path)
+    def test_components_still_require_exactly_the_five_forks(self):
+        self.assertEqual(set(pins_module.load()),pins_module.NAMES)
+    def test_the_package_command_prints_one_field(self):
+        out=subprocess.check_output(['python3','scripts/source-pins.py','package','dlssnr-amd','commit'],cwd=ROOT,text=True)
+        self.assertEqual(out.strip(),'9503f6b180df45305b38fbd21cd9f705164f2ab1')
     def test_a_wrong_checkout_or_nested_gitlink_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo=Path(tmp)

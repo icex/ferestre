@@ -281,5 +281,12 @@
         "wine"
       ]
     }
+  },
+  "packages": {
+    "dlssnr-amd": {
+      "repository": "https://github.com/TheAutomatic/DLSSNR-AMD.git",
+      "commit": "9503f6b180df45305b38fbd21cd9f705164f2ab1",
+      "version": "0.0.9"
+    }
   }
 }

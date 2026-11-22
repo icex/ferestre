@@ -269,6 +269,8 @@ jobs:
         run: |
           python3 tests/test_workflows.py
           python3 tests/test_source_pins.py
+          python3 tests/test_no_nvidia_urls.py
+          python3 tests/test_build_dlssnr.py
           python3 tests/test_runtime_staging.py
           python3 tests/test_release_signing.py
           python3 tests/test_build_appimage.py
