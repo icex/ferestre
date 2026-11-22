@@ -216,6 +216,39 @@ enum Cmd {
         yes: bool,
     },
 
+    /// Add a Windows game that is already on disk. Its files are never moved
+    /// or deleted.
+    Add {
+        /// The game's program, an .exe or .bat.
+        #[arg(value_name = "EXE")]
+        exe: PathBuf,
+        /// Its name. Defaults to the game's folder name.
+        #[arg(long)]
+        name: Option<String>,
+        /// The game's folder. Defaults to the program's folder.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// Its Wine prefix: an absolute path is used as it is, a relative one
+        /// is inside the games directory. Defaults to one of its own there.
+        #[arg(long, value_name = "DIR")]
+        prefix: Option<PathBuf>,
+        /// The runtime to start it with: a runtime's folder, or the name of a
+        /// Proton Steam has.
+        #[arg(long, value_name = "RUNTIME")]
+        runtime: Option<String>,
+    },
+
+    /// Import non-Steam shortcuts from Steam as local games. Steam's files are
+    /// only read.
+    ImportSteam {
+        /// Show what would be imported, and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Only this Steam user's shortcuts (the number under userdata/).
+        #[arg(long, value_name = "ID")]
+        user: Option<String>,
+    },
+
     /// Build and install the patched Proton runtime.
     InstallRuntime {
         /// Install the newest published runtime even when it is older than
@@ -336,6 +369,23 @@ fn dispatch(cli: &Cli) -> Result<ExitCode> {
                 yes: *yes,
             },
         ),
+        Cmd::Add {
+            exe,
+            name,
+            dir,
+            prefix,
+            runtime,
+        } => cmd_add(
+            cli,
+            ferestre_core::local::AddRequest {
+                exe: exe.clone(),
+                name: name.clone(),
+                dir: dir.clone(),
+                prefix: prefix.clone(),
+                runtime: runtime.clone(),
+            },
+        ),
+        Cmd::ImportSteam { dry_run, user } => cmd_import_steam(cli, *dry_run, user.as_deref()),
         Cmd::InstallRuntime { allow_downgrade } => cmd_install_runtime(cli, *allow_downgrade),
         Cmd::InspectPackage { path } => cmd_inspect_package(cli, path),
         Cmd::Env => cmd_env(cli),
@@ -1774,6 +1824,170 @@ fn uninstall_title(
     eprintln!("-- forgot the install record for {product_id}");
     if removal.keep_files {
         eprintln!("   the files are still in {}", dir.display());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// local games
+// ---------------------------------------------------------------------------
+
+/// `add`: a game already on disk becomes a local game. Only its recipe and
+/// runtime choice are written.
+fn cmd_add(cli: &Cli, mut request: ferestre_core::local::AddRequest) -> Result<ExitCode> {
+    let paths = Paths::from_env()?;
+    // Typed paths are relative to where the command was run. The prefix is
+    // not: a relative prefix is the games directory's, as in a recipe.
+    let cwd = std::env::current_dir().context("reading the current directory")?;
+    if request.exe.is_relative() {
+        request.exe = cwd.join(&request.exe);
+    }
+    if let Some(dir) = request.dir.as_mut().filter(|d| d.is_relative()) {
+        *dir = cwd.join(&*dir);
+    }
+    let recipe = ferestre_core::local::add(&paths, &request)?;
+    let id = &recipe.title.product_id;
+    let dir = paths.install_dir(&recipe)?;
+    let prefix = paths.prefix_dir(&recipe)?;
+    let found = ferestre_core::anticheat::detect(&dir, &recipe.launch.executable);
+    if cli.json {
+        print_json(&json!({
+            "schema": JSON_SCHEMA,
+            "product_id": id,
+            "name": recipe.title.name,
+            "dir": dir.display().to_string(),
+            "executable": recipe.launch.executable,
+            "prefix": prefix.display().to_string(),
+            "anticheat": anticheat_json(&found),
+        }));
+    } else {
+        eprintln!(
+            "-- added {} as {id}; start it with: ferestre run {id}",
+            recipe.title.name
+        );
+    }
+    if let Some(line) = ferestre_core::anticheat::describe(&found) {
+        eprintln!("-- {line}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Anti-cheat evidence as the `--json` documents carry it.
+fn anticheat_json(found: &[ferestre_core::anticheat::Detection]) -> Value {
+    found
+        .iter()
+        .map(|d| {
+            json!({
+                "name": d.name,
+                "kernel": d.kernel,
+                "proton_runtime": d.proton_runtime,
+                "evidence": d.evidence.display().to_string(),
+            })
+        })
+        .collect()
+}
+
+fn cmd_import_steam(cli: &Cli, dry_run: bool, user: Option<&str>) -> Result<ExitCode> {
+    let paths = Paths::from_env()?;
+    import_steam(cli, &paths, dry_run, user)
+}
+
+/// `import-steam`: every non-Steam shortcut of every Steam install becomes a
+/// local game. Nothing under a Steam root is written; with `dry_run`,
+/// nothing at all.
+fn import_steam(cli: &Cli, paths: &Paths, dry_run: bool, user: Option<&str>) -> Result<ExitCode> {
+    use ferestre_core::steam_import::{self, ImportStatus, RuntimeFound};
+    let candidates = steam_import::plan(paths, user)?;
+    let status = |c: &steam_import::Candidate| match &c.status {
+        ImportStatus::New => "new".to_owned(),
+        ImportStatus::Kept => "kept".to_owned(),
+        ImportStatus::Skipped(why) => format!("skipped: {why}"),
+    };
+    let prefix = |c: &steam_import::Candidate| match &c.recipe {
+        None => "-".to_owned(),
+        Some(r) => r
+            .install
+            .prefix
+            .clone()
+            .unwrap_or_else(|| "managed".to_owned()),
+    };
+    let runtime = |c: &steam_import::Candidate| match &c.runtime {
+        RuntimeFound::Tool(dir) => dir.display().to_string(),
+        RuntimeFound::Missing(name) => format!("missing: {name}"),
+        RuntimeFound::Unset => "Ferestre".to_owned(),
+    };
+    let report = if dry_run {
+        None
+    } else {
+        Some(steam_import::apply(paths, &candidates)?)
+    };
+
+    if cli.json {
+        let rows: Vec<Value> = candidates
+            .iter()
+            .map(|c| {
+                json!({
+                    "id": c.id,
+                    "name": c.name,
+                    "user": c.user,
+                    "status": status(c),
+                    "prefix": c.recipe.as_ref().map(|_| prefix(c)),
+                    "runtime": runtime(c),
+                    "anticheat": anticheat_json(&c.anticheat),
+                    "warnings": c.warnings,
+                })
+            })
+            .collect();
+        print_json(&json!({
+            "schema": JSON_SCHEMA,
+            "dry_run": dry_run,
+            "candidates": rows,
+        }));
+    } else if candidates.is_empty() {
+        println!("no non-Steam shortcuts found");
+    } else {
+        let mut rows = vec![vec![
+            "STATUS".to_owned(),
+            "ID".to_owned(),
+            "NAME".to_owned(),
+            "PREFIX".to_owned(),
+            "RUNTIME".to_owned(),
+        ]];
+        rows.extend(candidates.iter().map(|c| {
+            vec![
+                status(c),
+                c.id.clone(),
+                c.name.clone(),
+                prefix(c),
+                runtime(c),
+            ]
+        }));
+        print!("{}", table(&rows));
+    }
+    if !cli.json {
+        for c in &candidates {
+            for warning in &c.warnings {
+                eprintln!("-- {warning}");
+            }
+            if let Some(line) = ferestre_core::anticheat::describe(&c.anticheat) {
+                eprintln!("-- {}: {line}", c.name);
+            }
+        }
+    }
+    match &report {
+        None => eprintln!(
+            "-- would import {}",
+            candidates
+                .iter()
+                .filter(|c| c.status == ImportStatus::New)
+                .count()
+        ),
+        Some(report) => eprintln!(
+            "-- imported {}, kept {}, skipped {}",
+            report.added.len(),
+            report.kept.len(),
+            report.skipped.len()
+        ),
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -5992,6 +6206,24 @@ summary = "Runs."
             vec!["ferestre", "inspect-package", "/tmp/example.appx"],
             vec!["ferestre", "env"],
             vec!["ferestre", "version"],
+            vec![
+                "ferestre",
+                "add",
+                "/g/Game.exe",
+                "--name",
+                "G",
+                "--prefix",
+                "/p",
+                "--runtime",
+                "GE-Proton10-25",
+            ],
+            vec![
+                "ferestre",
+                "import-steam",
+                "--dry-run",
+                "--user",
+                "12345678",
+            ],
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }
@@ -7645,6 +7877,68 @@ summary = "Added by hand"
             .map(|d| d.flatten().map(|e| e.path()).collect())
             .unwrap_or_default();
         assert_eq!(before, after);
+    }
+
+    /// Every `LOCAL-STEAM-*.toml` among the user's recipes.
+    fn imported(paths: &Paths) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(paths.user_titles_dir()) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("LOCAL-STEAM-") && n.ends_with(".toml"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn import_steam_dry_run_writes_nothing() {
+        use ferestre_core::steam::{self, Value};
+        let mut home = Home::new("import-steam");
+        let steam_root = home.root().join("steam");
+        let game = home.root().join("drive/Game");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("Game.exe"), b"").unwrap();
+        let shortcut = Value::Map(vec![
+            ("appid".into(), Value::Int(-1_000_000_001)),
+            ("AppName".into(), Value::Str("Imported Game".into())),
+            (
+                "Exe".into(),
+                Value::Str(format!("\"{}\"", game.join("Game.exe").display())),
+            ),
+            (
+                "StartDir".into(),
+                Value::Str(format!("\"{}\"", game.display())),
+            ),
+            ("LaunchOptions".into(), Value::Str(String::new())),
+        ]);
+        let document = Value::Map(vec![(
+            "shortcuts".into(),
+            Value::Map(vec![("0".into(), shortcut)]),
+        )]);
+        let file = steam_root.join("userdata/12345678/config/shortcuts.vdf");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, steam::serialise(&document).unwrap()).unwrap();
+        let before = std::fs::read(&file).unwrap();
+        home.extra
+            .push(("XODUS_STEAM_DIR".into(), steam_root.display().to_string()));
+        let paths = home.paths();
+
+        assert_eq!(
+            import_steam(&cli(), &paths, true, None).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert!(imported(&paths).is_empty());
+        assert_eq!(
+            import_steam(&cli(), &paths, false, Some("12345678")).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(imported(&paths).len(), 1);
+        assert_eq!(std::fs::read(&file).unwrap(), before);
     }
 
     // -- the launch log and the end of a launch ------------------------------
