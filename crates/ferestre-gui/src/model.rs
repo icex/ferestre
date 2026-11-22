@@ -310,6 +310,17 @@ fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
     // A local game is run as it is described: no engine defaults are
     // inferred for it, and it may use the Proton builds Steam has.
     let local = recipe.is_local();
+    // A local game is never installed from here: its files are somewhere
+    // Ferestre did not put them, and when they are not there, that is what
+    // to say, whatever the runtime would have made of it.
+    if local && !(inputs.installed)(recipe) {
+        let program = ferestre_core::local::executable_path(recipe)
+            .unwrap_or_else(|| PathBuf::from(&recipe.launch.executable));
+        return blocked(format!(
+            "Not found: {} — is its drive mounted?",
+            program.display()
+        ));
+    }
     let inferred;
     let (judged, runtimes) = if local {
         (recipe, inputs.local_runtimes)
@@ -342,22 +353,12 @@ fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
         caution = Some(join(caution, &line));
     }
 
-    // A local game is never installed from here: its files are somewhere
-    // Ferestre did not put them, and when they are not there, that is what
-    // to say.
+    // Its files were found above, so a local game plays.
     if local {
         if let Some(found) = ferestre_core::anticheat::describe(&(inputs.anticheat)(recipe)) {
             caution = Some(join(caution, &found));
         }
-        if (inputs.installed)(recipe) {
-            return (Action::Play, caution);
-        }
-        let program = ferestre_core::local::executable_path(recipe)
-            .unwrap_or_else(|| PathBuf::from(&recipe.launch.executable));
-        return blocked(format!(
-            "Not found: {} — is its drive mounted?",
-            program.display()
-        ));
+        return (Action::Play, caution);
     }
 
     let action = if (inputs.installed)(recipe) {
@@ -920,6 +921,24 @@ pub fn launch_uses_accounts(recipe: Option<&Recipe>) -> bool {
     !recipe.is_some_and(Recipe::is_local)
 }
 
+/// What the person should know before importing these shortcuts: each new
+/// one's warnings (launch options left behind, a prefix another Proton will
+/// start) and the anti-cheat found in its folder. The ones already in the
+/// library or skipped are not being imported, so their notes are not shown.
+pub fn steam_import_notes(candidates: &[ferestre_core::steam_import::Candidate]) -> Vec<String> {
+    use ferestre_core::steam_import::ImportStatus;
+    candidates
+        .iter()
+        .filter(|c| c.status == ImportStatus::New)
+        .flat_map(|c| {
+            c.warnings.iter().cloned().chain(
+                ferestre_core::anticheat::describe(&c.anticheat)
+                    .map(|line| format!("{}: {line}", c.name)),
+            )
+        })
+        .collect()
+}
+
 /// The ids among `ids` that the Store catalog can be asked about, in order.
 pub fn store_ids(ids: &[String]) -> Vec<String> {
     ids.iter()
@@ -980,6 +999,13 @@ impl LibraryRow {
     /// Positive update evidence only; unknown checks are not update badges.
     pub fn has_update(&self) -> bool {
         self.installed && self.update == Some(true)
+    }
+
+    /// Whether a blocked row's reason is about the runtime, so that choosing
+    /// another one is the fix to offer. A local game whose files are missing
+    /// is blocked by its drive, which no runtime brings back.
+    pub fn blocked_by_runtime(&self) -> bool {
+        matches!(self.action, Action::Blocked(_)) && !(self.local && !self.installed)
     }
 
     /// Whether the catalog has been asked about this row yet. A row still
@@ -4087,6 +4113,60 @@ HTTP 401 Unauthorized",
             other => panic!("expected Blocked, got {other:?}"),
         }
         assert!(rows[0].local);
+    }
+
+    #[test]
+    fn steam_import_notes_name_what_a_new_shortcut_loses() {
+        use ferestre_core::steam_import::{Candidate, ImportStatus, RuntimeFound};
+        let candidate = |name: &str, status: ImportStatus, warning: &str| Candidate {
+            id: format!("LOCAL-STEAM-{name}"),
+            app_id: 1,
+            name: name.into(),
+            user: "1".into(),
+            status,
+            recipe: None,
+            runtime: RuntimeFound::Unset,
+            artwork: Default::default(),
+            anticheat: vec![ferestre_core::anticheat::Detection {
+                name: "EasyAntiCheat",
+                kernel: false,
+                proton_runtime: true,
+                evidence: PathBuf::from("/g/EasyAntiCheat"),
+            }],
+            warnings: vec![warning.into()],
+        };
+        let notes = steam_import_notes(&[
+            candidate(
+                "New",
+                ImportStatus::New,
+                "New: launch options not imported (shell operator); add them in Edit launch settings",
+            ),
+            candidate("Old", ImportStatus::Kept, "Old: should not be shown"),
+        ]);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(
+            notes[0].contains("launch options not imported"),
+            "{notes:?}"
+        );
+        assert!(
+            notes[1].starts_with("New: ") && notes[1].contains("EasyAntiCheat"),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_local_executable_says_not_found_even_without_a_runtime() {
+        // No runtime at all for local games: the row must still blame the
+        // drive, not the runtime, and must not offer a runtime as the fix.
+        let recipes = vec![local_recipe("/run/media/gone/Local Test")];
+        let own = Ownership::Unknown;
+        let rows = library(&inputs(&recipes, None, &own, NOTHING_INSTALLED));
+        assert_eq!(rows.len(), 1);
+        match &rows[0].action {
+            Action::Blocked(reason) => assert!(reason.contains("drive mounted"), "{reason}"),
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+        assert!(!rows[0].blocked_by_runtime());
     }
 
     #[test]

@@ -1305,6 +1305,8 @@ fn local_icons(
     })
 }
 
+/// Icons already on disk from a previous run. Nothing is fetched here: a window
+/// that waits on a hundred HTTP requests before it appears is not a window.
 fn existing_icons(cache: &Cache, catalog: &BTreeMap<String, Product>) -> BTreeMap<String, PathBuf> {
     catalog
         .keys()
@@ -2095,14 +2097,20 @@ mod tests {
             &paths.user_titles_dir().join("LOCAL-T.toml"),
             &local.to_toml().unwrap(),
         );
-        let portrait = paths.local_art_dir("LOCAL-T").unwrap().join("portrait.png");
-        write(&portrait, "png");
+        let art = paths.local_art_dir("LOCAL-T").unwrap();
+        let icon = art.join("icon.png");
+        write(&icon, "png");
 
         let mut m = Model::load_from(Ok(paths.clone()));
         assert!(m.recipes.iter().any(|r| r.is_local()), "{:?}", m.problem);
-        assert_eq!(m.icons.get("LOCAL-T"), Some(&portrait));
-        assert_eq!(m.local_art["LOCAL-T"].portrait, Some(portrait.clone()));
+        assert_eq!(m.icons.get("LOCAL-T"), Some(&icon));
+
+        // A portrait chosen after the window opened: the reload must show it,
+        // not the icon carried over from the first load.
+        let portrait = art.join("portrait.png");
+        write(&portrait, "png");
         m.reload_from(Model::load_from(Ok(paths)));
+        assert_eq!(m.local_art["LOCAL-T"].portrait, Some(portrait.clone()));
         assert_eq!(m.icons.get("LOCAL-T"), Some(&portrait));
     }
 

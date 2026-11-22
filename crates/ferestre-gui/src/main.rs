@@ -2906,6 +2906,12 @@ fn import_from_steam(ui: &Ui) {
             "{kept} already in your library; {skipped} skipped (Ferestre's own shortcuts or not \
              Windows programs)."
         ));
+        let notes = model::steam_import_notes(&candidates);
+        if !notes.is_empty() {
+            body.push(String::new());
+            body.extend(notes);
+            body.push(String::new());
+        }
         body.push("Steam's files are only read.".into());
         let dialog = adw::AlertDialog::new(Some("Import from Steam"), Some(&body.join("\n")));
         dialog.set_body_use_markup(false);
@@ -3550,13 +3556,16 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
             .tooltip_text(reason)
             .build();
         button.set_widget_name(&format!("game-{}-primary", row.product_id));
-        let (ui, product_id, name, reason) = (
+        let (ui, product_id, name, reason, offer_runtime) = (
             ui.clone(),
             row.product_id.clone(),
             row.name.clone(),
             reason.clone(),
+            row.blocked_by_runtime(),
         );
-        button.connect_clicked(move |_| explain_blocked(&ui, &product_id, &name, &reason));
+        button.connect_clicked(move |_| {
+            explain_blocked(&ui, &product_id, &name, &reason, offer_runtime)
+        });
         actions.append(&button);
         return (action_row, actions);
     }
@@ -4218,16 +4227,22 @@ fn warn_about_media(ui: &Ui, product_id: &str) {
 }
 
 /// Why a title with a recipe cannot start, with the fix the window can offer:
-/// its blocked reasons are about the runtime the launch would use.
-fn explain_blocked(ui: &Ui, product_id: &str, name: &str, reason: &str) {
-    let dialog = adw::AlertDialog::new(
-        Some(&format!("{name} cannot start")),
-        Some(&format!(
-            "{reason}\n\nChoose a runtime that provides what it needs, or update the runtime."
-        )),
-    );
+/// most blocked reasons are about the runtime the launch would use. A local
+/// game whose files are missing is not, and gets only the reason.
+fn explain_blocked(ui: &Ui, product_id: &str, name: &str, reason: &str, offer_runtime: bool) {
+    let body = if offer_runtime {
+        format!("{reason}\n\nChoose a runtime that provides what it needs, or update the runtime.")
+    } else {
+        reason.to_string()
+    };
+    let dialog = adw::AlertDialog::new(Some(&format!("{name} cannot start")), Some(&body));
     dialog.set_body_use_markup(false);
     dialog.add_response("close", "Close");
+    if !offer_runtime {
+        dialog.set_close_response("close");
+        dialog.present(Some(&ui.window));
+        return;
+    }
     dialog.add_response("runtime", "Choose runtime");
     dialog.set_response_appearance("runtime", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("runtime"));
@@ -4336,7 +4351,7 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
     let launch_tag = launch_state::tag();
     command.env(launch_state::TAG, &launch_tag);
     match &roles {
-        Some(roles) if uses_accounts => {
+        Some(roles) => {
             command.env(
                 "FERESTRE_ACCOUNT_ROLES",
                 serde_json::to_string(roles).unwrap(),
@@ -4426,7 +4441,8 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
     if let Some(executable) = executable {
         launch_state::watch(ui, &key, pgid, launch_tag, executable, finished.clone());
     }
-    if let Some(path) = output.clone() {
+    // A local game runs no presence runner: there is nothing to follow.
+    if let Some(path) = output.clone().filter(|_| uses_accounts) {
         // The launch's runner reports on its stderr, which goes to the
         // launch's output file; follow it while the launch runs.
         let (sender, mut events) = futures_channel::mpsc::unbounded();
@@ -4486,7 +4502,9 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
             ui.running.borrow_mut().remove(&key);
             ui.running_servers.borrow_mut().remove(&key);
             ui.running_channels.borrow_mut().remove(&key);
-            presence_ui::launch_ended(&ui, &key);
+            if uses_accounts {
+                presence_ui::launch_ended(&ui, &key);
+            }
         }
         ui.model.borrow().forget_probes();
         render(&ui);
@@ -5968,23 +5986,26 @@ fn add_to_steam_titles(ui: &Ui, titles: Vec<(String, String)>) {
                         .as_ref()
                         .filter(|_| ferestre_core::local::is_local_id(product_id))
                         .map(|paths| ferestre_core::local::artwork(paths, product_id));
-                    let artwork = match (&cache, product) {
+                    let artwork = if let Some(mut files) = local_art {
                         // The art Ferestre keeps for a local game.
-                        _ if local_art.is_some() => {
-                            let mut files = local_art.unwrap_or_default();
-                            files.icon = files.icon.or_else(|| fallback_icon.clone());
-                            files
+                        files.icon = files.icon.or_else(|| fallback_icon.clone());
+                        files
+                    } else {
+                        match (&cache, product) {
+                            (Some(cache), Some(product)) => {
+                                let (files, errors) = steam::prepare_artwork(
+                                    cache,
+                                    &product,
+                                    fallback_icon.as_deref(),
+                                );
+                                failures.extend(errors);
+                                files
+                            }
+                            _ => steam::ArtworkFiles {
+                                icon: fallback_icon.clone(),
+                                ..Default::default()
+                            },
                         }
-                        (Some(cache), Some(product)) => {
-                            let (files, errors) =
-                                steam::prepare_artwork(cache, &product, fallback_icon.as_deref());
-                            failures.extend(errors);
-                            files
-                        }
-                        _ => steam::ArtworkFiles {
-                            icon: fallback_icon.clone(),
-                            ..Default::default()
-                        },
                     };
                     let shortcut = steam::Shortcut::new(
                         &name,
