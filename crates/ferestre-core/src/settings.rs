@@ -19,6 +19,9 @@ pub const DLL_URL_ENV: &str = "FERESTRE_DLSSNR_DLL_URL";
 const TABLE: &str = "dlssnr";
 const DLL_URL: &str = "dll-url";
 const MENU_KEY: &str = "menu-key";
+/// NR Control's key when none is set. Upstream's End is missing from many
+/// compact keyboards (a Mac's, an iPad's); `menu-key = "End"` keeps it.
+pub const DEFAULT_MENU_KEY: &str = "Ctrl+Y";
 
 fn file(config_dir: &Path) -> PathBuf {
     config_dir.join(FILE)
@@ -84,24 +87,25 @@ fn check_menu_key(key: &str) -> Result<()> {
 }
 
 /// `[dlssnr] menu-key`: the key that opens NR Control, written into each
-/// game's `dlssnr-amd.ini`; `None` keeps upstream's (End).
-pub fn dlssnr_menu_key(config_dir: &Path) -> Result<Option<String>> {
+/// game's `dlssnr-amd.ini`; [`DEFAULT_MENU_KEY`] when unset.
+pub fn dlssnr_menu_key(config_dir: &Path) -> Result<String> {
     let table = read(config_dir)?;
     let Some(value) = table.get(TABLE).and_then(|t| t.get(MENU_KEY)) else {
-        return Ok(None);
+        return Ok(DEFAULT_MENU_KEY.to_string());
     };
     let path = file(config_dir);
     let key = value
         .as_str()
         .ok_or_else(|| anyhow!("{}: [{TABLE}] {MENU_KEY} is not a string", path.display()))?;
     if key.is_empty() {
-        return Ok(None);
+        return Ok(DEFAULT_MENU_KEY.to_string());
     }
     check_menu_key(key).map_err(|e| anyhow!("{}: [{TABLE}] {MENU_KEY}: {e}", path.display()))?;
-    Ok(Some(key.to_string()))
+    Ok(key.to_string())
 }
 
-/// Set or, with `None`, remove `[dlssnr] menu-key`.
+/// Set or, with `None`, remove `[dlssnr] menu-key` (back to
+/// [`DEFAULT_MENU_KEY`]).
 pub fn set_dlssnr_menu_key(config_dir: &Path, key: Option<&str>) -> Result<()> {
     if let Some(key) = key {
         check_menu_key(key)?;
@@ -223,16 +227,16 @@ mod tests {
     fn the_menu_key_is_kept_beside_the_url_and_checked() {
         let config = tempfile::tempdir().unwrap();
         let c = config.path();
-        assert_eq!(dlssnr_menu_key(c).unwrap(), None);
+        assert_eq!(dlssnr_menu_key(c).unwrap(), "Ctrl+Y", "the default");
         set_dlssnr_dll_url(c, Some("https://example.invalid/x.zip")).unwrap();
-        set_dlssnr_menu_key(c, Some("Ctrl+Y")).unwrap();
-        assert_eq!(dlssnr_menu_key(c).unwrap().as_deref(), Some("Ctrl+Y"));
+        set_dlssnr_menu_key(c, Some("End")).unwrap();
+        assert_eq!(dlssnr_menu_key(c).unwrap(), "End");
         assert!(file_dlssnr_dll_url(c).unwrap().is_some());
         for bad in ["", "Ctrl+", "End\nX", "a b", "../x"] {
             assert!(set_dlssnr_menu_key(c, Some(bad)).is_err(), "{bad:?}");
         }
         set_dlssnr_menu_key(c, None).unwrap();
-        assert_eq!(dlssnr_menu_key(c).unwrap(), None);
+        assert_eq!(dlssnr_menu_key(c).unwrap(), "Ctrl+Y");
         assert!(file_dlssnr_dll_url(c).unwrap().is_some());
     }
 

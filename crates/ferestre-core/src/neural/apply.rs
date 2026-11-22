@@ -756,12 +756,11 @@ fn use_proxy(exe_dir: &Path, entry: &Entry) -> Result<()> {
     crate::cache::write(&manifest, renamed.as_bytes())
 }
 
-/// `[dlssnr] menu-key` written into the game's `dlssnr-amd.ini`, keeping
-/// the file's line endings; nothing when it is unset or already that key.
+/// `[dlssnr] menu-key` (Ctrl+Y unless set) written into the game's
+/// `dlssnr-amd.ini`, keeping the file's line endings; nothing when it is
+/// already that key.
 fn apply_menu_key(ctx: &Context, exe_dir: &Path) -> Result<()> {
-    let Some(key) = crate::settings::dlssnr_menu_key(&ctx.config_dir)? else {
-        return Ok(());
-    };
+    let key = crate::settings::dlssnr_menu_key(&ctx.config_dir)?;
     let ini = exe_dir.join(INI);
     let Ok(text) = std::fs::read_to_string(&ini) else {
         return Ok(());
@@ -2057,9 +2056,15 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
         let w = World::new();
         w.enable(Route::Optiscaler);
         write(&w.game.join(INI), b"[NRControl]\nMenuKey = End\n");
-        crate::settings::set_dlssnr_menu_key(&w.ctx.config_dir, Some("Ctrl+Y")).unwrap();
         assert!(matches!(w.ensure(&[]), Ensured::Present(_)));
-        assert_eq!(read(&w.game.join(INI)), b"[NRControl]\nMenuKey = Ctrl+Y\n");
+        assert_eq!(
+            read(&w.game.join(INI)),
+            b"[NRControl]\nMenuKey = Ctrl+Y\n",
+            "Ctrl+Y unless another key is set"
+        );
+        crate::settings::set_dlssnr_menu_key(&w.ctx.config_dir, Some("F7")).unwrap();
+        assert!(matches!(w.ensure(&[]), Ensured::Present(_)));
+        assert_eq!(read(&w.game.join(INI)), b"[NRControl]\nMenuKey = F7\n");
     }
 
     #[test]

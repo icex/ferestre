@@ -324,13 +324,13 @@ enum NeuralCmd {
         #[arg(long, value_name = "NAME")]
         proxy: Option<String>,
     },
-    /// The key that opens the NR Control menu in every game (upstream: End),
-    /// e.g. Ctrl+Y for a keyboard without End. Applied at each game's next launch.
+    /// The key that opens the NR Control menu in every game: Ctrl+Y unless
+    /// set (End is upstream's, missing from many compact keyboards). Applied at each game's next launch.
     MenuKey {
         /// A key such as F7 or Ctrl+Y; without one, print the current key.
         #[arg(value_name = "KEY", conflicts_with = "reset")]
         key: Option<String>,
-        /// Go back to upstream's End.
+        /// Go back to the default, Ctrl+Y.
         #[arg(long)]
         reset: bool,
     },
@@ -558,10 +558,7 @@ fn cmd_neural(cli: &Cli, command: &NeuralCmd) -> Result<ExitCode> {
             if cli.json {
                 print_json(&json!({"schema": JSON_SCHEMA, "menu_key": current}));
             } else {
-                println!(
-                    "{}",
-                    current.as_deref().unwrap_or("End (upstream's default)")
-                );
+                println!("{}", current);
             }
             Ok(ExitCode::SUCCESS)
         }

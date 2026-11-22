@@ -106,16 +106,16 @@ yourself for the same DLL wins, and the launch says the mod may then not load.
 
 ### The NR Control menu key
 
-DLSSNR-AMD opens its NR Control menu with End. On a keyboard without one
-(a Mac or iPad keyboard), choose another key for every game:
+Upstream DLSSNR-AMD opens its NR Control menu with End, which many compact
+keyboards (a Mac's, an iPad's) lack, so Ferestre sets **Ctrl+Y** instead. To
+choose another key for every game:
 
 ```sh
-ferestre neural menu-key Ctrl+Y      # or F7; --reset goes back to End
+ferestre neural menu-key F7          # or End; --reset goes back to Ctrl+Y
 ```
 
 It is kept as `[dlssnr] menu-key` in `~/.config/ferestre/settings.toml` and
-written into each game's `dlssnr-amd.ini` at its next launch, including after
-a reinstall.
+written into each game's `dlssnr-amd.ini` at install and at every launch.
 
 ### A game that crashes with OptiScaler as dxgi.dll
 

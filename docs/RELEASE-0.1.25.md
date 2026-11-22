@@ -18,6 +18,7 @@ Ferestre can now be the one library for the Windows games you already have, not 
 NVIDIA's DLSS 5 neural rendering network on AMD Radeon RX 9000 (RDNA4) cards, through [DLSSNR-AMD](https://github.com/TheAutomatic/DLSSNR-AMD). See [Neural rendering](NEURAL-RENDERING.md).
 
 - Per game: **Neural rendering…** in a game's menu, or `ferestre neural enable <id>`. The route is detected from the game (OptiScaler for a 64-bit game with DLSS, FSR or XeSS; ReShade for other Direct3D 10–12, Vulkan or Direct3D 9 games). Every file it would overwrite is backed up, and Disable puts them back byte for byte.
+- In game, **Ctrl+Y** opens DLSSNR-AMD's NR Control menu (upstream's End is missing from many compact keyboards); `ferestre neural menu-key <key>` chooses another for every game. A game that crashes with OptiScaler as `dxgi.dll` can take another name it loads as: `ferestre neural enable <id> --proxy winmm` (Call of Duty: Modern Warfare 4 needs this).
 - The model comes from your own `nvngx_dlssnr.dll` (310.9.16 or 310.8.0, checked by SHA-256): a path you give, a copy found in your Steam, Heroic or local game folders, or a download address you set in Settings. Ferestre does not ship or link to any NVIDIA file.
 - The install is checked before every launch and redone after a game update.
 - Only on an RX 9000 card: on Intel, NVIDIA or an older Radeon it cannot be turned on, and a game that has it launches without it until the card is back.
