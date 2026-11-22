@@ -8,23 +8,33 @@ Play compatible **Xbox PC and Microsoft Store games on Linux** using your Micros
 
 **[Download the AppImage](https://github.com/icex/ferestre/releases/download/v0.1.23/ferestre-0.1.23-x86_64.AppImage)** · [Compatible games](docs/COMPATIBILITY.md#the-matrix) · [Quick start](#quick-start) · [Report a problem](https://github.com/icex/ferestre/issues)
 
-![Ferestre game library in handheld fullscreen mode, with controller navigation and game-update badges](docs/screenshots/library-handheld.png)
+![Ferestre game library in handheld fullscreen mode, with controller navigation and a game-update badge](docs/screenshots/library-handheld.png)
 
 <table>
   <tr>
+    <td width="50%"><img src="docs/screenshots/home.png" alt="Home with a featured-game carousel, quick links and a Jump back in shelf"><br><strong>Pick up where you left off</strong></td>
     <td width="50%"><img src="docs/screenshots/running-game.png" alt="Resume or stop a running game from its library card"><br><strong>Switch between running games</strong></td>
-    <td width="50%"><img src="docs/screenshots/install-game.png" alt="Choose a game installation folder inside Ferestre"><br><strong>Install with a controller-friendly folder picker</strong></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/install-game.png" alt="Choose a game installation folder and drive inside Ferestre"><br><strong>Install with a controller-friendly folder picker</strong></td>
+    <td width="50%"><img src="docs/screenshots/notifications.png" alt="Three notifications stacked in the corner of the library"><br><strong>See every result at once</strong></td>
   </tr>
 </table>
 
 <details>
-<summary>See the Stop confirmation dialog</summary>
+<summary>More screenshots: Stop confirmation, compact sidebar, a game already running, ultrawide</summary>
 
-![In-app Stop confirmation with Cancel selected and controller button hints](docs/screenshots/stop-confirmation.png)
+![In-app Stop confirmation with Cancel selected by the controller](docs/screenshots/stop-confirmation.png)
+
+![Compact icon sidebar with the account menu open](docs/screenshots/compact-sidebar.png)
+
+![A dialog offering to leave, close, or close and restart a game that is already running](docs/screenshots/already-running.png)
+
+![Home on an ultrawide 3440x1000 window](docs/screenshots/home-ultrawide.png)
 
 </details>
 
-*Screenshots use a demo library and synthetic account data.*
+*Screenshots use a demo library and synthetic account data. `tools/readme-screenshots.py` regenerates them.*
 
 ## Quick start
 

@@ -103,6 +103,26 @@ The fixtures they use are `fake_packagekit.py`, `https_fixture.py`,
 `store_catalog_fixture.py`, `license_token_fixture.py` and `ws_server.py`. Each
 one is a local stand-in and documents itself.
 
+### README screenshots
+
+**`tools/readme-screenshots.py`** regenerates `docs/screenshots/*.png` from
+the GUI fixtures above. It is not a test, and CI does not run it. Each picture
+runs in its own user, mount and PID namespace. In it, `/home`, `/run/user` and
+`/run/media` are empty, the home folder is `/home/player`, the hostname is
+`ferestre-demo` and the account is the synthetic "Player One". The GUI runs in
+a private virtual KWin session with the default renderer, so the dialog blur
+appears as it does for users. Artwork is public Store art copied from
+`~/.cache/ferestre/catalog`, stripped of everything but product metadata. The
+script refuses to start the GUI if the real home folder is reachable.
+
+```sh
+CARGO_TARGET_DIR=/var/tmp/ferestre-readme-target nice cargo build --release --offline -p ferestre-gui
+nice python3 tools/readme-screenshots.py                       # all of them, into docs/screenshots
+python3 tools/readme-screenshots.py --only home --out /var/tmp/shots   # one, for a look first
+```
+
+Look at every picture before committing it.
+
 **CI runs GTK 4.14 (Ubuntu 24.04).** AT-SPI naming and pointer behaviour differ
 from newer GTK. Expect a GUI test that passes locally to fail in the `gui` job
 now and then, and the reverse. To check before pushing, run it in an Ubuntu
