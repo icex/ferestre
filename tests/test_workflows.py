@@ -201,8 +201,23 @@ class WorkflowTests(unittest.TestCase):
         triggers = load(REPO / '.github/workflows/rust.yml')[True]
         for event in ('push', 'pull_request'):
             for pattern in ('scripts/**', 'packaging/**', 'Cargo.lock', '.github/workflows/**',
-                            'tests/*.sh', 'tests/license_token_fixture.py'):
+                            'tests/*.sh', 'tests/license_token_fixture.py',
+                            'tests/test_no_nvidia_urls.py', 'tests/test_build_dlssnr.py'):
                 self.assertIn(pattern, triggers[event]['paths'], event)
+
+    def test_the_nvidia_url_guard_runs_on_every_change(self):
+        # rust.yml is path-filtered, and a docs- or README-only change is the
+        # likeliest place for such a URL, so the guard has an unfiltered home.
+        workflow = load(REPO / '.github/workflows/guards.yml')
+        triggers = workflow[True]
+        for event in ('push', 'pull_request'):
+            self.assertIn(event, triggers)
+            self.assertFalse(triggers[event], f'{event} must not be filtered by path or branch')
+        job = workflow['jobs']['no-nvidia-urls']
+        self.assertNotIn('if', job)
+        self.assertIn('python3 tests/test_no_nvidia_urls.py', list(runs(job)))
+        for step in job['steps']:
+            self.assertNotIn('if', step, step.get('name'))
 
     def test_namespace_tests_cannot_skip_in_ci(self):
         # stop.rs and the image-view tests skip where unprivileged user

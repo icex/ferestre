@@ -27,14 +27,22 @@
 # of the published asset pinned in ferestre-core, not a rebuild.
 #
 # No NVIDIA file is ever packaged: a tarball containing a model is refused.
+#
+# `--inside` is the container's half and refuses to run anywhere else: it
+# installs packages with apt-get and writes under /work.
 set -euo pipefail
 
 # Bumped deliberately, never followed: the index digest of ubuntu:24.04 when
 # this was last reviewed (2026-11-22).
 IMAGE=docker.io/library/ubuntu:24.04@sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289
 ARCHES=(x86_64 i686)
-# Upstream's own check looks only for the last two names.
-MODEL_NAMES=(CC_SILVER_AARDWOLD.bin CC_SMALL_FP8.bin dlssnr.bin dlssnr-small.bin)
+# NVIDIA's networks and every weight file derived from them, matched on the
+# base name without regard to case: CC_SILVER_AARDWOLD.bin, CC_SMALL_FP8.bin,
+# dlssnr.bin, dlssnr-small.bin, and what upstream derives at install time
+# (CC_SILVER_AARDWOLD_OPTIMIZED.bin, ..._OPTIMIZED_INT4.bin,
+# CC_SMALL_FP8_EXPERIMENTAL.bin). Upstream's own check looks only for the
+# dlssnr names. A `.bin.sha256` beside one is a hash, not a model, and passes.
+MODEL_PATTERN='^(cc_[a-z0-9_]+|dlssnr[-a-z0-9_]*)\.bin$'
 PACKAGES=(ca-certificates git curl cmake ninja-build mingw-w64 g++-multilib python3 p7zip-full openssl osslsigncode)
 OPTISCALER_SOURCE='OptiScaler (GPL-3.0) is shipped unmodified from its nightly-20261030 release; source: https://github.com/optiscaler/OptiScaler at e7e3872d410f704479d94d318d68d163b6b58947'
 
@@ -45,14 +53,13 @@ die() {
 
 # refuse_models <tarball>: fail when any entry is a model file.
 refuse_models() {
-    local listing name model
+    local listing name base
     listing=$(tar -tzf "$1") || die "$1 is not a readable tarball"
     while IFS= read -r name; do
-        for model in "${MODEL_NAMES[@]}"; do
-            if [[ ${name##*/} == "$model" ]]; then
-                die "$1 contains $name; no NVIDIA model may be packaged"
-            fi
-        done
+        base=${name##*/}
+        if [[ ${base,,} =~ $MODEL_PATTERN ]]; then
+            die "$1 contains $name; no NVIDIA model may be packaged"
+        fi
     done <<<"$listing"
 }
 
@@ -73,6 +80,10 @@ repack() {
 # commit and its time in /work/result for the host to copy out.
 inside() {
     local src=/work/src result=/work/result arch
+    # Set only by main's container command; the engine's own marker file
+    # (Docker's /.dockerenv, Podman's /run/.containerenv) on top.
+    [[ ${FERESTRE_DLSSNR_INSIDE:-} == 1 && ( -e /.dockerenv || -e /run/.containerenv ) ]] ||
+        die "--inside runs only in the build container that scripts/build-dlssnr.sh <output dir> starts"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y --no-install-recommends "${PACKAGES[@]}"
@@ -91,6 +102,21 @@ inside() {
     done
     git rev-parse HEAD >"$result/commit"
     git show -s --format=%ct HEAD >"$result/mtime"
+}
+
+# What the EXIT trap removes. Globals, not locals: the trap runs after main
+# has returned, and no path is ever pasted into the trap's text.
+CLEANUP_WORK=
+CLEANUP_ENGINE=
+CLEANUP_CONTAINER=
+
+cleanup() {
+    if [[ -n $CLEANUP_WORK ]]; then
+        rm -rf -- "$CLEANUP_WORK"
+    fi
+    if [[ -n $CLEANUP_CONTAINER ]]; then
+        "$CLEANUP_ENGINE" rm -f "$CLEANUP_CONTAINER" >/dev/null 2>&1 || true
+    fi
 }
 
 main() {
@@ -117,13 +143,16 @@ main() {
     mkdir -p -- "$1"
     out=$(cd -- "$1" && pwd)
 
+    trap cleanup EXIT
     work=$(mktemp -d "${TMPDIR:-/tmp}/ferestre-dlssnr.XXXXXX")
+    CLEANUP_WORK=$work
     engine=${FERESTRE_CONTAINER:-docker}
     container=ferestre-dlssnr-$$-$RANDOM
-    # shellcheck disable=SC2064 # expand now: these are locals
-    trap "rm -rf -- '$work'; '$engine' rm -f '$container' >/dev/null 2>&1 || true" EXIT
+    CLEANUP_ENGINE=$engine
+    CLEANUP_CONTAINER=$container
     echo ":: DLSSNR-AMD $version ($commit) in $IMAGE"
     "$engine" run -i --name "$container" \
+        -e FERESTRE_DLSSNR_INSIDE=1 \
         -e DLSSNR_REPOSITORY="$repository" -e DLSSNR_COMMIT="$commit" -e DLSSNR_VERSION="$version" \
         "$IMAGE" bash -c 'cat >/build-dlssnr.sh && bash /build-dlssnr.sh --inside' \
         <"$root/scripts/build-dlssnr.sh"

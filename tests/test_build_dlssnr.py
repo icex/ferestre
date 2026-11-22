@@ -37,7 +37,11 @@ def make_tarball(path, files, mtime):
 class BuildDlssnrTests(unittest.TestCase):
     def test_a_tarball_with_a_model_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
-            for model in ('CC_SILVER_AARDWOLD.bin', 'CC_SMALL_FP8.bin', 'dlssnr.bin', 'dlssnr-small.bin'):
+            # The networks, and the weights upstream derives from them at
+            # install time, which a stray build could pack.
+            for model in ('CC_SILVER_AARDWOLD.bin', 'CC_SMALL_FP8.bin', 'dlssnr.bin', 'dlssnr-small.bin',
+                          'CC_SILVER_AARDWOLD_OPTIMIZED.bin', 'CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin',
+                          'CC_SMALL_FP8_EXPERIMENTAL.bin', 'cc_small_fp8.BIN'):
                 with self.subTest(model=model):
                     path = Path(tmp) / 'pkg.tar.gz'
                     make_tarball(path, {'install.sh': b'#!/bin/sh\n', 'dlssnr-amd/' + model: b'x'}, 1)
@@ -52,6 +56,28 @@ class BuildDlssnrTests(unittest.TestCase):
                                 'model-tools/CC_SILVER_AARDWOLD.bin.sha256': b''}, 1)
             result = call('refuse_models', str(path))
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_container_half_refuses_to_run_on_the_host(self):
+        # Without the container's marker it must stop before apt-get or /work.
+        env = {k: v for k, v in os.environ.items() if k != 'FERESTRE_DLSSNR_INSIDE'}
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / 'bin'
+            bin_dir.mkdir()
+            trap = bin_dir / 'apt-get'
+            trap.write_text('#!/bin/sh\ntouch "$0.ran"\nexit 1\n')
+            trap.chmod(0o755)
+            env['PATH'] = f'{bin_dir}:{env["PATH"]}'
+            for marker in (None, '1'):
+                with self.subTest(marker=marker):
+                    if marker:
+                        env['FERESTRE_DLSSNR_INSIDE'] = marker
+                    if marker and (Path('/.dockerenv').exists() or Path('/run/.containerenv').exists()):
+                        self.skipTest('this test runs inside a container')
+                    result = subprocess.run(['bash', str(SCRIPT), '--inside'], capture_output=True,
+                                            text=True, env=env)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('only in the build container', result.stderr)
+                    self.assertFalse((bin_dir / 'apt-get.ran').exists())
 
     def test_equal_contents_repack_to_an_equal_tarball_without_a_top_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -83,7 +109,7 @@ class BuildDlssnrTests(unittest.TestCase):
             self.assertIn('not empty', result.stderr)
             self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ['stale'])
 
-    def run_with_fake_engine(self, tmp, files, commit=None):
+    def run_with_fake_engine(self, tmp, files, commit=None, tmpdir=None):
         """main() against an engine whose `run` only reads the script and whose
         `cp` hands back prepared upstream tarballs."""
         tmp = Path(tmp)
@@ -106,7 +132,7 @@ class BuildDlssnrTests(unittest.TestCase):
                           'esac\n')
         engine.chmod(0o755)
         env = dict(os.environ, FERESTRE_CONTAINER=str(engine), FAKE_RESULT=str(result),
-                   FAKE_LOG=str(tmp / 'log'), FAKE_SCRIPT=str(tmp / 'script'), TMPDIR=str(tmp))
+                   FAKE_LOG=str(tmp / 'log'), FAKE_SCRIPT=str(tmp / 'script'), TMPDIR=str(tmpdir or tmp))
         out = tmp / 'out'
         run = subprocess.run(['bash', str(SCRIPT), str(out)], capture_output=True, text=True, env=env)
         return run, out, version, tmp
@@ -127,12 +153,22 @@ class BuildDlssnrTests(unittest.TestCase):
             self.assertIn('OptiScaler (GPL-3.0)', sources)
             # The pinned image ran the script it was handed, and nothing was bind-mounted.
             log = (tmp / 'log').read_text()
+            self.assertIn(' -e FERESTRE_DLSSNR_INSIDE=1 ', log)
             self.assertRegex(log, r'run -i --name \S+ .*docker\.io/library/ubuntu:24\.04@sha256:[0-9a-f]{64} ')
             self.assertNotRegex(log, r'(^|\s)(-v|--volume|--mount)(\s|=)')
             self.assertEqual((tmp / 'script').read_text(), SCRIPT.read_text())
             # The temporary work dir is gone; only what the test made is left.
             self.assertEqual(sorted(p.name for p in tmp.iterdir()),
                              ['engine', 'log', 'out', 'result', 'script'])
+
+    def test_cleanup_survives_a_quote_in_the_temporary_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            odd = Path(tmp) / "it's here"
+            odd.mkdir()
+            run, out, _, tmp = self.run_with_fake_engine(tmp, {'install.sh': b''}, tmpdir=odd)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(list(odd.iterdir()), [])
+            self.assertRegex((tmp / 'log').read_text(), r'(?m)^rm -f ferestre-dlssnr-\d+-\d+$')
 
     def test_a_model_in_upstreams_tarball_leaves_the_output_empty(self):
         with tempfile.TemporaryDirectory() as tmp:

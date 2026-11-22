@@ -88,6 +88,8 @@ on:
       - 'tests/test_build_appimage.py'
       - 'tests/test_release_signing.py'
       - 'tests/test_workflows.py'
+      - 'tests/test_no_nvidia_urls.py'
+      - 'tests/test_build_dlssnr.py'
       # The native harnesses and fixtures: the shell syntax step and the
       # `sources` job check these.
       - 'tests/*.sh'
@@ -153,6 +155,8 @@ on:
       - 'tests/test_build_appimage.py'
       - 'tests/test_release_signing.py'
       - 'tests/test_workflows.py'
+      - 'tests/test_no_nvidia_urls.py'
+      - 'tests/test_build_dlssnr.py'
       # The native harnesses and fixtures: the shell syntax step and the
       # `sources` job check these.
       - 'tests/*.sh'

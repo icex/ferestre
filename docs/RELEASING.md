@@ -181,8 +181,10 @@ branch, and published under its own tag so the launcher can pin it:
    are not byte-identical between builds.
 
 No NVIDIA file is in the package; `scripts/build-dlssnr.sh` refuses a tarball
-holding a model, and `tests/test_no_nvidia_urls.py` keeps any URL of one out
-of the repository.
+holding a model or a weight file derived from one, and
+`tests/test_no_nvidia_urls.py` keeps any URL of one out of the repository. That
+guard runs in `.github/workflows/guards.yml` on every push and pull request,
+with no path filter, so a docs-only change is checked too.
 
 ### Build caches
 
