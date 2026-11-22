@@ -8,7 +8,7 @@
 # On a pull request the checkout is the merge commit GitHub made, so its first
 # parent is the base branch as it is now, and HEAD^1..HEAD is exactly what the
 # PR would change. A push to main or dev, and a manual run, always run every
-# job: that is where a skipped job here would be caught.
+# job: that is where a job skipped here would be caught.
 #
 # The `test` job is not decided here. It always runs: it holds the Python,
 # shell and packaging checks for every path the workflow triggers on.
