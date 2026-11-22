@@ -29,6 +29,7 @@ mod queue_ui;
 mod state;
 mod stop;
 mod text_input;
+mod textures;
 mod window_activation;
 mod window_controls;
 
@@ -86,6 +87,8 @@ button.game-tile { padding: 0; border: 0; background-image: none; background-col
 button.game-tile:hover { background-color: #30343b; }
 button.game-tile:focus-visible { outline: 3px solid white; outline-offset: 4px; }
 .game-tile picture { border-radius: 7px 7px 0 0; }
+/* A cover still decoding: a quiet gradient of the card's own size, so nothing moves when it lands. */
+picture.art-loading { background-image: linear-gradient(160deg, #30343b, #24272c 60%, #1f2226); }
 .game-tile .game-title { font-size: 14px; font-weight: 700; }
 .game-tile .game-meta { font-size: 12px; color: #b3b6bd; }
 .game-tile .game-running { color: #8bd77b; font-weight: 700; }
@@ -2211,12 +2214,8 @@ fn render_recents(ui: &Ui) {
             .width_request(48)
             .height_request(56)
             .build();
-        if let Some(texture) = model
-            .icons
-            .get(&id)
-            .and_then(|p| gdk::Texture::from_filename(p).ok())
-        {
-            image.set_paintable(Some(&texture));
+        if let Some(path) = model.icons.get(&id) {
+            textures::set_image(&image, path, textures::Size::Icon);
         }
         content.append(&image);
         let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
@@ -2304,8 +2303,8 @@ fn render_featured(ui: &Ui, page: &gtk::Box, rows: &[LibraryRow]) {
             .borrow()
             .catalog_cache()
             .and_then(|cache| cache.hero_path(&row.product_id));
-        if let Some(texture) = path.and_then(|p| gdk::Texture::from_filename(p).ok()) {
-            art.set_paintable(Some(&texture));
+        if let Some(path) = path {
+            textures::set_picture(&art, &path, textures::Size::Hero);
         }
         overlay.set_child(Some(&art));
         let caption = gtk::Box::builder()
@@ -2443,19 +2442,16 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
         description.subtitle().unwrap_or_default()
     ))]);
     let key = row.product_id.to_ascii_uppercase();
-    let texture = ui
-        .model
-        .borrow()
-        .icons
-        .get(&key)
-        .and_then(|p| gdk::Texture::from_filename(p).ok());
     let art = gtk::Picture::builder()
         .can_shrink(true)
         .height_request(if ui.window.is_fullscreen() { 300 } else { 280 })
         .content_fit(gtk::ContentFit::Cover)
         .build();
-    if let Some(texture) = texture.filter(|t| t.width() >= 300) {
-        art.set_paintable(Some(&texture));
+    // Only a real cover: Size::Cover refuses a source narrower than 300 px,
+    // the catalogue's small square tile, which stretched over a portrait card
+    // looks worse than the plain card.
+    if let Some(path) = ui.model.borrow().icons.get(&key) {
+        textures::set_picture(&art, path, textures::Size::Cover);
     }
     let cover = gtk::Overlay::new();
     cover.set_child(Some(&art));
@@ -2723,9 +2719,7 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
             .icons
             .get(&row.product_id.to_ascii_uppercase())
         {
-            if let Ok(texture) = gdk::Texture::from_filename(path) {
-                icon.set_paintable(Some(&texture));
-            }
+            textures::set_image(&icon, path, textures::Size::Icon);
         }
         action_row.add_prefix(&icon);
     }
@@ -3124,9 +3118,7 @@ fn render_account_button(ui: &Ui) {
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     let avatar = adw::Avatar::new(28, model.account.as_ref().map(|a| a.label()), true);
     if let Some(path) = &model.avatar {
-        if let Ok(texture) = gdk::Texture::from_filename(path) {
-            avatar.set_custom_image(Some(&texture));
-        }
+        textures::set_avatar(&avatar, path, textures::Size::Avatar);
     }
     match &dot {
         Some(dot) if !split => {
