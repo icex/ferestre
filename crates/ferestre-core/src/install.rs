@@ -228,6 +228,8 @@ fn check_shape(dir: &Path) -> Result<PathBuf> {
 ///     and cache directories, the XDG base directories, the runtime, client
 ///     and build trees, Steam -- and any directory that contains one of them;
 ///   * a directory holding another title's recorded install;
+///   * the folder of a game Ferestre did not install, or the absolute prefix
+///     its recipe names, anything inside them, and anything containing them;
 ///   * a directory with another download or another title's prefix directly
 ///     inside it. That is what a library folder chosen as an install
 ///     destination looks like, and removing "the title" would remove the
@@ -249,6 +251,34 @@ pub fn check_removable(dir: &Path, paths: &crate::paths::Paths) -> Result<()> {
                 dir.display(),
                 protected.display()
             );
+        }
+    }
+
+    // A game Ferestre did not install: its folder, and a prefix it named by
+    // absolute path (Steam's `compatdata/<app id>`, say), belong to someone
+    // else. A relative prefix is one Ferestre made in the games directory,
+    // and the rules above and below decide about it as for any title.
+    let (recipes, _) = crate::Recipe::load_layered_report(&paths.title_dirs());
+    for recipe in recipes.iter().filter(|r| r.is_local()) {
+        let mut theirs = Vec::new();
+        if let Ok(game) = paths.install_dir(recipe) {
+            theirs.push(game);
+        }
+        if let Some(prefix) = recipe.install.prefix.as_deref() {
+            if prefix.starts_with('/') {
+                theirs.push(PathBuf::from(prefix));
+            }
+        }
+        for kept in theirs {
+            let kept = resolve(&kept);
+            if kept.starts_with(&resolved) || resolved.starts_with(&kept) {
+                bail!(
+                    "{} belongs to {}, a game Ferestre did not install; Ferestre never \
+                     deletes it",
+                    dir.display(),
+                    recipe.title.name
+                );
+            }
         }
     }
 
@@ -2158,5 +2188,53 @@ mod tests {
             assert_eq!(identity(config), TitleIdentity::default(), "{config}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A local game `LOCAL-T` in the user's titles directory, with its folder
+    /// and, if given, an absolute prefix.
+    fn write_local_recipe(paths: &crate::paths::Paths, game: &Path, prefix: Option<&Path>) {
+        let prefix = prefix
+            .map(|p| format!("prefix = \"{}\"\n", p.display()))
+            .unwrap_or_default();
+        let text = format!(
+            "schema = 1\n[title]\nproduct-id = \"LOCAL-T\"\nname = \"Test Game\"\n\
+             slug = \"local-t\"\nkind = \"local\"\n[install]\ndir = \"{}\"\n{prefix}\
+             [launch]\nexecutable = \"Game.exe\"\n[status]\nstate = \"untested\"\n\
+             summary = \"Added by hand\"\n",
+            game.display()
+        );
+        crate::Recipe::parse(&text)
+            .unwrap()
+            .save_to(&paths.user_titles_dir())
+            .unwrap();
+    }
+
+    #[test]
+    fn a_local_games_folder_and_prefix_are_never_removable() {
+        let home = Home::new("local-guard");
+        let game = home.root.join("drive/Game"); // outside the games dir
+        let prefix = home.root.join("steam/steamapps/compatdata/3000000001");
+        for d in [&game, &prefix] {
+            std::fs::create_dir_all(d.join("x")).unwrap();
+        }
+        write_local_recipe(&home.paths, &game, Some(&prefix));
+        for refused in [
+            game.clone(),
+            game.join("x"),
+            prefix.clone(),
+            home.root.join("drive"),
+        ] {
+            let err = check_removable(&refused, &home.paths)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("never deletes"),
+                "{}: {err}",
+                refused.display()
+            );
+        }
+        // The guard is about that game's folders, not every folder.
+        let other = home.game("other-title");
+        check_removable(&other, &home.paths).unwrap();
     }
 }
