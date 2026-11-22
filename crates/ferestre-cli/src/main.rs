@@ -753,7 +753,6 @@ fn gate_json(gate: &neural::apply::Gate) -> Value {
         Gate::NeedsAcknowledgement(names) => {
             json!({"state": "needs-acknowledgement", "names": names})
         }
-        Gate::Refused(names) => json!({"state": "refused", "names": names}),
     }
 }
 

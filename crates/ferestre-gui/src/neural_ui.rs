@@ -9,6 +9,8 @@ pub(crate) struct View {
     pub can_enable: bool,
     pub blocked_because: Option<String>,
     pub acknowledge: Vec<&'static str>,
+    /// The kernel-level ones among `acknowledge`: the strongest warning.
+    pub kernel: Vec<&'static str>,
     pub warnings: Vec<String>,
     pub route: Option<Route>,
     pub enabled: bool,
@@ -77,27 +79,29 @@ pub(crate) fn view(o: &Overview) -> View {
     let (can_enable, blocked_because, acknowledge) = match &o.gate {
         // Only an RX 9000 runs it; on Intel, NVIDIA or an older Radeon the
         // switch stays off whatever the game.
-        _ if o.hardware.unsupported.is_some() => (
-            false,
-            o.hardware.unsupported.clone(),
-            Vec::new(),
-        ),
+        _ if o.hardware.unsupported.is_some() => {
+            (false, o.hardware.unsupported.clone(), Vec::new())
+        }
         Gate::Allowed => (true, None, Vec::new()),
         Gate::NeedsAcknowledgement(names) => (true, None, names.clone()),
-        Gate::Refused(names) => (
-            false,
-            Some(format!(
-                "{} is a kernel-level anti-cheat that Proton cannot run; neural rendering cannot be enabled for this game",
-                names.join(", ")
-            )),
-            Vec::new(),
-        ),
     };
+    let kernel: Vec<&'static str> = neural::apply::kernel_risk(&o.anticheat)
+        .into_iter()
+        .filter(|name| acknowledge.contains(name))
+        .collect();
+    if !kernel.is_empty() {
+        warnings.push(format!(
+            "{} is a kernel-level anti-cheat: online, a game that loads a mod with it is likely \
+             to get the account banned. Enable it only for a build that never goes online.",
+            kernel.join(", ")
+        ));
+    }
     View {
         summary: lines.join("\n"),
         can_enable,
         blocked_because,
         acknowledge,
+        kernel,
         warnings,
         route: d.route,
         enabled,
@@ -272,10 +276,18 @@ fn present(ui: &Ui, product_id: &str, name: &str, v: &View) {
     content.append(&choice("Starting network", &networks));
 
     let acknowledged = (!v.acknowledge.is_empty()).then(|| {
-        gtk::CheckButton::with_label(&format!(
-            "I understand {} may ban accounts that load mods, and this game is single-player for me",
-            v.acknowledge.join(", ")
-        ))
+        gtk::CheckButton::with_label(&if v.kernel.is_empty() {
+            format!(
+                "I understand {} may ban accounts that load mods, and this game is single-player for me",
+                v.acknowledge.join(", ")
+            )
+        } else {
+            format!(
+                "I understand {} may ban accounts that load mods; this is an offline build and \
+                 I take the risk",
+                v.acknowledge.join(", ")
+            )
+        })
     });
     if let Some(check) = &acknowledged {
         content.append(check);
@@ -488,15 +500,28 @@ mod tests {
     }
 
     #[test]
-    fn a_kernel_anti_cheat_disables_enable_and_says_why() {
+    fn a_kernel_anti_cheat_asks_for_the_strongest_acknowledgement() {
         let v = view(&overview(
-            vec![det("Ricochet", true, false)],
-            Gate::Refused(vec!["Ricochet"]),
+            vec![det("Ricochet", true, false), det("BattlEye", true, true)],
+            Gate::NeedsAcknowledgement(vec!["Ricochet", "BattlEye"]),
             Some(Route::ReshadeFeeder),
         ));
-        assert!(!v.can_enable);
-        assert!(v.blocked_because.as_deref().unwrap().contains("Ricochet"));
-        assert!(v.acknowledge.is_empty());
+        assert!(v.can_enable);
+        assert_eq!(v.blocked_because, None);
+        assert_eq!(v.acknowledge, vec!["Ricochet", "BattlEye"]);
+        assert_eq!(v.kernel, vec!["Ricochet"]);
+        assert!(
+            v.warnings
+                .iter()
+                .any(|w| w.contains("Ricochet is a kernel-level")),
+            "{:?}",
+            v.warnings
+        );
+        assert!(
+            !enable_sensitive(&v, 0, Some(false)),
+            "not without the tick"
+        );
+        assert!(enable_sensitive(&v, 0, Some(true)));
     }
 
     #[test]
@@ -559,14 +584,6 @@ mod tests {
 
     #[test]
     fn enable_is_pressable_only_with_a_route_a_tick_and_no_refusal() {
-        let refused = view(&overview(
-            vec![det("Ricochet", true, false)],
-            Gate::Refused(vec!["Ricochet"]),
-            Some(Route::ReshadeFeeder),
-        ));
-        assert!(!enable_sensitive(&refused, 0, None));
-        assert!(!enable_sensitive(&refused, 1, None));
-
         let ask = view(&overview(
             vec![det("BattlEye", true, true)],
             Gate::NeedsAcknowledgement(vec!["BattlEye"]),

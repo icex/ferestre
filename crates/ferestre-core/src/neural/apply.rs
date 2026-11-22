@@ -59,30 +59,33 @@ pub fn exe_dir(game_dir: &Path, executable: &str) -> PathBuf {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Gate {
     Allowed,
-    /// Anti-cheats the person has not acknowledged for this game.
+    /// Anti-cheats the person has not acknowledged for this game. A
+    /// kernel-level one Proton cannot run (Ricochet, Vanguard) is among them
+    /// too: the build may be an offline one, and the risk is the person's to
+    /// take, with the strongest warning ([`kernel_risk`]).
     NeedsAcknowledgement(Vec<&'static str>),
-    /// Kernel-level anti-cheats Proton cannot run: never, no override.
-    Refused(Vec<&'static str>),
+}
+
+/// The kernel-level anti-cheats Proton cannot run among `found`: the ones an
+/// online build of the game would most likely ban for.
+pub fn kernel_risk(found: &[Detection]) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = Vec::new();
+    for d in found.iter().filter(|d| d.kernel && !d.proton_runtime) {
+        if !names.contains(&d.name) {
+            names.push(d.name);
+        }
+    }
+    names
 }
 
 pub fn gate(found: &[Detection], acknowledged: &BTreeSet<String>) -> Gate {
-    let mut refused: Vec<&'static str> = Vec::new();
     let mut unacknowledged: Vec<&'static str> = Vec::new();
     for detection in found {
-        let list = if detection.kernel && !detection.proton_runtime {
-            &mut refused
-        } else if !acknowledged.contains(detection.name) {
-            &mut unacknowledged
-        } else {
-            continue;
-        };
-        if !list.contains(&detection.name) {
-            list.push(detection.name);
+        if !acknowledged.contains(detection.name) && !unacknowledged.contains(&detection.name) {
+            unacknowledged.push(detection.name);
         }
     }
-    if !refused.is_empty() {
-        Gate::Refused(refused)
-    } else if !unacknowledged.is_empty() {
+    if !unacknowledged.is_empty() {
         Gate::NeedsAcknowledgement(unacknowledged)
     } else {
         Gate::Allowed
@@ -93,10 +96,6 @@ pub fn gate(found: &[Detection], acknowledged: &BTreeSet<String>) -> Gate {
 fn gate_reason(gate: &Gate) -> Option<String> {
     match gate {
         Gate::Allowed => None,
-        Gate::Refused(names) => Some(format!(
-            "{} is a kernel-level anti-cheat that Proton cannot run; neural rendering is never used with it",
-            names.join(", ")
-        )),
         Gate::NeedsAcknowledgement(names) => Some(format!(
             "{} was found and is not acknowledged for this game; to use neural rendering anyway, \
              turn it on again with --accept-anticheat-risk",
@@ -739,15 +738,22 @@ fn enable_with(ctx: &Context, req: &EnableRequest, found: &[Detection]) -> Resul
     let acknowledged = state::acknowledged(&ctx.config_dir, req.key)?;
     let newly = match gate(found, &acknowledged) {
         Gate::Allowed => Vec::new(),
-        Gate::Refused(names) => bail!(
-            "{name} uses {}, a kernel-level anti-cheat; neural rendering is never enabled for it.",
-            names.join(", ")
-        ),
-        Gate::NeedsAcknowledgement(names) if !req.accept_anticheat_risk => bail!(
-            "{name} uses {}. Modding a game with anti-cheat can get the account banned; \
-             to enable neural rendering anyway, pass --accept-anticheat-risk",
-            names.join(", ")
-        ),
+        Gate::NeedsAcknowledgement(names) if !req.accept_anticheat_risk => {
+            let kernel = kernel_risk(found);
+            if kernel.is_empty() {
+                bail!(
+                    "{name} uses {}. Modding a game with anti-cheat can get the account banned; \
+                     to enable neural rendering anyway, pass --accept-anticheat-risk",
+                    names.join(", ")
+                )
+            }
+            bail!(
+                "{name} uses {}, a kernel-level anti-cheat. Online, loading a mod with it is \
+                 likely to get the account banned. Only for a build that never goes online: \
+                 to enable neural rendering at your own risk, pass --accept-anticheat-risk",
+                kernel.join(", ")
+            )
+        }
         Gate::NeedsAcknowledgement(names) => {
             let unseen: Vec<&str> = req
                 .shown_anticheat
@@ -1421,18 +1427,21 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
     }
 
     #[test]
-    fn the_gate_refuses_kernel_anti_cheats_proton_cannot_run() {
+    fn every_anti_cheat_needs_an_acknowledgement_kernel_ones_included() {
         let none = BTreeSet::new();
         assert_eq!(gate(&[], &none), Gate::Allowed);
+        let both = [
+            det("Easy Anti-Cheat", true, true),
+            det("Ricochet", true, false),
+        ];
         assert_eq!(
-            gate(
-                &[
-                    det("Easy Anti-Cheat", true, true),
-                    det("Ricochet", true, false)
-                ],
-                &none
-            ),
-            Gate::Refused(vec!["Ricochet"])
+            gate(&both, &none),
+            Gate::NeedsAcknowledgement(vec!["Easy Anti-Cheat", "Ricochet"])
+        );
+        assert_eq!(kernel_risk(&both), vec!["Ricochet"]);
+        assert_eq!(
+            gate(&both, &BTreeSet::from(["Ricochet".to_string()])),
+            Gate::NeedsAcknowledgement(vec!["Easy Anti-Cheat"])
         );
         assert_eq!(
             gate(&[det("BattlEye", true, true)], &none),
@@ -1446,23 +1455,27 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
     }
 
     #[test]
-    fn a_kernel_anti_cheat_refuses_even_when_risk_is_accepted() {
+    fn a_kernel_anti_cheat_is_allowed_only_at_the_persons_own_risk() {
         let w = World::new();
+        let ricochet = [det("Ricochet", true, false)];
         let before = listing(&w.game);
-        let error = enable_with(
-            &w.ctx,
-            &w.req(Some(Route::ReshadeFeeder), true),
-            &[det("Ricochet", true, false)],
-        )
-        .unwrap_err();
-        let text = format!("{error:#}");
-        assert!(text.contains("Ricochet"), "{text}");
-        assert!(text.contains("kernel-level"), "{text}");
+        let text = format!(
+            "{:#}",
+            enable_with(&w.ctx, &w.req(Some(Route::ReshadeFeeder), false), &ricochet).unwrap_err()
+        );
+        assert!(text.contains("Ricochet, a kernel-level"), "{text}");
+        assert!(text.contains("own risk"), "{text}");
+        assert!(text.contains("--accept-anticheat-risk"), "{text}");
         assert_eq!(listing(&w.game), before, "no file written");
         assert_eq!(w.entry(), None);
+
+        enable_with(&w.ctx, &w.req(Some(Route::ReshadeFeeder), true), &ricochet).unwrap();
+        assert!(w.entry().unwrap().enabled);
         assert!(state::acknowledged(&w.ctx.config_dir, "local-game")
             .unwrap()
-            .is_empty());
+            .contains("Ricochet"));
+        // Remembered: the launch keeps it.
+        assert!(matches!(w.ensure(&ricochet), Ensured::Present(_)));
     }
 
     #[test]

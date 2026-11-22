@@ -6,8 +6,8 @@ neural rendering network on AMD Radeon RX 9000 (RDNA4) cards. It is
 experimental: expect games where it does not load, or looks wrong.
 
 Use it only for games you play single-player. Some anti-cheats ban accounts
-that load mods, and Ferestre never enables it on a game whose anti-cheat is a
-kernel-level one (see [Anti-cheat](#anti-cheat)).
+that load mods, so Ferestre enables it on a game with anti-cheat only when you
+accept the risk (see [Anti-cheat](#anti-cheat)).
 
 ## What you need
 
@@ -106,13 +106,15 @@ yourself for the same DLL wins, and the launch says the mod may then not load.
 
 ## Anti-cheat
 
-- A kernel-level anti-cheat that Proton cannot run (Ricochet, Vanguard, ACE,
-  GameGuard, mhyprot, EA AntiCheat and others): neural rendering is never
-  enabled. There is no override.
-- Any other anti-cheat, including Easy Anti-Cheat and BattlEye: enabling needs
+- Any anti-cheat, including Easy Anti-Cheat and BattlEye: enabling needs
   `--accept-anticheat-risk` (or the checkbox in the window). Ferestre
   remembers it for that game and that anti-cheat, until you remove a local
   game from Ferestre.
+- A kernel-level anti-cheat that Proton cannot run (Ricochet, Vanguard, ACE,
+  GameGuard, mhyprot, EA AntiCheat and others) gets the strongest warning:
+  online, a game that loads a mod with it is likely to get the account banned.
+  Accept the risk only for a build that never goes online, such as an offline
+  one.
 
 The check runs again before every launch. If a game update brings in an
 anti-cheat that forbids the mod, Ferestre takes the mod out, puts your files

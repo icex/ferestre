@@ -11,7 +11,7 @@ Ferestre's library without losing any of that.
 On top of that, an experimental per-game "neural rendering" switch runs
 NVIDIA's DLSS 5 neural rendering network on AMD RX 9000 (RDNA4) cards through
 [DLSSNR-AMD](https://github.com/TheAutomatic/DLSSNR-AMD) (MIT). It is meant for
-single-player games; games with anti-cheat are warned about or refused.
+single-player games; games with anti-cheat need an explicit acknowledgement.
 
 Two pull requests, in order: **A. Local games**, then **B. Neural rendering**
 (B builds on A; Xbox titles can use B too).
@@ -70,9 +70,10 @@ B. Neural rendering
   first and restored on disable; the needed `WINEDLLOVERRIDES` (and int4
   Vulkan layer env) are merged into the launch. The install is re-checked
   before every launch and redone when missing (game updates).
-- Anti-cheat gate: a kernel-level anti-cheat refuses enabling; any other
-  detected anti-cheat requires an explicit acknowledgement, remembered per
-  game and anti-cheat.
+- Anti-cheat gate: any detected anti-cheat requires an explicit
+  acknowledgement, remembered per game and anti-cheat. A kernel-level one
+  Proton cannot run gets the strongest warning (an offline build is the
+  person's call, at their own risk).
 - Hardware gate: only on an AMD Radeon RX 9000 (RDNA4) GPU. On Intel, NVIDIA
   or an older Radeon, enabling is refused, the GUI switch is off, and an
   enabled game launches without the mod (taken out, kept enabled, back on a
