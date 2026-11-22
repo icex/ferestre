@@ -579,12 +579,13 @@ jobs:
         with:
           persist-credentials: false
 
-      # Run-time libraries only; nothing is compiled here.
+      # The packages the unsharded job installed, so the window runs
+      # against exactly the libraries, themes and fonts it was tested with.
       - name: System libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libgtk-4-1 libadwaita-1-0 \
+          sudo apt-get install -y \
+            libgtk-4-dev libadwaita-1-dev \
             at-spi2-core gir1.2-atspi-2.0 python3-gi openbox \
             xvfb dbus-x11
 
