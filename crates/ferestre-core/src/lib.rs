@@ -29,6 +29,7 @@ pub mod install;
 pub mod launch;
 pub mod launch_options;
 pub mod library;
+pub mod local;
 pub mod media;
 pub mod paths;
 pub mod playfab;
