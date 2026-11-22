@@ -435,7 +435,12 @@ pub fn steam_tools(paths: &Paths) -> Vec<SteamTool> {
                             .get("install_path")
                             .and_then(crate::steam::Value::as_str)
                             .unwrap_or(".");
-                        let tool_dir = dir.join(install);
+                        // `"."` is the usual value: the tool's own folder,
+                        // named without a trailing `/.` in settings and output.
+                        let tool_dir = match install.trim_end_matches('/') {
+                            "" | "." => dir.clone(),
+                            other => dir.join(other),
+                        };
                         if tool_dir.join("proton").is_file() {
                             push(SteamTool {
                                 name,
@@ -2047,6 +2052,8 @@ hangs"""
             Some(&ge)
         );
         assert_eq!(steam_tool(&tools, "proton_9").map(|t| &t.dir), Some(&valve));
+        // `install_path "."` names the folder itself, as it is written down.
+        assert_eq!(tools[0].dir.to_str(), ge.to_str());
         assert!(steam_tool(&tools, "proton_8").is_none());
 
         let local = local_test_recipe();

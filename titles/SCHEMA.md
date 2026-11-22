@@ -252,10 +252,14 @@ the keys below. Such a recipe differs from a Store title's in these ways:
   `LOCAL-<NAME>` for one added by hand): the dash means it can never be a
   Store product id, and a recipe with one but not the other is refused.
 - `[title].slug` must be the id in lowercase.
-- `[install].dir` is the game's **absolute** folder, with no `..`. It is not
-  inside the games directory and Ferestre never deletes it.
+- `[install].dir` is the game's **absolute** folder, at least two levels
+  below `/`, with no `..`. It is not inside the games directory and Ferestre
+  never deletes it. Adding or importing a game also refuses a folder that is
+  or holds the home directory, the games directory, a Steam install or a
+  Steam library.
 - `[install].prefix` is optional: an absolute prefix (Steam's own
-  `compatdata/<app id>`, say) is used as it is and never deleted;
+  `compatdata/<app id>`, say), at least two levels below `/` with no `..`,
+  is used as it is and never deleted;
   a relative one, or none, gives a prefix in the games directory as for any
   title.
 - `[install].content`, `dir-env` and `prefix-env` are refused.

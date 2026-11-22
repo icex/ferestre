@@ -358,11 +358,37 @@ pub fn save_artwork(
 
 /// Why `dir` is too broad to be one local game's folder or prefix: it is, or
 /// holds, the home directory, the games directory or another directory the
-/// launcher never removes. `None` when it is narrow enough.
+/// launcher never removes, or a Steam install or one of its libraries.
+/// `None` when it is narrow enough.
 ///
-/// Such a folder is not protected by the removal guard -- it would shield
-/// every Store title -- and adding or importing a game should refuse it.
+/// Adding or importing a game refuses such a folder.
 pub fn too_broad(paths: &Paths, dir: &Path) -> Option<String> {
+    if let Some(why) = shields_store_titles(paths, dir) {
+        return Some(why);
+    }
+    // A shortcut started in a Steam library's root is that library's, not a
+    // game's: every Steam game and prefix in it would be "its" files.
+    let resolve = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let resolved = resolve(dir);
+    paths
+        .steam_roots()
+        .iter()
+        .flat_map(|root| crate::steam::libraries(root))
+        .find(|library| resolve(library).starts_with(&resolved))
+        .map(|library| {
+            format!(
+                "{} is or holds a Steam library ({})",
+                resolved.display(),
+                library.display()
+            )
+        })
+}
+
+/// Why `dir` is too broad for the removal guard to protect as one local
+/// game's: it is, or holds, the home directory, the games directory or
+/// another directory the launcher never removes. Protecting it would shield
+/// every Store title. `None` when it is narrow enough.
+pub(crate) fn shields_store_titles(paths: &Paths, dir: &Path) -> Option<String> {
     let resolve = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let dir = resolve(dir);
     if dir.components().count() < 3 {
@@ -504,6 +530,34 @@ mod tests {
             assert!(too_broad(&paths, &broad).is_some(), "{}", broad.display());
         }
         assert_eq!(too_broad(&paths, &home.path().join("drive/Game")), None);
+    }
+
+    #[test]
+    fn a_steam_install_or_library_is_too_broad_but_a_game_in_it_is_not() {
+        let home = tempfile::tempdir().unwrap();
+        let steam = home.path().join(".local/share/Steam");
+        let library = home.path().join("drive/SteamLibrary");
+        std::fs::create_dir_all(steam.join("steamapps")).unwrap();
+        std::fs::create_dir_all(library.join("steamapps/common/Game")).unwrap();
+        std::fs::write(
+            steam.join("steamapps/libraryfolders.vdf"),
+            format!(
+                "\"libraryfolders\" {{ \"0\" {{ \"path\" \"{}\" }} \"1\" {{ \"path\" \"{}\" }} }}",
+                steam.display(),
+                library.display()
+            ),
+        )
+        .unwrap();
+        let paths = test_paths(home.path());
+        for broad in [&steam, &library, &home.path().join("drive")] {
+            assert!(too_broad(&paths, broad).is_some(), "{}", broad.display());
+        }
+        assert_eq!(
+            too_broad(&paths, &library.join("steamapps/common/Game")),
+            None
+        );
+        // The removal guard still protects a library a recipe names.
+        assert_eq!(shields_store_titles(&paths, &library), None);
     }
 
     #[test]

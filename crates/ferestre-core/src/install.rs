@@ -260,14 +260,16 @@ pub fn check_removable(dir: &Path, paths: &crate::paths::Paths) -> Result<()> {
     // and the rules above and below decide about it as for any title.
     //
     // A folder that is or holds the home or games directory (see
-    // [`crate::local::too_broad`]) is no one game's and is not protected:
-    // otherwise one careless recipe would block removing every Store title.
+    // [`crate::local::shields_store_titles`]) is no one game's and is not
+    // protected: otherwise one careless recipe would block removing every
+    // Store title. A Steam library named by a hand-written recipe still is:
+    // over-protecting it costs nothing.
     //
     // A local recipe that no longer parses still protects its folders: its
     // raw TOML is read for them, and if even that fails, the removal is
     // refused while the broken file is named.
     for (name, kept) in local_folders(paths)? {
-        if crate::local::too_broad(paths, &kept).is_some() {
+        if crate::local::shields_store_titles(paths, &kept).is_some() {
             continue;
         }
         let kept = resolve(&kept);

@@ -850,6 +850,75 @@ mod tests {
     }
 
     #[test]
+    fn a_shortcut_started_in_root_home_or_a_steam_library_is_skipped() {
+        let h = steam_home();
+        let home = h.paths.home().to_path_buf();
+        let library = home.join("drive/SteamLibrary");
+        std::fs::create_dir_all(library.join("steamapps")).unwrap();
+        std::fs::write(
+            h.steam.join("steamapps/libraryfolders.vdf"),
+            format!(
+                "\"libraryfolders\" {{ \"0\" {{ \"path\" \"{}\" }} \"1\" {{ \"path\" \"{}\" }} }}",
+                h.steam.display(),
+                library.display()
+            ),
+        )
+        .unwrap();
+        let exe = h.cyberpunk_dir.join("bin/x64/Cyberpunk2077.exe");
+        let starts = [
+            "/".to_owned(),
+            home.display().to_string(),
+            h.steam.display().to_string(),
+            library.display().to_string(),
+        ];
+        let mut entries: Vec<Value> = starts
+            .iter()
+            .enumerate()
+            .map(|(i, start)| {
+                entry(
+                    &[
+                        ("AppName", &format!("Broad {i}")),
+                        ("Exe", &format!("\"{}\"", exe.display())),
+                        ("StartDir", &format!("\"{start}\"")),
+                    ],
+                    1_000 + i as u32,
+                )
+            })
+            .collect();
+        // A prefix as broad as the home directory is refused too.
+        entries.push(entry(
+            &[
+                ("AppName", "Broad prefix"),
+                ("Exe", &format!("\"{}\"", exe.display())),
+                ("LaunchOptions", "STEAM_COMPAT_DATA_PATH=~ %command%"),
+            ],
+            2_000,
+        ));
+        write_shortcuts(&h.steam.join("userdata/222/config/shortcuts.vdf"), entries);
+        let before = h.snapshot_steam();
+        let found = plan(&h.paths, Some("222")).unwrap();
+        assert_eq!(found.len(), 5);
+        for c in &found {
+            assert!(
+                matches!(c.status, ImportStatus::Skipped(_)) && c.recipe.is_none(),
+                "{}: {:?}",
+                c.name,
+                c.status
+            );
+        }
+        let report = apply(&h.paths, &found).unwrap();
+        assert!(report.added.is_empty() && report.skipped.len() == 5);
+        assert_eq!(h.snapshot_steam(), before);
+        assert!(
+            !h.paths.user_titles_dir().exists()
+                || std::fs::read_dir(h.paths.user_titles_dir())
+                    .unwrap()
+                    .next()
+                    .is_none()
+        );
+    }
+
+    #[test]
     fn import_writes_recipes_and_never_touches_steam() {
         let h = steam_home();
         let before = h.snapshot_steam();

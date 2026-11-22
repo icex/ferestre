@@ -138,6 +138,15 @@ Open the game's **More actions → Edit launch settings**. Settings such as nati
 - **Move:** open the game's **More actions → Move location**, choose an existing library folder and confirm after the space check. Ferestre verifies the move, and keeps the original if it fails or is cancelled. Saves and prefixes retain their existing locations.
 - **Steam:** close Steam, then choose **Add to Steam** in the game's menu. **Add All to Steam** in the Installed list adds all installed games. Shortcuts include available artwork and retain their identity when updated.
 
+### Play games you already have
+
+Windows games Ferestre did not install (GOG, other stores, Steam non-Steam shortcuts) can live in the same library as **local games**:
+
+- **Add a game:** choose **+ → Add game…** in the library and pick its `.exe`; the name and folder are filled in and can be edited. Or `./ferestre.AppImage add /path/to/Game.exe`.
+- **Import from Steam:** choose **+ → Import from Steam**, or `./ferestre.AppImage import-steam --dry-run` to see what would come in, then without `--dry-run`. Each non-Steam shortcut keeps its executable, launch options (environment, wrappers such as `gamemoderun`, arguments), Wine prefix, Proton build and grid art. Steam's files are only read; Ferestre's own shortcuts are skipped.
+
+Local games start through Ferestre's Proton shim without any Xbox service, licence or account. **Remove from library** only forgets a local game: its folder and its Wine prefix are never deleted. Games with anti-cheat files are flagged in the library. See [local games in recipes](titles/SCHEMA.md#local-games-user-recipes-only).
+
 ### Refresh your library
 
 Use the top-right **Refresh** button, or **Reload library** in the profile menu, after purchases or subscription changes. Lists open from cache for speed; refresh checks them again. A failed refresh retains the last complete library.
@@ -166,6 +175,8 @@ The AppImage also accepts CLI commands:
 ./ferestre.AppImage library
 ./ferestre.AppImage install PRODUCT-ID
 ./ferestre.AppImage run PRODUCT-ID
+./ferestre.AppImage add /path/to/Game.exe
+./ferestre.AppImage import-steam --dry-run
 ./ferestre.AppImage updates
 ./ferestre.AppImage check-app-updates
 ```
