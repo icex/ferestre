@@ -5,7 +5,8 @@
 //! should go with them. Anything that cost a network round trip -- the account,
 //! the library, the catalog, the icons -- lives here and survives a redraw.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use ferestre_core::account::Account;
@@ -133,9 +134,136 @@ pub struct Model {
     pub show_unsupported: bool,
 
     pub problem: Option<String>,
+
+    /// What the file system said about each install, remembered until
+    /// [`Model::forget_probes`]. See [`Probes`].
+    pub probes: RefCell<Probes>,
+}
+
+/// Answers about install folders, remembered between redraws.
+///
+/// Every redraw asked them all again: about 1400 `statx`, 156 opens and the
+/// runtime choices file once per row for one Library page, on the GTK thread.
+/// On a spun-down disk, NTFS or a network library each of those can stall.
+/// None of them changes unless something installs, removes, moves, pauses or
+/// launches a title, or the person changes files outside the window: the
+/// window forgets them after each of its own tasks, when it is activated
+/// again, once a minute, and with a fresh model after every reload.
+#[derive(Default)]
+pub struct Probes {
+    complete: HashMap<PathBuf, bool>,
+    has_entries: HashMap<PathBuf, bool>,
+    is_dir: HashMap<PathBuf, bool>,
+    /// By product id and the recorded folder, so a new record is a miss.
+    game_dir: HashMap<(String, Option<PathBuf>), Option<PathBuf>>,
+    version: HashMap<PathBuf, Option<String>>,
+    executable: HashMap<PathBuf, Option<String>>,
+    parent: HashMap<PathBuf, Option<String>>,
+    runtime: HashMap<String, Option<PathBuf>>,
+    runtime_note: HashMap<String, Option<String>>,
+    engine: HashMap<(PathBuf, String), Option<ferestre_core::autofix::Profile>>,
+    played: HashMap<String, Option<std::time::SystemTime>>,
+}
+
+/// Look `key` up in one of the [`Probes`] maps, computing it on a miss. The
+/// borrow is not held while `compute` runs, so a probe may use another.
+fn probe<K, V>(
+    probes: &RefCell<Probes>,
+    map: fn(&mut Probes) -> &mut HashMap<K, V>,
+    key: &K,
+    compute: impl FnOnce() -> V,
+) -> V
+where
+    K: std::hash::Hash + Eq + Clone,
+    V: Clone,
+{
+    if let Some(value) = map(&mut probes.borrow_mut()).get(key) {
+        return value.clone();
+    }
+    let value = compute();
+    map(&mut probes.borrow_mut()).insert(key.clone(), value.clone());
+    value
 }
 
 impl Model {
+    /// Ask the file system again from now on: something may have installed,
+    /// moved, paused or removed a title, or written a launch log.
+    pub fn forget_probes(&self) {
+        *self.probes.borrow_mut() = Probes::default();
+    }
+
+    fn complete(&self, dir: &Path) -> bool {
+        probe(
+            &self.probes,
+            |p| &mut p.complete,
+            &dir.to_path_buf(),
+            || install_complete(dir),
+        )
+    }
+
+    fn is_dir(&self, dir: &Path) -> bool {
+        probe(
+            &self.probes,
+            |p| &mut p.is_dir,
+            &dir.to_path_buf(),
+            || dir.is_dir(),
+        )
+    }
+
+    /// The bundle whose content folder this title's install is, if any.
+    pub fn content_parent(&self, product_id: &str) -> Option<String> {
+        let dir = self.product_dir(product_id)?;
+        probe(
+            &self.probes,
+            |p| &mut p.parent,
+            &dir,
+            || ferestre_core::related::parent(&dir),
+        )
+    }
+
+    /// The engine in a title's install folder, as `autofix::detect` reads it.
+    pub fn engine(&self, recipe: &Recipe, dir: &Path) -> Option<ferestre_core::autofix::Profile> {
+        let key = (dir.to_path_buf(), recipe.launch.executable.clone());
+        probe(
+            &self.probes,
+            |p| &mut p.engine,
+            &key,
+            || ferestre_core::autofix::detect(dir, &recipe.launch.executable),
+        )
+    }
+
+    /// The runtime chosen for this title, or the default choice.
+    pub fn requested_runtime(&self, product_id: &str) -> Option<PathBuf> {
+        let paths = self.paths.as_ref()?;
+        probe(
+            &self.probes,
+            |p| &mut p.runtime,
+            &product_id.to_ascii_uppercase(),
+            || runtime::requested(paths, product_id).ok().flatten(),
+        )
+    }
+
+    /// When the title last wrote its launch log: when it was last played.
+    pub fn last_played(&self, product_id: &str) -> Option<std::time::SystemTime> {
+        let paths = self.paths.as_ref()?;
+        let key = product_id.to_ascii_uppercase();
+        probe(
+            &self.probes,
+            |p| &mut p.played,
+            &key.clone(),
+            || {
+                std::fs::metadata(
+                    paths
+                        .state_dir()
+                        .join("launches")
+                        .join(format!("{key}.stderr")),
+                )
+                .ok()
+                .and_then(|m| m.modified().ok())
+            },
+        )
+    }
+
     /// Entitlements and the tier summary must change together.
     pub fn set_ownership(&mut self, entries: Vec<library::Entry>) {
         self.subscriptions = gamepass::active(&entries);
@@ -359,6 +487,7 @@ impl Model {
             page: 0,
             show_unsupported: false,
             problem,
+            probes: Default::default(),
         }
     }
 
@@ -404,8 +533,7 @@ impl Model {
     /// Whether the title is installed, not merely started: a folder appears
     /// the moment a download begins, and a stopped one is not a title to play.
     pub fn is_installed(&self, recipe: &Recipe) -> bool {
-        self.game_dir(recipe)
-            .is_some_and(|dir| install_complete(&dir))
+        self.game_dir(recipe).is_some_and(|dir| self.complete(&dir))
     }
 
     /// Whether a download of this product stopped and left files where the
@@ -418,7 +546,15 @@ impl Model {
                 .as_ref()
                 .map(|p| p.games_dir().join(product_id.to_ascii_lowercase())),
         };
-        dir.is_some_and(|dir| !install_complete(&dir) && has_entries(&dir))
+        dir.is_some_and(|dir| {
+            !self.complete(&dir)
+                && probe(
+                    &self.probes,
+                    |p| &mut p.has_entries,
+                    &dir,
+                    || has_entries(&dir),
+                )
+        })
     }
 
     /// Where a title is, or would be, installed.
@@ -429,6 +565,17 @@ impl Model {
     /// place made it look uninstalled -- no Play, no Remove, and Install
     /// downloading it all again.
     pub fn game_dir(&self, recipe: &Recipe) -> Option<PathBuf> {
+        let id = recipe.title.product_id.to_ascii_uppercase();
+        let recorded = self.records.get(&id).map(|r| r.dir.clone());
+        probe(
+            &self.probes,
+            |p| &mut p.game_dir,
+            &(id, recorded),
+            || self.find_game_dir(recipe),
+        )
+    }
+
+    fn find_game_dir(&self, recipe: &Recipe) -> Option<PathBuf> {
         let paths = self.paths.as_ref()?;
         let from_env = recipe
             .install
@@ -439,7 +586,7 @@ impl Model {
             if let Some(record) = self
                 .records
                 .get(&recipe.title.product_id.to_ascii_uppercase())
-                .filter(|record| record.dir.is_dir())
+                .filter(|record| self.is_dir(&record.dir))
             {
                 return Some(record.dir.clone());
             }
@@ -452,7 +599,13 @@ impl Model {
     /// A title installed outside this launcher has a version and no record;
     /// reading it costs one small file and is better than showing "Installed".
     pub fn installed_version(&self, recipe: &Recipe) -> Option<String> {
-        install::package_version(&self.game_dir(recipe)?)
+        let dir = self.game_dir(recipe)?;
+        probe(
+            &self.probes,
+            |p| &mut p.version,
+            &dir,
+            || install::package_version(&dir),
+        )
     }
 
     /// Wine's own way of shutting a title down: the server for its prefix, and
@@ -492,7 +645,19 @@ impl Model {
 
     /// The runtime a title's launch would use, for its row's tooltip: whether
     /// it was chosen for the title, or picked as the newest that fits.
+    ///
+    /// Remembered with the other [`Probes`]: working it out looks through the
+    /// install folder, and every row's tooltip asks.
     pub fn runtime_note(&self, product_id: &str) -> Option<String> {
+        probe(
+            &self.probes,
+            |p| &mut p.runtime_note,
+            &product_id.to_ascii_uppercase(),
+            || self.find_runtime_note(product_id),
+        )
+    }
+
+    fn find_runtime_note(&self, product_id: &str) -> Option<String> {
         let paths = self.paths.as_ref()?;
         let recipe = self.recipe_for(product_id)?;
         let chosen = runtime::selected(paths.config_dir(), product_id).is_some();
@@ -720,7 +885,7 @@ impl Model {
                 .paths
                 .as_ref()
                 .map(|p| p.games_dir().join(product_id.to_ascii_lowercase()))
-                .is_some_and(|dir| install_complete(&dir))
+                .is_some_and(|dir| self.complete(&dir))
     }
 
     /// Where a title with no recipe is on disk, when anything says: its
@@ -737,13 +902,23 @@ impl Model {
                     .as_ref()?
                     .games_dir()
                     .join(product_id.to_ascii_lowercase());
-                guess.is_dir().then_some(guess)
+                self.is_dir(&guess).then_some(guess)
             })
     }
 
     /// The entry point the installed package declares, if it is on disk.
     pub fn detected_executable(&self, recipe: &Recipe) -> Option<String> {
-        install::executable(&self.game_dir(recipe)?)
+        let dir = self.game_dir(recipe)?;
+        self.executable(&dir)
+    }
+
+    fn executable(&self, dir: &Path) -> Option<String> {
+        probe(
+            &self.probes,
+            |p| &mut p.executable,
+            &dir.to_path_buf(),
+            || install::executable(dir),
+        )
     }
 
     /// What the installed package says it launches, if anything did install it
@@ -753,7 +928,7 @@ impl Model {
     /// are exactly the ones with no recipe yet.
     pub fn product_executable(&self, product_id: &str) -> Option<String> {
         let record = self.records.get(&product_id.to_ascii_uppercase())?;
-        install::executable(&record.dir)
+        self.executable(&record.dir)
     }
 
     pub fn catalog_cache(&self) -> Option<Cache> {
@@ -1148,6 +1323,7 @@ mod tests {
             page: 0,
             show_unsupported: false,
             problem: None,
+            probes: Default::default(),
         }
     }
 
@@ -1200,6 +1376,10 @@ mod tests {
         assert!(!model.is_installed(&model.recipes[0]));
         assert!(model.incomplete("9ZZTESTGAME1"));
         std::fs::remove_file(dir.join(install::PARTIAL_CONTAINER)).unwrap();
+        // The model remembers what it found until told the disk changed, as
+        // the window tells it after every task it runs.
+        assert!(!model.is_installed(&model.recipes[0]));
+        model.forget_probes();
         assert!(model.is_installed(&model.recipes[0]));
         assert!(!model.incomplete("9ZZTESTGAME1"));
         // A folder nothing arrived in is neither.

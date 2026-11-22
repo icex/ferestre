@@ -144,7 +144,16 @@ pub struct Inferred<'a> {
 /// complete in one place and short of something in the other. `None` for the
 /// directory means it is not known, and the recipe is used as written.
 pub fn infer<'a>(recipe: &'a Recipe, game_dir: Option<&Path>) -> Inferred<'a> {
-    let profile = game_dir.and_then(|dir| detect(dir, &recipe.launch.executable));
+    infer_detected(
+        recipe,
+        game_dir.and_then(|dir| detect(dir, &recipe.launch.executable)),
+    )
+}
+
+/// [`infer`] with the engine already detected, for a caller that remembers
+/// [`detect`]'s answer between redraws instead of reading the install folder
+/// again for every row.
+pub fn infer_detected(recipe: &Recipe, profile: Option<Profile>) -> Inferred<'_> {
     let recipe = match profile {
         Some(profile) if !names(recipe, profile.capability()) => {
             let mut owned = recipe.clone();

@@ -869,6 +869,8 @@ fn build_ui(app: &adw::Application) {
         ui,
         move |window| {
             if window.is_active() {
+                // Files may have changed while the person was elsewhere.
+                ui.model.borrow().forget_probes();
                 client_check::check_if_blocked(&ui);
             }
         }
@@ -918,6 +920,7 @@ fn build_ui(app: &adw::Application) {
                 if !window.is_visible() {
                     return glib::ControlFlow::Break;
                 }
+                ui.model.borrow().forget_probes();
                 refresh_entitlements(&ui, false);
                 refresh_updates(&ui, false);
                 // Xbox is asked every five minutes, not every minute.
@@ -1340,21 +1343,13 @@ fn draw_list(
     };
     let installed = |r: &Recipe| model.is_installed(r);
     let incomplete = |id: &str| model.incomplete(id);
-    let selected_runtime = |id: &str| {
-        model
-            .paths
-            .as_ref()
-            .and_then(|paths| ferestre_core::runtime::requested(paths, id).ok().flatten())
-    };
+    let selected_runtime = |id: &str| model.requested_runtime(id);
     let installed_version = |r: &Recipe| model.installed_version(r);
     let installed_product = |id: &str| model.product_is_installed(id);
     let describes_itself = |id: &str| model.product_executable(id).is_some();
     let game_dir = |r: &Recipe| model.game_dir(r);
-    let content_parent = |id: &str| {
-        model
-            .product_dir(id)
-            .and_then(|dir| ferestre_core::related::parent(&dir))
-    };
+    let content_parent = |id: &str| model.content_parent(id);
+    let engine = |r: &Recipe, dir: &Path| model.engine(r, dir);
     let inputs = Inputs {
         recipes: &model.recipes,
         runtimes: &model.runtimes,
@@ -1375,6 +1370,7 @@ fn draw_list(
         installing: &installing,
         running: &running,
         game_dir: &game_dir,
+        engine: &engine,
     };
     // The Game Pass section is a different list, not a filter over the same
     // one: its rows come from a public catalogue listing rather than from what
@@ -2070,6 +2066,7 @@ fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
             automatic_product.as_deref(),
             None,
         );
+        automatic_ui.model.borrow().forget_probes();
         if let Err(error) = result {
             automatic_ui
                 .toasts
@@ -2104,11 +2101,13 @@ fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
         let selected_product = product_id.map(str::to_string);
         let path = runtime.path.clone();
         choice.connect_clicked(move |_| {
-            if let Err(error) = save_runtime_choice(
+            let result = save_runtime_choice(
                 selected_paths.config_dir(),
                 selected_product.as_deref(),
                 Some(&path),
-            ) {
+            );
+            selected_ui.model.borrow().forget_probes();
+            if let Err(error) = result {
                 selected_ui
                     .toasts
                     .add_toast(toast(format!("Could not save runtime choice: {error}")));
@@ -2204,14 +2203,7 @@ fn render_recents(ui: &Ui) {
                 || model.recipe_for(id).is_some_and(|r| model.is_installed(r))
         })
         .map(|id| {
-            let played = model
-                .paths
-                .as_ref()
-                .and_then(|p| {
-                    std::fs::metadata(p.state_dir().join("launches").join(format!("{id}.stderr")))
-                        .ok()
-                })
-                .and_then(|m| m.modified().ok());
+            let played = model.last_played(&id);
             let installed = model.records.get(&id).and_then(|r| r.installed_at.clone());
             (played, installed, id)
         })
@@ -3772,6 +3764,8 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
             }
         ));
     }
+    // The launch log was just written: the title is now the most recent.
+    ui.model.borrow().forget_probes();
     render(ui);
     ui.toasts.add_toast(toast(format!("Starting {name}")));
 
@@ -3806,6 +3800,7 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
             ui.running_channels.borrow_mut().remove(&key);
             presence_ui::launch_ended(&ui, &key);
         }
+        ui.model.borrow().forget_probes();
         render(&ui);
         match status {
             Ok((Ok(status), _)) if status.success() => {}
@@ -4219,6 +4214,7 @@ fn spawn_transfer(
     }
 
     ui.download.start(product_id, name, what);
+    ui.model.borrow().forget_probes();
     render(ui);
     let seen = Arc::clone(&ui.download.seen);
     let snapshot = Arc::clone(&ui.download.snapshot);
@@ -4660,18 +4656,37 @@ fn confirm_install(ui: &Ui, product_id: &str, name: &str) {
             Ok(destination)
         })
     };
+    // The free space is asked on a worker: statvfs on a sleeping or network
+    // drive can take seconds, and this runs on every keystroke. Only the
+    // answer for what the field still says is shown.
+    let asked = Rc::new(Cell::new(0u64));
     let show = {
         let resolve = Rc::clone(&resolve);
         let dialog = dialog.clone();
         let destination = destination.clone();
         move |text: &str| match resolve(text) {
             Ok(dir) => {
-                let free = free_space_label(&dir).unwrap_or_default();
-                destination.set_label(&format!("Installs into {}. {free}", dir.display()));
+                let into = format!("Installs into {}.", dir.display());
+                destination.set_label(&into);
                 destination.remove_css_class("error");
                 dialog.set_response_enabled("install", true);
+                let ask = asked.get().wrapping_add(1);
+                asked.set(ask);
+                let (asked, destination) = (asked.clone(), destination.downgrade());
+                glib::spawn_future_local(async move {
+                    let free = gio::spawn_blocking(move || free_space_label(&dir))
+                        .await
+                        .ok()
+                        .flatten();
+                    if let (Some(free), Some(destination)) = (free, destination.upgrade()) {
+                        if asked.get() == ask {
+                            destination.set_label(&format!("{into} {free}"));
+                        }
+                    }
+                });
             }
             Err(why) => {
+                asked.set(asked.get().wrapping_add(1));
                 destination.set_label(&why);
                 destination.add_css_class("error");
                 dialog.set_response_enabled("install", false);
@@ -5339,6 +5354,8 @@ const REFRESH_CLOSE_NOTE: &str =
     "You can close the window while this refresh runs. Cached lists are kept.";
 
 fn finish(ui: &Ui) {
+    // Whatever the task was, it may have changed what is on disk.
+    ui.model.borrow().forget_probes();
     *ui.busy.borrow_mut() = None;
     *ui.wait_on_close.borrow_mut() = false;
     ui.close_note.set(None);
@@ -5729,16 +5746,12 @@ fn refresh_updates(ui: &Ui, force: bool) {
     let (client, state_dir, records) = {
         let model = ui.model.borrow();
         let state_dir = model.private_state_dir();
+        // Which answers are still fresh is read on the worker below: it opens
+        // a file per install, and this runs on every section change.
         let records = model
             .records
             .values()
             .filter(|record| !record.content_ids.is_empty())
-            .filter(|record| {
-                force
-                    || state_dir
-                        .as_ref()
-                        .is_none_or(|dir| !ferestre_core::updates::is_fresh(dir, record))
-            })
             .cloned()
             .collect::<Vec<_>>();
         (model.xodus_cli(), state_dir, records)
@@ -5761,7 +5774,10 @@ fn refresh_updates(ui: &Ui, force: bool) {
         let expected = roles.clone();
         let checked = gio::spawn_blocking(move || {
             let mut available = Vec::new();
-            for record in records {
+            let stale = records
+                .into_iter()
+                .filter(|record| force || !ferestre_core::updates::is_fresh(&state_dir, record));
+            for record in stale {
                 let content_id = &record.content_ids[0];
                 let mut command = std::process::Command::new(&client);
                 command.args(["update", content_id, "--json"]);
@@ -6415,6 +6431,7 @@ mod catalog_regressions {
             page: 0,
             show_unsupported: false,
             problem: None,
+            probes: Default::default(),
         }
     }
 
