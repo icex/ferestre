@@ -25,6 +25,7 @@ mod install_drives;
 mod launch_state;
 mod max_width;
 mod model;
+mod neural_ui;
 mod notifications;
 mod packagekit;
 mod presence_ui;
@@ -1669,6 +1670,10 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
     default_row.add_suffix(&choose);
     group.add(&default_row);
     page.append(&group);
+    if let Some(paths) = model.paths.clone() {
+        drop(model);
+        page.append(&neural_ui::settings_group(ui, &paths));
+    }
 }
 
 /// What one page of the list looks like, lifted out of the borrow so widgets
@@ -3505,6 +3510,15 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
             let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
             item(icon, label, Box::new(move || run(&ui, &product_id, &name)));
         }
+    }
+    // Only for a title on disk: the dialog reads its files.
+    if row.installed && row.action != Action::Content {
+        let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
+        item(
+            "video-display-symbolic",
+            "Neural rendering…",
+            Box::new(move || neural_ui::open(&ui, &product_id, &name)),
+        );
     }
     if row.installed && !row.local && row.action != Action::Stop && row.action != Action::Installing
     {
