@@ -9,7 +9,9 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub mod detect;
 pub mod package;
+pub mod pe;
 
 /// A package's architecture, as its file name spells it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
