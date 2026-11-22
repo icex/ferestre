@@ -5,9 +5,6 @@ product-id = "9MT5NJ5W7B8Z"
 name = "Hogwarts Legacy"
 slug = "hogwarts-legacy"
 
-[install]
-dir = "9mt5nj5w7b8z"
-
 [launch]
 executable = 'Phoenix\Binaries\WinGDK\HogwartsLegacy.exe'
 
