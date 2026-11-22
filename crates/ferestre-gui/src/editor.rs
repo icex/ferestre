@@ -16,7 +16,9 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use ferestre_core::launch_options::{self, Kind, LaunchOption, Section};
 use ferestre_core::recipe::Recipe;
+use std::collections::BTreeMap;
 
 /// The fields worth putting in front of someone, in the order they matter.
 ///
@@ -29,24 +31,22 @@ pub struct Draft {
     pub executable: String,
     pub install_dir: String,
     pub prefix_dir: String,
-    /// `KEY=VALUE` per line, as it is typed.
-    pub environment: String,
+    /// The settings shown as switches and menus, by variable.
+    pub chosen: BTreeMap<&'static str, String>,
+    /// Every other variable, in the order the editor lists them.
+    pub other: Vec<(String, String)>,
 }
 
 impl Draft {
     pub fn from_recipe(recipe: &Recipe) -> Self {
+        let split = launch_options::split(&recipe.launch.env);
         Draft {
             name: recipe.title.name.clone(),
             executable: recipe.launch.executable.clone(),
             install_dir: recipe.install_dir().to_string(),
             prefix_dir: recipe.prefix_dir(),
-            environment: recipe
-                .launch
-                .env
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
+            chosen: split.chosen,
+            other: split.other,
         }
     }
 
@@ -67,27 +67,7 @@ impl Draft {
             );
         }
 
-        let mut environment = std::collections::BTreeMap::new();
-        for (number, line) in self.environment.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some((key, value)) = line.split_once('=') else {
-                return Err(format!(
-                    "Line {} of the environment is not KEY=VALUE: {line:?}",
-                    number + 1
-                ));
-            };
-            let key = key.trim();
-            if key.is_empty() {
-                return Err(format!(
-                    "Line {} of the environment has no name.",
-                    number + 1
-                ));
-            }
-            environment.insert(key.to_string(), value.trim().to_string());
-        }
+        let environment = launch_options::join(&self.chosen, &self.other)?;
 
         let name = self.name.trim();
         if !name.is_empty() {
@@ -121,6 +101,194 @@ fn non_empty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+/// One known setting's switch or menu, and how to read it back.
+enum OptionControl {
+    Switch(&'static LaunchOption, adw::SwitchRow),
+    Choice(&'static LaunchOption, adw::ComboRow),
+}
+
+impl OptionControl {
+    /// The variable and value to write, or `None` for leaving it out.
+    fn value(&self) -> Option<(&'static str, String)> {
+        let (option, value) = match (self, self.option().kind) {
+            (OptionControl::Switch(option, row), Kind::Switch { on, off }) => {
+                (option, if row.is_active() { on } else { off })
+            }
+            (OptionControl::Choice(option, row), Kind::Choice(choices)) => (
+                option,
+                choices
+                    .get(row.selected() as usize)
+                    .and_then(|(value, _)| *value),
+            ),
+            _ => return None,
+        };
+        value.map(|value| (option.key, value.to_string()))
+    }
+
+    fn option(&self) -> &'static LaunchOption {
+        match self {
+            OptionControl::Switch(option, _) | OptionControl::Choice(option, _) => option,
+        }
+    }
+}
+
+fn option_subtitle(option: &LaunchOption) -> String {
+    match option.capability {
+        Some(capability) => format!("{} Needs a runtime with {capability}.", option.help),
+        None => option.help.to_string(),
+    }
+}
+
+/// A group per section, each setting showing what the recipe chose.
+fn option_groups(
+    page: &adw::PreferencesPage,
+    chosen: &BTreeMap<&'static str, String>,
+) -> Vec<OptionControl> {
+    let mut controls = Vec::new();
+    for section in Section::ALL {
+        let group = adw::PreferencesGroup::builder()
+            .title(section.title())
+            .build();
+        for option in launch_options::OPTIONS
+            .iter()
+            .filter(|o| o.section == section)
+        {
+            let value = chosen.get(option.key).map(String::as_str);
+            let subtitle = option_subtitle(option);
+            match option.kind {
+                Kind::Switch { on, .. } => {
+                    let row = adw::SwitchRow::builder()
+                        .title(option.title)
+                        .subtitle(&subtitle)
+                        .active(value == on)
+                        .build();
+                    row.set_tooltip_text(Some(option.key));
+                    group.add(&row);
+                    controls.push(OptionControl::Switch(option, row));
+                }
+                Kind::Choice(choices) => {
+                    let labels: Vec<&str> = choices.iter().map(|(_, label)| *label).collect();
+                    let row = adw::ComboRow::builder()
+                        .title(option.title)
+                        .subtitle(&subtitle)
+                        .model(&gtk::StringList::new(&labels))
+                        .selected(choices.iter().position(|(v, _)| *v == value).unwrap_or(0) as u32)
+                        .build();
+                    row.set_tooltip_text(Some(option.key));
+                    group.add(&row);
+                    controls.push(OptionControl::Choice(option, row));
+                }
+            }
+        }
+        page.add(&group);
+    }
+    controls
+}
+
+/// The variables with no switch of their own: added, changed and removed
+/// one row at a time.
+struct OtherVariables {
+    group: adw::PreferencesGroup,
+    rows: RefCell<Vec<(gtk::ListBoxRow, gtk::Entry, gtk::Entry)>>,
+}
+
+impl OtherVariables {
+    fn new(page: &adw::PreferencesPage, values: &[(String, String)]) -> Rc<Self> {
+        let group = adw::PreferencesGroup::builder()
+            .title("Other variables")
+            .description("Passed to the game as they are, for anything not listed above")
+            .build();
+        let add = gtk::Button::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("Add a variable")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        add.update_property(&[gtk::accessible::Property::Label("Add a variable")]);
+        group.set_header_suffix(Some(&add));
+        page.add(&group);
+
+        let this = Rc::new(OtherVariables {
+            group,
+            rows: RefCell::new(Vec::new()),
+        });
+        for (key, value) in values {
+            this.add_row(key, value);
+        }
+        add.connect_clicked(glib::clone!(
+            #[weak]
+            this,
+            move |_| {
+                let name = this.add_row("", "");
+                name.grab_focus();
+            }
+        ));
+        this
+    }
+
+    fn add_row(self: &Rc<Self>, key: &str, value: &str) -> gtk::Entry {
+        let name = gtk::Entry::builder()
+            .text(key)
+            .placeholder_text("NAME")
+            .width_chars(22)
+            .valign(gtk::Align::Center)
+            .build();
+        name.update_property(&[gtk::accessible::Property::Label("Variable name")]);
+        let entry = gtk::Entry::builder()
+            .text(value)
+            .placeholder_text("value")
+            .hexpand(true)
+            .valign(gtk::Align::Center)
+            .build();
+        entry.update_property(&[gtk::accessible::Property::Label("Variable value")]);
+        let remove = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Remove this variable")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        remove.update_property(&[gtk::accessible::Property::Label("Remove this variable")]);
+        let line = gtk::Box::builder()
+            .spacing(8)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(12)
+            .margin_end(6)
+            .build();
+        line.append(&name);
+        line.append(&entry);
+        line.append(&remove);
+        let row = gtk::ListBoxRow::builder()
+            .child(&line)
+            .activatable(false)
+            .selectable(false)
+            .build();
+        self.group.add(&row);
+        self.rows
+            .borrow_mut()
+            .push((row.clone(), name.clone(), entry));
+        remove.connect_clicked(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            row,
+            move |_| {
+                this.group.remove(&row);
+                this.rows.borrow_mut().retain(|(r, _, _)| *r != row);
+            }
+        ));
+        name
+    }
+
+    fn values(&self) -> Vec<(String, String)> {
+        self.rows
+            .borrow()
+            .iter()
+            .map(|(_, name, value)| (name.text().to_string(), value.text().to_string()))
+            .collect()
+    }
+}
+
 /// Show the editor for a recipe. `on_saved` is handed the path it wrote.
 pub fn present(
     parent: &impl IsA<gtk::Widget>,
@@ -133,8 +301,8 @@ pub fn present(
 
     let dialog = adw::Dialog::builder()
         .title("Set up this title")
-        .content_width(560)
-        .content_height(620)
+        .content_width(600)
+        .content_height(720)
         .build();
 
     let name = adw::EntryRow::builder()
@@ -153,15 +321,6 @@ pub fn present(
         .title("Wine prefix directory")
         .text(&draft.prefix_dir)
         .build();
-
-    let environment = gtk::TextView::builder()
-        .monospace(true)
-        .top_margin(8)
-        .bottom_margin(8)
-        .left_margin(8)
-        .right_margin(8)
-        .build();
-    environment.buffer().set_text(&draft.environment);
 
     // The name first, because that is what a person recognises -- a row that
     // says "Product 9MSVBF0KZFVW" is asking somebody to set up something the
@@ -187,19 +346,10 @@ pub fn present(
     identity.add(&install_dir);
     identity.add(&prefix_dir);
 
-    let env_group = adw::PreferencesGroup::builder()
-        .title("Environment")
-        .description("One KEY=VALUE per line, passed to the title when it starts")
-        .build();
-    let env_frame = gtk::Frame::builder()
-        .height_request(140)
-        .child(&environment)
-        .build();
-    env_group.add(&env_frame);
-
     let page = adw::PreferencesPage::new();
     page.add(&identity);
-    page.add(&env_group);
+    let controls = Rc::new(option_groups(&page, &draft.chosen));
+    let others = Rc::new(OtherVariables::new(&page, &draft.other));
 
     let header = adw::HeaderBar::new();
     let cancel = gtk::Button::with_label("Cancel");
@@ -240,17 +390,17 @@ pub fn present(
         #[strong]
         prefix_dir,
         #[strong]
-        environment,
+        controls,
+        #[strong]
+        others,
         move |_| {
-            let buffer = environment.buffer();
             let draft = Draft {
                 name: name.text().to_string(),
                 executable: executable.text().to_string(),
                 install_dir: install_dir.text().to_string(),
                 prefix_dir: prefix_dir.text().to_string(),
-                environment: buffer
-                    .text(&buffer.start_iter(), &buffer.end_iter(), false)
-                    .to_string(),
+                chosen: controls.iter().filter_map(OptionControl::value).collect(),
+                other: others.values(),
             };
             let mut edited = recipe.borrow().clone();
             if let Err(complaint) = draft.apply(&mut edited) {
@@ -292,7 +442,11 @@ mod tests {
         let draft = Draft::from_recipe(&recipe);
         assert_eq!(draft.executable, "Game/Test.exe");
         assert_eq!(
-            draft.environment, "A=1\nB=2",
+            draft.other,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string())
+            ],
             "sorted, so a diff is readable"
         );
         assert_eq!(
@@ -315,7 +469,8 @@ mod tests {
             executable: "   ".into(),
             install_dir: String::new(),
             prefix_dir: String::new(),
-            environment: String::new(),
+            chosen: BTreeMap::new(),
+            other: Vec::new(),
         };
         assert!(draft.apply(&mut blank()).is_err());
     }
@@ -330,7 +485,8 @@ mod tests {
                 executable: attempt.into(),
                 install_dir: String::new(),
                 prefix_dir: String::new(),
-                environment: String::new(),
+                chosen: BTreeMap::new(),
+                other: Vec::new(),
             };
             assert!(
                 draft.apply(&mut blank()).is_err(),
@@ -339,35 +495,38 @@ mod tests {
         }
     }
 
+    /// Known settings open as their controls and everything else as a
+    /// variable row, and saving puts the same environment back.
     #[test]
-    fn the_environment_is_parsed_and_complains_with_a_line_number() {
-        let draft = Draft {
-            name: "Test".into(),
-            executable: "Game.exe".into(),
-            install_dir: String::new(),
-            prefix_dir: String::new(),
-            environment: "# a comment\n\n  A = 1  \nB=has=equals\n".into(),
-        };
+    fn settings_and_other_variables_round_trip() {
         let mut recipe = blank();
-        draft.apply(&mut recipe).expect("applies");
-        assert_eq!(recipe.launch.env.get("A").map(String::as_str), Some("1"));
+        recipe.launch.executable = "Game.exe".into();
+        for (key, value) in [
+            ("FERESTRE_NATIVE_WAYLAND", "1"),
+            ("FERESTRE_PERFORMANCE", "0"),
+            ("DXVK_HUD", "fps"),
+        ] {
+            recipe.launch.env.insert(key.into(), value.into());
+        }
+        let draft = Draft::from_recipe(&recipe);
+        assert_eq!(draft.chosen.len(), 2);
         assert_eq!(
-            recipe.launch.env.get("B").map(String::as_str),
-            Some("has=equals"),
-            "only the first = separates"
-        );
-        assert_eq!(
-            recipe.launch.env.len(),
-            2,
-            "comments and blanks are not variables"
+            draft.other,
+            vec![("DXVK_HUD".to_string(), "fps".to_string())]
         );
 
-        let bad = Draft {
-            environment: "A=1\nnot a variable\n".into(),
-            ..draft
+        let mut applied = blank();
+        draft.apply(&mut applied).expect("applies");
+        assert_eq!(applied.launch.env, recipe.launch.env);
+
+        // A variable row that names a setting shown above is refused, not
+        // silently merged with it.
+        let clash = Draft {
+            other: vec![("FERESTRE_NATIVE_WAYLAND".into(), "1".into())],
+            ..Draft::from_recipe(&recipe)
         };
-        let complaint = bad.apply(&mut blank()).expect_err("refuses");
-        assert!(complaint.contains("Line 2"), "{complaint}");
+        let complaint = clash.apply(&mut blank()).expect_err("refuses");
+        assert!(complaint.contains("Native Wayland"), "{complaint}");
     }
 
     /// Storing the computed default would freeze it, so a later rename would
