@@ -12,6 +12,7 @@ executable = "DeadByDaylight.exe"
 requires = [
     "loader.memfd-main-image",
     "xgameruntime.user",
+    "winhttp.websocket-repeated-first-receive",
 ]
 wants = [
     "appmodel.package-identity",
@@ -19,12 +20,10 @@ wants = [
 ]
 
 [status]
-state = "broken"
-summary = "Signs in and, with the Collections ID key, gets its store content; then crashes on the splash screen."
-stops-at = "Loading Characters on the splash screen: the game crashes right after its real-time messaging websocket connects"
-blocked-by = "runtime-gap"
+state = "playable-with-issues"
+summary = "Signs in, passes Loading Characters, reaches the main menu and opens the Store with its items; real-money purchases are refused by the game. Matches not tried."
 last-verified = 2026-11-22
-verified-with = "Xbox PC package of game version 10.2.2 with Easy Anti-Cheat, run headless (no input) on a local runtime with xgameruntime 9de84aa and the matching xodus-service."
+verified-with = "Xbox PC package of game version 10.2.2 with Easy Anti-Cheat, run headless on a local runtime with xgameruntime 9de84aa, the matching xodus-service and winhttp 72ad515: three launches of 300-420 s reached the main menu and the Store's Featured page with no crash. No match was joined."
 
 [[issues]]
 symptom = "CANNOT CONNECT TO STORE: Cannot retrieve the list of available content, on the splash screen about a minute after launch"
@@ -32,7 +31,12 @@ cause = "XStoreGetUserCollectionsIdAsync returned an empty key, and the game's b
 fix = "Use a runtime advertising xgameruntime.store-collections-id with its matching xodus-service."
 
 [[issues]]
-symptom = "Crash reporter (EXCEPTION_ACCESS_VIOLATION) while the splash screen says Loading Characters"
-cause = "The game queues a second WinHTTP websocket receive on rtm-v3.live.bhvrdbd.com while the first is still pending; Wine refuses it with ERROR_INVALID_OPERATION and the game then reads freed memory. Not yet fixed."
-fix = "None yet: needs a WinHTTP websocket change in the runtime."
+symptom = "Crash reporter (EXCEPTION_ACCESS_VIOLATION) while the splash screen says Loading Characters, or stuck on Connecting to RTM server..."
+cause = "The game issues its first WinHTTP websocket receive on rtm-v3.live.bhvrdbd.com twice with the same buffer; Wine refused the repeat with ERROR_INVALID_OPERATION and the game then dropped a buffer the pending receive still wrote into."
+fix = "Use a runtime advertising winhttp.websocket-repeated-first-receive."
 log-match = "Attempt to queue receive while another is pending"
+
+[[issues]]
+symptom = "Opening the Store shows NOTICE: The Microsoft Store user is not the same as the user logged into the game; after OK the Store lists its items, but real-money purchases are unavailable"
+cause = "Unknown. It appears with the same account as Store and Player. Purchasing is not supported by the runtime (XStoreShowPurchaseUIAsync is a stub), so the outcome would be the same without the notice."
+fix = "None yet. Press OK; in-game currency and browsing still work."
