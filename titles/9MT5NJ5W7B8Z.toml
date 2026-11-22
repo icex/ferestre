@@ -20,7 +20,7 @@ requires = [
 
 [status]
 state = "playable"
-summary = "Xbox sign-in and two hours of play confirmed by the player with callback waits enabled. One startup exit, which did not recur, is listed below."
+summary = "Xbox sign-in and two hours of play confirmed by the player with callback waits enabled. A first launch can close while it prepares shaders; see the issues below."
 last-verified = 2026-11-22
 verified-with = "Xbox PC package 1.0.22.0 with a runtime carrying icex/xgameruntime#1; tests/account_roles.c --callback-order."
 
@@ -30,6 +30,6 @@ cause = "The game reads the user and licence its completion callbacks set as soo
 fix = "Use a runtime advertising xgameruntime.async-callback-wait with this recipe's XGR_WAIT_FOR_ASYNC_CALLBACKS=1 setting."
 
 [[issues]]
-symptom = "The game exited during startup once, then opened normally on the next try"
-cause = "Not known. Seen once by the player, before two hours of play without a recurrence."
-fix = "None known; start the game again."
+symptom = "The first launch closes within half a minute, sometimes while Preparing Shaders"
+cause = "The game crashes now and then (access violations on several of its own threads) while it builds its first shader pre-cache. Seen in 5 of 15 headless starts without a pre-cache and in none of 9 with one."
+fix = "Start the game again. The shader work already done is kept, and later starts are unaffected."
