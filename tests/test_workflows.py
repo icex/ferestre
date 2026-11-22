@@ -286,6 +286,19 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(verify['if'], TAG_PUSH)
         self.assertEqual(verify['run'], 'scripts/check-sources.sh --remote')
 
+    def test_package_rebuilds_the_sdk_image_it_checks_in(self):
+        # The SDK tag in the manifest names an image only the build runner
+        # had; package makes it again from the built Proton commit before the
+        # display-mode check runs in it.
+        steps = load(REPO / '.github/workflows/runtime.yml')['jobs']['package']['steps']
+        names = [s.get('name') for s in steps]
+        rebuild = names.index('Rebuild the SDK image the dist was built in')
+        self.assertLess(rebuild, names.index("Verify practical resolutions through Wine's display API"))
+        run = steps[rebuild]['run']
+        self.assertIn('[ "$tag" != "$SDK" ]', run)
+        self.assertIn('docker build', run)
+        self.assertEqual(steps[rebuild]['env']['PROTON'], '${{ steps.dist.outputs.proton }}')
+
     def test_the_runtime_cache_is_kept_alive(self):
         workflow = load(REPO / '.github/workflows/runtime-cache-keepalive.yml')
         self.assertIn('schedule', workflow[True])
