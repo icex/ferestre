@@ -2172,6 +2172,13 @@ fn render_library_tabs(ui: &Ui, page: &gtk::Box) {
         if ui.model.borrow().section == section {
             button.add_css_class("active");
         }
+        // Enter, Space and an assistive technology's "click" emit `activate`,
+        // and GTK only turns that into `clicked` after a 250 ms press
+        // animation. Switch at once instead. Switching redraws the tabs, and a
+        // button taken out of the window mid-animation never emits `clicked`;
+        // on the tab already shown, the late `clicked` changes nothing.
+        let activated = ui.clone();
+        button.connect_activate(move |_| select_section(&activated, section));
         let ui = ui.clone();
         button.connect_clicked(move |_| select_section(&ui, section));
         tabs.append(&button);
