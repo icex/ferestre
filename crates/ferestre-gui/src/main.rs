@@ -2335,7 +2335,7 @@ fn render_featured(ui: &Ui, page: &gtk::Box, rows: &[LibraryRow]) {
                 .build(),
         );
         overlay.add_overlay(&caption);
-        let (_, actions) = library_components(ui, row);
+        let (_, actions) = library_components(ui, row, false);
         if let Some(button) = actions
             .last_child()
             .and_then(|w| w.downcast::<gtk::Button>().ok())
@@ -2381,7 +2381,7 @@ fn render_featured(ui: &Ui, page: &gtk::Box, rows: &[LibraryRow]) {
 }
 
 fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
-    let (view, actions) = library_components(ui, row);
+    let (view, actions) = library_components(ui, row, true);
     view.add_suffix(&actions);
     view
 }
@@ -2428,7 +2428,8 @@ fn game_launch_spinner(label: &str) -> gtk::DrawingArea {
 }
 
 fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
-    let (description, actions) = library_components(ui, row);
+    // The card draws its own cover, so the row's icon is never shown.
+    let (description, actions) = library_components(ui, row, false);
     let primary = actions
         .last_child()
         .and_then(|w| w.downcast::<gtk::Button>().ok());
@@ -2686,7 +2687,10 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
         .build()
 }
 
-fn library_components(ui: &Ui, row: &LibraryRow) -> (adw::ActionRow, gtk::Box) {
+/// The row describing a title, and its action buttons. `with_icon` is false
+/// for callers that only take the row's text and buttons (cards and featured
+/// tiles draw their own art), so the icon is not decoded for nothing.
+fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::ActionRow, gtk::Box) {
     ui.game_actions
         .borrow_mut()
         .insert(row.product_id.clone(), row.action.label().into());
@@ -2703,26 +2707,28 @@ fn library_components(ui: &Ui, row: &LibraryRow) -> (adw::ActionRow, gtk::Box) {
     action_row.set_use_markup(false);
     action_row.set_title(&row.name);
 
-    let icon = gtk::Image::builder()
-        .pixel_size(48)
-        .width_request(48)
-        .height_request(48)
-        .valign(gtk::Align::Center)
-        .icon_name("applications-games-symbolic")
-        .margin_top(6)
-        .margin_bottom(6)
-        .build();
-    if let Some(path) = ui
-        .model
-        .borrow()
-        .icons
-        .get(&row.product_id.to_ascii_uppercase())
-    {
-        if let Ok(texture) = gdk::Texture::from_filename(path) {
-            icon.set_paintable(Some(&texture));
+    if with_icon {
+        let icon = gtk::Image::builder()
+            .pixel_size(48)
+            .width_request(48)
+            .height_request(48)
+            .valign(gtk::Align::Center)
+            .icon_name("applications-games-symbolic")
+            .margin_top(6)
+            .margin_bottom(6)
+            .build();
+        if let Some(path) = ui
+            .model
+            .borrow()
+            .icons
+            .get(&row.product_id.to_ascii_uppercase())
+        {
+            if let Ok(texture) = gdk::Texture::from_filename(path) {
+                icon.set_paintable(Some(&texture));
+            }
         }
+        action_row.add_prefix(&icon);
     }
-    action_row.add_prefix(&icon);
 
     let size_text = {
         let model = ui.model.borrow();
