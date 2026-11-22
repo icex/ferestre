@@ -581,92 +581,225 @@ static int log_probe(void)
     return 0;
 }
 
-struct callback_order_probe
+/* --callback-order and --callback-order-off. With XGR_WAIT_FOR_ASYNC_CALLBACKS=1
+ * a blocking XAsyncGetStatus also waits for the block's thread-pool completion
+ * callback: Hogwarts Legacy waits, then reads what its callbacks set. Each case
+ * holds its callback open and looks at a blocking wait on another thread; -off
+ * checks that wait returns at once, as it always has. A setup step that does
+ * not happen prints why and exits 3. */
+#define PROBE_WAIT 5000
+#define HELD_PAYLOAD 0x484f4757u
+
+static void must(BOOL ok,const char *what)
 {
-    HANDLE callback_started, release_callback, callback_finished, waiter_started;
+    if (ok) return;
+    printf("FAIL: %s\n",what);
+    ExitProcess(3);
+}
+
+enum probe_kind { PROBE_USER, PROBE_LICENSE, PROBE_HELD, PROBE_FAILED };
+
+struct callback_probe
+{
+    enum probe_kind kind;
+    HANDLE started, release, finished, waiter_started;
     HRESULT callback_status, result_hr, wait_status;
     XUserHandle user;
     XStoreContextHandle store_context;
     XStoreGameLicense license;
+    UINT32 payload;
     XAsyncBlock async;
 };
 
-static void CALLBACK read_callback_result(XAsyncBlock *async)
+/* PROBE_HELD finishes inside Begin, so its callback is held until Begin
+ * returns; PROBE_FAILED finishes on a worker with a failure and no payload. */
+static HRESULT CALLBACK probe_provider(XAsyncOp op,const XAsyncProviderData *data)
 {
-    struct callback_order_probe *probe = async->context;
+    struct callback_probe *probe = data->context;
 
-    SetEvent(probe->callback_started);
-    if (WaitForSingleObject(probe->release_callback,5000) != WAIT_OBJECT_0) ExitProcess(35);
-    probe->callback_status = IXThreadingImpl_XAsyncGetStatus(threading,async,TRUE);
-    if (probe->store_context)
-        probe->result_hr = IXStoreImpl6_XStoreQueryGameLicenseResult(store,async,&probe->license);
-    else
-        probe->result_hr = IXUserImpl6_XUserAddResult(users,async,&probe->user);
-    SetEvent(probe->callback_finished);
+    switch (op)
+    {
+    case XAsyncOp_Begin:
+        if (probe->kind != PROBE_HELD) return IXThreadingImpl_XAsyncSchedule(threading,data->async,0);
+        IXThreadingImpl_XAsyncComplete(threading,data->async,S_OK,sizeof(UINT32));
+        return E_PENDING;
+    case XAsyncOp_DoWork:
+        IXThreadingImpl_XAsyncComplete(threading,data->async,E_FAIL,0);
+        return E_PENDING;
+    case XAsyncOp_GetResult:
+        if (data->buffer && data->bufferSize >= sizeof(UINT32)) *(UINT32 *)data->buffer = HELD_PAYLOAD;
+        return S_OK;
+    default:
+        return S_OK;
+    }
 }
 
-static DWORD WINAPI wait_for_callback(void *context)
+static void CALLBACK hold_callback(XAsyncBlock *async)
 {
-    struct callback_order_probe *probe = context;
+    struct callback_probe *probe = async->context;
+
+    SetEvent(probe->started);
+    must(WaitForSingleObject(probe->release,PROBE_WAIT) == WAIT_OBJECT_0,"the probe releases the held callback");
+    /* Asking about its own block must not wait for itself. */
+    probe->callback_status = IXThreadingImpl_XAsyncGetStatus(threading,async,TRUE);
+    switch (probe->kind)
+    {
+    case PROBE_USER:
+        probe->result_hr = IXUserImpl6_XUserAddResult(users,async,&probe->user);
+        break;
+    case PROBE_LICENSE:
+        probe->result_hr = IXStoreImpl6_XStoreQueryGameLicenseResult(store,async,&probe->license);
+        break;
+    case PROBE_HELD:
+        probe->result_hr = IXThreadingImpl_XAsyncGetResult(threading,async,NULL,sizeof(probe->payload),&probe->payload,NULL);
+        break;
+    case PROBE_FAILED:
+        probe->result_hr = probe->callback_status == E_FAIL ? S_OK : E_UNEXPECTED;
+        break;
+    }
+    SetEvent(probe->finished);
+}
+
+static DWORD WINAPI blocking_wait(void *context)
+{
+    struct callback_probe *probe = context;
 
     SetEvent(probe->waiter_started);
     probe->wait_status = IXThreadingImpl_XAsyncGetStatus(threading,&probe->async,TRUE);
     return 0;
 }
 
-static BOOL verify_callback_wait(struct callback_order_probe *probe)
+static void next_case(struct callback_probe *probe,enum probe_kind kind)
+{
+    memset(&probe->async.internal,0,sizeof(probe->async.internal));
+    probe->kind = kind;
+    probe->callback_status = probe->result_hr = probe->wait_status = E_UNEXPECTED;
+}
+
+static void check_wait(struct callback_probe *probe,BOOL waits,const char *name)
 {
     HANDLE waiter;
 
-    if (WaitForSingleObject(probe->callback_started,5000) != WAIT_OBJECT_0) ExitProcess(36);
-    CHECK(IXThreadingImpl_XAsyncGetStatus(threading,&probe->async,FALSE) == S_OK,
-        "polling can read the result while its callback is running");
-    waiter = CreateThread(NULL,0,wait_for_callback,probe,0,NULL);
-    if (!waiter || WaitForSingleObject(probe->waiter_started,5000) != WAIT_OBJECT_0) ExitProcess(37);
-    CHECK(WaitForSingleObject(waiter,100) == WAIT_TIMEOUT, "the blocking wait includes the ThreadPool callback");
-    SetEvent(probe->release_callback);
-    if (WaitForSingleObject(waiter,5000) != WAIT_OBJECT_0 ||
-        WaitForSingleObject(probe->callback_finished,5000) != WAIT_OBJECT_0) ExitProcess(38);
+    must(WaitForSingleObject(probe->started,PROBE_WAIT) == WAIT_OBJECT_0,"the completion callback starts");
+    CHECKF(IXThreadingImpl_XAsyncGetStatus(threading,&probe->async,FALSE) != E_PENDING,
+           "%s: polling sees the result while the callback runs",name);
+    must((waiter = CreateThread(NULL,0,blocking_wait,probe,0,NULL)) != NULL,"a waiting thread starts");
+    must(WaitForSingleObject(probe->waiter_started,PROBE_WAIT) == WAIT_OBJECT_0,"the waiting thread runs");
+    if (waits)
+        CHECKF(WaitForSingleObject(waiter,200) == WAIT_TIMEOUT,"%s: a blocking wait includes the running callback",name);
+    else
+        CHECKF(WaitForSingleObject(waiter,PROBE_WAIT) == WAIT_OBJECT_0,
+               "%s: without the switch a blocking wait returns before the callback",name);
+    SetEvent(probe->release);
+    must(WaitForSingleObject(waiter,PROBE_WAIT) == WAIT_OBJECT_0,"the blocking wait returns");
+    must(WaitForSingleObject(probe->finished,PROBE_WAIT) == WAIT_OBJECT_0,"the callback returns");
     CloseHandle(waiter);
-    return probe->wait_status == S_OK && probe->callback_status == S_OK && probe->result_hr == S_OK;
+    CHECKF(probe->result_hr == S_OK && probe->wait_status == probe->callback_status,
+           "%s: the callback and the waiter see the same outcome",name);
 }
 
-static int callback_order_probe(void)
+/* Two callbacks, each waiting for the other's operation. Without a guard each
+ * waits for the other's callback to return and neither does. */
+struct cross_probe
 {
-    struct callback_order_probe probe = {0};
+    XAsyncBlock a, b;
+    HANDLE both_started, done_a, done_b;
+    LONG started;
+    HRESULT a_status, b_status;
+};
+
+static HRESULT CALLBACK cross_provider(XAsyncOp op,const XAsyncProviderData *data)
+{
+    if (op == XAsyncOp_Begin) return IXThreadingImpl_XAsyncSchedule(threading,data->async,0);
+    if (op == XAsyncOp_DoWork) IXThreadingImpl_XAsyncComplete(threading,data->async,S_OK,0);
+    return op == XAsyncOp_DoWork ? E_PENDING : S_OK;
+}
+
+static void CALLBACK cross_callback(XAsyncBlock *async)
+{
+    struct cross_probe *probe = async->context;
+    BOOL first = async == &probe->a;
+
+    if (InterlockedIncrement(&probe->started) == 2) SetEvent(probe->both_started);
+    WaitForSingleObject(probe->both_started,PROBE_WAIT);
+    *(first ? &probe->a_status : &probe->b_status) =
+        IXThreadingImpl_XAsyncGetStatus(threading,first ? &probe->b : &probe->a,TRUE);
+    SetEvent(first ? probe->done_a : probe->done_b);
+}
+
+static void check_cross_wait(XTaskQueueHandle queue)
+{
+    struct cross_probe probe = {0};
+    HANDLE done[2];
+
+    probe.both_started = CreateEventW(NULL,TRUE,FALSE,NULL);
+    probe.done_a = CreateEventW(NULL,TRUE,FALSE,NULL);
+    probe.done_b = CreateEventW(NULL,TRUE,FALSE,NULL);
+    must(probe.both_started && probe.done_a && probe.done_b,"events for the cross-wait case");
+    probe.a.queue = probe.b.queue = queue;
+    probe.a.context = probe.b.context = &probe;
+    probe.a.callback = probe.b.callback = cross_callback;
+    must(IXThreadingImpl_XAsyncBegin(threading,&probe.a,NULL,NULL,"cross-a",cross_provider) == S_OK,"the first cross-wait operation starts");
+    must(IXThreadingImpl_XAsyncBegin(threading,&probe.b,NULL,NULL,"cross-b",cross_provider) == S_OK,"the second cross-wait operation starts");
+    done[0] = probe.done_a;
+    done[1] = probe.done_b;
+    /* Well inside the runtime's own limit on waiting for a callback. */
+    CHECK(WaitForMultipleObjects(2,done,TRUE,PROBE_WAIT) == WAIT_OBJECT_0,
+          "two callbacks waiting on each other's operations both return");
+    CHECK(probe.a_status == S_OK && probe.b_status == S_OK,"each sees the other's result");
+    CloseHandle(probe.done_b);
+    CloseHandle(probe.done_a);
+    CloseHandle(probe.both_started);
+}
+
+static int callback_order_probe(BOOL waits)
+{
+    struct callback_probe probe = {0};
     XTaskQueueHandle queue = NULL;
-    BOOL completed;
 
     control(1,1,1,1,0);
     SetEnvironmentVariableA("XGR_ACCOUNT_ROLES_V1","1");
-    probe.callback_started = CreateEventW(NULL,FALSE,FALSE,NULL);
-    probe.release_callback = CreateEventW(NULL,FALSE,FALSE,NULL);
-    probe.callback_finished = CreateEventW(NULL,FALSE,FALSE,NULL);
+    probe.started = CreateEventW(NULL,FALSE,FALSE,NULL);
+    probe.release = CreateEventW(NULL,FALSE,FALSE,NULL);
+    probe.finished = CreateEventW(NULL,FALSE,FALSE,NULL);
     probe.waiter_started = CreateEventW(NULL,FALSE,FALSE,NULL);
-    if (!probe.callback_started || !probe.release_callback || !probe.callback_finished ||
-        !probe.waiter_started) return 30;
-    if (IXThreadingImpl_XTaskQueueCreate(threading,XTaskQueueDispatchMode_ThreadPool,
-        XTaskQueueDispatchMode_ThreadPool,&queue) != S_OK) return 31;
+    must(probe.started && probe.release && probe.finished && probe.waiter_started,"events for the probe");
+    must(IXThreadingImpl_XTaskQueueCreate(threading,XTaskQueueDispatchMode_ThreadPool,
+         XTaskQueueDispatchMode_ThreadPool,&queue) == S_OK,"a thread-pool task queue");
     probe.async.queue = queue;
     probe.async.context = &probe;
-    probe.async.callback = read_callback_result;
-    if (IXUserImpl6_XUserAddAsync(users,XUserAddOptions_AddDefaultUserSilently,&probe.async) != S_OK) return 32;
-    completed = verify_callback_wait(&probe);
-    CHECK(completed && probe.user, "the user-add callback gives the waiter its user handle");
-    if (!completed || !probe.user ||
-        IXStoreImpl6_XStoreCreateContext(store,probe.user,&probe.store_context) != S_OK) return 33;
+    probe.async.callback = hold_callback;
 
-    memset(&probe.async.internal,0,sizeof(probe.async.internal));
-    if (IXStoreImpl6_XStoreQueryGameLicenseAsync(store,probe.store_context,&probe.async) != S_OK) return 34;
-    completed = verify_callback_wait(&probe);
-    CHECK(completed && probe.license.isActive, "the game-license callback gives the waiter the verified grant");
+    next_case(&probe,PROBE_USER);
+    must(IXUserImpl6_XUserAddAsync(users,XUserAddOptions_AddDefaultUserSilently,&probe.async) == S_OK,"XUserAddAsync starts");
+    check_wait(&probe,waits,"sign-in");
+    CHECK(probe.user != NULL,"sign-in: the callback gets the user handle");
+    must(IXStoreImpl6_XStoreCreateContext(store,probe.user,&probe.store_context) == S_OK,"a Store context for the user");
+
+    next_case(&probe,PROBE_LICENSE);
+    must(IXStoreImpl6_XStoreQueryGameLicenseAsync(store,probe.store_context,&probe.async) == S_OK,"the licence query starts");
+    check_wait(&probe,waits,"game licence");
+    CHECK(probe.license.isActive,"game licence: the callback gets the verified grant");
+
+    next_case(&probe,PROBE_HELD);
+    must(IXThreadingImpl_XAsyncBegin(threading,&probe.async,&probe,NULL,"held",probe_provider) == S_OK,"the held operation starts");
+    check_wait(&probe,waits,"completed inside Begin");
+    CHECK(probe.payload == HELD_PAYLOAD,"completed inside Begin: the callback gets the payload");
+
+    next_case(&probe,PROBE_FAILED);
+    must(IXThreadingImpl_XAsyncBegin(threading,&probe.async,&probe,NULL,"failed",probe_provider) == S_OK,"the failing operation starts");
+    check_wait(&probe,waits,"failed without a payload");
+
+    if (waits) check_cross_wait(queue);
+
     IXStoreImpl6_XStoreCloseContextHandle(store,probe.store_context);
     IXUserImpl6_XUserCloseHandle(users,probe.user);
     IXThreadingImpl_XTaskQueueCloseHandle(threading,queue);
     CloseHandle(probe.waiter_started);
-    CloseHandle(probe.callback_finished);
-    CloseHandle(probe.release_callback);
-    CloseHandle(probe.callback_started);
+    CloseHandle(probe.finished);
+    CloseHandle(probe.release);
+    CloseHandle(probe.started);
+    printf("%s (%u checks, %u failures)\n",failures ? "FAILED" : "PASSED",checks,failures);
     return failures ? 1 : 0;
 }
 
@@ -694,7 +827,8 @@ int main(int argc,char **argv)
     if(argc>2 && !strcmp(argv[1],"--sleep")) { Sleep(atoi(argv[2])*1000); return 0; }
     if(argc>1 && !strcmp(argv[1],"--log-probe")) return log_probe();
     if(argc>1 && !strcmp(argv[1],"--strict-token")) return strict_token_probe();
-    if(argc>1 && !strcmp(argv[1],"--callback-order")) return callback_order_probe();
+    if(argc>1 && !strcmp(argv[1],"--callback-order")) return callback_order_probe(TRUE);
+    if(argc>1 && !strcmp(argv[1],"--callback-order-off")) return callback_order_probe(FALSE);
     SetEnvironmentVariableA("XGR_ACCOUNT_ROLES_V1","1");
     test_identity_off_the_callers_thread();
     control(1,1,0,1,0);

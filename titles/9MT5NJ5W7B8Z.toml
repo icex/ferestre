@@ -20,6 +20,16 @@ requires = [
 
 [status]
 state = "playable"
-summary = "Player confirmed Xbox sign-in and two hours of gameplay with callback waits enabled, following an earlier startup crash that cleared on retry."
+summary = "Xbox sign-in and two hours of play confirmed by the player with callback waits enabled. One startup exit, which did not recur, is listed below."
 last-verified = 2026-11-22
-verified-with = "Xbox PC package 1.0.22.0 with the locally patched runtime."
+verified-with = "Xbox PC package 1.0.22.0 with a runtime carrying icex/xgameruntime#1; tests/account_roles.c --callback-order."
+
+[[issues]]
+symptom = "Signs in or checks the licence and then closes, or reads an empty Xbox user"
+cause = "The game reads the user and licence its completion callbacks set as soon as its blocking XAsyncGetStatus returns; without the wait the callbacks have not run yet."
+fix = "Use a runtime advertising xgameruntime.async-callback-wait with this recipe's XGR_WAIT_FOR_ASYNC_CALLBACKS=1 setting."
+
+[[issues]]
+symptom = "The game exited during startup once, then opened normally on the next try"
+cause = "Not known. Seen once by the player, before two hours of play without a recurrence."
+fix = "None known; start the game again."

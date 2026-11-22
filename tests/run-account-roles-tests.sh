@@ -35,7 +35,11 @@ python3 "$REPO_DIR/tests/account_roles_fixture.py" "$XODUS_RUNTIME_DIR" "$WORK/a
 FIXTURE=$!
 for ((i=0;i<100;i++)); do [ -S "$XODUS_RUNTIME_DIR/xodus.sock" ] && break; sleep 0.05; done
 (cd "$WORK" && timeout 300 "$WINE" "$WORK/account_roles.exe")
-(cd "$WORK" && XGR_WAIT_FOR_ASYNC_CALLBACKS=1 timeout 30 "$WINE" "$WORK/account_roles.exe" --callback-order)
+# The callback-wait switch is read once per process, so on and off each get a
+# run; "0" must count as off.
+(cd "$WORK" && XGR_WAIT_FOR_ASYNC_CALLBACKS=1 timeout 60 "$WINE" "$WORK/account_roles.exe" --callback-order)
+(cd "$WORK" && timeout 60 "$WINE" "$WORK/account_roles.exe" --callback-order-off)
+(cd "$WORK" && XGR_WAIT_FOR_ASYNC_CALLBACKS=0 timeout 60 "$WINE" "$WORK/account_roles.exe" --callback-order-off)
 # Strict manual queues are read once per process, so they get a run of their
 # own: the token request's service round trip must stay off the title's Work
 # port there too.
