@@ -47,6 +47,7 @@ struct Entry {
 
 struct Inner {
     overlay: gtk::Overlay,
+    gauge: gtk::DrawingArea,
     clamp: adw::Clamp,
     scroller: gtk::ScrolledWindow,
     rows: gtk::Box,
@@ -59,6 +60,9 @@ struct Inner {
     expanded: Cell<bool>,
     hovered: Cell<bool>,
     ticking: Cell<bool>,
+    /// Keep the column scrolled to its newest row (the bottom) when it is
+    /// taller than its room, unless the person scrolled up.
+    stick: Cell<bool>,
     history: RefCell<std::collections::VecDeque<String>>,
     unread: Cell<usize>,
     listeners: RefCell<Vec<Box<dyn Fn()>>>,
@@ -135,6 +139,7 @@ impl Toasts {
         overlay.add_overlay(&clamp);
         let inner = Rc::new(Inner {
             overlay,
+            gauge: gauge.clone(),
             clamp: clamp.clone(),
             scroller,
             rows,
@@ -147,6 +152,7 @@ impl Toasts {
             expanded: Cell::new(false),
             hovered: Cell::new(false),
             ticking: Cell::new(false),
+            stick: Cell::new(true),
             history: RefCell::new(Default::default()),
             unread: Cell::new(0),
             listeners: RefCell::new(Vec::new()),
@@ -159,12 +165,31 @@ impl Toasts {
                 return;
             }
             let weak = Rc::downgrade(&inner);
-            // Not during the allocation that reported it.
-            glib::idle_add_local_once(move || {
+            // Not during the allocation that reported it, but before the next
+            // frame: at default idle priority a busy frame clock (spinners on
+            // a slow renderer) could hold it back indefinitely.
+            glib::idle_add_local_full(glib::Priority::HIGH_IDLE, move || {
                 if let Some(inner) = weak.upgrade() {
                     Toasts(inner).relayout();
                 }
+                glib::ControlFlow::Break
             });
+        });
+        // The newest row is at the bottom: when the rows outgrow the column,
+        // show the bottom, not the oldest at the top.
+        let adjustment = toasts.0.scroller.vadjustment();
+        let weak = Rc::downgrade(&toasts.0);
+        adjustment.connect_changed(move |adjustment| {
+            if weak.upgrade().is_some_and(|inner| inner.stick.get()) {
+                adjustment.set_value(adjustment.upper() - adjustment.page_size());
+            }
+        });
+        let weak = Rc::downgrade(&toasts.0);
+        adjustment.connect_value_changed(move |adjustment| {
+            if let Some(inner) = weak.upgrade() {
+                let bottom = adjustment.upper() - adjustment.page_size();
+                inner.stick.set(adjustment.value() >= bottom - 1.0);
+            }
         });
         let motion = gtk::EventControllerMotion::new();
         let weak = Rc::downgrade(&toasts.0);
@@ -260,6 +285,7 @@ impl Toasts {
         }
         let id = inner.next_id.get();
         inner.next_id.set(id + 1);
+        inner.stick.set(true);
         let (revealer, count_label) = self.row(id, &toast, &title, high);
         inner.rows.append(&revealer);
         inner.entries.borrow_mut().push(Entry {
@@ -480,6 +506,12 @@ impl Toasts {
     /// Which rows show, given the room there is; "+N more" for the rest.
     fn relayout(&self) {
         let inner = &self.0;
+        // The content's height as allocated now, not only as last reported:
+        // a toast added before the resize idle ran must not use a stale one.
+        let live = inner.gauge.height();
+        if live > 0 {
+            inner.height.set(live);
+        }
         let height = f64::from(inner.height.get().max(0));
         let room = ((height * SHARE - 40.0) / (ROW + GAP)).floor();
         let capacity = if room.is_finite() && room > 0.0 {
