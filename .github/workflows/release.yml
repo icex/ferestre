@@ -35,12 +35,13 @@
 # not even written to the checkout, on GitHub-hosted runners (never the shared
 # self-hosted host, whose runner users also run pull request jobs):
 #
+#   gate      the tag is on main and has release notes; the version
 #   test      the workspace's tests, against the exact tree being shipped
 #   launcher  ferestre and ferestre-gui, release profile
 #   client    the pinned Xodus client and service, release profile
-#   build     needs all three: stages the tree, builds the AppImage, sums
+#   build     needs all of them: stages the tree, builds the AppImage, sums
 #
-# The first three run at once. `publish` runs only on a tag push, after
+# After `gate`, the next three run at once. `publish` runs only on a tag push, after
 # `build` has succeeded, and does nothing but check, sign and upload the
 # artefacts it is handed -- it is the one job that holds a token able to write
 # releases, and the only one that sees the signing key.
@@ -73,20 +74,81 @@ on:
 permissions:
   contents: read
 
-# A release always runs to the end.
+# A release always runs to the end. The event is part of the group: runs in
+# one group queue and GitHub keeps only the newest waiting one, so without it
+# a manual run on a tag ref could replace the waiting tag push.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Seconds, before any build: a tag that is not on main, or has no release
+  # notes, fails here rather than after the builds -- finding out they are
+  # missing after the whole build helps nobody.
+  gate:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # A tag can be created on any branch, and a release cut from dev would
+      # publish work that never reached main.
+      - name: The tag must be on main
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "::error::$GITHUB_REF_NAME is not on main -- merge to main and tag there"
+              exit 1
+          fi
+          echo ":: $GITHUB_REF_NAME is on main"
+
+      # A tag is the version, without its leading v. Otherwise the workspace
+      # says what it is, and a manual run may override that.
+      - name: Version
+        id: version
+        # Through the environment rather than interpolated into the script:
+        # a workflow_dispatch input is text somebody typed, and text somebody
+        # typed has no business being pasted into a shell.
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+              version=$INPUT_VERSION
+          elif [ "${GITHUB_REF_TYPE}" = tag ]; then
+              version=${GITHUB_REF_NAME#v}
+          else
+              version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+              version="$version+$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo ":: building $version"
+
+      # The publish job uses these as the release text.
+      - name: Release notes
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          test -f "docs/RELEASE-$VERSION.md" || {
+              echo "::error::docs/RELEASE-$VERSION.md does not exist"
+              exit 1
+          }
+
   # A release is not the place to discover a broken test. The same suite
   # rust.yml runs per push, run again against the exact tree being shipped.
   # --locked throughout: the release is built from the dependency versions in
   # Cargo.lock, which were reviewed, not whatever crates.io serves today.
   test:
+    needs: gate
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -108,6 +170,7 @@ jobs:
         run: cargo test --locked --workspace
 
   launcher:
+    needs: gate
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -142,6 +205,7 @@ jobs:
   # commit as the AUR package is used here, so the binary in the image and its
   # corresponding source identify the same client.
   client:
+    needs: gate
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -176,10 +240,10 @@ jobs:
           retention-days: 1
 
   build:
-    needs: [test, launcher, client]
+    needs: [gate, test, launcher, client]
     runs-on: ubuntu-24.04
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      version: ${{ needs.gate.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -190,20 +254,6 @@ jobs:
           # every build script it runs could read it from .git/config.
           persist-credentials: false
 
-      # A tag can be created on any branch, and a release cut from dev would
-      # publish work that never reached main. Now that there are two branches
-      # this is worth one fetch to be sure of.
-      - name: The tag must be on main
-        if: github.event_name == 'push' && github.ref_type == 'tag'
-        run: |
-          set -euo pipefail
-          git -C "." fetch --quiet --depth=100 origin main
-          if ! git -C "." merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-              echo "::error::$GITHUB_REF_NAME is not on main -- merge to main and tag there"
-              exit 1
-          fi
-          echo ":: $GITHUB_REF_NAME is on main"
-
       # fuse3 because the AppImage self-test at the end of the packaging
       # script mounts the image it just built, and a build that cannot run its
       # own output has not been tested at all.
@@ -212,32 +262,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y fuse3 libfuse3-3 zstd
 
-      # A tag is the version, without its leading v. Otherwise the workspace
-      # says what it is, and a manual run may override that.
-      - name: Version
-        id: version
-        # Through the environment rather than interpolated into the script:
-        # a workflow_dispatch input is text somebody typed, and text somebody
-        # typed has no business being pasted into a shell.
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          if [ -n "$INPUT_VERSION" ]; then
-              version=$INPUT_VERSION
-          elif [ "${GITHUB_REF_TYPE}" = tag ]; then
-              version=${GITHUB_REF_NAME#v}
-          else
-              version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-              version="$version+$(git rev-parse --short HEAD)"
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo ":: building $version"
-
-      # The publish job uses these as the release text.
+      # Checked in `gate`; copied here for the publish job's release text.
       - name: Release notes
         if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
           test -f "docs/RELEASE-$VERSION.md" || {
@@ -274,7 +303,7 @@ jobs:
       - name: Stage the tree
         id: stage
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
           root="stage/ferestre-$VERSION"
@@ -330,7 +359,7 @@ jobs:
       # never lets appimagetool mount itself.
       - name: AppImage
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.gate.outputs.version }}
         run: |
           packaging/appimage/build-appimage.sh \
             --bin target/release/ferestre \
@@ -349,7 +378,7 @@ jobs:
       - name: Unsigned build
         if: github.event_name != 'push' || github.ref_type != 'tag'
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.gate.outputs.version }}
         run: |
           msg="ferestre $VERSION was built by a manual run and is UNSIGNED. Only a v* tag signs and publishes."
           echo "::notice::$msg"
@@ -357,7 +386,7 @@ jobs:
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ferestre-${{ steps.version.outputs.version }}
+          name: ferestre-${{ needs.gate.outputs.version }}
           path: out/*
           if-no-files-found: error
 

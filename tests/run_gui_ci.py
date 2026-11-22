@@ -31,6 +31,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -97,11 +98,21 @@ def run_one(test, binary, dbus_config, timeout, work):
                 dbus += ['--config-file', dbus_config]
             cmd = dbus + ['--', sys.executable, test['script'],
                           '--binary', str(binary), *test.get('args', [])]
+            # A session of its own, so a test that hangs is taken down with
+            # everything it started -- the window, the CLI, the bus -- and
+            # nothing is left holding the display or the runner.
+            proc = subprocess.Popen(cmd, cwd=REPO, env=env, stdout=out,
+                                    stderr=subprocess.STDOUT, start_new_session=True)
             try:
-                code = subprocess.run(cmd, cwd=REPO, env=env, stdout=out,
-                                      stderr=subprocess.STDOUT, timeout=timeout).returncode
+                code = proc.wait(timeout)
             except subprocess.TimeoutExpired:
                 code = 'timeout'
+            finally:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
         finally:
             xvfb.terminate()
             try:

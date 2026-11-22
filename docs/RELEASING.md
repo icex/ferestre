@@ -154,6 +154,17 @@ start from that state. So:
   repository Actions variable `FERESTRE_RUNNER_LABELS` to the JSON array
   `["ubuntu-24.04"]`; delete it to go back.
 
+### Merge gating
+
+The Rust workflow ends in one job, `ci-ok`, that needs every other job and
+fails unless `preflight` and `test` succeeded and every other job succeeded
+or was skipped by the path filters. A skipped job shows as passing, and the
+GUI checks are named per shard, so `ci-ok` is the one check to require in a
+branch ruleset for `main` (Settings > Rules > Rulesets > New branch ruleset >
+Require status checks to pass > `ci-ok`). A pull request from a fork runs
+nothing (`preflight` refuses it) and so fails `ci-ok`; push its branch here to
+test it.
+
 ## Cutting a release
 
 1. Merge to `main`. Every release workflow refuses a tag that is not
@@ -249,7 +260,15 @@ recorded from this repository.
   the SDK image), write the capability manifest from the tag's
   `titles/capabilities.toml`, and make the `.tar.xz` with `SHA256SUMS`.
 - **`publish`** signs that, as before. The release notes name the run that
-  compiled the dist and the inputs digest.
+  compiled the dist and the inputs digest. Its condition checks that `plan`
+  and `package` succeeded itself (`always() && ...`): on the promotion path
+  `build` is skipped, and GitHub skips every job downstream of a skipped one
+  unless its condition carries a status function, which would end the tag run
+  green with nothing published.
+- **For a tag, `plan` also runs `scripts/check-sources.sh --remote`** against
+  the tag's own `sources.lock.json`: every fork commit public, its modified
+  paths and nested gitlinks. A promoted tag compiles nothing, so this is
+  where the full lock check happens for it.
 
 So a promoted dist was compiled from `main`-merged sources, by a `main` push,
 restoring only a cache `main` saved: the same basis a tag build has.
@@ -262,16 +281,30 @@ A cold runtime build takes about two hours on a hosted runner, and 12-15
 minutes with a warm compiler cache. The runtime workflow keeps Proton's
 compiler cache (ccache) between runs:
 
-- Only a push to `main` that compiles the runtime saves the cache (key
-  `runtime-ccache-v3-<digest>`; the `restore-keys` prefix finds the newest
-  one when the pins moved). It always builds the pinned Proton commit, from
+- Only a push to `main` that compiles the runtime saves the cache, under
+  `runtime-ccache-v3-<digest>-<run id>-<attempt>`, also after a failed or
+  timed-out build: the objects that compiled are good, and since the key
+  carries the run, a retry saves its own fuller cache rather than finding the
+  partial one under the same key and saving nothing. A build restores the
+  newest cache of its digest, else the newest of any (the usual case, a pin
+  that moved). It always builds the pinned Proton commit, from
   reviewed fork sources. A manual run may build any Proton ref, whose build
   scripts could write anything into the cache, so it restores the cache and
   saves nothing; so does a tag. What a signed release restores was therefore
   compiled only from sources that were merged to `main`.
 - `main` runtime builds are never cancelled: a cancelled build saves no cache
   and leaves nothing to promote. Pushes queue, and GitHub keeps only the
-  newest waiting run.
+  newest waiting run of a concurrency group. The group is
+  `runtime-<event>-<ref>` (and `release-<event>-<ref>`, `dlssnr-<event>-<ref>`),
+  so a manual run on `main` or on a tag ref queues apart and can never
+  replace a waiting push run, the only kind that saves the cache or makes a
+  promotable dist.
+- GitHub drops a cache not restored for seven days, and evicts the least
+  recently used first when the repository passes 10 GB. The runtime cache
+  (4-5 GB) is restored only when the pins move, while the Rust caches are
+  restored on every push, so it would be the first to go.
+  `runtime-cache-keepalive.yml` restores it on Monday and Thursday mornings
+  (UTC), which counts as a use; it builds and saves nothing.
 - `CCACHE_DIR` is `/home/runner/.ccache` and the build tree is under the
   workspace, the same paths on every hosted runner. Both matter: the cache
   service only finds a cache saved at the same path, and ccache misses
@@ -291,8 +324,10 @@ outlives the job, `~/.cache/ferestre-ci/<name>`
 the checkout, which checkout's clean step removes before the next job. It is
 emptied when it grows past its cap or the disk runs low.
 
-- Pull requests from this repository write to that directory, and `main` and
-  `dev` pushes build in it after them. It only ever feeds CI test results.
+- Pull requests build in `~/.cache/ferestre-ci/ferestre-pr`, pushes to `main`
+  and `dev` in `~/.cache/ferestre-ci/ferestre-push`, so nothing a pull request
+  compiled is ever reused by a `main` build. Either only ever feeds CI test
+  results.
 - The release and runtime workflows never use it, and never run on that host.
   `tests/test_workflows.py` checks both.
 - Hosted Rust jobs restore the GitHub cache everywhere and save it only on

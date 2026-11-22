@@ -93,10 +93,12 @@ permissions:
   contents: read
 
 # Never cancelled: a main build is what a release promotes and what fills the
-# compiler cache, and a tag is a release. Runs on the same ref queue; GitHub
-# keeps only the newest waiting one.
+# compiler cache, and a tag is a release. Runs of one event on one ref queue,
+# and GitHub keeps only the newest waiting one -- so the event is part of the
+# group: a manual run on main or on a tag must never replace a waiting push
+# run, which is the only kind that saves the cache or makes a promotable dist.
 concurrency:
-  group: runtime-${{ github.ref }}
+  group: runtime-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -136,6 +138,14 @@ jobs:
               exit 1
           fi
           echo ":: $GITHUB_REF_NAME is on main"
+
+      # A tag that promotes main's build compiles nothing, so the full lock
+      # check -- every fork commit public, its modified paths and its nested
+      # gitlinks -- runs here against the tag's own sources.lock.json rather
+      # than only in rust.yml on main.
+      - name: Verify the tag's source lock
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        run: scripts/check-sources.sh --remote
 
       # Only a manual run from a branch may build another Proton commit. A tag
       # push always builds the pin, and a manual run started on a tag ref is
@@ -222,16 +232,20 @@ jobs:
           # this job; none of them needs the token, so none of them gets it.
           persist-credentials: false
 
-      # Keyed on the inputs digest. An exact match is only likely for a
-      # rebuild; the fallback is what makes the usual case, a pin that moved
-      # since the last build, mostly hits.
+      # Saved under the inputs digest and this run (and attempt), so that a
+      # retry after a failed or timed-out build saves its own, fuller cache
+      # instead of finding the partial one under the same key and saving
+      # nothing. Restored from the newest cache of these inputs, else the
+      # newest of any: the usual case, a pin that moved since the last build,
+      # mostly hits. prune-ccache keeps only the newest.
       - name: Restore the compiler cache
         id: ccache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: /home/runner/.ccache
-          key: runtime-ccache-v3-${{ needs.plan.outputs.digest }}
+          key: runtime-ccache-v3-${{ needs.plan.outputs.digest }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            runtime-ccache-v3-${{ needs.plan.outputs.digest }}-
             runtime-ccache-v3-
 
       # Only to read the statistics; the compilers run inside Proton's
@@ -263,7 +277,7 @@ jobs:
       # build restores this cache, so only reviewed sources may ever fill it.
       # Tags and manual runs restore it and save nothing.
       - name: Save the compiler cache
-        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.ccache.outputs.cache-hit != 'true'
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: /home/runner/.ccache
@@ -503,9 +517,13 @@ jobs:
               gh cache delete "$id"
           done
 
+  # always(): when main's build is promoted, `build` is skipped, and without
+  # it GitHub would skip everything downstream of a skipped job -- the tag
+  # run would end green with nothing published. The results are checked
+  # instead.
   publish:
     needs: [plan, package]
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: always() && needs.plan.result == 'success' && needs.package.result == 'success' && github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     # Where the signing secrets live; see release.yml and docs/RELEASING.md.
     environment: release

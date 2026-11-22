@@ -171,10 +171,14 @@ checks formatting:
 | `msrv` | hosted | when `crates/`, `Cargo.toml` or `Cargo.lock` change; `cargo +1.88 check --all-targets` instead of the full test run |
 | `gui-build`, then `gui` ×4 | hosted | when the crates, `titles/`, `tests/fixtures/`, the GUI tests, their drivers, `run_gui_ci.py` or `gui_ci.json` change; built once, tested in four shards at once |
 | `sources` | hosted | when `sources.lock.json`, `.gitmodules`, `third_party/`, `scripts/check-sources.sh`, `scripts/source-pins.py` or the license fixtures change |
+| `ci-ok` | hosted | always, last: fails unless `preflight` and `test` passed and every other job passed or was skipped; the one check to require |
 
 The workflow and `.github/scripts/ci-*.sh` switch all of them on. A newer push
 cancels the pull request's older run; runs on `main`, `dev`, tags and manual
-runs are never cancelled. A skipped job is not a pass: when a change needs a
+runs are never cancelled. `guards.yml` cancels the same way, and also
+cancels an older push to a branch other than `main` and `dev`. A test that
+hangs is killed with everything it started (`run_gui_ci.py` runs each in its
+own session); a shard job stops after 25 minutes. A skipped job is not a pass: when a change needs a
 job the filter does not see, add the path to `ci-changes.sh` and to
 `tests/test_ci_changes.py`.
 

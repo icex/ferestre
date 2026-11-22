@@ -20,6 +20,11 @@ PINNED = re.compile(r'^[\w.-]+/[\w.-]+(/[\w./-]+)?@[0-9a-f]{40}$')
 # signing and publishing ask for the push event too.
 TAG_PUSH = "github.event_name == 'push' && github.ref_type == 'tag'"
 NOT_TAG_PUSH = "github.event_name != 'push' || github.ref_type != 'tag'"
+# The runtime's publish job: when main's build is promoted, `build` is skipped,
+# and a job downstream of a skipped one is skipped too unless its condition
+# carries a status function -- so it checks the results itself.
+RUNTIME_PUBLISH = ("always() && needs.plan.result == 'success' && needs.package.result == 'success' && "
+                   + TAG_PUSH)
 
 
 def load(path):
@@ -88,8 +93,11 @@ class WorkflowTests(unittest.TestCase):
             conditions = [c for c in re.findall(r'^\s*if: (.*)$', text, re.M)
                           if 'ref_type' in c]
             self.assertIn(TAG_PUSH, conditions, path.name)
+            allowed = (TAG_PUSH, NOT_TAG_PUSH)
+            if path.name == 'runtime.yml':
+                allowed += (RUNTIME_PUBLISH,)
             for cond in conditions:
-                self.assertIn(cond, (TAG_PUSH, NOT_TAG_PUSH), path.name)
+                self.assertIn(cond, allowed, path.name)
 
     def test_a_tagged_runtime_builds_the_pinned_proton(self):
         job = load(REPO / '.github/workflows/runtime.yml')['jobs']['plan']
@@ -114,7 +122,9 @@ class WorkflowTests(unittest.TestCase):
                     # Environment secrets, so the environment's tag rule and
                     # required reviewer gate every job that can read them.
                     self.assertEqual(job.get('environment'), 'release', f'{path.name}/{name}')
-                    self.assertEqual(job.get('if'), TAG_PUSH, f'{path.name}/{name}')
+                    self.assertEqual(job.get('if'),
+                                     RUNTIME_PUBLISH if path.name == 'runtime.yml' else TAG_PUSH,
+                                     f'{path.name}/{name}')
                     for step in job.get('steps', []):
                         if 'secrets.MINISIGN' in yaml.safe_dump(step):
                             self.assertEqual(step.get('if'), TAG_PUSH,
@@ -127,7 +137,7 @@ class WorkflowTests(unittest.TestCase):
                           if any('gh release create' in t for t in runs(j))]
             self.assertEqual([n for n, _ in publishing], ['publish'], wf)
             job = publishing[0][1]
-            self.assertEqual(job.get('if'), TAG_PUSH, wf)
+            self.assertEqual(job.get('if'), RUNTIME_PUBLISH if wf == 'runtime.yml' else TAG_PUSH, wf)
             texts = list(runs(job))
             sign = next(i for i, t in enumerate(texts) if 'packaging/sign-release.sh out' in t)
             publish = next(i for i, t in enumerate(texts) if 'gh release create' in t)
@@ -257,7 +267,47 @@ class WorkflowTests(unittest.TestCase):
         for wf in ('runtime.yml', 'release.yml', 'dlssnr.yml'):
             concurrency = load(REPO / '.github/workflows' / wf)['concurrency']
             self.assertIs(concurrency['cancel-in-progress'], False, wf)
-            self.assertIn('github.ref', concurrency['group'], wf)
+            # GitHub keeps only the newest waiting run of a group, so a manual
+            # run must never share one with a push: it would replace a waiting
+            # main build or tag release.
+            self.assertIn('${{ github.event_name }}-${{ github.ref }}', concurrency['group'], wf)
+
+    def test_a_runtime_tag_that_promotes_mains_build_still_publishes(self):
+        workflow = load(REPO / '.github/workflows/runtime.yml')
+        publish = workflow['jobs']['publish']
+        self.assertEqual(publish['needs'], ['plan', 'package'])
+        self.assertEqual(publish['if'], RUNTIME_PUBLISH)
+        package = workflow['jobs']['package']
+        self.assertIn('always()', package['if'])
+        self.assertIn("needs.build.result == 'skipped'", package['if'])
+        # The tag's own lock is fully checked even when nothing is compiled.
+        plan = workflow['jobs']['plan']
+        verify = next(s for s in plan['steps'] if s.get('name') == "Verify the tag's source lock")
+        self.assertEqual(verify['if'], TAG_PUSH)
+        self.assertEqual(verify['run'], 'scripts/check-sources.sh --remote')
+
+    def test_the_runtime_cache_is_kept_alive(self):
+        workflow = load(REPO / '.github/workflows/runtime-cache-keepalive.yml')
+        self.assertIn('schedule', workflow[True])
+        steps = workflow['jobs']['touch']['steps']
+        self.assertFalse(any('run' in s and 'cargo' in s['run'] for s in steps))
+        restore = [s for s in steps if str(s.get('uses', '')).startswith('actions/cache/restore@')]
+        self.assertEqual(len(restore), 1)
+        self.assertEqual(restore[0]['with']['path'], '/home/runner/.ccache')
+        self.assertEqual(restore[0]['with']['restore-keys'].split(), ['runtime-ccache-v3-'])
+        self.assertFalse(any(str(s.get('uses', '')).startswith(('actions/cache@', 'actions/cache/save@'))
+                             for s in steps))
+
+    def test_a_release_fails_fast_on_a_missing_gate(self):
+        workflow = load(REPO / '.github/workflows/release.yml')
+        jobs = workflow['jobs']
+        names = [s.get('name') for s in jobs['gate']['steps']]
+        self.assertIn('The tag must be on main', names)
+        self.assertIn('Release notes', names)
+        for name in ('test', 'launcher', 'client'):
+            self.assertEqual(jobs[name]['needs'], 'gate', name)
+        self.assertIn('gate', jobs['build']['needs'])
+        self.assertEqual(jobs['build']['outputs']['version'], '${{ needs.gate.outputs.version }}')
 
     def test_only_main_fills_the_runtime_cache_and_makes_promotable_dists(self):
         job = load(REPO / '.github/workflows/runtime.yml')['jobs']['build']
@@ -267,10 +317,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(job['env']['CCACHE_DIR'], '/home/runner/.ccache')
         saves = [s for s in job['steps'] if str(s.get('uses', '')).startswith('actions/cache/save@')]
         self.assertEqual(len(saves), 1)
-        self.assertEqual(saves[0]['if'],
-                         f"always() && {main_push} && steps.ccache.outputs.cache-hit != 'true'")
+        # Every main build saves, a retry after a failure included: its key
+        # carries the run, so it never finds its own partial cache and skips
+        # saving the fuller one.
+        self.assertEqual(saves[0]['if'], f"always() && {main_push}")
+        self.assertEqual(saves[0]['with']['key'], '${{ steps.ccache.outputs.cache-primary-key }}')
         restore = next(s for s in job['steps'] if str(s.get('uses', '')).startswith('actions/cache/restore@'))
-        self.assertEqual(restore['with']['restore-keys'].split(), ['runtime-ccache-v3-'])
+        self.assertEqual(restore['with']['key'],
+                         'runtime-ccache-v3-${{ needs.plan.outputs.digest }}-${{ github.run_id }}-${{ github.run_attempt }}')
+        self.assertEqual(restore['with']['restore-keys'].split(),
+                         ['runtime-ccache-v3-${{', 'needs.plan.outputs.digest', '}}-', 'runtime-ccache-v3-'])
         for step in job['steps']:
             self.assertFalse(str(step.get('uses', '')).startswith('actions/cache@'),
                              'a combined restore-and-save cache step would save from any ref')
@@ -309,6 +365,48 @@ class WorkflowTests(unittest.TestCase):
             # Anything but a pull request is a group of one.
             self.assertIn("github.event_name == 'pull_request' &&", concurrency['group'], wf)
             self.assertTrue(concurrency['group'].endswith('|| github.run_id }}'), wf)
+
+    def test_guards_cancel_only_superseded_branch_and_pull_request_runs(self):
+        concurrency = load(REPO / '.github/workflows/guards.yml')['concurrency']
+        cancellable = ("github.event_name == 'pull_request' || (github.event_name == 'push' && "
+                       "github.ref_type == 'branch' && github.ref != 'refs/heads/main' && "
+                       "github.ref != 'refs/heads/dev')")
+        self.assertEqual(concurrency['cancel-in-progress'], f'${{{{ {cancellable} }}}}')
+        self.assertIn(f'({cancellable}) &&', concurrency['group'])
+        self.assertTrue(concurrency['group'].endswith('|| github.run_id }}'))
+
+    def test_one_required_check_sees_every_ci_job(self):
+        workflow = load(REPO / '.github/workflows/rust.yml')
+        ok = workflow['jobs']['ci-ok']
+        others = set(workflow['jobs']) - {'ci-ok'}
+        self.assertEqual(set(ok['needs']), others)
+        self.assertEqual(ok['if'], 'always()')
+        text = '\n'.join(runs(ok))
+        self.assertIn("name in ('preflight', 'test')", text)
+        self.assertEqual(ok['steps'][0]['env']['NEEDS'], '${{ toJSON(needs) }}')
+
+    def test_every_listed_script_test_runs_in_ci(self):
+        # A test named in the path filter but run by no step can break without
+        # anything turning red.
+        import fnmatch
+        workflow = load(REPO / '.github/workflows/rust.yml')
+        texts = [t for job in workflow['jobs'].values() for t in runs(job)]
+        whole = '\n'.join(texts)
+        discovered = [m.group(1) for m in re.finditer(r"discover -s tests -p '([^']+)'", whole)]
+        for event in ('push', 'pull_request'):
+            for path in workflow[True][event]['paths']:
+                if not re.fullmatch(r'tests/test_[\w-]+\.py', path):
+                    continue
+                name = path.split('/', 1)[1]
+                self.assertTrue(path in whole or any(fnmatch.fnmatch(name, p) for p in discovered),
+                                f'{path} is in the path filter but no step runs it')
+
+    def test_pull_requests_never_share_a_build_directory_with_pushes(self):
+        test = load(REPO / '.github/workflows/rust.yml')['jobs']['test']
+        step = next(s for s in test['steps'] if 'ci-target-dir.sh' in s.get('run', ''))
+        self.assertEqual(step['env']['TRUST'],
+                         "${{ github.event_name == 'pull_request' && 'pr' || 'push' }}")
+        self.assertIn('"ferestre-$TRUST"', step['run'])
 
     def test_the_test_job_always_runs_and_formatting_is_checked(self):
         workflow = load(REPO / '.github/workflows/rust.yml')

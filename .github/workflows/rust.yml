@@ -289,9 +289,14 @@ jobs:
       # restored everywhere and saved only from main, because a cache saved
       # for a pull request or another branch is visible to that ref alone,
       # and every copy counts against the repository's 10 GB.
+      #
+      # Pull requests and pushes build in separate directories, so nothing a
+      # pull request compiled is ever reused by a main or dev build.
       - name: Persistent build directory
         if: runner.environment == 'self-hosted'
-        run: .github/scripts/ci-target-dir.sh target ferestre 12
+        env:
+          TRUST: ${{ github.event_name == 'pull_request' && 'pr' || 'push' }}
+        run: .github/scripts/ci-target-dir.sh target "ferestre-$TRUST" 12
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: runner.environment != 'self-hosted'
@@ -372,6 +377,7 @@ jobs:
           python3 tests/test_no_nvidia_urls.py
           python3 tests/test_build_dlssnr.py
           python3 tests/test_runtime_staging.py
+          python3 tests/test_runtime_inputs.py
           python3 tests/test_release_signing.py
           python3 tests/test_build_appimage.py
 
@@ -523,6 +529,7 @@ jobs:
     needs: preflight
     if: needs.preflight.outputs.gui == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -567,6 +574,8 @@ jobs:
   gui:
     needs: gui-build
     runs-on: ubuntu-24.04
+    # run_gui_ci.py gives each test ten minutes; a shard is about three.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -601,3 +610,28 @@ jobs:
         run: |
           chmod +x target/debug/ferestre-gui target/debug/ferestre
           python3 tests/run_gui_ci.py --shard "$SHARD/4"
+
+  # The one check to require before merging. Every other job is either
+  # skipped by design (a path the change does not touch) or has to pass, and
+  # a skipped job shows as passing, so this says which: preflight and test
+  # must succeed, and the rest must succeed or have been skipped. A pull
+  # request from a fork runs nothing (preflight's `if`), and fails here.
+  ci-ok:
+    needs: [preflight, test, msrv, sources, gui-build, gui]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Every job passed or was not needed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          needs = {name: job['result'] for name, job in json.loads(os.environ['NEEDS']).items()}
+          bad = {name: result for name, result in needs.items()
+                 if result != 'success' and (name in ('preflight', 'test') or result != 'skipped')}
+          for name, result in sorted(needs.items()):
+              print(f'{name}: {result}')
+          if bad:
+              sys.exit(f'not passed: {bad}')
+          PY
