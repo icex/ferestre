@@ -66,7 +66,8 @@ game. Each is `python3 tests/<name>.py`; CI's `test` job lists them all.
 | `test_no_nvidia_urls.py` | no address of an NVIDIA file anywhere in the repository (also its own `guards` workflow) |
 | `test_build_dlssnr.py` | `scripts/build-dlssnr.sh`: the pinned DLSSNR-AMD commit, the packaged layout, and no NVIDIA model in it |
 | `test_workflows.py`, `test_source_pins.py`, `test_runtime_staging.py`, `test_release_signing.py`, `test_build_appimage.py` | CI/release invariants, source pins, signing, the AppImage build |
-| `test_ci_changes.py` | which Rust CI jobs a pull request runs: every file the `sources` and `gui` jobs name switches that job on (`.github/scripts/ci-changes.sh`) |
+| `test_ci_changes.py` | which Rust CI jobs a pull request runs: every file the `sources` and `gui` jobs name, and every test in the GUI shard manifest, switches that job on (`.github/scripts/ci-changes.sh`) |
+| `test_runtime_inputs.py` | `scripts/runtime-inputs.py`: the runtime inputs digest, and every rule for promoting a `main` runtime build to a tag, against API responses recorded in `tests/fixtures/runtime-inputs/` (docs/RELEASING.md, "Runtime promotion") |
 | `tools/test_tool_hygiene.py`, `tools/test_xsts_probe.py` | the developer tools below (`python3 -m unittest discover -s tools -p 'test_*.py'`) |
 
 ## 3. GUI tests (the real window, through AT-SPI)
@@ -81,6 +82,24 @@ cargo build -p ferestre-gui -p ferestre-cli
 xvfb-run -a --server-args='-screen 0 1280x900x24 -noreset' \
     dbus-run-session -- python3 tests/gui_smoke.py
 ```
+
+**`tests/run_gui_ci.py`** runs them the way CI's `gui` job does. Each test in
+`tests/gui_ci.json` gets its own Xvfb (a free display picked by Xvfb itself,
+so nothing collides) and its own session bus, at the screen size the manifest
+names; every test runs even after one fails, and it prints each test's time:
+
+```sh
+python3 tests/run_gui_ci.py --list               # the four-way split, by weight
+python3 tests/run_gui_ci.py --shard 2/4          # one CI shard
+python3 tests/run_gui_ci.py --only smoke,move    # named tests
+```
+
+The manifest lists every `tests/gui_*.py` (`test_workflows.py` checks it),
+with a weight: seconds measured in CI. A new GUI test goes into the manifest
+with its weight, and the split rebalances itself. `gui_smoke.py` alone is
+about 150 s, the floor for any number of shards. On a desktop, pass
+`--dbus-config` with a session config that activates only the accessibility
+bus, so no test can start the real keyring daemon.
 
 Tests that need a real Wayland compositor (focus, window controls) run inside
 a private KWin session instead:
@@ -130,8 +149,13 @@ Look at every picture before committing it.
 
 **CI runs GTK 4.14 (Ubuntu 24.04).** AT-SPI naming and pointer behaviour differ
 from newer GTK. Expect a GUI test that passes locally to fail in the `gui` job
-now and then, and the reverse. To check before pushing, run it in an Ubuntu
-24.04 container with CI's packages, or push and read the `gui` job.
+now and then, and the reverse. To check before pushing, run `run_gui_ci.py`
+in an Ubuntu 24.04 container with CI's packages (`libgtk-4-dev
+libadwaita-1-dev at-spi2-core gir1.2-atspi-2.0 python3-gi openbox xvfb
+dbus-x11`, plus Rust to build). Run the tests as an ordinary user, not root
+(`gui_updater.py` fails as root), and give the container `--shm-size=1g` or
+more (`gui_move.py` moves 70 MB into `/dev/shm`, and Docker's default is
+64 MB).
 
 ### What CI runs on a pull request
 
@@ -140,17 +164,32 @@ pull request it runs only what the change can affect, decided by
 `.github/scripts/ci-changes.sh` in the hosted `preflight` job, which also
 checks formatting:
 
-| Job | On a pull request |
-|---|---|
-| `test` | always |
-| `msrv` | when `crates/`, `Cargo.toml` or `Cargo.lock` change; `cargo +1.88 check --all-targets` instead of the full test run |
-| `gui` | when the crates, `titles/`, `tests/fixtures/` or the GUI tests and their drivers change |
-| `sources` | when `sources.lock.json`, `.gitmodules`, `third_party/`, `scripts/check-sources.sh`, `scripts/source-pins.py` or the license fixtures change |
+| Job | Runner | On a pull request |
+|---|---|---|
+| `preflight` | hosted | always: rustfmt, and which jobs below the change needs |
+| `test` | self-hosted, one build slot (`FERESTRE_RUNNER_LABELS`) | always: clippy, the workspace tests and every offline script test, in a build directory that outlives the job |
+| `msrv` | hosted | when `crates/`, `Cargo.toml` or `Cargo.lock` change; `cargo +1.88 check --all-targets` instead of the full test run |
+| `gui-build`, then `gui` ×4 | hosted | when the crates, `titles/`, `tests/fixtures/`, the GUI tests, their drivers, `run_gui_ci.py` or `gui_ci.json` change; built once, tested in four shards at once |
+| `sources` | hosted | when `sources.lock.json`, `.gitmodules`, `third_party/`, `scripts/check-sources.sh`, `scripts/source-pins.py` or the license fixtures change |
 
 The workflow and `.github/scripts/ci-*.sh` switch all of them on. A newer push
-cancels the pull request's older run, and a failed `test` cancels the rest of
-it. A skipped job is not a pass: when a change needs a job the filter does not
-see, add the path to `ci-changes.sh` and to `tests/test_ci_changes.py`.
+cancels the pull request's older run; runs on `main`, `dev`, tags and manual
+runs are never cancelled. A skipped job is not a pass: when a change needs a
+job the filter does not see, add the path to `ci-changes.sh` and to
+`tests/test_ci_changes.py`.
+
+Measured locally on four cores (2026-11-22): the `test` job's cargo work
+takes about 66 s from an empty build directory and 20-35 s warm, alone or with
+a second pull request's `test` running at once; the GUI shards take
+117-139 s each in the GTK 4.14 container. Before this layout a pull request
+took about 42 build-slot minutes and 20-34 minutes of wall clock with two
+pull requests open; it now takes one slot for a few minutes.
+
+The runtime and release workflows run on hosted runners only; how a runtime
+tag reuses `main`'s build is in docs/RELEASING.md ("Runtime promotion").
+`scripts/build-runtime.sh <work dir> --until clone` clones the locked Proton
+graph and checks it against `sources.lock.json` locally in a few minutes,
+without Docker.
 
 ## 4. Runtime suites (Wine DLLs under Wine)
 
