@@ -117,8 +117,10 @@ fi
 # Quit Game never returned. With 0 the lookup fails at once and the title
 # carries on. Written once per prefix, by Proton so that a new prefix is
 # created first; a value already there, whatever it is, is left alone.
+# Not for a game Ferestre did not install (FERESTRE_LOCAL_GAME=1): it is no
+# GDK title, and its prefix may be Steam's own compatdata/<appid>.
 SYSTEM_REG="$STEAM_COMPAT_DATA_PATH/pfx/system.reg"
-if ! awk '/^\[/ { in_key = ($0 ~ /^\[Microsoft\\\\GamingServices\]/) }
+if [ "${FERESTRE_LOCAL_GAME:-}" != 1 ] && ! awk '/^\[/ { in_key = ($0 ~ /^\[Microsoft\\\\GamingServices\]/) }
           in_key && /^"ServiceRetryTimeout"=/ { found = 1 }
           END { exit !found }' "$SYSTEM_REG" 2>/dev/null; then
     env -u WINE_DLL_FILE_MAP -u WINE_PACKAGE_MANIFEST \

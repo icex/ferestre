@@ -32,7 +32,8 @@
 //!
 //! ## Why the process shape is what it is
 //!
-//! The program is always `xodus-cli run`, never the title's executable. The
+//! For a Store title the program is always `xodus-cli run`, never the title's
+//! executable. The
 //! executable is encrypted on disk and only exists decrypted inside a memfd
 //! that the client passes to Wine as an inherited file descriptor, so it has to
 //! stay a child of the process that opened it. That also rules out running any
@@ -271,6 +272,9 @@ pub fn log_path(recipe: &Recipe, dirs: &Dirs) -> PathBuf {
 
 /// Build the plan for launching a title.
 pub fn plan(recipe: &Recipe, dirs: &Dirs, options: &Options) -> Plan {
+    if recipe.is_local() {
+        return local_plan(recipe, dirs, options);
+    }
     let game_dir = game_dir(recipe, dirs, options);
     let prefix_dir = prefix_dir(recipe, dirs, options);
 
@@ -352,6 +356,79 @@ pub fn plan(recipe: &Recipe, dirs: &Dirs, options: &Options) -> Plan {
         // means a title that opens a file relative to the working directory
         // behaves differently depending on where you launched it. Pin it to the
         // install directory, which is what Steam does for its own games.
+        cwd: Some(game_dir),
+    }
+}
+
+/// A path as Wine sees it on its `Z:` drive, which maps `/`:
+/// `/games/Cyberpunk 2077/bin/x64/C.exe` is `Z:\games\Cyberpunk 2077\bin\x64\C.exe`.
+pub fn windows_path(path: &Path) -> String {
+    format!("Z:{}", string(path).replace('/', "\\"))
+}
+
+/// The plan for a game Ferestre did not install: an ordinary Windows program,
+/// so the shim runs it with Proton directly and nothing Xbox is involved --
+/// no client, no GameInput allow-list, no Xbox user id. Wrappers such as
+/// `gamemoderun` come first, as Steam puts them before `%command%`.
+fn local_plan(recipe: &Recipe, dirs: &Dirs, options: &Options) -> Plan {
+    let game_dir = game_dir(recipe, dirs, options);
+    let prefix_dir = prefix_dir(recipe, dirs, options);
+
+    let mut env_set: BTreeMap<String, String> = BTreeMap::new();
+    if !options.steam_integration {
+        env_set.insert("DISABLE_VK_LAYER_VALVE_steam_overlay_1".into(), "1".into());
+        env_set.insert(
+            "DISABLE_VK_LAYER_VALVE_steam_fossilize_1".into(),
+            "1".into(),
+        );
+    }
+    env_set.insert("FERESTRE_DESKTOP_INTEGRATION".into(), "1".into());
+    // Tells the shim this is not a GDK title, so it leaves GDK-only settings
+    // out of a prefix that may be Steam's own.
+    env_set.insert("FERESTRE_LOCAL_GAME".into(), "1".into());
+    env_set.insert("STEAM_COMPAT_DATA_PATH".into(), string(&prefix_dir));
+    env_set.insert(
+        "STEAM_COMPAT_CLIENT_INSTALL_PATH".into(),
+        string(&dirs.steam_dir),
+    );
+    env_set.insert("PROTON_DIR".into(), string(&dirs.proton_dir));
+    env_set.insert("XODUS_GAMES_DIR".into(), string(&dirs.games_dir));
+    env_set.insert("XODUS_PROTON_DIR".into(), string(&dirs.proton_dir));
+    env_set.insert("XODUS_STEAM_DIR".into(), string(&dirs.steam_dir));
+    for (key, value) in &recipe.launch.env {
+        env_set.insert(key.clone(), value.clone());
+    }
+
+    let env_unset = if options.steam_integration {
+        Vec::new()
+    } else {
+        STEAM_ENVIRONMENT
+            .iter()
+            .filter(|name| !env_set.contains_key(**name))
+            .map(|name| name.to_string())
+            .collect()
+    };
+
+    // Steam and Windows paths mix separators; either one names the same file.
+    // An absolute executable replaces the folder in the join.
+    let executable = game_dir.join(recipe.launch.executable.replace('\\', "/"));
+    let shim = string(&dirs.shim());
+    let (program, mut args) = match recipe.launch.wrapper.split_first() {
+        Some((first, rest)) => {
+            let mut args = rest.to_vec();
+            args.push(shim);
+            (PathBuf::from(first), args)
+        }
+        None => (dirs.shim(), Vec::new()),
+    };
+    args.push(windows_path(&executable));
+    args.extend(recipe.launch.args.iter().cloned());
+
+    Plan {
+        program,
+        args,
+        env_set,
+        env_unset,
         cwd: Some(game_dir),
     }
 }
@@ -709,5 +786,103 @@ summary = "Runs."
             );
             assert_eq!(plan.get("WINE_GAMEINPUT"), Some("1"));
         }
+    }
+
+    /// A local game in "/drive/My Game"; `extra` is more of `[launch]`, and
+    /// may open `[launch.env]`, which `[status]` then follows.
+    fn local_recipe(extra: &str) -> Recipe {
+        let text = format!(
+            r#"
+schema = 1
+[title]
+product-id = "LOCAL-GAME"
+name = "My Game"
+slug = "local-game"
+kind = "local"
+[install]
+dir = "/drive/My Game"
+[launch]
+executable = 'bin/Game.exe'
+{extra}
+[status]
+state = "untested"
+summary = "Added by hand"
+"#
+        );
+        Recipe::parse(&text).expect("fixture should parse")
+    }
+
+    #[test]
+    fn a_local_game_runs_through_the_shim_and_never_the_client() {
+        let options = Options {
+            game_dir: Some("/drive/My Game".into()),
+            prefix_dir: Some("/pfx/game".into()),
+            ..Options::default()
+        };
+        let plan = plan(&local_recipe("args = [\"-dx12\"]"), &dirs(), &options);
+        assert_eq!(
+            plan.program,
+            PathBuf::from("/usr/lib/ferestre/scripts/proton-wine-shim.sh")
+        );
+        assert_eq!(plan.args, vec![r"Z:\drive\My Game\bin\Game.exe", "-dx12"]);
+        assert_eq!(plan.cwd.as_deref(), Some(Path::new("/drive/My Game")));
+        assert_eq!(plan.get("STEAM_COMPAT_DATA_PATH"), Some("/pfx/game"));
+        assert_eq!(plan.get("FERESTRE_LOCAL_GAME"), Some("1"));
+        for absent in ["WINE_GAMEINPUT", "XODUS_CLI_DIR", "XGR_XUID"] {
+            assert!(plan.get(absent).is_none(), "{absent}");
+        }
+        assert!(!plan.args.iter().any(|a| a.contains("xodus-cli")));
+        assert!(plan.is_unset("LD_PRELOAD"));
+    }
+
+    #[test]
+    fn wrappers_come_first_and_the_recipe_environment_wins() {
+        let options = Options {
+            game_dir: Some("/drive/G".into()),
+            xuid: Some("2533274812345678".into()),
+            ..Options::default()
+        };
+        let plan = plan(
+            &local_recipe(
+                "wrapper = [\"gamemoderun\", \"mangohud\"]\n[launch.env]\nPROTON_ENABLE_WAYLAND = \"0\"",
+            ),
+            &dirs(),
+            &options,
+        );
+        assert_eq!(plan.program, PathBuf::from("gamemoderun"));
+        assert_eq!(
+            plan.args[..2],
+            ["mangohud", "/usr/lib/ferestre/scripts/proton-wine-shim.sh"]
+        );
+        assert_eq!(plan.args[2], r"Z:\drive\G\bin\Game.exe");
+        assert_eq!(plan.get("PROTON_ENABLE_WAYLAND"), Some("0"));
+        assert!(plan.get("XGR_XUID").is_none());
+    }
+
+    #[test]
+    fn an_absolute_executable_outside_the_folder_is_used_as_it_is() {
+        let mut recipe = local_recipe("");
+        recipe.launch.executable = "/other/Launcher.exe".into();
+        let plan = plan(&recipe, &dirs(), &Options::default());
+        assert_eq!(plan.args, vec![r"Z:\other\Launcher.exe"]);
+        assert_eq!(plan.cwd.as_deref(), Some(Path::new("/drive/My Game")));
+    }
+
+    #[test]
+    fn a_backslash_executable_is_the_same_file() {
+        let mut recipe = local_recipe("");
+        recipe.launch.executable = r"bin\Game.exe".into();
+        let backslash = plan(&recipe, &dirs(), &Options::default());
+        let forward = plan(&local_recipe(""), &dirs(), &Options::default());
+        assert_eq!(backslash.args, vec![r"Z:\drive\My Game\bin\Game.exe"]);
+        assert_eq!(backslash.args, forward.args);
+    }
+
+    #[test]
+    fn a_windows_path_is_the_unix_path_on_drive_z() {
+        assert_eq!(
+            windows_path(Path::new("/games/Cyberpunk 2077/bin/x64/C.exe")),
+            r"Z:\games\Cyberpunk 2077\bin\x64\C.exe"
+        );
     }
 }
