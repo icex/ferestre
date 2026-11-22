@@ -222,6 +222,14 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(job['runs-on'], 'ubuntu-24.04', name)
                 self.assertEqual(persistent, [], name)
 
+    def test_only_the_test_job_takes_a_self_hosted_slot(self):
+        for path in WORKFLOWS:
+            for name, job in load(path)['jobs'].items():
+                if path.name == 'rust.yml' and name == 'test':
+                    self.assertIn('vars.FERESTRE_RUNNER_LABELS', job['runs-on'])
+                    continue
+                self.assertEqual(job['runs-on'], 'ubuntu-24.04', f'{path.name}/{name}')
+
     def test_no_ci_job_can_cancel_or_write(self):
         # A pull request run gets nothing but a read-only token.
         workflow = load(REPO / '.github/workflows/rust.yml')
@@ -244,6 +252,12 @@ class WorkflowTests(unittest.TestCase):
         for name in ('gui-build', 'gui'):
             for text in runs(workflow['jobs'][name]):
                 self.assertNotIn('xvfb-run', text, name)
+
+    def test_release_trains_are_never_cancelled(self):
+        for wf in ('runtime.yml', 'release.yml', 'dlssnr.yml'):
+            concurrency = load(REPO / '.github/workflows' / wf)['concurrency']
+            self.assertIs(concurrency['cancel-in-progress'], False, wf)
+            self.assertIn('github.ref', concurrency['group'], wf)
 
     def test_only_main_fills_the_runtime_cache_and_makes_promotable_dists(self):
         job = load(REPO / '.github/workflows/runtime.yml')['jobs']['build']

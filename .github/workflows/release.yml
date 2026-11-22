@@ -29,13 +29,21 @@
 # outside a tag push (a manual run started on a tag ref is still a manual run),
 # the run says so in its summary, and the launcher refuses an unsigned runtime.
 #
-# Two jobs, because building runs a great deal of code nobody here wrote: the
-# build scripts and proc-macros of every crate in two dependency trees, and the
-# actions that set the toolchain up. `build` does all of that with a read-only
-# token that is not even written to the checkout. `publish` runs only on a tag
-# push, after `build` has succeeded, and does nothing but check, sign and
-# upload the artefacts it is handed -- it is the one job that holds a token able
-# to write releases, and the only one that sees the signing key.
+# Building runs a great deal of code nobody here wrote: the build scripts and
+# proc-macros of every crate in two dependency trees, and the actions that set
+# the toolchain up. All of that happens in jobs with a read-only token that is
+# not even written to the checkout, on GitHub-hosted runners (never the shared
+# self-hosted host, whose runner users also run pull request jobs):
+#
+#   test      the workspace's tests, against the exact tree being shipped
+#   launcher  ferestre and ferestre-gui, release profile
+#   client    the pinned Xodus client and service, release profile
+#   build     needs all three: stages the tree, builds the AppImage, sums
+#
+# The first three run at once. `publish` runs only on a tag push, after
+# `build` has succeeded, and does nothing but check, sign and upload the
+# artefacts it is handed -- it is the one job that holds a token able to write
+# releases, and the only one that sees the signing key.
 #
 # Signing uses minisign, and happens only on a tag push. The secrets live in the
 # GitHub Environment named `release`, not in the repository: MINISIGN_SECRET_KEY
@@ -65,13 +73,111 @@ on:
 permissions:
   contents: read
 
+# A release always runs to the end.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A release is not the place to discover a broken test. The same suite
+  # rust.yml runs per push, run again against the exact tree being shipped.
+  # --locked throughout: the release is built from the dependency versions in
+  # Cargo.lock, which were reviewed, not whatever crates.io serves today.
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+
+      # Third-party actions are pinned to a commit: a tag or a branch can be
+      # moved to code nobody reviewed.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+
+      - name: Test
+        run: cargo test --locked --workspace
+
+  launcher:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # GTK4 and libadwaita because the GUI links them.
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+
+      - name: Build
+        run: cargo build --locked --release --workspace
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: launcher-binaries
+          path: |
+            target/release/ferestre
+            target/release/ferestre-gui
+          if-no-files-found: error
+          retention-days: 1
+
+  # A release that opens but cannot sign in is not a usable AppImage. Build
+  # the GPL client separately and ship it beside the MIT launcher; the two
+  # still communicate solely by process invocation. The same pinned source
+  # commit as the AUR package is used here, so the binary in the image and its
+  # corresponding source identify the same client.
+  client:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+
+      - name: Build bundled Xodus client
+        run: |
+          set -euo pipefail
+          # Build the fork commit locked by the submodule and sources.lock.json.
+          git submodule update --init --quiet third_party/xodus-cli
+          python3 scripts/source-pins.py verify xodus --directory third_party/xodus-cli
+          cargo build --locked --release --manifest-path third_party/xodus-cli/Cargo.toml \
+              -p xodus-cli -p xodus-service
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: client-binaries
+          path: |
+            third_party/xodus-cli/target/release/xodus-cli
+            third_party/xodus-cli/target/release/xodus-service
+          if-no-files-found: error
+          retention-days: 1
+
   build:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ${{ fromJSON(vars.FERESTRE_RUNNER_LABELS || '["self-hosted", "linux", "x64", "icex-ci"]') }}
+    needs: [test, launcher, client]
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -98,30 +204,13 @@ jobs:
           fi
           echo ":: $GITHUB_REF_NAME is on main"
 
-      # GTK4 and libadwaita because the GUI links them; fuse3 because the
-      # AppImage self-test at the end of the packaging script mounts the image
-      # it just built, and a build that cannot run its own output has not been
-      # tested at all.
+      # fuse3 because the AppImage self-test at the end of the packaging
+      # script mounts the image it just built, and a build that cannot run its
+      # own output has not been tested at all.
       - name: System libraries
-        if: runner.environment != 'self-hosted'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-4-dev libadwaita-1-dev \
-            libgtk-3-dev libwebkit2gtk-4.1-dev \
-            fuse3 libfuse3-3 zstd protobuf-compiler
-
-      # Third-party actions are pinned to a commit: a tag or a branch can be
-      # moved to code nobody reviewed.
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
-        with:
-          toolchain: stable
-      # Restore only. A cache saved by a tag is visible to that tag alone, so
-      # it would only take space from the caches main saves for every push.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: ubuntu-24.04
-          save-if: false
+          sudo apt-get install -y fuse3 libfuse3-3 zstd
 
       # A tag is the version, without its leading v. Otherwise the workspace
       # says what it is, and a manual run may override that.
@@ -144,8 +233,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo ":: building $version"
 
-      # The publish job uses these as the release text, and finding out they
-      # are missing after an hour of building helps nobody.
+      # The publish job uses these as the release text.
       - name: Release notes
         if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
@@ -159,29 +247,23 @@ jobs:
           mkdir -p notes
           cp "docs/RELEASE-$VERSION.md" notes/
 
-      # A release is not the place to discover a broken test. The same suite
-      # rust.yml runs per push, run again against the exact tree being shipped.
-      # --locked throughout: the release is built from the dependency versions
-      # in Cargo.lock, which were reviewed, not whatever crates.io serves today.
-      - name: Test
-        run: cargo test --locked --workspace
+      # The binaries the launcher and client jobs built from this commit.
+      # Artifacts do not keep the executable bit.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: launcher-binaries
+          path: target/release
 
-      - name: Build
-        run: cargo build --locked --release --workspace
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: client-binaries
+          path: third_party/xodus-cli/target/release
 
-      # A release that opens but cannot sign in is not a usable AppImage. Build
-      # the GPL client separately and ship it beside the MIT launcher; the two
-      # still communicate solely by process invocation. The same pinned
-      # source commit as the AUR package is used here, so the binary in the
-      # image and its corresponding source identify the same client.
-      - name: Build bundled Xodus client
+      - name: Executable bits
         run: |
-          set -euo pipefail
-          # Build the fork commit locked by the submodule and sources.lock.json.
-          git submodule update --init --quiet third_party/xodus-cli
-          python3 scripts/source-pins.py verify xodus --directory third_party/xodus-cli
-          cargo build --locked --release --manifest-path third_party/xodus-cli/Cargo.toml \
-              -p xodus-cli -p xodus-service
+          chmod 0755 target/release/ferestre target/release/ferestre-gui \
+              third_party/xodus-cli/target/release/xodus-cli \
+              third_party/xodus-cli/target/release/xodus-service
 
       # The layout an installed copy has: usr/bin/ferestre with
       # usr/lib/ferestre beside it. paths.rs looks for its repository root at
@@ -292,7 +374,7 @@ jobs:
   publish:
     needs: build
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    runs-on: ${{ fromJSON(vars.FERESTRE_RUNNER_LABELS || '["self-hosted", "linux", "x64", "icex-ci"]') }}
+    runs-on: ubuntu-24.04
     # The signing secrets are environment secrets of `release`. Restrict that
     # environment to v* and runtime-* tags and give it a required reviewer
     # (docs/RELEASING.md), and nothing else can reach the key.
@@ -319,7 +401,6 @@ jobs:
           path: notes
 
       - name: minisign
-        if: runner.environment != 'self-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y minisign zstd
