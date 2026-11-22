@@ -14,7 +14,7 @@
 use super::*;
 
 /// Shelves hold this many tiles at most; "See all" opens the full list.
-const SHELF: usize = 20;
+const SHELF: usize = 12;
 const HERO_ITEMS: usize = 5;
 
 /// One title in the hero: the row, its banner and its one-line tagline.
