@@ -147,6 +147,10 @@ output directory containing `summary.txt`, `shot-*.png`, `launch.log` and
 sample, the screenshots show the game rather than an error dialog or a
 black screen, and `game.stderr` shows no crash before the final stop.
 `FERESTRE=` picks a different AppImage, such as a preview build.
+`INPUT=<script>` plays a `tools/wine_input_bot.c` script into the game at
+`INPUT_AT` seconds, from inside the game's prefix, to get past title screens
+and menus. For example, `focus Batman`, then `key 0D` with waits between the
+presses. The script header says how to build the bot.
 
 **`tools/wait-for-install.sh`** blocks until the install queue finishes
 another title, then prints `installed: <ID>.json`, or `queue empty`. Run it

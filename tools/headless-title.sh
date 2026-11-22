@@ -27,6 +27,16 @@
 #   FERESTRE   the launcher to run (default ~/.local/bin/ferestre.AppImage)
 #   OUT        output directory instead of a fresh one under /var/tmp
 #   SIZE       WxH of the virtual display (default 1280x720)
+#   INPUT      a tools/wine_input_bot.c script to play into the game, to get
+#              past title screens and menus without a person. It runs once,
+#              at the first sample at or after INPUT_AT seconds (default 60),
+#              inside the game's own prefix and wineserver, so the input goes
+#              to the game and never to the desktop. Its output goes to
+#              input.log. Use "focus <part of the window title>" first.
+#   INPUT_BOT  the built bot (default /var/tmp/ferestre-e2e/bin/wine_input_bot.exe):
+#                tools/in-container.sh x86_64-w64-mingw32-gcc -O1 \
+#                    -o /var/tmp/ferestre-e2e/bin/wine_input_bot.exe \
+#                    tools/wine_input_bot.c -luser32 -lgdi32
 #
 # Needs gamescope (with gamescopectl) and a systemd user session. The title
 # must already be installed, and the launcher must be able to run it, using its
@@ -50,6 +60,17 @@ scope_procs() {
     find "$cg" -name cgroup.procs -exec cat {} + 2>/dev/null
 }
 
+# Where the launcher puts this title's prefix and runtime, for INPUT.
+plan=$("$ferestre" run "$id" --dry-run 2>/dev/null)
+compat=$(printf '%s\n' "$plan" | sed -n "s/^export STEAM_COMPAT_DATA_PATH=//p" | tr -d "'" | tail -1)
+proton=$(printf '%s\n' "$plan" | sed -n "s/^export PROTON_DIR=//p" | tr -d "'" | tail -1)
+input_at=${INPUT_AT:-60}; input_bot=${INPUT_BOT:-/var/tmp/ferestre-e2e/bin/wine_input_bot.exe}
+input_done=
+if [ -n "${INPUT:-}" ] && { [ ! -f "$INPUT" ] || [ ! -f "$input_bot" ] || [ -z "$compat" ] || [ -z "$proton" ]; }; then
+    echo "!! INPUT needs the script, the built bot ($input_bot) and a launch plan with a prefix" >&2
+    exit 2
+fi
+
 before=$(displays)
 # Low CPU and I/O weight: the machine is usually doing something else too.
 systemd-run --user --scope --unit="$unit" --collect -p CPUWeight=50 -p IOWeight=50 -- \
@@ -70,6 +91,12 @@ while [ "$t" -lt "$secs" ]; do
     [ -n "$display" ] && GAMESCOPE_WAYLAND_DISPLAY=$display timeout 10 \
         gamescopectl screenshot "$out/shot-$(printf %03d "$t").png" > /dev/null 2>&1
     echo "t=$t exe=[$exe]" >> "$out/summary.txt"
+    if [ -n "${INPUT:-}" ] && [ -z "$input_done" ] && [ "$t" -ge "$input_at" ]; then
+        input_done=1
+        echo "t=$t input: $INPUT" >> "$out/summary.txt"
+        WINEPREFIX="$compat/pfx" WINEDEBUG=-all timeout 300 \
+            "$proton/files/bin/wine" "$input_bot" script "Z:$(realpath "$INPUT")" >> "$out/input.log" 2>&1 &
+    fi
     if ! systemctl --user is-active -q "$unit.scope"; then
         echo "scope exited at t=$t" >> "$out/summary.txt"
         break
