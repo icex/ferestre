@@ -397,6 +397,163 @@ pub fn all(paths: &Paths) -> Vec<InstalledRuntime> {
     runtimes
 }
 
+/// A compatibility tool Steam knows: a custom one in `compatibilitytools.d`
+/// (GE-Proton and friends) or one of Valve's Protons in a library. Offered to
+/// local games only; a Store title needs Ferestre's patched runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SteamTool {
+    /// The name Steam stores in `CompatToolMapping`.
+    pub name: String,
+    /// The directory holding its `proton` script.
+    pub dir: PathBuf,
+}
+
+/// Every compatibility tool of every Steam install on this machine. Reads
+/// only.
+pub fn steam_tools(paths: &Paths) -> Vec<SteamTool> {
+    let mut tools: Vec<SteamTool> = Vec::new();
+    let mut push = |tool: SteamTool| {
+        if !tools.iter().any(|known| known.name == tool.name) {
+            tools.push(tool);
+        }
+    };
+    for root in paths.steam_roots() {
+        for dir in sorted_children(&root.join("compatibilitytools.d")) {
+            let named = std::fs::read_to_string(dir.join("compatibilitytool.vdf"))
+                .ok()
+                .and_then(|text| crate::vdf::parse(&text).ok())
+                .and_then(|doc| {
+                    doc.get("compatibilitytools")
+                        .and_then(|v| v.get("compat_tools"))
+                        .and_then(|v| v.as_map())
+                        .map(<[_]>::to_vec)
+                });
+            match named {
+                Some(entries) => {
+                    for (name, entry) in entries {
+                        let install = entry
+                            .get("install_path")
+                            .and_then(crate::steam::Value::as_str)
+                            .unwrap_or(".");
+                        let tool_dir = dir.join(install);
+                        if tool_dir.join("proton").is_file() {
+                            push(SteamTool {
+                                name,
+                                dir: tool_dir,
+                            });
+                        }
+                    }
+                }
+                None => {
+                    if dir.join("proton").is_file() {
+                        if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+                            push(SteamTool {
+                                name: name.to_owned(),
+                                dir: dir.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        for library in crate::steam::libraries(&root) {
+            for dir in sorted_children(&library.join("steamapps").join("common")) {
+                if !(dir.join("proton").is_file() && dir.join("toolmanifest.vdf").is_file()) {
+                    continue;
+                }
+                if let Some(name) = dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(steam_proton_name)
+                {
+                    push(SteamTool { name, dir });
+                }
+            }
+        }
+    }
+    tools
+}
+
+/// The subdirectories of `dir`, sorted, so the first tool of a name found is
+/// the same one on every run.
+fn sorted_children(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut children: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    children.sort();
+    children
+}
+
+/// The name Steam gives one of Valve's Protons in `CompatToolMapping`, from
+/// its folder under `steamapps/common`. `None` for a folder that is not a
+/// Proton build (the anti-cheat runtimes live there too).
+fn steam_proton_name(dir_name: &str) -> Option<String> {
+    let rest = dir_name.strip_prefix("Proton")?;
+    match rest.trim() {
+        "- Experimental" => return Some("proton_experimental".into()),
+        "Hotfix" => return Some("proton_hotfix".into()),
+        _ => {}
+    }
+    let version = rest.strip_prefix(' ')?;
+    let (major, tail) = version.split_once('.')?;
+    let minor: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    if major.is_empty() || !major.bytes().all(|b| b.is_ascii_digit()) || minor.is_empty() {
+        return None;
+    }
+    let major_n: u32 = major.parse().ok()?;
+    let minor_n: u32 = minor.parse().ok()?;
+    Some(if major_n >= 7 || minor_n == 0 {
+        format!("proton_{major}")
+    } else {
+        format!("proton_{major}{minor}")
+    })
+}
+
+/// The tool Steam calls `name`: the exact name first, then one that differs
+/// only in ASCII case.
+pub fn steam_tool<'a>(tools: &'a [SteamTool], name: &str) -> Option<&'a SteamTool> {
+    tools
+        .iter()
+        .find(|t| t.name == name)
+        .or_else(|| tools.iter().find(|t| t.name.eq_ignore_ascii_case(name)))
+}
+
+/// Steam's tools as runtimes, leaving out any that [`all`] already lists (the
+/// legacy `compatibilitytools.d/xodus` is one of both), each once, sorted by
+/// path.
+pub fn external(paths: &Paths) -> Vec<InstalledRuntime> {
+    let known = all(paths);
+    let mut runtimes: Vec<InstalledRuntime> = Vec::new();
+    for tool in steam_tools(paths) {
+        let Ok(runtime) = InstalledRuntime::at(&tool.dir) else {
+            continue;
+        };
+        if known.iter().any(|k| same_path(&k.path, &runtime.path))
+            || runtimes.iter().any(|r| same_path(&r.path, &runtime.path))
+        {
+            continue;
+        }
+        runtimes.push(runtime);
+    }
+    runtimes.sort_by(|a, b| a.path.cmp(&b.path));
+    runtimes
+}
+
+/// The runtimes a title may be started with: [`all`] for a Store title, and
+/// for a local game Steam's own tools after them.
+pub fn for_recipe(paths: &Paths, recipe: &Recipe) -> Vec<InstalledRuntime> {
+    let mut runtimes = all(paths);
+    if recipe.is_local() {
+        runtimes.extend(external(paths));
+    }
+    runtimes
+}
+
 /// Per-title runtime choices kept outside shipped recipes. A release can update
 /// the compatibility matrix without overwriting the runtime a person chose.
 ///
@@ -1823,5 +1980,87 @@ hangs"""
                 "{name} has no symptom-if-missing, so a refusal cannot explain itself"
             );
         }
+    }
+
+    // --- Steam's own Protons ---------------------------------------------------
+
+    #[test]
+    fn steam_protons_are_named_as_steam_names_them() {
+        for (dir, name) in [
+            ("Proton 9.0 (Beta)", Some("proton_9")),
+            ("Proton 10.0", Some("proton_10")),
+            ("Proton 6.3", Some("proton_63")),
+            ("Proton 5.13", Some("proton_513")),
+            ("Proton 5.0", Some("proton_5")),
+            ("Proton - Experimental", Some("proton_experimental")),
+            ("Proton Hotfix", Some("proton_hotfix")),
+            ("Proton EasyAntiCheat Runtime", None),
+        ] {
+            assert_eq!(steam_proton_name(dir).as_deref(), name, "{dir}");
+        }
+    }
+
+    fn local_test_recipe() -> Recipe {
+        Recipe::parse(
+            "schema = 1\n[title]\nproduct-id = \"LOCAL-T\"\nname = \"T\"\n\
+             slug = \"local-t\"\nkind = \"local\"\n[install]\ndir = \"/drive/T\"\n\
+             [launch]\nexecutable = \"T.exe\"\n[status]\nstate = \"untested\"\n\
+             summary = \"Added by hand\"\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn external_protons_are_offered_to_local_games_only() {
+        let home = tempfile::tempdir().unwrap();
+        let steam = home.path().join(".local/share/Steam");
+        let ge = steam.join("compatibilitytools.d/GE-Proton10-25");
+        std::fs::create_dir_all(&ge).unwrap();
+        std::fs::write(ge.join("proton"), "#!/usr/bin/env python3\n").unwrap();
+        std::fs::write(
+            ge.join("compatibilitytool.vdf"),
+            "\"compatibilitytools\"\n{\n  \"compat_tools\"\n  {\n    \"GE-Proton10-25\"\n    {\n      \
+             \"install_path\" \".\"\n      \"display_name\" \"GE-Proton10-25\"\n      \
+             \"from_oslist\" \"windows\"\n      \"to_oslist\" \"linux\"\n    }\n  }\n}\n",
+        )
+        .unwrap();
+        let valve = steam.join("steamapps/common/Proton 9.0");
+        std::fs::create_dir_all(&valve).unwrap();
+        std::fs::write(valve.join("proton"), "#!/usr/bin/env python3\n").unwrap();
+        std::fs::write(valve.join("toolmanifest.vdf"), "\"manifest\" { }\n").unwrap();
+        // Not a tool: no toolmanifest.vdf.
+        let half = steam.join("steamapps/common/Proton 8.0");
+        std::fs::create_dir_all(&half).unwrap();
+        std::fs::write(half.join("proton"), "").unwrap();
+
+        let paths =
+            Paths::resolve(&Env::from_map([("HOME", home.path().to_str().unwrap())])).unwrap();
+        let managed = paths.runtimes_dir().join("11.0.20261122.1");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::write(managed.join("proton"), "#!/usr/bin/env python3\n").unwrap();
+
+        let tools = steam_tools(&paths);
+        let named: Vec<_> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(named, ["GE-Proton10-25", "proton_9"]);
+        assert_eq!(
+            steam_tool(&tools, "ge-proton10-25").map(|t| &t.dir),
+            Some(&ge)
+        );
+        assert_eq!(steam_tool(&tools, "proton_9").map(|t| &t.dir), Some(&valve));
+        assert!(steam_tool(&tools, "proton_8").is_none());
+
+        let local = local_test_recipe();
+        let xbox = Recipe::parse(RECIPE).unwrap();
+        let everything = all(&paths);
+        assert_eq!(everything.len(), 1);
+        let for_local = for_recipe(&paths, &local);
+        let local_paths: Vec<_> = for_local.iter().map(|r| r.path.clone()).collect();
+        assert_eq!(local_paths, [managed.clone(), ge.clone(), valve.clone()]);
+        let for_xbox = for_recipe(&paths, &xbox);
+        assert_eq!(for_xbox, everything);
+
+        assert!(choose(&xbox, &for_recipe(&paths, &xbox), Some(&ge), None).is_err());
+        let chosen = choose(&local, &for_local, Some(&ge), None).unwrap();
+        assert_eq!(chosen.runtime.path, ge);
     }
 }

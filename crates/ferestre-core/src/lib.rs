@@ -45,6 +45,7 @@ pub mod steam;
 pub mod transfers;
 pub mod updater;
 pub mod updates;
+pub mod vdf;
 pub mod winrt;
 pub mod xvd_key;
 
