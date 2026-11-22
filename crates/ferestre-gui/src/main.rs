@@ -1757,6 +1757,13 @@ fn draw_list(
     let installed_product = |id: &str| model.product_is_installed(id);
     let describes_itself = |id: &str| model.product_executable(id).is_some();
     let game_dir = |r: &Recipe| model.game_dir(r);
+    let anticheat = |r: &Recipe| {
+        model
+            .anticheat
+            .get(&r.title.product_id.to_ascii_uppercase())
+            .cloned()
+            .unwrap_or_default()
+    };
     let content_parent = |id: &str| model.content_parent(id);
     let engine = |r: &Recipe, dir: &Path| model.engine(r, dir);
     let inputs = Inputs {
@@ -1780,8 +1787,8 @@ fn draw_list(
         running: &running,
         game_dir: &game_dir,
         engine: &engine,
-        local_runtimes: &[],
-        anticheat: &|_| Vec::new(),
+        local_runtimes: &model.local_runtimes,
+        anticheat: &anticheat,
     };
     // The Game Pass section is a different list, not a filter over the same
     // one: its rows come from a public catalogue listing rather than from what
@@ -2435,7 +2442,10 @@ fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
         };
         (
             paths.clone(),
-            model.runtimes.clone(),
+            match product_id {
+                Some(id) => model.runtimes_for(id).to_vec(),
+                None => model.runtimes.clone(),
+            },
             match product_id {
                 Some(id) => ferestre_core::runtime::selected(paths.config_dir(), id),
                 None => ferestre_core::runtime::default_selected(paths.config_dir()),
@@ -6754,6 +6764,9 @@ mod catalog_regressions {
             recipes: Vec::new(),
             runtime: None,
             runtimes: Vec::new(),
+            local_runtimes: Vec::new(),
+            anticheat: BTreeMap::new(),
+            local_art: BTreeMap::new(),
             registry: None,
             records: BTreeMap::new(),
             disk_usage: BTreeMap::new(),
