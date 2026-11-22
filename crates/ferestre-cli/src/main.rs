@@ -266,11 +266,54 @@ enum Cmd {
         path: PathBuf,
     },
 
+    /// Experimental: NVIDIA's DLSS 5 neural rendering on AMD RX 9000 cards, through DLSSNR-AMD.
+    Neural {
+        #[command(subcommand)]
+        command: NeuralCmd,
+    },
+
     /// Print the resolved XODUS_* paths.
     Env,
 
     /// Print the version.
     Version,
+}
+
+#[derive(Subcommand, Debug)]
+enum NeuralCmd {
+    /// What is set up, and per game what is enabled; with a title, its route, anti-cheat and checks.
+    Status {
+        #[arg(value_name = "TITLE")]
+        title: Option<String>,
+    },
+    /// Download the package and extract the model from nvngx_dlssnr.dll (found, or given with --dll).
+    Setup {
+        /// The DLL, or a .zip holding exactly one.
+        #[arg(long, value_name = "PATH")]
+        dll: Option<PathBuf>,
+    },
+    /// Install DLSSNR-AMD into a game's executable folder, backing up what it replaces.
+    Enable {
+        #[arg(value_name = "TITLE")]
+        title: String,
+        /// optiscaler, reshade-feeder, reshade-feeder-vulkan or reshade-feeder-dx9;
+        /// detected from the game's files when not given.
+        #[arg(long, value_name = "ROUTE")]
+        route: Option<String>,
+        /// The network it starts with, e.g. CC_SMALL_FP8.
+        #[arg(long, value_name = "NETWORK")]
+        model: Option<String>,
+        /// Enable it on a game whose anti-cheat may ban accounts that load
+        /// mods (never a kernel-level one Proton cannot run). Remembered per
+        /// game.
+        #[arg(long)]
+        accept_anticheat_risk: bool,
+    },
+    /// Take DLSSNR-AMD out of a game and put back the files it replaced.
+    Disable {
+        #[arg(value_name = "TITLE")]
+        title: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +432,7 @@ fn dispatch(cli: &Cli) -> Result<ExitCode> {
         Cmd::ImportSteam { dry_run, user } => cmd_import_steam(cli, *dry_run, user.as_deref()),
         Cmd::InstallRuntime { allow_downgrade } => cmd_install_runtime(cli, *allow_downgrade),
         Cmd::InspectPackage { path } => cmd_inspect_package(cli, path),
+        Cmd::Neural { command } => cmd_neural(cli, command),
         Cmd::Env => cmd_env(cli),
         Cmd::Version => cmd_version(cli),
     }
@@ -429,6 +473,498 @@ fn cmd_inspect_package(cli: &Cli, path: &Path) -> Result<ExitCode> {
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// neural rendering
+// ---------------------------------------------------------------------------
+
+/// `neural …`: everything is decided in `ferestre_core::neural`; this finds
+/// the title, takes its lock and prints.
+fn cmd_neural(cli: &Cli, command: &NeuralCmd) -> Result<ExitCode> {
+    let paths = Paths::from_env()?;
+    let ctx = neural::Context::from_paths(&paths);
+    match command {
+        NeuralCmd::Status { title } => {
+            let doc = neural_status(cli, &paths, &ctx, title.as_deref())?;
+            if cli.json {
+                print_json(&doc);
+            } else {
+                print!("{}", render_neural_status(&doc));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        NeuralCmd::Setup { dll } => neural_setup(cli, &paths, &ctx, dll.as_deref()),
+        NeuralCmd::Enable {
+            title,
+            route,
+            model,
+            accept_anticheat_risk,
+        } => {
+            let route = parse_route(route.as_deref())?;
+            let model = parse_network(model.as_deref())?;
+            neural_enable(
+                cli,
+                &paths,
+                &ctx,
+                title,
+                route,
+                model,
+                *accept_anticheat_risk,
+            )
+        }
+        NeuralCmd::Disable { title } => neural_disable(cli, &paths, &ctx, title),
+    }
+}
+
+/// `--route`, a usage error naming every route when it is none of them.
+fn parse_route(text: Option<&str>) -> Result<Option<neural::Route>> {
+    text.map(|t| {
+        t.parse()
+            .map_err(|e: anyhow::Error| usage(&format!("--route: {e}")))
+    })
+    .transpose()
+}
+
+/// `--model`, a usage error naming every network when it is none of them.
+fn parse_network(text: Option<&str>) -> Result<Option<neural::Network>> {
+    text.map(|t| {
+        t.parse()
+            .map_err(|e: anyhow::Error| usage(&format!("--model: {e}")))
+    })
+    .transpose()
+}
+
+/// The recipe `title` names, with its state key, game folder and executable.
+fn neural_title<'a>(
+    paths: &Paths,
+    dir: &Path,
+    recipes: &'a [Recipe],
+    title: &str,
+) -> Result<(&'a Recipe, String, PathBuf)> {
+    let recipe = recipes.iter().find(|r| r.matches(title)).ok_or_else(|| {
+        anyhow!(
+            "no recipe for '{title}' in {} (see: ferestre titles)",
+            dir.display()
+        )
+    })?;
+    Ok((
+        recipe,
+        recipe.title.product_id.to_ascii_uppercase(),
+        paths.install_dir(recipe)?,
+    ))
+}
+
+/// The model part of `setup`: the x86_64 package (its extraction script),
+/// then, unless a model is cached and no DLL was given, the DLL found in the
+/// fixed discovery order and its models extracted.
+fn neural_models(
+    cli: &Cli,
+    paths: &Paths,
+    ctx: &neural::Context,
+    explicit: Option<&Path>,
+) -> Result<Vec<neural::ModelFile>> {
+    let package = (ctx.packages)(neural::Arch::X86_64)?;
+    if neural::package::installed(&ctx.root, &package).is_none() {
+        eprintln!(
+            ":: fetching the DLSSNR-AMD {} {} package",
+            package.version, package.arch
+        );
+    }
+    let package_dir = neural::package::ensure(&ctx.root, &package)?;
+    let cached = neural::models::verify(&ctx.root, &ctx.expect)?;
+    if !cached.is_empty() && explicit.is_none() {
+        return Ok(cached);
+    }
+    // Game folders are only looked through: a recipe that cannot be read
+    // narrows the scan, it does not stop it.
+    let recipes = recipes_from(cli, paths)
+        .map(|(_, recipes)| recipes)
+        .unwrap_or_default();
+    let locations = neural::dll::locations(paths, &recipes);
+    let url = ferestre_core::settings::dlssnr_dll_url(paths)?;
+    let work = ctx.root.join("work");
+    let (dll, step) = neural::dll::find(
+        &locations,
+        explicit,
+        url.as_deref(),
+        &work,
+        &ctx.expect,
+        &mut |line| eprintln!(":: {line}"),
+    )?;
+    // The URL is the person's own and is never printed.
+    let source = match step {
+        neural::dll::Step::Url => "the configured URL".to_string(),
+        _ => dll.found_at.display().to_string(),
+    };
+    eprintln!(
+        ":: extracting the model from {} {} ({source})",
+        neural::dll::DLL_NAME,
+        dll.version.version
+    );
+    neural::models::extract(&package_dir, &dll, &ctx.root, &ctx.expect)
+}
+
+fn models_json(models: &[neural::ModelFile]) -> Value {
+    Value::Array(
+        models
+            .iter()
+            .map(|m| json!({"file": m.file, "sha256": m.sha256, "size": m.size}))
+            .collect(),
+    )
+}
+
+fn neural_setup(
+    cli: &Cli,
+    paths: &Paths,
+    ctx: &neural::Context,
+    dll: Option<&Path>,
+) -> Result<ExitCode> {
+    let models = neural_models(cli, paths, ctx, dll)?;
+    if cli.json {
+        print_json(&json!({"schema": JSON_SCHEMA, "models": models_json(&models)}));
+    } else {
+        eprintln!(
+            ":: neural rendering is set up; cached: {}",
+            models
+                .iter()
+                .map(|m| m.file.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn neural_enable(
+    cli: &Cli,
+    paths: &Paths,
+    ctx: &neural::Context,
+    title: &str,
+    route: Option<neural::Route>,
+    model: Option<neural::Network>,
+    accept_anticheat_risk: bool,
+) -> Result<ExitCode> {
+    let (dir, recipes) = recipes_from(cli, paths)?;
+    let (recipe, product_id, game_dir) = neural_title(paths, &dir, &recipes, title)?;
+    // Outside the title's lock: this may download and scan for a while.
+    if neural::models::verify(&ctx.root, &ctx.expect)?.is_empty() {
+        eprintln!(":: no model is cached yet; setting up first");
+        neural_models(cli, paths, ctx, None).context(
+            "no model is cached and none could be extracted; run: ferestre neural setup \
+             --dll <path to nvngx_dlssnr.dll>",
+        )?;
+    }
+    let _lock = TitleLock::take(paths, &product_id, LockMode::Change)?;
+    let enabled = neural::apply::enable(
+        ctx,
+        &neural::apply::EnableRequest {
+            key: &product_id,
+            game_dir: &game_dir,
+            executable: &recipe.launch.executable,
+            route,
+            model,
+            accept_anticheat_risk,
+        },
+    )?;
+    for warning in &enabled.warnings {
+        eprintln!("-- {warning}");
+    }
+    let entry = &enabled.entry;
+    if cli.json {
+        print_json(&json!({
+            "schema": JSON_SCHEMA,
+            "product_id": product_id,
+            "entry": entry,
+            "warnings": enabled.warnings,
+        }));
+    }
+    eprintln!(
+        ":: neural rendering enabled for {} ({}, {})",
+        recipe.title.name, entry.route, entry.model
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn neural_disable(
+    cli: &Cli,
+    paths: &Paths,
+    ctx: &neural::Context,
+    title: &str,
+) -> Result<ExitCode> {
+    let (dir, recipes) = recipes_from(cli, paths)?;
+    let (name, product_id, game_dir, executable) = match neural_title(paths, &dir, &recipes, title)
+    {
+        Ok((recipe, product_id, game_dir)) => (
+            recipe.title.name.clone(),
+            product_id,
+            game_dir,
+            recipe.launch.executable.clone(),
+        ),
+        // A game whose recipe is gone still has its entry, which names
+        // the folder the mod is in.
+        Err(e) => {
+            let key = title.to_ascii_uppercase();
+            let entry = neural::state::get(&ctx.config_dir, &key)?.ok_or(e)?;
+            (key.clone(), key, entry.install_dir, String::new())
+        }
+    };
+    let _lock = TitleLock::take(paths, &product_id, LockMode::Change)?;
+    neural::apply::disable(ctx, &product_id, &game_dir, &executable)?;
+    if cli.json {
+        print_json(&json!({
+            "schema": JSON_SCHEMA,
+            "product_id": product_id,
+            "disabled": true,
+        }));
+    }
+    eprintln!(":: neural rendering disabled for {name}");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn api_name(api: neural::detect::Api) -> &'static str {
+    use neural::detect::Api;
+    match api {
+        Api::Dx10To12 => "d3d10-12",
+        Api::Vulkan => "vulkan",
+        Api::Dx9 => "d3d9",
+        Api::OpenGl => "opengl",
+        Api::Unknown => "unknown",
+    }
+}
+
+fn gate_json(gate: &neural::apply::Gate) -> Value {
+    use neural::apply::Gate;
+    match gate {
+        Gate::Allowed => json!({"state": "allowed", "names": []}),
+        Gate::NeedsAcknowledgement(names) => {
+            json!({"state": "needs-acknowledgement", "names": names})
+        }
+        Gate::Refused(names) => json!({"state": "refused", "names": names}),
+    }
+}
+
+/// `neural status` as a document. Never holds the DLL URL, only whether one
+/// is configured.
+fn neural_status(
+    cli: &Cli,
+    paths: &Paths,
+    ctx: &neural::Context,
+    title: Option<&str>,
+) -> Result<Value> {
+    let Some(title) = title else {
+        let package = match (ctx.packages)(neural::Arch::X86_64) {
+            Ok(p) => json!({
+                "version": p.version,
+                "arch": p.arch,
+                "ready": neural::package::installed(&ctx.root, &p).is_some(),
+            }),
+            Err(e) => json!({
+                "version": null,
+                "arch": neural::Arch::X86_64,
+                "ready": false,
+                "error": format!("{e:#}"),
+            }),
+        };
+        let titles: serde_json::Map<String, Value> = neural::state::all(&ctx.config_dir)?
+            .into_iter()
+            .map(|(key, entry)| Ok((key, serde_json::to_value(&entry)?)))
+            .collect::<Result<_>>()?;
+        return Ok(json!({
+            "schema": JSON_SCHEMA,
+            "package": package,
+            "models": models_json(&neural::models::cached(&ctx.root, &ctx.expect)),
+            "dll_url_configured": ferestre_core::settings::dlssnr_dll_url(paths)
+                .ok()
+                .flatten()
+                .is_some(),
+            "hardware": neural::hardware::check(),
+            "titles": titles,
+        }));
+    };
+    let (dir, recipes) = recipes_from(cli, paths)?;
+    let (recipe, product_id, game_dir) = neural_title(paths, &dir, &recipes, title)?;
+    let o = neural::overview(
+        ctx,
+        paths,
+        &product_id,
+        &game_dir,
+        &recipe.launch.executable,
+    );
+    Ok(json!({
+        "schema": JSON_SCHEMA,
+        "product_id": product_id,
+        "name": recipe.title.name,
+        "entry": o.entry,
+        "detected": {
+            "bits": o.detected.bits,
+            "api": api_name(o.detected.api),
+            "upscalers": o.detected.upscalers,
+            "assumed": o.detected.assumed,
+            "route": o.detected.route,
+        },
+        "anticheat": o.anticheat.iter().map(|d| json!({
+            "name": d.name,
+            "kernel": d.kernel,
+            "proton_runtime": d.proton_runtime,
+            "evidence": d.evidence.display().to_string(),
+        })).collect::<Vec<_>>(),
+        "gate": gate_json(&o.gate),
+        "installed": match &o.installed {
+            None => Value::Null,
+            Some(Ok(())) => json!({"ok": true}),
+            Some(Err(e)) => json!({"ok": false, "error": e}),
+        },
+        "models": models_json(&o.models),
+        "package_ready": o.package_ready,
+        "hardware": o.hardware,
+        "dll_url_configured": o.dll_url_configured,
+    }))
+}
+
+/// `neural status` for a person, from its document.
+fn render_neural_status(doc: &Value) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let text = |v: &Value| v.as_str().unwrap_or("").to_string();
+    let names = |v: &Value| {
+        v.as_array()
+            .map(|a| a.iter().map(text).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default()
+    };
+    let models = doc["models"]
+        .as_array()
+        .map(|a| a.iter().map(|m| text(&m["file"])).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let models = if models.is_empty() {
+        "none cached (run: ferestre neural setup)".to_string()
+    } else {
+        models.join(", ")
+    };
+    if let Some(product_id) = doc["product_id"].as_str() {
+        let _ = writeln!(out, "{} ({product_id})", text(&doc["name"]));
+        match doc["entry"].as_object() {
+            Some(entry) if entry["enabled"] == true => {
+                let _ = writeln!(
+                    out,
+                    "  neural rendering: on ({}, {}) in {}",
+                    text(&entry["route"]),
+                    text(&entry["model"]),
+                    text(&entry["install-dir"])
+                );
+            }
+            _ => {
+                let _ = writeln!(out, "  neural rendering: off");
+            }
+        }
+        match &doc["installed"] {
+            Value::Null => {}
+            installed if installed["ok"] == true => {
+                let _ = writeln!(out, "  install: whole");
+            }
+            installed => {
+                let _ = writeln!(
+                    out,
+                    "  install: incomplete ({}); the next launch installs it again",
+                    text(&installed["error"])
+                );
+            }
+        }
+        let detected = &doc["detected"];
+        let route = detected["route"].as_str().unwrap_or("none; pass --route");
+        let _ = writeln!(
+            out,
+            "  game: {}-bit {}{}; route: {route}",
+            detected["bits"],
+            text(&detected["api"]),
+            if detected["assumed"] == true {
+                " (assumed)"
+            } else {
+                ""
+            }
+        );
+        if let Some(upscalers) = detected["upscalers"].as_array().filter(|a| !a.is_empty()) {
+            let _ = writeln!(
+                out,
+                "  upscalers: {}",
+                names(&Value::Array(upscalers.clone()))
+            );
+        }
+        let gate = &doc["gate"];
+        let anticheat = doc["anticheat"]
+            .as_array()
+            .map(|a| a.iter().map(|d| text(&d["name"])).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "  anti-cheat: {}",
+            match gate["state"].as_str() {
+                Some("refused") => format!(
+                    "{} (kernel-level; neural rendering is never enabled)",
+                    names(&gate["names"])
+                ),
+                Some("needs-acknowledgement") => format!(
+                    "{} (enable needs --accept-anticheat-risk)",
+                    names(&gate["names"])
+                ),
+                _ if anticheat.is_empty() => "none found".to_string(),
+                _ => format!("{} (acknowledged)", anticheat.join(", ")),
+            }
+        );
+        let _ = writeln!(
+            out,
+            "  package: {}",
+            if doc["package_ready"] == true {
+                "ready"
+            } else {
+                "not fetched yet"
+            }
+        );
+    } else {
+        let package = &doc["package"];
+        let _ = writeln!(
+            out,
+            "DLSSNR-AMD package: {}",
+            match package["version"].as_str() {
+                Some(version) if package["ready"] == true => format!("{version} (ready)"),
+                Some(version) => format!("{version} (not fetched yet)"),
+                None => format!("unavailable: {}", text(&package["error"])),
+            }
+        );
+    }
+    let _ = writeln!(out, "  models: {models}");
+    let _ = writeln!(
+        out,
+        "  nvngx_dlssnr.dll download address: {}",
+        if doc["dll_url_configured"] == true {
+            "configured"
+        } else {
+            "not configured"
+        }
+    );
+    for warning in doc["hardware"].as_array().into_iter().flatten() {
+        let _ = writeln!(out, "-- {}", text(warning));
+    }
+    if let Some(titles) = doc["titles"].as_object() {
+        if titles.is_empty() {
+            let _ = writeln!(out, "no game has neural rendering on");
+        }
+        for (key, entry) in titles {
+            let _ = writeln!(
+                out,
+                "{key}  {}  {}  {}{}",
+                text(&entry["route"]),
+                text(&entry["model"]),
+                text(&entry["install-dir"]),
+                if entry["enabled"] == true {
+                    ""
+                } else {
+                    "  (off)"
+                }
+            );
+        }
+    }
+    out
 }
 
 fn cmd_version(cli: &Cli) -> Result<ExitCode> {
@@ -8935,7 +9471,7 @@ fi
         ctx
     }
 
-    fn neural_enable(ctx: &neural::Context, key: &str, game_dir: &Path, model: Network) {
+    fn neural_turn_on(ctx: &neural::Context, key: &str, game_dir: &Path, model: Network) {
         apply::enable(
             ctx,
             &apply::EnableRequest {
@@ -8978,7 +9514,7 @@ fi
     #[test]
     fn an_enabled_title_gets_its_dll_overrides_merged_into_the_plan() {
         let (_home, ctx, dir) = neural_xbox_home("neural-merge");
-        neural_enable(&ctx, GAME, &dir, Network::SilverAardwold);
+        neural_turn_on(&ctx, GAME, &dir, Network::SilverAardwold);
         let mut plan = empty_plan(&[("WINEDLLOVERRIDES", "d3d11=n")], &[]);
         neural_before_launch(&mut plan, &ctx, GAME, &dir, "Game.exe").unwrap();
         assert_eq!(plan.get("WINEDLLOVERRIDES"), Some("d3d11=n;dxgi=n,b"));
@@ -8988,7 +9524,7 @@ fi
     #[test]
     fn the_int4_layer_survives_the_steam_environment_strip() {
         let (home, ctx, dir) = neural_xbox_home("neural-int4");
-        neural_enable(&ctx, GAME, &dir, Network::SilverAardwoldOptimized);
+        neural_turn_on(&ctx, GAME, &dir, Network::SilverAardwoldOptimized);
         assert!(dir
             .join("dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin")
             .is_file());
@@ -9049,7 +9585,7 @@ fi
     fn a_new_kernel_anti_cheat_leaves_no_neural_override_in_the_launch() {
         let (_home, ctx, dir) = neural_xbox_home("neural-kernel");
         std::fs::write(dir.join("dxgi.dll"), THEIRS).unwrap();
-        neural_enable(&ctx, GAME, &dir, Network::SilverAardwoldOptimized);
+        neural_turn_on(&ctx, GAME, &dir, Network::SilverAardwoldOptimized);
         // A game update adds a kernel anti-cheat Proton cannot run.
         std::fs::write(dir.join("Randgrid.sys"), b"").unwrap();
         let mut plan = empty_plan(&[], &["VK_INSTANCE_LAYERS"]);
@@ -9087,7 +9623,7 @@ fi
     #[test]
     fn a_dry_run_reinstalls_nothing() {
         let (home, ctx, dir) = neural_xbox_home("neural-dry-run");
-        neural_enable(&ctx, GAME, &dir, Network::SilverAardwold);
+        neural_turn_on(&ctx, GAME, &dir, Network::SilverAardwold);
         std::fs::remove_file(dir.join(apply::INSTALL_MANIFEST)).unwrap();
         std::fs::remove_dir_all(dir.join("dlssnr-amd")).unwrap();
         let before = listing(&dir);
@@ -9121,7 +9657,7 @@ fi
     #[test]
     fn a_launch_reinstalls_neural_rendering_that_an_update_removed() {
         let (home, ctx, dir) = neural_xbox_home("neural-reinstall");
-        neural_enable(&ctx, GAME, &dir, Network::SilverAardwold);
+        neural_turn_on(&ctx, GAME, &dir, Network::SilverAardwold);
         std::fs::remove_file(dir.join(apply::INSTALL_MANIFEST)).unwrap();
         std::fs::remove_dir_all(dir.join("dlssnr-amd")).unwrap();
         let paths = home.paths();
@@ -9139,7 +9675,7 @@ fi
         let (home, ctx, dir) = neural_xbox_home("neural-uninstall");
         let paths = home.paths();
         record(&paths, GAME, &dir);
-        neural_enable(&ctx, GAME, &dir, Network::SilverAardwold);
+        neural_turn_on(&ctx, GAME, &dir, Network::SilverAardwold);
         let keep = Removal {
             keep_files: true,
             ..YES
@@ -9162,7 +9698,7 @@ fi
         local_game_recipe(&home, &game, "", "");
         let ctx = neural_setup(&mut home);
         let paths = home.paths();
-        neural_enable(&ctx, "LOCAL-TEST", &game, Network::SilverAardwold);
+        neural_turn_on(&ctx, "LOCAL-TEST", &game, Network::SilverAardwold);
         assert_ne!(std::fs::read(game.join("dxgi.dll")).unwrap(), THEIRS);
         uninstall(&paths, "local-test", YES).unwrap();
         assert_eq!(std::fs::read(game.join("dxgi.dll")).unwrap(), THEIRS);
@@ -9176,7 +9712,7 @@ fi
 
         // With the package gone the mod cannot come out: nothing is forgotten.
         local_game_recipe(&home, &game, "", "");
-        neural_enable(&ctx, "LOCAL-TEST", &game, Network::SilverAardwold);
+        neural_turn_on(&ctx, "LOCAL-TEST", &game, Network::SilverAardwold);
         std::fs::remove_dir_all(neural::root(paths.state_dir()).join("packages")).unwrap();
         let error = format!("{:#}", uninstall(&paths, "local-test", YES).unwrap_err());
         assert!(error.contains("ferestre neural disable"), "{error}");
@@ -9188,6 +9724,209 @@ fi
             .unwrap()
             .is_some());
         assert!(game.join(apply::INSTALL_MANIFEST).is_file());
+    }
+    // -- ferestre neural -------------------------------------------------------
+
+    #[test]
+    fn the_neural_commands_parse() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
+        assert!(matches!(
+            parse(&["ferestre", "neural", "status"]),
+            Cmd::Neural {
+                command: NeuralCmd::Status { title: None }
+            }
+        ));
+        match parse(&[
+            "ferestre",
+            "neural",
+            "setup",
+            "--dll",
+            "/x/nvngx_dlssnr.dll",
+        ]) {
+            Cmd::Neural {
+                command: NeuralCmd::Setup { dll },
+            } => assert_eq!(dll, Some(PathBuf::from("/x/nvngx_dlssnr.dll"))),
+            other => panic!("{other:?}"),
+        }
+        match parse(&[
+            "ferestre",
+            "neural",
+            "enable",
+            "bedrock",
+            "--route",
+            "reshade-feeder",
+            "--model",
+            "CC_SMALL_FP8",
+            "--accept-anticheat-risk",
+        ]) {
+            Cmd::Neural {
+                command:
+                    NeuralCmd::Enable {
+                        title,
+                        route,
+                        model,
+                        accept_anticheat_risk,
+                    },
+            } => {
+                assert_eq!(title, "bedrock");
+                assert_eq!(route.as_deref(), Some("reshade-feeder"));
+                assert_eq!(model.as_deref(), Some("CC_SMALL_FP8"));
+                assert!(accept_anticheat_risk);
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(&["ferestre", "neural", "disable", "bedrock"]) {
+            Cmd::Neural {
+                command: NeuralCmd::Disable { title },
+            } => assert_eq!(title, "bedrock"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_route_is_a_usage_error_naming_the_routes() {
+        let error = parse_route(Some("dxgi")).unwrap_err();
+        assert_eq!(exit_code_for(&error), EXIT_USAGE, "{error}");
+        let text = error.to_string();
+        for route in Route::ALL {
+            assert!(text.contains(route.as_str()), "{text}");
+        }
+        let error = parse_network(Some("CC_HUGE")).unwrap_err();
+        assert_eq!(exit_code_for(&error), EXIT_USAGE, "{error}");
+        for network in Network::ALL {
+            assert!(error.to_string().contains(network.as_str()), "{error}");
+        }
+        assert_eq!(
+            parse_route(Some("optiscaler")).unwrap(),
+            Some(Route::Optiscaler)
+        );
+        assert_eq!(parse_network(None).unwrap(), None);
+    }
+
+    #[test]
+    fn enabling_without_a_model_says_how_to_get_one() {
+        let (home, mut ctx, dir) = neural_xbox_home("neural-no-model");
+        // Nothing cached, no URL, nothing to find.
+        std::fs::remove_dir_all(neural::models::dir(&ctx.root)).unwrap();
+        ctx.expect.dlls = vec![neural::DllVersion {
+            version: "310.9.16".into(),
+            sha256: "0".repeat(64),
+            small_model: true,
+        }];
+        let paths = home.paths();
+        let error = neural_enable(
+            &cli(),
+            &paths,
+            &ctx,
+            "testgame",
+            Some(Route::ReshadeFeeder),
+            None,
+            false,
+        )
+        .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("ferestre neural setup"), "{text}");
+        assert!(text.contains("dll-url"), "{text}");
+        assert!(!dir.join(apply::INSTALL_MANIFEST).exists());
+        assert_eq!(neural_state::get(&ctx.config_dir, GAME).unwrap(), None);
+    }
+
+    #[test]
+    fn enabling_and_disabling_by_title_installs_and_takes_out() {
+        let (home, ctx, dir) = neural_xbox_home("neural-enable-cmd");
+        std::fs::write(dir.join("dxgi.dll"), THEIRS).unwrap();
+        let paths = home.paths();
+        neural_enable(
+            &cli(),
+            &paths,
+            &ctx,
+            "testgame",
+            Some(Route::ReshadeFeeder),
+            None,
+            false,
+        )
+        .unwrap();
+        let entry = neural_state::get(&ctx.config_dir, GAME).unwrap().unwrap();
+        assert_eq!(
+            (entry.route, entry.model),
+            (Route::ReshadeFeeder, Network::SmallFp8)
+        );
+        assert!(dir.join(apply::INSTALL_MANIFEST).is_file());
+        neural_disable(&cli(), &paths, &ctx, "testgame").unwrap();
+        assert_eq!(std::fs::read(dir.join("dxgi.dll")).unwrap(), THEIRS);
+        assert_eq!(neural_state::get(&ctx.config_dir, GAME).unwrap(), None);
+        let error = neural_enable(&cli(), &paths, &ctx, "nothing", None, None, false).unwrap_err();
+        assert!(error.to_string().contains("no recipe"), "{error}");
+    }
+
+    #[test]
+    fn status_json_reports_an_enabled_title() {
+        let (home, ctx, dir) = neural_xbox_home("neural-status");
+        neural_state::put(
+            &ctx.config_dir,
+            "9NBLGGH2JHXJ",
+            &neural_state::Entry {
+                enabled: true,
+                route: Route::Optiscaler,
+                model: Network::SmallFp8,
+                package: "0.0.9".into(),
+                arch: neural::Arch::X86_64,
+                install_dir: dir.clone(),
+            },
+        )
+        .unwrap();
+        let paths = home.paths();
+        let doc = neural_status(&cli(), &paths, &ctx, None).unwrap();
+        assert_eq!(doc["schema"], JSON_SCHEMA);
+        assert_eq!(doc["titles"]["9NBLGGH2JHXJ"]["route"], "optiscaler");
+        assert_eq!(doc["titles"]["9NBLGGH2JHXJ"]["model"], "CC_SMALL_FP8");
+        assert_eq!(doc["models"].as_array().unwrap().len(), 2);
+        assert_eq!(doc["package"]["version"], "0.0.9");
+
+        neural_enable(
+            &cli(),
+            &paths,
+            &ctx,
+            "testgame",
+            Some(Route::ReshadeFeeder),
+            None,
+            false,
+        )
+        .unwrap();
+        let doc = neural_status(&cli(), &paths, &ctx, Some("testgame")).unwrap();
+        assert_eq!(doc["product_id"], GAME);
+        assert_eq!(doc["entry"]["route"], "reshade-feeder");
+        assert_eq!(doc["installed"]["ok"], true);
+        assert_eq!(doc["gate"]["state"], "allowed");
+        let text = render_neural_status(&doc);
+        assert!(
+            text.contains("neural rendering: on (reshade-feeder"),
+            "{text}"
+        );
+        assert!(text.contains("install: whole"), "{text}");
+        let text = render_neural_status(&neural_status(&cli(), &paths, &ctx, None).unwrap());
+        assert!(text.contains("9NBLGGH2JHXJ  optiscaler"), "{text}");
+        assert!(text.contains("0.0.9 (ready)"), "{text}");
+    }
+
+    #[test]
+    fn status_never_prints_a_dll_url_it_was_not_given() {
+        let (mut home, ctx, _dir) = neural_xbox_home("neural-status-url");
+        let paths = home.paths();
+        let doc = neural_status(&cli(), &paths, &ctx, None).unwrap();
+        assert_eq!(doc["dll_url_configured"], false);
+        assert!(!doc.to_string().contains("https://"), "{doc}");
+        let doc = neural_status(&cli(), &paths, &ctx, Some("testgame")).unwrap();
+        assert_eq!(doc["dll_url_configured"], false);
+        // One that was given is reported as configured, never printed.
+        home.extra.push((
+            ferestre_core::settings::DLL_URL_ENV.into(),
+            "https://example.invalid/dll.zip".into(),
+        ));
+        let paths = home.paths();
+        let doc = neural_status(&cli(), &paths, &ctx, None).unwrap();
+        assert_eq!(doc["dll_url_configured"], true);
+        assert!(!doc.to_string().contains("example.invalid"), "{doc}");
     }
 }
 
