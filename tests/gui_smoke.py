@@ -1250,8 +1250,15 @@ print(":: done", flush=True)
         select_in_list(frame, "Library")
         wait_for(frame, lambda root: "Minecraft for Windows" in texts(root), "return to library", time.monotonic() + TIMEOUT)
 
-        labels = texts(frame)
-        check(any("on disk" in t for t in labels), "installed rows show measured disk usage in Library", frame)
+        # The size is measured in the background, so it can arrive after the
+        # page does.
+        labels = wait_for(
+            frame,
+            lambda root: (lambda t: t if any("on disk" in x for x in t) else None)(texts(root)),
+            "installed rows to show measured disk usage in Library",
+            time.monotonic() + TIMEOUT,
+        )
+        check(True, "installed rows show measured disk usage in Library")
         check(any("Purchased" in t and "12.5 GB" in t for t in labels), "purchased games show their access source", frame)
         check(not any("not in this account's library listing" in t.lower() for t in labels), "missing direct purchase entries never claim missing access", frame)
         check(any("12.5 GB download" in t for t in labels), "catalog rows show download size in their details", frame)
