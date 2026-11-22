@@ -107,9 +107,10 @@ one is a local stand-in and documents itself.
 
 **`tools/readme-screenshots.py`** regenerates `docs/screenshots/*.png` from
 the GUI fixtures above. It is not a test, and CI does not run it. Each picture
-runs in its own user, mount and PID namespace. In it, `/home`, `/run/user` and
-`/run/media` are empty, the home folder is `/home/player`, the hostname is
-`ferestre-demo` and the account is the synthetic "Player One". The GUI runs in
+runs in its own user, mount, hostname and PID namespace. In it, `/home`,
+`/run/user`, `/run/media`, `/media` and `/mnt` are empty, the home folder is
+`/home/player`, the hostname is `ferestre-demo` and the account is the
+synthetic "Player One". The GUI runs in
 a private virtual KWin session with the default renderer, so the dialog blur
 appears as it does for users. Artwork is public Store art copied from
 `~/.cache/ferestre/catalog`, stripped of everything but product metadata. The

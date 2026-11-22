@@ -8,16 +8,16 @@ Play compatible **Xbox PC and Microsoft Store games on Linux** using your Micros
 
 **[Download the AppImage](https://github.com/icex/ferestre/releases/download/v0.1.23/ferestre-0.1.23-x86_64.AppImage)** · [Compatible games](docs/COMPATIBILITY.md#the-matrix) · [Quick start](#quick-start) · [Report a problem](https://github.com/icex/ferestre/issues)
 
-![Ferestre game library in handheld fullscreen mode, with controller navigation and a game-update badge](docs/screenshots/library-handheld.png)
+![Ferestre's Home: a featured-game carousel, quick links and a Jump back in shelf, with installed games and their status in the sidebar](docs/screenshots/home.png)
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/home.png" alt="Home with a featured-game carousel, quick links and a Jump back in shelf"><br><strong>Pick up where you left off</strong></td>
-    <td width="50%"><img src="docs/screenshots/running-game.png" alt="Resume or stop a running game from its library card"><br><strong>Switch between running games</strong></td>
+    <td width="50%"><img src="docs/screenshots/library-handheld.png" alt="My Library in the fullscreen handheld layout, with Xbox controller hints and an Update available badge"><br><strong>Play from the couch with a controller</strong></td>
+    <td width="50%"><img src="docs/screenshots/running-game.png" alt="A running game's card with Resume and Stop"><br><strong>Switch between running games</strong></td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/screenshots/install-game.png" alt="Choose a game installation folder and drive inside Ferestre"><br><strong>Install with a controller-friendly folder picker</strong></td>
-    <td width="50%"><img src="docs/screenshots/notifications.png" alt="Three notifications stacked in the corner of the library"><br><strong>See every result at once</strong></td>
+    <td width="50%"><img src="docs/screenshots/install-game.png" alt="The install dialog with the download size, library folder and free space, over the blurred library"><br><strong>Choose where each game installs</strong></td>
+    <td width="50%"><img src="docs/screenshots/notifications.png" alt="Three notifications stacked in the corner of the window"><br><strong>See every result at once</strong></td>
   </tr>
 </table>
 
@@ -28,9 +28,9 @@ Play compatible **Xbox PC and Microsoft Store games on Linux** using your Micros
 
 ![Compact icon sidebar with the account menu open](docs/screenshots/compact-sidebar.png)
 
-![A dialog offering to leave, close, or close and restart a game that is already running](docs/screenshots/already-running.png)
+![A dialog offering to leave a game running, close it, or close it and start it again](docs/screenshots/already-running.png)
 
-![Home on an ultrawide 3440x1000 window](docs/screenshots/home-ultrawide.png)
+![Home in a 3440x1000 ultrawide window](docs/screenshots/home-ultrawide.png)
 
 </details>
 
@@ -69,15 +69,23 @@ In **Accounts**, choose the Microsoft account supplying purchases/Game Pass (**S
 
 1. Open **My Library** for your account's games and local installations, or **Game Pass** to browse the current PC catalogue.
 2. Choose a game, select **Install**, choose a library folder and confirm.
-3. Follow progress in **My Library → Install Queue**. Choose **Play** when installation finishes.
+3. Follow progress in **My Library → Install queue**, or with the **Downloads** button in the sidebar. Choose **Play** when installation finishes.
 
 Check the [compatibility list](docs/COMPATIBILITY.md#the-matrix) before a large download. Ferestre supports compatible **GDK/MSIXVC** games; many other Store apps use UWP/Appx/Msix formats that are currently unsupported. Game Pass access depends on your subscription, region and the title still being included. Microsoft checks the licence when installing or launching.
 
 ## Quick guides
 
+### Find your way around
+
+**Home** opens with a carousel of what is running, what you played last, games with updates and Game Pass titles. Below it are quick links, **Jump back in** with your installed games, and shelves of Game Pass and your library; **See all** opens the full list. The search at the top looks through your library and Game Pass.
+
+The sidebar lists every installed game, last played first, with its state: Running, Update ready, Queued, Downloading and so on. To turn it into a narrow rail of icons, switch on **Compact sidebar** in **Settings → Appearance** or in the account menu. Ferestre remembers the choice.
+
+Results such as "Starting…" or a finished install appear together in the bottom-right corner, newest at the bottom. The bell beside your account keeps this session's notifications for any you missed. Behind a dialog the window blurs; it only dims instead when your desktop turns animations off or the graphics are too slow for blur.
+
 ### Pause or resume a download
 
-Open **My Library → Install Queue** and choose **Pause** or **Resume**. The queue survives restarts and runs one transfer at a time. Resume keeps the saved destination and verified progress.
+Open **My Library → Install queue** and choose **Pause** or **Resume**. The queue survives restarts and runs one transfer at a time. Resume keeps the saved destination and verified progress.
 
 See [downloads and controls](docs/DOWNLOADS.md) for progress, reused data and recovery.
 
@@ -88,6 +96,8 @@ Open **My Library → Updates**, then choose **Update**. Ferestre updates the ex
 ### Switch between games
 
 Running game cards show **Resume** and **Stop**. Resume returns to the existing game window. Stop opens an in-app confirmation with **Cancel** selected first.
+
+If a game is already running from somewhere else, such as a Steam shortcut, **Play** does not start a second copy. Ferestre asks instead: **Leave It Running**, **Close It**, or **Close and Start Again**. Closing asks the game to quit and ends it after 15 seconds if it has not, so unsaved progress may be lost.
 
 Keep Ferestre open while playing to use the controller's **Xbox/Home** or **PS** button to return to the launcher. Select another game, resume one already running, or stop it from its card.
 
@@ -118,6 +128,10 @@ See [signed updates and rollback](docs/UPDATES.md) for supported installations. 
 Enable HDR in your desktop's display settings, install the current Ferestre runtime, then enable HDR in the game's video settings when available. Tested recipes such as Forza Horizon 6 select native Wayland HDR explicitly. Other games use XWayland for compatibility; testing native Wayland requires `FERESTRE_NATIVE_WAYLAND=1`. See [desktop integration](docs/DESKTOP-INTEGRATION.md) for details.
 
 Choose a suitable rendering resolution in the game. The runtime includes 4K and scaled ultrawide modes and preserves the display's native refresh rate. See [desktop integration](docs/DESKTOP-INTEGRATION.md) for detection, window controls and performance helpers.
+
+### Change a game's launch settings
+
+Open the game's **More actions → Edit launch settings**. Settings such as native Wayland, Gamescope, HDR, the performance profile and the runtime's compatibility switches appear as switches and menus, each with a line saying what it does; other environment variables can be added below them. Your changes are saved as your own copy of the game's recipe. **Reset to defaults** sets that copy aside as a `.toml.bak` file and returns the game to the settings Ferestre ships or detects.
 
 ### Move a game or add it to Steam
 
@@ -156,7 +170,7 @@ The AppImage also accepts CLI commands:
 ./ferestre.AppImage check-app-updates
 ```
 
-Use `./ferestre.AppImage --help` for all commands. The window and CLI use the same installation records and launch decisions. [Recipes and advanced setup](docs/RECIPES.md) cover custom paths and manual troubleshooting.
+Use `./ferestre.AppImage --help` for all commands. `run` refuses to start a game that is already running or still starting in its prefix, and exits with code 4; `run --help` lists the exit codes. The window and CLI use the same installation records and launch decisions. [Recipes and advanced setup](docs/RECIPES.md) cover custom paths and manual troubleshooting.
 
 ## Documentation and development
 

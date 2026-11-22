@@ -70,6 +70,16 @@ Where the title and its prefix live, relative to `XODUS_GAMES_DIR`.
 | `executable` | string | required | Backslash path **relative to the install directory**, as Windows writes it. Use a TOML literal string (single quotes) so backslashes stay backslashes. |
 | `env` (alias `environment`) | table | optional | Extra environment, on top of what the launcher sets for every title. Only put something here that is genuinely this title's. |
 
+The window's recipe editor (Edit launch settings) shows the variables it knows
+as switches and menus, from the catalogue in
+`crates/ferestre-core/src/launch_options.rs`: each entry has a title, a line of
+help, the values it writes and, where one applies, the capability it needs
+(`XGR_WAIT_FOR_ASYNC_CALLBACKS` needs `xgameruntime.async-callback-wait`, for
+example). A variable a recipe here uses needs an entry there; a test checks
+that. Any other variable, or a value no control can show, stays a plain row, so
+the editor never rewrites what a recipe says. Reset to defaults renames the
+user's copy to `<PRODUCT-ID>.toml.bak`.
+
 There is no way to pass arguments to the title: the client starts the
 executable with none, so a key for them would be a promise nothing keeps.
 

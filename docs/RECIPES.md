@@ -307,7 +307,8 @@ game/controller coverage are not separately qualified.
 | `newgrp docker` prompts / hangs | user not in the docker group | `sudo usermod -aG docker $USER`, log out and in |
 | game runs but no picture / colour bars in videos | Steam's ffmpeg has no H.264 outside Steam | launcher sets `PROTON_PREFER_SYSTEM_FFMPEG=1`; needs a system ffmpeg with H.264 |
 | several instances make everything slow | stray processes from testing | `scripts/kill-gdk.sh` |
-| a title keeps an old state, summary or setting after an upgrade | a recipe in `~/.config/ferestre/titles/` replaces the shipped recipe of the same product id as a whole, including its `[status]` | delete the personal copy, or bring it up to date with the shipped one. Launcher 0.1.8 finds a title installed under its product id from its install record, so a copy kept only for `[install] dir` is no longer needed |
+| `ferestre run` exits 4 with "already running or starting" | a copy of the title is running in its prefix (often from a Steam shortcut), or another `run` holds `<prefix>/.ferestre-run.lock` while it starts | close the running copy: press Play in the window and choose Close It, or quit the game. The refusal is also written to the title's launch log and, when no terminal shows it, sent as a desktop notification |
+| a title keeps an old state, summary or setting after an upgrade | a recipe in `~/.config/ferestre/titles/` replaces the shipped recipe of the same product id as a whole, including its `[status]` | choose **Reset to defaults** in the title's launch settings (it keeps the copy as `<product id>.toml.bak`), delete the personal copy, or bring it up to date with the shipped one. Launcher 0.1.8 finds a title installed under its product id from its install record, so a copy kept only for `[install] dir` is no longer needed |
 
 ## 6. Debugging a launch
 

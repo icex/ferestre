@@ -47,6 +47,11 @@ HDR-capable displays running in SDR are treated as SDR.
   stacked. `FERESTRE_PERFORMANCE=0` disables this automatic selection.
 - Optional helpers that cannot start do not prevent the original launch path.
   The launch log records the selected display/performance path.
+- Each of these settings is also a switch or menu in the game's **More actions →
+  Edit launch settings**, under Display and performance (Native Wayland,
+  Gamescope, Automatic HDR, Performance profile while playing, Desktop
+  integration). **Reset to defaults** there returns the game to the settings
+  Ferestre ships for it.
 
 The runtime's `graphics.xrandr-desktop-refresh` capability corrects a specific
 XWayland limitation: its 32-bit synthetic pixel clock can clamp an ultrawide

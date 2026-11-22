@@ -284,7 +284,21 @@ honestly marked as unproven rather than planned.
 
 - [x] **A sidebar, and a layout that survives a hundred titles.** One flat
       preferences page was right for three recipes and is wrong for a library.
-      Library / Installed / Updates / Runtime as sidebar sections.
+      Library / Installed / Updates / Runtime as sidebar sections. Since then
+      the window is laid out around the art: Home is a carousel, quick links,
+      Jump back in and shelves; the sidebar lists every installed title with
+      its state, or folds into a rail of icons (Compact sidebar); results stack
+      in a corner instead of queueing one at a time; and the window blurs
+      behind dialogs where the renderer can afford it.
+
+- [x] **One copy of a title at a time.** A second copy started into a prefix
+      that already runs the title exits at once with a code nobody can read.
+      Play now offers to leave the running copy, close it, or close it and
+      start again, and `ferestre run` refuses with exit code 4, holding
+      `<prefix>/.ferestre-run.lock` from before it changes the prefix until the
+      title ends, so a Steam shortcut and the window a moment apart cannot
+      both get through. Steam shows neither stderr nor the exit code, so the
+      refusal also goes to the launch log and a desktop notification.
 
 - [x] **A library you can find seven titles in.** Measured on the development
       account: of 102 owned games and apps, **7** ship as MSIXVC and the other
