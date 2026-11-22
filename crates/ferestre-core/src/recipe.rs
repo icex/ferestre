@@ -126,6 +126,11 @@ pub struct Launch {
     /// Local games only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wrapper: Vec<String>,
+    /// The folder the game starts in, relative to `[install].dir` or
+    /// absolute; the game folder when unset, as Steam starts a shortcut in its
+    /// start folder. Local games only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -385,6 +390,11 @@ impl Recipe {
                      wrappers: the client's run command takes none"
                 );
             }
+            if self.launch.working_dir.is_some() {
+                anyhow::bail!(
+                    "[launch].working-dir: only a local game chooses the folder it starts in"
+                );
+            }
             return Ok(());
         }
         if self.title.slug != id.to_ascii_lowercase() {
@@ -413,6 +423,9 @@ impl Recipe {
                 "[install].dir of a local game must be the game's absolute folder, at least two \
                  levels below `/`, with no `..`"
             ),
+        }
+        if self.launch.working_dir.as_deref().is_some_and(has_parent) {
+            anyhow::bail!("[launch].working-dir of a local game must not contain `..`");
         }
         if let Some(prefix) = self.install.prefix.as_deref() {
             if has_parent(prefix) {
@@ -601,6 +614,7 @@ impl Recipe {
                 env: Default::default(),
                 args: Vec::new(),
                 wrapper: Vec::new(),
+                working_dir: None,
             },
             runtime: Runtime::default(),
             status: Status {
@@ -1481,6 +1495,36 @@ summary = "Imported from Steam"
             let err = Recipe::parse(&text).expect_err(prefix).to_string();
             assert!(err.contains("must not contain `..`"), "{prefix}: {err}");
         }
+    }
+
+    #[test]
+    fn working_dir_is_local_only_and_never_climbs_out() {
+        let good = local("").unwrap().to_toml().unwrap();
+        let with = |dir: &str| {
+            good.replace(
+                "executable = ",
+                &format!("working-dir = '{dir}'\nexecutable = "),
+            )
+        };
+        let recipe = Recipe::parse(&with(r"bin\x64")).unwrap();
+        assert_eq!(recipe.launch.working_dir.as_deref(), Some(r"bin\x64"));
+        let again = Recipe::parse(&recipe.to_toml().unwrap()).unwrap();
+        assert_eq!(again.launch.working_dir.as_deref(), Some(r"bin\x64"));
+        for bad in ["../x", r"bin\..\..\x", "/run/media/me/../etc"] {
+            let err = Recipe::parse(&with(bad)).unwrap_err().to_string();
+            assert!(err.contains("working-dir"), "{bad}: {err}");
+        }
+        let store = Recipe::blank("9ZZTESTNEW1", "Test")
+            .to_toml()
+            .unwrap()
+            .replace(
+                "executable = \"\"",
+                "executable = \"Game.exe\"\nworking-dir = \"bin\"",
+            );
+        assert!(Recipe::parse(&store)
+            .unwrap_err()
+            .to_string()
+            .contains("working-dir"));
     }
 
     #[test]

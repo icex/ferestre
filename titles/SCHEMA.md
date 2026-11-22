@@ -271,4 +271,10 @@ the keys below. Such a recipe differs from a Store title's in these ways:
   through, such as `["gamemoderun", "mangohud"]` -- what Steam puts before
   `%command%`.
 
-A Store title's recipe with `args` or `wrapper` is refused.
+- `[launch].working-dir` (string) is the folder the game starts in, relative
+  to `[install].dir` (either separator) or absolute, with no `..`. Unset, the
+  game starts in `[install].dir`, as Steam starts a shortcut in its start
+  folder. Set it when the executable skips a launcher that used to start the
+  game from another folder (GOG's Witcher 3: `'bin\x64_dx12'`).
+
+A Store title's recipe with `args`, `wrapper` or `working-dir` is refused.

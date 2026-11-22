@@ -423,14 +423,15 @@ fn local_plan(recipe: &Recipe, dirs: &Dirs, options: &Options) -> Plan {
     };
     args.push(windows_path(&executable));
     args.extend(recipe.launch.args.iter().cloned());
-    // Started in its own folder, as Windows starts a program: a game behind a
-    // launcher in the top folder (GOG's REDprelauncher, say) was always
-    // started by it from its own folder, and run directly from the top one it
-    // cannot find its files and exits at once.
-    let cwd = executable
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or(game_dir);
+    // Started where Steam would start its shortcut: the game folder, which an
+    // import takes from the shortcut's start folder (Call of Duty starts
+    // sp26\sp26-cod.exe from its top folder and needs it). A recipe whose
+    // executable skips a launcher names the folder that launcher used
+    // (GOG's Witcher 3: bin\x64_dx12).
+    let cwd = match recipe.launch.working_dir.as_deref() {
+        Some(dir) => game_dir.join(dir.replace('\\', "/")),
+        None => game_dir,
+    };
 
     Plan {
         program,
@@ -835,8 +836,8 @@ summary = "Added by hand"
         assert_eq!(plan.args, vec![r"Z:\drive\My Game\bin\Game.exe", "-dx12"]);
         assert_eq!(
             plan.cwd.as_deref(),
-            Some(Path::new("/drive/My Game/bin")),
-            "started in the executable's own folder, as Windows does"
+            Some(Path::new("/drive/My Game")),
+            "started in the game folder, as Steam starts its shortcut"
         );
         assert_eq!(plan.get("STEAM_COMPAT_DATA_PATH"), Some("/pfx/game"));
         assert_eq!(plan.get("FERESTRE_LOCAL_GAME"), Some("1"));
@@ -877,7 +878,25 @@ summary = "Added by hand"
         recipe.launch.executable = "/other/Launcher.exe".into();
         let plan = plan(&recipe, &dirs(), &Options::default());
         assert_eq!(plan.args, vec![r"Z:\other\Launcher.exe"]);
-        assert_eq!(plan.cwd.as_deref(), Some(Path::new("/other")));
+        assert_eq!(plan.cwd.as_deref(), Some(Path::new("/drive/My Game")));
+    }
+
+    #[test]
+    fn a_working_dir_names_the_folder_the_game_starts_in() {
+        let options = Options {
+            game_dir: Some("/drive/My Game".into()),
+            ..Options::default()
+        };
+        let mut recipe = local_recipe("");
+        recipe.launch.working_dir = Some(r"bin\x64_dx12".into());
+        let started = plan(&recipe, &dirs(), &options);
+        assert_eq!(
+            started.cwd.as_deref(),
+            Some(Path::new("/drive/My Game/bin/x64_dx12"))
+        );
+        recipe.launch.working_dir = Some("/elsewhere/run".into());
+        let started = plan(&recipe, &dirs(), &options);
+        assert_eq!(started.cwd.as_deref(), Some(Path::new("/elsewhere/run")));
     }
 
     #[test]
