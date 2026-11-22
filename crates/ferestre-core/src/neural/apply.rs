@@ -279,7 +279,36 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
         }
         Ok(())
     } else {
-        std::fs::copy(from, to).map(|_| ())
+        std::fs::copy(from, to)?;
+        // The person's file comes back as it was, its time included: some
+        // tools (a store's file check, a mod manager) compare it.
+        keep_modified(to, &meta)
+    }
+}
+
+/// Give `path` the modification time in `meta`, through its path: a copy of
+/// a read-only file cannot be opened for writing.
+fn keep_modified(path: &Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: meta.mtime() as libc::time_t,
+            tv_nsec: meta.mtime_nsec() as _,
+        },
+    ];
+    // SAFETY: `c_path` is a valid NUL-terminated string and `times` holds two
+    // timespecs, as utimensat requires.
+    if unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -1444,6 +1473,20 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
         write(&w.game.join("dxgi.dll"), THEIRS);
         write(&w.game.join("ReShade.ini"), b"their ini");
         write(&w.game.join("reshade-shaders/a.fx"), b"their fx");
+        // Old, and in a folder read-only, as a game's own files often are.
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        for name in ["dxgi.dll", "reshade-shaders/a.fx"] {
+            std::fs::File::options()
+                .write(true)
+                .open(w.game.join(name))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let shader = w.game.join("reshade-shaders/a.fx");
+        let mut readonly = std::fs::metadata(&shader).unwrap().permissions();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&shader, readonly).unwrap();
         let enabled = w.enable(Route::ReshadeFeeder);
         assert_eq!(enabled.entry.route, Route::ReshadeFeeder);
         assert_eq!(enabled.entry.install_dir, w.game);
@@ -1455,6 +1498,11 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
         assert_eq!(read(&w.game.join("dxgi.dll")), THEIRS);
         assert_eq!(read(&w.game.join("ReShade.ini")), b"their ini");
         assert_eq!(read(&w.game.join("reshade-shaders/a.fx")), b"their fx");
+        let back = std::fs::metadata(w.game.join("dxgi.dll")).unwrap();
+        assert_eq!(back.modified().unwrap(), old);
+        let back = std::fs::metadata(&shader).unwrap();
+        assert_eq!(back.modified().unwrap(), old);
+        assert!(back.permissions().readonly());
         assert!(!w.game.join("reshade-shaders/x.fx").exists());
         assert!(!w.game.join(BACKUP_DIR).exists());
         assert!(!w.game.join(INSTALL_MANIFEST).exists());

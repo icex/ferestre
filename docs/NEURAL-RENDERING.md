@@ -105,7 +105,8 @@ yourself for the same DLL wins, and the launch says the mod may then not load.
   enabled. There is no override.
 - Any other anti-cheat, including Easy Anti-Cheat and BattlEye: enabling needs
   `--accept-anticheat-risk` (or the checkbox in the window). Ferestre
-  remembers it for that game and that anti-cheat.
+  remembers it for that game and that anti-cheat, until you remove a local
+  game from Ferestre.
 
 The check runs again before every launch. If a game update brings in an
 anti-cheat that forbids the mod, Ferestre takes the mod out, puts your files

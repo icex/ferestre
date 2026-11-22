@@ -146,6 +146,21 @@ pub fn forget(config_dir: &Path, product_id: &str) -> Result<()> {
     })
 }
 
+/// Drop everything kept about a game, its acknowledgements included: for a
+/// game Ferestre forgets. A local game's id comes from its name, so another
+/// game added later under the same name must not inherit them.
+pub fn forget_game(config_dir: &Path, product_id: &str) -> Result<()> {
+    let k = key(product_id);
+    let document = read(config_dir)?;
+    if !document.titles.contains_key(&k) && !document.acknowledged.contains_key(&k) {
+        return Ok(());
+    }
+    update(config_dir, |d| {
+        d.titles.remove(&k);
+        d.acknowledged.remove(&k);
+    })
+}
+
 pub fn all(config_dir: &Path) -> Result<BTreeMap<String, Entry>> {
     Ok(read(config_dir)?.titles)
 }
@@ -214,6 +229,25 @@ mod tests {
             BTreeSet::from(["BattlEye".to_string(), "Easy Anti-Cheat".to_string()])
         );
         assert!(acknowledged(c, "local-b").unwrap().is_empty());
+    }
+
+    #[test]
+    fn forgetting_a_game_drops_its_acknowledgements_too() {
+        let config = tempfile::tempdir().unwrap();
+        let c = config.path();
+        record(c, "local-a", &entry("/games/a"), &["Easy Anti-Cheat"]).unwrap();
+        acknowledge(c, "local-b", &["BattlEye"]).unwrap();
+        forget_game(c, "LOCAL-A").unwrap();
+        assert_eq!(get(c, "local-a").unwrap(), None);
+        assert!(acknowledged(c, "local-a").unwrap().is_empty());
+        assert_eq!(acknowledged(c, "local-b").unwrap().len(), 1);
+        // Only acknowledgements left: they go too.
+        forget_game(c, "local-b").unwrap();
+        assert!(acknowledged(c, "local-b").unwrap().is_empty());
+        // Nothing kept, nothing written.
+        let config = tempfile::tempdir().unwrap();
+        forget_game(config.path(), "local-a").unwrap();
+        assert!(!file(config.path()).exists());
     }
 
     #[test]

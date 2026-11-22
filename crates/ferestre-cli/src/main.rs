@@ -2256,6 +2256,9 @@ fn uninstall_title(
             eprintln!("-- neural rendering removed from {}", recipe.title.name);
         }
         let forgotten = ferestre_core::local::forget(paths, &product_id)?;
+        // Its id comes from its name: a game added later under the same name
+        // must be asked about its anti-cheat again.
+        neural::state::forget_game(paths.config_dir(), &product_id)?;
         if cli.json {
             print_json(&json!({
                 "schema": JSON_SCHEMA,
@@ -9723,6 +9726,14 @@ fi
             None
         );
         assert!(game.join("Game.exe").is_file());
+        // Another game added under the same name is asked about its
+        // anti-cheat again.
+        neural_state::acknowledge(&ctx.config_dir, "LOCAL-TEST", &["BattlEye"]).unwrap();
+        local_game_recipe(&home, &game, "", "");
+        uninstall(&paths, "local-test", YES).unwrap();
+        assert!(neural_state::acknowledged(&ctx.config_dir, "LOCAL-TEST")
+            .unwrap()
+            .is_empty());
 
         // With the package gone the mod cannot come out: nothing is forgotten.
         local_game_recipe(&home, &game, "", "");
