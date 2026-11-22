@@ -1633,9 +1633,14 @@ print(":: done", flush=True)
             "the editor says where an edit goes",
             frame,
         )
+        # Settings are switches and menus, so nobody has to know a variable's
+        # name; anything else goes in a list of its own.
+        for setting in ("Native Wayland", "Gamescope", "Strict manual task queues",
+                        "Easy Anti-Cheat Linux library", "Other variables"):
+            check(setting in labels, f"the editor offers {setting!r}", frame)
         check(
-            any("KEY=VALUE" in t for t in labels),
-            "and how to write the environment",
+            bool(find_all(frame, role="button", name="Add a variable")),
+            "and a variable can be added",
             frame,
         )
         for field in (
@@ -1682,6 +1687,16 @@ print(":: done", flush=True)
         editable = executable.get_editable_text_iface()
         check(editable is not None, "and editable", frame)
         Atspi.EditableText.set_text_contents(editable, "SmokeTest/Changed.exe")
+        click_named(frame, "Native Wayland")
+        click_named(frame, "Add a variable")
+        for field, value in (("Variable name", "SMOKE_TEST_VARIABLE"), ("Variable value", "kept")):
+            entry = wait_for(
+                frame,
+                lambda root, field=field: next(iter(find_all(root, role="text", name=field)), None),
+                f"an empty {field.lower()}",
+                time.monotonic() + TIMEOUT,
+            )
+            Atspi.EditableText.set_text_contents(entry.get_editable_text_iface(), value)
         click_named(frame, "Save")
         wait_for(
             frame,
@@ -1696,6 +1711,15 @@ print(":: done", flush=True)
         check(
             'executable = "SmokeTest/Changed.exe"' in body,
             "with the change in it",
+        )
+        environment = tomllib.loads(body)["launch"].get("env", {})
+        check(
+            environment.get("FERESTRE_NATIVE_WAYLAND") == "1",
+            f"the switch wrote its variable ({environment})",
+        )
+        check(
+            environment.get("SMOKE_TEST_VARIABLE") == "kept",
+            f"and the added variable was kept ({environment})",
         )
         check(
             "open an issue" in body,

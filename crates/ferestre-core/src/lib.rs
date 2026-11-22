@@ -27,6 +27,7 @@ pub mod gamepass;
 pub mod http;
 pub mod install;
 pub mod launch;
+pub mod launch_options;
 pub mod library;
 pub mod media;
 pub mod paths;
