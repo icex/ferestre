@@ -91,24 +91,6 @@ class DigestTests(unittest.TestCase):
                 self.assertNotEqual(ri.digest_of(ri.inputs(lock, BLOB)), D, f'{name}.{key}')
         self.assertNotEqual(ri.digest_of(ri.inputs(LOCK, 'c' * 40)), D)
 
-    def test_patches_change_it_and_none_keep_the_old_digest(self):
-        self.assertEqual(ri.digest_of(ri.inputs(LOCK, BLOB, {})), D)
-        one = {'packaging/runtime-patches/dxvk/01-a.patch': 'a' * 40}
-        with_one = ri.digest_of(ri.inputs(LOCK, BLOB, one))
-        self.assertNotEqual(with_one, D)
-        edited = {'packaging/runtime-patches/dxvk/01-a.patch': 'b' * 40}
-        self.assertNotEqual(ri.digest_of(ri.inputs(LOCK, BLOB, edited)), with_one)
-        with self.assertRaises(ValueError):
-            ri.inputs(LOCK, BLOB, {'x.patch': 'short'})
-
-    def test_the_working_tree_and_head_list_the_same_patches(self):
-        here = ri.patches_at(None)
-        self.assertTrue(all(p.startswith(ri.PATCHES + '/') for p in here), here)
-        if not subprocess.run(['git', '-C', str(REPO), 'diff', '--quiet', 'HEAD', '--', ri.PATCHES]).returncode \
-                and not subprocess.run(['git', '-C', str(REPO), 'ls-files', '--others', '--', ri.PATCHES],
-                                       capture_output=True, text=True).stdout:
-            self.assertEqual(ri.patches_at('HEAD'), here)
-
     def test_short_or_missing_commits_are_refused(self):
         with self.assertRaises(ValueError):
             ri.inputs(self.lock_with(lambda d: d['components']['wine'].update(commit='abc')), BLOB)

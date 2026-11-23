@@ -145,13 +145,14 @@
     },
     "vkd3d-proton": {
       "repository": "https://github.com/icex/vkd3d-proton.git",
-      "commit": "e6874335c04585e5fb693bb5a074977031c70406",
+      "commit": "f8a2f2c7e3ba3ea25bcc9669cf03cf99f4cb8214",
       "upstream": "https://github.com/HansKristian-Work/vkd3d-proton.git",
       "upstream_commit": "651f17762e439feeef22dbb4ee7eff167ee503d4",
       "modified_paths": [
         "include/private/config_flag_decl.h",
         "include/private/config_flags.h",
         "libs/vkd3d/command.c",
+        "libs/vkd3d/memory.c",
         "libs/vkd3d/vkd3d_private.h"
       ]
     },
@@ -267,7 +268,7 @@
     },
     "proton": {
       "repository": "https://github.com/icex/Proton-UWP.git",
-      "commit": "64724102b84352364a68fcb9680b99df359c3278",
+      "commit": "697727160b65f1eb4f50e78b787f17abd8b5a093",
       "upstream": "https://github.com/xodus-gaming/Proton.git",
       "upstream_commit": "7c0b435495814349735c913fde78da906aecea52",
       "modified_paths": [
@@ -275,10 +276,33 @@
         "Makefile.in",
         "configure.sh",
         "contrib/ferestre/Dockerfile.sdk",
+        "dxvk",
         "piper",
         "proton",
         "vkd3d-proton",
         "wine"
+      ]
+    },
+    "dxvk": {
+      "repository": "https://github.com/icex/dxvk.git",
+      "commit": "1b94ee227660bbd649a3bbd355454155ef52a60d",
+      "upstream": "https://github.com/doitsujin/dxvk.git",
+      "upstream_commit": "6227b633e8d528952873c4c146773663964fcb31",
+      "modified_paths": [
+        "dxvk.conf",
+        "src/dxgi/dxgi_adapter.cpp",
+        "src/dxgi/dxgi_options.cpp",
+        "src/dxgi/dxgi_options.h",
+        "src/dxgi/dxgi_output.cpp",
+        "src/dxgi/dxgi_swapchain.cpp",
+        "src/dxgi/dxgi_swapchain.h",
+        "src/dxvk/dxvk_presenter.cpp",
+        "src/util/config/config.cpp",
+        "src/wsi/win32/wsi_monitor_win32.cpp",
+        "src/wsi/win32/wsi_platform_win32.h",
+        "src/wsi/wsi_monitor.h",
+        "src/wsi/wsi_platform.cpp",
+        "src/wsi/wsi_platform.h"
       ]
     }
   },

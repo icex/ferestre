@@ -3,7 +3,7 @@
 #
 #   scripts/build-runtime.sh <work dir> [proton ref] [--until clone|configure|build]
 #
-# Clones Proton (with Wine, xgameruntime and vkd3d-proton as its recursive
+# Clones Proton (with Wine, xgameruntime, vkd3d-proton and DXVK as its recursive
 # submodules) into <work dir>/proton, refuses a source graph that differs from
 # sources.lock.json, configures with ccache, runs `make dist`, and packs the
 # result as <work dir>/out/dist.tar.zst with the SDK image name beside it in
@@ -66,6 +66,7 @@ echo ":: proton   $(git -C "$work/proton" rev-parse HEAD)"
 echo ":: wine     $(git -C "$work/proton/wine" rev-parse HEAD)"
 echo ":: xgr      $(git -C "$work/proton/wine/dlls/xgameruntime" rev-parse HEAD)"
 echo ":: vkd3d    $(git -C "$work/proton/vkd3d-proton" rev-parse HEAD)"
+echo ":: dxvk     $(git -C "$work/proton/dxvk" rev-parse HEAD)"
 
 # Refuse a source graph that differs from the lock before compiling anything.
 #
@@ -77,19 +78,10 @@ if [ "$ref" = "$pinned" ]; then
     pins verify wine --directory "$work/proton/wine"
     pins verify xgameruntime --directory "$work/proton/wine/dlls/xgameruntime"
     pins verify vkd3d-proton --directory "$work/proton/vkd3d-proton"
+    pins verify dxvk --directory "$work/proton/dxvk"
 else
     echo "::warning::building Proton $ref, not the pinned $pinned: lock not checked"
 fi
-
-# Ferestre's own fixes to the submodules, on the checked source graph.
-for dir in "$here"/packaging/runtime-patches/*/; do
-    sub=$(basename "$dir")
-    for patch in "$dir"*.patch; do
-        [ -e "$patch" ] || continue
-        echo ":: patch    $sub/$(basename "$patch")"
-        git -C "$work/proton/$sub" apply "$patch"
-    done
-done
 [ "$until" = clone ] && exit 0
 
 stamp configure

@@ -11,8 +11,7 @@
 `digest` is a SHA-256 over a canonical JSON of everything that decides what
 `make dist` produces: the repository and commit of Proton, Wine, xgameruntime
 and vkd3d-proton from sources.lock.json, and the git blob id of
-scripts/build-runtime.sh (which holds every configure and make flag), and the
-blob id of every patch under packaging/runtime-patches/ it applies. Proton's
+scripts/build-runtime.sh (which holds every configure and make flag). Proton's
 own commit pins its SDK image and every other submodule. A lock edit that
 leaves these alone (a dlssnr or xodus pin, a modified_paths list), or a change
 to the workflow file, does not change the digest, so it does not rebuild the
@@ -54,7 +53,6 @@ ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = 'ferestre-runtime-inputs/1'
 COMPONENTS = ('proton', 'wine', 'xgameruntime', 'vkd3d-proton')
 BUILD_SCRIPT = 'scripts/build-runtime.sh'
-PATCHES = 'packaging/runtime-patches'
 WORKFLOW = '.github/workflows/runtime.yml'
 LOCK = 'sources.lock.json'
 SHA = re.compile(r'[0-9a-f]{40}')
@@ -66,10 +64,8 @@ def git(*args, cwd=ROOT):
                           capture_output=True, text=True).stdout.strip()
 
 
-def inputs(lock_text, script_blob, patches=None):
-    """The canonical inputs, from the lock's text, the build script's blob id
-    and the patches' blob ids by path. No patches leaves the inputs as they
-    were before there were any, so older builds keep their digest."""
+def inputs(lock_text, script_blob):
+    """The canonical inputs, from the lock's text and the build script's blob id."""
     components = json.loads(lock_text)['components']
     picked = {}
     for name in COMPONENTS:
@@ -79,28 +75,7 @@ def inputs(lock_text, script_blob, patches=None):
         picked[name] = {'repository': pin['repository'], 'commit': pin['commit']}
     if not SHA.fullmatch(script_blob or ''):
         raise ValueError(f'{BUILD_SCRIPT}: no blob id')
-    data = {'schema': SCHEMA, 'components': picked, 'build_script': script_blob}
-    if patches:
-        for path, blob in patches.items():
-            if not SHA.fullmatch(blob):
-                raise ValueError(f'{path}: no blob id')
-        data['patches'] = dict(sorted(patches.items()))
-    return data
-
-
-def patches_at(rev=None, cwd=ROOT):
-    """The `*.patch` files build-runtime.sh applies, by path, with blob ids."""
-    if rev is None:
-        root = Path(cwd)
-        return {str(p.relative_to(root)): git('hash-object', str(p), cwd=cwd)
-                for p in sorted((root / PATCHES).glob('*/*.patch'))}
-    out = git('ls-tree', '-r', rev, '--', PATCHES, cwd=cwd)
-    found = {}
-    for line in out.splitlines():
-        meta, path = line.split('\t', 1)
-        if path.endswith('.patch') and path.count('/') == PATCHES.count('/') + 2:
-            found[path] = meta.split()[2]
-    return found
+    return {'schema': SCHEMA, 'components': picked, 'build_script': script_blob}
 
 
 def digest_of(data):
@@ -120,7 +95,7 @@ def inputs_at(rev=None, cwd=ROOT):
             blob = git('rev-parse', f'{rev}:{BUILD_SCRIPT}', cwd=cwd)
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
-    return inputs(lock, blob, patches_at(rev, cwd))
+    return inputs(lock, blob)
 
 
 def digest_at(rev=None, cwd=ROOT):

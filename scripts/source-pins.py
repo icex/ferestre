@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-NAMES = {'proton', 'wine', 'xgameruntime', 'vkd3d-proton', 'xodus'}
+NAMES = {'proton', 'wine', 'xgameruntime', 'vkd3d-proton', 'dxvk', 'xodus'}
 # Third-party packages Ferestre builds and hosts from an exact upstream commit.
 # Not forks, so they are validated apart from `components`.
 PACKAGES = {'dlssnr-amd'}
@@ -17,7 +17,7 @@ PACKAGES = {'dlssnr-amd'}
 def load(path=ROOT / 'sources.lock.json'):
     data = json.loads(path.read_text())
     if data.get('schema') != 1 or set(data.get('components', {})) != NAMES:
-        raise ValueError('source lock must name all five components')
+        raise ValueError('source lock must name all six components')
     for name, pin in data['components'].items():
         if not re.fullmatch(r'https://github\.com/icex/[A-Za-z0-9_.-]+\.git', pin['repository']):
             raise ValueError(name + ': expected an icex fork URL')
@@ -58,6 +58,7 @@ def verify_graph(pins, repos, require_clean=False):
         if require_clean and subprocess.run(['git','-C',str(repo),'diff','--quiet','--ignore-submodules=dirty','HEAD']).returncode:
             raise ValueError(name + ': source checkout contains uncommitted changes')
     for parent, sub, child in [('proton', 'wine', 'wine'), ('proton', 'vkd3d-proton', 'vkd3d-proton'),
+                               ('proton', 'dxvk', 'dxvk'),
                                ('wine', 'dlls/xgameruntime', 'xgameruntime')]:
         if parent not in repos:
             continue
@@ -129,7 +130,7 @@ def main():
                 subprocess.run(['git', '-C', str(repo), 'update-ref', 'HEAD', pin['commit']], check=True)
                 repos[name] = repo
             verify_graph(pins, repos)
-            print('All five public fork commits and nested source pins verified')
+            print('All six public fork commits and nested source pins verified')
 
 
 if __name__ == '__main__':
