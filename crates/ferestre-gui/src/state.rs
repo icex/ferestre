@@ -123,6 +123,8 @@ pub struct Model {
     /// The merchandised "All PC Games" ids within `gamepass`; the rest came
     /// from the tier feed and must be confirmed by the catalog to be listed.
     pub gamepass_merchandised: BTreeSet<String>,
+    /// The most popular of them, in order. `None` when never asked.
+    pub gamepass_popular: Option<Vec<String>>,
     pub subscriptions: Vec<&'static str>,
     pub entitlements_checked: bool,
     /// Which subscription tiers include which products. Joined against
@@ -425,7 +427,7 @@ impl Model {
         let cached = paths
             .as_ref()
             .and_then(|p| gamepass::load_cache(p.state_dir(), &market));
-        let (gamepass, gamepass_merchandised, tiers) = match cached {
+        let (gamepass, gamepass_merchandised, tiers, gamepass_popular) = match cached {
             Some(listing) => (
                 gamepass::complete_listing(&listing.product_ids, &listing.tiers),
                 listing
@@ -434,8 +436,14 @@ impl Model {
                     .map(|id| id.to_ascii_uppercase())
                     .collect(),
                 listing.tiers,
+                listing.popular,
             ),
-            None => (Vec::new(), BTreeSet::new(), gamepass::Tiers::default()),
+            None => (
+                Vec::new(),
+                BTreeSet::new(),
+                gamepass::Tiers::default(),
+                None,
+            ),
         };
         // Cached Game Pass rows must draw before background revalidation too.
         if let Some(paths) = &paths {
@@ -519,6 +527,7 @@ impl Model {
             avatar,
             gamepass,
             gamepass_merchandised,
+            gamepass_popular,
             subscriptions,
             entitlements_checked,
             tiers,
@@ -582,6 +591,7 @@ impl Model {
             icons,
             gamepass: std::mem::take(&mut self.gamepass),
             gamepass_merchandised: std::mem::take(&mut self.gamepass_merchandised),
+            gamepass_popular: self.gamepass_popular.take(),
             tiers: std::mem::take(&mut self.tiers),
             section: self.section,
             query: std::mem::take(&mut self.query),
@@ -1041,6 +1051,22 @@ impl Model {
         self.paths.as_ref().map(Paths::catalog_cache)
     }
 
+    /// `rows` with the most popular on Game Pass first, the rest as they were.
+    pub fn by_popularity<'a>(
+        &self,
+        rows: &'a [crate::model::LibraryRow],
+    ) -> Vec<&'a crate::model::LibraryRow> {
+        let popular = self.gamepass_popular.as_deref().unwrap_or_default();
+        let place = |id: &str| popular.iter().position(|p| p.eq_ignore_ascii_case(id));
+        let mut rows: Vec<_> = rows.iter().collect();
+        rows.sort_by_cached_key(|row| {
+            place(&row.product_id)
+                .or_else(|| place(&row.install_as.as_ref()?.0))
+                .unwrap_or(usize::MAX)
+        });
+        rows
+    }
+
     pub fn cache_dir(&self) -> Option<&Path> {
         self.paths.as_ref().map(Paths::cache_dir)
     }
@@ -1463,6 +1489,7 @@ mod tests {
             avatar: None,
             gamepass: Vec::new(),
             gamepass_merchandised: Default::default(),
+            gamepass_popular: None,
             subscriptions: Vec::new(),
             entitlements_checked: false,
             tiers: Default::default(),

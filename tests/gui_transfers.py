@@ -89,7 +89,7 @@ summary="Offline queue fixture"
  try:
   process,app,frame=start();s.select_in_list(frame,'My Library')
   for index,name in enumerate(names):
-   button=s.wait_for(frame,lambda root:s.row_button(root,name,'Install'),'Install '+name,time.monotonic()+s.TIMEOUT);s.click(button)
+   button=s.wait_for(frame,lambda root:s.row_button(root,name,'Install'),'Install '+name,time.monotonic()+s.TIMEOUT);s.open_install(frame,name)
    s.wait_for(frame,lambda root:any('Install '+name+'?' in t for t in s.texts(root)),'install confirmation',time.monotonic()+s.TIMEOUT)
    if index==1:
     library=home/'Custom Game Library'

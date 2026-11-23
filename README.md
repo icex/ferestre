@@ -8,7 +8,7 @@ Play compatible **Xbox PC and Microsoft Store games on Linux** using your Micros
 
 **[Download the AppImage](https://github.com/icex/ferestre/releases/download/v0.1.26/ferestre-0.1.26-x86_64.AppImage)** · [Compatible games](docs/COMPATIBILITY.md#the-matrix) · [Quick start](#quick-start) · [Report a problem](https://github.com/icex/ferestre/issues)
 
-![Ferestre's Home: a featured-game carousel, quick links and a Jump back in shelf, with installed games and their status in the sidebar](docs/screenshots/home.png)
+![Ferestre's Home: a featured-game carousel, quick links and a Jump back in shelf, with recent games and their status in the sidebar](docs/screenshots/home.png)
 
 <table>
   <tr>
@@ -79,7 +79,7 @@ Check the [compatibility list](docs/COMPATIBILITY.md#the-matrix) before a large 
 
 **Home** opens with a carousel of what is running, what you played last, games with updates and Game Pass titles. Below it are quick links, **Jump back in** with your installed games, and shelves of Game Pass and your library; **See all** opens the full list. The search at the top looks through your library and Game Pass.
 
-The sidebar lists every installed game, last played first, with its state: Running, Update ready, Queued, Downloading and so on. To turn it into a narrow rail of icons, switch on **Compact sidebar** in **Settings → Appearance** or in the account menu. Ferestre remembers the choice.
+The sidebar lists the games you played recently, last played first, with their state: Running, Update ready, Queued, Downloading and so on. To turn it into a narrow rail of icons, switch on **Compact sidebar** in **Settings → Appearance** or in the account menu. Ferestre remembers the choice.
 
 Results such as "Starting…" or a finished install appear together in the bottom-right corner, newest at the bottom. The bell beside your account keeps this session's notifications for any you missed. Behind a dialog the window blurs; it only dims instead when your desktop turns animations off or the graphics are too slow for blur.
 

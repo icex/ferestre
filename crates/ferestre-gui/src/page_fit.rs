@@ -1,5 +1,6 @@
-//! How many tiles a page of a list holds: as many whole rows of them as the
-//! view has room for. The page buttons stand below the list, outside what
+//! How many tiles a page of a list holds, and how large they are: whole rows
+//! and columns that use all of the view's room, with tiles near one size. The
+//! page buttons stand below the list, outside what
 //! scrolls, so they are in view whatever the page holds.
 use super::*;
 
@@ -7,7 +8,48 @@ use super::*;
 const LEAST: usize = 4;
 pub(crate) const ROW_SPACING: i32 = 22;
 pub(crate) const COLUMN_SPACING: i32 = 18;
-pub(crate) const MAX_COLUMNS: i32 = 14;
+pub(crate) const MAX_COLUMNS: i32 = 30;
+/// A tile's width: the one to be near, and how far from it one may be.
+const IDEAL: f64 = 190.0;
+const NARROWEST: i32 = 156;
+const WIDEST: i32 = 236;
+/// A cover's height for its width. It is 3:2; one a little off it is cropped.
+const COVER: f64 = 1.5;
+const FLATTEST: f64 = 1.26;
+const TALLEST: f64 = 1.62;
+
+/// A tile's width and its cover's height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Tile {
+    pub width: i32,
+    pub cover: i32,
+}
+
+pub(crate) const TILE: Tile = Tile {
+    width: 190,
+    cover: 285,
+};
+
+/// Until the view is measured.
+pub(crate) const FIRST: Fit = Fit {
+    columns: 10,
+    rows: 2,
+    tile: TILE,
+};
+
+/// How a page is laid out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Fit {
+    pub columns: usize,
+    pub rows: usize,
+    pub tile: Tile,
+}
+
+impl Fit {
+    fn tiles(&self) -> usize {
+        self.columns * self.rows
+    }
+}
 /// A resize reports every size on the way.
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(120);
 
@@ -95,20 +137,63 @@ impl Pager {
     }
 }
 
-/// The tiles that fit `width` by `height`, for tiles of this size.
-fn tiles(width: i32, height: i32, tile: (i32, i32)) -> usize {
-    let along =
-        |room: i32, each: i32, spacing: i32| ((room + spacing) / (each.max(1) + spacing)).max(1);
-    let columns = along(width, tile.0, COLUMN_SPACING).min(MAX_COLUMNS) as usize;
-    let rows = along(height, tile.1, ROW_SPACING) as usize;
-    // Whole rows, also when one row is fewer than the least.
-    let rows = rows.max(LEAST.div_ceil(columns));
-    columns * rows
+/// The layout that uses most of `width` by `height` with tiles nearest the
+/// ideal, for tiles with `text` under their cover.
+fn fit(width: i32, height: i32, text: i32) -> Fit {
+    let mut best: Option<(f64, Fit)> = None;
+    for columns in 1..=MAX_COLUMNS {
+        let each = (width - (columns - 1) * COLUMN_SPACING) / columns;
+        if each < NARROWEST && columns > 1 {
+            break;
+        }
+        let tile_width = each.min(WIDEST);
+        let unused = f64::from((each - tile_width) * columns) / f64::from(width.max(1));
+        let (low, high) = (
+            (f64::from(tile_width) * FLATTEST) as i32,
+            (f64::from(tile_width) * TALLEST) as i32,
+        );
+        for rows in 1.. {
+            let cover = (height - (rows - 1) * ROW_SPACING) / rows - text;
+            // One row is drawn even where it has to be scrolled to.
+            if cover < low && rows > 1 {
+                break;
+            }
+            let ratio = |cover: i32| f64::from(cover) / f64::from(tile_width.max(1));
+            let shown = if cover < low {
+                (f64::from(tile_width) * COVER) as i32
+            } else {
+                cover.min(high)
+            };
+            let spare = f64::from((cover - shown) * rows).abs() / f64::from(height.max(1));
+            let score = 1.5 * (f64::from(tile_width) / IDEAL).ln().abs()
+                + (ratio(shown) / COVER).ln().abs()
+                + 3.0 * (unused + spare);
+            if best.is_none_or(|(least, _)| score < least) {
+                let fit = Fit {
+                    columns: columns as usize,
+                    rows: (rows as usize).max(LEAST.div_ceil(columns as usize)),
+                    tile: Tile {
+                        width: tile_width,
+                        cover: shown,
+                    },
+                };
+                best = Some((score, fit));
+            }
+        }
+    }
+    best.map_or(
+        Fit {
+            columns: 1,
+            rows: LEAST,
+            tile: TILE,
+        },
+        |(_, fit)| fit,
+    )
 }
 
-/// What the page sizes should be for what is drawn now; `None` without tiles
+/// The layouts of the page drawn now and of the others; `None` without tiles
 /// or before the window has a size.
-fn measured(ui: &Ui) -> Option<(usize, usize)> {
+fn measured(ui: &Ui) -> Option<(Fit, Fit)> {
     fn find(root: &gtk::Widget, class: &str) -> Option<gtk::Widget> {
         if root.has_css_class(class) {
             return Some(root.clone());
@@ -147,23 +232,18 @@ fn measured(ui: &Ui) -> Option<(usize, usize)> {
         child = widget.next_sibling();
     }
     let pager = ui.pager.bar.measure(gtk::Orientation::Vertical, -1).1;
-    let mut tile = (0, 0);
+    let drawn = ui.tile.get();
+    let mut tallest = 0;
     let mut index = 0;
     while let Some(cell) = grid.child_at_index(index) {
-        tile.0 = tile.0.max(cell.measure(gtk::Orientation::Horizontal, -1).1);
+        tallest = tallest.max(cell.measure(gtk::Orientation::Vertical, drawn.tile.width).1);
         index += 1;
     }
-    for i in 0..index {
-        if let Some(cell) = grid.child_at_index(i) {
-            tile.1 = tile
-                .1
-                .max(cell.measure(gtk::Orientation::Vertical, tile.0).1);
-        }
-    }
-    let room = view - pager - above;
-    let rest = tiles(width, room + hero, tile);
+    let text = (tallest - drawn.tile.cover).max(0);
+    let room = view - pager - above - page.margin_bottom();
+    let rest = fit(width, room + hero, text);
     let first = if hero > 0 {
-        tiles(width, room, tile)
+        fit(width, room, text)
     } else {
         rest
     };
@@ -187,16 +267,18 @@ pub(crate) fn update(ui: &Ui) -> bool {
     };
     let mut model = ui.model.borrow_mut();
     let old = model.page_size;
-    // A later page does not show the hero the first one has above its list.
-    let first = if model.page > 0 && model.section == Section::GamePass {
-        old.0.min(rest)
+    // Drawn without the hero the first page has above its list, a later page
+    // cannot say how many that one holds.
+    let before = if model.page > 0 && model.section == Section::GamePass {
+        old.0.min(rest.tiles())
     } else {
-        first
+        first.tiles()
     };
-    let new = (first, rest);
-    if new == old {
+    let new = (before, rest.tiles());
+    if new == old && ui.tile.get() == first {
         return false;
     }
+    ui.tile.set(first);
     model.page = same_place(model.page, old, new);
     model.page_size = new;
     true
@@ -231,22 +313,47 @@ pub(crate) fn follow_size(ui: &Ui) {
 mod tests {
     use super::*;
 
+    /// What a layout leaves unused across and down.
+    fn spare(width: i32, height: i32, fit: Fit) -> (i32, i32) {
+        let (c, r) = (fit.columns as i32, fit.rows as i32);
+        (
+            width - c * fit.tile.width - (c - 1) * COLUMN_SPACING,
+            height - r * (fit.tile.cover + 98) - (r - 1) * ROW_SPACING,
+        )
+    }
+
     #[test]
-    fn a_page_is_the_whole_rows_that_fit() {
-        // A 1280x720 handheld, full screen, one row of 196x400.
-        assert_eq!(tiles(1216, 500, (196, 400)), 5);
-        assert_eq!(tiles(1216, 821, (196, 400)), 5);
-        assert_eq!(tiles(1216, 822, (196, 400)), 10);
-        // A very wide screen stops at the grid's columns.
-        assert_eq!(tiles(5000, 1300, (196, 400)), 42);
+    fn tiles_use_all_the_room_at_a_sensible_size() {
+        for width in (1000..5000).step_by(37) {
+            for height in (740..1500).step_by(41) {
+                let fit = fit(width, height, 98);
+                let (across, down) = spare(width, height, fit);
+                assert!(
+                    (0..=width / 25).contains(&across),
+                    "{width}x{height} {fit:?}"
+                );
+                assert!(
+                    (0..=height / 9).contains(&down),
+                    "{width}x{height} {fit:?} {down}"
+                );
+                assert!((NARROWEST..=WIDEST).contains(&fit.tile.width));
+            }
+        }
+    }
+
+    #[test]
+    fn a_wide_desktop_window_has_two_rows() {
+        let fit = fit(2127, 760, 98);
+        assert_eq!(fit.rows, 2, "{fit:?}");
+        assert!(fit.tiles() >= 20, "{fit:?}");
     }
 
     #[test]
     fn a_small_view_still_has_four() {
-        assert_eq!(tiles(1216, -50, (196, 400)), 5);
-        assert_eq!(tiles(420, 300, (196, 400)), 4);
-        assert_eq!(tiles(640, 300, (196, 400)), 6);
-        assert_eq!(tiles(100, 100, (196, 400)), 4);
+        assert!(fit(1216, -50, 98).tiles() >= 4);
+        assert!(fit(420, 300, 98).tiles() >= 4);
+        assert_eq!(fit(100, 100, 98).columns, 1);
+        assert_eq!(fit(100, 100, 98).rows, 4);
     }
 
     #[test]

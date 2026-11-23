@@ -2,9 +2,92 @@
 use super::*;
 use ferestre_core::product_details::{self, AgeRating, Details, PlayerRating, Requirement, Row};
 
+/// What the large button does, for a title with this id and name: a bundle's
+/// is the game in it.
+#[derive(Clone)]
+pub enum Main {
+    Install(String, String),
+    Resume(String, String),
+    Uninstall(String, String),
+}
+
+impl Main {
+    /// What there is to do for a row, if anything.
+    pub fn of(row: &LibraryRow) -> Option<Main> {
+        if row.local {
+            return None;
+        }
+        let (id, name) = row
+            .install_as
+            .clone()
+            .unwrap_or_else(|| (row.product_id.clone(), row.name.clone()));
+        match row.action {
+            Action::Install => Some(Main::Install(id, name)),
+            Action::Resume => Some(Main::Resume(id, name)),
+            Action::Stop | Action::Installing => None,
+            // As the menu's Delete: what is on disk is the row's own.
+            _ if row.installed => Some(Main::Uninstall(row.product_id.clone(), row.name.clone())),
+            _ => None,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Main::Install(..) => "Install",
+            Main::Resume(..) => "Resume install",
+            Main::Uninstall(..) => "Uninstall",
+        }
+    }
+
+    fn button(&self, ui: &Ui, dialog: &adw::Dialog) -> gtk::Button {
+        let (icons, class, name) = match self {
+            Main::Install(_, name) | Main::Resume(_, name) => (
+                ["folder-download-symbolic", "document-save-symbolic"],
+                "suggested-action",
+                name,
+            ),
+            Main::Uninstall(_, name) => (
+                ["user-trash-symbolic", "edit-delete-symbolic"],
+                "destructive-action",
+                name,
+            ),
+        };
+        // Not an adw::ButtonContent: that names the button after its label.
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        content.set_halign(gtk::Align::Center);
+        content.append(&icon(&icons, 18));
+        content.append(&gtk::Label::new(Some(self.label())));
+        let button = gtk::Button::builder()
+            .child(&content)
+            .width_request(320)
+            .height_request(54)
+            .halign(gtk::Align::Center)
+            .margin_top(10)
+            .margin_bottom(14)
+            .css_classes(["pill", "details-main", class])
+            .build();
+        button.update_property(&[gtk::accessible::Property::Label(&format!(
+            "{} {name}",
+            self.label()
+        ))]);
+        let (ui, dialog, main) = (ui.clone(), dialog.downgrade(), self.clone());
+        button.connect_clicked(move |_| {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
+            match &main {
+                Main::Install(id, name) => confirm_install(&ui, id, name),
+                Main::Resume(id, name) => resume_download(&ui, id, name),
+                Main::Uninstall(id, name) => confirm_remove(&ui, id, name),
+            }
+        });
+        button
+    }
+}
+
 /// `known` is what the window knows already. A local game has no Store page,
 /// and its id is not sent anywhere.
-pub fn open(ui: &Ui, product_id: &str, name: &str, known: &str, local: bool) {
+pub fn open(ui: &Ui, product_id: &str, name: &str, known: &str, local: bool, main: Option<&Main>) {
     let dialog = adw::Dialog::builder()
         .title(name)
         .content_width(900)
@@ -82,6 +165,13 @@ pub fn open(ui: &Ui, product_id: &str, name: &str, known: &str, local: bool) {
     view.add_top_bar(&tabs);
     view.set_content(Some(&stack));
     dialog.set_child(Some(&view));
+    // Under every tab, and where the focus starts.
+    if let Some(main) = main {
+        let button = main.button(ui, &dialog);
+        view.add_bottom_bar(&button);
+        dialog.set_default_widget(Some(&button));
+        dialog.set_focus(Some(&button));
+    }
     dialog.present(Some(&ui.window));
 }
 
@@ -415,7 +505,7 @@ fn carousel(ui: &Ui, urls: Vec<String>) -> Option<gtk::Box> {
         return None;
     }
     let carousel = adw::Carousel::builder()
-        .height_request(400)
+        .height_request(PICTURE_HEIGHT)
         .hexpand(true)
         // The wheel scrolls the page, which is longer than its pictures.
         .allow_scroll_wheel(false)
@@ -467,6 +557,10 @@ fn carousel(ui: &Ui, urls: Vec<String>) -> Option<gtk::Box> {
     all.append(&stage);
     all.append(&dots);
     all.set_visible(false);
+    let shown = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let waiting = bone(-1, PICTURE_HEIGHT);
+    shown.append(&waiting);
+    shown.append(&all);
 
     let (weak_all, weak) = (all.downgrade(), carousel.downgrade());
     glib::spawn_future_local(async move {
@@ -485,16 +579,82 @@ fn carousel(ui: &Ui, urls: Vec<String>) -> Option<gtk::Box> {
             picture.set_alternative_text(Some("Picture from the game’s Store page"));
             textures::set_picture(&picture, &path, textures::Size::Hero);
             carousel.append(&picture);
-            all.set_visible(true);
+            // Until the first one is decoded, not only fetched.
+            let reveal = {
+                let (all, waiting) = (all.downgrade(), waiting.downgrade());
+                move |picture: &gtk::Picture| {
+                    if picture.paintable().is_none() {
+                        return;
+                    }
+                    if let (Some(all), Some(waiting)) = (all.upgrade(), waiting.upgrade()) {
+                        waiting.set_visible(false);
+                        all.set_visible(true);
+                    }
+                }
+            };
+            picture.connect_paintable_notify(reveal.clone());
+            reveal(&picture);
+        }
+        // None could be fetched.
+        if weak.upgrade().is_some_and(|c| c.n_pages() == 0) {
+            waiting.set_visible(false);
         }
     });
-    Some(all)
+    Some(shown)
+}
+
+const PICTURE_HEIGHT: i32 = 400;
+
+/// A grey block where something is about to be.
+fn bone(width: i32, height: i32) -> gtk::Box {
+    let bone = gtk::Box::builder()
+        .width_request(width)
+        .height_request(height)
+        .css_classes(["skeleton"])
+        .accessible_role(gtk::AccessibleRole::Presentation)
+        .build();
+    if width > 0 {
+        bone.set_halign(gtk::Align::Start);
+    } else {
+        bone.set_hexpand(true);
+    }
+    bone
+}
+
+/// The shape of the overview below its name, until the catalog answers.
+fn skeleton() -> gtk::Box {
+    let all = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(18)
+        .accessible_role(gtk::AccessibleRole::Status)
+        .build();
+    all.update_property(&[gtk::accessible::Property::Label("Loading game details")]);
+    all.append(&bone(190, 22));
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    for end in [0, 40, 14, 260] {
+        let line = bone(-1, 14);
+        line.set_margin_end(end);
+        text.append(&line);
+    }
+    all.append(&text);
+    all.append(&bone(150, 22));
+    let cards = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    cards.set_homogeneous(true);
+    for _ in 0..3 {
+        cards.append(&bone(-1, 84));
+    }
+    all.append(&cards);
+    all
 }
 
 fn load(ui: &Ui, product_id: &str, shown: Page) {
     let (market, language) = ui.model.borrow().market();
-    let waiting = label("Asking Microsoft’s catalog…", &["dim-label"]);
+    let waiting = skeleton();
     shown.overview.append(&waiting);
+    let pictures = bone(-1, PICTURE_HEIGHT);
+    shown.top.append(&pictures);
+    let makers = bone(220, 14);
+    shown.head.append(&makers);
     let ui = ui.clone();
     let product_id = product_id.to_string();
     glib::spawn_future_local(async move {
@@ -506,13 +666,16 @@ fn load(ui: &Ui, product_id: &str, shown: Page) {
         if *ui.closing.borrow() {
             return;
         }
+        shown.overview.remove(&waiting);
+        shown.top.remove(&pictures);
+        shown.head.remove(&makers);
         match result {
             Ok(details) => {
-                shown.overview.remove(&waiting);
                 fill(&ui, &shown, details);
             }
             Err(error) => {
-                waiting.set_label(&format!("Microsoft’s catalog could not be read: {error}"))
+                let why = format!("Microsoft’s catalog could not be read: {error}");
+                shown.overview.append(&label(&why, &["dim-label"]));
             }
         }
     });

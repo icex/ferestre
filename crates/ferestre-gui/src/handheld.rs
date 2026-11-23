@@ -94,7 +94,6 @@ pub(super) fn install(
         header.set_show_back_button(!fullscreen);
         back.set_visible(!fullscreen);
         navigation.set_visible(fullscreen);
-        ui.controller_hints.set_visible(fullscreen);
         ui.split.set_collapsed(fullscreen || window.width() <= 860);
         ui.split.set_show_content(true);
         button.set_icon_name(if fullscreen {

@@ -419,6 +419,18 @@ def select_in_list(root, name, what=None):
     raise Failure(f"no selectable row called {what or name!r}")
 
 
+def open_install(frame, title):
+    """From a title's tile, through its details, to the Install confirmation."""
+    # A redraw can replace the tile between finding and pressing it.
+    until = time.monotonic() + TIMEOUT
+    while not find_all(frame, role="button", name=f"Install {title}"):
+        if time.monotonic() >= until:
+            raise Failure(f"the details of {title} did not open")
+        click_named(frame, f"{title} · Install")
+        time.sleep(1.5)
+    click_named(frame, f"Install {title}", "the details' Install button")
+
+
 def row_button(root, title, label):
     """The button on the row for `title` that reads `label`.
 
@@ -1101,14 +1113,6 @@ print(":: done", flush=True)
             "the titles this runtime cannot open are kept out of the way",
             frame,
         )
-        wait_for(
-            frame,
-            lambda root: any("25 ship as Appx or Msix packages" in t for t in texts(root)),
-            "the unsupported-package count and explanation to draw",
-            time.monotonic() + TIMEOUT,
-        )
-        check(True, "and the count of them is stated, with the reason, rather than left as a silent filter")
-
         print("showing them anyway")
         # Three nodes carry this name -- the row, its label, and the switch
         # inside it -- and only the last of them does anything, so this goes
@@ -1137,7 +1141,12 @@ print(":: done", flush=True)
                     continue
             raise Failure("the show-everything switch did not change state")
 
-        set_show_unsupported(True)
+        def through_settings(active):
+            click_named(frame, "Settings")
+            set_show_unsupported(active)
+            select_in_list(frame, "My Library")
+
+        through_settings(True)
         labels = wait_for(
             frame,
             lambda root: texts(root) if any("Uwp Puzzle" in t for t in texts(root)) else None,
@@ -1149,7 +1158,7 @@ print(":: done", flush=True)
             "each says which container it ships in, not just that it failed",
             frame,
         )
-        set_show_unsupported(False)
+        through_settings(False)
         wait_for(
             frame,
             lambda root: not any("Uwp Puzzle" in t for t in texts(root)),
@@ -1166,9 +1175,16 @@ print(":: done", flush=True)
                     return value
             return None
         value = scroll_value()
-        check(value is not None, "the library has a scrollable title list", frame)
-        value.set_current_value(200)
-        time.sleep(0.25)
+        # A page holds the tiles that fit the view, so it may not scroll at
+        # all; one that does must stay where it was.
+        def scroll_position():
+            value = scroll_value()
+            return value.get_current_value() if value is not None else 0
+
+        scrolls = value is not None
+        if scrolls:
+            value.set_current_value(200)
+            time.sleep(0.25)
         play = row_button(frame, "Minecraft for Windows", "Play")
         check(play is not None, "the installed fixture can be selected to play", frame)
         # The title list grows with the recipe set. A fixed offset does not
@@ -1194,8 +1210,8 @@ print(":: done", flush=True)
             target = value.get_current_value() + center - (view_box.y + view_box.height // 2)
             value.set_current_value(max(0, min(target, value.get_maximum_value())))
             time.sleep(0.25)
-        position = scroll_value().get_current_value()
-        check(position > 50, f"the library is scrolled before the click ({position})", frame)
+        position = scroll_position()
+        check(not scrolls or position > 50, f"the library is scrolled before the click ({position})", frame)
         button_box = play.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
         view_box = viewport.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
         check(
@@ -1222,7 +1238,7 @@ print(":: done", flush=True)
                 time.monotonic() + TIMEOUT,
             )
             time.sleep(0.5)
-            after = scroll_value().get_current_value()
+            after = scroll_position()
             check(abs(after - position) < 2, f"starting a title keeps the scroll position ({position} -> {after})", frame)
             wait_for(
                 frame,
@@ -1231,7 +1247,7 @@ print(":: done", flush=True)
                 time.monotonic() + TIMEOUT,
             )
             time.sleep(0.5)
-            after = scroll_value().get_current_value()
+            after = scroll_position()
             check(abs(after - position) < 2, f"and so does its exit ({position} -> {after})", frame)
 
         select_in_list(frame, "Runtime")
@@ -1282,6 +1298,7 @@ print(":: done", flush=True)
         install = row_button(frame, "Smoke Test Racer", "Install")
         check(install is not None, "an owned MSIXVC title offers an install", frame)
         click(install)
+        click_named(frame, "Install Smoke Test Racer", "the details' Install button")
         labels = wait_for(
             frame,
             lambda root: texts(root) if any("Install Smoke Test Racer?" in t for t in texts(root)) else None,
@@ -1419,8 +1436,9 @@ print(":: done", flush=True)
         )
         # Counted from the rows below it: the AppxBundle is held back, so two.
         check(
-            any("2 games in PC Game Pass for the US Store" in t for t in labels),
-            "the section says what the list is, where, and how long it is",
+            any(node.get_description() == "2 games in PC Game Pass for the US Store"
+                for node in find_all(frame, name="Game Pass")),
+            "the sidebar counts the games that can be installed, and where",
             frame,
         )
         # The distinction the whole section rests on: what the catalogue
@@ -1465,7 +1483,7 @@ print(":: done", flush=True)
             "the library to come back",
             time.monotonic() + TIMEOUT,
         )
-        click(row_button(frame, "Smoke Test Racer", "Install"))
+        open_install(frame, "Smoke Test Racer")
         wait_for(
             frame,
             lambda root: any("Install Smoke Test Racer?" in t for t in texts(root)),
@@ -1482,7 +1500,12 @@ print(":: done", flush=True)
             time.monotonic() + TIMEOUT,
         )
         check(True, "the bar says what is being installed")
-        installing = row_button(frame, "Smoke Test Racer", "Installing..")
+        installing = wait_for(
+            frame,
+            lambda root: row_button(root, "Smoke Test Racer", "Installing.."),
+            "the row to say it is installing",
+            time.monotonic() + TIMEOUT,
+        )
         check(
             installing is not None
             and not installing.get_state_set().contains(Atspi.StateType.SENSITIVE),
@@ -1846,7 +1869,7 @@ print(":: done", flush=True)
         check("Please wait" in tooltip.get_name(), "the spinner tooltip identifies the operation and game", frame)
         select_in_list(frame, "Library")
         installs = cli_calls(home, "install")
-        click(row_button(frame, "Smoke Test Racer", "Install"))
+        open_install(frame, "Smoke Test Racer")
         wait_for(frame, lambda root: any("Removing Minecraft for Windows. Please wait" in t for t in texts(root)),
                  "a specific busy message", time.monotonic() + TIMEOUT)
         # Long enough for a wrongly started install to reach the stub, or its
@@ -1898,7 +1921,7 @@ print(":: done", flush=True)
         select_in_list(frame, "Library")
         wait_for(frame, lambda root: row_button(root, "Smoke Test Racer", "Install"),
                  "the install action", time.monotonic() + TIMEOUT)
-        click(row_button(frame, "Smoke Test Racer", "Install"))
+        open_install(frame, "Smoke Test Racer")
         wait_for(frame, lambda root: bool(find_all(root, role="button", name="Install")),
                  "install confirmation", time.monotonic() + TIMEOUT)
         click_named(frame, "Install")

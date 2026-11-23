@@ -49,8 +49,9 @@ fn tagline(model: &Model, row: &LibraryRow, gamepass: bool) -> String {
 
 /// The titles the carousel would show if their banners were on disk, in the
 /// order [`features`] picks from, so their landscape art can be fetched.
-pub(crate) fn hero_candidates(library: &[LibraryRow], gamepass: &[LibraryRow]) -> Vec<String> {
-    const LOOK_AHEAD: usize = 12;
+pub(crate) fn hero_candidates(library: &[LibraryRow], gamepass: &[&LibraryRow]) -> Vec<String> {
+    // The carousel and the Featured cards, and some without wide art.
+    const LOOK_AHEAD: usize = 18;
     let mut ids: Vec<String> = Vec::new();
     let mut push = |row: &LibraryRow| {
         let id = row.product_id.to_ascii_uppercase();
@@ -67,12 +68,16 @@ pub(crate) fn hero_candidates(library: &[LibraryRow], gamepass: &[LibraryRow]) -
         .iter()
         .filter(|r| r.has_update())
         .for_each(&mut push);
-    gamepass.iter().filter(|r| !r.installed).for_each(&mut push);
+    gamepass
+        .iter()
+        .copied()
+        .filter(|r| !r.installed)
+        .for_each(&mut push);
     library.iter().for_each(&mut push);
     ids
 }
 
-fn features(model: &Model, library: &[LibraryRow], gamepass: &[LibraryRow]) -> Vec<Feature> {
+fn features(model: &Model, library: &[LibraryRow], gamepass: &[&LibraryRow]) -> Vec<Feature> {
     // Only art that is on disk: a title shown on a path with nothing behind
     // it was a blank banner in the carousel.
     let hero = |id: &str| model.wide_art(id);
@@ -634,7 +639,9 @@ fn feature_button(ui: &Ui, row: &LibraryRow, child: &impl IsA<gtk::Widget>) -> g
         }
     };
     button.set_widget_name(&format!("feature-{}-primary", row.product_id));
-    button.set_child(Some(child));
+    let surface = gtk::Overlay::builder().child(child).build();
+    effects::shimmer(&button, &surface);
+    button.set_child(Some(&surface));
     button.remove_css_class("suggested-action");
     button.remove_css_class("destructive-action");
     button.add_css_class("art-button");
@@ -731,7 +738,7 @@ fn landscape(ui: &Ui, row: &LibraryRow) -> gtk::Widget {
         .last_child()
         .and_then(|w| w.downcast::<gtk::Button>().ok())
     else {
-        return game_card(ui, row).upcast();
+        return game_card(ui, row, page_fit::TILE).upcast();
     };
     actions.remove(&primary);
     primary.set_child(Some(&overlay));
@@ -1078,8 +1085,9 @@ pub(crate) fn render_home(ui: &Ui, page: &gtk::Box) -> bool {
         return true;
     }
     let mut seen = std::collections::HashSet::new();
-    artwork::request_heroes(ui, hero_candidates(&library.rows, &gamepass.rows));
-    let hero_items = features(&ui.model.borrow(), &library.rows, &gamepass.rows);
+    let popular = ui.model.borrow().by_popularity(&gamepass.rows);
+    artwork::request_heroes(ui, hero_candidates(&library.rows, &popular));
+    let hero_items = features(&ui.model.borrow(), &library.rows, &popular);
     for f in &hero_items {
         seen.insert(f.row.product_id.to_ascii_uppercase());
     }
@@ -1112,7 +1120,7 @@ pub(crate) fn render_home(ui: &Ui, page: &gtk::Box) -> bool {
     }
     let jump = take(installed, &mut shown);
     let pass = take(
-        gamepass.rows.iter().filter(|r| !r.installed).collect(),
+        popular.iter().copied().filter(|r| !r.installed).collect(),
         &mut shown,
     );
     let owned = take(
@@ -1131,22 +1139,29 @@ pub(crate) fn render_home(ui: &Ui, page: &gtk::Box) -> bool {
         page,
         "From PC Game Pass",
         Some(Section::GamePass),
-        pass.iter().map(|r| game_card(ui, r).upcast()).collect(),
+        pass.iter()
+            .map(|r| game_card(ui, r, page_fit::TILE).upcast())
+            .collect(),
     );
     shelf(
         ui,
         page,
         "Your library",
         Some(Section::Library),
-        owned.iter().map(|r| game_card(ui, r).upcast()).collect(),
+        owned
+            .iter()
+            .map(|r| game_card(ui, r, page_fit::TILE).upcast())
+            .collect(),
     );
     // Featured: Game Pass titles with banners that the hero is not showing.
     let featured_rows: Vec<Feature> = {
         let model = ui.model.borrow();
         let cache = model.catalog_cache();
-        gamepass
-            .rows
+        popular
             .iter()
+            .copied()
+            // Playing it already is not what a feature is for.
+            .filter(|r| !r.installed)
             .filter(|r| !seen.contains(&r.product_id.to_ascii_uppercase()))
             .filter_map(|r| {
                 let art = cache.as_ref().and_then(|c| c.hero_path(&r.product_id))?;
@@ -1231,8 +1246,9 @@ pub(crate) fn gamepass_hero(ui: &Ui, page: &gtk::Box) {
         Listing::All,
     )
     .rows;
-    artwork::request_heroes(ui, hero_candidates(&[], &rows));
-    let items = features(&ui.model.borrow(), &[], &rows);
+    let popular = ui.model.borrow().by_popularity(&rows);
+    artwork::request_heroes(ui, hero_candidates(&[], &popular));
+    let items = features(&ui.model.borrow(), &[], &popular);
     hero(ui, page, items);
 }
 

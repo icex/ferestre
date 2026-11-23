@@ -220,6 +220,88 @@ pub(crate) fn duration(ms: u32) -> u32 {
     }
 }
 
+/// How long the light takes over a tile (the CSS has the same), and how soon
+/// after being left a tile is the same one still: a redraw replaces it.
+const SHIMMER_MS: u64 = 850;
+const SAME_TILE: std::time::Duration = std::time::Duration::from_millis(500);
+
+thread_local! {
+    /// The tile selected last, and when it was left.
+    static SELECTED: RefCell<Option<(String, Option<std::time::Instant>)>> =
+        const { RefCell::new(None) };
+}
+
+/// Whether selecting `name` is news, for the last one selected.
+fn newly_selected(last: &Option<(String, Option<std::time::Instant>)>, name: &str) -> bool {
+    match last {
+        Some((last, left)) if last == name => left.is_some_and(|at| at.elapsed() >= SAME_TILE),
+        _ => true,
+    }
+}
+
+/// A band of light over `surface` when `button` is selected: by the pointer,
+/// the keyboard or a controller.
+pub(crate) fn shimmer(button: &impl IsA<gtk::Widget>, surface: &gtk::Overlay) {
+    let light = gtk::Box::builder()
+        .can_target(false)
+        .can_focus(false)
+        .css_classes(["tile-shimmer"])
+        .accessible_role(gtk::AccessibleRole::Presentation)
+        .build();
+    surface.add_overlay(&light);
+    let button = button.upcast_ref::<gtk::Widget>();
+    let select = {
+        let (button, light) = (button.downgrade(), light.downgrade());
+        move || {
+            let (Some(button), Some(light)) = (button.upgrade(), light.upgrade()) else {
+                return;
+            };
+            let name = button.widget_name().to_string();
+            let news = SELECTED.with(|s| newly_selected(&s.borrow(), &name));
+            SELECTED.with(|s| s.replace(Some((name, None))));
+            if !news || !animations_enabled() || light.has_css_class("run") {
+                return;
+            }
+            light.add_css_class("run");
+            let light = light.downgrade();
+            let length = std::time::Duration::from_millis(SHIMMER_MS + 50);
+            glib::timeout_add_local_once(length, move || {
+                if let Some(light) = light.upgrade() {
+                    light.remove_css_class("run");
+                }
+            });
+        }
+    };
+    let leave = {
+        let button = button.downgrade();
+        move || {
+            let Some(button) = button.upgrade() else {
+                return;
+            };
+            let name = button.widget_name();
+            SELECTED.with(|s| {
+                if let Some((last, left)) = s.borrow_mut().as_mut() {
+                    if *last == name {
+                        *left = Some(std::time::Instant::now());
+                    }
+                }
+            });
+        }
+    };
+    let focus = gtk::EventControllerFocus::new();
+    let on = select.clone();
+    focus.connect_enter(move |_| on());
+    let off = leave.clone();
+    focus.connect_leave(move |_| off());
+    button.add_controller(focus);
+    let pointer = gtk::EventControllerMotion::new();
+    pointer.connect_enter(move |_, _, _| select());
+    let off = leave.clone();
+    pointer.connect_leave(move |_| off());
+    button.add_controller(pointer);
+    button.connect_unmap(move |_| leave());
+}
+
 /// Frosted glass on surfaces drawn inside the window, where GTK can do it:
 /// `backdrop-filter` arrived in GTK 4.22, and an older GTK would only print a
 /// parse warning for it, so this is a second stylesheet loaded on 4.22 and
@@ -239,8 +321,22 @@ pub(crate) fn load_glass(display: &gdk::Display) {
 
 const GLASS: &str = "
 window.blur-ok .notification, window.blur-ok .notification-more {
-  background-color: alpha(#24272d, 0.68);
-  backdrop-filter: blur(18px);
+  background-color: alpha(#24272d, 0.56);
+  backdrop-filter: blur(22px) saturate(1.35);
+  box-shadow: 0 8px 28px alpha(black, 0.45), inset 0 0 0 1px alpha(white, 0.10);
+}
+window.blur-ok floating-sheet > sheet, window.blur-ok bottom-sheet > sheet {
+  background-color: alpha(#22252b, 0.58);
+  backdrop-filter: blur(26px) saturate(1.4);
+  box-shadow: 0 18px 60px alpha(black, 0.55), inset 0 0 0 1px alpha(white, 0.11);
+}
+/* What stands on the glass must not paint over it. */
+window.blur-ok floating-sheet > sheet toolbarview, window.blur-ok floating-sheet > sheet scrolledwindow,
+window.blur-ok floating-sheet > sheet preferencespage, window.blur-ok floating-sheet > sheet headerbar {
+  background-color: transparent;
+}
+window.blur-ok.dialog-open floating-sheet > dimming, window.blur-ok.dialog-open bottom-sheet > dimming {
+  background-color: alpha(black, 0.30);
 }
 window.blur-ok .search-pill {
   background-color: alpha(#2a2d33, 0.7);
@@ -263,5 +359,18 @@ mod tests {
     fn a_software_frame_decides_at_once() {
         assert_eq!(slow_verdict(16_700, HOPELESS_FRAME, 0), Some(true));
         assert_eq!(slow_verdict(900_000, 900_000, 0), Some(true));
+    }
+
+    #[test]
+    fn a_redrawn_tile_is_not_a_new_selection() {
+        let now = std::time::Instant::now();
+        assert!(newly_selected(&None, "a"));
+        assert!(!newly_selected(&Some(("a".into(), None)), "a"));
+        assert!(!newly_selected(&Some(("a".into(), Some(now))), "a"));
+        assert!(newly_selected(
+            &Some(("a".into(), Some(now - 2 * SAME_TILE))),
+            "a"
+        ));
+        assert!(newly_selected(&Some(("a".into(), None)), "b"));
     }
 }

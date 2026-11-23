@@ -21,7 +21,7 @@ show an Update available badge on their cover, including while running; current
 installs and unknown update checks show no badge. The search is a pill centred
 above the page and looks through your library and Game Pass.
 
-The sidebar has Home, Game Pass and My Library, then every installed title,
+The sidebar has Home, Game Pass and My Library, then the titles played recently,
 last played first, with a status line: Downloading N%, Paused, Queued, Update
 ready, Running, Playable with issues, Menus only, Does not run, or Unavailable
 to this account. While the install queue has work, a Downloads button with a
@@ -91,6 +91,8 @@ search, LB/RB change sections, View opens navigation and Menu opens the focused
 game's options. In navigation, ↑/↓ chooses an item; → or A enters its games.
 The stick moves spatially through banners, section tabs, game cards and paging.
 The focused control has a persistent green outline and scrolls into view.
+Button hints show at the bottom while a controller is in use, and go when the
+mouse or keyboard is.
 Xbox Home/Guide or PlayStation PS on any connected mapped controller brings the
 main Ferestre window forward. Controllers plugged in after startup are discovered
 by SDL event pumping,

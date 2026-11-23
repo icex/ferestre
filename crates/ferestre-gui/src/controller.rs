@@ -643,20 +643,14 @@ pub(super) fn update_hints(ui: &Ui) {
     if ui.controller_hints.label().as_str() != markup {
         ui.controller_hints.set_markup(&markup);
     }
-    ui.navigation_hint.set_markup(&format!(
-        "↑ / ↓ Choose   ·   → Games
-{a} Open   ·   {b} Return"
-    ));
-    ui.navigation_hint.set_visible(
-        ui.controller_connected.get()
-            || ui.window.is_fullscreen()
-            || ui.window.has_css_class("controller-navigation"),
-    );
-    ui.controller_hints.set_visible(
-        ui.controller_connected.get()
-            || ui.window.is_fullscreen()
-            || ui.window.has_css_class("controller-navigation"),
-    );
+    ui.controller_hints
+        .set_visible(ui.controller_connected.get() && ui.controller_in_use.get());
+}
+/// The mouse or the keyboard is in use: its help is not a controller's.
+fn controller_put_down(ui: &Ui) {
+    if ui.controller_in_use.replace(false) {
+        update_hints(ui);
+    }
 }
 pub(super) fn show_help(ui: &Ui) {
     let (a, b, y, view, menu, shoulders) = ui.controller_family.get().controls();
@@ -1390,6 +1384,7 @@ pub(super) fn install(ui: &Ui) {
     let key_ui = ui.clone();
     keys.connect_key_pressed(move |_, key, _, modifiers| {
         key_ui.pending_tab_focus.set(None);
+        controller_put_down(&key_ui);
         if key == gdk::Key::F11 {
             dispatch(&key_ui, Action::Fullscreen);
             return glib::Propagation::Stop;
@@ -1467,13 +1462,29 @@ pub(super) fn install(ui: &Ui) {
     let pointer = gtk::GestureClick::new();
     pointer.set_button(0);
     pointer.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let pointer_ui = ui.clone();
     let pointer_window = ui.window.clone();
     let pointer_pending = ui.pending_tab_focus.clone();
     pointer.connect_pressed(move |_, _, _, _| {
         pointer_pending.set(None);
-        pointer_window.remove_css_class("controller-navigation")
+        pointer_window.remove_css_class("controller-navigation");
+        controller_put_down(&pointer_ui);
     });
     ui.window.add_controller(pointer);
+    // GTK also reports motion when widgets move under a pointer that is still.
+    let motion = gtk::EventControllerMotion::new();
+    motion.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let motion_ui = ui.clone();
+    let at = Cell::new(None::<(f64, f64)>);
+    motion.connect_motion(move |_, x, y| {
+        let moved = at
+            .replace(Some((x, y)))
+            .is_some_and(|(was_x, was_y)| (x - was_x).abs() + (y - was_y).abs() > 1.0);
+        if moved {
+            controller_put_down(&motion_ui);
+        }
+    });
+    ui.window.add_controller(motion);
     let Some(mut pad) = Pad::load() else {
         return;
     };
@@ -1527,6 +1538,7 @@ pub(super) fn install(ui: &Ui) {
         }
         for (family, action) in controllers.actions(&samples, Instant::now()) {
             ui.controller_family.set(family);
+            ui.controller_in_use.set(true);
             dispatch(&ui, action);
         }
         glib::ControlFlow::Continue

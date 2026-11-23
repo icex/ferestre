@@ -1,4 +1,4 @@
-//! The sidebar's lower half: every installed title with a status line, and a
+//! The sidebar's lower half: the titles played last with a status line, and a
 //! downloads button while the install queue has work.
 //!
 //! The list is drawn from the same rows the game cards are ([`draw_list`]),
@@ -66,8 +66,119 @@ fn percent(ui: &Ui) -> u32 {
     (ui.download.bar.fraction().clamp(0.0, 1.0) * 100.0).round() as u32
 }
 
-/// Redraw the Installed list, if anything it shows changed.
-pub(crate) fn render_installed(ui: &Ui) {
+/// A count at the end of a section's row, hidden until there is one.
+pub(crate) fn count_badge(section: Section) -> gtk::Label {
+    let badge = gtk::Label::builder()
+        .css_classes(["nav-count"])
+        .valign(gtk::Align::Center)
+        .accessible_role(gtk::AccessibleRole::Presentation)
+        .visible(false)
+        .build();
+    badge.set_widget_name(&format!("nav-count-{}", section.title()));
+    badge
+}
+
+/// How many games `rows` can install, or have installed. What cannot be
+/// installed is not counted, and a game listed as itself and as the bundle it
+/// is sold in is counted once. Not by what they install: Minecraft's games
+/// all install its launcher.
+pub(crate) fn installable(rows: &[LibraryRow]) -> usize {
+    rows.iter()
+        .filter(|row| !row.known_uninstallable() && row.unavailable.is_none())
+        .filter(|row| !matches!(row.action, Action::Blocked(_) | Action::Content))
+        .map(|row| {
+            row.name
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+/// Games on this machine, from any store. Add-ons are not games.
+fn installed_games(rows: &[LibraryRow]) -> usize {
+    rows.iter()
+        .filter(|row| row.installed && row.action != Action::Content)
+        .count()
+}
+
+pub(crate) fn render_counts(ui: &Ui) {
+    let downloading = ui
+        .download
+        .current
+        .borrow()
+        .as_ref()
+        .map(|d| d.product_id.clone());
+    let rows = |section: Section| {
+        draw_list(
+            &ui.model.borrow(),
+            &ui.running.borrow(),
+            downloading.as_deref(),
+            NameLookups {
+                asked: &ui.asked_names.borrow(),
+                fetching: ui.fetching_names.get(),
+            },
+            section,
+            |_| true,
+            Listing::All,
+        )
+        .rows
+    };
+    let pass = installable(&rows(Section::GamePass));
+    let mine = installed_games(&rows(Section::Installed));
+    let games = |n: usize| if n == 1 { "game" } else { "games" };
+    let about_pass = {
+        let model = ui.model.borrow();
+        match (&model.account, model.subscriptions.as_slice()) {
+            (Some(store), [_, ..]) if model.entitlements_checked => format!(
+                "{pass} {} {} can install with {}",
+                games(pass),
+                store.label(),
+                model.subscriptions.join(" and ")
+            ),
+            _ => format!(
+                "{pass} {} in PC Game Pass for the {} Store",
+                games(pass),
+                model.market().0
+            ),
+        }
+    };
+    for (section, count, about) in [
+        (Section::GamePass, pass, about_pass),
+        (
+            Section::Library,
+            mine,
+            format!("{mine} {} installed", games(mine)),
+        ),
+    ] {
+        let name = format!("nav-count-{}", section.title());
+        let Some(badge) = named_widget(ui.sidebar.upcast_ref(), &name) else {
+            continue;
+        };
+        if let Some(badge) = badge.downcast_ref::<gtk::Label>() {
+            badge.set_label(&count.to_string());
+        }
+        badge.set_visible(count > 0 && !ui.compact.get());
+        let Some(row) = badge.ancestor(gtk::ListBoxRow::static_type()) else {
+            continue;
+        };
+        if count > 0 {
+            row.set_tooltip_text(Some(&format!("{} · {about}", section.title())));
+            row.update_property(&[gtk::accessible::Property::Description(&about)]);
+        } else {
+            row.set_tooltip_text(Some(section.title()));
+            row.reset_property(gtk::AccessibleProperty::Description);
+        }
+    }
+}
+
+/// How many titles Recently played shows.
+const RECENT: usize = 10;
+
+/// Redraw Recently played, if anything it shows changed.
+pub(crate) fn render_recent(ui: &Ui) {
     let downloading = ui
         .download
         .current
@@ -88,18 +199,19 @@ pub(crate) fn render_installed(ui: &Ui) {
         |row| row.installed,
         Listing::All,
     );
-    let mut titles: Vec<(Option<std::time::SystemTime>, LibraryRow)> = {
+    let mut titles: Vec<(std::time::SystemTime, LibraryRow)> = {
         let model = ui.model.borrow();
         drawn
             .rows
             .into_iter()
-            .map(|row| (model.last_played(&row.product_id), row))
+            .filter_map(|row| Some((model.last_played(&row.product_id)?, row)))
             .collect()
     };
     titles.sort_by(|a, b| {
         b.0.cmp(&a.0)
             .then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
     });
+    titles.truncate(RECENT);
     let lines: Vec<(LibraryRow, Option<Status>, bool)> = {
         let model = ui.model.borrow();
         titles
@@ -144,7 +256,7 @@ pub(crate) fn render_installed(ui: &Ui) {
     ui.sidebar_progress.replace(None);
     ui.recent_games.append(
         &gtk::Label::builder()
-            .label("Installed")
+            .label("Recently played")
             .xalign(0.0)
             .margin_top(10)
             .margin_bottom(4)
@@ -156,7 +268,7 @@ pub(crate) fn render_installed(ui: &Ui) {
     if lines.is_empty() && !compact {
         ui.recent_games.append(
             &gtk::Label::builder()
-                .label("Your installed games appear here")
+                .label("Games you play appear here")
                 .wrap(true)
                 .xalign(0.0)
                 .margin_start(6)
@@ -364,7 +476,8 @@ pub(crate) fn set_compact(ui: &Ui, compact: bool) {
     while let Some(widget) = row {
         if let Some(label) = widget
             .first_child()
-            .and_then(|content| content.last_child())
+            .and_then(|content| content.first_child())
+            .and_then(|icon| icon.next_sibling())
             .filter(|w| w.has_css_class("nav-label"))
         {
             label.set_visible(!compact);
@@ -393,7 +506,6 @@ pub(crate) fn set_compact(ui: &Ui, compact: bool) {
             hide_labels(&button, compact);
         }
     }
-    ui.navigation_hint.set_visible(false);
     ui.recents_fingerprint.set(0);
     render(ui);
 }

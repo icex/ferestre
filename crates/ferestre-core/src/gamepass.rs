@@ -34,6 +34,9 @@ use std::path::{Path, PathBuf};
 /// window with a few hundred wrong titles and look like it worked.
 pub const ALL_PC_GAMES: &str = "fdd9e2a7-0fee-49f6-ad69-4354098401ff";
 
+/// The "Most popular" collection of PC Game Pass, most popular first.
+pub const MOST_POPULAR_PC: &str = "a884932a-f02b-40c8-a903-a008c23b1df1";
+
 const HOST: &str = "https://catalog.gamepass.com";
 
 /// The subscription products an entitlement list can carry.
@@ -82,6 +85,11 @@ pub fn active(entries: &[Entry]) -> Vec<&'static str> {
 /// the rest are `{"id": "9NBLGGH2JHXJ"}`. Both shapes are in one array, which
 /// is why this is a hand-written pass rather than a `Vec<Something>`.
 pub fn parse(json: &str) -> Result<Vec<String>> {
+    parse_titled(json, "pc")
+}
+
+/// As [`parse`], for a collection with `word` in its title.
+fn parse_titled(json: &str, word: &str) -> Result<Vec<String>> {
     let document: serde_json::Value =
         serde_json::from_str(json).map_err(|e| anyhow!("not JSON: {e}"))?;
     let items = document
@@ -97,9 +105,10 @@ pub fn parse(json: &str) -> Result<Vec<String>> {
         .and_then(|first| first.get("title"))
         .and_then(|title| title.as_str());
     if let Some(title) = title {
-        if !title.to_ascii_lowercase().contains("pc") {
+        if !title.to_ascii_lowercase().contains(word) {
             return Err(anyhow!(
-                "this collection is {title:?}, which is not a PC one -- check the sigl id"
+                "this collection is {title:?}, which is not a {} one -- check the sigl id",
+                word.to_uppercase()
             ));
         }
     }
@@ -237,6 +246,12 @@ pub fn fetch(market: &str, language: &str) -> Result<Vec<String>> {
     parse(&body)
 }
 
+/// The titles most played now, the first the most.
+pub fn fetch_popular(market: &str, language: &str) -> Result<Vec<String>> {
+    let body = crate::http::get_text(&url(MOST_POPULAR_PC, market, language))?;
+    parse_titled(&body, "popular")
+}
+
 /// The merchandised "All PC Games" list can omit installable PC products.
 /// Forza Horizon 6 (9NR1R1XWLCNB) was absent from that feed while its
 /// PCSubMetadata said Included. Supplement it using explicit PC inclusion;
@@ -276,6 +291,9 @@ pub struct Listing {
     /// warn about titles that moved between tiers in between.
     #[serde(default)]
     pub tiers: Tiers,
+    /// The most popular, in order. `None` in a file from before it was kept.
+    #[serde(default)]
+    pub popular: Option<Vec<String>>,
 }
 
 /// Version 2 is where the tier map joined the listing. A version-1 file parses
@@ -294,6 +312,7 @@ pub fn save_cache(
     market: &str,
     product_ids: &[String],
     tiers: &Tiers,
+    popular: Option<&[String]>,
 ) -> Result<()> {
     std::fs::create_dir_all(state_dir)?;
     let listing = Listing {
@@ -305,6 +324,7 @@ pub fn save_cache(
         market: market.to_string(),
         product_ids: product_ids.to_vec(),
         tiers: tiers.clone(),
+        popular: popular.map(<[String]>::to_vec),
     };
     crate::cache::write(
         &cache_path(state_dir),
@@ -514,6 +534,13 @@ mod tests {
     }
 
     #[test]
+    fn the_popular_list_keeps_its_order_and_must_be_the_popular_one() {
+        let json = r#"[{"title":"Most popular"},{"id":"9zzb"},{"id":"9ZZA"},{"id":"9ZZB"}]"#;
+        assert_eq!(parse_titled(json, "popular").unwrap(), ["9ZZB", "9ZZA"]);
+        assert!(parse_titled(r#"[{"title":"All PC Games"},{"id":"9ZZB"}]"#, "popular").is_err());
+    }
+
+    #[test]
     fn the_url_carries_the_market_and_language() {
         let url = url(ALL_PC_GAMES, "GB", "en-gb");
         assert!(url.contains(ALL_PC_GAMES));
@@ -526,8 +553,20 @@ mod tests {
     #[test]
     fn a_cached_listing_is_only_used_for_the_market_it_was_fetched_for() {
         let dir = std::env::temp_dir().join(format!("ferestre-gp-{}", std::process::id()));
-        save_cache(&dir, "US", &["9NBLGGH2JHXJ".into()], &Tiers::default()).expect("writes");
-        assert!(load_cache(&dir, "US").is_some());
+        let popular = ["9ZZPOPULAR02".to_string(), "9ZZPOPULAR01".to_string()];
+        save_cache(
+            &dir,
+            "US",
+            &["9NBLGGH2JHXJ".into()],
+            &Tiers::default(),
+            Some(&popular),
+        )
+        .expect("writes");
+        assert_eq!(
+            load_cache(&dir, "US").unwrap().popular.unwrap(),
+            popular,
+            "in the service's order"
+        );
         assert!(load_cache(&dir, "GB").is_none(), "not this market's list");
         assert!(
             load_cache(&dir, "us").is_some(),

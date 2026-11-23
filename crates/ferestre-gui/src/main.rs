@@ -23,6 +23,7 @@ mod folder_picker;
 mod handheld;
 mod home;
 mod install_drives;
+mod launch_show;
 mod launch_state;
 mod max_width;
 mod model;
@@ -69,6 +70,9 @@ const STYLE: &str = "
 window label.details-stars { color: #f5c211; letter-spacing: 2px; }
 .details-badge { background: alpha(white, .12); border-radius: 10px; padding: 10px 8px; font-size: 1.2em; font-weight: 800; }
 .details-stage { border-radius: 16px; }
+@keyframes skeleton { from { background-position: 140% 0; } to { background-position: -40% 0; } }
+.skeleton { border-radius: 10px; background-color: alpha(white, 0.07); background-image: linear-gradient(100deg, alpha(white, 0) 40%, alpha(white, 0.09) 50%, alpha(white, 0) 60%); background-size: 300% 100%; background-repeat: no-repeat; animation: skeleton 1500ms linear infinite; }
+window.reduced-motion .skeleton { background-image: none; animation: none; }
 .details-id .subtitle { font-family: monospace; }
 
 @define-color window_bg_color #1b1d21;
@@ -286,12 +290,17 @@ button.see-all { padding: 0 14px; font-weight: 600; color: #c9ccd2; }
 .game-card, .game-tile, button.game-tile, .game-launch-overlay { border-radius: 14px; }
 .game-tile picture, .game-card picture { border-radius: 14px 14px 0 0; }
 button.game-tile, button.art-button { transition: box-shadow 160ms ease-out, background-color 160ms ease-out; }
+.tile-shimmer { border-radius: 14px; background-color: transparent; background-image: none; }
+@keyframes tile-shimmer { from { background-position: 135% 0; opacity: 1; } 85% { opacity: 1; } to { background-position: -35% 0; opacity: 0; } }
+.tile-shimmer.run { background-image: linear-gradient(105deg, alpha(white, 0) 40%, alpha(white, 0.10) 45%, alpha(white, 0.38) 50%, alpha(white, 0.10) 55%, alpha(white, 0) 60%); background-size: 300% 100%; background-repeat: no-repeat; animation: tile-shimmer 850ms ease-in-out forwards; }
+window.reduced-motion .tile-shimmer.run { background-image: none; animation: none; }
 button.game-tile:hover, button.art-button:hover { box-shadow: 0 10px 26px alpha(black, 0.45); background-color: #30343b; }
 window.ferestre-window:not(.controller-navigation) button.art-button:focus-visible,
 window.ferestre-window:not(.controller-navigation) button.game-tile:focus-visible { outline: 3px solid #ffffff; outline-offset: 3px; }
 window.controller-navigation button.art-button:focus { outline: 4px solid #8bd77b; outline-offset: 3px; }
 window.reduced-motion button.game-tile, window.reduced-motion button.art-button, window.reduced-motion .hero-peek { transition: none; }
 .gamepass-strip { border-radius: 14px; }
+.nav-count { font-size: 12px; font-weight: 700; padding: 1px 8px; border-radius: 999px; background-color: alpha(white, 0.12); color: alpha(white, 0.85); }
 statuspage.compact > scrolledwindow > viewport > box { margin: 24px 0; }
 window.compact-sidebar .navigation-sidebar row { margin: 2px 10px; padding: 0; }
 window.compact-sidebar .sidebar-recents { margin-left: 4px; margin-right: 4px; }
@@ -314,6 +323,7 @@ window.ferestre-window .notification button.flat { min-width: 32px; min-height: 
 window.ferestre-window .notification-more { min-height: 30px; border-radius: 999px; padding: 2px 14px; background-color: alpha(#24272d, 0.92); color: #f4f4f5; box-shadow: 0 4px 12px alpha(black, 0.3); }
 window.ferestre-window button.bell .unread-dot { min-width: 8px; min-height: 8px; border-radius: 999px; background-color: #ff5f57; margin: 0; }
 .history-item { padding: 6px 2px; border-bottom: 1px solid alpha(#ffffff, 0.06); }
+.details-main { font-size: 17px; font-weight: 800; }
 popover.glass-menu > contents { background-color: alpha(#24272d, 0.96); border: 1px solid alpha(#ffffff, 0.08); border-radius: 16px; box-shadow: 0 12px 32px alpha(black, 0.45); }
 /* Page switches: a page that replaced another settles in. Blur only where it
    is cheap (see effects.rs); otherwise an opacity fade; nothing at all when
@@ -327,7 +337,7 @@ window.ferestre-window.reduced-motion .page-enter { animation: none; }
    libadwaita's own dimming is darker everywhere, which is the fallback. */
 window .app-shell { transition: filter 180ms ease-out; }
 window.reduced-motion .app-shell { transition: none; }
-window.blur-ok.dialog-open .app-shell { filter: blur(6px) brightness(0.8); }
+window.blur-ok.launching .app-shell, window.blur-ok.dialog-open .app-shell { filter: blur(6px) brightness(0.8); }
 floating-sheet > dimming, bottom-sheet > dimming { background-color: alpha(black, 0.42); }
 floating-sheet > sheet { border-radius: 18px; }
 
@@ -368,6 +378,9 @@ struct Ui {
     scroll: gtk::ScrolledWindow,
     pager: page_fit::Pager,
     refitting: Rc<Cell<bool>>,
+    launch_show: launch_show::Show,
+    launch_animation: Rc<RefCell<Option<adw::TimedAnimation>>>,
+    tile: Rc<Cell<page_fit::Fit>>,
     account_button: gtk::Button,
     title: adw::WindowTitle,
     search: gtk::SearchEntry,
@@ -450,9 +463,10 @@ struct Ui {
     /// this window's launches report.
     presence: Rc<RefCell<presence_ui::State>>,
     controller_hints: gtk::Label,
-    navigation_hint: gtk::Label,
     controller_family: Rc<Cell<controller::Family>>,
     controller_connected: Rc<Cell<bool>>,
+    /// The last input came from a controller, not the mouse or keyboard.
+    controller_in_use: Rc<Cell<bool>>,
     last_game_focus: Rc<RefCell<Option<String>>>,
     pending_tab_focus: Rc<Cell<Option<Section>>>,
     game_actions: Rc<RefCell<BTreeMap<String, String>>>,
@@ -586,8 +600,11 @@ fn build_ui(app: &adw::Application) {
                 .label(section.title())
                 .xalign(0.0)
                 .css_classes(["nav-label"])
+                .hexpand(true)
                 .build(),
         );
+        // Its name is the section's alone; the count is its description.
+        content.append(&sidebar::count_badge(section));
         let row = gtk::ListBoxRow::builder()
             .child(&content)
             .tooltip_text(section.title())
@@ -625,16 +642,6 @@ fn build_ui(app: &adw::Application) {
             .child(&sidebar)
             .build(),
     );
-
-    let navigation_hint = gtk::Label::builder()
-        .label("↑ / ↓ Choose a section   → Games")
-        .wrap(true)
-        .margin_start(12)
-        .margin_end(12)
-        .css_classes(["controller-hints"])
-        .visible(false)
-        .build();
-    sidebar_box.append(&navigation_hint);
 
     let recent_games = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -824,7 +831,10 @@ fn build_ui(app: &adw::Application) {
     content_header.pack_start(&navigation);
     scroll.set_kinetic_scrolling(true);
     window.set_size_request(360, 480);
-    window.set_content(Some(&split));
+    let launch_show = launch_show::Show::new();
+    let shell = gtk::Overlay::builder().child(&split).build();
+    shell.add_overlay(&launch_show);
+    window.set_content(Some(&shell));
     effects::install(&window, &split);
     window_controls::install(&window, &split, &sidebar_header, &content_header);
 
@@ -841,9 +851,9 @@ fn build_ui(app: &adw::Application) {
     let ui = Ui {
         model,
         controller_hints,
-        navigation_hint,
         controller_family: Rc::new(Cell::new(controller::Family::default())),
         controller_connected: Rc::new(Cell::new(false)),
+        controller_in_use: Rc::new(Cell::new(false)),
         last_game_focus: Rc::new(RefCell::new(None)),
         pending_tab_focus: Rc::new(Cell::new(None)),
         game_actions: Rc::new(RefCell::new(BTreeMap::new())),
@@ -874,6 +884,9 @@ fn build_ui(app: &adw::Application) {
         scroll,
         pager,
         refitting: Rc::default(),
+        launch_show,
+        launch_animation: Rc::default(),
+        tile: Rc::new(Cell::new(page_fit::FIRST)),
         account_button: account_button.clone(),
         title,
         search: search.clone(),
@@ -1109,6 +1122,9 @@ fn build_ui(app: &adw::Application) {
         }
     ));
 
+    if handheld::read_preference(&ui, "show_uninstallable") == Some(true) {
+        ui.model.borrow_mut().show_unsupported = true;
+    }
     render(&ui);
     // The account is cheap and answers the first question the window raises --
     // whose library is this -- so it is asked without being told to. The
@@ -1456,7 +1472,18 @@ fn render(ui: &Ui) {
         .child(&page)
         .build();
     ui.content.append(&clamp);
-    if ui.last_section.replace(Some(section)) != Some(section) {
+    let previous = ui.last_section.replace(Some(section));
+    let in_library = |section: Section| {
+        matches!(
+            section,
+            Section::Library | Section::Installed | Section::Updates | Section::Downloads
+        )
+    };
+    // Between the library's own tabs only the listing changes, below.
+    let same_header =
+        !ui.window.is_fullscreen() && in_library(section) && previous.is_some_and(in_library);
+    let entered = previous != Some(section);
+    if entered && !same_header {
         effects::enter(&clamp, &ui.window);
     }
 
@@ -1485,14 +1512,10 @@ fn render(ui: &Ui) {
         page.append(&group);
     }
 
-    if !ui.window.is_fullscreen()
-        && matches!(
-            section,
-            Section::Library | Section::Installed | Section::Updates | Section::Downloads
-        )
-    {
+    if !ui.window.is_fullscreen() && in_library(section) {
         render_library_tabs(ui, &page);
     }
+    let header = page.last_child();
     match section {
         Section::Runtime => {
             ui.pager.hide();
@@ -1541,11 +1564,19 @@ fn render(ui: &Ui) {
     }
     // Once: what a second drawing measures is what it was drawn for.
     if !ui.refitting.get() && page_fit::update(ui) {
+        ui.last_section.set(previous);
         ui.refitting.set(true);
         render(ui);
         ui.refitting.set(false);
         refocus(ui, focus_name);
         return;
+    }
+    if entered && same_header {
+        let mut part = header.and_then(|header| header.next_sibling());
+        while let Some(widget) = part {
+            effects::enter(&widget, &ui.window);
+            part = widget.next_sibling();
+        }
     }
     preload_gamepass_art(ui);
     refocus(ui, focus_name);
@@ -1669,6 +1700,35 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
     ));
     appearance.add(&compact);
     page.append(&appearance);
+
+    let library = adw::PreferencesGroup::builder().title("Library").build();
+    let unsupported = adw::SwitchRow::builder()
+        .title("Show titles you cannot install")
+        .subtitle(
+            "Those outside this account's Game Pass tier, and Appx or Msix packages, which the \
+             runtime cannot open",
+        )
+        .subtitle_lines(2)
+        .active(ui.model.borrow().show_unsupported)
+        .build();
+    unsupported.connect_active_notify(glib::clone!(
+        #[strong]
+        ui,
+        move |row| {
+            let on = row.is_active();
+            {
+                let mut model = ui.model.borrow_mut();
+                model.show_unsupported = on;
+                model.page = 0;
+            }
+            if let Err(error) = handheld::save_preference(&ui, "show_uninstallable", on) {
+                ui.toasts
+                    .add_toast(toast(format!("Could not save the setting: {error}")));
+            }
+        }
+    ));
+    library.add(&unsupported);
+    page.append(&library);
 
     let model = ui.model.borrow();
     let (title, subtitle) = model::runtime_summary(model.runtime.as_ref());
@@ -2056,78 +2116,60 @@ fn draw_list(
 /// leaving that unsaid would make every licence refusal look like a bug in the
 /// launcher.
 fn render_gamepass(ui: &Ui, page: &gtk::Box) {
-    let (held, fetched, market, store, checked) = {
+    let (held, fetched, store, checked) = {
         let model = ui.model.borrow();
         (
             model.subscriptions.clone(),
             !model.gamepass.is_empty(),
-            model.market().0,
             model.account.as_ref().map(|a| a.label().to_string()),
             model.entitlements_checked,
         )
     };
 
-    // Drawn first, filled in after the list: the count is what the list below
-    // actually holds -- games only, in this market, that this account's tier
-    // and this runtime can install -- not the size of the feed it came from.
     home::gamepass_hero(ui, page);
-    let group = adw::PreferencesGroup::builder().build();
-    let banner = adw::ActionRow::builder().subtitle_lines(3).build();
-    banner.add_css_class("gamepass-strip");
-    banner.set_use_markup(false);
-    banner.add_prefix(&gtk::Image::from_icon_name("starred-symbolic"));
-    group.add(&banner);
-    page.append(&group);
+    // Only what there is something to do about. How many games there are is
+    // in the sidebar.
+    let notice = match (fetched, store, checked, held.as_slice()) {
+        (false, ..) => Some((
+            "The Game Pass catalogue has not been fetched yet".to_string(),
+            "Reload to fetch it. It is a public listing -- no account needed.".to_string(),
+        )),
+        (true, None, ..) => Some((
+            "Not signed in".to_string(),
+            "Sign in to see which of these your Store account can play.".to_string(),
+        )),
+        (true, Some(store), false, _) => Some((
+            "Library not loaded".to_string(),
+            format!("Load the library to see which of these {store} can play."),
+        )),
+        (true, Some(store), true, []) => Some((
+            "No Game Pass subscription".to_string(),
+            format!(
+                "{store} has no Game Pass subscription, so it cannot play these. Choose an \
+                 account with Game Pass as the Store account in Accounts."
+            ),
+        )),
+        (true, Some(_), true, _) => None,
+    };
+    if let Some((title, subtitle)) = notice {
+        let group = adw::PreferencesGroup::builder().build();
+        let banner = adw::ActionRow::builder().subtitle_lines(3).build();
+        banner.add_css_class("gamepass-strip");
+        banner.set_use_markup(false);
+        banner.add_prefix(&gtk::Image::from_icon_name("starred-symbolic"));
+        banner.set_title(&title);
+        banner.set_subtitle(&subtitle);
+        group.add(&banner);
+        page.append(&group);
+    }
 
     let show_all = ui.model.borrow().show_unsupported;
-    let listed = render_rows(
+    render_rows(
         ui,
         page,
         move |row| show_all || !row.known_uninstallable(),
         "Nothing here yet.",
     );
-
-    let games = |n: usize| format!("{n} {}", if n == 1 { "game" } else { "games" });
-    let in_market = format!("{} in PC Game Pass for the {market} Store", games(listed));
-    let (title, subtitle) = match (fetched, store, checked, held.as_slice()) {
-        (false, ..) => (
-            "The Game Pass catalogue has not been fetched yet".to_string(),
-            "Reload to fetch it. It is a public listing -- no account needed.".to_string(),
-        ),
-        (true, None, ..) => (
-            in_market,
-            "Sign in to see which of these your Store account can play.".to_string(),
-        ),
-        (true, Some(store), false, _) => (
-            in_market,
-            format!("Load the library to see which of these {store} can play."),
-        ),
-        (true, Some(store), true, []) => (
-            in_market,
-            format!(
-                "{store} has no Game Pass subscription, so it cannot play these. Choose an \
-                 account with Game Pass as the Store account in Accounts."
-            ),
-        ),
-        (true, Some(store), true, subs) => (
-            if show_all {
-                in_market
-            } else {
-                format!(
-                    "{} {store} can install with {}",
-                    games(listed),
-                    subs.join(" and ")
-                )
-            },
-            format!(
-                "From the PC Game Pass catalogue for the {market} Store. Add-ons are not \
-                 counted, and titles outside the tier or in packages this runtime cannot \
-                 open are left out unless you choose to show them."
-            ),
-        ),
-    };
-    banner.set_title(&title);
-    banner.set_subtitle(&subtitle);
 }
 
 /// The saved measurement for a title, if it still matches the install the
@@ -2294,9 +2336,6 @@ fn render_rows(
         });
         group.set_header_suffix(Some(&add_all_to_steam_button(ui, drawn.kept.clone())));
     }
-    // Deliberately not an early return: an empty list is exactly when the
-    // reader most needs the switch below, because the filter may be the reason
-    // it is empty.
     if drawn.rows.is_empty() {
         let query = ui.model.borrow().query.clone();
         let message = if query.trim().is_empty() {
@@ -2310,8 +2349,15 @@ fn render_rows(
         } else {
             format!("Nothing matches {query:?}")
         };
+        // The filter may be the reason it is empty.
+        let held_back = drawn.unsupported + drawn.outside_tier;
+        let hidden = matches!(section, Section::Library | Section::GamePass)
+            && held_back > 0
+            && !ui.model.borrow().show_unsupported;
+        let hidden = hidden
+            .then(|| format!("{held_back} you cannot install are hidden. Settings can show them."));
         // The query is whatever was typed, "&" included.
-        let row = plain_row(&message, None);
+        let row = plain_row(&message, hidden.as_deref());
         row.add_css_class("dim-label");
         group.add(&row);
     } else {
@@ -2323,6 +2369,7 @@ fn render_rows(
     }
     page.append(&group);
     if !drawn.rows.is_empty() && section != Section::Updates {
+        page.set_margin_bottom(12);
         let heading = gtk::Label::builder()
             .label(if section == Section::Home {
                 "All games".into()
@@ -2342,14 +2389,13 @@ fn render_rows(
             .selection_mode(gtk::SelectionMode::None)
             .homogeneous(true)
             .min_children_per_line(1)
-            // Wide windows get more columns, not bigger covers.
-            .max_children_per_line(page_fit::MAX_COLUMNS as u32)
+            .max_children_per_line(ui.tile.get().columns as u32)
             .row_spacing(page_fit::ROW_SPACING as u32)
             .column_spacing(page_fit::COLUMN_SPACING as u32)
             .css_classes(["game-grid", "paged-grid"])
             .build();
         for (index, row) in drawn.rows.iter().enumerate() {
-            grid.insert(&game_card(ui, row), -1);
+            grid.insert(&game_card(ui, row, ui.tile.get().tile), -1);
             // Each card already contains its own primary and More controls.
             // A focusable wrapper adds a second selection boundary.
             if let Some(child) = grid.child_at_index(index as i32) {
@@ -2389,50 +2435,6 @@ fn render_rows(
             .css_classes(["dim-label"])
             .build();
         page.append(&progress);
-    }
-
-    // Only in the library: the other sections list installed or updatable
-    // titles, which are runnable by construction.
-    let held_back = drawn.unsupported + drawn.outside_tier;
-    if matches!(section, Section::Library | Section::GamePass) && held_back > 0 {
-        // Two reasons a title is held back, and the switch names whichever
-        // applies. Saying "95 titles" without saying why is the kind of filter
-        // that makes people think a library is broken.
-        let mut why = Vec::new();
-        if drawn.outside_tier > 0 {
-            why.push(format!(
-                "{} are not in the Game Pass tier this account holds",
-                drawn.outside_tier
-            ));
-        }
-        if drawn.unsupported > 0 {
-            why.push(format!(
-                "{} ship as Appx or Msix packages, which this runtime cannot open",
-                drawn.unsupported
-            ));
-        }
-        let row = adw::SwitchRow::builder()
-            .title("Show titles you cannot install")
-            .subtitle(format!("{}.", why.join("; ")))
-            .subtitle_lines(2)
-            .active(ui.model.borrow().show_unsupported)
-            .build();
-        let ui = ui.clone();
-        row.connect_active_notify(move |switch| {
-            {
-                let mut model = ui.model.borrow_mut();
-                if model.show_unsupported == switch.is_active() {
-                    return;
-                }
-                model.show_unsupported = switch.is_active();
-                // The page the reader was on does not exist in the other list.
-                model.page = 0;
-            }
-            render(&ui);
-        });
-        let group = adw::PreferencesGroup::builder().margin_top(18).build();
-        group.add(&row);
-        page.append(&group);
     }
 
     ui.pager
@@ -2939,7 +2941,8 @@ fn import_from_steam(ui: &Ui) {
     });
 }
 fn render_recents(ui: &Ui) {
-    sidebar::render_installed(ui);
+    sidebar::render_recent(ui);
+    sidebar::render_counts(ui);
     sidebar::render_downloads(ui);
 }
 fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
@@ -2989,10 +2992,7 @@ fn game_launch_spinner(label: &str) -> gtk::DrawingArea {
     ring
 }
 
-/// A game tile, as wide as its cover.
-const TILE_WIDTH: i32 = 196;
-
-fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
+fn game_card(ui: &Ui, row: &LibraryRow, tile: page_fit::Tile) -> adw::Clamp {
     // The card draws its own cover, so the row's icon is never shown.
     let (description, actions) = library_components(ui, row, false);
     let primary = actions
@@ -3010,10 +3010,8 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
     let key = row.product_id.to_ascii_uppercase();
     let art = gtk::Picture::builder()
         .can_shrink(true)
-        // A cover's own size, before it is loaded too: a tile that grew when
-        // its cover came moved the grid, and the page no longer fitted.
-        .width_request(TILE_WIDTH)
-        .height_request(if ui.window.is_fullscreen() { 300 } else { 294 })
+        // The tile's size whether or not its cover is loaded: one that grew
+        // when the cover came moved the grid, and the page no longer fitted.
         .content_fit(gtk::ContentFit::Cover)
         .build();
     // Only a real cover: Size::Cover refuses a source narrower than 300 px,
@@ -3026,7 +3024,8 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
         .borrow_mut()
         .add_picture(key.clone(), &art, textures::Size::Cover);
     let cover = gtk::Overlay::new();
-    cover.set_child(Some(&art));
+    // Held to it: a loaded picture would ask for its own height.
+    cover.set_child(Some(&home::sized(&art, Some(tile.width), tile.cover)));
     if row.has_update() {
         // Keep the badge on the cover, below the separate top-right menu.
         // Both controls must remain readable on the narrow handheld cards.
@@ -3062,9 +3061,9 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
         .wrap(true)
         .lines(2)
         .ellipsize(gtk::pango::EllipsizeMode::End)
-        .width_chars(18)
+        .width_chars(12)
         .max_width_chars(20)
-        .height_request(36)
+        .height_request(40)
         .css_classes(["game-title"])
         .build();
     text.append(&title);
@@ -3223,6 +3222,7 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
     } else if let Some(primary) = primary {
         actions.remove(&primary);
         primary.set_child(Some(&surface));
+        effects::shimmer(&primary, &surface);
         primary.set_tooltip_text(description.tooltip_text().as_deref());
         primary.reset_relation(gtk::AccessibleRelation::LabelledBy);
         primary.update_property(&[gtk::accessible::Property::Label(&format!(
@@ -3255,8 +3255,8 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
     // Clamp both the natural size and final width: FlowBox otherwise chooses
     // one giant column from a texture's original pixel dimensions.
     adw::Clamp::builder()
-        .maximum_size(TILE_WIDTH)
-        .tightening_threshold(TILE_WIDTH)
+        .maximum_size(tile.width)
+        .tightening_threshold(tile.width)
         .child(&overlay)
         .build()
 }
@@ -3457,6 +3457,18 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
             Box::new(move || spawn_title(&ui, &id, &name)),
         );
     }
+    if row.action == Action::Install && row.action.is_enabled() {
+        let (id, name) = row
+            .install_as
+            .clone()
+            .unwrap_or_else(|| (row.product_id.clone(), row.name.clone()));
+        let ui = ui.clone();
+        item(
+            "folder-download-symbolic",
+            "Install",
+            Box::new(move || confirm_install(&ui, &id, &name)),
+        );
+    }
     let detail_ui = ui.clone();
     let (detail_id, local) = (row.product_id.clone(), row.local);
     let detail_name = row.name.clone();
@@ -3464,12 +3476,22 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
         Some(runtime) => format!("{details}\n\n{runtime}"),
         None => details.clone(),
     };
+    let detail_main = details_ui::Main::of(row);
+    let show_details: Rc<dyn Fn()> = Rc::new(move || {
+        details_ui::open(
+            &detail_ui,
+            &detail_id,
+            &detail_name,
+            &detail_text,
+            local,
+            detail_main.as_ref(),
+        );
+    });
+    let details_item = show_details.clone();
     item(
         "dialog-information-symbolic",
         "Game details",
-        Box::new(move || {
-            details_ui::open(&detail_ui, &detail_id, &detail_name, &detail_text, local);
-        }),
+        Box::new(move || details_item()),
     );
     // A shortcut needs something that will launch. A recipe is one; a title on
     // disk is another, because `run` writes a recipe from the package manifest
@@ -3699,7 +3721,9 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
                     } else if updating {
                         update_download(&ui, &product_id, &title_name);
                     } else if waits {
-                        confirm_install(&ui, &product_id, &title_name);
+                        // What it is before whether to have it: Install is
+                        // the details' own button.
+                        show_details();
                     } else if plays {
                         spawn_title(&ui, &product_id, &title_name);
                     } else {
@@ -4462,6 +4486,8 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
     }
     // The launch log was just written: the title is now the most recent.
     ui.model.borrow().forget_probes();
+    // Before the redraw: it starts from the tile that is there now.
+    launch_show::play(ui, product_id, name);
     render(ui);
     ui.toasts
         .add_toast_replacing(product_id, toast(format!("Starting {name}")));
@@ -6806,7 +6832,7 @@ fn refresh_library(ui: &Ui) {
         .iter()
         .map(|r| r.title.product_id.clone())
         .collect();
-    ui.toasts.add_toast(toast("Asking what this account owns"));
+    ui.toasts.add_toast(toast("Loading your library"));
 
     let roles = ui.model.borrow().roles.clone();
     let ui = ui.clone();
@@ -6905,7 +6931,9 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
             // fetched: the listing survives a restart and the tier map does
             // not, so every session after the first showed 524 titles with no
             // idea which of them this account can install.
-            !model.gamepass.is_empty() && !model.tiers.included.is_empty(),
+            !model.gamepass.is_empty()
+                && !model.tiers.included.is_empty()
+                && model.gamepass_popular.is_some(),
         )
     };
     if have
@@ -6940,12 +6968,14 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
                 move || {
                     let listing = gamepass::fetch(&market, &language)?;
                     let tiers = gamepass::fetch_tiers(&market, &language)?;
-                    Ok::<_, anyhow::Error>((listing, tiers))
+                    // Only an order: the catalogue is of use without it.
+                    let popular = gamepass::fetch_popular(&market, &language).ok();
+                    Ok::<_, anyhow::Error>((listing, tiers, popular))
                 }
             })
             .await;
             ui.fetching_gamepass.replace(false);
-            let Ok(Ok((listing, tiers))) = fetched else {
+            let Ok(Ok((listing, tiers, popular))) = fetched else {
                 let failures = ui.gamepass_failures.get().saturating_add(1);
                 ui.gamepass_failures.set(failures);
                 ui.gamepass_retry_at.set(Some(
@@ -6965,8 +6995,11 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
             ui.gamepass_retry_at.set(None);
             // The merchandised list is what is kept: which ids the tier feed
             // added is worth knowing again on the next start.
+            let popular = popular
+                .or_else(|| ui.model.borrow().gamepass_popular.clone())
+                .unwrap_or_default();
             if let Some(dir) = paths {
-                let _ = gamepass::save_cache(&dir, &market, &listing, &tiers);
+                let _ = gamepass::save_cache(&dir, &market, &listing, &tiers, Some(&popular));
             }
             {
                 let mut model = ui.model.borrow_mut();
@@ -6974,9 +7007,10 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
                 model.gamepass_merchandised =
                     listing.iter().map(|id| id.to_ascii_uppercase()).collect();
                 model.tiers = tiers;
+                model.gamepass_popular = Some(popular);
             }
             preload_gamepass_art(&ui);
-            if ui.model.borrow().section == Section::GamePass {
+            if matches!(ui.model.borrow().section, Section::GamePass | Section::Home) {
                 render_soon(&ui);
             }
         });
@@ -7258,6 +7292,7 @@ mod catalog_regressions {
             avatar: None,
             gamepass: vec!["9NR1R1XWLCNB".into()],
             gamepass_merchandised: Default::default(),
+            gamepass_popular: None,
             subscriptions: Vec::new(),
             entitlements_checked: false,
             tiers: gamepass::parse_tiers(r#"{"9NR1R1XWLCNB":{"PCSubMetadata":{"Included":true}}}"#)
