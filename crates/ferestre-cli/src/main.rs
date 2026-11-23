@@ -1950,6 +1950,7 @@ fn launch_prepared_with(
         &game_dir,
         &recipe.launch.executable,
     )?;
+    let cpus = dense_cpu_layout(&mut plan);
     if !local && runtime.provides("xgameruntime.playfab-file-saves") {
         if let Some(identity) = install::package_identity(&game_dir) {
             let backups = paths
@@ -2017,7 +2018,38 @@ fn launch_prepared_with(
             );
         }
     }
-    run_teed(plan.to_command(), &log, &forwarding)
+    let mut command = plan.to_command();
+    if let Some(cpus) = cpus {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: restrict_to only fills a stack cpu_set_t and makes one
+        // system call, which is fine between fork and exec.
+        unsafe {
+            command.pre_exec(move || ferestre_core::cpu_topology::restrict_to(&cpus));
+        }
+    }
+    run_teed(command, &log, &forwarding)
+}
+
+/// On a machine whose CPUs are numbered with gaps, a mapping Wine can use
+/// and the CPUs the game is to keep to; see [`ferestre_core::cpu_topology`].
+fn dense_cpu_layout(plan: &mut launch::Plan) -> Option<Vec<usize>> {
+    use ferestre_core::cpu_topology::{for_host, ENV};
+    // A mapping the recipe or the person's own environment gives wins.
+    if plan.get(ENV).is_some() || (std::env::var_os(ENV).is_some() && !plan.is_unset(ENV)) {
+        return None;
+    }
+    match for_host(Path::new("/sys/devices/system/cpu")) {
+        Ok(Some(mapping)) => {
+            eprintln!(":: CPUs numbered with gaps: {ENV}={} for Wine", mapping.env);
+            plan.env_set.insert(ENV.into(), mapping.env);
+            Some(mapping.cpus)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("-- the CPU layout was left to Wine: {e:#}");
+            None
+        }
+    }
 }
 
 /// The runtime a launch uses, whether or not it can run the title.

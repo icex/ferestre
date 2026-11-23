@@ -22,6 +22,7 @@ pub mod cache;
 pub mod capability;
 pub mod catalog;
 pub mod client_deps;
+pub mod cpu_topology;
 pub mod diagnostics;
 pub mod gamepass;
 pub mod http;
