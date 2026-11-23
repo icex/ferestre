@@ -158,7 +158,7 @@
     },
     "wine": {
       "repository": "https://github.com/icex/wine.git",
-      "commit": "8c7e8e7e985f5009fe902c73e48989212e481adc",
+      "commit": "e44177e9c93f818507fa73234555e9c7635847d4",
       "upstream": "https://github.com/xodus-gaming/wine.git",
       "upstream_commit": "b1dd32734a34472a28eb5be9922df06e07ac0834",
       "modified_paths": [
@@ -268,7 +268,7 @@
     },
     "proton": {
       "repository": "https://github.com/icex/Proton-UWP.git",
-      "commit": "697727160b65f1eb4f50e78b787f17abd8b5a093",
+      "commit": "6775f3d648efa75958cd36452607a3de0bd392b4",
       "upstream": "https://github.com/xodus-gaming/Proton.git",
       "upstream_commit": "7c0b435495814349735c913fde78da906aecea52",
       "modified_paths": [
