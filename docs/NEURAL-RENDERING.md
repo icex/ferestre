@@ -120,6 +120,9 @@ ferestre neural menu-key F7          # or End; --reset goes back to Ctrl+Y
 It is kept as `[dlssnr] menu-key` in `~/.config/ferestre/settings.toml` and
 written into each game's `dlssnr-amd.ini` at install and at every launch.
 
+OptiScaler's own menu opens with **Home** instead of Insert, unless another key
+was chosen in it. OptiScaler takes a single key there, without Ctrl.
+
 ### A game that crashes with OptiScaler as dxgi.dll
 
 On the `optiscaler` route OptiScaler goes in as `dxgi.dll`. Some games crash

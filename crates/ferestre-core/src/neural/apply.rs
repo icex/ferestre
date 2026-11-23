@@ -32,6 +32,7 @@ pub const INSTALL_MANIFEST: &str = "dlssnr-amd-install.txt";
 const BACKUP_MANIFEST: &str = "manifest.json";
 const BACKUP_SCHEMA: u32 = 1;
 const INI: &str = "dlssnr-amd.ini";
+const OPTISCALER_INI: &str = "OptiScaler.ini";
 /// The person's `dlssnr-amd.ini`, kept across a reinstall (which writes a
 /// fresh one).
 const KEPT_INI: &str = "dlssnr-amd.ini.user";
@@ -708,7 +709,8 @@ fn install(
     kept_back?;
     use_proxy(exe_dir, entry)?;
     apply_menu_key(ctx, exe_dir)?;
-    record_installed(exe_dir, &files)
+    record_installed(exe_dir, &files)?;
+    apply_optiscaler_key(exe_dir, entry.route)
 }
 
 /// The files an entry's install writes, OptiScaler under its DLL name.
@@ -774,6 +776,44 @@ fn apply_menu_key(ctx: &Context, exe_dir: &Path) -> Result<()> {
 /// `text` with `MenuKey` in `[NRControl]` set to `key`, or `None` when it is
 /// already or the ini has no such line.
 fn with_menu_key(text: &str, key: &str) -> Option<String> {
+    with_ini_line(text, "NRControl", "MenuKey", |value| {
+        (value != key).then(|| format!("MenuKey = {key}"))
+    })
+}
+
+/// OptiScaler's menu opens with Home where nobody chose a key: its own
+/// default, Insert, is missing from many keyboards, and it takes a single
+/// key, without Ctrl.
+fn apply_optiscaler_key(exe_dir: &Path, route: Route) -> Result<()> {
+    if route != Route::Optiscaler {
+        return Ok(());
+    }
+    let ini = exe_dir.join(OPTISCALER_INI);
+    let Ok(text) = std::fs::read_to_string(&ini) else {
+        return Ok(());
+    };
+    if let Some(changed) = with_optiscaler_key(&text) {
+        crate::cache::write(&ini, changed.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn with_optiscaler_key(text: &str) -> Option<String> {
+    with_ini_line(text, "Menu", "ShortcutKey", |value| {
+        value
+            .eq_ignore_ascii_case("auto")
+            .then(|| "ShortcutKey=0x24".to_string())
+    })
+}
+
+/// `text` with the line setting `key` in `[section]` replaced by what `replace`
+/// makes of its value, keeping line endings; `None` when nothing changed.
+fn with_ini_line(
+    text: &str,
+    wanted: &str,
+    key: &str,
+    replace: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
     let mut section = String::new();
     let mut changed = false;
     let out: String = text
@@ -782,12 +822,14 @@ fn with_menu_key(text: &str, key: &str) -> Option<String> {
             let body = line.trim_end_matches(['\r', '\n']);
             let trimmed = body.trim();
             if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                section = trimmed[1..trimmed.len() - 1].trim().to_ascii_lowercase();
-            } else if section == "nrcontrol" {
+                section = trimmed[1..trimmed.len() - 1].trim().to_string();
+            } else if section.eq_ignore_ascii_case(wanted) {
                 if let Some((name, value)) = trimmed.split_once('=') {
-                    if name.trim().eq_ignore_ascii_case("MenuKey") && value.trim() != key {
-                        changed = true;
-                        return format!("MenuKey = {key}{}", &line[body.len()..]);
+                    if name.trim().eq_ignore_ascii_case(key) {
+                        if let Some(new) = replace(value.trim()) {
+                            changed = true;
+                            return format!("{new}{}", &line[body.len()..]);
+                        }
                     }
                 }
             }
@@ -1189,6 +1231,9 @@ fn ensure_with(
         // A menu key set since the install takes effect now.
         if let Err(e) = apply_menu_key(ctx, &dir) {
             eprintln!("-- neural rendering: the menu key was not set: {e:#}");
+        }
+        if let Err(e) = apply_optiscaler_key(&dir, entry.route) {
+            eprintln!("-- neural rendering: OptiScaler's menu key was not set: {e:#}");
         }
         return Ensured::Present(entry);
     }
@@ -2131,6 +2176,26 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
         crate::settings::set_dlssnr_menu_key(&w.ctx.config_dir, Some("F7")).unwrap();
         assert!(matches!(w.ensure(&[]), Ensured::Present(_)));
         assert_eq!(read(&w.game.join(INI)), b"[NRControl]\nMenuKey = F7\n");
+    }
+
+    #[test]
+    fn optiscalers_menu_opens_with_home_unless_a_key_was_chosen() {
+        let ini =
+            "[FG]\r\nShortcutKey=auto\r\n[Menu]\r\nShortcutKey=auto\r\nFpsShortcutKey=auto\r\n";
+        let changed = with_optiscaler_key(ini).unwrap();
+        assert_eq!(
+            changed,
+            "[FG]\r\nShortcutKey=auto\r\n[Menu]\r\nShortcutKey=0x24\r\nFpsShortcutKey=auto\r\n"
+        );
+        assert_eq!(with_optiscaler_key(&changed), None);
+        assert_eq!(with_optiscaler_key("[Menu]\nShortcutKey=0x23\n"), None);
+
+        let w = World::new();
+        w.enable(Route::Optiscaler);
+        let ini = w.game.join(OPTISCALER_INI);
+        write(&ini, b"[Menu]\nShortcutKey=auto\n");
+        assert!(matches!(w.ensure(&[]), Ensured::Present(_)));
+        assert_eq!(read(&ini), b"[Menu]\nShortcutKey=0x24\n");
     }
 
     #[test]
