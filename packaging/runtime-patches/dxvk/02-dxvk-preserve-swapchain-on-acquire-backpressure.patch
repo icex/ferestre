@@ -1,0 +1,50 @@
+diff --git a/src/dxvk/dxvk_presenter.cpp b/src/dxvk/dxvk_presenter.cpp
+index 51141c4..3d47d64 100644
+--- a/src/dxvk/dxvk_presenter.cpp
++++ b/src/dxvk/dxvk_presenter.cpp
+@@ -98,8 +98,8 @@ namespace dxvk {
+     updateSwapChain();
+ 
+     // Don't acquire if we already did so after present
+-    if (m_acquireStatus == VK_NOT_READY && m_swapchain) {
+-      PresenterSync sync = m_semaphores.at(m_frameIndex);
++    if ((m_acquireStatus == VK_NOT_READY || m_acquireStatus == VK_TIMEOUT) && m_swapchain) {
++      PresenterSync& sync = m_semaphores.at(m_frameIndex);
+ 
+       waitForSwapchainFence(sync);
+ 
+@@ -108,6 +108,13 @@ namespace dxvk {
+         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+     }
+ 
++    // Wine's managed child surfaces can return early to avoid blocking window
++    // updates. Keep the last frame and let the caller retry without recreating.
++    if (m_swapchain && (m_acquireStatus == VK_NOT_READY || m_acquireStatus == VK_TIMEOUT)) {
++      m_acquireStatus = VK_NOT_READY;
++      return VK_NOT_READY;
++    }
++
+     // This is a normal occurence, but may be useful for
+     // debugging purposes in case WSI goes wrong somehow.
+     if (m_acquireStatus != VK_SUCCESS && m_swapchain)
+@@ -125,12 +132,19 @@ namespace dxvk {
+       if (vr != VK_SUCCESS)
+         return softError(vr);
+ 
+-      PresenterSync sync = m_semaphores.at(m_frameIndex);
++      PresenterSync& sync = m_semaphores.at(m_frameIndex);
+ 
+       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
+         m_swapchain, std::numeric_limits<uint64_t>::max(),
+         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+ 
++      // A fresh swapchain can also be temporarily unavailable. Do not expose
++      // an image or set m_presentPending until acquisition actually succeeds.
++      if (m_acquireStatus == VK_NOT_READY || m_acquireStatus == VK_TIMEOUT) {
++        m_acquireStatus = VK_NOT_READY;
++        return VK_NOT_READY;
++      }
++
+       if (m_acquireStatus < 0) {
+         Logger::info(str::format("Presenter: Got ", m_acquireStatus, " from fresh swapchain"));
+         return softError(m_acquireStatus);

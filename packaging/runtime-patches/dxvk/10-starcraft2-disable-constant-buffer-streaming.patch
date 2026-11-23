@@ -1,0 +1,15 @@
+diff --git a/src/util/config/config.cpp b/src/util/config/config.cpp
+index ff6f9f3..de8d31d 100644
+--- a/src/util/config/config.cpp
++++ b/src/util/config/config.cpp
+@@ -525,6 +525,10 @@ namespace dxvk {
+       { "dxgi.deferInitialFullscreen",      "True" },
+     }} },
+ 
++    /* StarCraft II: avoid GPU hangs with constant buffer streaming. */
++    { R"(\\SC2(_x64)?\.exe$)", {{
++      { "d3d9.deviceLocalConstantBuffers", "False" },
++    }} },
+     /* A Hat in Time                              */
+     { R"(\\HatinTimeGame\.exe$)", {{
+       { "d3d9.lenientClear",                "True" },

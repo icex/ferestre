@@ -80,6 +80,16 @@ if [ "$ref" = "$pinned" ]; then
 else
     echo "::warning::building Proton $ref, not the pinned $pinned: lock not checked"
 fi
+
+# Ferestre's own fixes to the submodules, on the checked source graph.
+for dir in "$here"/packaging/runtime-patches/*/; do
+    sub=$(basename "$dir")
+    for patch in "$dir"*.patch; do
+        [ -e "$patch" ] || continue
+        echo ":: patch    $sub/$(basename "$patch")"
+        git -C "$work/proton/$sub" apply "$patch"
+    done
+done
 [ "$until" = clone ] && exit 0
 
 stamp configure
