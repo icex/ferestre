@@ -906,7 +906,14 @@ fn enable_with(ctx: &Context, req: &EnableRequest, found: &[Detection]) -> Resul
     }
     let executable = PathBuf::from(req.executable.replace('\\', "/"));
     let detected = detect::detect(req.game_dir, &executable);
-    let route = match req.route.or(detected.route) {
+    // What was installed for this game before, on or off, stays chosen
+    // unless the person picks again: "Automatic" detects for a new game.
+    let kept = state::choice(&ctx.config_dir, req.key)?;
+    let route = match req
+        .route
+        .or(kept.as_ref().map(|e| e.route))
+        .or(detected.route)
+    {
         Some(route) => route,
         None => bail!(
             "cannot tell which DLSSNR-AMD route suits {} ({}); pass --route with one of {}",
@@ -972,6 +979,10 @@ fn enable_with(ctx: &Context, req: &EnableRequest, found: &[Detection]) -> Resul
              run: ferestre neural setup --dll <its path>",
             needs(model, &ctx.expect).file
         ),
+        None if kept.as_ref().is_some_and(|e| has(e.model)) => kept
+            .as_ref()
+            .map(|e| e.model)
+            .unwrap_or(Network::SilverAardwold),
         None if has(Network::SmallFp8) => Network::SmallFp8,
         None => Network::SilverAardwold,
     };
@@ -1613,6 +1624,23 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
         assert_eq!(
             gate(&[det("BattlEye", true, true)], &acknowledged),
             Gate::Allowed
+        );
+    }
+
+    #[test]
+    fn a_chosen_route_stays_chosen_through_off_and_on() {
+        let w = World::new();
+        // Detected: reshade-feeder. Chosen: the Vulkan one.
+        w.enable(Route::ReshadeFeederVulkan);
+        disable(&w.ctx, "local-game", &w.game, "Game.exe").unwrap();
+        assert_eq!(w.entry(), None);
+        let again = enable_with(&w.ctx, &w.req(None, false), &[]).unwrap();
+        assert_eq!(again.entry.route, Route::ReshadeFeederVulkan);
+        assert_eq!(
+            state::choice(&w.ctx.config_dir, "local-game")
+                .unwrap()
+                .map(|c| c.route),
+            Some(Route::ReshadeFeederVulkan)
         );
     }
 

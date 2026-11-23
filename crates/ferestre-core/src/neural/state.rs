@@ -44,6 +44,16 @@ pub struct Entry {
     pub proxy: Option<String>,
 }
 
+/// The route and network last installed for a game: what "Automatic" means
+/// for it until the person chooses again. Kept when neural rendering is
+/// turned off, like the acknowledgements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Choice {
+    pub route: Route,
+    pub model: Network,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Document {
     #[serde(default)]
@@ -55,6 +65,8 @@ struct Document {
     /// Kept when neural rendering is turned off, like the acknowledgements.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     proxies: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    choices: BTreeMap<String, Choice>,
     /// Whatever a newer build added.
     #[serde(flatten)]
     other: toml::Table,
@@ -147,6 +159,11 @@ pub fn set_proxy(config_dir: &Path, product_id: &str, proxy: Option<&str>) -> Re
     })
 }
 
+/// The route and network last installed for a game.
+pub fn choice(config_dir: &Path, product_id: &str) -> Result<Option<Choice>> {
+    Ok(read(config_dir)?.choices.remove(&key(product_id)))
+}
+
 /// The entry and any new acknowledgements, in one write: an acknowledgement
 /// is only ever stored together with a successful enable.
 pub fn record(
@@ -158,6 +175,13 @@ pub fn record(
     update(config_dir, |d| {
         let k = key(product_id);
         d.titles.insert(k.clone(), entry.clone());
+        d.choices.insert(
+            k.clone(),
+            Choice {
+                route: entry.route,
+                model: entry.model,
+            },
+        );
         if !acknowledged.is_empty() {
             d.acknowledged
                 .entry(k)
@@ -187,6 +211,7 @@ pub fn forget_game(config_dir: &Path, product_id: &str) -> Result<()> {
     if !document.titles.contains_key(&k)
         && !document.acknowledged.contains_key(&k)
         && !document.proxies.contains_key(&k)
+        && !document.choices.contains_key(&k)
     {
         return Ok(());
     }
@@ -194,6 +219,7 @@ pub fn forget_game(config_dir: &Path, product_id: &str) -> Result<()> {
         d.titles.remove(&k);
         d.acknowledged.remove(&k);
         d.proxies.remove(&k);
+        d.choices.remove(&k);
     })
 }
 
@@ -300,6 +326,15 @@ mod tests {
         record(c, "local-a", &entry("/games/a2"), &[]).unwrap();
         assert_eq!(acknowledged(c, "local-a").unwrap().len(), 1);
         assert_eq!(get(c, "local-a").unwrap(), Some(entry("/games/a2")));
+        // The choice outlives turning it off, not forgetting the game.
+        let chosen = Choice {
+            route: Route::ReshadeFeederVulkan,
+            model: Network::SilverAardwoldOptimized,
+        };
+        forget(c, "local-a").unwrap();
+        assert_eq!(choice(c, "LOCAL-A").unwrap(), Some(chosen));
+        forget_game(c, "local-a").unwrap();
+        assert_eq!(choice(c, "local-a").unwrap(), None);
     }
 
     #[test]

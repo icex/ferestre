@@ -14,6 +14,16 @@ pub(crate) struct View {
     pub warnings: Vec<String>,
     pub route: Option<Route>,
     pub enabled: bool,
+    /// The dropdowns' first selections: the route and network last installed
+    /// for this game, so opening the dialog never undoes a choice.
+    pub route_index: u32,
+    pub network_index: u32,
+}
+
+/// The dropdown index of `item` in `all`, after "Automatic" at 0.
+fn index_of<T: PartialEq>(all: &[T], item: Option<&T>) -> u32 {
+    item.and_then(|item| all.iter().position(|x| x == item))
+        .map_or(0, |i| i as u32 + 1)
 }
 
 fn api_text(api: neural::detect::Api) -> &'static str {
@@ -105,6 +115,8 @@ pub(crate) fn view(o: &Overview) -> View {
         warnings,
         route: d.route,
         enabled,
+        route_index: index_of(&Route::ALL, o.choice.as_ref().map(|c| &c.route)),
+        network_index: index_of(&Network::ALL, o.choice.as_ref().map(|c| &c.model)),
     }
 }
 
@@ -257,6 +269,8 @@ fn present(ui: &Ui, product_id: &str, name: &str, v: &View) {
     let mut network_names = vec!["Automatic"];
     network_names.extend(Network::ALL.map(Network::as_str));
     let networks = gtk::DropDown::from_strings(&network_names);
+    routes.set_selected(v.route_index);
+    networks.set_selected(v.network_index);
     let choice = |title: &str, widget: &gtk::DropDown| {
         let row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -489,6 +503,7 @@ mod tests {
     fn overview(anticheat: Vec<Detection>, gate: Gate, route: Option<Route>) -> Overview {
         Overview {
             entry: None,
+            choice: None,
             detected: Detected {
                 bits: 64,
                 api: Api::Dx10To12,
@@ -573,6 +588,23 @@ mod tests {
         assert_eq!(v.route, None);
         assert!(v.can_enable);
         assert!(!v.enabled);
+    }
+
+    #[test]
+    fn the_dialog_opens_on_the_route_and_network_last_installed() {
+        let mut o = overview(Vec::new(), Gate::Allowed, Some(Route::ReshadeFeeder));
+        let v = view(&o);
+        assert_eq!((v.route_index, v.network_index), (0, 0));
+        o.choice = Some(neural::state::Choice {
+            route: Route::Optiscaler,
+            model: Network::SilverAardwold,
+        });
+        let v = view(&o);
+        assert_eq!(chosen_route(v.route_index), Some(Route::Optiscaler));
+        assert_eq!(
+            chosen_network(v.network_index),
+            Some(Network::SilverAardwold)
+        );
     }
 
     #[test]
