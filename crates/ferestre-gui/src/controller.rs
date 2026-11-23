@@ -395,6 +395,9 @@ fn is_control(root: &gtk::Widget) -> bool {
         || root.is::<gtk::Switch>()
         || root.is::<gtk::CheckButton>()
         || root.is::<gtk::TextView>()
+        // The row takes the focus; the switch or list inside it does not.
+        || root.is::<adw::SwitchRow>()
+        || root.is::<adw::ComboRow>()
 }
 fn move_surface(root: &gtk::Widget, focus: Option<gtk::Widget>, action: Action) {
     fn collect(root: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
@@ -976,7 +979,45 @@ fn dropdown_for(focus: &gtk::Widget) -> Option<gtk::DropDown> {
     }
     None
 }
-fn choose_option(dropdown: &gtk::DropDown, parent: &gtk::Window) -> bool {
+/// A list of options: a dropdown, or a row that is one.
+#[derive(Clone)]
+enum Options {
+    DropDown(gtk::DropDown),
+    Row(adw::ComboRow),
+}
+impl Options {
+    fn model(&self) -> Option<gio::ListModel> {
+        match self {
+            Self::DropDown(w) => w.model(),
+            Self::Row(w) => w.model(),
+        }
+    }
+    fn selected(&self) -> u32 {
+        match self {
+            Self::DropDown(w) => w.selected(),
+            Self::Row(w) => w.selected(),
+        }
+    }
+    fn select(&self, index: u32) {
+        match self {
+            Self::DropDown(w) => w.set_selected(index),
+            Self::Row(w) => w.set_selected(index),
+        }
+    }
+    fn is_mapped(&self) -> bool {
+        match self {
+            Self::DropDown(w) => w.is_mapped(),
+            Self::Row(w) => w.is_mapped(),
+        }
+    }
+    fn title(&self) -> Option<glib::GString> {
+        match self {
+            Self::DropDown(w) => w.tooltip_text(),
+            Self::Row(w) => Some(w.title()),
+        }
+    }
+}
+fn choose_option(dropdown: &Options, parent: &gtk::Window) -> bool {
     let Some(model) = dropdown.model() else {
         return false;
     };
@@ -993,12 +1034,7 @@ fn choose_option(dropdown: &gtk::DropDown, parent: &gtk::Window) -> bool {
         return false;
     };
     let dialog = adw::Dialog::builder()
-        .title(
-            dropdown
-                .tooltip_text()
-                .as_deref()
-                .unwrap_or("Choose an option"),
-        )
+        .title(dropdown.title().as_deref().unwrap_or("Choose an option"))
         .content_width(480)
         .content_height(360)
         .build();
@@ -1036,7 +1072,7 @@ fn choose_option(dropdown: &gtk::DropDown, parent: &gtk::Window) -> bool {
                 .and_then(|v| v.downcast::<gtk::StringObject>().ok())
                 .is_some_and(|v| v.string() == label);
             if dropdown.is_mapped() && same {
-                dropdown.set_selected(index as u32);
+                dropdown.select(index as u32);
             }
             if let Some(dialog) = dialog.upgrade() {
                 dialog.close();
@@ -1071,9 +1107,18 @@ fn activate(ui: &Ui, focus: &gtk::Widget) {
         .and_downcast::<gtk::Window>()
         .unwrap_or_else(|| ui.window.clone().upcast());
     if let Some(dropdown) = dropdown_for(focus) {
-        if choose_option(&dropdown, &parent) {
+        if choose_option(&Options::DropDown(dropdown), &parent) {
             return;
         }
+    }
+    if let Some(row) = focus.downcast_ref::<adw::ComboRow>() {
+        if choose_option(&Options::Row(row.clone()), &parent) {
+            return;
+        }
+    }
+    if let Some(row) = focus.downcast_ref::<adw::SwitchRow>() {
+        row.set_active(!row.is_active());
+        return;
     }
     if let Some(view) = focus.downcast_ref::<gtk::TextView>() {
         if view.is_editable() {

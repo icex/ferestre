@@ -16,6 +16,7 @@ mod cancel;
 mod client_check;
 mod controller;
 mod deadline;
+mod details_ui;
 mod editor;
 mod effects;
 mod folder_picker;
@@ -1665,7 +1666,7 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
     choose.connect_clicked(glib::clone!(
         #[strong]
         ui,
-        move |_| runtime_chooser(&ui, None, "Default game runtime")
+        move |_| runtime_chooser(&ui)
     ));
     default_row.add_suffix(&choose);
     group.add(&default_row);
@@ -2435,11 +2436,8 @@ fn render_rows(
     listed
 }
 
-fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
-    runtime_chooser(ui, Some(product_id), &format!("Runtime for {title}"));
-}
-
-fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
+/// The default runtime, for games with no choice of their own.
+fn runtime_chooser(ui: &Ui) {
     let (paths, runtimes, current) = {
         let model = ui.model.borrow();
         let Some(paths) = model.paths.clone() else {
@@ -2447,18 +2445,12 @@ fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
         };
         (
             paths.clone(),
-            match product_id {
-                Some(id) => model.runtimes_for(id).to_vec(),
-                None => model.runtimes.clone(),
-            },
-            match product_id {
-                Some(id) => ferestre_core::runtime::selected(paths.config_dir(), id),
-                None => ferestre_core::runtime::default_selected(paths.config_dir()),
-            },
+            model.runtimes.clone(),
+            ferestre_core::runtime::default_selected(paths.config_dir()),
         )
     };
     let dialog = adw::Dialog::builder()
-        .title(title)
+        .title("Default game runtime")
         .content_width(520)
         .content_height(420)
         .build();
@@ -2471,29 +2463,16 @@ fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
         .margin_end(18)
         .build();
     content.append(&gtk::Label::builder()
-        .label(if product_id.is_some() {
-            "Choose a runtime for this game, or inherit your Settings default. Applies to the next launch."
-        } else {
-            "Used for games without their own override. Automatic selects the newest compatible runtime. Applies to the next launch."
-        })
+        .label("Used for games without their own override. Automatic selects the newest compatible runtime. Applies to the next launch.")
         .wrap(true)
         .xalign(0.0)
         .build());
-    let automatic = gtk::Button::with_label(if product_id.is_some() {
-        "Use default runtime"
-    } else {
-        "Automatic (newest compatible)"
-    });
+    let automatic = gtk::Button::with_label("Automatic (newest compatible)");
     let automatic_ui = ui.clone();
     let automatic_dialog = dialog.clone();
     let automatic_paths = paths.clone();
-    let automatic_product = product_id.map(str::to_string);
     automatic.connect_clicked(move |_| {
-        let result = save_runtime_choice(
-            automatic_paths.config_dir(),
-            automatic_product.as_deref(),
-            None,
-        );
+        let result = ferestre_core::runtime::set_default(automatic_paths.config_dir(), None);
         automatic_ui.model.borrow().forget_probes();
         if let Err(error) = result {
             automatic_ui
@@ -2526,14 +2505,10 @@ fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
         let selected_ui = ui.clone();
         let selected_dialog = dialog.clone();
         let selected_paths = paths.clone();
-        let selected_product = product_id.map(str::to_string);
         let path = runtime.path.clone();
         choice.connect_clicked(move |_| {
-            let result = save_runtime_choice(
-                selected_paths.config_dir(),
-                selected_product.as_deref(),
-                Some(&path),
-            );
+            let result =
+                ferestre_core::runtime::set_default(selected_paths.config_dir(), Some(&path));
             selected_ui.model.borrow().forget_probes();
             if let Err(error) = result {
                 selected_ui
@@ -2563,17 +2538,6 @@ fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
     ));
     dialog.present(Some(&ui.window));
     automatic.grab_focus();
-}
-
-fn save_runtime_choice(
-    config: &std::path::Path,
-    product_id: Option<&str>,
-    path: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
-    match product_id {
-        Some(id) => ferestre_core::runtime::set_selected(config, id, path),
-        None => ferestre_core::runtime::set_default(config, path),
-    }
 }
 
 fn render_library_tabs(ui: &Ui, page: &gtk::Box) {
@@ -3360,7 +3324,7 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
     let details = details.join("  ·  ");
     action_row.set_subtitle(&details);
     // Which runtime Play would use: the per-title choice changes it, and a
-    // row that hid that made "Choose runtime" look as if it did nothing.
+    // row that hid that made a runtime choice look as if it did nothing.
     let runtime_note = ui.model.borrow().runtime_note(&row.product_id);
     action_row.set_tooltip_text(Some(&match &runtime_note {
         Some(note) => format!("{}\n{}\n{}\n{}", row.name, details, note, row.product_id),
@@ -3458,7 +3422,22 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
         });
         menu.append(&button);
     };
+    // A game with an update can be played as it is.
+    if matches!(row.action, Action::Play | Action::Update) {
+        // A bundle row runs its child, as its button does.
+        let (id, name) = row
+            .install_as
+            .clone()
+            .unwrap_or_else(|| (row.product_id.clone(), row.name.clone()));
+        let ui = ui.clone();
+        item(
+            "media-playback-start-symbolic",
+            "Launch",
+            Box::new(move || spawn_title(&ui, &id, &name)),
+        );
+    }
     let detail_ui = ui.clone();
+    let (detail_id, local) = (row.product_id.clone(), row.local);
     let detail_name = row.name.clone();
     let detail_text = match &runtime_note {
         Some(runtime) => format!("{details}\n\n{runtime}"),
@@ -3468,28 +3447,9 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
         "dialog-information-symbolic",
         "Game details",
         Box::new(move || {
-            let dialog = adw::AlertDialog::new(Some(&detail_name), Some(&detail_text));
-            dialog.set_body_use_markup(false);
-            dialog.add_response("close", "Close");
-            dialog.set_close_response("close");
-            dialog.present(Some(&detail_ui.window));
+            details_ui::open(&detail_ui, &detail_id, &detail_name, &detail_text, local);
         }),
     );
-    // A local game has no Store page, is not moved, and is never deleted.
-    if !row.local {
-        let store_url = format!("{STORE_PAGE}{}", row.product_id);
-        // Weak for the same reason: the row holds the menu that holds this.
-        let anchor = action_row.downgrade();
-        item(
-            "web-browser-symbolic",
-            "Open Store page",
-            Box::new(move || {
-                if let Some(anchor) = anchor.upgrade() {
-                    open_link(&anchor, &store_url);
-                }
-            }),
-        );
-    }
     // A shortcut needs something that will launch. A recipe is one; a title on
     // disk is another, because `run` writes a recipe from the package manifest
     // on its way past.
@@ -3501,11 +3461,10 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
     if (row.has_recipe || row.installed) && row.action != Action::Content {
         for (icon, label, run) in [
             (
-                "applications-engineering-symbolic",
-                "Choose runtime",
-                choose_runtime as fn(&Ui, &str, &str),
+                "list-add-symbolic",
+                "Add to Steam",
+                add_to_steam as fn(&Ui, &str, &str),
             ),
-            ("list-add-symbolic", "Add to Steam", add_to_steam),
             (
                 "document-edit-symbolic",
                 "Edit launch settings",
@@ -3518,15 +3477,6 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
             let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
             item(icon, label, Box::new(move || run(&ui, &product_id, &name)));
         }
-    }
-    // Only for a title on disk: the dialog reads its files.
-    if row.installed && row.action != Action::Content {
-        let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
-        item(
-            "video-display-symbolic",
-            "Neural rendering…",
-            Box::new(move || neural_ui::open(&ui, &product_id, &name)),
-        );
     }
     if row.installed && !row.local && row.action != Action::Stop && row.action != Action::Installing
     {
@@ -3555,7 +3505,7 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
         let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
         item(
             "user-trash-symbolic",
-            "Remove from disk",
+            "Delete",
             Box::new(move || confirm_remove(&ui, &product_id, &name)),
         );
     }
@@ -4271,7 +4221,7 @@ fn explain_blocked(ui: &Ui, product_id: &str, name: &str, reason: &str, offer_ru
     dialog.set_close_response("close");
     let (chooser_ui, product_id, name) = (ui.clone(), product_id.to_string(), name.to_string());
     dialog.connect_response(Some("runtime"), move |_, _| {
-        choose_runtime(&chooser_ui, &product_id, &name)
+        open_editor_on(&chooser_ui, &product_id, &name, Some(editor::PROTON_TAB))
     });
     dialog.present(Some(&ui.window));
 }
@@ -5763,7 +5713,11 @@ fn free_space_label(dir: &Path) -> Option<String> {
 }
 
 fn open_editor(ui: &Ui, product_id: &str, name: &str) {
-    let (recipe, titles_dir, runtime) = {
+    open_editor_on(ui, product_id, name, None);
+}
+
+fn open_editor_on(ui: &Ui, product_id: &str, name: &str, tab: Option<&'static str>) {
+    let (recipe, titles_dir, runtimes) = {
         let model = ui.model.borrow();
         let mut recipe = model.recipe_for(product_id).cloned().unwrap_or_else(|| {
             let mut blank = Recipe::blank(product_id, name);
@@ -5788,8 +5742,21 @@ fn open_editor(ui: &Ui, product_id: &str, name: &str) {
                 recipe.launch.executable = found;
             }
         }
-        let runtime = model.launch_runtime(&recipe).ok().map(|r| r.path.clone());
-        (recipe, model.user_titles_dir(), runtime)
+        let runtimes = editor::Runtimes {
+            choices: recipe.launch.steam_app_id.is_none().then(|| {
+                model
+                    .runtimes_for(product_id)
+                    .iter()
+                    .map(|r| (r.path.clone(), r.label()))
+                    .collect()
+            }),
+            chosen: model
+                .paths
+                .as_ref()
+                .and_then(|p| ferestre_core::runtime::selected(p.config_dir(), product_id)),
+            launch: model.launch_runtime(&recipe).ok().map(|r| r.path.clone()),
+        };
+        (recipe, model.user_titles_dir(), runtimes)
     };
     let Some(titles_dir) = titles_dir else {
         ui.toasts
@@ -5801,18 +5768,33 @@ fn open_editor(ui: &Ui, product_id: &str, name: &str) {
     let ui = ui.clone();
     let reset_ui = ui.clone();
     let reset_name = name.to_string();
+    let (runtime_ui, runtime_id) = (ui.clone(), product_id.to_string());
     editor::present(
         &window,
         recipe,
-        titles_dir,
-        runtime,
+        editor::Setup {
+            titles_dir,
+            runtimes,
+            neural: neural_ui::tab(&ui, product_id),
+            tab,
+        },
+        move |path| {
+            let paths = runtime_ui.model.borrow().paths.clone();
+            let paths = paths.ok_or("Ferestre's folders are unknown")?;
+            let saved = ferestre_core::runtime::set_selected(paths.config_dir(), &runtime_id, path);
+            runtime_ui.model.borrow().forget_probes();
+            saved.map_err(|e| format!("{e:#}"))
+        },
         move |path| {
             ui.model.borrow_mut().reload();
             render(&ui);
-            ui.toasts.add_toast(toast(format!(
-                "Saved {}",
-                path.file_name().unwrap_or_default().to_string_lossy()
-            )));
+            ui.toasts.add_toast(toast(match path {
+                Some(path) => format!(
+                    "Saved {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ),
+                None => "Runtime choice saved for the next launch".to_string(),
+            }));
         },
         move || {
             reset_ui.model.borrow_mut().reload();

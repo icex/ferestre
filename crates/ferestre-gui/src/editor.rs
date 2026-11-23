@@ -172,6 +172,13 @@ pub fn relative_install_dir(games_dir: &std::path::Path, dir: &std::path::Path) 
     (normal && !text.is_empty()).then(|| text.to_string())
 }
 
+fn same_recipe(a: &Recipe, b: &Recipe) -> bool {
+    match (a.to_toml(), b.to_toml()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 fn non_empty(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
@@ -201,6 +208,15 @@ impl OptionControl {
         value.map(|value| (option.key, value.to_string()))
     }
 
+    /// Say again what the option does, for another runtime.
+    fn describe_for(&self, runtime: Option<&Path>) {
+        let subtitle = option_subtitle(self.option(), runtime);
+        match self {
+            OptionControl::Switch(_, row) => row.set_subtitle(&subtitle),
+            OptionControl::Choice(_, row) => row.set_subtitle(&subtitle),
+        }
+    }
+
     fn option(&self) -> &'static LaunchOption {
         match self {
             OptionControl::Switch(option, _) | OptionControl::Choice(option, _) => option,
@@ -226,14 +242,15 @@ fn option_subtitle(option: &LaunchOption, runtime: Option<&Path>) -> String {
     }
 }
 
-/// A group per section, each setting showing what the recipe chose.
+/// A group for each of `sections`, each setting showing what the recipe chose.
 fn option_groups(
     page: &adw::PreferencesPage,
+    sections: &[Section],
     chosen: &BTreeMap<&'static str, String>,
     runtime: Option<&Path>,
 ) -> Vec<OptionControl> {
     let mut controls = Vec::new();
-    for section in Section::ALL {
+    for &section in sections {
         let group = adw::PreferencesGroup::builder()
             .title(section.title())
             .build();
@@ -377,24 +394,100 @@ impl OtherVariables {
     }
 }
 
+/// The tabs of settings, each with its name and the sections it shows.
+const OPTION_TABS: [(&str, &str, &[Section]); 4] = [
+    ("display", "Display", &[Section::Display]),
+    (
+        "compatibility",
+        "Compatibility",
+        &[
+            Section::Controllers,
+            Section::Compatibility,
+            Section::AntiCheat,
+        ],
+    ),
+    ("upscaling", "Upscaling", &[Section::Upscaling]),
+    (PROTON_TAB, "Proton", &[Section::Proton]),
+];
+
+/// The tab with the runtime choice, for opening the editor on it.
+pub const PROTON_TAB: &str = "proton";
+
+/// The runtimes a title can be given and the one it has.
+pub struct Runtimes {
+    /// `None` for a game Steam starts, whose runtime is Steam's choice.
+    pub choices: Option<Vec<(PathBuf, String)>>,
+    /// The choice saved for this title; `None` follows the default.
+    pub chosen: Option<PathBuf>,
+    /// What a launch uses now.
+    pub launch: Option<PathBuf>,
+}
+
+impl Runtimes {
+    /// The dropdown's entries after "Default", keeping a chosen runtime that
+    /// is not installed any more so that saving does not drop it.
+    fn entries(&self) -> Vec<(PathBuf, String)> {
+        let mut entries = self.choices.clone().unwrap_or_default();
+        if let Some(chosen) = &self.chosen {
+            if !entries.iter().any(|(path, _)| path == chosen) {
+                entries.push((
+                    chosen.clone(),
+                    format!("{} (not installed)", chosen.display()),
+                ));
+            }
+        }
+        entries
+    }
+
+    fn selected(&self, entries: &[(PathBuf, String)]) -> u32 {
+        self.chosen
+            .as_ref()
+            .and_then(|chosen| entries.iter().position(|(path, _)| path == chosen))
+            .map_or(0, |i| i as u32 + 1)
+    }
+}
+
+fn entry_at(entries: &[(PathBuf, String)], selected: u32) -> Option<&PathBuf> {
+    (selected as usize)
+        .checked_sub(1)
+        .and_then(|i| entries.get(i))
+        .map(|(path, _)| path)
+}
+
+/// What the editor is opened with besides the recipe.
+pub struct Setup {
+    pub titles_dir: PathBuf,
+    pub runtimes: Runtimes,
+    /// The neural rendering tab's content.
+    pub neural: gtk::Widget,
+    /// The tab to open on; the first one unless named.
+    pub tab: Option<&'static str>,
+}
+
 /// Show the editor for a recipe. `on_saved` is handed the path it wrote;
 /// `on_reset` runs after the title's edits were set aside by "Reset to
-/// defaults". `runtime` is the one the title would launch with.
+/// defaults"; `on_runtime` saves a changed runtime choice.
 pub fn present(
     parent: &impl IsA<gtk::Widget>,
     recipe: Recipe,
-    titles_dir: PathBuf,
-    runtime: Option<PathBuf>,
-    on_saved: impl Fn(PathBuf) + 'static,
+    setup: Setup,
+    on_runtime: impl Fn(Option<&Path>) -> Result<(), String> + 'static,
+    on_saved: impl Fn(Option<PathBuf>) + 'static,
     on_reset: impl Fn() + 'static,
 ) {
+    let Setup {
+        titles_dir,
+        runtimes,
+        neural,
+        tab,
+    } = setup;
     let draft = Draft::from_recipe(&recipe);
     let local = recipe.is_local();
     let recipe = Rc::new(RefCell::new(recipe));
 
     let dialog = adw::Dialog::builder()
         .title("Set up this title")
-        .content_width(600)
+        .content_width(860)
         .content_height(720)
         .build();
 
@@ -463,10 +556,74 @@ pub fn present(
         identity.add(&wrapper);
     }
 
+    let stack = gtk::Stack::builder().vexpand(true).build();
     let page = adw::PreferencesPage::new();
     page.add(&identity);
-    let controls = Rc::new(option_groups(&page, &draft.chosen, runtime.as_deref()));
+    stack.add_titled(&page, Some("general"), "General");
+
+    let runtime_entries = Rc::new(runtimes.entries());
+    let runtime_row = adw::ComboRow::builder()
+        .title("Runtime")
+        .subtitle("The Proton this game runs with. Default follows Settings.")
+        .build();
+    let mut controls = Vec::new();
+    for (id, title, sections) in OPTION_TABS {
+        let page = adw::PreferencesPage::new();
+        if id == PROTON_TAB && runtimes.choices.is_some() {
+            let labels: Vec<&str> = std::iter::once("Default")
+                .chain(runtime_entries.iter().map(|(_, label)| label.as_str()))
+                .collect();
+            runtime_row.set_model(Some(&gtk::StringList::new(&labels)));
+            runtime_row.set_selected(runtimes.selected(&runtime_entries));
+            let group = adw::PreferencesGroup::new();
+            group.add(&runtime_row);
+            page.add(&group);
+        }
+        controls.extend(option_groups(
+            &page,
+            sections,
+            &draft.chosen,
+            runtimes.launch.as_deref(),
+        ));
+        stack.add_titled(&page, Some(id), title);
+    }
+    let controls = Rc::new(controls);
+    let page = adw::PreferencesPage::new();
     let others = Rc::new(OtherVariables::new(&page, &draft.other));
+    stack.add_titled(&page, Some("variables"), "Variables");
+    stack.add_titled(&neural, Some("neural"), "Neural rendering (experimental)");
+    if let Some(tab) = tab {
+        stack.set_visible_child_name(tab);
+    }
+    let first_runtime = runtime_row.selected();
+    {
+        // Which flags a runtime knows changes with the runtime. Which one
+        // "Default" is, is known only while it is what a launch uses.
+        let (controls, entries) = (controls.clone(), runtime_entries.clone());
+        let launch = runtimes.launch.clone();
+        runtime_row.connect_selected_notify(move |row| {
+            let runtime = match entry_at(&entries, row.selected()) {
+                Some(path) => Some(path.clone()),
+                None if first_runtime == 0 => launch.clone(),
+                None => None,
+            };
+            for control in controls.iter().filter(|c| c.option().is_proton_flag()) {
+                control.describe_for(runtime.as_deref());
+            }
+        });
+    }
+    let switcher = gtk::StackSwitcher::builder()
+        .stack(&stack)
+        .halign(gtk::Align::Center)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_bottom(6)
+        .build();
+    let tabs = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .child(&switcher)
+        .build();
 
     let header = adw::HeaderBar::new();
     let cancel = gtk::Button::with_label("Cancel");
@@ -501,9 +658,10 @@ pub fn present(
     header.pack_start(&reset);
 
     let toasts = crate::notifications::Toasts::new();
-    toasts.set_child(Some(&page));
+    toasts.set_child(Some(&stack));
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
+    toolbar.add_top_bar(&tabs);
     toolbar.set_content(Some(toasts.widget()));
     dialog.set_child(Some(&toolbar));
 
@@ -601,13 +759,27 @@ pub fn present(
                 toasts.add_toast(crate::toast(&complaint));
                 return;
             }
+            if runtime_row.selected() != first_runtime {
+                let path = entry_at(&runtime_entries, runtime_row.selected());
+                if let Err(e) = on_runtime(path.map(PathBuf::as_path)) {
+                    toasts.add_toast(crate::toast(format!("Could not save the runtime: {e}")));
+                    return;
+                }
+                // Only the runtime changed: an edit of the recipe would be
+                // one nobody made, and would keep winning over a shipped one.
+                if same_recipe(&edited, &recipe.borrow()) {
+                    on_saved(None);
+                    dialog.close();
+                    return;
+                }
+            }
             // Somebody has looked at it now: an edited recipe is theirs, and
             // keeps winning over one shipped later, as a generated one would
             // not.
             edited.generated = false;
             match edited.save_to(&titles_dir) {
                 Ok(path) => {
-                    on_saved(path);
+                    on_saved(Some(path));
                     dialog.close();
                 }
                 Err(e) => toasts.add_toast(crate::toast(format!("Could not save: {e}"))),
@@ -725,6 +897,45 @@ mod tests {
         };
         let complaint = clash.apply(&mut blank()).expect_err("refuses");
         assert!(complaint.contains("Native Wayland"), "{complaint}");
+    }
+
+    #[test]
+    fn every_section_is_on_one_tab() {
+        for section in Section::ALL {
+            let tabs = OPTION_TABS
+                .iter()
+                .filter(|(_, _, sections)| sections.contains(&section))
+                .count();
+            assert_eq!(tabs, 1, "{section:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_chosen_runtime_stays_chosen() {
+        let runtimes = Runtimes {
+            choices: Some(vec![("/r/a".into(), "A".into())]),
+            chosen: Some("/r/gone".into()),
+            launch: None,
+        };
+        let entries = runtimes.entries();
+        let selected = runtimes.selected(&entries);
+        assert_eq!(
+            entry_at(&entries, selected),
+            Some(&PathBuf::from("/r/gone"))
+        );
+        assert_eq!(entry_at(&entries, 0), None, "the default");
+    }
+
+    #[test]
+    fn choosing_only_a_runtime_is_not_an_edit_of_the_recipe() {
+        let mut recipe = blank();
+        recipe.launch.executable = "Game.exe".into();
+        let mut edited = recipe.clone();
+        let draft = Draft::from_recipe(&recipe);
+        draft.apply(&mut edited).unwrap();
+        assert!(same_recipe(&edited, &recipe));
+        edited.launch.env.insert("A".into(), "1".into());
+        assert!(!same_recipe(&edited, &recipe));
     }
 
     #[test]

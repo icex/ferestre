@@ -403,7 +403,7 @@ pub fn launch_runtime<'a>(
         if !runtimes.iter().any(|rt| rt.path == path) {
             return Err(format!(
                 "the runtime chosen for this title is no longer installed ({}); choose another \
-                 with Choose runtime",
+                 in Edit launch settings, Proton",
                 path.display()
             ));
         }

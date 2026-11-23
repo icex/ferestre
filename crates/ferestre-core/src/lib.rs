@@ -36,6 +36,7 @@ pub mod neural;
 pub mod paths;
 pub mod playfab;
 pub mod presence;
+pub mod product_details;
 pub mod recipe;
 pub mod related;
 pub mod relocation;

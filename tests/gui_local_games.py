@@ -86,7 +86,7 @@ summary = "Added by hand"
             s.check(any('Ricochet' in t for t in s.texts(frame)), 'the anti-cheat file is named on the row', frame)
             offers = s.row_menu_offers(app, frame, TITLE)
             s.check('Remove from library' in offers, f'the menu offers Remove from library ({offers!r})', frame)
-            for absent in ('Open Store page', 'Move location', 'Remove from disk'):
+            for absent in ('Move location', 'Delete'):
                 s.check(absent not in offers, f'a local game has no {absent} ({offers!r})', frame)
 
             s.click_named(frame, 'Add games')

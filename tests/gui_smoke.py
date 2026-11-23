@@ -491,7 +491,7 @@ def toggle_row_menu(app, frame, title, want_open):
     raise Failure(f"timed out waiting for {title}'s menu to " + ("open" if want_open else "close"))
 
 
-MENU_ITEMS = {"Game details", "Move location", "Open Store page", "Choose runtime", "Add to Steam", "Edit launch settings", "Neural rendering…", "Remove from disk"}
+MENU_ITEMS = {"Launch", "Game details", "Move location", "Add to Steam", "Edit launch settings", "Delete"}
 
 
 def row_menu_offers(app, frame, title):
@@ -1543,11 +1543,13 @@ print(":: done", flush=True)
             f"each managed recipe offers Add to Steam ({steam!r})",
             frame,
         )
-        check(
-            all("Open Store page" in items for items in offered.values()),
-            "every row's menu links its Store page",
-            frame,
-        )
+        check("Launch" in offered["Minecraft for Windows"], "an installed game's menu launches it", frame)
+        row_action(app, frame, "Game details", "Minecraft for Windows")
+        wait_for(app, lambda root: find_all(root, role="button", name="Open Store page"),
+                 "the Store page button in Game details", time.monotonic() + TIMEOUT)
+        click_named(app, "Close")
+        wait_for(app, lambda root: not find_all(root, role="button", name="Open Store page"),
+                 "Game details to close", time.monotonic() + TIMEOUT)
         steam_title = steam[0]
         row_action(app, frame, "Add to Steam", steam_title)
         wait_for(frame, lambda root: os.path.isfile(shortcuts),
@@ -1666,9 +1668,16 @@ print(":: done", flush=True)
         )
         # Settings are switches and menus, so nobody has to know a variable's
         # name; anything else goes in a list of its own.
-        for setting in ("Native Wayland", "Gamescope", "Strict manual task queues",
-                        "Easy Anti-Cheat Linux library", "Other variables"):
-            check(setting in labels, f"the editor offers {setting!r}", frame)
+        # They are spread over tabs, and only the shown tab's are readable.
+        for tab, settings in (("Display", ("Native Wayland", "Gamescope")),
+                              ("Compatibility", ("Strict manual task queues", "Easy Anti-Cheat Linux library")),
+                              ("Upscaling", ("FSR 4 upgrade",)),
+                              ("Proton", ("Runtime", "No NVIDIA API")),
+                              ("Variables", ("Other variables",))):
+            click_named(app, tab)
+            for setting in settings:
+                wait_for(app, lambda root, setting=setting: setting in texts(root),
+                         f"{setting!r} on the {tab} tab", time.monotonic() + TIMEOUT)
         check(
             bool(find_all(frame, role="button", name="Add a variable")),
             "and a variable can be added",
@@ -1696,16 +1705,17 @@ print(":: done", flush=True)
         check(True, "and closing it leaves the library where it was")
 
         print("neural rendering dialog")
-        # Minecraft is the fixture on disk; the item is only offered for one.
-        row_action(app, frame, "Neural rendering…", "Minecraft for Windows")
+        # Minecraft is the fixture on disk; the tab reads its files.
+        row_action(app, frame, "Edit launch settings", "Minecraft for Windows")
+        click_named(app, "Neural rendering (experimental)")
         labels = wait_for(
             app,
-            lambda root: texts(root) if any(t.startswith("Neural rendering for") for t in texts(root)) else None,
-            "the neural rendering dialog to open",
+            lambda root: texts(root) if any(t.startswith("Experimental: DLSSNR-AMD") for t in texts(root)) else None,
+            "the neural rendering tab to open",
             time.monotonic() + TIMEOUT,
         )
         check(any(t.startswith("Experimental: DLSSNR-AMD") for t in labels),
-              "the dialog says it is experimental", frame)
+              "the tab says it is experimental", frame)
         check(any(t.startswith("Off") for t in labels),
               "and that neural rendering is off for this game", frame)
         check("Route" in labels and "Starting network" in labels,
@@ -1719,8 +1729,8 @@ print(":: done", flush=True)
         click_named(app, "Cancel")
         wait_for(
             app,
-            lambda root: not any(t.startswith("Neural rendering for") for t in texts(root)),
-            "the neural rendering dialog to close",
+            lambda root: not any(t.startswith("Experimental: DLSSNR-AMD") for t in texts(root)),
+            "the neural rendering tab to close",
             time.monotonic() + TIMEOUT,
         )
         check(True, "Cancel closes it without enabling anything")
@@ -1750,7 +1760,9 @@ print(":: done", flush=True)
         editable = executable.get_editable_text_iface()
         check(editable is not None, "and editable", frame)
         Atspi.EditableText.set_text_contents(editable, "SmokeTest/Changed.exe")
+        click_named(app, "Display")
         click_named(frame, "Native Wayland")
+        click_named(app, "Variables")
         click_named(frame, "Add a variable")
         for field, value in (("Variable name", "SMOKE_TEST_VARIABLE"), ("Variable value", "kept")):
             entry = wait_for(
@@ -1817,7 +1829,7 @@ print(":: done", flush=True)
                  "the automatic update check to finish", time.monotonic() + TIMEOUT)
         wait_for(frame, lambda root: row_menus(root) or None,
                  "the installed game's row menu", time.monotonic() + TIMEOUT)
-        row_action(app, frame, "Remove from disk")
+        row_action(app, frame, "Delete")
         wait_for(frame, lambda root: any("Remove Minecraft for Windows?" in t for t in texts(root)),
                  "the removal confirmation", time.monotonic() + TIMEOUT)
         click_named(frame, "Remove")

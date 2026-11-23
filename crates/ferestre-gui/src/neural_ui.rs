@@ -176,31 +176,70 @@ pub(crate) fn enable_sensitive(v: &View, route_index: u32, acknowledged: Option<
         && acknowledged.unwrap_or(true)
 }
 
-/// Reads the game's neural rendering state off the main loop, then shows
-/// the dialog.
-pub fn open(ui: &Ui, product_id: &str, name: &str) {
+fn message(content: &gtk::Box, text: &str) {
+    while let Some(child) = content.first_child() {
+        content.remove(&child);
+    }
+    content.append(
+        &gtk::Label::builder()
+            .label(text)
+            .wrap(true)
+            .xalign(0.0)
+            .build(),
+    );
+}
+
+/// The editor's neural rendering tab. The game's files are read, off the main
+/// loop, when the tab is first shown.
+pub fn tab(ui: &Ui, product_id: &str) -> gtk::Widget {
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(18)
+        .margin_bottom(18)
+        .margin_start(18)
+        .margin_end(18)
+        .build();
+    let page = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&content)
+        .build();
+    let (ui, product_id) = (ui.clone(), product_id.to_string());
+    let started = std::cell::Cell::new(false);
+    page.connect_map(move |_| {
+        if !started.replace(true) {
+            load(&ui, &product_id, &content);
+        }
+    });
+    page.upcast()
+}
+
+fn load(ui: &Ui, product_id: &str, content: &gtk::Box) {
     let (paths, recipe) = {
         let model = ui.model.borrow();
         let (Some(paths), Some(recipe)) = (model.paths.clone(), model.recipe_for(product_id))
         else {
-            ui.toasts
-                .add_toast(toast(format!("{name} has no recipe to read")));
+            message(content, "Save this game's launch settings first.");
             return;
         };
         (paths, recipe.clone())
     };
-    // The folder `ferestre neural` acts on, so the dialog and the CLI agree.
+    // The folder `ferestre neural` acts on, so the tab and the CLI agree.
     let game_dir = match paths.install_dir(&recipe) {
-        Ok(dir) => dir,
+        Ok(dir) if dir.is_dir() => dir,
+        Ok(_) => {
+            message(content, "Install this game to set up neural rendering.");
+            return;
+        }
         Err(error) => {
-            ui.toasts
-                .add_toast(toast(format!("Cannot find {name}: {error:#}")));
+            message(content, &format!("Cannot find this game: {error:#}"));
             return;
         }
     };
+    message(content, "Reading the game’s files…");
     let key = recipe.title.product_id.to_ascii_uppercase();
-    let ui = ui.clone();
-    let name = name.to_string();
+    let (ui, content) = (ui.clone(), content.clone());
     glib::spawn_future_local(async move {
         let blocking_key = key.clone();
         let result = gio::spawn_blocking(move || {
@@ -218,28 +257,16 @@ pub fn open(ui: &Ui, product_id: &str, name: &str) {
             return;
         }
         match result {
-            Ok(o) => present(&ui, &key, &name, &view(&o)),
-            Err(_) => ui
-                .toasts
-                .add_toast(toast("Could not read neural rendering for this game")),
+            Ok(o) => fill(&ui, &content, &key, &view(&o)),
+            Err(_) => message(&content, "Could not read neural rendering for this game"),
         }
     });
 }
 
-fn present(ui: &Ui, product_id: &str, name: &str, v: &View) {
-    let dialog = adw::Dialog::builder()
-        .title(format!("Neural rendering for {name}"))
-        .content_width(560)
-        .content_height(600)
-        .build();
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(8)
-        .margin_top(18)
-        .margin_bottom(18)
-        .margin_start(18)
-        .margin_end(18)
-        .build();
+fn fill(ui: &Ui, content: &gtk::Box, product_id: &str, v: &View) {
+    while let Some(child) = content.first_child() {
+        content.remove(&child);
+    }
     let label = |text: &str| {
         gtk::Label::builder()
             .label(text)
@@ -250,7 +277,8 @@ fn present(ui: &Ui, product_id: &str, name: &str, v: &View) {
     };
     content.append(&label(
         "Experimental: DLSSNR-AMD upscales with NVIDIA’s neural model on AMD RDNA4. \
-         It goes into the game’s folder and comes out again, with your own files put back, when you disable it.",
+         It goes into the game’s folder and comes out again, with your own files put back, when you disable it. \
+         The buttons here act at once, on the saved settings; Save is not needed.",
     ));
     content.append(&label(&v.summary));
     for warning in &v.warnings {
@@ -336,11 +364,27 @@ fn present(ui: &Ui, product_id: &str, name: &str, v: &View) {
     if let Some(check) = &acknowledged {
         check.connect_toggled(move |_| sensitivity());
     }
+    let disable = v.enabled.then(|| gtk::Button::with_label("Disable"));
+    let status = label("");
+    status.set_visible(false);
+    // One of them at a time, and only once: what is shown here is from before.
+    let started = {
+        let (enable, disable, status) = (enable.clone(), disable.clone(), status.clone());
+        move |what: &str| {
+            enable.set_visible(false);
+            if let Some(disable) = &disable {
+                disable.set_visible(false);
+            }
+            status.set_label(&format!(
+                "{what}. The main window shows the progress; open this again for the result."
+            ));
+            status.set_visible(true);
+        }
+    };
     {
-        let (ui, dialog, product_id) = (ui.clone(), dialog.clone(), product_id.to_string());
-        let (routes, networks, acknowledged) =
-            (routes.clone(), networks.clone(), acknowledged.clone());
+        let (ui, product_id) = (ui.clone(), product_id.to_string());
         let shown = v.acknowledge.clone();
+        let started = started.clone();
         enable.connect_clicked(move |_| {
             let route = chosen_route(routes.selected());
             let model = chosen_network(networks.selected());
@@ -350,45 +394,24 @@ fn present(ui: &Ui, product_id: &str, name: &str, v: &View) {
                 args.extend(shown_args(&shown));
             }
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            dialog.close();
+            started("Enabling neural rendering");
             spawn_cli_tracked(&ui, &args, "Enabling neural rendering");
         });
     }
     content.append(&enable);
-    if v.enabled {
-        let disable = gtk::Button::with_label("Disable");
-        let (ui, dialog, product_id) = (ui.clone(), dialog.clone(), product_id.to_string());
+    if let Some(disable) = &disable {
+        let (ui, product_id) = (ui.clone(), product_id.to_string());
         disable.connect_clicked(move |_| {
-            dialog.close();
+            started("Disabling neural rendering");
             spawn_cli_tracked(
                 &ui,
                 &["neural", "disable", &product_id],
                 "Disabling neural rendering",
             );
         });
-        content.append(&disable);
+        content.append(disable);
     }
-    let cancel = gtk::Button::with_label("Cancel");
-    let cancel_dialog = dialog.clone();
-    cancel.connect_clicked(move |_| {
-        cancel_dialog.close();
-    });
-    content.append(&cancel);
-    // A header bar, as the accounts dialog has: it shows the title, which
-    // libadwaita 1.5 (GTK 4.14, CI's) otherwise neither draws nor gives the
-    // dialog as its accessible name.
-    let view = adw::ToolbarView::new();
-    view.add_top_bar(&adw::HeaderBar::new());
-    view.set_content(Some(
-        &gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vexpand(true)
-            .child(&content)
-            .build(),
-    ));
-    dialog.set_child(Some(&view));
-    dialog.present(Some(&ui.window));
-    cancel.grab_focus();
+    content.append(&status);
 }
 
 thread_local! {

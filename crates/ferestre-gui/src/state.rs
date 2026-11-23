@@ -898,7 +898,7 @@ impl Model {
         Folder::Other
     }
 
-    /// The folder "Remove from disk" deletes, found the way `ferestre
+    /// The folder "Delete" deletes, found the way `ferestre
     /// uninstall` finds it: the record, then the recipe's directory, then
     /// games_dir/<product id>. A stopped download has no record, and those are
     /// exactly the folders that most need removing.

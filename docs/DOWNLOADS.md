@@ -14,7 +14,8 @@ the same carousel.
 My Library has four tabs: My games, Installed, Updates and Install queue. They
 share one header and search field, so it stays in place when you change tabs.
 Library pages use large cover cards and the full window width; pressing a card
-starts its primary action. The always-visible More menu includes Game details,
+starts its primary action. The always-visible More menu includes Launch, Game
+details (with the Store page, the description and what Microsoft's catalog says),
 Edit launch settings and other actions. Installed games with a confirmed update
 show an Update available badge on their cover, including while running; current
 installs and unknown update checks show no badge. The search is a pill centred
@@ -72,8 +73,9 @@ it with, only Leave It Running is offered. While a close runs, Play on that
 title says it is closing and asks you to press Play again once it has closed.
 
 Edit launch settings opens the title's recipe editor. Settings Ferestre and its
-runtime understand appear as switches and menus in four groups (Display and
-performance, Controllers, Compatibility, Anti-cheat), each with a line saying
+runtime understand appear as switches and menus on tabs (Display,
+Compatibility, Upscaling, Proton with the runtime, Variables and the experimental
+Neural rendering), each with a line saying
 what it does and, where it applies, which runtime capability it needs. Any
 other variable is a row of its own that can be added, edited and removed. A
 value a control cannot show stays a plain variable, so opening and saving a

@@ -119,7 +119,7 @@ Text entry, destination selection, installation, queues and confirmation dialogs
 
 Open **Settings → Check for Updates**, then use the **Update** banner. Downloads are signature-checked; a writable AppImage is replaced with a backup kept for recovery. New runtimes install alongside previous versions, and a restart waits for current work to finish.
 
-Existing per-game runtime choices remain selected. To change one, use the game's **More actions → Choose runtime**. **Settings → Choose default runtime** sets the default; **Use default runtime** clears a game's override. Changes apply to the next launch.
+Existing per-game runtime choices remain selected. To change one, use the game's **More actions → Edit launch settings → Proton**. **Settings → Choose default runtime** sets the default; **Use default runtime** clears a game's override. Changes apply to the next launch.
 
 See [signed updates and rollback](docs/UPDATES.md) for supported installations. Update package-managed installations through your package manager.
 
@@ -150,7 +150,7 @@ Other local games start through Ferestre's Proton shim without any Xbox service,
 
 ### Try neural rendering (experimental)
 
-On an AMD Radeon RX 9000 card, a game can run NVIDIA's DLSS 5 neural rendering network through [DLSSNR-AMD](https://github.com/TheAutomatic/DLSSNR-AMD). Choose **Neural rendering…** in a game's menu, or `./ferestre.AppImage neural enable <id>`. It needs your own `nvngx_dlssnr.dll` (Ferestre ships no NVIDIA file), and in game the game's upscaler set to DLSS. **Ctrl+Y** opens the NR Control menu. Turning it off puts every replaced file back. See [Neural rendering](docs/NEURAL-RENDERING.md) for requirements, anti-cheat and troubleshooting.
+On an AMD Radeon RX 9000 card, a game can run NVIDIA's DLSS 5 neural rendering network through [DLSSNR-AMD](https://github.com/TheAutomatic/DLSSNR-AMD). Open **Edit launch settings → Neural rendering**, or `./ferestre.AppImage neural enable <id>`. It needs your own `nvngx_dlssnr.dll` (Ferestre ships no NVIDIA file), and in game the game's upscaler set to DLSS. **Ctrl+Y** opens the NR Control menu. Turning it off puts every replaced file back. See [Neural rendering](docs/NEURAL-RENDERING.md) for requirements, anti-cheat and troubleshooting.
 
 ### Refresh your library
 

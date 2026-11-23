@@ -43,7 +43,7 @@ ferestre neural status [<title>]
 ferestre neural disable <title>
 ```
 
-In the window, open a game's menu and choose **Neural rendering…**. The
+In the window, open a game's **Edit launch settings** and its **Neural rendering** tab. The
 download address field is under Settings, in **Neural rendering
 (experimental)**.
 
