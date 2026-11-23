@@ -257,7 +257,9 @@ recorded from this repository.
   between jobs), and checks every manifest field against the run it came from
   and the pinned Proton commit. Only then does it unpack, run the checks on
   those exact bytes (inherited descriptors, Wayland drivers, display modes in
-  the SDK image), write the capability manifest from the tag's
+  the SDK image, which it rebuilds from the built Proton commit's
+  `contrib/ferestre/Dockerfile.sdk` and refuses unless it gives the tag the
+  manifest recorded), write the capability manifest from the tag's
   `titles/capabilities.toml`, and make the `.tar.xz` with `SHA256SUMS`.
 - **`publish`** signs that, as before. The release notes name the run that
   compiled the dist and the inputs digest. Its condition checks that `plan`

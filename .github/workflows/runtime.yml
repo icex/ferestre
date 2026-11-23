@@ -417,6 +417,32 @@ jobs:
           test -s share/default_pfx/drive_c/windows/system32/winewayland.drv
           test -s share/default_pfx/drive_c/windows/syswow64/winewayland.drv
 
+      # The SDK image the dist was built in is a local extension of the
+      # pinned Steam Runtime SDK (Proton's contrib/ferestre/Dockerfile.sdk:
+      # xkbregistry, and weston for the check below), made by configure.sh
+      # on the build runner and never pushed anywhere. Make the same image
+      # here from the Proton commit the manifest says was built, and refuse a
+      # Dockerfile whose hash does not give the tag the build recorded.
+      - name: Rebuild the SDK image the dist was built in
+        env:
+          SDK: ${{ steps.dist.outputs.sdk }}
+          PROTON: ${{ steps.dist.outputs.proton }}
+        run: |
+          set -euo pipefail
+          repo=$(python3 ferestre/scripts/source-pins.py get proton repository)
+          git init -q sdk-src
+          git -C sdk-src fetch -q --depth=1 --filter=blob:none "$repo" "$PROTON"
+          git -C sdk-src checkout -q FETCH_HEAD -- Makefile.in contrib/ferestre
+          base=$(make --silent --no-print-directory -C sdk-src SRCDIR=. --file Makefile.in TARGET_ARCH=x86_64 get-steamrt-image | tail -n 1)
+          tag="ferestre-proton-sdk:$(sha256sum sdk-src/contrib/ferestre/Dockerfile.sdk | cut -c1-16)"
+          echo ":: base $base, image $tag"
+          if [ "$tag" != "$SDK" ]; then
+              echo "::error::the dist was built in $SDK, but Proton $PROTON's Dockerfile.sdk makes $tag"
+              exit 1
+          fi
+          docker build -q --build-arg "BASE_IMAGE=$base" \
+              -f sdk-src/contrib/ferestre/Dockerfile.sdk -t "$tag" sdk-src/contrib/ferestre
+
       - name: Verify practical resolutions through Wine's display API
         env:
           SDK: ${{ steps.dist.outputs.sdk }}
