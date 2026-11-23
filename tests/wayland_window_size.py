@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The window keeps its size across starts, and fits a display it outgrew.
 
-Run under tests/run_wayland_gui.py (a 1280x720 private KWin).
+Run under tests/run_wayland_gui.py (a 1280x720 private KWin). Not a gui_*.py:
+CI runs those on Xvfb, where nothing can resize the window this way.
 """
 import argparse
 import json

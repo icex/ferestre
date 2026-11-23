@@ -1649,6 +1649,7 @@ pub(super) fn install(ui: &Ui) {
             && ui.window.visible_dialog().is_none()
             && GtkWindowExt::focus(&ui.window).is_none()
             && ui.pending_tab_focus.get().is_none()
+            && !ui.refocus_pending.get()
         {
             focus_content(&ui);
         }

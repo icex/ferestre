@@ -205,7 +205,7 @@ summary="Offline controller fixture"
             s.check(True, 'controller type changes update the displayed button family')
             s.click_named(frame, 'Enter fullscreen')
             wait(lambda r: s.find_all(r, role='button', name='Exit fullscreen') and has_focus(r, ' · Install'), 'fullscreen controller focus')
-            press(4, lambda r: any('→ Games' in (n.get_name() or '') and n.get_state_set().contains(s.Atspi.StateType.SHOWING)
+            press(4, lambda r: any('→' in (n.get_name() or '') and 'Games' in (n.get_name() or '') and n.get_state_set().contains(s.Atspi.StateType.SHOWING)
                                   for n in s.find_all(r, role='label')), 'visible Guide navigation instructions in fullscreen')
             press(14, lambda r: has_focus(r, ' · Install'), 'fullscreen navigation returns to games')
             s.click_named(frame, 'Exit fullscreen')

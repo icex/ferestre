@@ -76,10 +76,12 @@ def main():
                 driver.pulse(12);driver.seek('Launch Game 0 · Play');time.sleep(.35)
                 bands=outline_bands(gui.pid,focus(app));print('Outline bands',fullscreen,bands,flush=True)
                 s.check(len(bands)==1,'one green tile outline in '+('fullscreen' if fullscreen else 'desktop'))
-                tile=focus(app)
+                name=focus(app).get_name()
                 s.Atspi.generate_keyboard_event(0xff09,None,s.Atspi.KeySynthType.SYM)
                 wait(lambda r:focus(r) is not None and 'More actions' in focus(r).get_name(),'keyboard focus enters the separate More control')
                 time.sleep(.04)
+                # A background redraw may have replaced the tile meanwhile.
+                tile=wait(lambda r:next(iter(s.find_all(r,name=name)),None),'the tile')
                 s.check(outline_bands(gui.pid,tile)==[],'moving focus inside a card removes its previous outer ring')
             s.click_named(frame,'Exit fullscreen');wait(lambda r:s.find_all(r,name='Enter fullscreen'),'desktop')
             s.select_in_list(frame,'Installed');driver.pulse(12);driver.seek('Install queue')

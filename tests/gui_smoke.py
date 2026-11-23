@@ -908,6 +908,8 @@ last-verified = 2026-10-10
                 "fetched": 0,
                 "market": "US",
                 "product_ids": [pid for pid, _, _, _ in pass_titles],
+                # Without it the file counts as an old one, to be fetched again.
+                "popular": [],
                 "tiers": {
                     "included": {
                         # In the tier the seeded account holds, and not.
@@ -1215,11 +1217,12 @@ print(":: done", flush=True)
             play = row_button(frame, "Minecraft for Windows", "Play")
             button_box = play.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
             view_box = viewport.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
-            center = button_box.y + button_box.height // 2
-            if view_box.y <= center < view_box.y + view_box.height:
+            # All of it: GTK scrolls to the rest of a button clicked while
+            # partly out of view, which is not the jump looked for here.
+            if view_box.y <= button_box.y and button_box.y + button_box.height <= view_box.y + view_box.height:
                 break
             value = scroll_value()
-            target = value.get_current_value() + center - (view_box.y + view_box.height // 2)
+            target = value.get_current_value() + button_box.y - view_box.y - 12
             value.set_current_value(max(0, min(target, value.get_maximum_value())))
             time.sleep(0.25)
         position = scroll_position()
@@ -1227,7 +1230,7 @@ print(":: done", flush=True)
         button_box = play.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
         view_box = viewport.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
         check(
-            view_box.y <= button_box.y + button_box.height // 2 < view_box.y + view_box.height,
+            view_box.y <= button_box.y and button_box.y + button_box.height <= view_box.y + view_box.height,
             f"the pointer target is visible (button y={button_box.y}, viewport y={view_box.y}, height={view_box.height})",
             frame,
         )

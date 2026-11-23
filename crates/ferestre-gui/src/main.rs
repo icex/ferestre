@@ -481,6 +481,8 @@ struct Ui {
     controller_in_use: Rc<Cell<bool>>,
     /// What gets the focus back after the redraw under way.
     refocus: Rc<RefCell<Option<String>>>,
+    /// A redraw let go of the focus and gives it back once idle.
+    refocus_pending: Rc<Cell<bool>>,
     last_game_focus: Rc<RefCell<Option<String>>>,
     pending_tab_focus: Rc<Cell<Option<Section>>>,
     game_actions: Rc<RefCell<BTreeMap<String, String>>>,
@@ -871,6 +873,7 @@ fn build_ui(app: &adw::Application) {
         controller_connected: Rc::new(Cell::new(false)),
         controller_in_use: Rc::new(Cell::new(false)),
         refocus: Rc::default(),
+        refocus_pending: Rc::default(),
         last_game_focus: Rc::new(RefCell::new(None)),
         pending_tab_focus: Rc::new(Cell::new(None)),
         game_actions: Rc::new(RefCell::new(BTreeMap::new())),
@@ -1644,7 +1647,9 @@ fn refocus(ui: &Ui, focus_name: Option<String>, in_view: bool) {
             controller::focus_section_tab(ui, ui.model.borrow().section);
         } else {
             let ui = ui.clone();
+            ui.refocus_pending.set(true);
             glib::idle_add_local_once(move || {
+                ui.refocus_pending.set(false);
                 if GtkWindowExt::focus(&ui.window).is_some() {
                     return;
                 }
