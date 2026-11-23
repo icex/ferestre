@@ -26,8 +26,7 @@ use crate::model::Ownership;
 /// The gamerpic host serves only certain sizes; `account::supported_avatar_size`
 /// is what guarantees this is one of them.
 pub const AVATAR_PX: u32 = 64;
-/// Rows per page. Enough that scrolling is normal, few enough that a page of
-/// icons is a handful of requests rather than a hundred.
+/// Rows per page of a plain list, and of tiles until the view is measured.
 pub const PER_PAGE: usize = 20;
 
 /// Which section of the window is showing.
@@ -135,6 +134,8 @@ pub struct Model {
     pub section: Section,
     pub query: String,
     pub page: usize,
+    /// Tiles on the first page, and on the others (see `page_fit`).
+    pub page_size: (usize, usize),
     /// Whether to list titles whose package this runtime cannot open. Off by
     /// default because they are the overwhelming majority -- 95 of 102 on the
     /// development account -- and a list where the seven that work are buried
@@ -524,6 +525,7 @@ impl Model {
             section: Section::Home,
             query: String::new(),
             page: 0,
+            page_size: (PER_PAGE, PER_PAGE),
             show_unsupported: false,
             problem,
             probes: Default::default(),
@@ -584,6 +586,7 @@ impl Model {
             section: self.section,
             query: std::mem::take(&mut self.query),
             page: self.page,
+            page_size: self.page_size,
             show_unsupported: self.show_unsupported,
             ..fresh
         };
@@ -1466,6 +1469,7 @@ mod tests {
             section: Section::Library,
             query: String::new(),
             page: 0,
+            page_size: (PER_PAGE, PER_PAGE),
             show_unsupported: false,
             problem: None,
             probes: Default::default(),

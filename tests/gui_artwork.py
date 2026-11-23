@@ -134,8 +134,35 @@ def main():
             with lock:
                 s.check(peak <= 4, f'network concurrency remains bounded (peak {peak})')
                 before = counts.copy()
+            def shown():
+                # One-based, "6-15 of 60".
+                label = next(t for t in s.texts(frame) if re.fullmatch(r'\d+-\d+ of 60', t))
+                return [int(n) for n in re.findall(r'\d+', label)[:2]]
+            def fits(what, whole=True):
+                time.sleep(.5)
+                window = frame.get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
+                pager = s.find_all(frame, role='button', name='Next page')[0].get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
+                cards = [b.get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
+                         for b in s.find_all(frame, role='button')
+                         if 'Artwork Game' in (b.get_name() or '') and ' · Install' in (b.get_name() or '')]
+                cards = [c for c in cards if c.width > 0]
+                first, last = shown()
+                print(what, (window.width, window.height), 'pager', pager.y, 'titles', first, last,
+                      'rows', sorted({(c.y, c.height) for c in cards}), flush=True)
+                s.check(0 < pager.y and pager.y + pager.height <= window.height, f'{what}: the page buttons are in view')
+                s.check(last - first + 1 >= 4 or last == 60, f'{what}: at least four titles')
+                if whole:
+                    s.check(all(c.y + c.height <= pager.y for c in cards if c.height > 100),
+                            f'{what}: every tile is above the page buttons')
+                return first, last
+            _, last = fits('first page', False)
             s.click_named(frame, 'Next page')
-            s.wait_for(frame, lambda r: 'Artwork Game 020' in s.texts(r), 'page two', time.monotonic() + 10)
+            s.wait_for(frame, lambda _: shown()[0] == last + 1, 'page two', time.monotonic() + 10)
+            fits('second page')
+            s.click_named(frame, 'Previous page')
+            s.wait_for(frame, lambda _: shown() == [1, last], 'page one again', time.monotonic() + 10)
+            s.click_named(frame, 'Next page')
+            s.wait_for(frame, lambda _: shown()[0] == last + 1, 'page two again', time.monotonic() + 10)
             time.sleep(.3)
             with lock:
                 s.check(counts == before, 'pagination reuses the preloaded cover cache')
@@ -149,6 +176,7 @@ def main():
                 cards = [b.get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
                          for b in s.find_all(frame, role='button') if 'Artwork Game' in (b.get_name() or '') and ' · Install' in (b.get_name() or '')]
                 print('handheld card allocations',[(b.x,b.y,b.width,b.height) for b in cards],flush=True)
+                fits('handheld')
                 s.check(len({b.x for b in cards}) >= 4, 'handheld Game Pass has at least four cover columns')
                 s.check(any(b.y > 0 and b.y + b.height <= 688 for b in cards), 'complete cover cards fit above controller hints at 720p')
                 s.check(any(b.get_state_set().contains(s.Atspi.StateType.FOCUSED)

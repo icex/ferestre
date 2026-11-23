@@ -1508,13 +1508,27 @@ impl Page<'_> {
     }
 }
 
-pub fn paginate<'a>(rows: &[&'a LibraryRow], page: usize, per_page: usize) -> Page<'a> {
-    let per_page = per_page.max(1);
+/// The first row of `page`, for a first page of `first` rows and others of
+/// `rest`.
+pub fn page_start(page: usize, first: usize, rest: usize) -> usize {
+    match page {
+        0 => 0,
+        n => first + (n - 1) * rest,
+    }
+}
+
+/// `sizes` is the first page's, then the others'.
+pub fn paginate<'a>(
+    rows: &[&'a LibraryRow],
+    page: usize,
+    (first, rest): (usize, usize),
+) -> Page<'a> {
+    let (first, rest) = (first.max(1), rest.max(1));
     let total = rows.len();
-    let pages = total.div_ceil(per_page).max(1);
+    let pages = 1 + total.saturating_sub(first).div_ceil(rest);
     let page = page.min(pages - 1);
-    let start = page * per_page;
-    let end = (start + per_page).min(total);
+    let start = page_start(page, first, rest);
+    let end = (start + if page == 0 { first } else { rest }).min(total);
     Page {
         rows: rows[start..end].to_vec(),
         page,
@@ -3742,13 +3756,13 @@ HTTP 401 Unauthorized",
         );
         let all: Vec<&LibraryRow> = rows.iter().collect();
 
-        let first = paginate(&all, 0, 20);
+        let first = paginate(&all, 0, (20, 20));
         assert_eq!(first.rows.len(), 20);
         assert_eq!((first.pages, first.total), (3, 45));
         assert_eq!(first.label(), "1-20 of 45");
         assert!(!first.has_previous() && first.has_next());
 
-        let last = paginate(&all, 2, 20);
+        let last = paginate(&all, 2, (20, 20));
         assert_eq!(last.rows.len(), 5);
         assert_eq!(last.label(), "41-45 of 45");
         assert!(last.has_previous() && !last.has_next());
@@ -3761,15 +3775,27 @@ HTTP 401 Unauthorized",
     fn a_page_past_the_end_is_clamped_not_shown_empty() {
         let rows = rows_named(&[("9ZZTESTGAME1", "Only One")]);
         let all: Vec<&LibraryRow> = rows.iter().collect();
-        let page = paginate(&all, 7, 20);
+        let page = paginate(&all, 7, (20, 20));
         assert_eq!(page.page, 0);
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.label(), "1-1 of 1");
     }
 
     #[test]
+    fn a_shorter_first_page_shifts_the_rest() {
+        let rows = rows_named(&[("9ZZTEST00000", "Title"); 45]);
+        let all: Vec<&LibraryRow> = rows.iter().collect();
+        assert_eq!(paginate(&all, 0, (5, 20)).label(), "1-5 of 45");
+        let second = paginate(&all, 1, (5, 20));
+        assert_eq!((second.label().as_str(), second.pages), ("6-25 of 45", 3));
+        let last = paginate(&all, 9, (5, 20));
+        assert_eq!(last.label(), "26-45 of 45");
+        assert!(!last.has_next());
+    }
+
+    #[test]
     fn an_empty_library_still_produces_a_sane_page() {
-        let page = paginate(&[], 0, 20);
+        let page = paginate(&[], 0, (20, 20));
         assert_eq!(
             (page.pages, page.total, page.first, page.last),
             (1, 0, 0, 0)

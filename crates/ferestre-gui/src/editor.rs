@@ -264,6 +264,7 @@ fn option_groups(
                 Kind::Switch { on, .. } => {
                     let row = adw::SwitchRow::builder()
                         .title(option.title)
+                        .use_markup(false)
                         .subtitle(&subtitle)
                         .active(value == on)
                         .build();
@@ -275,6 +276,7 @@ fn option_groups(
                     let labels: Vec<&str> = choices.iter().map(|(_, label)| *label).collect();
                     let row = adw::ComboRow::builder()
                         .title(option.title)
+                        .use_markup(false)
                         .subtitle(&subtitle)
                         .model(&gtk::StringList::new(&labels))
                         .selected(choices.iter().position(|(v, _)| *v == value).unwrap_or(0) as u32)

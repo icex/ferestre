@@ -29,6 +29,7 @@ mod model;
 mod neural_ui;
 mod notifications;
 mod packagekit;
+mod page_fit;
 mod presence_ui;
 mod progress;
 mod queue_ui;
@@ -365,6 +366,8 @@ struct Ui {
     toasts: notifications::Toasts,
     content: gtk::Box,
     scroll: gtk::ScrolledWindow,
+    pager: page_fit::Pager,
+    refitting: Rc<Cell<bool>>,
     account_button: gtk::Button,
     title: adw::WindowTitle,
     search: gtk::SearchEntry,
@@ -716,7 +719,11 @@ fn build_ui(app: &adw::Application) {
         .child(&content)
         .build();
     let toasts = notifications::Toasts::new();
-    toasts.set_child(Some(&scroll));
+    let pager = page_fit::Pager::new();
+    let pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    pane.append(&scroll);
+    pane.append(&pager.root);
+    toasts.set_child(Some(&pane));
 
     // Below the content and outside it, because `render` empties the content
     // box: an inline bar would be destroyed and rebuilt four times a second,
@@ -865,6 +872,8 @@ fn build_ui(app: &adw::Application) {
         toasts,
         content,
         scroll,
+        pager,
+        refitting: Rc::default(),
         account_button: account_button.clone(),
         title,
         search: search.clone(),
@@ -911,6 +920,8 @@ fn build_ui(app: &adw::Application) {
     };
 
     sidebar_top.append(&notification_bell(&ui));
+    ui.pager.connect(&ui);
+    page_fit::follow_size(&ui);
     // The hero is sized to the window; follow a resize (maximise, a moved
     // window, a rotated handheld) once it settles.
     let width_ui = ui.clone();
@@ -1483,8 +1494,12 @@ fn render(ui: &Ui) {
         render_library_tabs(ui, &page);
     }
     match section {
-        Section::Runtime => render_runtime(ui, &page),
+        Section::Runtime => {
+            ui.pager.hide();
+            render_runtime(ui, &page)
+        }
         Section::Downloads => {
+            ui.pager.hide();
             let body = gtk::Box::builder()
                 .orientation(gtk::Orientation::Vertical)
                 .spacing(24)
@@ -1492,7 +1507,7 @@ fn render(ui: &Ui) {
             queue_ui::render_queue(ui, &body);
             page.append(&max_width::wrap(&body, 1100));
         }
-        Section::Home if home::render_home(ui, &page) => {}
+        Section::Home if home::render_home(ui, &page) => ui.pager.hide(),
         Section::Home | Section::Library => {
             let show_all = ui.model.borrow().show_unsupported;
             render_rows(
@@ -1524,7 +1539,19 @@ fn render(ui: &Ui) {
             );
         }
     }
+    // Once: what a second drawing measures is what it was drawn for.
+    if !ui.refitting.get() && page_fit::update(ui) {
+        ui.refitting.set(true);
+        render(ui);
+        ui.refitting.set(false);
+        refocus(ui, focus_name);
+        return;
+    }
     preload_gamepass_art(ui);
+    refocus(ui, focus_name);
+}
+
+fn refocus(ui: &Ui, focus_name: Option<String>) {
     if let Some(name) = focus_name {
         if name.starts_with("section-") {
             controller::focus_section_tab(ui, ui.model.borrow().section);
@@ -1963,8 +1990,17 @@ fn draw_list(
         .collect();
 
     let (matching, per_page, page) = match listing {
-        Listing::Page => (model::search(&rows, &model.query), PER_PAGE, model.page),
-        Listing::All => (rows.iter().collect(), rows.len(), 0),
+        Listing::Page => (
+            model::search(&rows, &model.query),
+            // Updates are rows, not tiles.
+            if section == Section::Updates {
+                (PER_PAGE, PER_PAGE)
+            } else {
+                model.page_size
+            },
+            model.page,
+        ),
+        Listing::All => (rows.iter().collect(), (rows.len(), rows.len()), 0),
     };
     let view = model::paginate(&matching, page, per_page);
     // With a query, the rows that are *not* on screen matter: search matches on
@@ -2307,10 +2343,10 @@ fn render_rows(
             .homogeneous(true)
             .min_children_per_line(1)
             // Wide windows get more columns, not bigger covers.
-            .max_children_per_line(14)
-            .row_spacing(22)
-            .column_spacing(18)
-            .css_classes(["game-grid"])
+            .max_children_per_line(page_fit::MAX_COLUMNS as u32)
+            .row_spacing(page_fit::ROW_SPACING as u32)
+            .column_spacing(page_fit::COLUMN_SPACING as u32)
+            .css_classes(["game-grid", "paged-grid"])
             .build();
         for (index, row) in drawn.rows.iter().enumerate() {
             grid.insert(&game_card(ui, row), -1);
@@ -2399,56 +2435,8 @@ fn render_rows(
         page.append(&group);
     }
 
-    // Only when there is more than one page: a pager under a list that already
-    // fits on screen is noise.
-    if drawn.has_previous || drawn.has_next {
-        let pager = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(12)
-            .halign(gtk::Align::Center)
-            .margin_top(12)
-            .margin_bottom(18)
-            .build();
-        let previous = gtk::Button::from_icon_name("go-previous-symbolic");
-        previous.set_sensitive(drawn.has_previous);
-        previous.set_tooltip_text(Some("Previous page"));
-        previous.update_property(&[gtk::accessible::Property::Label("Previous page")]);
-        let next = gtk::Button::from_icon_name("go-next-symbolic");
-        next.set_sensitive(drawn.has_next);
-        next.set_tooltip_text(Some("Next page"));
-        next.update_property(&[gtk::accessible::Property::Label("Next page")]);
-        let counter = gtk::Label::builder()
-            .label(&drawn.label)
-            .css_classes(["dim-label"])
-            .build();
-
-        previous.connect_clicked(glib::clone!(
-            #[strong]
-            ui,
-            move |_| {
-                {
-                    let mut model = ui.model.borrow_mut();
-                    model.page = model.page.saturating_sub(1);
-                }
-                ui.scroll.vadjustment().set_value(0.0);
-                render(&ui);
-            }
-        ));
-        next.connect_clicked(glib::clone!(
-            #[strong]
-            ui,
-            move |_| {
-                ui.model.borrow_mut().page += 1;
-                ui.scroll.vadjustment().set_value(0.0);
-                render(&ui);
-            }
-        ));
-
-        pager.append(&previous);
-        pager.append(&counter);
-        pager.append(&next);
-        ui.content.append(&pager);
-    }
+    ui.pager
+        .show(&drawn.label, drawn.has_previous, drawn.has_next);
 
     // Names before art: a row reading "9NBLGGH18846" is unusable, a row with no
     // picture is merely plain. Both fetch themselves rather than waiting to be
@@ -3001,6 +2989,9 @@ fn game_launch_spinner(label: &str) -> gtk::DrawingArea {
     ring
 }
 
+/// A game tile, as wide as its cover.
+const TILE_WIDTH: i32 = 196;
+
 fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
     // The card draws its own cover, so the row's icon is never shown.
     let (description, actions) = library_components(ui, row, false);
@@ -3019,7 +3010,10 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
     let key = row.product_id.to_ascii_uppercase();
     let art = gtk::Picture::builder()
         .can_shrink(true)
-        .height_request(if ui.window.is_fullscreen() { 300 } else { 280 })
+        // A cover's own size, before it is loaded too: a tile that grew when
+        // its cover came moved the grid, and the page no longer fitted.
+        .width_request(TILE_WIDTH)
+        .height_request(if ui.window.is_fullscreen() { 300 } else { 294 })
         .content_fit(gtk::ContentFit::Cover)
         .build();
     // Only a real cover: Size::Cover refuses a source narrower than 300 px,
@@ -3261,8 +3255,8 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
     // Clamp both the natural size and final width: FlowBox otherwise chooses
     // one giant column from a texture's original pixel dimensions.
     adw::Clamp::builder()
-        .maximum_size(196)
-        .tightening_threshold(196)
+        .maximum_size(TILE_WIDTH)
+        .tightening_threshold(TILE_WIDTH)
         .child(&overlay)
         .build()
 }
@@ -7271,6 +7265,7 @@ mod catalog_regressions {
             section: Section::GamePass,
             query: String::new(),
             page: 0,
+            page_size: (PER_PAGE, PER_PAGE),
             show_unsupported: false,
             problem: None,
             probes: Default::default(),

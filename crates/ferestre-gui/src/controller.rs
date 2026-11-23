@@ -557,8 +557,11 @@ fn move_main(ui: &Ui, action: Action) -> bool {
     // The active transfer bar belongs to the content navigation region.
     // Keeping it outside this set traps horizontal movement on the queue
     // and can skip its Pause/Stop controls at taller window sizes.
-    let in_content =
-        |w: &gtk::Widget| w.is_ancestor(&ui.content) || w.is_ancestor(&ui.download.root);
+    let in_content = |w: &gtk::Widget| {
+        w.is_ancestor(&ui.content)
+            || w.is_ancestor(&ui.pager.root)
+            || w.is_ancestor(&ui.download.root)
+    };
     let next = if in_content(&focus) {
         let indices: Vec<usize> = buttons
             .iter()
