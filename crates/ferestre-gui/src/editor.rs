@@ -13,7 +13,7 @@
 use adw::prelude::*;
 use gtk::glib;
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use ferestre_core::launch_options::{self, Kind, LaunchOption, Section};
@@ -208,7 +208,18 @@ impl OptionControl {
     }
 }
 
-fn option_subtitle(option: &LaunchOption) -> String {
+/// What an option says under its title; `runtime` is the one the title would
+/// launch with, to say when it does not know a flag.
+fn option_subtitle(option: &LaunchOption, runtime: Option<&Path>) -> String {
+    if option.is_proton_flag() {
+        if let Some(dir) = runtime {
+            if launch_options::reads(dir, option.key) == Some(false) {
+                let name = dir.file_name().unwrap_or_default().to_string_lossy();
+                return format!("{} Not known to this game's runtime, {name}.", option.help);
+            }
+        }
+        return option.help.to_string();
+    }
     match option.capability {
         Some(capability) => format!("{} Needs a runtime with {capability}.", option.help),
         None => option.help.to_string(),
@@ -219,6 +230,7 @@ fn option_subtitle(option: &LaunchOption) -> String {
 fn option_groups(
     page: &adw::PreferencesPage,
     chosen: &BTreeMap<&'static str, String>,
+    runtime: Option<&Path>,
 ) -> Vec<OptionControl> {
     let mut controls = Vec::new();
     for section in Section::ALL {
@@ -230,7 +242,7 @@ fn option_groups(
             .filter(|o| o.section == section)
         {
             let value = chosen.get(option.key).map(String::as_str);
-            let subtitle = option_subtitle(option);
+            let subtitle = option_subtitle(option, runtime);
             match option.kind {
                 Kind::Switch { on, .. } => {
                     let row = adw::SwitchRow::builder()
@@ -367,11 +379,12 @@ impl OtherVariables {
 
 /// Show the editor for a recipe. `on_saved` is handed the path it wrote;
 /// `on_reset` runs after the title's edits were set aside by "Reset to
-/// defaults".
+/// defaults". `runtime` is the one the title would launch with.
 pub fn present(
     parent: &impl IsA<gtk::Widget>,
     recipe: Recipe,
     titles_dir: PathBuf,
+    runtime: Option<PathBuf>,
     on_saved: impl Fn(PathBuf) + 'static,
     on_reset: impl Fn() + 'static,
 ) {
@@ -452,7 +465,7 @@ pub fn present(
 
     let page = adw::PreferencesPage::new();
     page.add(&identity);
-    let controls = Rc::new(option_groups(&page, &draft.chosen));
+    let controls = Rc::new(option_groups(&page, &draft.chosen, runtime.as_deref()));
     let others = Rc::new(OtherVariables::new(&page, &draft.other));
 
     let header = adw::HeaderBar::new();
@@ -712,6 +725,19 @@ mod tests {
         };
         let complaint = clash.apply(&mut blank()).expect_err("refuses");
         assert!(complaint.contains("Native Wayland"), "{complaint}");
+    }
+
+    #[test]
+    fn a_flag_the_runtime_does_not_read_says_so() {
+        let dir = std::env::temp_dir().join(format!("ferestre-editor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("proton"), "PROTON_FSR4_UPGRADE").unwrap();
+        let subtitle =
+            |key| option_subtitle(launch_options::find(key).expect("listed"), Some(&dir));
+        assert!(subtitle("PROTON_USE_OPTISCALER").contains("Not known"));
+        assert!(!subtitle("PROTON_FSR4_UPGRADE").contains("Not known"));
+        assert!(!subtitle("FERESTRE_NATIVE_WAYLAND").contains("Not known"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Storing the computed default would freeze it, so a later rename would

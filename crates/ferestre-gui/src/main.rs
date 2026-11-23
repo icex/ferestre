@@ -5763,7 +5763,7 @@ fn free_space_label(dir: &Path) -> Option<String> {
 }
 
 fn open_editor(ui: &Ui, product_id: &str, name: &str) {
-    let (recipe, titles_dir) = {
+    let (recipe, titles_dir, runtime) = {
         let model = ui.model.borrow();
         let mut recipe = model.recipe_for(product_id).cloned().unwrap_or_else(|| {
             let mut blank = Recipe::blank(product_id, name);
@@ -5788,7 +5788,8 @@ fn open_editor(ui: &Ui, product_id: &str, name: &str) {
                 recipe.launch.executable = found;
             }
         }
-        (recipe, model.user_titles_dir())
+        let runtime = model.launch_runtime(&recipe).ok().map(|r| r.path.clone());
+        (recipe, model.user_titles_dir(), runtime)
     };
     let Some(titles_dir) = titles_dir else {
         ui.toasts
@@ -5804,6 +5805,7 @@ fn open_editor(ui: &Ui, product_id: &str, name: &str) {
         &window,
         recipe,
         titles_dir,
+        runtime,
         move |path| {
             ui.model.borrow_mut().reload();
             render(&ui);
