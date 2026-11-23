@@ -239,13 +239,13 @@ window.ferestre-window searchentry.search-pill:focus-within { border-color: alph
 /* Hero carousel */
 .hero-peek { padding: 0; border: 0; border-radius: 18px; background: none; box-shadow: none; opacity: 0.4; transition: opacity 200ms ease-out; }
 .hero-peek:hover { opacity: 0.62; }
-window.blur-ok .hero-peek picture { filter: blur(5px); transform: scale(1.06); }
+window.blur-ok .hero-peek picture { filter: blur(2.5px); transform: scale(1.03); }
 @keyframes hero-was-peek { from { opacity: 0.4; } to { opacity: 1; } }
 @keyframes hero-was-centre { from { opacity: 1; } to { opacity: 0.4; } }
 @keyframes hero-arriving { from { opacity: 0; } to { opacity: 0.4; } }
 @keyframes hero-leaving { from { opacity: 0.4; } to { opacity: 0; } }
-@keyframes hero-sharpen { from { filter: blur(5px); } to { filter: blur(0px); } }
-@keyframes hero-soften { from { filter: blur(0px); transform: scale(1); } to { filter: blur(5px); transform: scale(1.06); } }
+@keyframes hero-sharpen { from { filter: blur(2.5px); } to { filter: blur(0px); } }
+@keyframes hero-soften { from { filter: blur(0px); transform: scale(1); } to { filter: blur(2.5px); transform: scale(1.03); } }
 .hero-was-peek { animation: hero-was-peek 380ms ease-out; }
 .hero-was-peek .hero-caption { animation: hero-was-peek 380ms ease-out; }
 .hero-was-centre { animation: hero-was-centre 380ms ease-out; }
