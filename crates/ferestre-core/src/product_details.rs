@@ -8,19 +8,53 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-/// One heading of the page and its lines.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Group {
-    pub title: &'static str,
-    pub rows: Vec<(String, String)>,
+/// What players gave it over one span of time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlayerRating {
+    pub span: String,
+    pub average: f64,
+    pub count: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// One thing the game needs, at least and ideally. Either may be empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requirement {
+    pub what: &'static str,
+    pub minimum: String,
+    pub recommended: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgeRating {
+    pub system: String,
+    pub rating: String,
+    pub descriptors: Vec<String>,
+}
+
+/// A labelled value. Values are never empty.
+pub type Row = (&'static str, String);
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Details {
     pub description: String,
     /// Image addresses with no size on them: the banner, then screenshots.
     pub pictures: Vec<String>,
-    pub groups: Vec<Group>,
+    pub developer: String,
+    pub publisher: String,
+    pub categories: Vec<String>,
+    pub dates: Vec<Row>,
+    pub release_notes: String,
+    pub players: Vec<PlayerRating>,
+    /// The catalog's own names, such as `XblAchievements`; see [`feature`].
+    pub features: Vec<String>,
+    pub purchases: Vec<Row>,
+    pub requirements: Vec<Requirement>,
+    pub requirement_notes: Vec<Row>,
+    pub ages: Vec<AgeRating>,
+    pub package: Vec<Row>,
+    pub languages: Vec<String>,
+    pub links: Vec<Row>,
+    pub copyright: String,
 }
 
 /// Ask the catalog. A local game's id is not the Store's and is never sent.
@@ -55,129 +89,287 @@ pub fn parse(json: &str) -> Result<Details> {
     .find(|t| !t.is_empty())
     .unwrap_or_default();
 
-    let mut groups = Vec::new();
-    let mut about = Rows::default();
-    about.add("Developer", text(&local["DeveloperName"]));
-    about.add("Publisher", text(&local["PublisherName"]));
-    about.add("Category", strings(&properties["Categories"]));
-    about.add("Subcategory", text(&properties["Subcategory"]));
-    about.add("Release date", date(&market["OriginalReleaseDate"]));
-    about.add("Last update", date(&sku_properties["LastUpdateDate"]));
-    about.add("Catalog entry changed", date(&product["LastModifiedDate"]));
-    about.add(
-        "Release notes",
-        text(&sku["LocalizedProperties"][0]["ReleaseNotes"]),
-    );
-    about.into_group("About", &mut groups);
+    let notes = &sku["LocalizedProperties"][0];
+    let legal = &notes["LegalText"];
+    let hardware = &sku_properties["HardwareProperties"];
 
-    let mut reviews = Rows::default();
-    for usage in array(&market["UsageData"]) {
-        let count = usage["RatingCount"].as_u64().unwrap_or(0);
-        if let (Some(rating), true) = (usage["AverageRating"].as_f64(), count > 0) {
-            let span = text(&usage["AggregateTimeSpan"]);
-            let span = match span.as_str() {
-                "7Days" => "Last 7 days".to_string(),
-                "30Days" => "Last 30 days".to_string(),
-                "AllTime" => "All time".to_string(),
-                _ => span,
-            };
-            reviews.add(&span, format!("{rating:.1} of 5 ({count} ratings)"));
-        }
+    let mut categories = list(&properties["Categories"]);
+    let subcategory = text(&properties["Subcategory"]);
+    if !subcategory.is_empty() && !categories.contains(&subcategory) {
+        categories.push(subcategory);
     }
-    reviews.into_group("Player ratings", &mut groups);
 
-    let mut features = Rows::default();
-    let names: Vec<String> = array(&properties["Attributes"])
+    let players = array(&market["UsageData"])
         .iter()
-        .map(|a| spaced(text(&a["Name"]).trim_start_matches("Xbl")))
+        .filter_map(|usage| {
+            let count = usage["RatingCount"].as_u64().filter(|c| *c > 0)?;
+            let span = text(&usage["AggregateTimeSpan"]);
+            Some(PlayerRating {
+                span: match span.as_str() {
+                    "7Days" => "Last 7 days".into(),
+                    "30Days" => "Last 30 days".into(),
+                    "AllTime" => "All time".into(),
+                    _ => span,
+                },
+                average: usage["AverageRating"].as_f64()?,
+                count,
+            })
+        })
+        .collect();
+
+    let mut features: Vec<String> = array(&properties["Attributes"])
+        .iter()
+        .map(|a| text(&a["Name"]))
         .filter(|n| !n.is_empty())
         .collect();
-    features.add("Features", names.join(", "));
-    features.add(
-        "Optimized for consoles",
-        strings(&properties["XboxConsoleGenOptimized"]),
-    );
-    features.add(
-        "Plays on consoles",
-        strings(&properties["XboxConsoleGenCompatible"]),
-    );
-    features.add("Xbox Play Anywhere", yes(&sku_properties["XboxXPA"]));
-    features.add(
-        "Add-ons",
-        yes(&properties["ExtendedClientMetadata"]["HasAddOns"]),
-    );
-    features.add(
-        "In-app purchases",
-        yes(&sku_properties["HasThirdPartyIAPs"]),
-    );
-    features.into_group("Features", &mut groups);
-
-    let hardware = &sku_properties["HardwareProperties"];
-    let mut needs = Rows::default();
-    for (label, key) in [
-        ("Minimum processor", "MinimumProcessor"),
-        ("Recommended processor", "RecommendedProcessor"),
-        ("Minimum graphics", "MinimumGraphics"),
-        ("Recommended graphics", "RecommendedGraphics"),
-    ] {
-        needs.add(label, text(&hardware[key]));
+    if sku_properties["XboxXPA"].as_bool() == Some(true) && !features.iter().any(|f| f == "XPA") {
+        features.push("XPA".into());
     }
-    needs.add("Minimum hardware", strings(&hardware["MinimumHardware"]));
-    needs.add(
-        "Recommended hardware",
-        strings(&hardware["RecommendedHardware"]),
-    );
-    let notes = &sku["LocalizedProperties"][0];
-    needs.add("Minimum notes", text(&notes["MinimumNotes"]));
-    needs.add("Recommended notes", text(&notes["RecommendedNotes"]));
-    needs.into_group("System requirements", &mut groups);
 
-    let mut ratings = Rows::default();
-    for rating in array(&market["ContentRatings"]) {
-        let mut what = without_prefix(&text(&rating["RatingId"]));
-        let extra: Vec<String> = ["RatingDescriptors", "InteractiveElements"]
-            .iter()
-            .flat_map(|key| array(&rating[*key]))
-            .map(|v| spaced(&without_prefix(&text(v))))
-            .collect();
-        if !extra.is_empty() {
-            what = format!("{what} ({})", extra.join(", "));
-        }
-        ratings.add(&text(&rating["RatingSystem"]), what);
+    let (minimum, minimum_codes) = hardware_codes(&hardware["MinimumHardware"]);
+    let (recommended, recommended_codes) = hardware_codes(&hardware["RecommendedHardware"]);
+    let mut requirements: Vec<Requirement> = [
+        ("Processor", "MinimumProcessor", "RecommendedProcessor"),
+        ("Graphics", "MinimumGraphics", "RecommendedGraphics"),
+    ]
+    .into_iter()
+    .map(|(what, least, ideal)| Requirement {
+        what,
+        minimum: text(&hardware[least]),
+        recommended: text(&hardware[ideal]),
+    })
+    .collect();
+    for (index, what) in HARDWARE.into_iter().enumerate() {
+        requirements.push(Requirement {
+            what,
+            minimum: minimum[index].join(", "),
+            recommended: recommended[index].join(", "),
+        });
     }
-    ratings.into_group("Age ratings", &mut groups);
+    requirements.push(Requirement {
+        what: "Other (Store codes)",
+        minimum: minimum_codes.join(", "),
+        recommended: recommended_codes.join(", "),
+    });
+    requirements.retain(|r| !r.minimum.is_empty() || !r.recommended.is_empty());
 
-    let mut technical = Rows::default();
-    technical.add("Product id", text(&product["ProductId"]));
-    technical.add("Type", text(&product["ProductType"]));
-    technical.add("Package family", text(&properties["PackageFamilyName"]));
-    technical.add("Package format", text(&package["PackageFormat"]));
-    technical.add("Architectures", strings(&package["Architectures"]));
-    if let Some(bytes) = package["MaxDownloadSizeInBytes"]
+    let ages = array(&market["ContentRatings"])
+        .iter()
+        .map(|rating| AgeRating {
+            system: text(&rating["RatingSystem"]),
+            rating: without_prefix(&text(&rating["RatingId"])),
+            descriptors: ["RatingDescriptors", "InteractiveElements"]
+                .iter()
+                .flat_map(|key| array(&rating[*key]))
+                .map(|v| descriptor(&without_prefix(&text(v))))
+                .collect(),
+        })
+        .filter(|r| !r.rating.is_empty())
+        .collect();
+
+    let size = package["MaxDownloadSizeInBytes"]
         .as_u64()
-        .filter(|b| *b > 0)
-    {
-        technical.add("Download size", format!("{:.1} GB", bytes as f64 / 1e9));
-    }
-    technical.add("Content id", text(&package["ContentId"]));
-    technical.add("Languages", strings(&package["Languages"]));
-    technical.into_group("Package", &mut groups);
-
-    let legal = &sku["LocalizedProperties"][0]["LegalText"];
-    let mut links = Rows::default();
-    links.add("Website", text(&local["PublisherWebsiteUri"]));
-    links.add("Support", text(&local["SupportUri"]));
-    links.add("Privacy policy", text(&legal["PrivacyPolicyUri"]));
-    links.add("Terms of use", first_text(legal, &["TouUri", "Tou"]));
-    links.add("Licence terms", text(&legal["AdditionalLicenseTerms"]));
-    links.add("Copyright", text(&legal["Copyright"]));
-    links.into_group("Links and legal", &mut groups);
+        .filter(|bytes| *bytes > 0)
+        .map(|bytes| format!("{:.1} GB", bytes as f64 / 1e9))
+        .unwrap_or_default();
 
     Ok(Details {
         description,
         pictures: pictures(local),
-        groups,
+        developer: text(&local["DeveloperName"]),
+        publisher: text(&local["PublisherName"]),
+        categories,
+        dates: rows([
+            ("Released", date(&market["OriginalReleaseDate"])),
+            ("Last update", date(&sku_properties["LastUpdateDate"])),
+            ("Store entry changed", date(&product["LastModifiedDate"])),
+        ]),
+        release_notes: text(&notes["ReleaseNotes"]),
+        players,
+        features,
+        purchases: rows([
+            (
+                "Add-ons",
+                yes(&properties["ExtendedClientMetadata"]["HasAddOns"]),
+            ),
+            (
+                "In-app purchases",
+                yes(&sku_properties["HasThirdPartyIAPs"]),
+            ),
+            (
+                "Optimized for consoles",
+                consoles(&properties["XboxConsoleGenOptimized"]),
+            ),
+            (
+                "Plays on consoles",
+                consoles(&properties["XboxConsoleGenCompatible"]),
+            ),
+        ]),
+        requirements,
+        requirement_notes: rows([
+            ("Minimum", text(&notes["MinimumNotes"])),
+            ("Recommended", text(&notes["RecommendedNotes"])),
+        ]),
+        ages,
+        package: rows([
+            ("Download size", size),
+            ("Format", text(&package["PackageFormat"])),
+            ("Architecture", list(&package["Architectures"]).join(", ")),
+            ("Type", text(&product["ProductType"])),
+            ("Product id", text(&product["ProductId"])),
+            ("Package family", text(&properties["PackageFamilyName"])),
+            ("Content id", text(&package["ContentId"])),
+        ]),
+        languages: list(&package["Languages"]),
+        links: rows([
+            ("Website", text(&local["PublisherWebsiteUri"])),
+            ("Support", text(&local["SupportUri"])),
+            ("Privacy policy", text(&legal["PrivacyPolicyUri"])),
+            ("Terms of use", first_text(legal, &["TouUri", "Tou"])),
+            ("Licence terms", text(&legal["AdditionalLicenseTerms"])),
+        ]),
+        copyright: text(&legal["Copyright"]),
     })
+}
+
+fn rows<const N: usize>(all: [Row; N]) -> Vec<Row> {
+    all.into_iter().filter(|(_, v)| !v.is_empty()).collect()
+}
+
+/// A feature as people write it; one not known here by its words.
+pub fn feature(name: &str) -> String {
+    match name {
+        "SinglePlayer" => "Single player".into(),
+        "XblOnlineMultiPlayer" => "Online multiplayer".into(),
+        "XblLocalMultiPlayer" => "Local multiplayer".into(),
+        "XblCrossPlatformMultiPlayer" => "Cross-platform multiplayer".into(),
+        "XboxLiveCrossGenMP" => "Cross-generation multiplayer".into(),
+        "XblOnlineCoop" => "Online co-op".into(),
+        "XblLocalCoop" => "Local co-op".into(),
+        "XblCrossPlatformCoop" => "Cross-platform co-op".into(),
+        "SharedSplitScreen" => "Shared or split screen".into(),
+        "XblAchievements" => "Achievements".into(),
+        "XblCloudSaves" => "Cloud saves".into(),
+        "XblClubs" => "Clubs".into(),
+        "XblPresence" => "Presence".into(),
+        "XboxLive" => "Xbox network".into(),
+        "XPA" => "Xbox Play Anywhere".into(),
+        "Capability4k" => "4K Ultra HD".into(),
+        "CapabilityHDR" => "HDR".into(),
+        "RayTracing" => "Ray tracing".into(),
+        "DolbyAtmos" => "Dolby Atmos".into(),
+        "BroadcastSupport" => "Broadcasting".into(),
+        "VREnabled" => "Virtual reality".into(),
+        "MixedRealitySeated" => "Mixed reality, seated".into(),
+        "ConsoleGen9Optimized" => "Optimized for Xbox Series X|S".into(),
+        "ConsoleCrossGen" => "Cross-generation".into(),
+        _ => sentence(name.trim_start_matches("Xbl")),
+    }
+}
+
+/// Where a rating board's ratings apply; empty for one not known here.
+pub fn rating_region(system: &str) -> &'static str {
+    match system {
+        "ESRB" => "United States and Canada",
+        "PEGI" => "Europe",
+        "USK" => "Germany",
+        "CERO" => "Japan",
+        "GRB" => "South Korea",
+        "CSRR" => "Taiwan",
+        "DJCTQ" => "Brazil",
+        "COB-AU" => "Australia",
+        "OFLC-NZ" => "New Zealand",
+        "FPB" => "South Africa",
+        "IARC" => "International",
+        "PCBP" => "Russia",
+        _ => "",
+    }
+}
+
+/// A rating board's short word for its reason, such as `MilVio`, in full. A
+/// part not known here stays as it is written.
+fn descriptor(code: &str) -> String {
+    match code {
+        "UseInt" => return "Users interact".into(),
+        "InGamPur" => return "In-game purchases".into(),
+        "OnlIntAndCha" => return "Online interactivity and chat".into(),
+        "UseOfAlcAndTob" => return "Use of alcohol and tobacco".into(),
+        "UrgAct" => return "Urges to act".into(),
+        _ => {}
+    }
+    let words: Vec<String> = spaced(code)
+        .split(' ')
+        .map(|part| {
+            match part {
+                "Vio" => "violence",
+                "Mil" => "mild",
+                "Fan" => "fantasy",
+                "Str" => "strong",
+                "Lan" => "language",
+                "Ina" => "inappropriate",
+                "Blo" => "blood",
+                "Gor" => "gore",
+                "Lyr" => "lyrics",
+                "Sug" => "suggestive",
+                "The" => "themes",
+                "Sca" => "scary",
+                "Sce" => "scenes",
+                "Sim" => "simulated",
+                "Gam" | "Gmb" => "gambling",
+                "Fea" => "fear",
+                "Hor" => "horror",
+                "Cri" => "crime",
+                "Dru" => "drugs",
+                "Leg" => "legal",
+                "Tob" => "tobacco",
+                "Alc" => "alcohol",
+                other => other,
+            }
+            .to_string()
+        })
+        .collect();
+    capitalised(&words.join(" "))
+}
+
+/// What the Store's hardware codes are about, in the order
+/// [`hardware_codes`] gives them.
+const HARDWARE: [&str; 3] = ["Memory", "Video memory", "Input"];
+
+/// The codes with a known meaning by kind, and the rest as written.
+fn hardware_codes(value: &Value) -> ([Vec<String>; 3], Vec<String>) {
+    let mut known: [Vec<String>; 3] = Default::default();
+    let mut rest = Vec::new();
+    for code in list(value) {
+        let gigabytes = |prefix: char| {
+            let number: u32 = code.strip_prefix(prefix)?.parse().ok()?;
+            Some(format!("{number} GB"))
+        };
+        if let Some(memory) = gigabytes('m') {
+            known[0].push(memory);
+        } else if let Some(video) = gigabytes('v') {
+            known[1].push(video);
+        } else {
+            match code.as_str() {
+                "kbd" => known[2].push("Keyboard".into()),
+                "mse" => known[2].push("Mouse".into()),
+                "xgp" => known[2].push("Xbox controller".into()),
+                _ => rest.push(code),
+            }
+        }
+    }
+    (known, rest)
+}
+
+fn consoles(value: &Value) -> String {
+    let names: Vec<String> = list(value)
+        .into_iter()
+        .map(|name| match name.as_str() {
+            "ConsoleGen8" => "Xbox One".into(),
+            "ConsoleGen9" => "Xbox Series X|S".into(),
+            _ => name,
+        })
+        .collect();
+    names.join(", ")
 }
 
 /// The most pictures shown, the banner included.
@@ -253,26 +445,6 @@ fn full_sku(product: &Value) -> &Value {
         .unwrap_or(&Value::Null)
 }
 
-#[derive(Default)]
-struct Rows(Vec<(String, String)>);
-
-impl Rows {
-    fn add(&mut self, label: &str, value: String) {
-        if !value.is_empty() {
-            self.0.push((label.to_string(), value));
-        }
-    }
-
-    fn into_group(self, title: &'static str, groups: &mut Vec<Group>) {
-        if !self.0.is_empty() {
-            groups.push(Group {
-                title,
-                rows: self.0,
-            });
-        }
-    }
-}
-
 fn array(value: &Value) -> &[Value] {
     value.as_array().map(Vec::as_slice).unwrap_or_default()
 }
@@ -288,13 +460,12 @@ fn first_text(value: &Value, keys: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-fn strings(value: &Value) -> String {
-    let all: Vec<String> = array(value)
+fn list(value: &Value) -> Vec<String> {
+    array(value)
         .iter()
         .map(text)
         .filter(|t| !t.is_empty())
-        .collect();
-    all.join(", ")
+        .collect()
 }
 
 fn yes(value: &Value) -> String {
@@ -316,6 +487,31 @@ fn date(value: &Value) -> String {
 /// `ESRB:E10` as `E10`.
 fn without_prefix(text: &str) -> String {
     text.split_once(':').map_or(text, |(_, rest)| rest).into()
+}
+
+fn capitalised(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// `SomeNewThing` as `Some new thing`; words in capitals stay.
+fn sentence(name: &str) -> String {
+    let words: Vec<String> = spaced(name)
+        .split(' ')
+        .enumerate()
+        .map(|(i, word)| {
+            let shouting = word.len() > 1 && word.chars().all(|c| !c.is_ascii_lowercase());
+            if i == 0 || shouting {
+                word.to_string()
+            } else {
+                word.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    words.join(" ")
 }
 
 /// `SinglePlayer` as `Single Player`; a run of capitals stays together.
@@ -347,40 +543,50 @@ mod tests {
         "DisplaySkuAvailabilities":[
             {"Sku":{"Properties":{"IsTrial":true,"Packages":[{"PackageFormat":"Trial"}]}}},
             {"Sku":{"Properties":{"IsTrial":false,"XboxXPA":true,
-                "HardwareProperties":{"MinimumGraphics":"RX 6500 XT"},
+                "HardwareProperties":{"MinimumGraphics":"RX 6500 XT","MinimumHardware":["dcc","m08","mT0"]},
                 "Packages":[{"PackageFormat":"MSIXVC","MaxDownloadSizeInBytes":2500000000}]}}}]}]}"#;
 
-    fn row<'a>(d: &'a Details, group: &str, label: &str) -> Option<&'a str> {
-        d.groups
-            .iter()
-            .find(|g| g.title == group)?
-            .rows
-            .iter()
-            .find(|(l, _)| l == label)
-            .map(|(_, v)| v.as_str())
+    #[test]
+    fn the_catalogs_answer_is_read_without_empty_lines() {
+        let d = parse(PAYLOAD).unwrap();
+        assert_eq!(d.description, "All about it.");
+        assert_eq!(d.developer, "Dev");
+        assert_eq!(d.dates.len(), 1, "no release date: {:?}", d.dates);
+        assert_eq!(d.players.len(), 1, "a span nobody rated is left out");
+        assert_eq!(d.features, ["SinglePlayer", "XPA"]);
+        assert_eq!(
+            d.requirements,
+            [
+                Requirement {
+                    what: "Graphics",
+                    minimum: "RX 6500 XT".into(),
+                    recommended: String::new()
+                },
+                Requirement {
+                    what: "Memory",
+                    minimum: "8 GB".into(),
+                    recommended: String::new()
+                },
+                Requirement {
+                    what: "Other (Store codes)",
+                    minimum: "dcc, mT0".into(),
+                    recommended: String::new()
+                },
+            ]
+        );
+        assert_eq!(d.ages[0].rating, "E10");
+        assert_eq!(d.ages[0].descriptors, ["Fantasy violence"]);
+        let package = |label| d.package.iter().find(|(l, _)| *l == label).unwrap();
+        assert_eq!(package("Format").1, "MSIXVC", "the game, not its trial");
+        assert_eq!(package("Download size").1, "2.5 GB");
     }
 
     #[test]
-    fn the_catalogs_answer_becomes_groups_without_empty_lines() {
-        let d = parse(PAYLOAD).unwrap();
-        assert_eq!(d.description, "All about it.");
-        assert_eq!(row(&d, "About", "Developer"), Some("Dev"));
-        assert_eq!(row(&d, "About", "Release date"), None, "no real date");
-        assert_eq!(row(&d, "Player ratings", "Last 7 days"), None);
-        assert_eq!(row(&d, "Features", "Features"), Some("Single Player, XPA"));
-        assert_eq!(row(&d, "Features", "Xbox Play Anywhere"), Some("Yes"));
-        assert_eq!(
-            row(&d, "System requirements", "Minimum graphics"),
-            Some("RX 6500 XT")
-        );
-        assert_eq!(row(&d, "Age ratings", "ESRB"), Some("E10 (Fan Vio)"));
-        assert_eq!(
-            row(&d, "Package", "Package format"),
-            Some("MSIXVC"),
-            "the game, not its trial"
-        );
-        assert_eq!(row(&d, "Package", "Download size"), Some("2.5 GB"));
-        assert!(d.groups.iter().all(|g| !g.rows.is_empty()));
+    fn catalog_words_are_written_out() {
+        assert_eq!(feature("XblAchievements"), "Achievements");
+        assert_eq!(feature("XblSomeNewThing"), "Some new thing");
+        assert_eq!(descriptor("StrVio"), "Strong violence");
+        assert_eq!(descriptor("AntSoc"), "Ant Soc", "unknown words stay");
     }
 
     #[test]

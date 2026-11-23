@@ -487,7 +487,7 @@ pub fn present(
 
     let dialog = adw::Dialog::builder()
         .title("Set up this title")
-        .content_width(860)
+        .content_width(940)
         .content_height(720)
         .build();
 
@@ -615,9 +615,11 @@ pub fn present(
     let switcher = gtk::StackSwitcher::builder()
         .stack(&stack)
         .halign(gtk::Align::Center)
+        // Room for the focus outline, which the scroller would cut.
+        .margin_top(10)
         .margin_start(12)
         .margin_end(12)
-        .margin_bottom(6)
+        .margin_bottom(10)
         .build();
     let tabs = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)

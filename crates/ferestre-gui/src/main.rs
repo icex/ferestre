@@ -58,6 +58,17 @@ const APP_ID: &str = "io.github.icex.ferestre";
 /// Only what Adwaita's own classes do not cover. Colours are Adwaita's named
 /// ones, so dark mode and accent changes follow without a second stylesheet.
 const STYLE: &str = "
+.details-card { background: alpha(white, .06); border-radius: 14px; padding: 14px 16px; }
+.details-chip { background: alpha(white, .09); border-radius: 999px; padding: 5px 12px; }
+.details-flow > flowboxchild { padding: 0; }
+.details-flow > flowboxchild:hover { background: none; }
+.details-body { line-height: 1.5; }
+.details-figure { font-size: 2em; font-weight: 800; }
+window label.details-stars { color: #f5c211; letter-spacing: 2px; }
+.details-badge { background: alpha(white, .12); border-radius: 10px; padding: 10px 8px; font-size: 1.2em; font-weight: 800; }
+.details-stage { border-radius: 16px; }
+.details-id .subtitle { font-family: monospace; }
+
 @define-color window_bg_color #1b1d21;
 @define-color window_fg_color #f4f4f5;
 @define-color view_bg_color #1b1d21;

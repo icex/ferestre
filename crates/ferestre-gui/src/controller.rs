@@ -437,9 +437,46 @@ fn move_surface(root: &gtk::Widget, focus: Option<gtk::Widget>, action: Action) 
             })
         })
         .collect();
-    if let Some(next) = bounds.and_then(|rects| spatial_target(&rects, index, action)) {
-        controls[next].grab_focus();
+    let next = bounds.and_then(|rects| spatial_target(&rects, index, action));
+    let page = long_page(root);
+    // Above a scrolled page, Up brings the page back before leaving it.
+    let rewind = action == Action::Up
+        && page
+            .as_ref()
+            .is_some_and(|p| !focus.is_ancestor(p) && p.vadjustment().value() > 0.0);
+    match (next, page) {
+        (Some(next), _) if !rewind => {
+            controls[next].grab_focus();
+        }
+        // A page with nothing more to focus that way is read by scrolling.
+        (_, Some(page)) if matches!(action, Action::Up | Action::Down) => {
+            let adjustment = page.vadjustment();
+            let step = adjustment.page_size() * 0.6;
+            let step = if action == Action::Up { -step } else { step };
+            adjustment.set_value(adjustment.value() + step);
+        }
+        _ => (),
     }
+}
+/// The page in `root` that is longer than what is shown of it.
+fn long_page(root: &gtk::Widget) -> Option<gtk::ScrolledWindow> {
+    if !root.is_mapped() {
+        return None;
+    }
+    if let Some(page) = root.downcast_ref::<gtk::ScrolledWindow>() {
+        let adjustment = page.vadjustment();
+        if adjustment.upper() - adjustment.lower() > adjustment.page_size() + 1.0 {
+            return Some(page.clone());
+        }
+    }
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        if let Some(page) = long_page(&widget) {
+            return Some(page);
+        }
+        child = widget.next_sibling();
+    }
+    None
 }
 fn move_dialog(dialog: &adw::Dialog, action: Action) {
     move_surface(dialog.upcast_ref(), dialog.focus(), action);

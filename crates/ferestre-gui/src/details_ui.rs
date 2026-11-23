@@ -1,34 +1,24 @@
 //! One game's details: what the window knows, and what Microsoft's catalog says.
 use super::*;
-use ferestre_core::product_details;
-
-/// The tabs after Overview, each with the catalog's groups it shows. A group
-/// named in none of them is on Overview, under the description.
-const TABS: [(&str, &[&str]); 5] = [
-    ("Features", &["Features"]),
-    ("Requirements", &["System requirements"]),
-    ("Age ratings", &["Age ratings"]),
-    ("Package", &["Package"]),
-    ("Links and legal", &["Links and legal"]),
-];
+use ferestre_core::product_details::{self, AgeRating, Details, PlayerRating, Requirement, Row};
 
 /// `known` is what the window knows already. A local game has no Store page,
 /// and its id is not sent anywhere.
 pub fn open(ui: &Ui, product_id: &str, name: &str, known: &str, local: bool) {
     let dialog = adw::Dialog::builder()
         .title(name)
-        .content_width(720)
-        .content_height(720)
+        .content_width(900)
+        .content_height(760)
         .build();
-    let stack = gtk::Stack::builder().vexpand(true).build();
-    let overview = page(&stack, "Overview");
-    overview.append(&paragraph(known));
-    let switcher = gtk::StackSwitcher::builder()
+    let stack = adw::ViewStack::builder().vexpand(true).build();
+    let switcher = adw::ViewSwitcher::builder()
         .stack(&stack)
-        .halign(gtk::Align::Center)
+        .policy(adw::ViewSwitcherPolicy::Narrow)
+        // Room for the focus outline, which the scroller would cut.
+        .margin_top(10)
         .margin_start(12)
         .margin_end(12)
-        .margin_bottom(6)
+        .margin_bottom(10)
         .build();
     let tabs = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
@@ -37,15 +27,55 @@ pub fn open(ui: &Ui, product_id: &str, name: &str, known: &str, local: bool) {
         // One tab is nothing to choose from.
         .visible(false)
         .build();
+
+    let overview = page(&stack, "Overview", &["view-grid-symbolic"]);
+    let top = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    overview.append(&top);
+    let head = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    head.set_hexpand(true);
+    head.append(&label(name, &["title-1"]));
+    let makers = label("", &["dim-label"]);
+    makers.set_visible(false);
+    head.append(&makers);
+    let title = gtk::Box::new(gtk::Orientation::Horizontal, 18);
+    title.append(&head);
+    overview.append(&title);
+
+    // "v1 · 2 GB · Playable", then a paragraph about the runtime.
+    let (state, runtime) = known.split_once("\n\n").unwrap_or((known, ""));
+    let chips: Vec<String> = state.split("  ·  ").map(str::to_string).collect();
+    overview.append(&chip_box(&chips));
+    if !runtime.is_empty() {
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        line.append(&icon(&["applications-engineering-symbolic"], 16));
+        line.append(&label(runtime, &["caption", "dim-label"]));
+        overview.append(&line);
+    }
     if !local {
-        let store = gtk::Button::builder()
+        let content = adw::ButtonContent::builder()
+            .icon_name(icon_name(&[
+                "adw-external-link-symbolic",
+                "web-browser-symbolic",
+            ]))
             .label("Open Store page")
-            .halign(gtk::Align::Start)
             .build();
+        let store = gtk::Button::builder()
+            .child(&content)
+            .valign(gtk::Align::Center)
+            .build();
+        store.update_property(&[gtk::accessible::Property::Label("Open Store page")]);
         let url = format!("{STORE_PAGE}{product_id}");
         store.connect_clicked(move |button| open_link(button, &url));
-        overview.append(&store);
-        load(ui, product_id, &stack, &tabs, &overview);
+        title.append(&store);
+        let shown = Page {
+            stack: stack.clone(),
+            tabs: tabs.clone(),
+            overview,
+            top,
+            head,
+            makers,
+        };
+        load(ui, product_id, shown);
     }
     let view = adw::ToolbarView::new();
     view.add_top_bar(&adw::HeaderBar::new());
@@ -55,48 +85,315 @@ pub fn open(ui: &Ui, product_id: &str, name: &str, known: &str, local: bool) {
     dialog.present(Some(&ui.window));
 }
 
+/// The parts the catalog's answer fills in.
+struct Page {
+    stack: adw::ViewStack,
+    tabs: gtk::ScrolledWindow,
+    overview: gtk::Box,
+    /// Above the name, for the pictures.
+    top: gtk::Box,
+    head: gtk::Box,
+    makers: gtk::Label,
+}
+
+/// The first of `names` the icon theme has.
+fn icon_name(names: &[&'static str]) -> &'static str {
+    let theme = gdk::Display::default().map(|d| gtk::IconTheme::for_display(&d));
+    names
+        .iter()
+        .copied()
+        .find(|name| theme.as_ref().is_some_and(|t| t.has_icon(name)))
+        .unwrap_or("dialog-information-symbolic")
+}
+
+fn icon(names: &[&'static str], size: i32) -> gtk::Image {
+    gtk::Image::builder()
+        .icon_name(icon_name(names))
+        .pixel_size(size)
+        .valign(gtk::Align::Center)
+        .accessible_role(gtk::AccessibleRole::Presentation)
+        .build()
+}
+
 /// Add a tab and return the box its content goes in.
-fn page(stack: &gtk::Stack, title: &str) -> gtk::Box {
+fn page(stack: &adw::ViewStack, title: &str, icons: &[&'static str]) -> gtk::Box {
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(18)
         .margin_top(18)
-        .margin_bottom(18)
-        .margin_start(18)
-        .margin_end(18)
+        .margin_bottom(30)
+        .margin_start(24)
+        .margin_end(24)
+        .build();
+    let clamp = adw::Clamp::builder()
+        .maximum_size(840)
+        .tightening_threshold(700)
+        .child(&content)
         .build();
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
-        .child(&content)
+        .child(&clamp)
         .build();
-    stack.add_titled(&scroll, Some(title), title);
+    stack.add_titled_with_icon(&scroll, Some(title), title, icon_name(icons));
     content
 }
 
-fn paragraph(text: &str) -> gtk::Label {
+fn label(text: &str, classes: &[&str]) -> gtk::Label {
     gtk::Label::builder()
         .label(text)
         .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
         .xalign(0.0)
-        .selectable(true)
-        .focusable(false)
+        .css_classes(classes.to_vec())
         .build()
 }
 
-fn group_rows(group: &product_details::Group) -> adw::PreferencesGroup {
-    let rows = adw::PreferencesGroup::builder().title(group.title).build();
-    for (label, value) in &group.rows {
-        let row = plain_row(label, Some(value));
-        row.add_css_class("property");
+fn heading(text: &str) -> gtk::Label {
+    let heading = label(text, &["title-4"]);
+    heading.set_margin_top(6);
+    heading
+}
+
+/// Text to read and copy.
+fn body(text: &str) -> gtk::Label {
+    let body = label(text, &["details-body"]);
+    body.set_selectable(true);
+    body.set_focusable(false);
+    body
+}
+
+/// Children side by side, as many as fit, none of them something to select.
+fn flow(children: impl IntoIterator<Item = gtk::Widget>, most: u32, same: bool) -> gtk::FlowBox {
+    let flow = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .max_children_per_line(most)
+        .homogeneous(same)
+        .column_spacing(if same { 12 } else { 6 })
+        .row_spacing(if same { 12 } else { 6 })
+        .css_classes(["details-flow"])
+        .build();
+    for child in children {
+        let cell = gtk::FlowBoxChild::builder()
+            .child(&child)
+            .focusable(false)
+            .build();
+        flow.append(&cell);
+    }
+    flow
+}
+
+fn chip_box(texts: &[String]) -> gtk::FlowBox {
+    let chips = texts.iter().filter(|t| !t.is_empty()).map(|t| {
+        let chip = label(t, &["details-chip", "caption"]);
+        chip.set_xalign(0.5);
+        chip.upcast()
+    });
+    let chips = flow(chips, 30, false);
+    chips.set_halign(gtk::Align::Fill);
+    chips
+}
+
+fn card(orientation: gtk::Orientation, spacing: i32) -> gtk::Box {
+    gtk::Box::builder()
+        .orientation(orientation)
+        .spacing(spacing)
+        .css_classes(["details-card"])
+        .build()
+}
+
+/// An icon beside a small label over its value.
+fn fact(icons: &[&'static str], what: &str, value: &str) -> gtk::Widget {
+    let fact = card(gtk::Orientation::Horizontal, 14);
+    fact.append(&icon(icons, 20));
+    let words = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    words.append(&label(what, &["caption", "dim-label"]));
+    words.append(&label(value, &["heading"]));
+    fact.append(&words);
+    fact.upcast()
+}
+
+fn player_card(rating: &PlayerRating) -> gtk::Widget {
+    let all = card(gtk::Orientation::Vertical, 4);
+    all.append(&label(&rating.span, &["caption", "dim-label"]));
+    let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    line.append(&label(
+        &format!("{:.1}", rating.average),
+        &["details-figure"],
+    ));
+    let stars = label(&stars(rating.average), &["details-stars"]);
+    stars.set_wrap(false);
+    stars.update_property(&[gtk::accessible::Property::Label(&format!(
+        "{:.1} of 5",
+        rating.average
+    ))]);
+    line.append(&stars);
+    all.append(&line);
+    let noun = if rating.count == 1 {
+        "rating"
+    } else {
+        "ratings"
+    };
+    all.append(&label(
+        &format!("{} {noun}", thousands(rating.count)),
+        &["caption", "dim-label"],
+    ));
+    all.upcast()
+}
+
+fn stars(average: f64) -> String {
+    let full = average.round().clamp(0.0, 5.0) as usize;
+    "★".repeat(full) + &"☆".repeat(5 - full)
+}
+
+fn thousands(number: u64) -> String {
+    let digits = number.to_string();
+    let mut out = String::new();
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push('\u{202f}');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+fn feature_icons(name: &str) -> &'static [&'static str] {
+    match name {
+        "SinglePlayer" => &["avatar-default-symbolic"],
+        "XblAchievements" => &["starred-symbolic"],
+        "XblCloudSaves" => &["weather-overcast-symbolic", "folder-remote-symbolic"],
+        "Capability4k" | "CapabilityHDR" => &["video-display-symbolic"],
+        "RayTracing" => &["weather-clear-symbolic", "display-brightness-symbolic"],
+        "DolbyAtmos" => &["audio-speakers-symbolic", "audio-volume-high-symbolic"],
+        "BroadcastSupport" => &["camera-video-symbolic", "media-record-symbolic"],
+        "VREnabled" | "MixedRealitySeated" => &["view-reveal-symbolic"],
+        "XboxLive" | "XblCrossPlatformMultiPlayer" | "XblCrossPlatformCoop" => {
+            &["network-workgroup-symbolic"]
+        }
+        _ if name.contains("Coop") || name.contains("MultiPlayer") || name.contains("Split") => {
+            &["system-users-symbolic"]
+        }
+        _ if name.contains("Console") || name == "XPA" => &["input-gaming-symbolic"],
+        _ => &["object-select-symbolic"],
+    }
+}
+
+fn row_icons(what: &str) -> &'static [&'static str] {
+    match what {
+        "Released" | "Last update" | "Store entry changed" => &["x-office-calendar-symbolic"],
+        "Add-ons" => &["list-add-symbolic"],
+        "In-app purchases" => &["emblem-important-symbolic"],
+        "Optimized for consoles" | "Plays on consoles" => &["input-gaming-symbolic"],
+        "Processor" => &["applications-engineering-symbolic"],
+        "Graphics" | "Video memory" => &["video-display-symbolic"],
+        "Memory" => &["media-flash-symbolic", "drive-harddisk-solidstate-symbolic"],
+        "Input" => &["input-keyboard-symbolic"],
+        "Download size" => &["folder-download-symbolic", "drive-harddisk-symbolic"],
+        "Format" | "Package family" => &["package-x-generic-symbolic"],
+        "Architecture" => &["applications-engineering-symbolic"],
+        "Type" => &["input-gaming-symbolic"],
+        "Website" => &["web-browser-symbolic"],
+        "Support" => &["help-browser-symbolic", "help-about-symbolic"],
+        "Privacy policy" => &["security-high-symbolic", "channel-secure-symbolic"],
+        "Terms of use" | "Licence terms" => &["text-x-generic-symbolic"],
+        _ => &["dialog-information-symbolic"],
+    }
+}
+
+fn facts(rows: &[Row], most: u32) -> gtk::FlowBox {
+    flow(
+        rows.iter()
+            .map(|(what, value)| fact(row_icons(what), what, value)),
+        most,
+        true,
+    )
+}
+
+fn feature_tile(name: &str) -> gtk::Widget {
+    let tile = card(gtk::Orientation::Horizontal, 14);
+    tile.append(&icon(feature_icons(name), 20));
+    tile.append(&label(&product_details::feature(name), &["heading"]));
+    tile.upcast()
+}
+
+fn requirement_card(need: &Requirement) -> gtk::Box {
+    let all = card(gtk::Orientation::Vertical, 12);
+    let title = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    title.append(&icon(row_icons(need.what), 20));
+    title.append(&label(need.what, &["heading"]));
+    all.append(&title);
+    let columns = gtk::Box::builder().spacing(24).homogeneous(true).build();
+    for (what, value) in [
+        ("Minimum", &need.minimum),
+        ("Recommended", &need.recommended),
+    ] {
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        column.append(&label(what, &["caption", "dim-label"]));
+        column.append(&label(
+            if value.is_empty() {
+                "Not stated"
+            } else {
+                value
+            },
+            if value.is_empty() {
+                &["dim-label"]
+            } else {
+                &[]
+            },
+        ));
+        columns.append(&column);
+    }
+    all.append(&columns);
+    all
+}
+
+fn age_card(age: &AgeRating) -> gtk::Widget {
+    let all = card(gtk::Orientation::Horizontal, 16);
+    let badge = gtk::Label::builder()
+        .label(&age.rating)
+        .width_chars(4)
+        .valign(gtk::Align::Start)
+        .css_classes(["details-badge"])
+        .build();
+    all.append(&badge);
+    let words = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    words.set_hexpand(true);
+    words.append(&label(&age.system, &["heading"]));
+    let region = product_details::rating_region(&age.system);
+    if !region.is_empty() {
+        words.append(&label(region, &["caption"]));
+    }
+    if !age.descriptors.is_empty() {
+        let reasons = label(&age.descriptors.join(" · "), &["caption", "dim-label"]);
+        // Two cards to a line: the reasons wrap rather than widen their card.
+        reasons.set_width_chars(20);
+        reasons.set_max_width_chars(32);
+        words.append(&reasons);
+    }
+    all.append(&words);
+    all.upcast()
+}
+
+fn link_list(links: &[Row]) -> adw::PreferencesGroup {
+    let list = adw::PreferencesGroup::new();
+    for (what, value) in links {
+        let row = plain_row(what, Some(value));
+        row.add_prefix(&icon(row_icons(what), 20));
         if let Some(url) = product_details::link(value) {
+            // The address shown is the one opened, without its scheme.
+            let shown = url.split_once("://").map_or(url, |(_, rest)| rest);
+            row.set_subtitle(shown.trim_end_matches('/'));
             let open = gtk::Button::builder()
-                .icon_name("web-browser-symbolic")
+                .icon_name(icon_name(&[
+                    "adw-external-link-symbolic",
+                    "go-next-symbolic",
+                ]))
                 .tooltip_text(url)
                 .valign(gtk::Align::Center)
                 .css_classes(["flat"])
                 .build();
-            open.update_property(&[gtk::accessible::Property::Label(&format!("Open {label}"))]);
+            open.update_property(&[gtk::accessible::Property::Label(&format!("Open {what}"))]);
             let url = url.to_string();
             open.connect_clicked(move |button| open_link(button, &url));
             row.add_suffix(&open);
@@ -104,9 +401,9 @@ fn group_rows(group: &product_details::Group) -> adw::PreferencesGroup {
         } else {
             row.set_subtitle_selectable(true);
         }
-        rows.add(&row);
+        list.add(&row);
     }
-    rows
+    list
 }
 
 /// The banner and screenshots, one at a time. Each is fetched in turn while
@@ -118,7 +415,7 @@ fn carousel(ui: &Ui, urls: Vec<String>) -> Option<gtk::Box> {
         return None;
     }
     let carousel = adw::Carousel::builder()
-        .height_request(340)
+        .height_request(400)
         .hexpand(true)
         // The wheel scrolls the page, which is longer than its pictures.
         .allow_scroll_wheel(false)
@@ -147,7 +444,11 @@ fn carousel(ui: &Ui, urls: Vec<String>) -> Option<gtk::Box> {
         });
         button
     };
-    let stage = gtk::Overlay::builder().child(&carousel).build();
+    let stage = gtk::Overlay::builder()
+        .child(&carousel)
+        .overflow(gtk::Overflow::Hidden)
+        .css_classes(["details-stage"])
+        .build();
     stage.add_overlay(&turn(
         "go-previous-symbolic",
         "Previous picture",
@@ -178,7 +479,7 @@ fn carousel(ui: &Ui, urls: Vec<String>) -> Option<gtk::Box> {
             let Ok(Ok(path)) = got else { continue };
             let picture = gtk::Picture::builder()
                 .can_shrink(true)
-                .content_fit(gtk::ContentFit::Contain)
+                .content_fit(gtk::ContentFit::Cover)
                 .hexpand(true)
                 .build();
             picture.set_alternative_text(Some("Picture from the game’s Store page"));
@@ -190,18 +491,11 @@ fn carousel(ui: &Ui, urls: Vec<String>) -> Option<gtk::Box> {
     Some(all)
 }
 
-fn load(
-    ui: &Ui,
-    product_id: &str,
-    stack: &gtk::Stack,
-    tabs: &gtk::ScrolledWindow,
-    overview: &gtk::Box,
-) {
+fn load(ui: &Ui, product_id: &str, shown: Page) {
     let (market, language) = ui.model.borrow().market();
-    let waiting = paragraph("Asking Microsoft’s catalog…");
-    overview.append(&waiting);
+    let waiting = label("Asking Microsoft’s catalog…", &["dim-label"]);
+    shown.overview.append(&waiting);
     let ui = ui.clone();
-    let (stack, tabs, overview) = (stack.clone(), tabs.clone(), overview.clone());
     let product_id = product_id.to_string();
     glib::spawn_future_local(async move {
         let result = gio::spawn_blocking(move || {
@@ -209,43 +503,139 @@ fn load(
         })
         .await
         .unwrap_or_else(|_| Err("the request stopped".into()));
-        let details = match result {
-            Ok(details) => details,
-            Err(error) => {
-                waiting.set_label(&format!("Microsoft’s catalog could not be read: {error}"));
-                return;
-            }
-        };
-        overview.remove(&waiting);
         if *ui.closing.borrow() {
             return;
         }
-        if let Some(pictures) = carousel(&ui, details.pictures) {
-            overview.prepend(&pictures);
-        }
-        if !details.description.is_empty() {
-            overview.append(&paragraph(&details.description));
-        }
-        let on_tab = |title: &str| TABS.iter().any(|(_, groups)| groups.contains(&title));
-        for group in details.groups.iter().filter(|g| !on_tab(g.title)) {
-            overview.append(&group_rows(group));
-        }
-        for (title, wanted) in TABS {
-            let groups: Vec<_> = details
-                .groups
-                .iter()
-                .filter(|g| wanted.contains(&g.title))
-                .collect();
-            if groups.is_empty() {
-                continue;
+        match result {
+            Ok(details) => {
+                shown.overview.remove(&waiting);
+                fill(&ui, &shown, details);
             }
-            let content = page(&stack, title);
-            for group in groups {
-                content.append(&group_rows(group));
+            Err(error) => {
+                waiting.set_label(&format!("Microsoft’s catalog could not be read: {error}"))
             }
-            tabs.set_visible(true);
         }
     });
+}
+
+fn fill(ui: &Ui, shown: &Page, details: Details) {
+    let Page {
+        stack, overview, ..
+    } = shown;
+    let mut makers = vec![details.developer.clone()];
+    if details.publisher != details.developer {
+        makers.push(details.publisher.clone());
+    }
+    makers.retain(|m| !m.is_empty());
+    shown.makers.set_label(&makers.join("  ·  "));
+    shown.makers.set_visible(!makers.is_empty());
+
+    if let Some(pictures) = carousel(ui, details.pictures) {
+        shown.top.append(&pictures);
+    }
+    if !details.categories.is_empty() {
+        let chips = chip_box(&details.categories);
+        chips.set_margin_top(4);
+        shown.head.append(&chips);
+    }
+    if !details.description.is_empty() {
+        overview.append(&heading("About this game"));
+        overview.append(&body(&details.description));
+    }
+    if !details.players.is_empty() {
+        overview.append(&heading("Player ratings"));
+        overview.append(&flow(details.players.iter().map(player_card), 3, true));
+    }
+    if !details.dates.is_empty() {
+        overview.append(&heading("Dates"));
+        overview.append(&facts(&details.dates, 3));
+    }
+    if !details.release_notes.is_empty() {
+        overview.append(&heading("Release notes"));
+        overview.append(&body(&details.release_notes));
+    }
+
+    let tab = |title: &str, icons: &[&'static str]| {
+        shown.tabs.set_visible(true);
+        page(stack, title, icons)
+    };
+    if !details.features.is_empty() || !details.purchases.is_empty() {
+        let content = tab("Features", &["starred-symbolic"]);
+        if !details.features.is_empty() {
+            content.append(&heading("What it supports"));
+            content.append(&flow(
+                details.features.iter().map(|f| feature_tile(f)),
+                3,
+                true,
+            ));
+        }
+        if !details.purchases.is_empty() {
+            content.append(&heading("Purchases and consoles"));
+            content.append(&facts(&details.purchases, 2));
+        }
+    }
+    if !details.requirements.is_empty() || !details.requirement_notes.is_empty() {
+        let content = tab("Requirements", &["computer-symbolic"]);
+        content.append(&heading("System requirements"));
+        content.append(&label(
+            "What the publisher lists for Windows.",
+            &["dim-label"],
+        ));
+        for need in &details.requirements {
+            content.append(&requirement_card(need));
+        }
+        for (what, value) in &details.requirement_notes {
+            content.append(&heading(&format!("{what} notes")));
+            content.append(&body(value));
+        }
+    }
+    if !details.ages.is_empty() {
+        let content = tab("Age ratings", &["system-users-symbolic"]);
+        content.append(&heading("Age ratings"));
+        content.append(&flow(details.ages.iter().map(age_card), 2, true));
+    }
+    if !details.package.is_empty() || !details.languages.is_empty() {
+        let content = tab("Package", &["package-x-generic-symbolic"]);
+        // Ids are long, and for copying; the rest reads better as cards.
+        let (ids, short): (Vec<Row>, Vec<Row>) = details
+            .package
+            .into_iter()
+            .partition(|(what, _)| what.ends_with(" id") || *what == "Package family");
+        if !short.is_empty() {
+            content.append(&heading("Package"));
+            content.append(&facts(&short, 2));
+        }
+        if !details.languages.is_empty() {
+            content.append(&heading("Languages"));
+            content.append(&chip_box(&details.languages));
+        }
+        if !ids.is_empty() {
+            let list = adw::PreferencesGroup::builder()
+                .title("Identifiers")
+                .build();
+            for (what, value) in &ids {
+                let row = plain_row(what, Some(value));
+                row.add_css_class("property");
+                row.add_css_class("details-id");
+                row.set_subtitle_selectable(true);
+                list.add(&row);
+            }
+            content.append(&list);
+        }
+    }
+    if !details.links.is_empty() || !details.copyright.is_empty() {
+        let content = tab(
+            "Links and legal",
+            &["adw-external-link-symbolic", "web-browser-symbolic"],
+        );
+        if !details.links.is_empty() {
+            content.append(&heading("Links"));
+            content.append(&link_list(&details.links));
+        }
+        if !details.copyright.is_empty() {
+            content.append(&label(&details.copyright, &["caption", "dim-label"]));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -253,13 +643,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_tabs_name_groups_the_catalog_gives() {
-        let source = include_str!("../../ferestre-core/src/product_details.rs");
-        for group in TABS.iter().flat_map(|(_, groups)| groups.iter()) {
-            assert!(
-                source.contains(&format!("into_group(\"{group}\"")),
-                "{group}"
-            );
-        }
+    fn ratings_read_as_people_write_them() {
+        assert_eq!(stars(4.8), "★★★★★");
+        assert_eq!(stars(3.4), "★★★☆☆");
+        assert_eq!(stars(9.0), "★★★★★");
+        assert_eq!(thousands(190), "190");
+        assert_eq!(thousands(2_252_544), "2\u{202f}252\u{202f}544");
     }
 }
