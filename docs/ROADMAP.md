@@ -6,7 +6,14 @@ for Bedrock on Android, for Microsoft Store titles on Linux.
 
 ## Current qualification
 
-Release 0.1.24 pairs with runtime 11.0.20261122.2. Hogwarts Legacy, Batman:
+Release 0.1.26 pairs with runtime 11.0.20261122.2, the first release that
+publishes it; 0.1.24 was never published and its changes shipped in 0.1.25.
+0.1.25 added local games (added by hand or imported from Steam's non-Steam
+shortcuts, launched without the Xbox client) and experimental neural rendering
+through DLSSNR-AMD on Radeon RX 9000 cards; see its
+[release notes](RELEASE-0.1.25.md).
+
+The 0.1.24 changes, which shipped in 0.1.25: Hogwarts Legacy, Batman:
 Arkham Knight, Control, Crash Bandicoot N. Sane Trilogy and Dead by Daylight
 play, each checked by a person; Death Stranding Director's Cut plays its
 opening offline, checked headless. The runtime waits, with a time limit, for
@@ -20,7 +27,7 @@ fewer redraws, a Home carousel and shelves, an Installed sidebar with a compact
 mode, stacked notifications and blur behind dialogs. A title runs once per
 prefix: Play on a running title asks first, and `ferestre run` exits 4 for a
 second copy. The launch settings editor has Reset to defaults. See
-[release qualification](RELEASE-0.1.24.md).
+[release qualification](RELEASE-0.1.26.md).
 
 Release 0.1.23 pairs with runtime 11.0.20261122.1. Gears 5 (Xbox PC) plays,
 campaign and multiplayer, with Easy Anti-Cheat. Two gaps stood in the way. The
