@@ -39,6 +39,7 @@ mod text_input;
 mod textures;
 mod window_activation;
 mod window_controls;
+mod window_size;
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -238,6 +239,20 @@ window.ferestre-window searchentry.search-pill:focus-within { border-color: alph
 /* Hero carousel */
 .hero-peek { padding: 0; border: 0; border-radius: 18px; background: none; box-shadow: none; opacity: 0.4; transition: opacity 200ms ease-out; }
 .hero-peek:hover { opacity: 0.62; }
+window.blur-ok .hero-peek picture { filter: blur(5px); transform: scale(1.06); }
+@keyframes hero-was-peek { from { opacity: 0.4; } to { opacity: 1; } }
+@keyframes hero-was-centre { from { opacity: 1; } to { opacity: 0.4; } }
+@keyframes hero-arriving { from { opacity: 0; } to { opacity: 0.4; } }
+@keyframes hero-leaving { from { opacity: 0.4; } to { opacity: 0; } }
+@keyframes hero-sharpen { from { filter: blur(5px); } to { filter: blur(0px); } }
+@keyframes hero-soften { from { filter: blur(0px); transform: scale(1); } to { filter: blur(5px); transform: scale(1.06); } }
+.hero-was-peek { animation: hero-was-peek 380ms ease-out; }
+.hero-was-peek .hero-caption { animation: hero-was-peek 380ms ease-out; }
+.hero-was-centre { animation: hero-was-centre 380ms ease-out; }
+.hero-arriving { animation: hero-arriving 380ms ease-out; }
+.hero-leaving { animation: hero-leaving 380ms ease-out forwards; }
+window.blur-ok .hero-was-peek picture { animation: hero-sharpen 380ms ease-out; }
+window.blur-ok .hero-was-centre picture { animation: hero-soften 380ms ease-out; }
 button.art-button { padding: 0; border: 0; background-image: none; background-color: #25282d; box-shadow: none; border-radius: 14px; }
 button.hero-centre { border-radius: 18px; box-shadow: 0 12px 36px alpha(black, 0.4); }
 .hero-caption { padding: 72px 32px 26px; background-image: linear-gradient(to bottom, alpha(black, 0), alpha(black, 0.82)); }
@@ -544,8 +559,8 @@ fn build_ui(app: &adw::Application) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Ferestre")
-        .default_width(1280)
-        .default_height(800)
+        .default_width(window_size::DEFAULT.0)
+        .default_height(window_size::DEFAULT.1)
         .css_classes(["ferestre-window"])
         .build();
 
@@ -1098,6 +1113,7 @@ fn build_ui(app: &adw::Application) {
         refresh_account(&ui);
     }
 
+    window_size::install(&ui);
     handheld::install(&ui, &content_view, &content_header, &back);
     if handheld::read_preference(&ui, "compact") == Some(true) {
         sidebar::set_compact(&ui, true);

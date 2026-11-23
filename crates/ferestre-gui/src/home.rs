@@ -148,6 +148,9 @@ pub(crate) fn sized(child: &impl IsA<gtk::Widget>, width: Option<i32>, height: i
     }
 }
 
+/// Draws the hero, turned by so many places.
+type Fill = Rc<dyn Fn(&Ui, isize)>;
+
 /// The hero carousel, for Home and Game Pass.
 pub(crate) fn hero(ui: &Ui, page: &gtk::Box, items: Vec<Feature>) {
     if items.is_empty() {
@@ -162,7 +165,8 @@ pub(crate) fn hero(ui: &Ui, page: &gtk::Box, items: Vec<Feature>) {
         .css_classes(["hero-stage"])
         .build();
     // Sizes follow the allocated width, so a resize needs no rebuild.
-    stage.set_layout_manager(Some(HeroLayout::default()));
+    let layout = HeroLayout::default();
+    stage.set_layout_manager(Some(layout.clone()));
     let dots = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -193,9 +197,19 @@ pub(crate) fn hero(ui: &Ui, page: &gtk::Box, items: Vec<Feature>) {
     if items.len() < 2 {
         controls.set_visible(false);
     }
-    let fill: Rc<dyn Fn(&Ui)> = {
+    // The turn in progress: it runs from where the last one had got to.
+    let turn: Rc<RefCell<Option<adw::TimedAnimation>>> = Rc::default();
+    let fill: Fill = {
         let (stage, dots, items) = (stage.clone(), dots.clone(), items.clone());
-        Rc::new(move |ui: &Ui| {
+        Rc::new(move |ui: &Ui, step: isize| {
+            let animate =
+                step != 0 && gtk::Settings::default().is_none_or(|s| s.is_gtk_enable_animations());
+            let running = turn.take();
+            let mut from = 0.0;
+            if let Some(running) = running {
+                from = running.value();
+                running.pause();
+            }
             let index = ui.hero_index.get() % items.len();
             let had_focus = GtkWindowExt::focus(&ui.window)
                 .is_some_and(|f| f.is_ancestor(&stage) || f.has_css_class("hero-centre"));
@@ -206,13 +220,83 @@ pub(crate) fn hero(ui: &Ui, page: &gtk::Box, items: Vec<Feature>) {
                 dots.remove(&child);
             }
             let n = items.len();
+            // The title that leaves the stage on this turn, shown until it has.
+            let leaving = |by: usize, next: bool| {
+                let gone = peek(ui, &items[(index + by) % n], next);
+                gone.set_can_target(false);
+                gone.set_tooltip_text(None);
+                gone.add_css_class("hero-leaving");
+                gone
+            };
+            if animate && step > 0 {
+                stage.append(&leaving(2 * n - 2, false));
+            }
             if n > 1 {
-                stage.append(&peek(ui, &items[(index + n - 1) % n], false));
+                let side = peek(ui, &items[(index + n - 1) % n], false);
+                if animate && step > 0 {
+                    side.add_css_class("hero-was-centre");
+                } else if animate {
+                    side.add_css_class("hero-arriving");
+                }
+                stage.append(&side);
             }
             let centre = centre(ui, &items[index], index == 0);
+            if animate {
+                centre.add_css_class("hero-was-peek");
+            }
             stage.append(&centre);
             if n > 1 {
-                stage.append(&peek(ui, &items[(index + 1) % n], true));
+                let side = peek(ui, &items[(index + 1) % n], true);
+                if animate && step < 0 {
+                    side.add_css_class("hero-was-centre");
+                } else if animate {
+                    side.add_css_class("hero-arriving");
+                }
+                stage.append(&side);
+            }
+            if animate && step < 0 {
+                stage.append(&leaving(2, true));
+            }
+            layout.set_first(match (n > 1, animate && step > 0) {
+                (false, _) => 0,
+                (true, false) => -1,
+                (true, true) => -2,
+            });
+            layout.set_offset(0.0);
+            if animate {
+                let from = (from + step as f64).clamp(-2.0, 2.0);
+                layout.set_offset(from);
+                let target = adw::CallbackAnimationTarget::new(glib::clone!(
+                    #[weak]
+                    layout,
+                    move |value| layout.set_offset(value)
+                ));
+                let animation = adw::TimedAnimation::builder()
+                    .widget(&stage)
+                    .value_from(from)
+                    .value_to(0.0)
+                    .duration(HERO_TURN_MS)
+                    .easing(adw::Easing::EaseOutCubic)
+                    .target(&target)
+                    .build();
+                animation.connect_done(glib::clone!(
+                    #[weak]
+                    stage,
+                    #[weak]
+                    layout,
+                    move |_| {
+                        let mut child = stage.first_child();
+                        while let Some(c) = child {
+                            child = c.next_sibling();
+                            if c.has_css_class("hero-leaving") {
+                                stage.remove(&c);
+                            }
+                        }
+                        layout.set_first(-1);
+                    }
+                ));
+                animation.play();
+                turn.replace(Some(animation));
             }
             for i in 0..n {
                 let dot = gtk::Box::builder()
@@ -230,13 +314,13 @@ pub(crate) fn hero(ui: &Ui, page: &gtk::Box, items: Vec<Feature>) {
             }
         })
     };
-    fill(ui);
+    fill(ui, 0);
     for (button, step) in [(previous, -1isize), (next, 1)] {
         let (ui, fill, n) = (ui.clone(), fill.clone(), items.len());
         button.connect_clicked(move |_| {
             let index = (ui.hero_index.get() as isize + step).rem_euclid(n as isize);
             ui.hero_index.set(index as usize);
-            fill(&ui);
+            fill(&ui, step);
         });
     }
     let column = gtk::Box::builder()
@@ -274,7 +358,12 @@ mod hero_layout {
     use gtk::{glib, prelude::*, subclass::prelude::*};
 
     #[derive(Default)]
-    pub struct Imp;
+    pub struct Imp {
+        /// Where the first child stands: 0 the centre, -1 left of it, -2 gone.
+        pub first: std::cell::Cell<i32>,
+        /// How far a turn still has to go, in places.
+        pub offset: std::cell::Cell<f64>,
+    }
 
     #[glib::object_subclass]
     impl ObjectSubclass for Imp {
@@ -312,11 +401,14 @@ mod hero_layout {
             let peeks = kids.len() > 1;
             match orientation {
                 gtk::Orientation::Horizontal => {
+                    // A title leaving during a turn asks for no room.
+                    let kept = kids.len().min(3);
                     let min = kids
                         .iter()
+                        .filter(|c| !c.has_css_class("hero-leaving"))
                         .map(|c| c.measure(orientation, -1).0)
                         .sum::<i32>()
-                        + super::HERO_GAP * (kids.len().max(1) as i32 - 1);
+                        + super::HERO_GAP * (kept.max(1) as i32 - 1);
                     let (_, _, natural) = super::hero_geometry(i32::MAX, peeks);
                     (min, natural.max(min), -1, -1)
                 }
@@ -337,18 +429,13 @@ mod hero_layout {
 
         fn allocate(&self, widget: &gtk::Widget, width: i32, height: i32, _baseline: i32) {
             let kids = children(widget);
-            let (centre, peek, total) = super::hero_geometry(width, kids.len() > 1);
-            let mut x = ((width - total) / 2).max(0);
+            let peeks = kids.len() > 1;
+            let (first, offset) = (f64::from(self.first.get()), self.offset.get());
             for (i, child) in kids.iter().enumerate() {
-                let wanted = if kids.len() > 1 && i != 1 {
-                    peek
-                } else {
-                    centre
-                };
+                let (x, wanted) = super::hero_place(width, peeks, first + i as f64 + offset);
                 let w = wanted.max(child.measure(gtk::Orientation::Horizontal, height).0);
                 let h = height.max(child.measure(gtk::Orientation::Vertical, w).0);
                 child.size_allocate(&gtk::Allocation::new(x, 0, w, h), -1);
-                x += w + super::HERO_GAP;
             }
         }
     }
@@ -364,6 +451,22 @@ impl Default for HeroLayout {
     }
 }
 
+impl HeroLayout {
+    fn set_first(&self, first: i32) {
+        use gtk::subclass::prelude::ObjectSubclassIsExt;
+        self.imp().first.set(first);
+        self.layout_changed();
+    }
+
+    fn set_offset(&self, offset: f64) {
+        use gtk::subclass::prelude::ObjectSubclassIsExt;
+        self.imp().offset.set(offset);
+        self.layout_changed();
+    }
+}
+
+/// How long a turn of the hero takes.
+const HERO_TURN_MS: u32 = 380;
 const HERO_MAX: i32 = 1400;
 const HERO_GAP: i32 = 16;
 /// Each neighbour is this share of the centre banner's width.
@@ -388,6 +491,31 @@ fn hero_geometry(width: i32, peeks: bool) -> (i32, i32, i32) {
         peek as i32,
         (centre + 2.0 * peek + gaps) as i32,
     )
+}
+
+/// Left edge and width at `place`: 0 the centre, 1 its right neighbour, 2 past
+/// that and half as wide, inside the stage's edge; between them, in between.
+fn hero_place(width: i32, peeks: bool, place: f64) -> (i32, i32) {
+    let (centre, peek, total) = hero_geometry(width, peeks);
+    let left = f64::from(((width - total) / 2).max(0));
+    let (centre, peek, total) = (f64::from(centre), f64::from(peek), f64::from(total));
+    let gap = f64::from(HERO_GAP);
+    if !peeks {
+        return (left as i32, centre as i32);
+    }
+    let half = (peek / 2.0).floor();
+    let stops = [
+        (left, half),
+        (left, peek),
+        (left + peek + gap, centre),
+        (left + total - peek, peek),
+        (left + total - half, half),
+    ];
+    let at = (place + 2.0).clamp(0.0, 4.0);
+    let (low, part) = (at.floor() as usize, at.fract());
+    let (a, b) = (stops[low], stops[(low + 1).min(4)]);
+    let mix = |a: f64, b: f64| (a + (b - a) * part).round() as i32;
+    (mix(a.0, b.0), mix(a.1, b.1))
 }
 
 /// A wide banner, between 220 and 440 px tall.
@@ -439,6 +567,10 @@ fn centre(ui: &Ui, feature: &Feature, first: bool) -> gtk::Widget {
     let button = feature_button(ui, row, &overlay);
     button.set_overflow(gtk::Overflow::Hidden);
     button.add_css_class("hero-centre");
+    // A card's action is centred in its row; the banner fills the stage, also
+    // while a turn has it narrow.
+    button.set_valign(gtk::Align::Fill);
+    button.set_halign(gtk::Align::Fill);
     if first {
         button.add_css_class("hero-first");
     }
@@ -1102,4 +1234,29 @@ pub(crate) fn gamepass_hero(ui: &Ui, page: &gtk::Box) {
     artwork::request_heroes(ui, hero_candidates(&[], &rows));
     let items = features(&ui.model.borrow(), &[], &rows);
     hero(ui, page, items);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hero_turn_starts_and_ends_on_the_resting_places() {
+        let (centre, peek, total) = hero_geometry(1000, true);
+        let left = (1000 - total) / 2;
+        assert_eq!(hero_place(1000, true, -1.0), (left, peek));
+        assert_eq!(
+            hero_place(1000, true, 0.0),
+            (left + peek + HERO_GAP, centre)
+        );
+        assert_eq!(hero_place(1000, true, 1.0), (left + total - peek, peek));
+        // Halfway it is between them, and nothing ever leaves the stage.
+        let (x, w) = hero_place(1000, true, 0.5);
+        assert!(x > left + peek + HERO_GAP && w < centre && w > peek);
+        for place in -30..=30 {
+            let (x, w) = hero_place(1000, true, f64::from(place) / 10.0);
+            assert!(x >= left && x + w <= left + total + 1, "{place}");
+        }
+        assert_eq!(hero_place(1000, false, 0.0), (0, 1000));
+    }
 }

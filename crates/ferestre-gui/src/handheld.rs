@@ -13,14 +13,22 @@ pub(super) const SECTIONS: [(&str, Section); 6] = [
 /// A saved window preference (`window.json`), such as `fullscreen` or
 /// `compact`.
 pub(super) fn read_preference(ui: &Ui, key: &str) -> Option<bool> {
+    read_value(ui, key).and_then(|v| v.as_bool())
+}
+
+pub(super) fn read_value(ui: &Ui, key: &str) -> Option<serde_json::Value> {
     preference(ui)
         .and_then(|p| std::fs::read(p).ok())
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|v| v.get(key).and_then(|v| v.as_bool()))
+        .and_then(|v| v.get(key).cloned())
 }
 
 /// Save one window preference, keeping the others.
 pub(super) fn save_preference(ui: &Ui, key: &str, value: bool) -> anyhow::Result<()> {
+    save_value(ui, key, serde_json::Value::Bool(value))
+}
+
+pub(super) fn save_value(ui: &Ui, key: &str, value: serde_json::Value) -> anyhow::Result<()> {
     let Some(path) = preference(ui) else {
         return Ok(());
     };
@@ -29,7 +37,7 @@ pub(super) fn save_preference(ui: &Ui, key: &str, value: bool) -> anyhow::Result
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .filter(|v| v.is_object())
         .unwrap_or_else(|| serde_json::json!({}));
-    saved[key] = serde_json::Value::Bool(value);
+    saved[key] = value;
     ferestre_core::cache::write(&path, &serde_json::to_vec(&saved)?)?;
     Ok(())
 }
