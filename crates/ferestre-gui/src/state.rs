@@ -1079,10 +1079,25 @@ impl Model {
     ) -> Vec<&'a crate::model::LibraryRow> {
         let popular = self.gamepass_popular.as_deref().unwrap_or_default();
         let place = |id: &str| popular.iter().position(|p| p.eq_ignore_ascii_case(id));
+        let bundles = |bundle: &str, row: &crate::model::LibraryRow| {
+            self.catalog
+                .get(&bundle.to_ascii_uppercase())
+                .is_some_and(|p| {
+                    p.bundled_ids
+                        .iter()
+                        .any(|id| id.eq_ignore_ascii_case(&row.product_id))
+                })
+        };
         let mut rows: Vec<_> = rows.iter().collect();
         rows.sort_by_cached_key(|row| {
             place(&row.product_id)
                 .or_else(|| place(&row.install_as.as_ref()?.0))
+                // Installed, it is listed as itself and not as its bundle.
+                .or_else(|| {
+                    popular
+                        .iter()
+                        .position(|p| row.installed && bundles(p, row))
+                })
                 .unwrap_or(usize::MAX)
         });
         rows

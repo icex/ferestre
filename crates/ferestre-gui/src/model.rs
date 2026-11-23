@@ -619,8 +619,43 @@ pub fn gamepass(
             }
         })
         .collect();
+    let here: HashMap<String, LibraryRow> = library(inputs)
+        .into_iter()
+        .filter(|row| !row.local && (row.installed || row.action == Action::Resume))
+        .filter(|row| row.action != Action::Content)
+        .map(|row| (row.product_id.to_ascii_uppercase(), row))
+        .collect();
+    let mut listed = BTreeSet::new();
+    rows.retain_mut(|row| {
+        if let Some(own) = on_disk_row(inputs, &here, &row.product_id) {
+            *row = own.clone();
+        }
+        // A bundle and the title in it can both be listed.
+        listed.insert(row.product_id.to_ascii_uppercase())
+    });
     rows.sort_by_cached_key(sort_key);
     rows
+}
+
+/// The library's row for a listed title that is on disk: its own, or for a
+/// bundle, the one of the title in it. The bundle's id is never what is
+/// installed, launched or removed.
+fn on_disk_row<'a>(
+    inputs: &Inputs,
+    here: &'a HashMap<String, LibraryRow>,
+    product_id: &str,
+) -> Option<&'a LibraryRow> {
+    let key = product_id.to_ascii_uppercase();
+    here.get(&key).or_else(|| {
+        let children = &inputs.catalog.get(&key)?.bundled_ids;
+        let found = |installed: bool| {
+            children
+                .iter()
+                .filter_map(|id| here.get(&id.to_ascii_uppercase()))
+                .find(|row| row.installed || !installed)
+        };
+        found(true).or_else(|| found(false))
+    })
 }
 
 /// `1 title`, `3 titles`. English only, like the rest of the window.
@@ -2905,6 +2940,35 @@ HTTP 401 Unauthorized",
             Some(("9ZZTESTCHLD".to_string(), "The Playable One".to_string())),
             "the download is the child's, under the child's name"
         );
+    }
+
+    /// Installed, a Game Pass bundle is the title on disk, as in the library:
+    /// once, and with nothing to install.
+    #[test]
+    fn a_gamepass_bundle_whose_title_is_installed_is_that_title() {
+        let mut bundle = product("9ZZTESTBNDL", "The Bundle", &[]);
+        bundle.bundled_ids = vec!["9zztestadd1".into(), "9zztestchld".into()];
+        let cat = catalog(vec![
+            bundle,
+            product("9ZZTESTCHLD", "The Playable One", &["cid"]),
+        ]);
+        let own = Ownership::Known(vec![]);
+        let recipes = [recipe("9ZZTESTCHLD", "playable", &[])];
+        let rt = runtime_with(&[], CapabilitySource::Manifest);
+        let listed = ["9ZZTESTBNDL".to_string(), "9ZZTESTCHLD".to_string()];
+        let mut fixture = inputs(&recipes, Some(&rt), &own, ALL_INSTALLED);
+        fixture.catalog = &cat;
+        for ids in [&listed[..1], &listed[..]] {
+            let rows = gamepass(&fixture, ids, None, &Default::default(), &[]);
+            assert_eq!(rows, library(&fixture));
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].installed && rows[0].install_as.is_none());
+            assert_eq!(rows[0].action, Action::Play);
+        }
+        fixture.installed = NOTHING_INSTALLED;
+        let rows = gamepass(&fixture, &listed[..1], None, &Default::default(), &[]);
+        assert_eq!(rows[0].product_id, "9ZZTESTBNDL");
+        assert_eq!(rows[0].action, Action::Install);
     }
 
     /// And says only what it knows. Before the children are fetched there is no
