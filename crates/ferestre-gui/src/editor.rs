@@ -471,11 +471,15 @@ pub fn present(
     let has_edit = Recipe::path_for(&product_id, &titles_dir)
         .map(|path| path.exists())
         .unwrap_or(false);
+    // A local game's recipe is the game: there are no defaults behind it.
+    let local = recipe.borrow().is_local();
     let reset = gtk::Button::builder()
         .label("Reset to defaults")
         .css_classes(["destructive-action"])
-        .sensitive(has_edit)
-        .tooltip_text(if has_edit {
+        .sensitive(has_edit && !local)
+        .tooltip_text(if local {
+            "A local game has no defaults; its settings here are the game"
+        } else if has_edit {
             "Undo every change made here for this title"
         } else {
             "Nothing has been changed for this title"

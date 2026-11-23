@@ -745,6 +745,18 @@ impl Recipe {
         if !path.exists() {
             return Ok(None);
         }
+        // A local game has no packaged or detected recipe to go back to: its
+        // own recipe is the game, and setting it aside makes it vanish.
+        let local = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| Self::parse(&text).ok())
+            .is_some_and(|r| r.is_local());
+        if local {
+            anyhow::bail!(
+                "{product_id} is a local game: its recipe is the game itself, with no defaults \
+                 to go back to; change it in Edit launch settings, or remove the game"
+            );
+        }
         let backup = path.with_extension("toml.bak");
         std::fs::rename(&path, &backup).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         Ok(Some(backup))
@@ -1385,6 +1397,19 @@ summary = "Runs."
             None
         );
         assert!(Recipe::reset_in("../etc", dir.path()).is_err());
+
+        // A local game's recipe is the game: it is never set aside.
+        let mut local = Recipe::blank("LOCAL-STEAM-42", "Local Test");
+        local.title.kind = TitleKind::Local;
+        local.title.slug = "local-steam-42".into();
+        local.install.dir = Some("/games/local/test".into());
+        local.launch.executable = "Game.exe".into();
+        let path = local.save_to(dir.path()).unwrap();
+        let err = Recipe::reset_in("local-steam-42", dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local game"), "{err}");
+        assert!(path.exists() && !path.with_extension("toml.bak").exists());
     }
 
     fn local(extra: &str) -> anyhow::Result<Recipe> {
