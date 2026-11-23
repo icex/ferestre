@@ -6,7 +6,7 @@ Play compatible **Xbox PC and Microsoft Store games on Linux** using your Micros
 
 <br clear="left">
 
-**[Download the AppImage](https://github.com/icex/ferestre/releases/download/v0.1.25/ferestre-0.1.25-x86_64.AppImage)** · [Compatible games](docs/COMPATIBILITY.md#the-matrix) · [Quick start](#quick-start) · [Report a problem](https://github.com/icex/ferestre/issues)
+**[Download the AppImage](https://github.com/icex/ferestre/releases/download/v0.1.26/ferestre-0.1.26-x86_64.AppImage)** · [Compatible games](docs/COMPATIBILITY.md#the-matrix) · [Quick start](#quick-start) · [Report a problem](https://github.com/icex/ferestre/issues)
 
 ![Ferestre's Home: a featured-game carousel, quick links and a Jump back in shelf, with installed games and their status in the sidebar](docs/screenshots/home.png)
 
@@ -207,7 +207,7 @@ Use `./ferestre.AppImage --help` for all commands. `run` refuses to start a game
 | [Releasing](docs/RELEASING.md) | Release builds and signing |
 | [Debugging notes](notes/) | Technical investigations |
 
-Current releases: **[Ferestre 0.1.25](https://github.com/icex/ferestre/releases/tag/v0.1.25)** and **[runtime 11.0.20261122.2](https://github.com/icex/ferestre/releases/tag/runtime-11.0.20261122.2)**. Read the [release notes](docs/RELEASE-0.1.25.md) for tested scope.
+Current releases: **[Ferestre 0.1.26](https://github.com/icex/ferestre/releases/tag/v0.1.26)** and **[runtime 11.0.20261122.2](https://github.com/icex/ferestre/releases/tag/runtime-11.0.20261122.2)**. Read the [0.1.26](docs/RELEASE-0.1.26.md) and [0.1.25](docs/RELEASE-0.1.25.md) release notes for tested scope.
 
 ## About the project
 

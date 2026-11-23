@@ -1,5 +1,7 @@
 # Ferestre 0.1.24
 
+0.1.24 was never published. Its changes shipped in 0.1.25, and the [0.1.26 notes](RELEASE-0.1.26.md) list them together with runtime 11.0.20261122.2.
+
 Pairs with runtime 11.0.20261122.2. The game fixes below need that runtime; **Settings → Choose default runtime** selects it once it is installed.
 
 ## Games
