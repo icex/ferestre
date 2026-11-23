@@ -689,7 +689,8 @@ pub fn present(
                 Some(&format!(
                     "Every launch setting changed here for this title is undone. It uses \
                      the settings Ferestre ships for it again, or, for a title Ferestre has \
-                     none for, works them out again the next time it starts.\n\n\
+                     none for, works them out again the next time it starts. \
+                     The chosen runtime and neural rendering stay as they are.\n\n\
                      The settings it has now are kept in {kept}, replacing an older copy \
                      there."
                 )),

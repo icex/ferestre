@@ -447,7 +447,7 @@ fn pick_artwork(images: &[Image]) -> Artwork {
 }
 
 /// Catalog image URIs come back protocol-relative (`//store-images...`).
-fn absolute(uri: &str) -> String {
+pub(crate) fn absolute(uri: &str) -> String {
     match uri.strip_prefix("//") {
         Some(rest) => format!("https://{rest}"),
         None => uri.to_string(),
