@@ -83,6 +83,12 @@ def main():
                 # A background redraw may have replaced the tile meanwhile.
                 tile=wait(lambda r:next(iter(s.find_all(r,name=name)),None),'the tile')
                 s.check(outline_bands(gui.pid,tile)==[],'moving focus inside a card removes its previous outer ring')
+                s.click_named(frame,'Refresh library, subscriptions and catalogue')
+                for _ in range(20):
+                    time.sleep(.1)
+                    held=focus(app)
+                    if held is not None:s.check('More actions' in held.get_name(),'a redraw keeps the focus on More')
+                s.check(held is not None,'More has the focus after the redraw')
             s.click_named(frame,'Exit fullscreen');wait(lambda r:s.find_all(r,name='Enter fullscreen'),'desktop')
             s.select_in_list(frame,'Installed');driver.pulse(12);driver.seek('Install queue')
             driver.press(0,lambda root:s.find_all(root,name='Downloads page'),'open queue from library tabs')

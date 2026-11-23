@@ -1442,7 +1442,14 @@ fn render(ui: &Ui) {
     let window = &ui.window;
     let focus_name = GtkWindowExt::focus(window)
         .filter(|w| w.is_ancestor(&ui.content))
-        .and_then(|w| controller::focus_after_render(&w.widget_name(), ui.model.borrow().section));
+        .and_then(|w| {
+            // A menu button's focus is on the button inside it, which has no name.
+            let named = w
+                .parent()
+                .filter(|parent| parent.is::<gtk::MenuButton>())
+                .unwrap_or(w);
+            controller::focus_after_render(&named.widget_name(), ui.model.borrow().section)
+        });
     let focus_in_view = GtkWindowExt::focus(window).is_none_or(|focus| in_view(ui, &focus));
     if GtkWindowExt::focus(window).is_some_and(|focus| focus.is_ancestor(&ui.content)) {
         GtkWindowExt::set_focus(window, None::<&gtk::Widget>);
