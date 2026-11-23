@@ -144,8 +144,9 @@ Windows games Ferestre did not install (GOG, other stores, Steam non-Steam short
 
 - **Add a game:** choose **+ → Add game…** in the library and pick its `.exe`; the name and folder are filled in and can be edited. Or `./ferestre.AppImage add /path/to/Game.exe`.
 - **Import from Steam:** choose **+ → Import from Steam**, or `./ferestre.AppImage import-steam --dry-run` to see what would come in, then without `--dry-run`. Each non-Steam shortcut keeps its executable, launch options (environment, wrappers such as `gamemoderun`, arguments), Wine prefix, Proton build and grid art. Steam's files are only read; Ferestre's own shortcuts are skipped.
+- **Games Steam installed** come in with the same import, marked **Steam game**. **Play** asks Steam to start them, so Steam's Proton, launch options, DRM and cloud saves stay as they are. A shortcut to a script or other Linux program of your own is imported the same way, as a **Steam shortcut**; for neural rendering, set the Windows program it runs and its Wine prefix in **Edit launch settings**.
 
-Local games start through Ferestre's Proton shim without any Xbox service, licence or account. **Remove from library** only forgets a local game: its folder and its Wine prefix are never deleted. Games with anti-cheat files are flagged in the library. See [local games in recipes](titles/SCHEMA.md#local-games-user-recipes-only).
+Other local games start through Ferestre's Proton shim without any Xbox service, licence or account. **Remove from library** only forgets a local game: its folder and its Wine prefix are never deleted. A local game has no **Reset to defaults**: its settings are the game. Games with anti-cheat files are flagged in the library. See [local games in recipes](titles/SCHEMA.md#local-games-user-recipes-only).
 
 ### Try neural rendering (experimental)
 

@@ -1,6 +1,6 @@
 # Pinned source forks
 
-Ferestre builds the components it modifies directly from forks. Fixes live as commits in those repositories; there is no patch-application step.
+Ferestre builds the components it modifies directly from forks. Fixes live as commits in those repositories. The one exception is [`packaging/runtime-patches/`](../packaging/runtime-patches/README.md): patches to unforked submodules of the Proton graph (DXVK), and to vkd3d-proton, taken from GE-Proton and MW4-Proton, which `scripts/build-runtime.sh` applies after the lock check and `scripts/runtime-inputs.py` hashes into the runtime digest.
 
 | Component | Fork | Purpose |
 |---|---|---|

@@ -277,4 +277,14 @@ the keys below. Such a recipe differs from a Store title's in these ways:
   folder. Set it when the executable skips a launcher that used to start the
   game from another folder (GOG's Witcher 3: `'bin\x64_dx12'`).
 
-A Store title's recipe with `args`, `wrapper` or `working-dir` is refused.
+- `[launch].steam-app-id` (integer) makes **Play** ask Steam to start the
+  game (`steam://rungameid/…`) instead of running it: an app Steam
+  installed (`LOCAL-STEAMAPP-<app id>`), or a non-Steam shortcut, whose id
+  has the top bit set. Steam's own launch options apply, so `args`,
+  `wrapper`, `env` and `working-dir` are refused beside it. `executable` and
+  `[install].prefix` only say where neural rendering goes: the mod beside the
+  executable, and its DLL override in that prefix's `user.reg`, for that
+  program alone.
+
+A Store title's recipe with `args`, `wrapper`, `working-dir` or
+`steam-app-id` is refused.
