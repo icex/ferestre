@@ -44,11 +44,13 @@ pub mod sdl;
 pub mod settings;
 pub mod signing;
 pub mod steam;
+pub mod steam_games;
 pub mod steam_import;
 pub mod transfers;
 pub mod updater;
 pub mod updates;
 pub mod vdf;
+pub mod wine_reg;
 pub mod winrt;
 pub mod xvd_key;
 

@@ -1260,6 +1260,29 @@ pub fn dll_overrides(route: Route) -> &'static [(&'static str, &'static str)] {
     }
 }
 
+/// The DLLs an installed entry needs loaded native first: the route's, or
+/// the proxy name OptiScaler went in as.
+pub fn override_dlls(entry: &Entry) -> Vec<String> {
+    let proxy_file = package::proxy_file(entry.route, entry.proxy.as_deref());
+    if proxy_file == "dxgi.dll" {
+        dll_overrides(entry.route)
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect()
+    } else {
+        vec![proxy_file.trim_end_matches(".dll").to_string()]
+    }
+}
+
+/// Whether an installed entry also needs launch environment beyond DLL
+/// overrides (the INT4 network's Vulkan layer), which a game Steam starts
+/// cannot be given.
+pub fn needs_layer_env(entry: &Entry, exe_dir: &Path) -> bool {
+    entry.route != Route::Optiscaler
+        && entry.model == Network::SilverAardwoldOptimized
+        && exe_dir.join(INT4_MODEL).is_file()
+}
+
 fn dll_name(name: &str) -> String {
     let name = name.trim().to_ascii_lowercase();
     name.strip_suffix(".dll").unwrap_or(&name).to_string()
@@ -1315,24 +1338,16 @@ pub fn launch_env(
 ) -> LaunchEnv {
     let mut env = LaunchEnv::default();
     let existing = current("WINEDLLOVERRIDES");
-    let proxy_file = package::proxy_file(entry.route, entry.proxy.as_deref());
-    let proxied = [(proxy_file.trim_end_matches(".dll"), "n,b")];
-    let ours = if proxy_file == "dxgi.dll" {
-        dll_overrides(entry.route)
-    } else {
-        &proxied[..]
-    };
-    let (merged, theirs) = merge_dll_overrides(existing.as_deref(), ours);
+    let names = override_dlls(entry);
+    let ours: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "n,b")).collect();
+    let (merged, theirs) = merge_dll_overrides(existing.as_deref(), &ours);
     env.set.push(("WINEDLLOVERRIDES".to_string(), merged));
     for name in theirs {
         env.notes.push(format!(
             "-- neural rendering: your WINEDLLOVERRIDES sets {name} itself, so DLSSNR-AMD may not load"
         ));
     }
-    if entry.route != Route::Optiscaler
-        && entry.model == Network::SilverAardwoldOptimized
-        && exe_dir.join(INT4_MODEL).is_file()
-    {
+    if needs_layer_env(entry, exe_dir) {
         let layer = exe_dir.join(INT4_LAYER_DIR).display().to_string();
         env.set.push((
             "VK_ADD_LAYER_PATH".to_string(),

@@ -527,10 +527,7 @@ fn feature_button(ui: &Ui, row: &LibraryRow, child: &impl IsA<gtk::Widget>) -> g
 /// it is in. Named like a card (`game-<id>-primary`), because it is the
 /// title's one card on Home.
 fn landscape(ui: &Ui, row: &LibraryRow) -> gtk::Widget {
-    if row.action == Action::Stop {
-        // Resume and Stop are two controls; the portrait card draws them.
-        return game_card(ui, row).upcast();
-    }
+    let running = row.action == Action::Stop;
     let key = row.product_id.to_ascii_uppercase();
     // Only a banner on disk. A path to one never fetched (only featured
     // titles' are) was a blank tile in Jump back in, waiting on a slot
@@ -549,7 +546,16 @@ fn landscape(ui: &Ui, row: &LibraryRow) -> gtk::Widget {
     }
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&sized(&art, Some(320), 180)));
-    let (state, class) = if row.has_update() {
+    let (state, class) = if running {
+        let part = |p: &str| row.subtitle.split("  ·  ").any(|s| s == p);
+        if part("starting") {
+            ("Starting…", "ok")
+        } else if part("stopping") {
+            ("Stopping…", "ok")
+        } else {
+            ("● Running", "ok")
+        }
+    } else if row.has_update() {
         ("Update available", "update")
     } else if row.unavailable.is_some() {
         ("Unavailable", "warning")
@@ -586,6 +592,9 @@ fn landscape(ui: &Ui, row: &LibraryRow) -> gtk::Widget {
     );
     overlay.add_overlay(&caption);
     let (description, actions) = library_components(ui, row, false);
+    if running {
+        return running_landscape(row, &overlay, &actions);
+    }
     let Some(primary) = actions
         .last_child()
         .and_then(|w| w.downcast::<gtk::Button>().ok())
@@ -613,6 +622,61 @@ fn landscape(ui: &Ui, row: &LibraryRow) -> gtk::Widget {
     holder.set_child(Some(&primary));
     if let Some(more) = actions.first_child() {
         actions.remove(&more);
+        more.set_halign(gtk::Align::End);
+        more.set_valign(gtk::Align::Start);
+        more.set_margin_top(8);
+        more.set_margin_end(8);
+        more.add_css_class("game-more");
+        holder.add_overlay(&more);
+    }
+    holder.upcast()
+}
+
+/// A running title's landscape tile: the banner with its Resume and Stop
+/// laid over it, as separate controls (never buttons inside a button), and
+/// its menu in the corner.
+fn running_landscape(row: &LibraryRow, art: &gtk::Overlay, actions: &gtk::Box) -> gtk::Widget {
+    let controls = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
+    let mut more = None;
+    let mut control = actions.first_child();
+    while let Some(widget) = control {
+        control = widget.next_sibling();
+        if widget.is::<gtk::MenuButton>() {
+            actions.remove(&widget);
+            more = Some(widget);
+        } else if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+            actions.remove(&widget);
+            widget.set_size_request(112, 40);
+            widget.add_css_class("pill");
+            widget.reset_relation(gtk::AccessibleRelation::LabelledBy);
+            widget.update_property(&[gtk::accessible::Property::Label(&format!(
+                "{} · {}",
+                row.name,
+                button.label().unwrap_or_default()
+            ))]);
+            controls.append(&widget);
+        }
+    }
+    let layer = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["game-launch-overlay"])
+        .build();
+    layer.set_accessible_role(gtk::AccessibleRole::Group);
+    layer.update_property(&[gtk::accessible::Property::Label("Running overlay")]);
+    controls.set_vexpand(true);
+    layer.append(&controls);
+    art.add_overlay(&layer);
+    let holder = gtk::Overlay::new();
+    holder.add_css_class("landscape-tile");
+    holder.set_overflow(gtk::Overflow::Hidden);
+    holder.set_widget_name(&format!("game-{}-primary", row.product_id));
+    holder.set_child(Some(art));
+    if let Some(more) = more {
         more.set_halign(gtk::Align::End);
         more.set_valign(gtk::Align::Start);
         more.set_margin_top(8);

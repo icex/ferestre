@@ -18,7 +18,7 @@ use crate::anticheat::{self, Detection};
 use crate::paths::Paths;
 use crate::recipe::{Recipe, TitleKind};
 use crate::steam::{self, ArtworkFiles, Value};
-use crate::{local, runtime};
+use crate::{local, runtime, steam_games};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -507,7 +507,66 @@ pub fn plan(paths: &Paths, user: Option<&str>) -> Result<Vec<Candidate>> {
             }
         }
     }
+    candidates.extend(installed_games(paths, &roots));
     Ok(candidates)
+}
+
+const STEAM_SUMMARY: &str = "Installed by Steam; Play starts it through Steam";
+
+/// Every game Steam installed, as a local game Steam starts.
+fn installed_games(paths: &Paths, roots: &[PathBuf]) -> Vec<Candidate> {
+    let user_titles = paths.user_titles_dir();
+    // Art someone chose in Steam's library for the app, from any user.
+    let grids: Vec<PathBuf> = roots
+        .iter()
+        .flat_map(|root| steam::shortcut_files(root))
+        .filter_map(|file| file.parent().map(|config| config.join("grid")))
+        .collect();
+    steam_games::installed(roots)
+        .into_iter()
+        .map(|app| {
+            let mut candidate = Candidate {
+                id: local::steam_app_id(app.app_id),
+                app_id: app.app_id,
+                name: app.name.clone(),
+                user: String::new(),
+                status: ImportStatus::New,
+                recipe: None,
+                runtime: RuntimeFound::Unset,
+                artwork: ArtworkFiles::default(),
+                anticheat: Vec::new(),
+                warnings: Vec::new(),
+            };
+            let Some(executable) = steam_games::main_executable(&app.dir) else {
+                candidate.status = ImportStatus::Skipped("no Windows program in its folder".into());
+                return candidate;
+            };
+            let mut recipe = Recipe::blank(&candidate.id, &candidate.name);
+            recipe.title.kind = TitleKind::Local;
+            recipe.title.slug = candidate.id.to_ascii_lowercase();
+            recipe.install.dir = Some(app.dir.display().to_string());
+            recipe.install.prefix = Some(app.compatdata.display().to_string());
+            recipe.launch.executable = executable.clone();
+            recipe.launch.steam_app_id = Some(app.app_id);
+            recipe.status.summary = STEAM_SUMMARY.into();
+            if let Err(e) = recipe.to_toml().and_then(|text| Recipe::parse(&text)) {
+                candidate.status = ImportStatus::Skipped(format!("{e}"));
+                return candidate;
+            }
+            let mut art = ArtworkFiles::default();
+            for grid in &grids {
+                fill_missing_art(&mut art, shortcut_artwork(grid, app.app_id, ""));
+            }
+            fill_missing_art(&mut art, steam_games::library_artwork(roots, app.app_id));
+            candidate.artwork = art;
+            candidate.anticheat = anticheat::detect(&app.dir, &executable);
+            if user_titles.join(format!("{}.toml", candidate.id)).exists() {
+                candidate.status = ImportStatus::Kept;
+            }
+            candidate.recipe = Some(recipe);
+            candidate
+        })
+        .collect()
 }
 
 /// Write what [`plan`] found: a user recipe, its art and its runtime choice

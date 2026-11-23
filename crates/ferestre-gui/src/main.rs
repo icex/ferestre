@@ -2859,7 +2859,7 @@ fn import_from_steam(ui: &Ui) {
             .add_toast(toast("Cannot work out where things live: HOME is not set"));
         return;
     };
-    if !begin(ui, "Reading Steam's shortcuts") {
+    if !begin(ui, "Reading Steam's games and shortcuts") {
         report_busy(ui);
         return;
     }
@@ -2908,8 +2908,8 @@ fn import_from_steam(ui: &Ui) {
         }
         body.push(String::new());
         body.push(format!(
-            "{kept} already in your library; {skipped} skipped (Ferestre's own shortcuts or not \
-             Windows programs)."
+            "{kept} already in your library; {skipped} skipped (Ferestre's own shortcuts, or not \
+             Windows programs). Games Steam installed are started through Steam."
         ));
         let notes = model::steam_import_notes(&candidates);
         if !notes.is_empty() {
@@ -3421,7 +3421,7 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
     let menu_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .min_content_width(240)
-        .max_content_height(320)
+        .max_content_height(400)
         .propagate_natural_height(true)
         .child(&menu)
         .build();
@@ -3493,6 +3493,11 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
     // A shortcut needs something that will launch. A recipe is one; a title on
     // disk is another, because `run` writes a recipe from the package manifest
     // on its way past.
+    // Steam starts a game it installed: its runtime is Steam's choice, and it
+    // is in Steam's library already.
+    let steam_game = ui.model.borrow().recipes.iter().any(|r| {
+        r.title.product_id.eq_ignore_ascii_case(&row.product_id) && r.launch.steam_app_id.is_some()
+    });
     if (row.has_recipe || row.installed) && row.action != Action::Content {
         for (icon, label, run) in [
             (
@@ -3507,6 +3512,9 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
                 open_editor,
             ),
         ] {
+            if steam_game && label != "Edit launch settings" {
+                continue;
+            }
             let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
             item(icon, label, Box::new(move || run(&ui, &product_id, &name)));
         }

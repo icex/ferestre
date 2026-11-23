@@ -131,6 +131,11 @@ pub struct Launch {
     /// start folder. Local games only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
+    /// A game Steam installed: Play asks Steam to start this app, so Steam's
+    /// own Proton, launch options, DRM and cloud saves apply, and the
+    /// executable only says where neural rendering goes. Local games only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steam_app_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -395,6 +400,9 @@ impl Recipe {
                     "[launch].working-dir: only a local game chooses the folder it starts in"
                 );
             }
+            if self.launch.steam_app_id.is_some() {
+                anyhow::bail!("[launch].steam-app-id: only a local game is started by Steam");
+            }
             return Ok(());
         }
         if self.title.slug != id.to_ascii_lowercase() {
@@ -423,6 +431,20 @@ impl Recipe {
                 "[install].dir of a local game must be the game's absolute folder, at least two \
                  levels below `/`, with no `..`"
             ),
+        }
+        if self.launch.steam_app_id.is_some()
+            && (!self.launch.args.is_empty()
+                || !self.launch.wrapper.is_empty()
+                || !self.launch.env.is_empty()
+                || self.launch.working_dir.is_some())
+        {
+            anyhow::bail!(
+                "[launch].steam-app-id: Steam starts this game with its own launch options; \
+                 set arguments, wrappers and environment in Steam's Properties, not here"
+            );
+        }
+        if self.launch.steam_app_id == Some(0) {
+            anyhow::bail!("[launch].steam-app-id must not be 0");
         }
         if self.launch.working_dir.as_deref().is_some_and(has_parent) {
             anyhow::bail!("[launch].working-dir of a local game must not contain `..`");
@@ -615,6 +637,7 @@ impl Recipe {
                 args: Vec::new(),
                 wrapper: Vec::new(),
                 working_dir: None,
+                steam_app_id: None,
             },
             runtime: Runtime::default(),
             status: Status {
@@ -1404,6 +1427,42 @@ summary = "Imported from Steam"
         let text = Recipe::blank("9ZZTESTNEW1", "Test").to_toml().unwrap();
         for key in ["kind", "args", "wrapper"] {
             assert!(!text.contains(&format!("{key} =")), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_steam_app_id_is_for_a_local_game_steam_starts_alone() {
+        let with = |id: &str, kind: &str, launch: &str| {
+            Recipe::parse(&bare(id, kind).replace(
+                "executable = \"G.exe\"\n",
+                &format!("executable = \"G.exe\"\n{launch}"),
+            ))
+        };
+        let steam = with(
+            "LOCAL-STEAMAPP-2807960",
+            "kind = \"local\"\n",
+            "steam-app-id = 2807960\n",
+        )
+        .unwrap();
+        assert_eq!(steam.launch.steam_app_id, Some(2807960));
+        let again = Recipe::parse(&steam.to_toml().unwrap()).unwrap();
+        assert_eq!(again.launch.steam_app_id, Some(2807960));
+        assert!(with("9ZZTESTNEW1", "", "steam-app-id = 1\n").is_err());
+        assert!(with("LOCAL-G", "kind = \"local\"\n", "steam-app-id = 0\n").is_err());
+        for extra in [
+            "args = [\"-x\"]\n",
+            "wrapper = [\"gamemoderun\"]\n",
+            "working-dir = \"bin\"\n",
+            "env = { A = \"1\" }\n",
+        ] {
+            let err = with(
+                "LOCAL-G",
+                "kind = \"local\"\n",
+                &format!("steam-app-id = 5\n{extra}"),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("Steam"), "{extra}: {err}");
         }
     }
 

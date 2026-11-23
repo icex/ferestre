@@ -321,6 +321,14 @@ fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
             program.display()
         ));
     }
+    // Steam starts a game it installed, with its own Proton: no runtime of
+    // Ferestre's takes part.
+    if local && recipe.launch.steam_app_id.is_some() {
+        if let Some(found) = ferestre_core::anticheat::describe(&(inputs.anticheat)(recipe)) {
+            caution = Some(join(caution, &found));
+        }
+        return (Action::Play, caution);
+    }
     let inferred;
     let (judged, runtimes) = if local {
         (recipe, inputs.local_runtimes)
@@ -1190,19 +1198,21 @@ fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
 /// A local game's row: its own name and badge, no Store art, no update check.
 fn local_row(inputs: &Inputs, recipe: &Recipe, view: TitleView) -> LibraryRow {
     let installed = (inputs.installed)(recipe);
+    let steam = recipe.launch.steam_app_id.is_some();
+    let kind = if steam { "Steam game" } else { "Local game" };
     let subtitle = match &view.action {
         Action::Blocked(reason) => reason.clone(),
-        Action::Stop => "Local game  ·  running".to_string(),
+        Action::Stop => format!("{kind}  ·  running"),
         _ => match &view.caution {
-            Some(caution) => format!("Local game  ·  {caution}"),
-            None => "Local game".to_string(),
+            Some(caution) => format!("{kind}  ·  {caution}"),
+            None => kind.to_string(),
         },
     };
     LibraryRow {
         product_id: recipe.title.product_id.clone(),
         name: recipe.title.name.clone(),
         subtitle,
-        badge: Some(("Local", "dim-label")),
+        badge: Some((if steam { "Steam" } else { "Local" }, "dim-label")),
         image: None,
         owned: false,
         has_recipe: true,

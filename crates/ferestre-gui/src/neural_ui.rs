@@ -218,7 +218,7 @@ fn present(ui: &Ui, product_id: &str, name: &str, v: &View) {
     let dialog = adw::Dialog::builder()
         .title(format!("Neural rendering for {name}"))
         .content_width(560)
-        .content_height(520)
+        .content_height(600)
         .build();
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)

@@ -762,6 +762,8 @@ fn neural_disable(
     };
     let _lock = TitleLock::take(paths, &product_id, LockMode::Change)?;
     neural::apply::disable(ctx, &product_id, &game_dir, &executable)?;
+    // A game Steam starts had its overrides written into its prefix.
+    ferestre_core::steam_games::clear_overrides(paths.state_dir(), &product_id)?;
     if cli.json {
         print_json(&json!({
             "schema": JSON_SCHEMA,
@@ -1322,6 +1324,26 @@ fn run_title(
         title_args_allowed(&recipes, title, args)?;
     }
 
+    if let Some(recipe) = recipes_from(cli, paths)?
+        .1
+        .into_iter()
+        .find(|r| r.matches(title) && r.launch.steam_app_id.is_some())
+    {
+        if !args.is_empty() {
+            return Err(usage(
+                "Steam starts this game with its own launch options; set them in Steam's \
+                 Properties",
+            ));
+        }
+        return run_through_steam(
+            cli,
+            paths,
+            &recipe,
+            request,
+            &neural::Context::from_paths(paths),
+        );
+    }
+
     let mut prepared = prepare_launch(cli, paths, title, request)?;
     let local = prepared.recipe.is_local();
     if local {
@@ -1353,6 +1375,147 @@ fn run_title(
         }
     }
     launch_prepared(paths, prepared, request.force)
+}
+
+/// Play for a game Steam installed: neural rendering is checked and its
+/// DLL overrides written into the game's own prefix, then Steam is asked to
+/// start the game, which it does with its own Proton and launch options.
+/// Returns once Steam has been asked.
+fn run_through_steam(
+    cli: &Cli,
+    paths: &Paths,
+    recipe: &Recipe,
+    request: LaunchRequest,
+    ctx: &neural::Context,
+) -> Result<ExitCode> {
+    use ferestre_core::steam_games;
+    let app_id = recipe
+        .launch
+        .steam_app_id
+        .ok_or_else(|| anyhow!("{} is not a Steam game", recipe.title.name))?;
+    let product_id = recipe.title.product_id.to_ascii_uppercase();
+    let game_dir = paths.install_dir(recipe)?;
+    let executable = ferestre_core::local::executable_path(recipe)
+        .unwrap_or_else(|| game_dir.join(&recipe.launch.executable));
+    let path = std::env::var_os("PATH");
+    let (program, args) = steam_games::launch_command(app_id, path.as_deref());
+    let compatdata = recipe
+        .install
+        .prefix
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("{} has no Steam prefix in its recipe", recipe.title.name))?;
+    if request.dry_run {
+        let entry = neural::apply::preview(ctx, &product_id, &game_dir, &recipe.launch.executable);
+        let dlls = entry
+            .as_ref()
+            .map(neural::apply::override_dlls)
+            .unwrap_or_default();
+        if cli.json {
+            print_json(&json!({
+                "schema": JSON_SCHEMA,
+                "steam_app_id": app_id,
+                "program": program,
+                "args": args,
+                "dll_overrides": dlls,
+                "prefix": steam_games::user_reg(&compatdata).display().to_string(),
+            }));
+        } else {
+            println!("{program} {}", args.join(" "));
+            for dll in &dlls {
+                println!(
+                    "{}: {}\\DllOverrides {dll}={}",
+                    steam_games::user_reg(&compatdata).display(),
+                    executable
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    steam_games::NATIVE_FIRST
+                );
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !executable.is_file() {
+        bail!(
+            "{}'s executable is not at {}; is its drive mounted, or did an update rename it? \
+             Choose it in Edit launch settings",
+            recipe.title.name,
+            executable.display()
+        );
+    }
+    let _lock = TitleLock::take(paths, &product_id, LockMode::Run)?;
+    let images = running::running_in(&compatdata.join("pfx"));
+    if !images.is_empty() {
+        // Steam brings the running game forward; nothing in its folder or
+        // prefix may change under it.
+        eprintln!("-- {} is already running", recipe.title.name);
+    } else {
+        // A plan that is never run: only the overrides it would get matter.
+        let mut plan = launch::Plan {
+            program: PathBuf::from(&program),
+            args: args.clone(),
+            env_set: Default::default(),
+            env_unset: Vec::new(),
+            cwd: None,
+        };
+        neural_before_launch(
+            &mut plan,
+            ctx,
+            &product_id,
+            &game_dir,
+            &recipe.launch.executable,
+        )?;
+        let entry = neural::state::get(&ctx.config_dir, &product_id)?
+            .filter(|e| e.enabled)
+            .filter(|_| plan.env_set.contains_key("WINEDLLOVERRIDES"));
+        let dlls = entry
+            .as_ref()
+            .map(neural::apply::override_dlls)
+            .unwrap_or_default();
+        if let Some(entry) = &entry {
+            let exe_dir = neural::apply::exe_dir(&game_dir, &recipe.launch.executable);
+            if neural::apply::needs_layer_env(entry, &exe_dir) {
+                eprintln!(
+                    "-- neural rendering: {} needs a Vulkan layer a game Steam starts cannot be \
+                     given; choose another network",
+                    entry.model.as_str()
+                );
+            }
+        }
+        let program_name = executable
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let written = steam_games::sync_overrides(
+            paths.state_dir(),
+            &product_id,
+            &steam_games::user_reg(&compatdata),
+            &program_name,
+            &dlls,
+        );
+        match written {
+            Ok(()) if !dlls.is_empty() => eprintln!(
+                ":: neural rendering: {} loads {} native first in its Steam prefix",
+                program_name,
+                dlls.join(", ")
+            ),
+            Ok(()) => {}
+            Err(e) => eprintln!("-- neural rendering is off for this launch: {e:#}"),
+        }
+    }
+    eprintln!(":: asking Steam to start {}", recipe.title.name);
+    let status = std::process::Command::new(&program)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("starting {program}"))?;
+    // Steam hands the request to its running copy and exits; a Steam that
+    // was not running stays up, and is not this launch's to wait for.
+    drop(status);
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Whether `title` may be given arguments of its own. Only a local game can:
@@ -2303,6 +2466,7 @@ fn uninstall_title(
                 })?;
             eprintln!("-- neural rendering removed from {}", recipe.title.name);
         }
+        ferestre_core::steam_games::clear_overrides(paths.state_dir(), &product_id)?;
         let forgotten = ferestre_core::local::forget(paths, &product_id)?;
         // Its id comes from its name: a game added later under the same name
         // must be asked about its anti-cheat again.
