@@ -104,7 +104,46 @@ fn installed_games(rows: &[LibraryRow]) -> usize {
         .count()
 }
 
-pub(crate) fn render_counts(ui: &Ui) {
+/// Count in a while, once for every redraw until then: it draws whole lists.
+pub(crate) fn counts_soon(ui: &Ui) {
+    if ui.counts_pending.replace(true) {
+        return;
+    }
+    let ui = ui.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
+        ui.counts_pending.set(false);
+        if !*ui.closing.borrow() {
+            render_counts(&ui);
+        }
+    });
+}
+
+/// Put the last counts on the My Library tabs and the fullscreen sections.
+pub(crate) fn show_tab_counts(ui: &Ui) {
+    for (section, count) in ui.tab_counts.borrow().iter() {
+        let name = format!("tab-count-{}", section.title());
+        for root in [
+            ui.content.upcast_ref::<gtk::Widget>(),
+            ui.fullscreen_nav.upcast_ref(),
+        ] {
+            let Some(badge) = named_widget(root, &name) else {
+                continue;
+            };
+            if let Some(badge) = badge.downcast_ref::<gtk::Label>() {
+                badge.set_label(&count.to_string());
+            }
+            badge.set_visible(*count > 0);
+            if let Some(tab) = badge.ancestor(gtk::Button::static_type()) {
+                let games = if *count == 1 { "game" } else { "games" };
+                tab.update_property(&[gtk::accessible::Property::Description(&format!(
+                    "{count} {games}"
+                ))]);
+            }
+        }
+    }
+}
+
+fn render_counts(ui: &Ui) {
     let downloading = ui
         .download
         .current
@@ -127,7 +166,22 @@ pub(crate) fn render_counts(ui: &Ui) {
         .rows
     };
     let pass = installable(&rows(Section::GamePass));
-    let mine = installed_games(&rows(Section::Installed));
+    let library = rows(Section::Library);
+    let mine = installed_games(&library);
+    let show_all = ui.model.borrow().show_unsupported;
+    let count = |keep: &dyn Fn(&LibraryRow) -> bool| library.iter().filter(|r| keep(r)).count();
+    ui.tab_counts.replace(vec![
+        (Section::GamePass, pass),
+        (Section::Installed, count(&|r| r.installed)),
+        (
+            Section::Library,
+            count(&|r| show_all || !r.known_uninstallable()),
+        ),
+        (Section::Elsewhere, count(&|r| r.local)),
+        (Section::Updates, count(&|r| r.update == Some(true))),
+        (Section::Downloads, ui.install_queue.borrow().jobs.len()),
+    ]);
+    show_tab_counts(ui);
     let games = |n: usize| if n == 1 { "game" } else { "games" };
     let about_pass = {
         let model = ui.model.borrow();
@@ -508,6 +562,7 @@ pub(crate) fn set_compact(ui: &Ui, compact: bool) {
     }
     ui.recents_fingerprint.set(0);
     render(ui);
+    render_counts(ui);
 }
 
 /// Hide (or show) the text inside a footer button, keeping its icon.

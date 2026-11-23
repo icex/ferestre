@@ -2,48 +2,124 @@
 use super::*;
 use ferestre_core::product_details::{self, AgeRating, Details, PlayerRating, Requirement, Row};
 
-/// What the large button does, for a title with this id and name: a bundle's
+/// What a large button does, for a title with this id and name: a bundle's
 /// is the game in it.
 #[derive(Clone)]
 pub enum Main {
+    Launch(String, String),
     Install(String, String),
     Resume(String, String),
     Uninstall(String, String),
+    Update(String, String),
+    /// Describe how it starts.
+    SetUp(String, String),
+    /// Say why it cannot start, and whether another runtime may help.
+    Blocked(String, String, String, bool),
+    /// Back to the running game.
+    Return(String, String),
+    Stop(String, String),
 }
 
 impl Main {
-    /// What there is to do for a row, if anything.
-    pub fn of(row: &LibraryRow) -> Option<Main> {
-        if row.local {
-            return None;
-        }
+    /// What there is to do for a row, the likeliest first.
+    pub fn of(ui: &Ui, row: &LibraryRow) -> Vec<Main> {
         let (id, name) = row
             .install_as
             .clone()
             .unwrap_or_else(|| (row.product_id.clone(), row.name.clone()));
         match row.action {
-            Action::Install => Some(Main::Install(id, name)),
-            Action::Resume => Some(Main::Resume(id, name)),
-            Action::Stop | Action::Installing => None,
-            // As the menu's Delete: what is on disk is the row's own.
-            _ if row.installed => Some(Main::Uninstall(row.product_id.clone(), row.name.clone())),
-            _ => None,
+            Action::Install if !row.local => return vec![Main::Install(id, name)],
+            Action::Resume if !row.local => return vec![Main::Resume(id, name)],
+            Action::Stop => {
+                // A bundle row runs its child, under the child's id.
+                let running = ui.running.borrow();
+                let own = running.get(&row.product_id.to_ascii_uppercase());
+                let id = match own {
+                    Some(_) => row.product_id.clone(),
+                    None => id,
+                };
+                let ready = running
+                    .get(&id.to_ascii_uppercase())
+                    .is_some_and(|launch| launch.ready);
+                let mut all = Vec::new();
+                if ready {
+                    all.push(Main::Return(id.clone(), row.name.clone()));
+                }
+                all.push(Main::Stop(id, row.name.clone()));
+                return all;
+            }
+            Action::Installing => return Vec::new(),
+            _ => {}
         }
+        let mut all = Vec::new();
+        if matches!(row.action, Action::Play | Action::Update) {
+            all.push(Main::Launch(id.clone(), name.clone()));
+        }
+        match &row.action {
+            Action::Update => all.push(Main::Update(id, name)),
+            Action::Adopt => all.push(Main::SetUp(row.product_id.clone(), row.name.clone())),
+            Action::Blocked(reason) if row.has_recipe && !row.unsupported => {
+                all.push(Main::Blocked(
+                    row.product_id.clone(),
+                    row.name.clone(),
+                    reason.clone(),
+                    row.blocked_by_runtime(),
+                ));
+            }
+            _ => {}
+        }
+        // As the menu's Delete: what is on disk is the row's own.
+        if row.installed && !row.local {
+            all.push(Main::Uninstall(row.product_id.clone(), row.name.clone()));
+        }
+        all
     }
 
     fn label(&self) -> &'static str {
         match self {
+            Main::Launch(..) => "Launch",
             Main::Install(..) => "Install",
             Main::Resume(..) => "Resume install",
             Main::Uninstall(..) => "Uninstall",
+            Main::Update(..) => "Update",
+            Main::SetUp(..) => "Set up",
+            Main::Blocked(..) => "Launch",
+            Main::Return(..) => "Resume",
+            Main::Stop(..) => "Stop",
         }
     }
 
     fn button(&self, ui: &Ui, dialog: &adw::Dialog) -> gtk::Button {
         let (icons, class, name) = match self {
+            Main::Launch(_, name) | Main::Blocked(_, name, ..) | Main::Return(_, name) => (
+                [
+                    "media-playback-start-symbolic",
+                    "media-playback-start-symbolic",
+                ],
+                "suggested-action",
+                name,
+            ),
             Main::Install(_, name) | Main::Resume(_, name) => (
                 ["folder-download-symbolic", "document-save-symbolic"],
                 "suggested-action",
+                name,
+            ),
+            Main::Update(_, name) => (
+                [
+                    "software-update-available-symbolic",
+                    "folder-download-symbolic",
+                ],
+                "update-action",
+                name,
+            ),
+            Main::SetUp(_, name) => (
+                ["document-edit-symbolic", "document-properties-symbolic"],
+                "suggested-action",
+                name,
+            ),
+            Main::Stop(_, name) => (
+                ["media-playback-stop-symbolic", "process-stop-symbolic"],
+                "destructive-action",
                 name,
             ),
             Main::Uninstall(_, name) => (
@@ -59,11 +135,8 @@ impl Main {
         content.append(&gtk::Label::new(Some(self.label())));
         let button = gtk::Button::builder()
             .child(&content)
-            .width_request(320)
+            .width_request(220)
             .height_request(54)
-            .halign(gtk::Align::Center)
-            .margin_top(10)
-            .margin_bottom(14)
             .css_classes(["pill", "details-main", class])
             .build();
         button.update_property(&[gtk::accessible::Property::Label(&format!(
@@ -76,9 +149,17 @@ impl Main {
                 dialog.close();
             }
             match &main {
+                Main::Launch(id, name) => spawn_title(&ui, id, name),
                 Main::Install(id, name) => confirm_install(&ui, id, name),
                 Main::Resume(id, name) => resume_download(&ui, id, name),
                 Main::Uninstall(id, name) => confirm_remove(&ui, id, name),
+                Main::Update(id, name) => update_download(&ui, id, name),
+                Main::SetUp(id, name) => open_editor(&ui, id, name),
+                Main::Blocked(id, name, reason, runtime) => {
+                    explain_blocked(&ui, id, name, reason, *runtime)
+                }
+                Main::Return(id, name) => window_activation::resume(&ui, id, name),
+                Main::Stop(id, name) => confirm_stop_title(&ui, id, name),
             }
         });
         button
@@ -87,13 +168,18 @@ impl Main {
 
 /// `known` is what the window knows already. A local game has no Store page,
 /// and its id is not sent anywhere.
-pub fn open(ui: &Ui, product_id: &str, name: &str, known: &str, local: bool, main: Option<&Main>) {
+pub fn open(ui: &Ui, product_id: &str, name: &str, known: &str, local: bool, main: &[Main]) {
     let dialog = adw::Dialog::builder()
         .title(name)
         .content_width(900)
         .content_height(760)
         .build();
-    let stack = adw::ViewStack::builder().vexpand(true).build();
+    let stack = adw::ViewStack::builder()
+        .vexpand(true)
+        // Only the tab shown is measured.
+        .hhomogeneous(false)
+        .vhomogeneous(false)
+        .build();
     let switcher = adw::ViewSwitcher::builder()
         .stack(&stack)
         .policy(adw::ViewSwitcherPolicy::Narrow)
@@ -134,6 +220,7 @@ pub fn open(ui: &Ui, product_id: &str, name: &str, known: &str, local: bool, mai
         line.append(&label(runtime, &["caption", "dim-label"]));
         overview.append(&line);
     }
+    let mut page_parts = None;
     if !local {
         let content = adw::ButtonContent::builder()
             .icon_name(icon_name(&[
@@ -157,8 +244,9 @@ pub fn open(ui: &Ui, product_id: &str, name: &str, known: &str, local: bool, mai
             top,
             head,
             makers,
+            bones: RefCell::default(),
         };
-        load(ui, product_id, shown);
+        page_parts = Some(shown);
     }
     let view = adw::ToolbarView::new();
     view.add_top_bar(&adw::HeaderBar::new());
@@ -166,13 +254,38 @@ pub fn open(ui: &Ui, product_id: &str, name: &str, known: &str, local: bool, mai
     view.set_content(Some(&stack));
     dialog.set_child(Some(&view));
     // Under every tab, and where the focus starts.
-    if let Some(main) = main {
-        let button = main.button(ui, &dialog);
-        view.add_bottom_bar(&button);
-        dialog.set_default_widget(Some(&button));
-        dialog.set_focus(Some(&button));
+    if !main.is_empty() {
+        let bar = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(14)
+            .homogeneous(true)
+            .halign(gtk::Align::Center)
+            .margin_top(10)
+            .margin_bottom(14)
+            .margin_start(14)
+            .margin_end(14)
+            .build();
+        for (index, what) in main.iter().enumerate() {
+            let button = what.button(ui, &dialog);
+            bar.append(&button);
+            // Never what takes something away.
+            if index == 0 && !matches!(what, Main::Uninstall(..) | Main::Stop(..)) {
+                dialog.set_default_widget(Some(&button));
+                dialog.set_focus(Some(&button));
+            }
+        }
+        view.add_bottom_bar(&bar);
+    }
+    if let Some(parts) = &page_parts {
+        parts.wait();
     }
     dialog.present(Some(&ui.window));
+    // The dialog first: the answer may come at once, and drawing it must not
+    // hold the dialog back.
+    if let Some(parts) = page_parts {
+        let (ui, product_id) = (ui.clone(), product_id.to_string());
+        glib::timeout_add_local_once(OPENING, move || load(&ui, &product_id, parts));
+    }
 }
 
 /// The parts the catalog's answer fills in.
@@ -184,6 +297,20 @@ struct Page {
     top: gtk::Box,
     head: gtk::Box,
     makers: gtk::Label,
+    /// What stands where the answer goes, and what it is in.
+    bones: RefCell<Vec<(gtk::Box, gtk::Box)>>,
+}
+
+impl Page {
+    fn wait(&self) {
+        let put = |parent: &gtk::Box, bone: gtk::Box| {
+            parent.append(&bone);
+            self.bones.borrow_mut().push((parent.clone(), bone));
+        };
+        put(&self.overview, skeleton());
+        put(&self.top, bone(-1, PICTURE_HEIGHT));
+        put(&self.head, bone(220, 14));
+    }
 }
 
 /// The first of `names` the icon theme has.
@@ -566,11 +693,11 @@ fn carousel(ui: &Ui, urls: Vec<String>) -> Option<gtk::Box> {
     glib::spawn_future_local(async move {
         for url in urls {
             let dir = dir.clone();
-            let got = gio::spawn_blocking(move || product_details::picture(&dir, &url)).await;
+            let got = off_thread(move || product_details::picture(&dir, &url)).await;
             let (Some(all), Some(carousel)) = (weak_all.upgrade(), weak.upgrade()) else {
                 return;
             };
-            let Ok(Ok(path)) = got else { continue };
+            let Some(Ok(path)) = got else { continue };
             let picture = gtk::Picture::builder()
                 .can_shrink(true)
                 .content_fit(gtk::ContentFit::Cover)
@@ -647,31 +774,46 @@ fn skeleton() -> gtk::Box {
     all
 }
 
+/// libadwaita's opening animation.
+const OPENING: std::time::Duration = std::time::Duration::from_millis(260);
+
+/// On a thread of its own: the shared pool may be busy with downloads.
+async fn off_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (send, receive) = futures_channel::oneshot::channel();
+    std::thread::Builder::new()
+        .name("details".into())
+        .spawn(move || {
+            let _ = send.send(work());
+        })
+        .ok()?;
+    receive.await.ok()
+}
+
+/// Let the frames in between be drawn.
+async fn a_frame() {
+    glib::timeout_future(std::time::Duration::from_millis(18)).await;
+}
+
 fn load(ui: &Ui, product_id: &str, shown: Page) {
     let (market, language) = ui.model.borrow().market();
-    let waiting = skeleton();
-    shown.overview.append(&waiting);
-    let pictures = bone(-1, PICTURE_HEIGHT);
-    shown.top.append(&pictures);
-    let makers = bone(220, 14);
-    shown.head.append(&makers);
     let ui = ui.clone();
     let product_id = product_id.to_string();
     glib::spawn_future_local(async move {
-        let result = gio::spawn_blocking(move || {
+        let result = off_thread(move || {
             product_details::fetch(&product_id, &market, &language).map_err(|e| format!("{e:#}"))
         })
         .await
-        .unwrap_or_else(|_| Err("the request stopped".into()));
-        if *ui.closing.borrow() {
+        .unwrap_or_else(|| Err("the request stopped".into()));
+        // Closed meanwhile.
+        if *ui.closing.borrow() || shown.stack.root().is_none() {
             return;
         }
-        shown.overview.remove(&waiting);
-        shown.top.remove(&pictures);
-        shown.head.remove(&makers);
+        for (parent, bone) in shown.bones.take() {
+            parent.remove(&bone);
+        }
         match result {
             Ok(details) => {
-                fill(&ui, &shown, details);
+                fill(&ui, &shown, details).await;
             }
             Err(error) => {
                 let why = format!("Microsoft’s catalog could not be read: {error}");
@@ -681,7 +823,8 @@ fn load(ui: &Ui, product_id: &str, shown: Page) {
     });
 }
 
-fn fill(ui: &Ui, shown: &Page, details: Details) {
+/// A part at a time, with frames between them.
+async fn fill(ui: &Ui, shown: &Page, details: Details) {
     let Page {
         stack, overview, ..
     } = shown;
@@ -718,6 +861,7 @@ fn fill(ui: &Ui, shown: &Page, details: Details) {
         overview.append(&body(&details.release_notes));
     }
 
+    a_frame().await;
     let tab = |title: &str, icons: &[&'static str]| {
         shown.tabs.set_visible(true);
         page(stack, title, icons)
@@ -737,6 +881,7 @@ fn fill(ui: &Ui, shown: &Page, details: Details) {
             content.append(&facts(&details.purchases, 2));
         }
     }
+    a_frame().await;
     if !details.requirements.is_empty() || !details.requirement_notes.is_empty() {
         let content = tab("Requirements", &["computer-symbolic"]);
         content.append(&heading("System requirements"));
@@ -752,11 +897,13 @@ fn fill(ui: &Ui, shown: &Page, details: Details) {
             content.append(&body(value));
         }
     }
+    a_frame().await;
     if !details.ages.is_empty() {
         let content = tab("Age ratings", &["system-users-symbolic"]);
         content.append(&heading("Age ratings"));
         content.append(&flow(details.ages.iter().map(age_card), 2, true));
     }
+    a_frame().await;
     if !details.package.is_empty() || !details.languages.is_empty() {
         let content = tab("Package", &["package-x-generic-symbolic"]);
         // Ids are long, and for copying; the rest reads better as cards.
@@ -786,6 +933,7 @@ fn fill(ui: &Ui, shown: &Page, details: Details) {
             content.append(&list);
         }
     }
+    a_frame().await;
     if !details.links.is_empty() || !details.copyright.is_empty() {
         let content = tab(
             "Links and legal",

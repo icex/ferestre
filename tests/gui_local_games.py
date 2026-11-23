@@ -83,16 +83,16 @@ summary = "Added by hand"
             frame = wait(lambda root: next(iter(s.find_all(root, role='frame', name='Ferestre')), None), 'window')
             s.select_in_list(frame, 'My Library')
             wait(lambda _: s.row_button(frame, TITLE, 'Play'), 'the local game offers Play')
-            s.check(any('Ricochet' in t for t in s.texts(frame)), 'the anti-cheat file is named on the row', frame)
+            wait(lambda _: any('Ricochet' in t for t in s.texts(frame)), 'the anti-cheat file is named on the row')
             offers = s.row_menu_offers(app, frame, TITLE)
             s.check('Remove from library' in offers, f'the menu offers Remove from library ({offers!r})', frame)
             for absent in ('Move location', 'Delete'):
                 s.check(absent not in offers, f'a local game has no {absent} ({offers!r})', frame)
 
-            s.click_named(frame, 'Add games')
+            s.click_named(frame, 'Library actions')
             wait(lambda root: s.find_all(root, role='button', name='Add game…'), 'the add menu offers Add game…')
             s.check(bool(s.find_all(app, role='button', name='Import from Steam')), 'the add menu offers Import from Steam', frame)
-            s.click_named(frame, 'Add games')
+            s.click_named(frame, 'Library actions')
             wait(lambda root: not s.find_all(root, role='button', name='Import from Steam') or None, 'the add menu to close')
 
             if steam_running():

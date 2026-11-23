@@ -414,7 +414,19 @@ def select_in_list(root, name, what=None):
                 if name == "My Library":
                     selection.clear_selection()
                 selection.select_child(index)
-                return settled(child)
+                if name != "My Library":
+                    return settled(child)
+                # It opens on Installed; the whole library is the next tab.
+                until = time.monotonic() + TIMEOUT
+                while not find_all(root, name="My Library page"):
+                    click_named(root, "My games")
+                    try:
+                        wait_for(root, lambda r: find_all(r, name="My Library page"),
+                                 "My Library page", min(until, time.monotonic() + 2))
+                    except Failure:
+                        if time.monotonic() >= until:
+                            raise
+                return child
     dump(root, f"looking for a selectable {name!r}")
     raise Failure(f"no selectable row called {what or name!r}")
 
@@ -552,8 +564,8 @@ def check_game_row_layout(root, title, size, action):
     if any(bounds(image).height>=200 for image in images):
         title_label=find_all(button,role="label",name=title)[0]
         top,whole=bounds(title_label),bounds(button)
-        check(whole.width>=140 and whole.height>=300,"cover tiles have a generous touch target",button)
-        check(top.y>=whole.y+200,"the title sits below the cover artwork",button)
+        check(whole.width>=140 and whole.height>=200,"cover tiles have a generous touch target",button)
+        check(top.y>=whole.y+whole.height*.6,"the title sits below the cover artwork, or on its lower part",button)
         check(any(bounds(image).width>=120 and bounds(image).height>=200 for image in images),"the card uses large cover art",button)
     else:
         # A missing image still produces a usable, labelled tile.
@@ -1634,7 +1646,8 @@ print(":: done", flush=True)
             # asking. Ask again until it asks back.
             until = time.monotonic() + TIMEOUT
             while True:
-                click_named(frame, "Add All to Steam")
+                click_named(frame, "Library actions")
+                click_named(frame, "Add all games to Steam")
                 try:
                     wait_for(frame, lambda root: any(t == f"Add {heading} to Steam?" for t in texts(root)),
                              "the add-all confirmation", min(until, time.monotonic() + 3))
@@ -1656,7 +1669,8 @@ print(":: done", flush=True)
             f.write('<Package><Identity Name="ConcernedApe.StardewValleyPC" Version="1.6.15.0" /></Package>')
         click_named(frame, "Refresh library, subscriptions and catalogue")
         select_in_list(frame, "Installed")
-        wait_for(frame, lambda root: "2 games" in texts(root), "two installed games", time.monotonic() + TIMEOUT)
+        wait_for(frame, lambda root: any(b.get_description() == "2 games" for b in find_all(root, role="button", name="Installed")),
+                 "two installed games", time.monotonic() + TIMEOUT)
         wait_for(frame, lambda root: not any("Checking for game updates" in t for t in texts(root)),
                  "the automatic update check to finish", time.monotonic() + TIMEOUT)
         before = launch_targets()
@@ -1673,7 +1687,7 @@ print(":: done", flush=True)
         check(launch_targets() == after, "Add All again updates in place", frame)
         shutil.rmtree(stardew)
         click_named(frame, "Refresh library, subscriptions and catalogue")
-        wait_for(frame, lambda root: "1 game" in texts(root), "one installed game again", time.monotonic() + TIMEOUT)
+        wait_for(frame, lambda root: any(b.get_description() == "1 game" for b in find_all(root, role="button", name="Installed")), "one installed game again", time.monotonic() + TIMEOUT)
         select_in_list(frame, "Library")
         wait_for(frame, lambda root: any("Minecraft" in t for t in texts(root)),
                  "the library after Add All", time.monotonic() + TIMEOUT)

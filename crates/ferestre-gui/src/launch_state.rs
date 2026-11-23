@@ -95,7 +95,7 @@ pub fn watch(
         })
         .await;
         if matches!(result, Ok(true)) && mark_ready(&mut ui.running.borrow_mut(), &key, pgid) {
-            render(&ui);
+            render_soon(&ui);
         }
     });
 }

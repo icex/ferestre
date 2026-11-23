@@ -136,7 +136,7 @@ Open the game's **More actions → Edit launch settings**. Settings such as nati
 ### Move a game or add it to Steam
 
 - **Move:** open the game's **More actions → Move location**, choose an existing library folder and confirm after the space check. Ferestre verifies the move, and keeps the original if it fails or is cancelled. Saves and prefixes retain their existing locations.
-- **Steam:** close Steam, then choose **Add to Steam** in the game's menu. **Add All to Steam** in the Installed list adds all installed games. Shortcuts include available artwork and retain their identity when updated.
+- **Steam:** close Steam, then choose **Add to Steam** in the game's menu. **Add all games to Steam**, in My Library's menu, adds all installed games. Shortcuts include available artwork and retain their identity when updated.
 
 ### Play games you already have
 

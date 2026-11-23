@@ -110,6 +110,13 @@ fn enqueue(ui: &Ui, ids: Vec<String>, visible: bool, heroes: usize) {
             if !cover && !hero {
                 continue;
             }
+            // Asked for already, and nothing to bring forward.
+            if !visible
+                && (!cover || queue.attempted.contains(&product.product_id))
+                && (!hero || queue.attempted_hero.contains(&product.product_id))
+            {
+                continue;
+            }
             queue.add(product.clone(), visible, cover, hero);
         }
     }
@@ -155,9 +162,10 @@ fn kick(ui: &Ui) {
                         .icons
                         .insert(key.clone(), path.clone());
                     // Straight into the cards that show it. Only a visible
-                    // title nothing is holding a picture for needs a redraw.
+                    // title nothing is holding a picture for needs a redraw,
+                    // and a list makes its tiles as they are scrolled to.
                     let filled = ui.art_slots.borrow_mut().fill(&key, &path);
-                    if visible && !filled {
+                    if visible && !filled && ui.endless.borrow().upgrade().is_none() {
                         render_soon(&ui);
                     }
                 }

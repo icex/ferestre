@@ -26,9 +26,6 @@ use crate::model::Ownership;
 /// The gamerpic host serves only certain sizes; `account::supported_avatar_size`
 /// is what guarantees this is one of them.
 pub const AVATAR_PX: u32 = 64;
-/// Rows per page of a plain list, and of tiles until the view is measured.
-pub const PER_PAGE: usize = 20;
-
 /// Which section of the window is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
@@ -36,20 +33,50 @@ pub enum Section {
     Library,
     GamePass,
     Installed,
+    /// Installed games that did not come from the Xbox store: Steam and local.
+    Elsewhere,
     Updates,
     Runtime,
     Downloads,
 }
 
 impl Section {
+    /// My Library's tabs.
+    pub const LIBRARY_TABS: [Section; 5] = [
+        Section::Installed,
+        Section::Library,
+        Section::Elsewhere,
+        Section::Updates,
+        Section::Downloads,
+    ];
+
+    /// The sidebar's row for it. My Library's tabs share one.
+    pub fn nav(self) -> Section {
+        match self {
+            Section::Installed | Section::Elsewhere | Section::Updates | Section::Downloads => {
+                Section::Library
+            }
+            section => section,
+        }
+    }
+
+    /// What the sidebar's row for it opens: My Library starts on Installed.
+    pub fn landing(self) -> Section {
+        match self {
+            Section::Library => Section::Installed,
+            section => section,
+        }
+    }
+
     pub const NAV: [Section; 3] = [Section::Home, Section::GamePass, Section::Library];
 
-    pub fn title(self) -> &'static str {
+    pub const fn title(self) -> &'static str {
         match self {
             Section::Home => "Home",
             Section::Library => "My Library",
             Section::GamePass => "Game Pass",
             Section::Installed => "Installed",
+            Section::Elsewhere => "Beyond Xbox",
             Section::Updates => "Updates",
             Section::Runtime => "Runtime",
             Section::Downloads => "Downloads",
@@ -62,6 +89,7 @@ impl Section {
             Section::Library => "view-grid-symbolic",
             Section::GamePass => "emblem-shared-symbolic",
             Section::Installed => "drive-harddisk-symbolic",
+            Section::Elsewhere => "applications-games-symbolic",
             Section::Updates => "software-update-available-symbolic",
             Section::Runtime => "applications-engineering-symbolic",
             Section::Downloads => "folder-download-symbolic",
@@ -135,9 +163,6 @@ pub struct Model {
     /// destroys them and the person's place in the list should survive it.
     pub section: Section,
     pub query: String,
-    pub page: usize,
-    /// Tiles on the first page, and on the others (see `page_fit`).
-    pub page_size: (usize, usize),
     /// Whether to list titles whose package this runtime cannot open. Off by
     /// default because they are the overwhelming majority -- 95 of 102 on the
     /// development account -- and a list where the seven that work are buried
@@ -533,8 +558,6 @@ impl Model {
             tiers,
             section: Section::Home,
             query: String::new(),
-            page: 0,
-            page_size: (PER_PAGE, PER_PAGE),
             show_unsupported: false,
             problem,
             probes: Default::default(),
@@ -595,8 +618,6 @@ impl Model {
             tiers: std::mem::take(&mut self.tiers),
             section: self.section,
             query: std::mem::take(&mut self.query),
-            page: self.page,
-            page_size: self.page_size,
             show_unsupported: self.show_unsupported,
             ..fresh
         };
@@ -1495,8 +1516,6 @@ mod tests {
             tiers: Default::default(),
             section: Section::Library,
             query: String::new(),
-            page: 0,
-            page_size: (PER_PAGE, PER_PAGE),
             show_unsupported: false,
             problem: None,
             probes: Default::default(),

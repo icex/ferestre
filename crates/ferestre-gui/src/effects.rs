@@ -224,11 +224,50 @@ pub(crate) fn duration(ms: u32) -> u32 {
 /// after being left a tile is the same one still: a redraw replaces it.
 const SHIMMER_MS: u64 = 850;
 const SAME_TILE: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long a tile stays selected before the light runs: passing over tiles
+/// on the way to another lights none of them, also one press at a time and
+/// in the wait before a held direction repeats.
+const SETTLED: std::time::Duration = std::time::Duration::from_millis(650);
 
 thread_local! {
     /// The tile selected last, and when it was left.
     static SELECTED: RefCell<Option<(String, Option<std::time::Instant>)>> =
         const { RefCell::new(None) };
+    /// The tile waiting to settle, and which wait it is.
+    static SETTLING: RefCell<(u64, String)> = const { RefCell::new((0, String::new())) };
+}
+
+/// Start waiting for `name` to settle, instead of whichever was.
+fn settle(name: &str) -> u64 {
+    SETTLING.with(|s| {
+        let mut s = s.borrow_mut();
+        *s = (s.0.wrapping_add(1), name.to_string());
+        s.0
+    })
+}
+
+/// `name` was left: it does not settle.
+fn unsettle(name: &str) {
+    SETTLING.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.1 == name {
+            *s = (s.0.wrapping_add(1), String::new());
+        }
+    });
+}
+
+fn settled(wait: u64) -> bool {
+    SETTLING.with(|s| s.borrow().0 == wait)
+}
+
+thread_local! {
+    static STEERED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether a controller or the keyboard moves the selection, until the mouse
+/// itself moves.
+pub(crate) fn set_steered(steered: bool) {
+    STEERED.with(|s| s.set(steered));
 }
 
 /// Whether selecting `name` is news, for the last one selected.
@@ -257,28 +296,44 @@ pub(crate) fn shimmer(button: &impl IsA<gtk::Widget>, surface: &gtk::Overlay) {
                 return;
             };
             let name = button.widget_name().to_string();
-            let news = SELECTED.with(|s| newly_selected(&s.borrow(), &name));
-            SELECTED.with(|s| s.replace(Some((name, None))));
-            if !news || !animations_enabled() || light.has_css_class("run") {
+            if !SELECTED.with(|s| newly_selected(&s.borrow(), &name)) {
+                SELECTED.with(|s| s.replace(Some((name, None))));
                 return;
             }
-            light.add_css_class("run");
+            let wait = settle(&name);
             let light = light.downgrade();
-            let length = std::time::Duration::from_millis(SHIMMER_MS + 50);
-            glib::timeout_add_local_once(length, move || {
-                if let Some(light) = light.upgrade() {
-                    light.remove_css_class("run");
+            glib::timeout_add_local_once(SETTLED, move || {
+                let Some(light) = light.upgrade() else { return };
+                if !settled(wait) || !light.is_mapped() {
+                    return;
                 }
+                SELECTED.with(|s| s.replace(Some((name, None))));
+                if !animations_enabled() || light.has_css_class("run") {
+                    return;
+                }
+                light.add_css_class("run");
+                let light = light.downgrade();
+                let length = std::time::Duration::from_millis(SHIMMER_MS + 50);
+                glib::timeout_add_local_once(length, move || {
+                    if let Some(light) = light.upgrade() {
+                        light.remove_css_class("run");
+                    }
+                });
             });
         }
     };
     let leave = {
-        let button = button.downgrade();
+        let (button, light) = (button.downgrade(), light.downgrade());
         move || {
             let Some(button) = button.upgrade() else {
                 return;
             };
+            // It does not play on behind the next one.
+            if let Some(light) = light.upgrade() {
+                light.remove_css_class("run");
+            }
             let name = button.widget_name();
+            unsettle(&name);
             SELECTED.with(|s| {
                 if let Some((last, left)) = s.borrow_mut().as_mut() {
                     if *last == name {
@@ -295,11 +350,34 @@ pub(crate) fn shimmer(button: &impl IsA<gtk::Widget>, surface: &gtk::Overlay) {
     focus.connect_leave(move |_| off());
     button.add_controller(focus);
     let pointer = gtk::EventControllerMotion::new();
-    pointer.connect_enter(move |_, _, _| select());
+    // Motion, not entering: a tile also comes under a mouse that lies still
+    // while a controller scrolls, and that one is not selected.
+    let over = Rc::new(Cell::new(false));
+    let is_over = over.clone();
+    pointer.connect_motion(move |_, _, _| {
+        if !STEERED.with(Cell::get) && !is_over.replace(true) {
+            select();
+        }
+    });
     let off = leave.clone();
-    pointer.connect_leave(move |_| off());
+    pointer.connect_leave(move |_| {
+        if over.replace(false) {
+            off();
+        }
+    });
     button.add_controller(pointer);
     button.connect_unmap(move |_| leave());
+}
+
+/// No tooltips on a tile or anything in it: it says what matters itself.
+pub(crate) fn no_tooltips(tile: &impl IsA<gtk::Widget>) {
+    let tile = tile.upcast_ref::<gtk::Widget>();
+    tile.set_has_tooltip(false);
+    let mut child = tile.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        no_tooltips(&widget);
+    }
 }
 
 /// Frosted glass on surfaces drawn inside the window, where GTK can do it:
@@ -325,9 +403,10 @@ window.blur-ok .notification, window.blur-ok .notification-more {
   backdrop-filter: blur(22px) saturate(1.35);
   box-shadow: 0 8px 28px alpha(black, 0.45), inset 0 0 0 1px alpha(white, 0.10);
 }
+/* The shell behind a dialog is blurred already, once: a second blur here would
+   be drawn again for every change on the glass. */
 window.blur-ok floating-sheet > sheet, window.blur-ok bottom-sheet > sheet {
-  background-color: alpha(#22252b, 0.58);
-  backdrop-filter: blur(26px) saturate(1.4);
+  background-color: alpha(#22252b, 0.66);
   box-shadow: 0 18px 60px alpha(black, 0.55), inset 0 0 0 1px alpha(white, 0.11);
 }
 /* What stands on the glass must not paint over it. */

@@ -153,6 +153,38 @@ pub(super) fn start_next(ui: &Ui) {
         return;
     }
 }
+/// Ask before taking a job off the queue.
+fn confirm_remove_job(ui: &Ui, id: &str, name: &str) {
+    let dialog = adw::AlertDialog::new(
+        Some(&format!("Remove {name} from the install queue?")),
+        Some("It will not be downloaded. What it has downloaded so far stays on disk."),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("remove", "Remove");
+    dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let (job_ui, id) = (ui.clone(), id.to_string());
+    dialog.connect_response(Some("remove"), move |_, _| {
+        // It may have started while the question was open.
+        let active = job_ui
+            .download
+            .current
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| d.product_id == id);
+        if active {
+            job_ui
+                .toasts
+                .add_toast(toast("It has started downloading. Stop it first."));
+            return;
+        }
+        job_ui.install_queue.borrow_mut().remove(&id);
+        save(&job_ui);
+        super::render_soon(&job_ui);
+    });
+    dialog.present(Some(&ui.window));
+}
 pub(super) fn completed(ui: &Ui, id: &str, success: bool, stopped: bool) {
     if success {
         ui.install_queue.borrow_mut().remove(id);
@@ -259,16 +291,14 @@ pub(super) fn render_queue(ui: &Ui, page: &gtk::Box) {
         let remove = gtk::Button::with_label(if active { "Stop" } else { "Remove" });
         remove.set_valign(gtk::Align::Center);
         remove.set_widget_name(&format!("queue-{}-stop", job.product_id));
-        let (remove_ui, id) = (ui.clone(), job.product_id.clone());
+        let (remove_ui, id, name) = (ui.clone(), job.product_id.clone(), job.name.clone());
         remove.connect_clicked(move |_| {
             if active {
                 if let Some(control) = remove_ui.download_control.borrow().as_ref() {
                     control.stop();
                 }
             } else {
-                remove_ui.install_queue.borrow_mut().remove(&id);
-                save(&remove_ui);
-                render(&remove_ui);
+                confirm_remove_job(&remove_ui, &id, &name);
             }
         });
         row.add_suffix(&remove);

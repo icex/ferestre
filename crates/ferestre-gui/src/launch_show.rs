@@ -1,13 +1,15 @@
 //! What plays over the window when a game starts: its art lifts off the tile
-//! it was started from, grows to the middle of the dimmed window with a band
-//! of light across it, and rushes forward as it fades. It only draws: input
+//! it was started from, spins twice like a card on its way to the middle of the
+//! dimmed window, is crossed by a band of light, and rushes forward as it fades. It only draws: input
 //! goes through it, and the launch does not wait for it.
 use super::*;
 
-const LENGTH_MS: u32 = 2300;
+const LENGTH_MS: u32 = 2800;
 /// When the art has arrived, and when it starts to leave, of the whole.
-const ARRIVED: f64 = 0.24;
-const LEAVES: f64 = 0.80;
+const ARRIVED: f64 = 0.48;
+const LEAVES: f64 = 0.84;
+/// How often the art turns on its way.
+const TURNS: f64 = 2.0;
 /// The window's class while the content behind is blurred.
 const LAUNCHING: &str = "launching";
 
@@ -93,6 +95,22 @@ impl Show {
         ch *= scale;
         let rect = Rect::new(x, y, cw, ch);
         let rounded = gtk::gsk::RoundedRect::from_rect(rect, 18.0);
+        // It turns about its upright middle, in perspective.
+        let turn = arriving * TURNS * std::f64::consts::TAU;
+        let facing = turn.cos() as f32;
+        let centre = Point::new(x + cw / 2.0, y + ch / 2.0);
+        snapshot.save();
+        snapshot.translate(&centre);
+        snapshot.perspective(cw.max(ch) * 3.0);
+        snapshot.rotate_3d(
+            turn.to_degrees() as f32,
+            &gtk::graphene::Vec3::new(0.0, 1.0, 0.0),
+        );
+        // The back shows the art too, the right way round.
+        if facing < 0.0 {
+            snapshot.scale(-1.0, 1.0);
+        }
+        snapshot.translate(&Point::new(-centre.x(), -centre.y()));
         let pulse = (0.65 + 0.35 * (at * std::f64::consts::TAU * 2.0).sin()) as f32;
         snapshot.push_opacity(f64::from(1.0 - leaving as f32));
         snapshot.append_outset_shadow(
@@ -124,8 +142,8 @@ impl Show {
         art.snapshot(snapshot, f64::from(aw), f64::from(ah));
         snapshot.restore();
         // Light sweeps over it twice.
-        for start in [0.22, 0.52] {
-            let sweep = ((at - start) / 0.26) as f32;
+        for start in [0.46, 0.64] {
+            let sweep = ((at - start) / 0.2) as f32;
             if (0.0..=1.0).contains(&sweep) {
                 let centre = x - cw * 0.5 + sweep * cw * 2.0;
                 let half = cw * 0.35;
@@ -142,11 +160,17 @@ impl Show {
                 );
             }
         }
+        // Darker the more it is turned away.
+        snapshot.append_color(
+            &gdk::RGBA::new(0.0, 0.0, 0.0, 0.5 * (1.0 - facing.abs())),
+            &rect,
+        );
         snapshot.pop();
         snapshot.pop();
+        snapshot.restore();
 
         // The name rises into place under it.
-        let words = (((at - 0.16) / 0.14).clamp(0.0, 1.0) * (1.0 - leaving)) as f32;
+        let words = (((at - 0.40) / 0.12).clamp(0.0, 1.0) * (1.0 - leaving)) as f32;
         if words > 0.0 {
             let line = |text: &str, size: i32, bold: bool, top: f32, alpha: f32| {
                 let layout = self.create_pango_layout(Some(text));
@@ -176,7 +200,7 @@ impl Show {
 /// How far the art has arrived, and how far it has left.
 fn phases(at: f64) -> (f64, f64) {
     let part = (at / ARRIVED).clamp(0.0, 1.0);
-    let arriving = 1.0 - (1.0 - part).powi(3);
+    let arriving = part * part * (3.0 - 2.0 * part);
     let leaving = ((at - LEAVES) / (1.0 - LEAVES)).clamp(0.0, 1.0);
     (arriving, leaving * leaving)
 }
@@ -302,7 +326,7 @@ mod tests {
     #[test]
     fn the_art_arrives_stands_and_leaves() {
         assert_eq!(phases(0.0), (0.0, 0.0));
-        assert_eq!(phases(0.5), (1.0, 0.0));
+        assert_eq!(phases(0.6), (1.0, 0.0));
         assert_eq!(phases(1.0), (1.0, 1.0));
     }
 
