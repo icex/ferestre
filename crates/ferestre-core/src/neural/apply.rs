@@ -840,6 +840,16 @@ fn enable_with(ctx: &Context, req: &EnableRequest, found: &[Detection]) -> Resul
     if let Some(reason) = hardware::gate(&ctx.drm) {
         bail!("{reason}");
     }
+    // A game started by a script names the script: the mod would land beside
+    // it, not beside the program the script runs.
+    let lower = req.executable.to_ascii_lowercase();
+    if !(lower.ends_with(".exe") || lower.ends_with(".bat")) {
+        bail!(
+            "{}: neural rendering goes beside the game's Windows program; choose the .exe it \
+             runs in Edit launch settings",
+            req.executable
+        );
+    }
     let _lock = lock(ctx, req.key)?;
     let name = game_name(req.game_dir, req.key);
     let acknowledged = state::acknowledged(&ctx.config_dir, req.key)?;
@@ -1604,6 +1614,19 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
             gate(&[det("BattlEye", true, true)], &acknowledged),
             Gate::Allowed
         );
+    }
+
+    #[test]
+    fn a_script_is_no_place_for_the_mod() {
+        let w = World::new();
+        std::fs::write(w.game.join("launch.sh"), b"#!/bin/sh\n").unwrap();
+        let before = listing(&w.game);
+        let mut req = w.req(Some(Route::ReshadeFeeder), true);
+        req.executable = "launch.sh";
+        let text = format!("{:#}", enable_with(&w.ctx, &req, &[]).unwrap_err());
+        assert!(text.contains("choose the .exe it runs"), "{text}");
+        assert_eq!(listing(&w.game), before);
+        assert_eq!(w.entry(), None);
     }
 
     #[test]

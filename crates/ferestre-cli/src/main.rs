@@ -1399,12 +1399,10 @@ fn run_through_steam(
         .unwrap_or_else(|| game_dir.join(&recipe.launch.executable));
     let path = std::env::var_os("PATH");
     let (program, args) = steam_games::launch_command(app_id, path.as_deref());
-    let compatdata = recipe
-        .install
-        .prefix
-        .as_deref()
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("{} has no Steam prefix in its recipe", recipe.title.name))?;
+    // A shortcut to a script has none until the person names the one its
+    // script uses.
+    let compatdata = recipe.install.prefix.as_deref().map(PathBuf::from);
+    let user_reg = compatdata.as_deref().map(steam_games::user_reg);
     if request.dry_run {
         let entry = neural::apply::preview(ctx, &product_id, &game_dir, &recipe.launch.executable);
         let dlls = entry
@@ -1418,14 +1416,16 @@ fn run_through_steam(
                 "program": program,
                 "args": args,
                 "dll_overrides": dlls,
-                "prefix": steam_games::user_reg(&compatdata).display().to_string(),
+                "prefix": user_reg.as_ref().map(|r| r.display().to_string()),
             }));
         } else {
             println!("{program} {}", args.join(" "));
             for dll in &dlls {
                 println!(
                     "{}: {}\\DllOverrides {dll}={}",
-                    steam_games::user_reg(&compatdata).display(),
+                    user_reg
+                        .as_ref()
+                        .map_or("(no Wine prefix set)".into(), |r| r.display().to_string()),
                     executable
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
@@ -1445,7 +1445,10 @@ fn run_through_steam(
         );
     }
     let _lock = TitleLock::take(paths, &product_id, LockMode::Run)?;
-    let images = running::running_in(&compatdata.join("pfx"));
+    let images = compatdata
+        .as_ref()
+        .map(|c| running::running_in(&c.join("pfx")))
+        .unwrap_or_default();
     if !images.is_empty() {
         // Steam brings the running game forward; nothing in its folder or
         // prefix may change under it.
@@ -1487,13 +1490,20 @@ fn run_through_steam(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let written = steam_games::sync_overrides(
-            paths.state_dir(),
-            &product_id,
-            &steam_games::user_reg(&compatdata),
-            &program_name,
-            &dlls,
-        );
+        let written = match &user_reg {
+            Some(user_reg) => steam_games::sync_overrides(
+                paths.state_dir(),
+                &product_id,
+                user_reg,
+                &program_name,
+                &dlls,
+            ),
+            None if dlls.is_empty() => steam_games::clear_overrides(paths.state_dir(), &product_id),
+            None => Err(anyhow!(
+                "set the Wine prefix {} runs in, in Edit launch settings",
+                recipe.title.name
+            )),
+        };
         match written {
             Ok(()) if !dlls.is_empty() => eprintln!(
                 ":: neural rendering: {} loads {} native first in its Steam prefix",

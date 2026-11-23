@@ -1198,8 +1198,13 @@ fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
 /// A local game's row: its own name and badge, no Store art, no update check.
 fn local_row(inputs: &Inputs, recipe: &Recipe, view: TitleView) -> LibraryRow {
     let installed = (inputs.installed)(recipe);
-    let steam = recipe.launch.steam_app_id.is_some();
-    let kind = if steam { "Steam game" } else { "Local game" };
+    let steam = recipe.launch.steam_app_id;
+    let kind = match steam {
+        Some(id) if ferestre_core::steam_games::is_shortcut(id) => "Steam shortcut",
+        Some(_) => "Steam game",
+        None => "Local game",
+    };
+    let steam = steam.is_some();
     let subtitle = match &view.action {
         Action::Blocked(reason) => reason.clone(),
         Action::Stop => format!("{kind}  ·  running"),

@@ -422,10 +422,27 @@ pub fn clear_overrides(state_dir: &Path, id: &str) -> Result<()> {
     write_record(state_dir, &record)
 }
 
-/// The program and arguments that ask Steam to start an app: `steam` when it
-/// is on `PATH`, else the Flatpak's, else whatever opens `steam://` links.
+/// Whether `app_id` is a non-Steam shortcut's: Steam makes those with the
+/// top bit set, which no app of its own has.
+pub fn is_shortcut(app_id: u32) -> bool {
+    app_id & 0x8000_0000 != 0
+}
+
+/// The game id `steam://rungameid/` takes: an app's own id, or for a
+/// shortcut its id in the upper half with the shortcut type below.
+pub fn run_game_id(app_id: u32) -> u64 {
+    if is_shortcut(app_id) {
+        (u64::from(app_id) << 32) | 0x0200_0000
+    } else {
+        u64::from(app_id)
+    }
+}
+
+/// The program and arguments that ask Steam to start an app or shortcut:
+/// `steam` when it is on `PATH`, else the Flatpak's, else whatever opens
+/// `steam://` links.
 pub fn launch_command(app_id: u32, path: Option<&std::ffi::OsStr>) -> (String, Vec<String>) {
-    let url = format!("steam://rungameid/{app_id}");
+    let url = format!("steam://rungameid/{}", run_game_id(app_id));
     let on_path = |name: &str| {
         path.map(std::env::split_paths)
             .into_iter()
@@ -636,6 +653,13 @@ mod tests {
         );
         let empty = tempfile::tempdir().unwrap();
         let (program, _) = launch_command(42, Some(empty.path().as_os_str()));
+        // A shortcut's id goes in the upper half, with the shortcut type.
+        let (_, args) = launch_command(0x9f3a_1c2e, Some(bin.path().as_os_str()));
+        assert_eq!(
+            args,
+            vec![format!("steam://rungameid/{}", 0x9f3a_1c2e_0200_0000u64)]
+        );
+        assert!(!is_shortcut(2_807_960) && run_game_id(2_807_960) == 2_807_960);
         assert!(program == "xdg-open" || program == "flatpak");
     }
 }
