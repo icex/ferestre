@@ -132,7 +132,8 @@ def main():
             # Escape dismisses the focused one and returns to the content.
             before = set(alerts(frame))
             s.select_in_list(frame, "My Library")
-            for _ in range(3):
+            # Three steps make a cycle; a redraw on the way may cost one.
+            for _ in range(6):
                 key(F6)
                 node = focused(frame)
                 if node is not None and node.get_name() == "Dismiss notification":
