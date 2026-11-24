@@ -80,9 +80,14 @@ def main():
                 s.Atspi.generate_keyboard_event(0xff09,None,s.Atspi.KeySynthType.SYM)
                 wait(lambda r:(n:=focus(r)) is not None and 'More actions' in n.get_name(),'keyboard focus enters the separate More control')
                 time.sleep(.04)
-                # A background redraw may have replaced the tile meanwhile.
-                tile=wait(lambda r:next(iter(s.find_all(r,name=name)),None),'the tile')
-                s.check(outline_bands(gui.pid,tile)==[],'moving focus inside a card removes its previous outer ring')
+                # A background redraw may replace the tile at any time.
+                # AT-SPI can still list the old one, under the same name.
+                def live_bands(root):
+                    for tile in s.find_all(root,name=name):
+                        try:return [outline_bands(gui.pid,tile)]
+                        except s.GLib.GError:continue
+                bands=wait(live_bands,'the tile')[0]
+                s.check(bands==[],'moving focus inside a card removes its previous outer ring')
                 s.click_named(frame,'Refresh library, subscriptions and catalogue')
                 for _ in range(20):
                     time.sleep(.1)
