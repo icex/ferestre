@@ -144,7 +144,7 @@ pedantic about.
 
 | key | type | | meaning |
 |---|---|---|---|
-| `symptom` | string | required | What the person sees. |
+| `symptom` | string | required | What the person sees. With `fix`, shown in the game's details: as a warning for `playable-with-issues`, `menus` and `broken`, folded away for `playable`. |
 | `cause` | string | required | |
 | `fix` | string | required | Say "none known" if there is none. |
 | `log-match` | string | optional | A regular expression that identifies this issue in a launch log, so a failed run can name itself. |

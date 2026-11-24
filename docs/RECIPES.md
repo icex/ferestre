@@ -226,7 +226,7 @@ found. The confirmed restoration used a read-only source backup and a local
 copy, not an automatic import feature. No account-specific folder name is
 needed in this recipe.
 
-### Halo Infinite — **playable; intermittent offline display unresolved**
+### Halo Infinite — **playable**
 
 Use launcher 0.1.5 with runtime 11.0.20261010.1, a licensed Store/Game Pass
 installation and the shipped `9PP5G1F0C2B6.toml` recipe. Keep the original
@@ -239,7 +239,8 @@ launch and its campaign handoff; the encrypted installation stays intact.
 The launch inherits its package manifest into child processes.
 
 Campaign, Academy and multiplayer have live confirmation, as does local saving.
-Intermittent offline display is unresolved. Cloud saves and purchases are not
+The earlier intermittent offline display was reported resolved by the player on
+2026-11-24; it was not retested. Cloud saves and purchases are not
 qualified. A Store/Xbox account mismatch dialog can be dismissed to play.
 Remove an older personal Halo recipe override, or update it to match the shipped
 recipe, since personal overrides take precedence (see Troubleshooting).

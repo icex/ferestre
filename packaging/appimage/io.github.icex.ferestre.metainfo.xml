@@ -74,6 +74,14 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.1.27" date="2026-11-24">
+      <description>
+        <p>Games Steam installed join the library and start through Steam, with experimental neural rendering.</p>
+        <p>Every game shows how well it runs, on its tile and in its details, with known issues as a warning.</p>
+        <p>Launch settings and game details as tabs, Proton's upscaling and compatibility flags, scrolling lists, and a layout for handhelds.</p>
+        <p>The updated Proton runtime has GE-Proton's DXGI fixes, video memory fixes and a native Wayland fix.</p>
+      </description>
+    </release>
     <release version="0.1.25" date="2026-11-22">
       <description>
         <p>Play the Windows games you already have from one library: import Steam's non-Steam shortcuts with their prefixes, Proton builds, launch options and artwork, or add any game by its executable. Saves and prefixes are reused, and removing a game never deletes it.</p>

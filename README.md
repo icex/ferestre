@@ -6,23 +6,29 @@ Play compatible **Xbox PC and Microsoft Store games on Linux** using your Micros
 
 <br clear="left">
 
-**[Download the AppImage](https://github.com/icex/ferestre/releases/download/v0.1.26/ferestre-0.1.26-x86_64.AppImage)** · [Compatible games](docs/COMPATIBILITY.md#the-matrix) · [Quick start](#quick-start) · [Report a problem](https://github.com/icex/ferestre/issues)
+**[Download the AppImage](https://github.com/icex/ferestre/releases/download/v0.1.27/ferestre-0.1.27-x86_64.AppImage)** · [Compatible games](docs/COMPATIBILITY.md#the-matrix) · [Quick start](#quick-start) · [Report a problem](https://github.com/icex/ferestre/issues)
 
 ![Ferestre's Home: a featured-game carousel, quick links and a Jump back in shelf, with recent games and their status in the sidebar](docs/screenshots/home.png)
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/library-handheld.png" alt="My Library in the fullscreen handheld layout, with Xbox controller hints and an Update available badge"><br><strong>Play from the couch with a controller</strong></td>
+    <td width="50%"><img src="docs/screenshots/library-handheld.png" alt="My games in the fullscreen handheld layout, with a top bar of tabs, compatibility labels, an Update badge and Xbox controller hints"><br><strong>Play from the couch with a controller</strong></td>
     <td width="50%"><img src="docs/screenshots/running-game.png" alt="A running game's card with Resume and Stop"><br><strong>Switch between running games</strong></td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/screenshots/install-game.png" alt="The install dialog with the download size, library folder and free space, over the blurred library"><br><strong>Choose where each game installs</strong></td>
-    <td width="50%"><img src="docs/screenshots/notifications.png" alt="Three notifications stacked in the corner of the window"><br><strong>See every result at once</strong></td>
+    <td width="50%"><img src="docs/screenshots/install-game.png" alt="The install dialog with the download size, library folder and free space"><br><strong>Choose where each game installs</strong></td>
+    <td width="50%"><img src="docs/screenshots/notifications.png" alt="My Library with three games starting and notifications stacked in the corner of the window"><br><strong>See every result at once</strong></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/library.png" alt="My Library with a compatibility label on every game: Playable, Playable with issues or Untested"><br><strong>See how well each game runs</strong></td>
+    <td width="50%"><img src="docs/screenshots/game-details.png" alt="A game's details with its compatibility label and its known issues as a warning"><br><strong>Know the issues before you install</strong></td>
   </tr>
 </table>
 
 <details>
-<summary>More screenshots: Stop confirmation, compact sidebar, a game already running, ultrawide</summary>
+<summary>More screenshots: launch settings, Stop confirmation, compact sidebar, a game already running, ultrawide</summary>
+
+![The launch settings editor and its tabs](docs/screenshots/launch-settings.png)
 
 ![In-app Stop confirmation with Cancel selected by the controller](docs/screenshots/stop-confirmation.png)
 
@@ -71,7 +77,7 @@ In **Accounts**, choose the Microsoft account supplying purchases/Game Pass (**S
 2. Choose a game, select **Install**, choose a library folder and confirm.
 3. Follow progress in **My Library → Install queue**, or with the **Downloads** button in the sidebar. Choose **Play** when installation finishes.
 
-Check the [compatibility list](docs/COMPATIBILITY.md#the-matrix) before a large download. Ferestre supports compatible **GDK/MSIXVC** games; many other Store apps use UWP/Appx/Msix formats that are currently unsupported. Game Pass access depends on your subscription, region and the title still being included. Microsoft checks the licence when installing or launching.
+Check the label on the game's tile (**Playable**, **Playable with issues**, **Untested** or **Not playable**) before a large download; **Game details** says what was tested and lists known issues. The [compatibility list](docs/COMPATIBILITY.md#the-matrix) has every tested game. Ferestre supports compatible **GDK/MSIXVC** games; many other Store apps use UWP/Appx/Msix formats that are currently unsupported. Game Pass access depends on your subscription, region and the title still being included. Microsoft checks the licence when installing or launching.
 
 ## Quick guides
 
@@ -131,7 +137,7 @@ Choose a suitable rendering resolution in the game. The runtime includes 4K and 
 
 ### Change a game's launch settings
 
-Open the game's **More actions → Edit launch settings**. Settings such as native Wayland, Gamescope, HDR, the performance profile and the runtime's compatibility switches appear as switches and menus, each with a line saying what it does; other environment variables can be added below them. Your changes are saved as your own copy of the game's recipe. **Reset to defaults** sets that copy aside as a `.toml.bak` file and returns the game to the settings Ferestre ships or detects.
+Open the game's **More actions → Edit launch settings**. The tabs hold native Wayland, Gamescope, HDR, the performance profile, compatibility and upscaling switches and the runtime, each with a line saying what it does; other environment variables can be added below them. Your changes are saved as your own copy of the game's recipe. **Reset to defaults** sets that copy aside as a `.toml.bak` file and returns the game to the settings Ferestre ships or detects.
 
 ### Move a game or add it to Steam
 
@@ -208,7 +214,7 @@ Use `./ferestre.AppImage --help` for all commands. `run` refuses to start a game
 | [Releasing](docs/RELEASING.md) | Release builds and signing |
 | [Debugging notes](notes/) | Technical investigations |
 
-Current releases: **[Ferestre 0.1.26](https://github.com/icex/ferestre/releases/tag/v0.1.26)** and **[runtime 11.0.20261122.2](https://github.com/icex/ferestre/releases/tag/runtime-11.0.20261122.2)**. Read the [0.1.26](docs/RELEASE-0.1.26.md) and [0.1.25](docs/RELEASE-0.1.25.md) release notes for tested scope.
+Current releases: **[Ferestre 0.1.27](https://github.com/icex/ferestre/releases/tag/v0.1.27)** and **[runtime 11.0.20261124.1](https://github.com/icex/ferestre/releases/tag/runtime-11.0.20261124.1)**. Read the [0.1.27](docs/RELEASE-0.1.27.md) and [0.1.26](docs/RELEASE-0.1.26.md) release notes for tested scope.
 
 ## About the project
 

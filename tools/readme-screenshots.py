@@ -18,8 +18,11 @@ What it does
         compact-sidebar.png    the icon rail with the account menu open
         home-ultrawide.png     Home at 3440x1000 (a 32:9-style wide window)
         already-running.png    the "<title> is already running" dialog
+        library.png            My Library with each game's compatibility label
+        game-details.png       a game's details, with its known issues
+        launch-settings.png    the launch settings editor
 
-    All are 1280x800 except home-ultrawide.png.
+    All are 1280x800 except home-ultrawide.png and the cropped game-details.png.
 
 How to run it
     export PATH=$HOME/.cargo/bin:$PATH
@@ -104,6 +107,7 @@ GAMEPASS = ["9MSVPJCHHRPR", "9PJTHRNVH62H", "C2KDNLT2H7DM", "9PP5G1F0C2B6", "9N6
 DOWNLOAD_GB = {"9MSVPJCHHRPR": 75, "9MT5NJ5W7B8Z": 82, "9NNX1VVR3KNQ": 118}
 RUNNING = "9PL1J8PJKH29"  # Control, for the running, Stop and already-running shots
 INSTALL = "9MSVPJCHHRPR"  # Avowed, for the install dialog
+DETAILS = "9MT5NJ5W7B8Z"  # Hogwarts Legacy, which plays with issues
 FOCUS = "9NJWTJSVGVLJ"  # Age of Empires, the focused card in fullscreen
 
 SHOTS = {
@@ -117,7 +121,14 @@ SHOTS = {
     "compact-sidebar": (1280, 800, {"compact": True}, False),
     "home-ultrawide": (3440, 1000, {}, False),
     "already-running": (1280, 800, {}, False),
+    "library": (1280, 800, {}, False),
+    "game-details": (1280, 800, {}, False),
+    "launch-settings": (1280, 800, {}, False),
 }
+
+# The virtual screen has a desktop monitor's size. Fullscreen pictures are of a
+# handheld, whose layout follows the screen's width in millimetres.
+HANDHELD_SCREEN = "int gdk_monitor_get_width_mm(void *monitor) { (void)monitor; return 155; }\n"
 
 CLIENT = r'''#!/usr/bin/env python3
 # Fake xodus-cli: one synthetic signed-in account, nothing real.
@@ -299,6 +310,9 @@ def prepare_scratch(repo, args):
     (scratch / "template/.fixture/lib").mkdir()
     subprocess.run(["cc", "-shared", "-fPIC", str(scratch / "sdl.c"), "-o",
                     str(scratch / "template/.fixture/lib/libSDL2-2.0.so.0")], check=True)
+    write(scratch / "screen.c", HANDHELD_SCREEN)
+    subprocess.run(["cc", "-shared", "-fPIC", str(scratch / "screen.c"), "-o",
+                    str(scratch / "template/.fixture/lib/handheld-screen.so")], check=True)
     write(scratch / "passwd", "root:x:0:0:root:/root:/bin/sh\n"
           f"player:x:{os.getuid()}:{os.getgid()}:Player One:{DEMO_HOME}:/bin/sh\n"
           "nobody:x:65534:65534:Nobody:/:/usr/bin/nologin\n")
@@ -504,6 +518,7 @@ class Scene:
         env["NO_PROXY"] = env["no_proxy"] = ""
         if SHOTS[self.shot][3]:
             env["LD_LIBRARY_PATH"] = str(f / "lib")
+            env["LD_PRELOAD"] = str(f / "lib/handheld-screen.so")
             env["FERESTRE_TEST_PAD_FILE"] = str(f / "pad")
         return env
 
@@ -512,7 +527,7 @@ class Scene:
         (self.fixture / "pad-next").write_bytes(struct.pack("<Hhhhh2xii", buttons, 0, 0, 0, 0, kind, 1))
         (self.fixture / "pad-next").replace(self.fixture / "pad")
 
-    def capture(self, wait=1.5):
+    def capture(self, wait=1.5, crop=None):
         """The virtual screen, through KWin's ScreenShot2."""
         time.sleep(wait)
         import gi
@@ -549,7 +564,10 @@ class Scene:
         raw = "BGRA" if meta.get("format", 4) in (4, 5, 6) else "RGBA"
         image = Image.frombuffer("RGBA", (meta["width"], meta["height"]), data, "raw", raw, meta["stride"], 1)
         out = self.scratch / "out" / f"{self.shot}.png"
-        image.convert("RGB").save(out)
+        image = image.convert("RGB")
+        if crop:
+            image = image.crop(crop)
+        image.save(out)
         print("captured", out.name, meta["width"], meta["height"], flush=True)
 
     def start(self):
@@ -575,8 +593,8 @@ class Scene:
         s = self.s
         if SHOTS[self.shot][2].get("fullscreen"):
             # Fullscreen has a row of section buttons instead of the sidebar.
-            s.click(self.wait(lambda r: next(iter(s.find_all(r, role="button", name="My Library")), None),
-                              "the My Library tab"))
+            s.click(self.wait(lambda r: next(iter(s.find_all(r, role="button", name="My games")), None),
+                              "the My games tab"))
         else:
             s.select_in_list(self.frame, "My Library")
         self.wait(lambda _: s.row_button(self.frame, self.names[UPDATE], "Update"), "the library to settle")
@@ -613,6 +631,7 @@ class Scene:
     def scene_library_handheld(self):
         self.library()
         time.sleep(2)
+        self.dismiss_notifications()
         self.driver().seek(f"{self.names[FOCUS]} · Play")
         self.capture(2)
 
@@ -665,7 +684,10 @@ class Scene:
         self.library()
         driver = self.driver()
         driver.seek(f"{name} · Install")
-        driver.press(0, lambda root: any(t.startswith(f"Install {name}") for t in s.texts(root)),
+        # Its details open first, with Install selected.
+        driver.press(0, lambda root: s.find_all(root, role="button", name=f"Install {name}"), "the details")
+        time.sleep(2)
+        driver.press(0, lambda root: f"Install {name}?" in s.texts(root),
                      "the install dialog")
         self.capture(3)
 
@@ -683,7 +705,7 @@ class Scene:
                     break
                 except s.Failure:
                     pass
-        self.capture(1.5)
+        self.capture(4)  # past the start animation, which covers the window
 
     def alerts(self):
         s, found = self.s, []
@@ -727,6 +749,29 @@ class Scene:
         else:
             raise s.Failure("no already-running dialog")
         self.capture(2.5)
+
+
+    def scene_library(self):
+        self.library()
+        time.sleep(2)
+        self.dismiss_notifications()
+        self.capture(2)
+
+    def menu_item(self, pid, item):
+        s = self.s
+        self.library()
+        s.click_named(self.frame, f"More actions for {self.names[pid]}")
+        time.sleep(1)
+        s.click_named(self.app, item)
+
+    def scene_game_details(self):
+        self.menu_item(DETAILS, "Game details")
+        # Without the network the catalog's part of the page is an error line.
+        self.capture(5, crop=(170, 20, 1110, 570))
+
+    def scene_launch_settings(self):
+        self.menu_item(RUNNING, "Edit launch settings")
+        self.capture(3)
 
 
 def main():

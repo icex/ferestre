@@ -220,7 +220,12 @@ pub fn open(
 
     // "v1 · 2 GB · Playable", then a paragraph about the runtime.
     let (state, runtime) = known.split_once("\n\n").unwrap_or((known, ""));
-    let chips: Vec<String> = state.split("  ·  ").map(str::to_string).collect();
+    // The compatibility section below says these in full.
+    let chips: Vec<String> = state
+        .split("  ·  ")
+        .filter(|chip| *chip != report.label() && *chip != report.summary)
+        .map(str::to_string)
+        .collect();
     overview.append(&chip_box(&chips));
     if !runtime.is_empty() {
         let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);

@@ -11,14 +11,16 @@ scroll buttons), and featured cards. Each part shows only when it has something
 to show. A search, or fullscreen, shows the plain grid instead. Game Pass has
 the same carousel.
 
-My Library has four tabs: My games, Installed, Updates and Install queue. They
+My Library has five tabs: Installed, My games, Beyond Xbox, Updates and Install queue. They
 share one header and search field, so it stays in place when you change tabs.
 Library pages use large cover cards and the full window width; pressing a card
-starts its primary action. The always-visible More menu includes Launch, Game
+starts its primary action, or opens the details of a title that is not installed. The always-visible More menu includes Launch, Game
 details (with the Store page, the description and what Microsoft's catalog says),
 Edit launch settings and other actions. Installed games with a confirmed update
 show an Update available badge on their cover, including while running; current
-installs and unknown update checks show no badge. The search is a pill centred
+installs and unknown update checks show no badge. Every tile also says how well
+the game runs: Playable, Playable with issues, Untested or Not playable; Game
+details adds what was tested, when, and the known issues. The search is a pill centred
 above the page and looks through your library and Game Pass.
 
 The sidebar has Home, Game Pass and My Library, then the titles played recently,

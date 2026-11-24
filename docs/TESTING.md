@@ -137,7 +137,9 @@ synthetic "Player One". The GUI runs in
 a private virtual KWin session with the default renderer, so the dialog blur
 appears as it does for users. Artwork is public Store art copied from
 `~/.cache/ferestre/catalog`, stripped of everything but product metadata. The
-script refuses to start the GUI if the real home folder is reachable.
+script refuses to start the GUI if the real home folder is reachable. The
+fullscreen pictures preload a small library that reports a handheld's screen
+width, since the virtual screen has a desktop monitor's.
 
 ```sh
 CARGO_TARGET_DIR=/var/tmp/ferestre-readme-target nice cargo build --release --offline -p ferestre-gui
