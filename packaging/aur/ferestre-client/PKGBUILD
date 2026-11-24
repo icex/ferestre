@@ -10,7 +10,7 @@
 
 pkgname=ferestre-client
 pkgver=0.1.0.r166.ga31215b
-pkgrel=1
+pkgrel=2
 pkgdesc='Xodus client for Microsoft Store titles, with the Ferestre fixes (sign-in, licences, MSIXVC download and decrypt)'
 arch=('x86_64')
 url='https://github.com/icex/xodus'
@@ -47,6 +47,10 @@ conflicts=('xodus-cli' 'xodus-cli-git')
 
 # The same exact source commit as sources.lock.json and the AppImage build.
 _commit=a31215ba075350a723baec870647901f5ff915cd
+# GCC's LTO objects, from the C code in the crypto crates, are not something
+# Rust's own linker can read: the link fails with undefined symbols.
+options=('!lto')
+
 source=("xodus::git+$url.git#commit=$_commit")
 sha256sums=('SKIP')
 

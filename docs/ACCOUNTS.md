@@ -19,7 +19,7 @@ The **Store account** supplies game purchases, Game Pass subscriptions and conte
 
 Changes apply to the next launch. A running game keeps the account pair it started with. Selecting different accounts does not grant extra game access; Microsoft and publisher licence checks still apply.
 
-Separate Store/Player selection requires a compatible runtime. Current signed runtime **11.0.20261107.1** supports it; select a suitable runtime in Settings or the game's options if you previously chose an older one.
+Separate Store/Player selection requires a compatible runtime. Current signed runtime **11.0.20261124.1** supports it; select a suitable runtime in Settings or the game's options if you previously chose an older one.
 
 ## Saves and account changes
 

@@ -14,7 +14,7 @@
 # to /usr/lib/ferestre and not /usr/share.
 
 pkgname=ferestre-git
-pkgver=0.1.25
+pkgver=0.1.27
 pkgrel=1
 pkgdesc='Download and run the Microsoft Store and Xbox GDK titles you own, on Linux'
 arch=('x86_64')
@@ -58,6 +58,10 @@ provides=('ferestre')
 conflicts=('ferestre')
 
 install="$pkgname.install"
+
+# GCC's LTO objects, from the C code in the crypto crates, are not something
+# Rust's own linker can read: the link fails with undefined symbols.
+options=('!lto')
 
 source=("$pkgname::git+$url.git")
 sha256sums=('SKIP')
