@@ -39,7 +39,7 @@ prefix = 'drive_c/users/steamuser/AppData/Local/Packages/Microsoft.254428597CFE2
 note = "Local campaign checkpoints and settings. Cloud synchronization has not been qualified."
 
 [status]
-state = "playable"
+state = "playable-with-issues"
 summary = "Campaign, Academy training and multiplayer run; campaign save restoration was confirmed locally. Intermittent offline display remains under investigation."
 last-verified = 2026-10-10
 verified-with = "Game Pass Ultimate, package 1.4206.46191.0; live Warship Gbraakon gameplay, user-confirmed saving, campaign handoff/relaunch and clean process exit; 216 general and 46 manual-queue checks"
