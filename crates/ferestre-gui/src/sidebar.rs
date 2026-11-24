@@ -54,10 +54,11 @@ fn status(ui: &Ui, row: &LibraryRow, downloading: Option<&str>) -> Option<Status
             "action-unavailable-symbolic",
         ));
     }
-    match row.badge.map(|(label, _)| label) {
-        Some("Issues") => Some(("Playable with issues".into(), "dialog-warning-symbolic")),
-        Some("Menus only") => Some(("Menus only".into(), "dialog-warning-symbolic")),
-        Some("Does not run") => Some(("Does not run".into(), "dialog-error-symbolic")),
+    match Some(ui.model.borrow().compatibility(row).label()) {
+        Some("Playable with issues") => {
+            Some(("Playable with issues".into(), "dialog-warning-symbolic"))
+        }
+        Some("Not playable") => Some(("Not playable".into(), "dialog-error-symbolic")),
         _ => None,
     }
 }

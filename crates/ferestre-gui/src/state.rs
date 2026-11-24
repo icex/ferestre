@@ -110,6 +110,8 @@ pub struct Model {
     pub refused: BTreeSet<String>,
     pub paths: Option<Paths>,
     pub recipes: Vec<Recipe>,
+    /// What the packaged recipes say of how titles run.
+    pub reports: BTreeMap<String, crate::compat::Report>,
     /// The automatic default, used for compatibility rows.
     pub runtime: Option<InstalledRuntime>,
     /// Every runtime the person can choose from on this machine.
@@ -371,6 +373,11 @@ impl Model {
             .as_ref()
             .map(|p| load_recipes(&p.title_dirs()))
             .unwrap_or_default();
+        let reports = paths
+            .as_ref()
+            .and_then(Paths::titles_dir)
+            .map(|dir| crate::compat::packaged(&load_recipes(&[dir.to_path_buf()]).0))
+            .unwrap_or_default();
         let registry = paths
             .as_ref()
             .and_then(Paths::titles_dir)
@@ -533,6 +540,7 @@ impl Model {
             refused: BTreeSet::new(),
             paths,
             recipes,
+            reports,
             runtime,
             runtimes,
             local_runtimes,
@@ -562,6 +570,15 @@ impl Model {
             problem,
             probes: Default::default(),
         }
+    }
+
+    /// How well a row's title is known to run; a bundle's is its game's.
+    pub fn compatibility(&self, row: &crate::model::LibraryRow) -> crate::compat::Report {
+        let game = row.install_as.as_ref().map(|(id, _)| id.as_str());
+        let ids: Vec<&str> = std::iter::once(row.product_id.as_str())
+            .chain(game)
+            .collect();
+        crate::compat::report(&self.reports, &self.recipes, &ids)
     }
 
     /// Reload from disk, keeping what was fetched. Account-private state
@@ -1506,6 +1523,7 @@ mod tests {
             refused: Default::default(),
             paths: Some(paths),
             recipes: Vec::new(),
+            reports: BTreeMap::new(),
             runtime: None,
             runtimes: Vec::new(),
             local_runtimes: Vec::new(),

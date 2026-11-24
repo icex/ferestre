@@ -14,6 +14,7 @@ mod app_updates;
 mod artwork;
 mod cancel;
 mod client_check;
+mod compat;
 mod controller;
 mod deadline;
 mod details_ui;
@@ -294,6 +295,10 @@ button.see-all { padding: 0 14px; font-weight: 600; color: #c9ccd2; }
 .featured-title { font-size: 20px; }
 .tile-subtitle { font-size: 13px; color: alpha(#ffffff, 0.82); }
 .tile-badge { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; background-color: alpha(#ffffff, 0.16); color: #ffffff; }
+.compat-warning { padding: 10px 12px; border-radius: 7px; background-color: alpha(#f2ca64, 0.14); }
+.compat-warning > image { color: #f2ca64; }
+.compat-shade { padding: 28px 8px 8px; }
+.tile-badge.untested { background-color: alpha(#ffffff, 0.16); color: #d4d6da; }
 .tile-badge.ok { background-color: alpha(#8bd77b, 0.24); color: #c9f2bf; }
 .tile-badge.update { background-color: #f2ca64; color: #171b20; }
 .tile-badge.warning { background-color: alpha(#f2ca64, 0.25); color: #f7dc95; }
@@ -3114,7 +3119,8 @@ fn game_card(ui: &Ui, row: &LibraryRow, tile: page_fit::Tile) -> adw::Clamp {
                 gtk::Align::End
             })
             .margin_top(6)
-            .margin_bottom(6)
+            // Above the compatibility badge.
+            .margin_bottom(38)
             .margin_start(6)
             .margin_end(6)
             .css_classes(["game-update-badge"])
@@ -3131,6 +3137,17 @@ fn game_card(ui: &Ui, row: &LibraryRow, tile: page_fit::Tile) -> adw::Clamp {
         words.update_property(&[gtk::accessible::Property::Label("Update available")]);
         badge.append(&words);
         cover.add_overlay(&badge);
+    }
+    let compat = compat::badge(&ui.model.borrow().compatibility(row));
+    if !tile.compact {
+        // On a shade, as in "Jump back in": covers are any colour.
+        let shade = gtk::Box::builder()
+            .valign(gtk::Align::End)
+            .css_classes(["tile-caption", "compat-shade"])
+            .can_target(false)
+            .build();
+        shade.append(&compat);
+        cover.add_overlay(&shade);
     }
     body.append(&cover);
     let text = gtk::Box::builder()
@@ -3154,6 +3171,7 @@ fn game_card(ui: &Ui, row: &LibraryRow, tile: page_fit::Tile) -> adw::Clamp {
         text.add_css_class("compact-caption");
         text.set_valign(gtk::Align::End);
         text.set_can_target(false);
+        text.append(&compat);
     }
     let title = gtk::Label::builder()
         .label(&row.name)
@@ -3445,8 +3463,12 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> Components 
         details.push(format!("v{}", version.trim_start_matches("Version ")));
     }
     details.push(size_text);
-    if let Some((badge, _)) = row.badge {
+    let report = ui.model.borrow().compatibility(row);
+    if let Some((badge, _)) = row.badge.filter(|_| row.local) {
         details.push(badge.to_string());
+    }
+    if row.badge.is_some() {
+        details.push(report.label().to_string());
     }
     if !description.is_empty() {
         details.push(description.to_string());
@@ -3592,6 +3614,7 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> Components 
             &detail_id,
             &detail_name,
             &detail_text,
+            &report,
             local,
             &detail_main,
         );
@@ -7380,6 +7403,7 @@ mod catalog_regressions {
             refused: Default::default(),
             paths: None,
             recipes: Vec::new(),
+            reports: Default::default(),
             runtime: None,
             runtimes: Vec::new(),
             local_runtimes: Vec::new(),

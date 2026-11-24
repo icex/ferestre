@@ -168,7 +168,15 @@ impl Main {
 
 /// `known` is what the window knows already. A local game has no Store page,
 /// and its id is not sent anywhere.
-pub fn open(ui: &Ui, product_id: &str, name: &str, known: &str, local: bool, main: &[Main]) {
+pub fn open(
+    ui: &Ui,
+    product_id: &str,
+    name: &str,
+    known: &str,
+    report: &compat::Report,
+    local: bool,
+    main: &[Main],
+) {
     let dialog = adw::Dialog::builder()
         .title(name)
         .content_width(900)
@@ -220,6 +228,7 @@ pub fn open(ui: &Ui, product_id: &str, name: &str, known: &str, local: bool, mai
         line.append(&label(runtime, &["caption", "dim-label"]));
         overview.append(&line);
     }
+    overview.append(&compat::section(report));
     let mut page_parts = None;
     if !local {
         let content = adw::ButtonContent::builder()

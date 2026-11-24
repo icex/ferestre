@@ -896,12 +896,7 @@ fn landscape(ui: &Ui, row: &LibraryRow) -> gtk::Widget {
     } else if row.unavailable.is_some() {
         ("Unavailable", "warning")
     } else {
-        match row.badge.map(|b| b.0) {
-            Some("Issues") => ("Playable with issues", "warning"),
-            Some("Menus only") => ("Menus only", "warning"),
-            Some("Does not run") => ("Does not run", "error"),
-            _ => ("Installed", "ok"),
-        }
+        ui.model.borrow().compatibility(row).badge()
     };
     let caption = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
