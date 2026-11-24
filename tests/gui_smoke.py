@@ -361,9 +361,11 @@ def click_named(root, name, what=None):
         for candidate in find_all(root, name=name):
             action, useful = press_actions(candidate)
             if useful:
-                index = next(i for i in range(action.get_n_actions())
-                             if action.get_action_name(i) == useful[0])
-                return candidate, action, index
+                # Gone between the two questions: not yet, as in wait_for.
+                index = next((i for i in range(action.get_n_actions())
+                              if action.get_action_name(i) == useful[0]), None)
+                if index is not None:
+                    return candidate, action, index
         return None
     candidate, action, index = wait_for(root, ready, what or f"clickable {name!r}", time.monotonic()+TIMEOUT)
     action.do_action(index)
