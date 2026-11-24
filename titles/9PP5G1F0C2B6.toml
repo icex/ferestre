@@ -40,7 +40,7 @@ note = "Local campaign checkpoints and settings. Cloud synchronization has not b
 
 [status]
 state = "playable"
-summary = "Campaign, Academy training and multiplayer run; campaign save restoration was confirmed locally. Intermittent offline display remains under investigation."
+summary = "Campaign, Academy training and multiplayer run; campaign save restoration was confirmed locally. The earlier intermittent offline display was reported resolved by the player on 2026-11-24."
 last-verified = 2026-10-10
 verified-with = "Game Pass Ultimate, package 1.4206.46191.0; live Warship Gbraakon gameplay, user-confirmed saving, campaign handoff/relaunch and clean process exit; 216 general and 46 manual-queue checks"
 
@@ -59,7 +59,7 @@ log-match = "Thread not registered"
 [[issues]]
 symptom = "The game sometimes displays the account as offline"
 cause = "Not established. Captured sign-in, presence, profile and session requests succeeded; the observed HTTP 400s were image requests."
-fix = "Under investigation; no proven workaround."
+fix = "Reported resolved by the player on 2026-11-24. Update the launcher and runtime together."
 
 [[issues]]
 symptom = "A startup dialog says the Microsoft Store and Xbox Live users differ"

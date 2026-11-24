@@ -19,7 +19,7 @@ requires = [
 ]
 
 [status]
-state = "playable"
+state = "playable-with-issues"
 summary = "Xbox sign-in and two hours of play confirmed by the player with callback waits enabled. A first launch can close while it prepares shaders; see the issues below."
 last-verified = 2026-11-22
 verified-with = "Xbox PC package 1.0.22.0 with a runtime carrying icex/xgameruntime#1; tests/account_roles.c --callback-order."

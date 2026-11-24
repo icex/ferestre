@@ -26,10 +26,6 @@ use crate::model::Ownership;
 /// The gamerpic host serves only certain sizes; `account::supported_avatar_size`
 /// is what guarantees this is one of them.
 pub const AVATAR_PX: u32 = 64;
-/// Rows per page. Enough that scrolling is normal, few enough that a page of
-/// icons is a handful of requests rather than a hundred.
-pub const PER_PAGE: usize = 20;
-
 /// Which section of the window is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
@@ -37,20 +33,50 @@ pub enum Section {
     Library,
     GamePass,
     Installed,
+    /// Installed games that did not come from the Xbox store: Steam and local.
+    Elsewhere,
     Updates,
     Runtime,
     Downloads,
 }
 
 impl Section {
+    /// My Library's tabs.
+    pub const LIBRARY_TABS: [Section; 5] = [
+        Section::Installed,
+        Section::Library,
+        Section::Elsewhere,
+        Section::Updates,
+        Section::Downloads,
+    ];
+
+    /// The sidebar's row for it. My Library's tabs share one.
+    pub fn nav(self) -> Section {
+        match self {
+            Section::Installed | Section::Elsewhere | Section::Updates | Section::Downloads => {
+                Section::Library
+            }
+            section => section,
+        }
+    }
+
+    /// What the sidebar's row for it opens: My Library starts on Installed.
+    pub fn landing(self) -> Section {
+        match self {
+            Section::Library => Section::Installed,
+            section => section,
+        }
+    }
+
     pub const NAV: [Section; 3] = [Section::Home, Section::GamePass, Section::Library];
 
-    pub fn title(self) -> &'static str {
+    pub const fn title(self) -> &'static str {
         match self {
             Section::Home => "Home",
             Section::Library => "My Library",
             Section::GamePass => "Game Pass",
             Section::Installed => "Installed",
+            Section::Elsewhere => "Beyond Xbox",
             Section::Updates => "Updates",
             Section::Runtime => "Runtime",
             Section::Downloads => "Downloads",
@@ -63,6 +89,7 @@ impl Section {
             Section::Library => "view-grid-symbolic",
             Section::GamePass => "emblem-shared-symbolic",
             Section::Installed => "drive-harddisk-symbolic",
+            Section::Elsewhere => "applications-games-symbolic",
             Section::Updates => "software-update-available-symbolic",
             Section::Runtime => "applications-engineering-symbolic",
             Section::Downloads => "folder-download-symbolic",
@@ -83,6 +110,8 @@ pub struct Model {
     pub refused: BTreeSet<String>,
     pub paths: Option<Paths>,
     pub recipes: Vec<Recipe>,
+    /// What the packaged recipes say of how titles run.
+    pub reports: BTreeMap<String, crate::compat::Report>,
     /// The automatic default, used for compatibility rows.
     pub runtime: Option<InstalledRuntime>,
     /// Every runtime the person can choose from on this machine.
@@ -124,6 +153,8 @@ pub struct Model {
     /// The merchandised "All PC Games" ids within `gamepass`; the rest came
     /// from the tier feed and must be confirmed by the catalog to be listed.
     pub gamepass_merchandised: BTreeSet<String>,
+    /// The most popular of them, in order. `None` when never asked.
+    pub gamepass_popular: Option<Vec<String>>,
     pub subscriptions: Vec<&'static str>,
     pub entitlements_checked: bool,
     /// Which subscription tiers include which products. Joined against
@@ -134,7 +165,6 @@ pub struct Model {
     /// destroys them and the person's place in the list should survive it.
     pub section: Section,
     pub query: String,
-    pub page: usize,
     /// Whether to list titles whose package this runtime cannot open. Off by
     /// default because they are the overwhelming majority -- 95 of 102 on the
     /// development account -- and a list where the seven that work are buried
@@ -343,6 +373,11 @@ impl Model {
             .as_ref()
             .map(|p| load_recipes(&p.title_dirs()))
             .unwrap_or_default();
+        let reports = paths
+            .as_ref()
+            .and_then(Paths::titles_dir)
+            .map(|dir| crate::compat::packaged(&load_recipes(&[dir.to_path_buf()]).0))
+            .unwrap_or_default();
         let registry = paths
             .as_ref()
             .and_then(Paths::titles_dir)
@@ -424,7 +459,7 @@ impl Model {
         let cached = paths
             .as_ref()
             .and_then(|p| gamepass::load_cache(p.state_dir(), &market));
-        let (gamepass, gamepass_merchandised, tiers) = match cached {
+        let (gamepass, gamepass_merchandised, tiers, gamepass_popular) = match cached {
             Some(listing) => (
                 gamepass::complete_listing(&listing.product_ids, &listing.tiers),
                 listing
@@ -433,8 +468,14 @@ impl Model {
                     .map(|id| id.to_ascii_uppercase())
                     .collect(),
                 listing.tiers,
+                listing.popular,
             ),
-            None => (Vec::new(), BTreeSet::new(), gamepass::Tiers::default()),
+            None => (
+                Vec::new(),
+                BTreeSet::new(),
+                gamepass::Tiers::default(),
+                None,
+            ),
         };
         // Cached Game Pass rows must draw before background revalidation too.
         if let Some(paths) = &paths {
@@ -499,6 +540,7 @@ impl Model {
             refused: BTreeSet::new(),
             paths,
             recipes,
+            reports,
             runtime,
             runtimes,
             local_runtimes,
@@ -518,16 +560,25 @@ impl Model {
             avatar,
             gamepass,
             gamepass_merchandised,
+            gamepass_popular,
             subscriptions,
             entitlements_checked,
             tiers,
             section: Section::Home,
             query: String::new(),
-            page: 0,
             show_unsupported: false,
             problem,
             probes: Default::default(),
         }
+    }
+
+    /// How well a row's title is known to run; a bundle's is its game's.
+    pub fn compatibility(&self, row: &crate::model::LibraryRow) -> crate::compat::Report {
+        let game = row.install_as.as_ref().map(|(id, _)| id.as_str());
+        let ids: Vec<&str> = std::iter::once(row.product_id.as_str())
+            .chain(game)
+            .collect();
+        crate::compat::report(&self.reports, &self.recipes, &ids)
     }
 
     /// Reload from disk, keeping what was fetched. Account-private state
@@ -580,10 +631,10 @@ impl Model {
             icons,
             gamepass: std::mem::take(&mut self.gamepass),
             gamepass_merchandised: std::mem::take(&mut self.gamepass_merchandised),
+            gamepass_popular: self.gamepass_popular.take(),
             tiers: std::mem::take(&mut self.tiers),
             section: self.section,
             query: std::mem::take(&mut self.query),
-            page: self.page,
             show_unsupported: self.show_unsupported,
             ..fresh
         };
@@ -898,7 +949,7 @@ impl Model {
         Folder::Other
     }
 
-    /// The folder "Remove from disk" deletes, found the way `ferestre
+    /// The folder "Delete" deletes, found the way `ferestre
     /// uninstall` finds it: the record, then the recipe's directory, then
     /// games_dir/<product id>. A stopped download has no record, and those are
     /// exactly the folders that most need removing.
@@ -1036,6 +1087,37 @@ impl Model {
 
     pub fn catalog_cache(&self) -> Option<Cache> {
         self.paths.as_ref().map(Paths::catalog_cache)
+    }
+
+    /// `rows` with the most popular on Game Pass first, the rest as they were.
+    pub fn by_popularity<'a>(
+        &self,
+        rows: &'a [crate::model::LibraryRow],
+    ) -> Vec<&'a crate::model::LibraryRow> {
+        let popular = self.gamepass_popular.as_deref().unwrap_or_default();
+        let place = |id: &str| popular.iter().position(|p| p.eq_ignore_ascii_case(id));
+        let bundles = |bundle: &str, row: &crate::model::LibraryRow| {
+            self.catalog
+                .get(&bundle.to_ascii_uppercase())
+                .is_some_and(|p| {
+                    p.bundled_ids
+                        .iter()
+                        .any(|id| id.eq_ignore_ascii_case(&row.product_id))
+                })
+        };
+        let mut rows: Vec<_> = rows.iter().collect();
+        rows.sort_by_cached_key(|row| {
+            place(&row.product_id)
+                .or_else(|| place(&row.install_as.as_ref()?.0))
+                // Installed, it is listed as itself and not as its bundle.
+                .or_else(|| {
+                    popular
+                        .iter()
+                        .position(|p| row.installed && bundles(p, row))
+                })
+                .unwrap_or(usize::MAX)
+        });
+        rows
     }
 
     pub fn cache_dir(&self) -> Option<&Path> {
@@ -1441,6 +1523,7 @@ mod tests {
             refused: Default::default(),
             paths: Some(paths),
             recipes: Vec::new(),
+            reports: BTreeMap::new(),
             runtime: None,
             runtimes: Vec::new(),
             local_runtimes: Vec::new(),
@@ -1460,12 +1543,12 @@ mod tests {
             avatar: None,
             gamepass: Vec::new(),
             gamepass_merchandised: Default::default(),
+            gamepass_popular: None,
             subscriptions: Vec::new(),
             entitlements_checked: false,
             tiers: Default::default(),
             section: Section::Library,
             query: String::new(),
-            page: 0,
             show_unsupported: false,
             problem: None,
             probes: Default::default(),

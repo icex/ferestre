@@ -20,8 +20,8 @@ requires = ["loader.memfd-main-image", "xgameruntime.user", "winhttp.http2"]
 wants = ["appmodel.package-identity"]
 
 [status]
-state = "playable-with-issues"
-summary = "Xbox sign-in and tutorial gameplay verified with HTTP/2. Online deployment was observed. An intermittent crash occurred on an earlier lobby entry."
+state = "playable"
+summary = "Xbox sign-in and tutorial gameplay verified with HTTP/2. Online deployment was observed. An earlier intermittent lobby crash was reported resolved by the player on 2026-11-24."
 last-verified = 2026-11-21
 verified-with = "Xbox PC package 1.5.0.0 on CachyOS with the local Ferestre HTTP/2 runtime"
 

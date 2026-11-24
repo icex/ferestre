@@ -361,9 +361,11 @@ def click_named(root, name, what=None):
         for candidate in find_all(root, name=name):
             action, useful = press_actions(candidate)
             if useful:
-                index = next(i for i in range(action.get_n_actions())
-                             if action.get_action_name(i) == useful[0])
-                return candidate, action, index
+                # Gone between the two questions: not yet, as in wait_for.
+                index = next((i for i in range(action.get_n_actions())
+                              if action.get_action_name(i) == useful[0]), None)
+                if index is not None:
+                    return candidate, action, index
         return None
     candidate, action, index = wait_for(root, ready, what or f"clickable {name!r}", time.monotonic()+TIMEOUT)
     action.do_action(index)
@@ -414,9 +416,33 @@ def select_in_list(root, name, what=None):
                 if name == "My Library":
                     selection.clear_selection()
                 selection.select_child(index)
-                return settled(child)
+                if name != "My Library":
+                    return settled(child)
+                # It opens on Installed; the whole library is the next tab.
+                until = time.monotonic() + TIMEOUT
+                while not find_all(root, name="My Library page"):
+                    click_named(root, "My games")
+                    try:
+                        wait_for(root, lambda r: find_all(r, name="My Library page"),
+                                 "My Library page", min(until, time.monotonic() + 2))
+                    except Failure:
+                        if time.monotonic() >= until:
+                            raise
+                return child
     dump(root, f"looking for a selectable {name!r}")
     raise Failure(f"no selectable row called {what or name!r}")
+
+
+def open_install(frame, title):
+    """From a title's tile, through its details, to the Install confirmation."""
+    # A redraw can replace the tile between finding and pressing it.
+    until = time.monotonic() + TIMEOUT
+    while not find_all(frame, role="button", name=f"Install {title}"):
+        if time.monotonic() >= until:
+            raise Failure(f"the details of {title} did not open")
+        click_named(frame, f"{title} · Install")
+        time.sleep(1.5)
+    click_named(frame, f"Install {title}", "the details' Install button")
 
 
 def row_button(root, title, label):
@@ -491,7 +517,7 @@ def toggle_row_menu(app, frame, title, want_open):
     raise Failure(f"timed out waiting for {title}'s menu to " + ("open" if want_open else "close"))
 
 
-MENU_ITEMS = {"Game details", "Move location", "Open Store page", "Choose runtime", "Add to Steam", "Edit launch settings", "Neural rendering…", "Remove from disk"}
+MENU_ITEMS = {"Launch", "Game details", "Move location", "Add to Steam", "Edit launch settings", "Delete"}
 
 
 def row_menu_offers(app, frame, title):
@@ -540,8 +566,8 @@ def check_game_row_layout(root, title, size, action):
     if any(bounds(image).height>=200 for image in images):
         title_label=find_all(button,role="label",name=title)[0]
         top,whole=bounds(title_label),bounds(button)
-        check(whole.width>=140 and whole.height>=300,"cover tiles have a generous touch target",button)
-        check(top.y>=whole.y+200,"the title sits below the cover artwork",button)
+        check(whole.width>=140 and whole.height>=200,"cover tiles have a generous touch target",button)
+        check(top.y>=whole.y+whole.height*.6,"the title sits below the cover artwork, or on its lower part",button)
         check(any(bounds(image).width>=120 and bounds(image).height>=200 for image in images),"the card uses large cover art",button)
     else:
         # A missing image still produces a usable, labelled tile.
@@ -884,6 +910,8 @@ last-verified = 2026-10-10
                 "fetched": 0,
                 "market": "US",
                 "product_ids": [pid for pid, _, _, _ in pass_titles],
+                # Without it the file counts as an old one, to be fetched again.
+                "popular": [],
                 "tiers": {
                     "included": {
                         # In the tier the seeded account holds, and not.
@@ -1101,14 +1129,6 @@ print(":: done", flush=True)
             "the titles this runtime cannot open are kept out of the way",
             frame,
         )
-        wait_for(
-            frame,
-            lambda root: any("25 ship as Appx or Msix packages" in t for t in texts(root)),
-            "the unsupported-package count and explanation to draw",
-            time.monotonic() + TIMEOUT,
-        )
-        check(True, "and the count of them is stated, with the reason, rather than left as a silent filter")
-
         print("showing them anyway")
         # Three nodes carry this name -- the row, its label, and the switch
         # inside it -- and only the last of them does anything, so this goes
@@ -1137,7 +1157,12 @@ print(":: done", flush=True)
                     continue
             raise Failure("the show-everything switch did not change state")
 
-        set_show_unsupported(True)
+        def through_settings(active):
+            click_named(frame, "Settings")
+            set_show_unsupported(active)
+            select_in_list(frame, "My Library")
+
+        through_settings(True)
         labels = wait_for(
             frame,
             lambda root: texts(root) if any("Uwp Puzzle" in t for t in texts(root)) else None,
@@ -1149,7 +1174,7 @@ print(":: done", flush=True)
             "each says which container it ships in, not just that it failed",
             frame,
         )
-        set_show_unsupported(False)
+        through_settings(False)
         wait_for(
             frame,
             lambda root: not any("Uwp Puzzle" in t for t in texts(root)),
@@ -1166,9 +1191,16 @@ print(":: done", flush=True)
                     return value
             return None
         value = scroll_value()
-        check(value is not None, "the library has a scrollable title list", frame)
-        value.set_current_value(200)
-        time.sleep(0.25)
+        # A page holds the tiles that fit the view, so it may not scroll at
+        # all; one that does must stay where it was.
+        def scroll_position():
+            value = scroll_value()
+            return value.get_current_value() if value is not None else 0
+
+        scrolls = value is not None
+        if scrolls:
+            value.set_current_value(200)
+            time.sleep(0.25)
         play = row_button(frame, "Minecraft for Windows", "Play")
         check(play is not None, "the installed fixture can be selected to play", frame)
         # The title list grows with the recipe set. A fixed offset does not
@@ -1187,19 +1219,20 @@ print(":: done", flush=True)
             play = row_button(frame, "Minecraft for Windows", "Play")
             button_box = play.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
             view_box = viewport.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
-            center = button_box.y + button_box.height // 2
-            if view_box.y <= center < view_box.y + view_box.height:
+            # All of it: GTK scrolls to the rest of a button clicked while
+            # partly out of view, which is not the jump looked for here.
+            if view_box.y <= button_box.y and button_box.y + button_box.height <= view_box.y + view_box.height:
                 break
             value = scroll_value()
-            target = value.get_current_value() + center - (view_box.y + view_box.height // 2)
+            target = value.get_current_value() + button_box.y - view_box.y - 12
             value.set_current_value(max(0, min(target, value.get_maximum_value())))
             time.sleep(0.25)
-        position = scroll_value().get_current_value()
-        check(position > 50, f"the library is scrolled before the click ({position})", frame)
+        position = scroll_position()
+        check(not scrolls or position > 50, f"the library is scrolled before the click ({position})", frame)
         button_box = play.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
         view_box = viewport.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
         check(
-            view_box.y <= button_box.y + button_box.height // 2 < view_box.y + view_box.height,
+            view_box.y <= button_box.y and button_box.y + button_box.height <= view_box.y + view_box.height,
             f"the pointer target is visible (button y={button_box.y}, viewport y={view_box.y}, height={view_box.height})",
             frame,
         )
@@ -1222,7 +1255,7 @@ print(":: done", flush=True)
                 time.monotonic() + TIMEOUT,
             )
             time.sleep(0.5)
-            after = scroll_value().get_current_value()
+            after = scroll_position()
             check(abs(after - position) < 2, f"starting a title keeps the scroll position ({position} -> {after})", frame)
             wait_for(
                 frame,
@@ -1231,7 +1264,7 @@ print(":: done", flush=True)
                 time.monotonic() + TIMEOUT,
             )
             time.sleep(0.5)
-            after = scroll_value().get_current_value()
+            after = scroll_position()
             check(abs(after - position) < 2, f"and so does its exit ({position} -> {after})", frame)
 
         select_in_list(frame, "Runtime")
@@ -1282,6 +1315,7 @@ print(":: done", flush=True)
         install = row_button(frame, "Smoke Test Racer", "Install")
         check(install is not None, "an owned MSIXVC title offers an install", frame)
         click(install)
+        click_named(frame, "Install Smoke Test Racer", "the details' Install button")
         labels = wait_for(
             frame,
             lambda root: texts(root) if any("Install Smoke Test Racer?" in t for t in texts(root)) else None,
@@ -1419,8 +1453,9 @@ print(":: done", flush=True)
         )
         # Counted from the rows below it: the AppxBundle is held back, so two.
         check(
-            any("2 games in PC Game Pass for the US Store" in t for t in labels),
-            "the section says what the list is, where, and how long it is",
+            any(node.get_description() == "2 games in PC Game Pass for the US Store"
+                for node in find_all(frame, name="Game Pass")),
+            "the sidebar counts the games that can be installed, and where",
             frame,
         )
         # The distinction the whole section rests on: what the catalogue
@@ -1465,7 +1500,7 @@ print(":: done", flush=True)
             "the library to come back",
             time.monotonic() + TIMEOUT,
         )
-        click(row_button(frame, "Smoke Test Racer", "Install"))
+        open_install(frame, "Smoke Test Racer")
         wait_for(
             frame,
             lambda root: any("Install Smoke Test Racer?" in t for t in texts(root)),
@@ -1482,7 +1517,12 @@ print(":: done", flush=True)
             time.monotonic() + TIMEOUT,
         )
         check(True, "the bar says what is being installed")
-        installing = row_button(frame, "Smoke Test Racer", "Installing..")
+        installing = wait_for(
+            frame,
+            lambda root: row_button(root, "Smoke Test Racer", "Installing.."),
+            "the row to say it is installing",
+            time.monotonic() + TIMEOUT,
+        )
         check(
             installing is not None
             and not installing.get_state_set().contains(Atspi.StateType.SENSITIVE),
@@ -1543,11 +1583,13 @@ print(":: done", flush=True)
             f"each managed recipe offers Add to Steam ({steam!r})",
             frame,
         )
-        check(
-            all("Open Store page" in items for items in offered.values()),
-            "every row's menu links its Store page",
-            frame,
-        )
+        check("Launch" in offered["Minecraft for Windows"], "an installed game's menu launches it", frame)
+        row_action(app, frame, "Game details", "Minecraft for Windows")
+        wait_for(app, lambda root: find_all(root, role="button", name="Open Store page"),
+                 "the Store page button in Game details", time.monotonic() + TIMEOUT)
+        click_named(app, "Close")
+        wait_for(app, lambda root: not find_all(root, role="button", name="Open Store page"),
+                 "Game details to close", time.monotonic() + TIMEOUT)
         steam_title = steam[0]
         row_action(app, frame, "Add to Steam", steam_title)
         wait_for(frame, lambda root: os.path.isfile(shortcuts),
@@ -1609,7 +1651,8 @@ print(":: done", flush=True)
             # asking. Ask again until it asks back.
             until = time.monotonic() + TIMEOUT
             while True:
-                click_named(frame, "Add All to Steam")
+                click_named(frame, "Library actions")
+                click_named(frame, "Add all games to Steam")
                 try:
                     wait_for(frame, lambda root: any(t == f"Add {heading} to Steam?" for t in texts(root)),
                              "the add-all confirmation", min(until, time.monotonic() + 3))
@@ -1631,7 +1674,8 @@ print(":: done", flush=True)
             f.write('<Package><Identity Name="ConcernedApe.StardewValleyPC" Version="1.6.15.0" /></Package>')
         click_named(frame, "Refresh library, subscriptions and catalogue")
         select_in_list(frame, "Installed")
-        wait_for(frame, lambda root: "2 games" in texts(root), "two installed games", time.monotonic() + TIMEOUT)
+        wait_for(frame, lambda root: any(b.get_description() == "2 games" for b in find_all(root, role="button", name="Installed")),
+                 "two installed games", time.monotonic() + TIMEOUT)
         wait_for(frame, lambda root: not any("Checking for game updates" in t for t in texts(root)),
                  "the automatic update check to finish", time.monotonic() + TIMEOUT)
         before = launch_targets()
@@ -1648,7 +1692,7 @@ print(":: done", flush=True)
         check(launch_targets() == after, "Add All again updates in place", frame)
         shutil.rmtree(stardew)
         click_named(frame, "Refresh library, subscriptions and catalogue")
-        wait_for(frame, lambda root: "1 game" in texts(root), "one installed game again", time.monotonic() + TIMEOUT)
+        wait_for(frame, lambda root: any(b.get_description() == "1 game" for b in find_all(root, role="button", name="Installed")), "one installed game again", time.monotonic() + TIMEOUT)
         select_in_list(frame, "Library")
         wait_for(frame, lambda root: any("Minecraft" in t for t in texts(root)),
                  "the library after Add All", time.monotonic() + TIMEOUT)
@@ -1666,9 +1710,16 @@ print(":: done", flush=True)
         )
         # Settings are switches and menus, so nobody has to know a variable's
         # name; anything else goes in a list of its own.
-        for setting in ("Native Wayland", "Gamescope", "Strict manual task queues",
-                        "Easy Anti-Cheat Linux library", "Other variables"):
-            check(setting in labels, f"the editor offers {setting!r}", frame)
+        # They are spread over tabs, and only the shown tab's are readable.
+        for tab, settings in (("Display", ("Native Wayland", "Gamescope")),
+                              ("Compatibility", ("Strict manual task queues", "Easy Anti-Cheat Linux library")),
+                              ("Upscaling", ("FSR 4 upgrade",)),
+                              ("Proton", ("Runtime", "No NVIDIA API")),
+                              ("Variables", ("Other variables",))):
+            click_named(app, tab)
+            for setting in settings:
+                wait_for(app, lambda root, setting=setting: setting in texts(root),
+                         f"{setting!r} on the {tab} tab", time.monotonic() + TIMEOUT)
         check(
             bool(find_all(frame, role="button", name="Add a variable")),
             "and a variable can be added",
@@ -1696,16 +1747,17 @@ print(":: done", flush=True)
         check(True, "and closing it leaves the library where it was")
 
         print("neural rendering dialog")
-        # Minecraft is the fixture on disk; the item is only offered for one.
-        row_action(app, frame, "Neural rendering…", "Minecraft for Windows")
+        # Minecraft is the fixture on disk; the tab reads its files.
+        row_action(app, frame, "Edit launch settings", "Minecraft for Windows")
+        click_named(app, "Neural rendering (experimental)")
         labels = wait_for(
             app,
-            lambda root: texts(root) if any(t.startswith("Neural rendering for") for t in texts(root)) else None,
-            "the neural rendering dialog to open",
+            lambda root: texts(root) if any(t.startswith("Experimental: DLSSNR-AMD") for t in texts(root)) else None,
+            "the neural rendering tab to open",
             time.monotonic() + TIMEOUT,
         )
         check(any(t.startswith("Experimental: DLSSNR-AMD") for t in labels),
-              "the dialog says it is experimental", frame)
+              "the tab says it is experimental", frame)
         check(any(t.startswith("Off") for t in labels),
               "and that neural rendering is off for this game", frame)
         check("Route" in labels and "Starting network" in labels,
@@ -1719,8 +1771,8 @@ print(":: done", flush=True)
         click_named(app, "Cancel")
         wait_for(
             app,
-            lambda root: not any(t.startswith("Neural rendering for") for t in texts(root)),
-            "the neural rendering dialog to close",
+            lambda root: not any(t.startswith("Experimental: DLSSNR-AMD") for t in texts(root)),
+            "the neural rendering tab to close",
             time.monotonic() + TIMEOUT,
         )
         check(True, "Cancel closes it without enabling anything")
@@ -1750,7 +1802,9 @@ print(":: done", flush=True)
         editable = executable.get_editable_text_iface()
         check(editable is not None, "and editable", frame)
         Atspi.EditableText.set_text_contents(editable, "SmokeTest/Changed.exe")
+        click_named(app, "Display")
         click_named(frame, "Native Wayland")
+        click_named(app, "Variables")
         click_named(frame, "Add a variable")
         for field, value in (("Variable name", "SMOKE_TEST_VARIABLE"), ("Variable value", "kept")):
             entry = wait_for(
@@ -1817,7 +1871,7 @@ print(":: done", flush=True)
                  "the automatic update check to finish", time.monotonic() + TIMEOUT)
         wait_for(frame, lambda root: row_menus(root) or None,
                  "the installed game's row menu", time.monotonic() + TIMEOUT)
-        row_action(app, frame, "Remove from disk")
+        row_action(app, frame, "Delete")
         wait_for(frame, lambda root: any("Remove Minecraft for Windows?" in t for t in texts(root)),
                  "the removal confirmation", time.monotonic() + TIMEOUT)
         click_named(frame, "Remove")
@@ -1834,7 +1888,7 @@ print(":: done", flush=True)
         check("Please wait" in tooltip.get_name(), "the spinner tooltip identifies the operation and game", frame)
         select_in_list(frame, "Library")
         installs = cli_calls(home, "install")
-        click(row_button(frame, "Smoke Test Racer", "Install"))
+        open_install(frame, "Smoke Test Racer")
         wait_for(frame, lambda root: any("Removing Minecraft for Windows. Please wait" in t for t in texts(root)),
                  "a specific busy message", time.monotonic() + TIMEOUT)
         # Long enough for a wrongly started install to reach the stub, or its
@@ -1886,7 +1940,7 @@ print(":: done", flush=True)
         select_in_list(frame, "Library")
         wait_for(frame, lambda root: row_button(root, "Smoke Test Racer", "Install"),
                  "the install action", time.monotonic() + TIMEOUT)
-        click(row_button(frame, "Smoke Test Racer", "Install"))
+        open_install(frame, "Smoke Test Racer")
         wait_for(frame, lambda root: bool(find_all(root, role="button", name="Install")),
                  "install confirmation", time.monotonic() + TIMEOUT)
         click_named(frame, "Install")

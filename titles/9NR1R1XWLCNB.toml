@@ -32,16 +32,11 @@ wants = ["appmodel.package-identity", "xgameruntime.store-catalog"]
 
 [status]
 state = "playable"
-summary = "Gameplay and Continue with saved progress confirmed by the player. Also plays with separate Store and Player accounts: the Store account's Game Pass licence, the Player account's gamertag, profile and saves. The in-game marketplace is currently unavailable."
-last-verified = 2026-10-17
-verified-with = "Ferestre 0.1.8, package 3.461.691.0, runtime 11.0.20261013.2-local; player-confirmed gameplay and Continue after normal exit. Native PlayFab cloud synchronization and byte-identical save reopen also passed. Local 0.1.13 accounts build and runtime 11.0.20261017.2-accounts (the patches in runtime 11.0.20261018.1): a Game Pass Store account with a separate Player account created and played the Player's own profile and saves."
+summary = "Gameplay and Continue with saved progress confirmed by the player. Also plays with separate Store and Player accounts: the Store account's Game Pass licence, the Player account's gamertag, profile and saves. The in-game store lists its content; purchases are unsupported. Online races and cloud saves after a crash are untested."
+last-verified = 2026-11-24
+verified-with = "Ferestre 0.1.8, package 3.461.691.0, runtime 11.0.20261013.2-local; player-confirmed gameplay and Continue after normal exit. Native PlayFab cloud synchronization and byte-identical save reopen also passed. Local 0.1.13 accounts build and runtime 11.0.20261017.2-accounts (the patches in runtime 11.0.20261018.1): a Game Pass Store account with a separate Player account created and played the Player's own profile and saves. Package and runtime of 2026-11-24 (11.0.20261124.0.1), headless as the Store account: Continue into the world, Store tab and Car Packs list, Online tab, and a normal exit with its save synchronized."
 
 [[issues]]
 symptom = "The in-game store reports failed to download marketplace data."
-cause = "The original catalog calls returned empty results. A later trace showed an older background service rejecting the new catalog protocol; the matching runtime and service pass live product and paging probes. In-game recovery remains unconfirmed."
-fix = "Use the matching launcher and runtime; a real catalog probe passes, but marketplace UI recovery is unconfirmed and purchases remain unsupported."
-
-[[issues]]
-symptom = "Crash-time cloud synchronization and full online-mode coverage remain unverified."
-cause = "Normal shutdown uploads and Continue passed; the compatibility layer does not yet provide an out-of-process save uploader after a crash."
-fix = "Keep save backups while qualifying these paths."
+cause = "The original catalog calls returned empty results. A later trace showed an older background service rejecting the new catalog protocol; the matching runtime and service answer it, and the in-game list loaded on 2026-11-24."
+fix = "Use the Automatic runtime, and update it and the launcher together. Purchases remain unsupported."

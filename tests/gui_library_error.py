@@ -80,7 +80,7 @@ def main():
             wait(lambda _: len(json.loads(cache.read_text())['items']) == 2, 'Reload succeeds after the service recovers')
             s.check(len(json.loads(cache.read_text())['items']) == 2, 'successful reload replaces the ownership snapshot')
             wait(lambda r: not s.find_all(r, name_contains='Former Pass Game'), 'uninstalled former account title disappears despite its recipe')
-            s.check(bool(s.row_button(frame, 'Launch Game 1', 'Play')), 'an installed game stays manageable after ownership disappears')
+            wait(lambda _: s.row_button(frame, 'Launch Game 1', 'Play'), 'an installed game stays manageable after ownership disappears')
             s.click_named(frame, 'Close')
             s.check(process.wait(timeout=10) == 0, 'library-error fixture closes cleanly')
             print('PASS: library refresh preserves failures, removes recipe-only titles and retains installed games', flush=True)

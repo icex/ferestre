@@ -14,20 +14,25 @@ mod app_updates;
 mod artwork;
 mod cancel;
 mod client_check;
+mod compat;
 mod controller;
 mod deadline;
+mod details_ui;
 mod editor;
 mod effects;
+mod endless;
 mod folder_picker;
 mod handheld;
 mod home;
 mod install_drives;
+mod launch_show;
 mod launch_state;
 mod max_width;
 mod model;
 mod neural_ui;
 mod notifications;
 mod packagekit;
+mod page_fit;
 mod presence_ui;
 mod progress;
 mod queue_ui;
@@ -38,6 +43,7 @@ mod text_input;
 mod textures;
 mod window_activation;
 mod window_controls;
+mod window_size;
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -50,13 +56,26 @@ use std::sync::{Arc, Mutex};
 use ferestre_core::recipe::Recipe;
 use ferestre_core::{account, accounts, catalog, gamepass, library, steam};
 use model::{Action, Inputs, LibraryRow, Ownership};
-use state::{Model, Section, AVATAR_PX, PER_PAGE};
+use state::{Model, Section, AVATAR_PX};
 
 const APP_ID: &str = "io.github.icex.ferestre";
 
 /// Only what Adwaita's own classes do not cover. Colours are Adwaita's named
 /// ones, so dark mode and accent changes follow without a second stylesheet.
 const STYLE: &str = "
+.details-card { background: alpha(white, .06); border-radius: 14px; padding: 14px 16px; }
+.details-chip { background: alpha(white, .09); border-radius: 999px; padding: 5px 12px; }
+.details-flow > flowboxchild { padding: 0; }
+.details-flow > flowboxchild:hover { background: none; }
+.details-body { line-height: 1.5; }
+.details-figure { font-size: 2em; font-weight: 800; }
+window label.details-stars { color: #f5c211; letter-spacing: 2px; }
+.details-badge { background: alpha(white, .12); border-radius: 10px; padding: 10px 8px; font-size: 1.2em; font-weight: 800; }
+.details-stage { border-radius: 16px; }
+.skeleton { border-radius: 10px; background-color: alpha(white, 0.09); }
+ 
+.details-id .subtitle { font-family: monospace; }
+
 @define-color window_bg_color #1b1d21;
 @define-color window_fg_color #f4f4f5;
 @define-color view_bg_color #1b1d21;
@@ -186,8 +205,6 @@ window.controller-navigation button:focus, window.controller-navigation row:focu
 window.controller-navigation button.game-tile:focus { background-color: #343a40; }
 .controller-navigation .game-grid flowboxchild:focus-visible { outline: none; }
 .fullscreen-navigation { padding: 4px 20px 8px; }
-.fullscreen-navigation button { background: transparent; border-radius: 8px; font-weight: 700; font-size: 16px; }
-.fullscreen-navigation button.active { background: #393d45; border-bottom: 3px solid #8bd77b; }
 window.fullscreen-browser button, window.fullscreen-browser menubutton > button { min-height: 48px; min-width: 48px; }
 .fullscreen-browser .game-title { font-size: 16px; }
 .fullscreen-browser .game-meta { font-size: 14px; }
@@ -218,17 +235,44 @@ window.ferestre-window entry.search-pill, window.ferestre-window searchentry.sea
   min-height: 40px; border-radius: 999px; background-color: #2a2d33; border: 1px solid alpha(#ffffff, 0.08); padding: 0 14px;
 }
 window.ferestre-window searchentry.search-pill:focus-within { border-color: alpha(#ffffff, 0.45); }
+.library-tabs-scroll { margin: -10px 0 -10px -10px; }
 .library-tabs { padding: 4px; border-radius: 999px; background-color: #25282d; }
 .library-tabs button { border-radius: 999px; border-bottom: 0; padding: 4px 18px; min-height: 36px; font-weight: 600; }
 .library-tabs button.active { background-color: #e4e5e7; color: #17191d; }
+.library-tabs button.active .nav-count { background-color: alpha(#17191d, 0.14); color: #17191d; }
 .library-tabs button:hover:not(.active) { background-color: alpha(#ffffff, 0.06); }
 
 /* Hero carousel */
 .hero-peek { padding: 0; border: 0; border-radius: 18px; background: none; box-shadow: none; opacity: 0.4; transition: opacity 200ms ease-out; }
 .hero-peek:hover { opacity: 0.62; }
+window.blur-ok .hero-peek picture { filter: blur(2.5px); transform: scale(1.03); }
+@keyframes hero-was-peek { from { opacity: 0.4; } to { opacity: 1; } }
+@keyframes hero-was-centre { from { opacity: 1; } to { opacity: 0.4; } }
+@keyframes hero-arriving { from { opacity: 0; } to { opacity: 0.4; } }
+@keyframes hero-leaving { from { opacity: 0.4; } to { opacity: 0; } }
+@keyframes hero-sharpen { from { filter: blur(2.5px); } to { filter: blur(0px); } }
+@keyframes hero-soften { from { filter: blur(0px); transform: scale(1); } to { filter: blur(2.5px); transform: scale(1.03); } }
+.hero-was-peek { animation: hero-was-peek 380ms ease-out; }
+.hero-was-centre { animation: hero-was-centre 380ms ease-out; }
+.hero-arriving { animation: hero-arriving 380ms ease-out; }
+.hero-leaving { animation: hero-leaving 380ms ease-out forwards; }
+window.blur-ok .hero-was-peek picture { animation: hero-sharpen 380ms ease-out; }
+window.blur-ok .hero-was-centre picture { animation: hero-soften 380ms ease-out; }
 button.art-button { padding: 0; border: 0; background-image: none; background-color: #25282d; box-shadow: none; border-radius: 14px; }
 button.hero-centre { border-radius: 18px; box-shadow: 0 12px 36px alpha(black, 0.4); }
-.hero-caption { padding: 72px 32px 26px; background-image: linear-gradient(to bottom, alpha(black, 0), alpha(black, 0.82)); }
+.hero-caption { padding: 0 32px 26px; }
+.hero-shade { background-image: linear-gradient(to bottom, alpha(black, 0), alpha(black, 0.82)); }
+@keyframes hero-caption-new { from { opacity: 0; } 35% { opacity: 0; } to { opacity: 1; } }
+.hero-caption-new { animation: hero-caption-new 380ms ease-out; }
+.compact-caption { padding: 34px 9px 8px; border-radius: 0 0 14px 14px; background-image: linear-gradient(to bottom, alpha(black, 0), alpha(black, 0.72) 45%, alpha(black, 0.9)); }
+.handheld .game-tile .compact-caption .game-title { font-size: 15px; color: white; }
+.handheld .game-tile .compact-caption .game-meta { font-size: 13px; color: #d4d6da; }
+.handheld .game-tile picture { border-radius: 14px; }
+window.ferestre-window.handheld .game-more > button { min-width: 34px; min-height: 34px; padding: 0; border-radius: 10px; background-color: alpha(#111317, 0.62); }
+window.handheld .controller-hints { padding: 5px 12px; font-size: 13px; }
+window.handheld .fullscreen-navigation { padding: 2px 16px 4px; }
+window.handheld .hero-title { font-size: 26px; }
+window.handheld .library-tabs button { padding: 2px 14px; }
 .hero-title { font-size: 34px; font-weight: 800; color: #ffffff; }
 .hero-tagline { font-size: 16px; color: alpha(#ffffff, 0.86); }
 .hero-dot { min-width: 8px; min-height: 8px; border-radius: 999px; background-color: alpha(#ffffff, 0.3); }
@@ -251,6 +295,10 @@ button.see-all { padding: 0 14px; font-weight: 600; color: #c9ccd2; }
 .featured-title { font-size: 20px; }
 .tile-subtitle { font-size: 13px; color: alpha(#ffffff, 0.82); }
 .tile-badge { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; background-color: alpha(#ffffff, 0.16); color: #ffffff; }
+.compat-warning { padding: 10px 12px; border-radius: 7px; background-color: alpha(#f2ca64, 0.14); }
+.compat-warning > image { color: #f2ca64; }
+.compat-shade { padding: 28px 8px 8px; }
+.tile-badge.untested { background-color: alpha(#ffffff, 0.16); color: #d4d6da; }
 .tile-badge.ok { background-color: alpha(#8bd77b, 0.24); color: #c9f2bf; }
 .tile-badge.update { background-color: #f2ca64; color: #171b20; }
 .tile-badge.warning { background-color: alpha(#f2ca64, 0.25); color: #f7dc95; }
@@ -258,12 +306,17 @@ button.see-all { padding: 0 14px; font-weight: 600; color: #c9ccd2; }
 .game-card, .game-tile, button.game-tile, .game-launch-overlay { border-radius: 14px; }
 .game-tile picture, .game-card picture { border-radius: 14px 14px 0 0; }
 button.game-tile, button.art-button { transition: box-shadow 160ms ease-out, background-color 160ms ease-out; }
+.tile-shimmer { border-radius: 14px; background-color: transparent; background-image: none; }
+@keyframes tile-shimmer { from { background-position: 135% 0; opacity: 1; } 85% { opacity: 1; } to { background-position: -35% 0; opacity: 0; } }
+.tile-shimmer.run { background-image: linear-gradient(105deg, alpha(white, 0) 40%, alpha(white, 0.10) 45%, alpha(white, 0.38) 50%, alpha(white, 0.10) 55%, alpha(white, 0) 60%); background-size: 300% 100%; background-repeat: no-repeat; animation: tile-shimmer 850ms ease-in-out forwards; }
+window.reduced-motion .tile-shimmer.run { background-image: none; animation: none; }
 button.game-tile:hover, button.art-button:hover { box-shadow: 0 10px 26px alpha(black, 0.45); background-color: #30343b; }
 window.ferestre-window:not(.controller-navigation) button.art-button:focus-visible,
 window.ferestre-window:not(.controller-navigation) button.game-tile:focus-visible { outline: 3px solid #ffffff; outline-offset: 3px; }
 window.controller-navigation button.art-button:focus { outline: 4px solid #8bd77b; outline-offset: 3px; }
 window.reduced-motion button.game-tile, window.reduced-motion button.art-button, window.reduced-motion .hero-peek { transition: none; }
 .gamepass-strip { border-radius: 14px; }
+.nav-count { font-size: 12px; font-weight: 700; padding: 1px 8px; border-radius: 999px; background-color: alpha(white, 0.12); color: alpha(white, 0.85); }
 statuspage.compact > scrolledwindow > viewport > box { margin: 24px 0; }
 window.compact-sidebar .navigation-sidebar row { margin: 2px 10px; padding: 0; }
 window.compact-sidebar .sidebar-recents { margin-left: 4px; margin-right: 4px; }
@@ -286,6 +339,7 @@ window.ferestre-window .notification button.flat { min-width: 32px; min-height: 
 window.ferestre-window .notification-more { min-height: 30px; border-radius: 999px; padding: 2px 14px; background-color: alpha(#24272d, 0.92); color: #f4f4f5; box-shadow: 0 4px 12px alpha(black, 0.3); }
 window.ferestre-window button.bell .unread-dot { min-width: 8px; min-height: 8px; border-radius: 999px; background-color: #ff5f57; margin: 0; }
 .history-item { padding: 6px 2px; border-bottom: 1px solid alpha(#ffffff, 0.06); }
+.details-main { font-size: 17px; font-weight: 800; }
 popover.glass-menu > contents { background-color: alpha(#24272d, 0.96); border: 1px solid alpha(#ffffff, 0.08); border-radius: 16px; box-shadow: 0 12px 32px alpha(black, 0.45); }
 /* Page switches: a page that replaced another settles in. Blur only where it
    is cheap (see effects.rs); otherwise an opacity fade; nothing at all when
@@ -297,9 +351,8 @@ window.ferestre-window.blur-ok .page-enter { animation: page-enter 220ms ease-ou
 window.ferestre-window.reduced-motion .page-enter { animation: none; }
 /* Behind a dialog: the window's content blurs and darkens on a GPU, and
    libadwaita's own dimming is darker everywhere, which is the fallback. */
-window .app-shell { transition: filter 180ms ease-out; }
-window.reduced-motion .app-shell { transition: none; }
-window.blur-ok.dialog-open .app-shell { filter: blur(6px) brightness(0.8); }
+window.blur-ok.launching .app-shell { filter: blur(6px) brightness(0.8); }
+window.blur-ok.dialog-open .app-shell { filter: blur(14px) brightness(0.85); }
 floating-sheet > dimming, bottom-sheet > dimming { background-color: alpha(black, 0.42); }
 floating-sheet > sheet { border-radius: 18px; }
 
@@ -338,6 +391,13 @@ struct Ui {
     toasts: notifications::Toasts,
     content: gtk::Box,
     scroll: gtk::ScrolledWindow,
+    /// The list of tiles on the page, if it has one.
+    endless: Rc<RefCell<glib::WeakRef<endless::Endless>>>,
+    /// The height of the text under a tile's cover.
+    tile_text: Rc<Cell<i32>>,
+    launch_show: launch_show::Show,
+    launch_animation: Rc<RefCell<Option<adw::TimedAnimation>>>,
+    tile: Rc<Cell<page_fit::Fit>>,
     account_button: gtk::Button,
     title: adw::WindowTitle,
     search: gtk::SearchEntry,
@@ -420,9 +480,14 @@ struct Ui {
     /// this window's launches report.
     presence: Rc<RefCell<presence_ui::State>>,
     controller_hints: gtk::Label,
-    navigation_hint: gtk::Label,
     controller_family: Rc<Cell<controller::Family>>,
     controller_connected: Rc<Cell<bool>>,
+    /// The last input came from a controller, not the mouse or keyboard.
+    controller_in_use: Rc<Cell<bool>>,
+    /// What gets the focus back after the redraw under way.
+    refocus: Rc<RefCell<Option<String>>>,
+    /// A redraw let go of the focus and gives it back once idle.
+    refocus_pending: Rc<Cell<bool>>,
     last_game_focus: Rc<RefCell<Option<String>>>,
     pending_tab_focus: Rc<Cell<Option<Section>>>,
     game_actions: Rc<RefCell<BTreeMap<String, String>>>,
@@ -435,6 +500,10 @@ struct Ui {
     /// A redraw asked for by background work and not yet done. Many results
     /// landing in one main-loop turn become one [`render`].
     render_dirty: Rc<Cell<bool>>,
+    render_pending: Rc<Cell<bool>>,
+    counts_pending: Rc<Cell<bool>>,
+    /// What each My Library tab holds, as last counted.
+    tab_counts: Rc<RefCell<Vec<(Section, usize)>>>,
     /// Pictures showing a title's art, by `ArtSlot` key, so artwork that
     /// arrives later updates them in place instead of redrawing the page.
     art_slots: Rc<RefCell<textures::Slots>>,
@@ -532,8 +601,8 @@ fn build_ui(app: &adw::Application) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Ferestre")
-        .default_width(1280)
-        .default_height(800)
+        .default_width(window_size::DEFAULT.0)
+        .default_height(window_size::DEFAULT.1)
         .css_classes(["ferestre-window"])
         .build();
 
@@ -556,8 +625,11 @@ fn build_ui(app: &adw::Application) {
                 .label(section.title())
                 .xalign(0.0)
                 .css_classes(["nav-label"])
+                .hexpand(true)
                 .build(),
         );
+        // Its name is the section's alone; the count is its description.
+        content.append(&sidebar::count_badge(section));
         let row = gtk::ListBoxRow::builder()
             .child(&content)
             .tooltip_text(section.title())
@@ -595,16 +667,6 @@ fn build_ui(app: &adw::Application) {
             .child(&sidebar)
             .build(),
     );
-
-    let navigation_hint = gtk::Label::builder()
-        .label("↑ / ↓ Choose a section   → Games")
-        .wrap(true)
-        .margin_start(12)
-        .margin_end(12)
-        .css_classes(["controller-hints"])
-        .visible(false)
-        .build();
-    sidebar_box.append(&navigation_hint);
 
     let recent_games = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -689,7 +751,9 @@ fn build_ui(app: &adw::Application) {
         .child(&content)
         .build();
     let toasts = notifications::Toasts::new();
-    toasts.set_child(Some(&scroll));
+    let pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    pane.append(&scroll);
+    toasts.set_child(Some(&pane));
 
     // Below the content and outside it, because `render` empties the content
     // box: an inline bar would be destroyed and rebuilt four times a second,
@@ -790,7 +854,10 @@ fn build_ui(app: &adw::Application) {
     content_header.pack_start(&navigation);
     scroll.set_kinetic_scrolling(true);
     window.set_size_request(360, 480);
-    window.set_content(Some(&split));
+    let launch_show = launch_show::Show::new();
+    let shell = gtk::Overlay::builder().child(&split).build();
+    shell.add_overlay(&launch_show);
+    window.set_content(Some(&shell));
     effects::install(&window, &split);
     window_controls::install(&window, &split, &sidebar_header, &content_header);
 
@@ -807,17 +874,18 @@ fn build_ui(app: &adw::Application) {
     let ui = Ui {
         model,
         controller_hints,
-        navigation_hint,
         controller_family: Rc::new(Cell::new(controller::Family::default())),
         controller_connected: Rc::new(Cell::new(false)),
+        controller_in_use: Rc::new(Cell::new(false)),
+        refocus: Rc::default(),
+        refocus_pending: Rc::default(),
         last_game_focus: Rc::new(RefCell::new(None)),
         pending_tab_focus: Rc::new(Cell::new(None)),
         game_actions: Rc::new(RefCell::new(BTreeMap::new())),
         fullscreen_nav: gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(16)
-            .halign(gtk::Align::Center)
-            .css_classes(["fullscreen-navigation"])
+            .spacing(4)
+            .css_classes(["library-tabs"])
             .build(),
         recent_games,
         sidebar: sidebar.clone(),
@@ -825,6 +893,9 @@ fn build_ui(app: &adw::Application) {
         install_queue: Rc::new(RefCell::new(install_queue)),
         queue_error: Rc::new(RefCell::new(queue_error)),
         render_dirty: Rc::new(Cell::new(false)),
+        render_pending: Rc::default(),
+        counts_pending: Rc::default(),
+        tab_counts: Rc::default(),
         art_slots: Rc::new(RefCell::new(textures::Slots::default())),
         showed_pending_names: Rc::new(Cell::new(false)),
         names_requeued: Rc::new(Cell::new(false)),
@@ -838,6 +909,11 @@ fn build_ui(app: &adw::Application) {
         toasts,
         content,
         scroll,
+        endless: Rc::default(),
+        tile_text: Rc::new(Cell::new(98)),
+        launch_show,
+        launch_animation: Rc::default(),
+        tile: Rc::new(Cell::new(page_fit::FIRST)),
         account_button: account_button.clone(),
         title,
         search: search.clone(),
@@ -884,6 +960,14 @@ fn build_ui(app: &adw::Application) {
     };
 
     sidebar_top.append(&notification_bell(&ui));
+    endless::follow(&ui);
+    let dialog_ui = ui.clone();
+    ui.window.connect_visible_dialog_notify(move |window| {
+        if window.visible_dialog().is_none() && dialog_ui.render_dirty.get() {
+            render_when_idle(&dialog_ui);
+        }
+    });
+    page_fit::follow_size(&ui);
     // The hero is sized to the window; follow a resize (maximise, a moved
     // window, a rotated handheld) once it settles.
     let width_ui = ui.clone();
@@ -971,7 +1055,7 @@ fn build_ui(app: &adw::Application) {
         ui,
         move |_, row| {
             if let Some(section) = Section::NAV.get(row.index() as usize) {
-                select_section(&ui, *section);
+                select_section(&ui, section.landing());
             }
         }
     ));
@@ -986,19 +1070,17 @@ fn build_ui(app: &adw::Application) {
             };
             {
                 let mut model = ui.model.borrow_mut();
-                if model.section == section {
+                // Also its other tabs, and what selected the row itself.
+                if model.section.nav() == section {
                     return;
                 }
-                model.section = section;
-                model.page = 0;
+                model.section = section.landing();
             }
+            ui.last_game_focus.replace(None);
             ui.split.set_show_content(true);
             ui.scroll.vadjustment().set_value(0.0);
             render(&ui);
-            if section == Section::GamePass {
-                refresh_entitlements(&ui, false);
-            }
-            refresh_updates(&ui, false);
+            refresh_for(&ui, section);
         }
     ));
 
@@ -1013,7 +1095,6 @@ fn build_ui(app: &adw::Application) {
                     return;
                 }
                 model.query = text;
-                model.page = 0;
             }
             ui.scroll.vadjustment().set_value(0.0);
             render(&ui);
@@ -1071,6 +1152,9 @@ fn build_ui(app: &adw::Application) {
         }
     ));
 
+    if handheld::read_preference(&ui, "show_uninstallable") == Some(true) {
+        ui.model.borrow_mut().show_unsupported = true;
+    }
     render(&ui);
     // The account is cheap and answers the first question the window raises --
     // whose library is this -- so it is asked without being told to. The
@@ -1086,6 +1170,7 @@ fn build_ui(app: &adw::Application) {
         refresh_account(&ui);
     }
 
+    window_size::install(&ui);
     handheld::install(&ui, &content_view, &content_header, &back);
     if handheld::read_preference(&ui, "compact") == Some(true) {
         sidebar::set_compact(&ui, true);
@@ -1263,15 +1348,9 @@ fn notification_bell(ui: &Ui) -> gtk::Button {
 fn select_section(ui: &Ui, section: Section) {
     let from_tab = GtkWindowExt::focus(&ui.window)
         .is_some_and(|focus| focus.widget_name().starts_with("section-"));
-    let nav = if matches!(
-        section,
-        Section::Installed | Section::Updates | Section::Downloads
-    ) {
-        Section::Library
-    } else {
-        section
-    };
-    if let Some(index) = Section::NAV.iter().position(|s| *s == nav) {
+    // Before the sidebar is told, which would open its row's own section.
+    let before = std::mem::replace(&mut ui.model.borrow_mut().section, section);
+    if let Some(index) = Section::NAV.iter().position(|s| *s == section.nav()) {
         if let Some(row) = ui.sidebar.row_at_index(index as i32) {
             ui.sidebar.select_row(Some(&row));
         }
@@ -1280,19 +1359,27 @@ fn select_section(ui: &Ui, section: Section) {
         // so returning to the same primary row also emits selection changes.
         ui.sidebar.unselect_all();
     }
-    if ui.model.borrow().section != section {
-        {
-            let mut model = ui.model.borrow_mut();
-            model.section = section;
-            model.page = 0;
-        }
+    if before != section {
+        // Another list starts at its start.
+        ui.last_game_focus.replace(None);
         ui.scroll.vadjustment().set_value(0.0);
         render(ui);
+        if before.nav() != section.nav() && Section::NAV.contains(&section.nav()) {
+            refresh_for(ui, section.nav());
+        }
     }
     ui.split.set_show_content(true);
     if from_tab {
         controller::focus_section_tab(ui, section);
     }
+}
+
+/// What is asked anew when a sidebar section opens.
+fn refresh_for(ui: &Ui, nav: Section) {
+    if nav == Section::GamePass {
+        refresh_entitlements(ui, false);
+    }
+    refresh_updates(ui, false);
 }
 
 fn named_widget(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
@@ -1313,22 +1400,41 @@ fn named_widget(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
 /// burst of background results (names, sizes, updates, an account) becomes
 /// one redraw rather than one each. A [`render`] that runs first does it.
 fn render_soon(ui: &Ui) {
-    if ui.render_dirty.replace(true) {
+    if !ui.render_dirty.replace(true) {
+        render_when_idle(ui);
+    }
+}
+
+/// Redraw if something still wants it. Not behind a dialog: nobody sees the
+/// page, and the dialog stutters while it is rebuilt. It is drawn when the
+/// dialog closes.
+fn render_when_idle(ui: &Ui) {
+    let ui = ui.clone();
+    glib::idle_add_local_full(glib::Priority::DEFAULT_IDLE, move || {
+        if ui.render_dirty.get() && !*ui.closing.borrow() && ui.window.visible_dialog().is_none() {
+            render(&ui);
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+/// Redraw in a while, once for everything that asks until then: names arrive
+/// many times in a row.
+fn render_later(ui: &Ui) {
+    if ui.render_pending.replace(true) {
         return;
     }
     let ui = ui.clone();
-    glib::idle_add_local_full(glib::Priority::DEFAULT_IDLE, move || {
-        if ui.render_dirty.get() && !*ui.closing.borrow() {
-            render(&ui);
-        }
-        ui.render_dirty.set(false);
-        glib::ControlFlow::Break
+    glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
+        ui.render_pending.set(false);
+        render_soon(&ui);
     });
 }
 
 fn render(ui: &Ui) {
     ui.render_dirty.set(false);
     ui.art_slots.borrow_mut().prune();
+    handheld::update(ui);
     app_updates::render(ui);
     handheld::render_navigation(ui);
     ui.game_actions.borrow_mut().clear();
@@ -1341,10 +1447,20 @@ fn render(ui: &Ui) {
     let window = &ui.window;
     let focus_name = GtkWindowExt::focus(window)
         .filter(|w| w.is_ancestor(&ui.content))
-        .and_then(|w| controller::focus_after_render(&w.widget_name(), ui.model.borrow().section));
+        .and_then(|w| {
+            // A menu button's focus is on the button inside it, which has no name.
+            let named = w
+                .parent()
+                .filter(|parent| parent.is::<gtk::MenuButton>())
+                .unwrap_or(w);
+            controller::focus_after_render(&named.widget_name(), ui.model.borrow().section)
+        });
+    let focus_in_view = GtkWindowExt::focus(window).is_none_or(|focus| in_view(ui, &focus));
     if GtkWindowExt::focus(window).is_some_and(|focus| focus.is_ancestor(&ui.content)) {
         GtkWindowExt::set_focus(window, None::<&gtk::Widget>);
     }
+    ui.refocus.replace(focus_name.clone());
+    ui.endless.replace(glib::WeakRef::new());
     while let Some(child) = ui.content.first_child() {
         ui.content.remove(&child);
     }
@@ -1360,6 +1476,7 @@ fn render(ui: &Ui) {
             | Section::Library
             | Section::GamePass
             | Section::Installed
+            | Section::Elsewhere
             | Section::Updates
     ));
     render_account_button(ui);
@@ -1384,8 +1501,8 @@ fn render(ui: &Ui) {
     // outer viewport and put the preference groups in ordinary content.
     let page = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(if ui.window.is_fullscreen() { 16 } else { 24 })
-        .margin_top(if ui.window.is_fullscreen() { 16 } else { 24 })
+        .spacing(if handheld::top_bar(ui) { 16 } else { 24 })
+        .margin_top(if handheld::top_bar(ui) { 16 } else { 24 })
         .margin_bottom(24)
         .margin_start(24)
         .margin_end(24)
@@ -1404,20 +1521,43 @@ fn render(ui: &Ui) {
         Section::Home
             | Section::Library
             | Section::Installed
+            | Section::Elsewhere
             | Section::Updates
             | Section::Downloads
             | Section::GamePass
     );
     let margin = if ui.window.width() > 2560 { 48 } else { 32 };
+    let compact = ui.window.has_css_class(handheld::CLASS);
+    let margin = if compact { 20 } else { margin };
     page.set_margin_start(margin);
     page.set_margin_end(margin);
+    if compact {
+        page.set_spacing(12);
+        page.set_margin_top(12);
+        page.set_margin_bottom(12);
+    }
     let clamp = adw::Clamp::builder()
         .maximum_size(if artwork { i32::MAX } else { 1100 })
         .tightening_threshold(if artwork { i32::MAX } else { 900 })
         .child(&page)
         .build();
     ui.content.append(&clamp);
-    if ui.last_section.replace(Some(section)) != Some(section) {
+    let previous = ui.last_section.replace(Some(section));
+    let in_library = |section: Section| {
+        matches!(
+            section,
+            Section::Library
+                | Section::Installed
+                | Section::Elsewhere
+                | Section::Updates
+                | Section::Downloads
+        )
+    };
+    // Between the library's own tabs only the listing changes, below.
+    let same_header =
+        !handheld::top_bar(ui) && in_library(section) && previous.is_some_and(in_library);
+    let entered = previous != Some(section);
+    if entered && !same_header {
         effects::enter(&clamp, &ui.window);
     }
 
@@ -1446,14 +1586,10 @@ fn render(ui: &Ui) {
         page.append(&group);
     }
 
-    if !ui.window.is_fullscreen()
-        && matches!(
-            section,
-            Section::Library | Section::Installed | Section::Updates | Section::Downloads
-        )
-    {
+    if !handheld::top_bar(ui) && in_library(section) {
         render_library_tabs(ui, &page);
     }
+    let header = page.last_child();
     match section {
         Section::Runtime => render_runtime(ui, &page),
         Section::Downloads => {
@@ -1464,7 +1600,7 @@ fn render(ui: &Ui) {
             queue_ui::render_queue(ui, &body);
             page.append(&max_width::wrap(&body, 1100));
         }
-        Section::Home if home::render_home(ui, &page) => {}
+        Section::Home if home::render_home(ui, &page) => (),
         Section::Home | Section::Library => {
             let show_all = ui.model.borrow().show_unsupported;
             render_rows(
@@ -1487,6 +1623,14 @@ fn render(ui: &Ui) {
                 "Nothing is installed yet. Find a title in the library and install it.",
             );
         }
+        Section::Elsewhere => {
+            render_rows(
+                ui,
+                &page,
+                |row| row.local,
+                "Games from Steam and other places appear here. Add them with +.",
+            );
+        }
         Section::Updates => {
             render_rows(
                 ui,
@@ -1496,40 +1640,78 @@ fn render(ui: &Ui) {
             );
         }
     }
+    page_fit::lay_out(ui);
+    if entered && same_header {
+        let mut part = header.and_then(|header| header.next_sibling());
+        while let Some(widget) = part {
+            effects::enter(&widget, &ui.window);
+            part = widget.next_sibling();
+        }
+    }
     preload_gamepass_art(ui);
+    refocus(ui, focus_name, focus_in_view);
+}
+
+/// `in_view` is whether it was before the redraw.
+fn refocus(ui: &Ui, focus_name: Option<String>, in_view: bool) {
     if let Some(name) = focus_name {
         if name.starts_with("section-") {
             controller::focus_section_tab(ui, ui.model.borrow().section);
         } else {
-            let window = ui.window.clone();
+            let ui = ui.clone();
+            ui.refocus_pending.set(true);
             glib::idle_add_local_once(move || {
-                if GtkWindowExt::focus(&window).is_none() {
-                    if let Some(widget) = named_widget(window.upcast_ref(), &name) {
-                        widget.grab_focus();
-                    }
+                ui.refocus_pending.set(false);
+                if GtkWindowExt::focus(&ui.window).is_some() {
+                    return;
+                }
+                let Some(widget) = named_widget(ui.window.upcast_ref(), &name) else {
+                    return;
+                };
+                // Scrolled away from: it keeps the focus, and the view stays.
+                let view = ui
+                    .scroll
+                    .child()
+                    .and_then(|child| child.downcast::<gtk::Viewport>().ok())
+                    .filter(|_| !in_view);
+                if let Some(view) = &view {
+                    view.set_scroll_to_focus(false);
+                }
+                widget.grab_focus();
+                if let Some(view) = view {
+                    view.set_scroll_to_focus(true);
                 }
             });
         }
     }
 }
 
-/// The Installed list's "Add All to Steam", for every installed title on
-/// every page, whatever the search shows.
-fn add_all_to_steam_button(ui: &Ui, titles: Vec<(String, String)>) -> gtk::Button {
-    let button = gtk::Button::builder()
-        .child(
-            &adw::ButtonContent::builder()
-                .icon_name("list-add-symbolic")
-                .label("Add All to Steam")
-                .build(),
-        )
-        .tooltip_text("Add a Steam shortcut for every installed game")
-        .valign(gtk::Align::Center)
-        .css_classes(["flat"])
-        .build();
-    let ui = ui.clone();
-    button.connect_clicked(move |_| confirm_add_all_to_steam(&ui, titles.clone()));
-    button
+/// Whether any of a widget on the page is in view.
+fn in_view(ui: &Ui, widget: &gtk::Widget) -> bool {
+    widget
+        .compute_bounds(&ui.scroll)
+        .is_none_or(|b| b.y() + b.height() > 0.0 && b.y() < ui.scroll.height() as f32)
+}
+
+/// Ask to add every installed title to Steam, whatever the search shows.
+fn add_all_to_steam(ui: &Ui) {
+    let drawn = draw_list(
+        &ui.model.borrow(),
+        &ui.running.borrow(),
+        None,
+        NameLookups {
+            asked: &ui.asked_names.borrow(),
+            fetching: ui.fetching_names.get(),
+        },
+        Section::Installed,
+        |row| row.installed,
+        Listing::All,
+    );
+    if drawn.kept.is_empty() {
+        ui.toasts.add_toast(toast("Nothing is installed yet."));
+        return;
+    }
+    confirm_add_all_to_steam(ui, drawn.kept);
 }
 
 /// Set an unreadable `account-roles.json` aside and start over without roles.
@@ -1615,6 +1797,34 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
     appearance.add(&compact);
     page.append(&appearance);
 
+    let library = adw::PreferencesGroup::builder().title("Library").build();
+    let unsupported = adw::SwitchRow::builder()
+        .title("Show titles you cannot install")
+        .subtitle(
+            "Those outside this account's Game Pass tier, and Appx or Msix packages, which the \
+             runtime cannot open",
+        )
+        .subtitle_lines(2)
+        .active(ui.model.borrow().show_unsupported)
+        .build();
+    unsupported.connect_active_notify(glib::clone!(
+        #[strong]
+        ui,
+        move |row| {
+            let on = row.is_active();
+            {
+                let mut model = ui.model.borrow_mut();
+                model.show_unsupported = on;
+            }
+            if let Err(error) = handheld::save_preference(&ui, "show_uninstallable", on) {
+                ui.toasts
+                    .add_toast(toast(format!("Could not save the setting: {error}")));
+            }
+        }
+    ));
+    library.add(&unsupported);
+    page.append(&library);
+
     let model = ui.model.borrow();
     let (title, subtitle) = model::runtime_summary(model.runtime.as_ref());
     let group = adw::PreferencesGroup::builder()
@@ -1665,7 +1875,7 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
     choose.connect_clicked(glib::clone!(
         #[strong]
         ui,
-        move |_| runtime_chooser(&ui, None, "Default game runtime")
+        move |_| runtime_chooser(&ui)
     ));
     default_row.add_suffix(&choose);
     group.add(&default_row);
@@ -1679,12 +1889,8 @@ fn render_runtime(ui: &Ui, page: &gtk::Box) {
 /// What one page of the list looks like, lifted out of the borrow so widgets
 /// can be built without holding the model.
 struct Drawn {
-    page: usize,
     rows: Vec<LibraryRow>,
-    label: String,
-    has_previous: bool,
-    has_next: bool,
-    /// Rows on this page whose art has not been fetched yet.
+    /// Rows whose art has not been fetched yet.
     want_icons: Vec<String>,
     /// Rows on this page still showing a product id because nothing has looked
     /// their name up.
@@ -1698,7 +1904,7 @@ struct Drawn {
     /// Rows the list holds after the filter and before a search narrows it:
     /// what a heading counting this list should say.
     listed: usize,
-    /// Those rows' product ids and names, every page of them: what an action
+    /// Those rows' product ids and names: what an action
     /// on the whole list applies to.
     kept: Vec<(String, String)>,
     /// Rows in the whole list still waiting for a name while a search is
@@ -1722,11 +1928,11 @@ impl NameLookups<'_> {
     }
 }
 
-/// One page of a list, searched, as the grid shows it; or all of it,
-/// unsearched, for the shelves and the sidebar.
+/// A list as the grid shows it, searched; or all of it, for the shelves and
+/// the sidebar.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Listing {
-    Page,
+    Searched,
     All,
 }
 
@@ -1934,23 +2140,21 @@ fn draw_list(
         .map(|row| (row.product_id.clone(), row.name.clone()))
         .collect();
 
-    let (matching, per_page, page) = match listing {
-        Listing::Page => (model::search(&rows, &model.query), PER_PAGE, model.page),
-        Listing::All => (rows.iter().collect(), rows.len(), 0),
+    let shown = match listing {
+        Listing::Searched => model::search(&rows, &model.query),
+        Listing::All => rows.iter().collect(),
     };
-    let view = model::paginate(&matching, page, per_page);
     // With a query, the rows that are *not* on screen matter: search matches on
     // the name, and a row nothing has looked up is still showing its product
     // id, so "age of" cannot match it. That was a search that found nothing
     // until you happened to page past the row, and then worked ever after.
     Drawn {
-        page: view.page,
         listed,
         kept,
         pending_names: unnamed_off_page.len(),
         want_names: metadata_ids
             .into_iter()
-            .chain(view.rows.iter().flat_map(|row| {
+            .chain(shown.iter().flat_map(|row| {
                 let mut wanted = Vec::new();
                 if !row.is_named() {
                     wanted.push(row.product_id.clone());
@@ -1965,8 +2169,7 @@ fn draw_list(
                 wanted
             }))
             .collect(),
-        want_icons: view
-            .rows
+        want_icons: shown
             .iter()
             .filter(|row| {
                 !model
@@ -1975,10 +2178,7 @@ fn draw_list(
             })
             .map(|row| row.product_id.clone())
             .collect(),
-        label: view.label(),
-        has_previous: view.has_previous(),
-        has_next: view.has_next(),
-        rows: view.rows.into_iter().cloned().collect(),
+        rows: shown.into_iter().cloned().collect(),
         unsupported,
         outside_tier,
     }
@@ -1992,78 +2192,60 @@ fn draw_list(
 /// leaving that unsaid would make every licence refusal look like a bug in the
 /// launcher.
 fn render_gamepass(ui: &Ui, page: &gtk::Box) {
-    let (held, fetched, market, store, checked) = {
+    let (held, fetched, store, checked) = {
         let model = ui.model.borrow();
         (
             model.subscriptions.clone(),
             !model.gamepass.is_empty(),
-            model.market().0,
             model.account.as_ref().map(|a| a.label().to_string()),
             model.entitlements_checked,
         )
     };
 
-    // Drawn first, filled in after the list: the count is what the list below
-    // actually holds -- games only, in this market, that this account's tier
-    // and this runtime can install -- not the size of the feed it came from.
     home::gamepass_hero(ui, page);
-    let group = adw::PreferencesGroup::builder().build();
-    let banner = adw::ActionRow::builder().subtitle_lines(3).build();
-    banner.add_css_class("gamepass-strip");
-    banner.set_use_markup(false);
-    banner.add_prefix(&gtk::Image::from_icon_name("starred-symbolic"));
-    group.add(&banner);
-    page.append(&group);
+    // Only what there is something to do about. How many games there are is
+    // in the sidebar.
+    let notice = match (fetched, store, checked, held.as_slice()) {
+        (false, ..) => Some((
+            "The Game Pass catalogue has not been fetched yet".to_string(),
+            "Reload to fetch it. It is a public listing -- no account needed.".to_string(),
+        )),
+        (true, None, ..) => Some((
+            "Not signed in".to_string(),
+            "Sign in to see which of these your Store account can play.".to_string(),
+        )),
+        (true, Some(store), false, _) => Some((
+            "Library not loaded".to_string(),
+            format!("Load the library to see which of these {store} can play."),
+        )),
+        (true, Some(store), true, []) => Some((
+            "No Game Pass subscription".to_string(),
+            format!(
+                "{store} has no Game Pass subscription, so it cannot play these. Choose an \
+                 account with Game Pass as the Store account in Accounts."
+            ),
+        )),
+        (true, Some(_), true, _) => None,
+    };
+    if let Some((title, subtitle)) = notice {
+        let group = adw::PreferencesGroup::builder().build();
+        let banner = adw::ActionRow::builder().subtitle_lines(3).build();
+        banner.add_css_class("gamepass-strip");
+        banner.set_use_markup(false);
+        banner.add_prefix(&gtk::Image::from_icon_name("starred-symbolic"));
+        banner.set_title(&title);
+        banner.set_subtitle(&subtitle);
+        group.add(&banner);
+        page.append(&group);
+    }
 
     let show_all = ui.model.borrow().show_unsupported;
-    let listed = render_rows(
+    render_rows(
         ui,
         page,
         move |row| show_all || !row.known_uninstallable(),
         "Nothing here yet.",
     );
-
-    let games = |n: usize| format!("{n} {}", if n == 1 { "game" } else { "games" });
-    let in_market = format!("{} in PC Game Pass for the {market} Store", games(listed));
-    let (title, subtitle) = match (fetched, store, checked, held.as_slice()) {
-        (false, ..) => (
-            "The Game Pass catalogue has not been fetched yet".to_string(),
-            "Reload to fetch it. It is a public listing -- no account needed.".to_string(),
-        ),
-        (true, None, ..) => (
-            in_market,
-            "Sign in to see which of these your Store account can play.".to_string(),
-        ),
-        (true, Some(store), false, _) => (
-            in_market,
-            format!("Load the library to see which of these {store} can play."),
-        ),
-        (true, Some(store), true, []) => (
-            in_market,
-            format!(
-                "{store} has no Game Pass subscription, so it cannot play these. Choose an \
-                 account with Game Pass as the Store account in Accounts."
-            ),
-        ),
-        (true, Some(store), true, subs) => (
-            if show_all {
-                in_market
-            } else {
-                format!(
-                    "{} {store} can install with {}",
-                    games(listed),
-                    subs.join(" and ")
-                )
-            },
-            format!(
-                "From the PC Game Pass catalogue for the {market} Store. Add-ons are not \
-                 counted, and titles outside the tier or in packages this runtime cannot \
-                 open are left out unless you choose to show them."
-            ),
-        ),
-    };
-    banner.set_title(&title);
-    banner.set_subtitle(&subtitle);
 }
 
 /// The saved measurement for a title, if it still matches the install the
@@ -2203,7 +2385,7 @@ fn render_rows(
         .borrow()
         .as_ref()
         .map(|d| d.product_id.clone());
-    let drawn = draw_list(
+    let mut drawn = draw_list(
         &ui.model.borrow(),
         &ui.running.borrow(),
         downloading.as_deref(),
@@ -2213,26 +2395,12 @@ fn render_rows(
         },
         section,
         keep,
-        Listing::Page,
+        Listing::Searched,
     );
     let listed = drawn.listed;
-    artwork::visible(ui, drawn.rows.iter().map(|row| row.product_id.clone()));
-    // Persist the clamped page. Otherwise Previous decrements a stale page
-    // number and keeps showing the last page after the list shrinks.
-    ui.model.borrow_mut().page = drawn.page;
-    fetch_disk_usage(ui, &drawn.rows);
 
+    let any = !drawn.rows.is_empty();
     let group = adw::PreferencesGroup::builder().build();
-    if section == Section::Installed && !drawn.kept.is_empty() {
-        group.set_title(&match listed {
-            1 => "1 game".to_string(),
-            n => format!("{n} games"),
-        });
-        group.set_header_suffix(Some(&add_all_to_steam_button(ui, drawn.kept.clone())));
-    }
-    // Deliberately not an early return: an empty list is exactly when the
-    // reader most needs the switch below, because the filter may be the reason
-    // it is empty.
     if drawn.rows.is_empty() {
         let query = ui.model.borrow().query.clone();
         let message = if query.trim().is_empty() {
@@ -2246,180 +2414,88 @@ fn render_rows(
         } else {
             format!("Nothing matches {query:?}")
         };
+        // The filter may be the reason it is empty.
+        let held_back = drawn.unsupported + drawn.outside_tier;
+        let hidden = matches!(section, Section::Library | Section::GamePass)
+            && held_back > 0
+            && !ui.model.borrow().show_unsupported;
+        let hidden = hidden
+            .then(|| format!("{held_back} you cannot install are hidden. Settings can show them."));
         // The query is whatever was typed, "&" included.
-        let row = plain_row(&message, None);
+        let row = plain_row(&message, hidden.as_deref());
         row.add_css_class("dim-label");
         group.add(&row);
     } else {
         if section == Section::Updates {
+            artwork::visible(ui, drawn.rows.iter().map(|row| row.product_id.clone()));
+            fetch_disk_usage(ui, &drawn.rows);
+            if !drawn.want_icons.is_empty() {
+                fetch_icons(ui, drawn.want_icons.clone());
+            }
             for row in &drawn.rows {
                 group.add(&library_row(ui, row));
             }
         }
     }
-    page.append(&group);
+    if drawn.rows.is_empty() || section == Section::Updates {
+        page.append(&group);
+    }
     if !drawn.rows.is_empty() && section != Section::Updates {
-        let heading = gtk::Label::builder()
-            .label(if section == Section::Home {
-                "All games".into()
-            } else {
-                format!("{} games", drawn.listed)
-            })
-            .xalign(0.0)
-            .css_classes(["title-2"])
-            .build();
-        // Installed says its count once, in the group above with Add All.
-        if !(ui.window.is_fullscreen() && section == Section::GamePass)
-            && section != Section::Installed
-        {
-            page.append(&heading);
+        page.set_margin_bottom(12);
+        // How many there are is in badges. Home has shelves above it.
+        if section == Section::Home {
+            page.append(
+                &gtk::Label::builder()
+                    .label("All games")
+                    .xalign(0.0)
+                    .css_classes(["title-2"])
+                    .build(),
+            );
         }
-        let grid = gtk::FlowBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .homogeneous(true)
-            .min_children_per_line(1)
-            // Wide windows get more columns, not bigger covers.
-            .max_children_per_line(14)
-            .row_spacing(22)
-            .column_spacing(18)
-            .css_classes(["game-grid"])
-            .build();
-        for (index, row) in drawn.rows.iter().enumerate() {
-            grid.insert(&game_card(ui, row), -1);
-            // Each card already contains its own primary and More controls.
-            // A focusable wrapper adds a second selection boundary.
-            if let Some(child) = grid.child_at_index(index as i32) {
-                child.set_focusable(false);
-            }
-        }
-        grid.connect_child_activated(|_, child| {
-            if let Some(card) = child.child() {
-                fn primary(root: &gtk::Widget) -> Option<gtk::Widget> {
-                    if root.widget_name().starts_with("game-")
-                        && root.widget_name().ends_with("-primary")
-                    {
-                        return Some(root.clone());
-                    }
-                    let mut next = root.first_child();
-                    while let Some(widget) = next {
-                        if let Some(found) = primary(&widget) {
-                            return Some(found);
-                        }
-                        next = widget.next_sibling();
-                    }
-                    None
+        let rows = Rc::new(std::mem::take(&mut drawn.rows));
+        let wanted = ui.refocus.borrow().clone();
+        let pinned = [wanted, ui.last_game_focus.borrow().clone()]
+            .into_iter()
+            .flatten()
+            .find_map(|name| {
+                let id = endless::product_of(&name)?;
+                rows.iter()
+                    .position(|row| row.product_id.eq_ignore_ascii_case(id))
+            });
+        let (make_ui, make_rows) = (ui.clone(), rows.clone());
+        let near_ui = ui.clone();
+        let grid = endless::Endless::new(
+            rows.len(),
+            ui.tile_text.get(),
+            pinned,
+            move |index, tile| game_card(&make_ui, &make_rows[index], tile).upcast(),
+            move |near| {
+                let near = &rows[near];
+                artwork::visible(&near_ui, near.iter().map(|row| row.product_id.clone()));
+                fetch_disk_usage(&near_ui, near);
+                let icons: Vec<String> = {
+                    let model = near_ui.model.borrow();
+                    near.iter()
+                        .map(|row| row.product_id.clone())
+                        .filter(|id| !model.icons.contains_key(&id.to_ascii_uppercase()))
+                        .collect()
+                };
+                if !icons.is_empty() {
+                    fetch_icons(&near_ui, icons);
                 }
-                if let Some(button) = primary(&card) {
-                    button.activate();
-                }
-            }
-        });
+            },
+        );
+        ui.endless.replace(grid.downgrade());
         page.append(&grid);
     }
 
-    ui.showed_pending_names
-        .set(drawn.pending_names > 0 && !drawn.rows.is_empty());
-    if drawn.pending_names > 0 && !drawn.rows.is_empty() {
+    ui.showed_pending_names.set(drawn.pending_names > 0 && any);
+    if drawn.pending_names > 0 && any {
         let progress = gtk::Label::builder()
             .label(format!("Looking up {} title names…", drawn.pending_names))
             .css_classes(["dim-label"])
             .build();
         page.append(&progress);
-    }
-
-    // Only in the library: the other sections list installed or updatable
-    // titles, which are runnable by construction.
-    let held_back = drawn.unsupported + drawn.outside_tier;
-    if matches!(section, Section::Library | Section::GamePass) && held_back > 0 {
-        // Two reasons a title is held back, and the switch names whichever
-        // applies. Saying "95 titles" without saying why is the kind of filter
-        // that makes people think a library is broken.
-        let mut why = Vec::new();
-        if drawn.outside_tier > 0 {
-            why.push(format!(
-                "{} are not in the Game Pass tier this account holds",
-                drawn.outside_tier
-            ));
-        }
-        if drawn.unsupported > 0 {
-            why.push(format!(
-                "{} ship as Appx or Msix packages, which this runtime cannot open",
-                drawn.unsupported
-            ));
-        }
-        let row = adw::SwitchRow::builder()
-            .title("Show titles you cannot install")
-            .subtitle(format!("{}.", why.join("; ")))
-            .subtitle_lines(2)
-            .active(ui.model.borrow().show_unsupported)
-            .build();
-        let ui = ui.clone();
-        row.connect_active_notify(move |switch| {
-            {
-                let mut model = ui.model.borrow_mut();
-                if model.show_unsupported == switch.is_active() {
-                    return;
-                }
-                model.show_unsupported = switch.is_active();
-                // The page the reader was on does not exist in the other list.
-                model.page = 0;
-            }
-            render(&ui);
-        });
-        let group = adw::PreferencesGroup::builder().margin_top(18).build();
-        group.add(&row);
-        page.append(&group);
-    }
-
-    // Only when there is more than one page: a pager under a list that already
-    // fits on screen is noise.
-    if drawn.has_previous || drawn.has_next {
-        let pager = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(12)
-            .halign(gtk::Align::Center)
-            .margin_top(12)
-            .margin_bottom(18)
-            .build();
-        let previous = gtk::Button::from_icon_name("go-previous-symbolic");
-        previous.set_sensitive(drawn.has_previous);
-        previous.set_tooltip_text(Some("Previous page"));
-        previous.update_property(&[gtk::accessible::Property::Label("Previous page")]);
-        let next = gtk::Button::from_icon_name("go-next-symbolic");
-        next.set_sensitive(drawn.has_next);
-        next.set_tooltip_text(Some("Next page"));
-        next.update_property(&[gtk::accessible::Property::Label("Next page")]);
-        let counter = gtk::Label::builder()
-            .label(&drawn.label)
-            .css_classes(["dim-label"])
-            .build();
-
-        previous.connect_clicked(glib::clone!(
-            #[strong]
-            ui,
-            move |_| {
-                {
-                    let mut model = ui.model.borrow_mut();
-                    model.page = model.page.saturating_sub(1);
-                }
-                ui.scroll.vadjustment().set_value(0.0);
-                render(&ui);
-            }
-        ));
-        next.connect_clicked(glib::clone!(
-            #[strong]
-            ui,
-            move |_| {
-                ui.model.borrow_mut().page += 1;
-                ui.scroll.vadjustment().set_value(0.0);
-                render(&ui);
-            }
-        ));
-
-        pager.append(&previous);
-        pager.append(&counter);
-        pager.append(&next);
-        ui.content.append(&pager);
     }
 
     // Names before art: a row reading "9NBLGGH18846" is unusable, a row with no
@@ -2429,17 +2505,11 @@ fn render_rows(
     if !drawn.want_names.is_empty() {
         fetch_names(ui, drawn.want_names);
     }
-    if !drawn.want_icons.is_empty() {
-        fetch_icons(ui, drawn.want_icons);
-    }
     listed
 }
 
-fn choose_runtime(ui: &Ui, product_id: &str, title: &str) {
-    runtime_chooser(ui, Some(product_id), &format!("Runtime for {title}"));
-}
-
-fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
+/// The default runtime, for games with no choice of their own.
+fn runtime_chooser(ui: &Ui) {
     let (paths, runtimes, current) = {
         let model = ui.model.borrow();
         let Some(paths) = model.paths.clone() else {
@@ -2447,18 +2517,12 @@ fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
         };
         (
             paths.clone(),
-            match product_id {
-                Some(id) => model.runtimes_for(id).to_vec(),
-                None => model.runtimes.clone(),
-            },
-            match product_id {
-                Some(id) => ferestre_core::runtime::selected(paths.config_dir(), id),
-                None => ferestre_core::runtime::default_selected(paths.config_dir()),
-            },
+            model.runtimes.clone(),
+            ferestre_core::runtime::default_selected(paths.config_dir()),
         )
     };
     let dialog = adw::Dialog::builder()
-        .title(title)
+        .title("Default game runtime")
         .content_width(520)
         .content_height(420)
         .build();
@@ -2471,29 +2535,16 @@ fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
         .margin_end(18)
         .build();
     content.append(&gtk::Label::builder()
-        .label(if product_id.is_some() {
-            "Choose a runtime for this game, or inherit your Settings default. Applies to the next launch."
-        } else {
-            "Used for games without their own override. Automatic selects the newest compatible runtime. Applies to the next launch."
-        })
+        .label("Used for games without their own override. Automatic selects the newest compatible runtime. Applies to the next launch.")
         .wrap(true)
         .xalign(0.0)
         .build());
-    let automatic = gtk::Button::with_label(if product_id.is_some() {
-        "Use default runtime"
-    } else {
-        "Automatic (newest compatible)"
-    });
+    let automatic = gtk::Button::with_label("Automatic (newest compatible)");
     let automatic_ui = ui.clone();
     let automatic_dialog = dialog.clone();
     let automatic_paths = paths.clone();
-    let automatic_product = product_id.map(str::to_string);
     automatic.connect_clicked(move |_| {
-        let result = save_runtime_choice(
-            automatic_paths.config_dir(),
-            automatic_product.as_deref(),
-            None,
-        );
+        let result = ferestre_core::runtime::set_default(automatic_paths.config_dir(), None);
         automatic_ui.model.borrow().forget_probes();
         if let Err(error) = result {
             automatic_ui
@@ -2526,14 +2577,10 @@ fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
         let selected_ui = ui.clone();
         let selected_dialog = dialog.clone();
         let selected_paths = paths.clone();
-        let selected_product = product_id.map(str::to_string);
         let path = runtime.path.clone();
         choice.connect_clicked(move |_| {
-            let result = save_runtime_choice(
-                selected_paths.config_dir(),
-                selected_product.as_deref(),
-                Some(&path),
-            );
+            let result =
+                ferestre_core::runtime::set_default(selected_paths.config_dir(), Some(&path));
             selected_ui.model.borrow().forget_probes();
             if let Err(error) = result {
                 selected_ui
@@ -2565,15 +2612,21 @@ fn runtime_chooser(ui: &Ui, product_id: Option<&str>, title: &str) {
     automatic.grab_focus();
 }
 
-fn save_runtime_choice(
-    config: &std::path::Path,
-    product_id: Option<&str>,
-    path: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
-    match product_id {
-        Some(id) => ferestre_core::runtime::set_selected(config, id, path),
-        None => ferestre_core::runtime::set_default(config, path),
-    }
+/// A tab for a section, with how many games it holds.
+fn section_tab(section: Section) -> gtk::Button {
+    let label = match section {
+        Section::Library => "My games",
+        Section::Downloads => "Install queue",
+        section => section.title(),
+    };
+    let badge = sidebar::count_badge(section);
+    badge.set_widget_name(&format!("tab-count-{}", section.title()));
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    content.append(&gtk::Label::new(Some(label)));
+    content.append(&badge);
+    let tab = gtk::Button::builder().child(&content).build();
+    tab.update_property(&[gtk::accessible::Property::Label(label)]);
+    tab
 }
 
 fn render_library_tabs(ui: &Ui, page: &gtk::Box) {
@@ -2590,13 +2643,8 @@ fn render_library_tabs(ui: &Ui, page: &gtk::Box) {
         .halign(gtk::Align::Start)
         .css_classes(["library-tabs"])
         .build();
-    for (label, section) in [
-        ("My games", Section::Library),
-        ("Installed", Section::Installed),
-        ("Updates", Section::Updates),
-        ("Install queue", Section::Downloads),
-    ] {
-        let button = gtk::Button::with_label(label);
+    for section in Section::LIBRARY_TABS {
+        let button = section_tab(section);
         button.set_widget_name(&format!("section-{}", section.title()));
         if ui.model.borrow().section == section {
             button.add_css_class("active");
@@ -2618,15 +2666,22 @@ fn render_library_tabs(ui: &Ui, page: &gtk::Box) {
         .hexpand(true)
         .child(&tabs)
         .build();
+    // The scroller cuts what it holds at its edges: room for the outline.
+    tabs.set_margin_top(10);
+    tabs.set_margin_bottom(10);
+    tabs.set_margin_start(10);
+    tabs.set_margin_end(10);
+    scroll.add_css_class("library-tabs-scroll");
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     bar.append(&scroll);
-    bar.append(&library_add_menu(ui));
+    bar.append(&library_menu(ui));
     page.append(&bar);
+    sidebar::show_tab_counts(ui);
 }
 
 /// The library's "+": add a game that is already on disk, or import Steam's
 /// non-Steam shortcuts.
-fn library_add_menu(ui: &Ui) -> gtk::MenuButton {
+fn library_menu(ui: &Ui) -> gtk::MenuButton {
     let menu = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -2637,21 +2692,26 @@ fn library_add_menu(ui: &Ui) -> gtk::MenuButton {
         .build();
     let popover = gtk::Popover::builder().child(&menu).build();
     let button = gtk::MenuButton::builder()
-        .icon_name("list-add-symbolic")
+        .icon_name("view-more-symbolic")
         .valign(gtk::Align::Center)
         .css_classes(["flat"])
-        .tooltip_text("Add games")
+        .tooltip_text("Library actions")
         .popover(&popover)
         .build();
     button.set_widget_name("library-add");
-    button.update_property(&[gtk::accessible::Property::Label("Add games")]);
+    button.update_property(&[gtk::accessible::Property::Label("Library actions")]);
     type Item = (&'static str, &'static str, fn(&Ui));
-    let items: [Item; 2] = [
+    let items: [Item; 3] = [
         ("document-open-symbolic", "Add game…", add_game_dialog),
         (
             "emblem-shared-symbolic",
             "Import from Steam",
             import_from_steam,
+        ),
+        (
+            "list-add-symbolic",
+            "Add all games to Steam",
+            add_all_to_steam,
         ),
     ];
     for (icon, label, run) in items {
@@ -2859,7 +2919,7 @@ fn import_from_steam(ui: &Ui) {
             .add_toast(toast("Cannot work out where things live: HOME is not set"));
         return;
     };
-    if !begin(ui, "Reading Steam's shortcuts") {
+    if !begin(ui, "Reading Steam's games and shortcuts") {
         report_busy(ui);
         return;
     }
@@ -2908,8 +2968,8 @@ fn import_from_steam(ui: &Ui) {
         }
         body.push(String::new());
         body.push(format!(
-            "{kept} already in your library; {skipped} skipped (Ferestre's own shortcuts or not \
-             Windows programs)."
+            "{kept} already in your library; {skipped} skipped (Ferestre's own shortcuts, or not \
+             Windows programs). Games Steam installed are started through Steam."
         ));
         let notes = model::steam_import_notes(&candidates);
         if !notes.is_empty() {
@@ -2960,11 +3020,12 @@ fn import_from_steam(ui: &Ui) {
     });
 }
 fn render_recents(ui: &Ui) {
-    sidebar::render_installed(ui);
+    sidebar::render_recent(ui);
+    sidebar::counts_soon(ui);
     sidebar::render_downloads(ui);
 }
 fn library_row(ui: &Ui, row: &LibraryRow) -> adw::ActionRow {
-    let (view, actions) = library_components(ui, row, true);
+    let (view, actions, _) = library_components(ui, row, true);
     view.add_suffix(&actions);
     view
 }
@@ -3010,9 +3071,9 @@ fn game_launch_spinner(label: &str) -> gtk::DrawingArea {
     ring
 }
 
-fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
+fn game_card(ui: &Ui, row: &LibraryRow, tile: page_fit::Tile) -> adw::Clamp {
     // The card draws its own cover, so the row's icon is never shown.
-    let (description, actions) = library_components(ui, row, false);
+    let (description, actions, _) = library_components(ui, row, false);
     let primary = actions
         .last_child()
         .and_then(|w| w.downcast::<gtk::Button>().ok());
@@ -3028,7 +3089,8 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
     let key = row.product_id.to_ascii_uppercase();
     let art = gtk::Picture::builder()
         .can_shrink(true)
-        .height_request(if ui.window.is_fullscreen() { 300 } else { 280 })
+        // The tile's size whether or not its cover is loaded: one that grew
+        // when the cover came moved the grid, and the page no longer fitted.
         .content_fit(gtk::ContentFit::Cover)
         .build();
     // Only a real cover: Size::Cover refuses a source narrower than 300 px,
@@ -3041,7 +3103,8 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
         .borrow_mut()
         .add_picture(key.clone(), &art, textures::Size::Cover);
     let cover = gtk::Overlay::new();
-    cover.set_child(Some(&art));
+    // Held to it: a loaded picture would ask for its own height.
+    cover.set_child(Some(&home::sized(&art, Some(tile.width), tile.cover)));
     if row.has_update() {
         // Keep the badge on the cover, below the separate top-right menu.
         // Both controls must remain readable on the narrow handheld cards.
@@ -3049,8 +3112,15 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
             .orientation(gtk::Orientation::Horizontal)
             .spacing(4)
             .halign(gtk::Align::Start)
-            .valign(gtk::Align::End)
-            .margin_bottom(6)
+            // The words are at a compact cover's foot.
+            .valign(if tile.compact {
+                gtk::Align::Start
+            } else {
+                gtk::Align::End
+            })
+            .margin_top(6)
+            // Above the compatibility badge.
+            .margin_bottom(38)
             .margin_start(6)
             .margin_end(6)
             .css_classes(["game-update-badge"])
@@ -3059,8 +3129,25 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
         let icon = gtk::Image::from_icon_name("software-update-available-symbolic");
         icon.set_pixel_size(14);
         badge.append(&icon);
-        badge.append(&gtk::Label::new(Some("Update available")));
+        let words = gtk::Label::new(Some(if tile.compact {
+            "Update"
+        } else {
+            "Update available"
+        }));
+        words.update_property(&[gtk::accessible::Property::Label("Update available")]);
+        badge.append(&words);
         cover.add_overlay(&badge);
+    }
+    let compat = compat::badge(&ui.model.borrow().compatibility(row));
+    if !tile.compact {
+        // On a shade, as in "Jump back in": covers are any colour.
+        let shade = gtk::Box::builder()
+            .valign(gtk::Align::End)
+            .css_classes(["tile-caption", "compat-shade"])
+            .can_target(false)
+            .build();
+        shade.append(&compat);
+        cover.add_overlay(&shade);
     }
     body.append(&cover);
     let text = gtk::Box::builder()
@@ -3071,15 +3158,30 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
         .margin_start(10)
         .margin_end(10)
         .build();
+    if tile.compact {
+        text.set_spacing(1);
+        for set in [
+            gtk::Widget::set_margin_top,
+            gtk::Widget::set_margin_bottom,
+            gtk::Widget::set_margin_start,
+            gtk::Widget::set_margin_end,
+        ] {
+            set(text.upcast_ref(), 0);
+        }
+        text.add_css_class("compact-caption");
+        text.set_valign(gtk::Align::End);
+        text.set_can_target(false);
+        text.append(&compat);
+    }
     let title = gtk::Label::builder()
         .label(&row.name)
         .xalign(0.0)
         .wrap(true)
         .lines(2)
         .ellipsize(gtk::pango::EllipsizeMode::End)
-        .width_chars(18)
+        .width_chars(12)
         .max_width_chars(20)
-        .height_request(36)
+        .height_request(if tile.compact { -1 } else { 40 })
         .css_classes(["game-title"])
         .build();
     text.append(&title);
@@ -3096,15 +3198,17 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
                 "Xbox PC".into()
             }
         });
-    text.append(
-        &gtk::Label::builder()
-            .label(publisher)
-            .xalign(0.0)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .max_width_chars(20)
-            .css_classes(["game-meta"])
-            .build(),
-    );
+    if !tile.compact {
+        text.append(
+            &gtk::Label::builder()
+                .label(publisher)
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .max_width_chars(20)
+                .css_classes(["game-meta"])
+                .build(),
+        );
+    }
     let launching =
         row.action == Action::Stop && row.subtitle.split("  ·  ").any(|s| s == "starting");
     let state = if row.action == Action::Stop {
@@ -3155,7 +3259,11 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
         status.add_css_class("game-running");
     }
     text.append(&status);
-    body.append(&text);
+    if tile.compact {
+        cover.add_overlay(&text);
+    } else {
+        body.append(&text);
+    }
     let surface = gtk::Overlay::new();
     surface.set_child(Some(&body));
     if row.action == Action::Stop {
@@ -3238,7 +3346,7 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
     } else if let Some(primary) = primary {
         actions.remove(&primary);
         primary.set_child(Some(&surface));
-        primary.set_tooltip_text(description.tooltip_text().as_deref());
+        effects::shimmer(&primary, &surface);
         primary.reset_relation(gtk::AccessibleRelation::LabelledBy);
         primary.update_property(&[gtk::accessible::Property::Label(&format!(
             "{} · {}",
@@ -3269,17 +3377,21 @@ fn game_card(ui: &Ui, row: &LibraryRow) -> adw::Clamp {
     }
     // Clamp both the natural size and final width: FlowBox otherwise chooses
     // one giant column from a texture's original pixel dimensions.
+    effects::no_tooltips(&overlay);
     adw::Clamp::builder()
-        .maximum_size(196)
-        .tightening_threshold(196)
+        .maximum_size(tile.width)
+        .tightening_threshold(tile.width)
         .child(&overlay)
         .build()
 }
 
+/// A title's row, its action buttons, and what shows its details.
+type Components = (adw::ActionRow, gtk::Box, Rc<dyn Fn()>);
+
 /// The row describing a title, and its action buttons. `with_icon` is false
 /// for callers that only take the row's text and buttons (cards and featured
 /// tiles draw their own art), so the icon is not decoded for nothing.
-fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::ActionRow, gtk::Box) {
+fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> Components {
     ui.game_actions
         .borrow_mut()
         .insert(row.product_id.clone(), row.action.label().into());
@@ -3351,8 +3463,12 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
         details.push(format!("v{}", version.trim_start_matches("Version ")));
     }
     details.push(size_text);
-    if let Some((badge, _)) = row.badge {
+    let report = ui.model.borrow().compatibility(row);
+    if let Some((badge, _)) = row.badge.filter(|_| row.local) {
         details.push(badge.to_string());
+    }
+    if row.badge.is_some() {
+        details.push(report.label().to_string());
     }
     if !description.is_empty() {
         details.push(description.to_string());
@@ -3360,7 +3476,7 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
     let details = details.join("  ·  ");
     action_row.set_subtitle(&details);
     // Which runtime Play would use: the per-title choice changes it, and a
-    // row that hid that made "Choose runtime" look as if it did nothing.
+    // row that hid that made a runtime choice look as if it did nothing.
     let runtime_note = ui.model.borrow().runtime_note(&row.product_id);
     action_row.set_tooltip_text(Some(&match &runtime_note {
         Some(note) => format!("{}\n{}\n{}\n{}", row.name, details, note, row.product_id),
@@ -3421,7 +3537,7 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
     let menu_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .min_content_width(240)
-        .max_content_height(320)
+        .max_content_height(400)
         .propagate_natural_height(true)
         .child(&menu)
         .build();
@@ -3458,67 +3574,85 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
         });
         menu.append(&button);
     };
+    // A game with an update can be played as it is.
+    if matches!(row.action, Action::Play | Action::Update) {
+        // A bundle row runs its child, as its button does.
+        let (id, name) = row
+            .install_as
+            .clone()
+            .unwrap_or_else(|| (row.product_id.clone(), row.name.clone()));
+        let ui = ui.clone();
+        item(
+            "media-playback-start-symbolic",
+            "Launch",
+            Box::new(move || spawn_title(&ui, &id, &name)),
+        );
+    }
+    if row.action == Action::Install && row.action.is_enabled() {
+        let (id, name) = row
+            .install_as
+            .clone()
+            .unwrap_or_else(|| (row.product_id.clone(), row.name.clone()));
+        let ui = ui.clone();
+        item(
+            "folder-download-symbolic",
+            "Install",
+            Box::new(move || confirm_install(&ui, &id, &name)),
+        );
+    }
     let detail_ui = ui.clone();
+    let (detail_id, local) = (row.product_id.clone(), row.local);
     let detail_name = row.name.clone();
     let detail_text = match &runtime_note {
         Some(runtime) => format!("{details}\n\n{runtime}"),
         None => details.clone(),
     };
+    let detail_main = details_ui::Main::of(ui, row);
+    let show_details: Rc<dyn Fn()> = Rc::new(move || {
+        details_ui::open(
+            &detail_ui,
+            &detail_id,
+            &detail_name,
+            &detail_text,
+            &report,
+            local,
+            &detail_main,
+        );
+    });
+    let details_item = show_details.clone();
+    let details_of_row = show_details.clone();
     item(
         "dialog-information-symbolic",
         "Game details",
-        Box::new(move || {
-            let dialog = adw::AlertDialog::new(Some(&detail_name), Some(&detail_text));
-            dialog.set_body_use_markup(false);
-            dialog.add_response("close", "Close");
-            dialog.set_close_response("close");
-            dialog.present(Some(&detail_ui.window));
-        }),
+        Box::new(move || details_item()),
     );
-    // A local game has no Store page, is not moved, and is never deleted.
-    if !row.local {
-        let store_url = format!("{STORE_PAGE}{}", row.product_id);
-        // Weak for the same reason: the row holds the menu that holds this.
-        let anchor = action_row.downgrade();
-        item(
-            "web-browser-symbolic",
-            "Open Store page",
-            Box::new(move || {
-                if let Some(anchor) = anchor.upgrade() {
-                    open_link(&anchor, &store_url);
-                }
-            }),
-        );
-    }
     // A shortcut needs something that will launch. A recipe is one; a title on
     // disk is another, because `run` writes a recipe from the package manifest
     // on its way past.
+    // Steam starts a game it installed: its runtime is Steam's choice, and it
+    // is in Steam's library already.
+    let steam_game = ui.model.borrow().recipes.iter().any(|r| {
+        r.title.product_id.eq_ignore_ascii_case(&row.product_id) && r.launch.steam_app_id.is_some()
+    });
     if (row.has_recipe || row.installed) && row.action != Action::Content {
         for (icon, label, run) in [
             (
-                "applications-engineering-symbolic",
-                "Choose runtime",
-                choose_runtime as fn(&Ui, &str, &str),
+                "list-add-symbolic",
+                "Add to Steam",
+                add_to_steam as fn(&Ui, &str, &str),
             ),
-            ("list-add-symbolic", "Add to Steam", add_to_steam),
             (
                 "document-edit-symbolic",
                 "Edit launch settings",
                 open_editor,
             ),
         ] {
+            if steam_game && label != "Edit launch settings" {
+                continue;
+            }
             let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
             item(icon, label, Box::new(move || run(&ui, &product_id, &name)));
         }
-    }
-    // Only for a title on disk: the dialog reads its files.
-    if row.installed && row.action != Action::Content {
-        let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
-        item(
-            "video-display-symbolic",
-            "Neural rendering…",
-            Box::new(move || neural_ui::open(&ui, &product_id, &name)),
-        );
     }
     if row.installed && !row.local && row.action != Action::Stop && row.action != Action::Installing
     {
@@ -3547,7 +3681,7 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
         let (ui, product_id, name) = (ui.clone(), row.product_id.clone(), row.name.clone());
         item(
             "user-trash-symbolic",
-            "Remove from disk",
+            "Delete",
             Box::new(move || confirm_remove(&ui, &product_id, &name)),
         );
     }
@@ -3561,7 +3695,7 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
     if let Action::Blocked(reason) = &row.action {
         action_row.set_tooltip_text(Some(&format!("{}\n{}\n{}", row.name, details, reason)));
         if row.unsupported || !row.has_recipe {
-            return (action_row, actions);
+            return (action_row, actions, show_details);
         }
         let button = gtk::Button::builder()
             .label(row.action.label())
@@ -3581,7 +3715,7 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
             explain_blocked(&ui, &product_id, &name, &reason, offer_runtime)
         });
         actions.append(&button);
-        return (action_row, actions);
+        return (action_row, actions, show_details);
     }
 
     let button = gtk::Button::builder()
@@ -3720,7 +3854,9 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
                     } else if updating {
                         update_download(&ui, &product_id, &title_name);
                     } else if waits {
-                        confirm_install(&ui, &product_id, &title_name);
+                        // What it is before whether to have it: Install is
+                        // the details' own button.
+                        show_details();
                     } else if plays {
                         spawn_title(&ui, &product_id, &title_name);
                     } else {
@@ -3732,7 +3868,7 @@ fn library_components(ui: &Ui, row: &LibraryRow, with_icon: bool) -> (adw::Actio
     }
     actions.append(&button);
     action_row.set_activatable_widget(Some(&button));
-    (action_row, actions)
+    (action_row, actions, details_of_row)
 }
 
 fn render_account_button(ui: &Ui) {
@@ -4263,7 +4399,7 @@ fn explain_blocked(ui: &Ui, product_id: &str, name: &str, reason: &str, offer_ru
     dialog.set_close_response("close");
     let (chooser_ui, product_id, name) = (ui.clone(), product_id.to_string(), name.to_string());
     dialog.connect_response(Some("runtime"), move |_, _| {
-        choose_runtime(&chooser_ui, &product_id, &name)
+        open_editor_on(&chooser_ui, &product_id, &name, Some(editor::PROTON_TAB))
     });
     dialog.present(Some(&ui.window));
 }
@@ -4483,6 +4619,8 @@ fn spawn_title(ui: &Ui, product_id: &str, name: &str) {
     }
     // The launch log was just written: the title is now the most recent.
     ui.model.borrow().forget_probes();
+    // Before the redraw: it starts from the tile that is there now.
+    launch_show::play(ui, product_id, name);
     render(ui);
     ui.toasts
         .add_toast_replacing(product_id, toast(format!("Starting {name}")));
@@ -5755,7 +5893,11 @@ fn free_space_label(dir: &Path) -> Option<String> {
 }
 
 fn open_editor(ui: &Ui, product_id: &str, name: &str) {
-    let (recipe, titles_dir) = {
+    open_editor_on(ui, product_id, name, None);
+}
+
+fn open_editor_on(ui: &Ui, product_id: &str, name: &str, tab: Option<&'static str>) {
+    let (recipe, titles_dir, runtimes) = {
         let model = ui.model.borrow();
         let mut recipe = model.recipe_for(product_id).cloned().unwrap_or_else(|| {
             let mut blank = Recipe::blank(product_id, name);
@@ -5780,7 +5922,21 @@ fn open_editor(ui: &Ui, product_id: &str, name: &str) {
                 recipe.launch.executable = found;
             }
         }
-        (recipe, model.user_titles_dir())
+        let runtimes = editor::Runtimes {
+            choices: recipe.launch.steam_app_id.is_none().then(|| {
+                model
+                    .runtimes_for(product_id)
+                    .iter()
+                    .map(|r| (r.path.clone(), r.label()))
+                    .collect()
+            }),
+            chosen: model
+                .paths
+                .as_ref()
+                .and_then(|p| ferestre_core::runtime::selected(p.config_dir(), product_id)),
+            launch: model.launch_runtime(&recipe).ok().map(|r| r.path.clone()),
+        };
+        (recipe, model.user_titles_dir(), runtimes)
     };
     let Some(titles_dir) = titles_dir else {
         ui.toasts
@@ -5792,17 +5948,33 @@ fn open_editor(ui: &Ui, product_id: &str, name: &str) {
     let ui = ui.clone();
     let reset_ui = ui.clone();
     let reset_name = name.to_string();
+    let (runtime_ui, runtime_id) = (ui.clone(), product_id.to_string());
     editor::present(
         &window,
         recipe,
-        titles_dir,
+        editor::Setup {
+            titles_dir,
+            runtimes,
+            neural: neural_ui::tab(&ui, product_id),
+            tab,
+        },
+        move |path| {
+            let paths = runtime_ui.model.borrow().paths.clone();
+            let paths = paths.ok_or("Ferestre's folders are unknown")?;
+            let saved = ferestre_core::runtime::set_selected(paths.config_dir(), &runtime_id, path);
+            runtime_ui.model.borrow().forget_probes();
+            saved.map_err(|e| format!("{e:#}"))
+        },
         move |path| {
             ui.model.borrow_mut().reload();
             render(&ui);
-            ui.toasts.add_toast(toast(format!(
-                "Saved {}",
-                path.file_name().unwrap_or_default().to_string_lossy()
-            )));
+            ui.toasts.add_toast(toast(match path {
+                Some(path) => format!(
+                    "Saved {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ),
+                None => "Runtime choice saved for the next launch".to_string(),
+            }));
         },
         move || {
             reset_ui.model.borrow_mut().reload();
@@ -6793,7 +6965,7 @@ fn refresh_library(ui: &Ui) {
         .iter()
         .map(|r| r.title.product_id.clone())
         .collect();
-    ui.toasts.add_toast(toast("Asking what this account owns"));
+    ui.toasts.add_toast(toast("Loading your library"));
 
     let roles = ui.model.borrow().roles.clone();
     let ui = ui.clone();
@@ -6855,7 +7027,6 @@ fn refresh_library(ui: &Ui) {
                             .catalog
                             .insert(product.product_id.to_ascii_uppercase(), product);
                     }
-                    model.page = 0;
                 }
                 render(&ui);
                 let message = if failures.is_empty() {
@@ -6892,7 +7063,9 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
             // fetched: the listing survives a restart and the tier map does
             // not, so every session after the first showed 524 titles with no
             // idea which of them this account can install.
-            !model.gamepass.is_empty() && !model.tiers.included.is_empty(),
+            !model.gamepass.is_empty()
+                && !model.tiers.included.is_empty()
+                && model.gamepass_popular.is_some(),
         )
     };
     if have
@@ -6927,12 +7100,14 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
                 move || {
                     let listing = gamepass::fetch(&market, &language)?;
                     let tiers = gamepass::fetch_tiers(&market, &language)?;
-                    Ok::<_, anyhow::Error>((listing, tiers))
+                    // Only an order: the catalogue is of use without it.
+                    let popular = gamepass::fetch_popular(&market, &language).ok();
+                    Ok::<_, anyhow::Error>((listing, tiers, popular))
                 }
             })
             .await;
             ui.fetching_gamepass.replace(false);
-            let Ok(Ok((listing, tiers))) = fetched else {
+            let Ok(Ok((listing, tiers, popular))) = fetched else {
                 let failures = ui.gamepass_failures.get().saturating_add(1);
                 ui.gamepass_failures.set(failures);
                 ui.gamepass_retry_at.set(Some(
@@ -6952,8 +7127,11 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
             ui.gamepass_retry_at.set(None);
             // The merchandised list is what is kept: which ids the tier feed
             // added is worth knowing again on the next start.
+            let popular = popular
+                .or_else(|| ui.model.borrow().gamepass_popular.clone())
+                .unwrap_or_default();
             if let Some(dir) = paths {
-                let _ = gamepass::save_cache(&dir, &market, &listing, &tiers);
+                let _ = gamepass::save_cache(&dir, &market, &listing, &tiers, Some(&popular));
             }
             {
                 let mut model = ui.model.borrow_mut();
@@ -6961,9 +7139,10 @@ fn fetch_gamepass(ui: &Ui, force: bool) {
                 model.gamepass_merchandised =
                     listing.iter().map(|id| id.to_ascii_uppercase()).collect();
                 model.tiers = tiers;
+                model.gamepass_popular = Some(popular);
             }
             preload_gamepass_art(&ui);
-            if ui.model.borrow().section == Section::GamePass {
+            if matches!(ui.model.borrow().section, Section::GamePass | Section::Home) {
                 render_soon(&ui);
             }
         });
@@ -7000,7 +7179,6 @@ fn fetch_names(ui: &Ui, product_ids: Vec<String>) {
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let (market, language) = market;
-        let mut any_changed = false;
         // In chunks, so filling in five hundred names shows rows as they land
         // rather than after every request has finished. Each chunk is several
         // batched lookups, so this is not a request per await.
@@ -7037,14 +7215,13 @@ fn fetch_names(ui: &Ui, product_ids: Vec<String>) {
                 }
             }
             if changed {
-                any_changed = true;
-                render_soon(&ui);
+                render_later(&ui);
             }
         }
         ui.fetching_names.set(false);
         // A section change or explicit refresh may have queued more ids, and
         // a "Looking up" line has to go now that nothing is.
-        if any_changed || ui.names_requeued.replace(false) || ui.showed_pending_names.get() {
+        if ui.names_requeued.replace(false) || ui.showed_pending_names.get() {
             render_soon(&ui);
         }
     });
@@ -7226,6 +7403,7 @@ mod catalog_regressions {
             refused: Default::default(),
             paths: None,
             recipes: Vec::new(),
+            reports: Default::default(),
             runtime: None,
             runtimes: Vec::new(),
             local_runtimes: Vec::new(),
@@ -7245,13 +7423,13 @@ mod catalog_regressions {
             avatar: None,
             gamepass: vec!["9NR1R1XWLCNB".into()],
             gamepass_merchandised: Default::default(),
+            gamepass_popular: None,
             subscriptions: Vec::new(),
             entitlements_checked: false,
             tiers: gamepass::parse_tiers(r#"{"9NR1R1XWLCNB":{"PCSubMetadata":{"Included":true}}}"#)
                 .unwrap(),
             section: Section::GamePass,
             query: String::new(),
-            page: 0,
             show_unsupported: false,
             problem: None,
             probes: Default::default(),
@@ -7310,7 +7488,7 @@ mod catalog_regressions {
                 no_lookups(),
                 Section::GamePass,
                 |row| !row.known_uninstallable(),
-                Listing::Page,
+                Listing::Searched,
             )
         };
         assert_eq!(
@@ -7338,7 +7516,7 @@ mod catalog_regressions {
             no_lookups(),
             Section::GamePass,
             |row| !row.known_uninstallable(),
-            Listing::Page,
+            Listing::Searched,
         );
         assert_eq!(drawn.rows.len(), 1);
         assert_eq!(drawn.rows[0].action, Action::Installing);
@@ -7352,7 +7530,6 @@ mod catalog_regressions {
         model
             .gamepass
             .extend((0..50).map(|i| format!("9ZZTEST{i:05}")));
-        model.page = 99;
         let drawn = draw_list(
             &model,
             &BTreeMap::new(),
@@ -7360,11 +7537,10 @@ mod catalog_regressions {
             no_lookups(),
             Section::GamePass,
             |row| !row.known_uninstallable(),
-            Listing::Page,
+            Listing::Searched,
         );
         assert_eq!(drawn.pending_names, 51);
         assert!(drawn.want_names.contains(&"9NR1R1XWLCNB".into()));
-        assert!(drawn.page < 99);
         assert!(!drawn.rows.is_empty());
     }
 
@@ -7394,7 +7570,7 @@ mod catalog_regressions {
                 },
                 Section::GamePass,
                 |row| !row.known_uninstallable(),
-                Listing::Page,
+                Listing::Searched,
             )
         };
         assert_eq!(
@@ -7440,7 +7616,7 @@ mod catalog_regressions {
                 no_lookups(),
                 section,
                 |_| true,
-                Listing::Page,
+                Listing::Searched,
             );
             let row = drawn
                 .rows
@@ -7457,7 +7633,7 @@ mod catalog_regressions {
                 no_lookups(),
                 section,
                 |_| true,
-                Listing::Page,
+                Listing::Searched,
             );
             let row = starting
                 .rows

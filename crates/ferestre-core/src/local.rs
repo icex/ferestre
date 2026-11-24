@@ -29,6 +29,11 @@ pub fn steam_id(app_id: u32) -> String {
     format!("{ID_PREFIX}STEAM-{app_id}")
 }
 
+/// The id of a game Steam installed, with this app id.
+pub fn steam_app_id(app_id: u32) -> String {
+    format!("{ID_PREFIX}STEAMAPP-{app_id}")
+}
+
 /// A new id for a game added by hand: `LOCAL-` and its name as a slug,
 /// uppercased, then `-2`, `-3`... while `taken` says the id is in use.
 pub fn new_id(name: &str, taken: &dyn Fn(&str) -> bool) -> String {

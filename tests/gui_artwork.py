@@ -128,17 +128,44 @@ def main():
             s.check(not (cache / 'images' / (ids[0] + '-cover-600.png')).exists(),
                     'a stalled image does not hold the rest of the page')
             release.set()
-            # Stay on page one: later pages must fill without being visited.
+            # Do not scroll: the rest must fill without being visited.
             s.wait_for(frame, lambda _: len(covered()) == len(ids), 'the full catalogue to prefetch', time.monotonic() + 20)
-            s.check(len(covered()) == 60, 'all three pages preload after opening Game Pass')
+            s.check(len(covered()) == 60, 'the whole list preloads after opening Game Pass')
             with lock:
                 s.check(peak <= 4, f'network concurrency remains bounded (peak {peak})')
                 before = counts.copy()
-            s.click_named(frame, 'Next page')
-            s.wait_for(frame, lambda r: 'Artwork Game 020' in s.texts(r), 'page two', time.monotonic() + 10)
+            def tiles():
+                """The list's tiles, by the number in their name."""
+                found = {}
+                for button in s.find_all(frame, role='button'):
+                    match = re.match(r'Artwork Game (\d+) · Install', button.get_name() or '')
+                    if match:
+                        found[int(match[1])] = button
+                return found
+            def extents(button):
+                return button.get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
+            def scroll_through(what):
+                """Scroll down until the list ends."""
+                until = time.monotonic() + 60
+                seen = set(tiles())
+                s.check(0 in seen and len(seen) >= 4, f'{what}: the list starts at its start')
+                def bar():
+                    bars = s.wait_for(frame, lambda r: [b for b in s.find_all(r, role='scroll bar') if b.get_value_iface()], 'a scroll bar', time.monotonic() + s.TIMEOUT)
+                    return max(bars, key=lambda b: b.get_value_iface().get_maximum_value()).get_value_iface()
+                while 59 not in seen and time.monotonic() < until:
+                    value = bar()
+                    value.set_current_value(value.get_current_value() + 200)
+                    time.sleep(.25)
+                    seen |= set(tiles())
+                s.check(seen == set(range(60)), f'{what}: scrolling reaches every title ({sorted(set(range(60)) - seen)} missing)')
+                s.check(len(tiles()) < 60, f'{what}: tiles far from the view are not kept ({len(tiles())} of 60)')
+                end = bar().get_current_value()
+                time.sleep(1)
+                s.check(abs(bar().get_current_value() - end) < 2, f'{what}: the list stays where it was scrolled to')
+            scroll_through('desktop')
             time.sleep(.3)
             with lock:
-                s.check(counts == before, 'pagination reuses the preloaded cover cache')
+                s.check(counts == before, 'scrolling reuses the preloaded cover cache')
             if args.fullscreen:
                 s.click_named(frame, 'Enter fullscreen')
                 s.wait_for(frame, lambda r: s.find_all(r, role='button', name='Exit fullscreen'),

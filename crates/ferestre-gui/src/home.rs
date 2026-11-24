@@ -49,8 +49,9 @@ fn tagline(model: &Model, row: &LibraryRow, gamepass: bool) -> String {
 
 /// The titles the carousel would show if their banners were on disk, in the
 /// order [`features`] picks from, so their landscape art can be fetched.
-pub(crate) fn hero_candidates(library: &[LibraryRow], gamepass: &[LibraryRow]) -> Vec<String> {
-    const LOOK_AHEAD: usize = 12;
+pub(crate) fn hero_candidates(library: &[LibraryRow], gamepass: &[&LibraryRow]) -> Vec<String> {
+    // The carousel and the Featured cards, and some without wide art.
+    const LOOK_AHEAD: usize = 18;
     let mut ids: Vec<String> = Vec::new();
     let mut push = |row: &LibraryRow| {
         let id = row.product_id.to_ascii_uppercase();
@@ -67,12 +68,16 @@ pub(crate) fn hero_candidates(library: &[LibraryRow], gamepass: &[LibraryRow]) -
         .iter()
         .filter(|r| r.has_update())
         .for_each(&mut push);
-    gamepass.iter().filter(|r| !r.installed).for_each(&mut push);
+    gamepass
+        .iter()
+        .copied()
+        .filter(|r| !r.installed)
+        .for_each(&mut push);
     library.iter().for_each(&mut push);
     ids
 }
 
-fn features(model: &Model, library: &[LibraryRow], gamepass: &[LibraryRow]) -> Vec<Feature> {
+fn features(model: &Model, library: &[LibraryRow], gamepass: &[&LibraryRow]) -> Vec<Feature> {
     // Only art that is on disk: a title shown on a path with nothing behind
     // it was a blank banner in the carousel.
     let hero = |id: &str| model.wide_art(id);
@@ -148,6 +153,9 @@ pub(crate) fn sized(child: &impl IsA<gtk::Widget>, width: Option<i32>, height: i
     }
 }
 
+/// Draws the hero, turned by so many places.
+type Fill = Rc<dyn Fn(&Ui, isize)>;
+
 /// The hero carousel, for Home and Game Pass.
 pub(crate) fn hero(ui: &Ui, page: &gtk::Box, items: Vec<Feature>) {
     if items.is_empty() {
@@ -162,7 +170,8 @@ pub(crate) fn hero(ui: &Ui, page: &gtk::Box, items: Vec<Feature>) {
         .css_classes(["hero-stage"])
         .build();
     // Sizes follow the allocated width, so a resize needs no rebuild.
-    stage.set_layout_manager(Some(HeroLayout::default()));
+    let layout = HeroLayout::default();
+    stage.set_layout_manager(Some(layout.clone()));
     let dots = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -193,9 +202,32 @@ pub(crate) fn hero(ui: &Ui, page: &gtk::Box, items: Vec<Feature>) {
     if items.len() < 2 {
         controls.set_visible(false);
     }
-    let fill: Rc<dyn Fn(&Ui)> = {
-        let (stage, dots, items) = (stage.clone(), dots.clone(), items.clone());
-        Rc::new(move |ui: &Ui| {
+    // The turn in progress: it runs from where the last one had got to.
+    let turn: Rc<RefCell<Option<adw::TimedAnimation>>> = Rc::default();
+    // How far it has been dragged, in places.
+    let dragged: Rc<Cell<f64>> = Rc::default();
+    let fill: Fill = {
+        // Weak: the stage's own drag leads back here.
+        let (weak_stage, weak_dots) = (stage.downgrade(), dots.downgrade());
+        let (items, weak_layout) = (items.clone(), layout.downgrade());
+        let (turn, dragged) = (turn.clone(), dragged.clone());
+        Rc::new(move |ui: &Ui, step: isize| {
+            let (Some(stage), Some(dots), Some(layout)) = (
+                weak_stage.upgrade(),
+                weak_dots.upgrade(),
+                weak_layout.upgrade(),
+            ) else {
+                return;
+            };
+            let animate =
+                step != 0 && gtk::Settings::default().is_none_or(|s| s.is_gtk_enable_animations());
+            let running = turn.take();
+            let was_dragged = dragged.get() != 0.0;
+            let mut from = dragged.take();
+            if let Some(running) = running {
+                from = running.value();
+                running.pause();
+            }
             let index = ui.hero_index.get() % items.len();
             let had_focus = GtkWindowExt::focus(&ui.window)
                 .is_some_and(|f| f.is_ancestor(&stage) || f.has_css_class("hero-centre"));
@@ -206,13 +238,85 @@ pub(crate) fn hero(ui: &Ui, page: &gtk::Box, items: Vec<Feature>) {
                 dots.remove(&child);
             }
             let n = items.len();
+            // The title that leaves the stage on this turn, shown until it has.
+            let leaving = |by: usize, next: bool| {
+                let gone = peek(ui, &items[(index + by) % n], next);
+                gone.set_can_target(false);
+                gone.add_css_class("hero-leaving");
+                gone
+            };
+            if animate && step > 0 {
+                stage.append(&leaving(2 * n - 2, false));
+            }
             if n > 1 {
-                stage.append(&peek(ui, &items[(index + n - 1) % n], false));
+                let side = peek(ui, &items[(index + n - 1) % n], false);
+                if animate && step > 0 {
+                    side.add_css_class("hero-was-centre");
+                } else if animate {
+                    side.add_css_class("hero-arriving");
+                }
+                stage.append(&side);
             }
             let centre = centre(ui, &items[index], index == 0);
+            if animate {
+                centre.add_css_class("hero-was-peek");
+            }
             stage.append(&centre);
             if n > 1 {
-                stage.append(&peek(ui, &items[(index + 1) % n], true));
+                let side = peek(ui, &items[(index + 1) % n], true);
+                if animate && step < 0 {
+                    side.add_css_class("hero-was-centre");
+                } else if animate {
+                    side.add_css_class("hero-arriving");
+                }
+                stage.append(&side);
+            }
+            if animate && step < 0 {
+                stage.append(&leaving(2, true));
+            }
+            // Over all of it and always in the centre's place, so a turn moves
+            // the pictures and the words only change.
+            let caption = caption(&items[index]);
+            if animate {
+                caption.add_css_class("hero-caption-new");
+            }
+            // Dragged, the words come along; turned by a button they stay.
+            layout.set_words_move(was_dragged);
+            stage.append(&caption);
+            layout.set_first(match (n > 1, animate && step > 0) {
+                (false, _) => 0,
+                (true, false) => -1,
+                (true, true) => -2,
+            });
+            layout.set_offset(0.0);
+            if animate {
+                let from = (from + step as f64).clamp(-2.0, 2.0);
+                layout.set_offset(from);
+                let target = adw::CallbackAnimationTarget::new(glib::clone!(
+                    #[weak]
+                    layout,
+                    move |value| layout.set_offset(value)
+                ));
+                let animation = adw::TimedAnimation::builder()
+                    .widget(&stage)
+                    .value_from(from)
+                    .value_to(0.0)
+                    .duration(HERO_TURN_MS)
+                    .easing(adw::Easing::EaseOutCubic)
+                    .target(&target)
+                    .build();
+                animation.connect_done(glib::clone!(
+                    #[weak]
+                    stage,
+                    #[weak]
+                    layout,
+                    move |_| {
+                        drop_leaving(&stage);
+                        layout.set_first(-1);
+                    }
+                ));
+                animation.play();
+                turn.replace(Some(animation));
             }
             for i in 0..n {
                 let dot = gtk::Box::builder()
@@ -230,15 +334,87 @@ pub(crate) fn hero(ui: &Ui, page: &gtk::Box, items: Vec<Feature>) {
             }
         })
     };
-    fill(ui);
+    fill(ui, 0);
     for (button, step) in [(previous, -1isize), (next, 1)] {
         let (ui, fill, n) = (ui.clone(), fill.clone(), items.len());
         button.connect_clicked(move |_| {
             let index = (ui.hero_index.get() as isize + step).rem_euclid(n as isize);
             ui.hero_index.set(index as usize);
-            fill(&ui);
+            fill(&ui, step);
         });
     }
+    let drag_turn: Rc<dyn Fn(isize)> = {
+        let (ui, fill, n, previous) = (ui.clone(), fill.clone(), items.len(), turn.clone());
+        let (layout, dragged, stage) = (layout.downgrade(), dragged.clone(), stage.downgrade());
+        Rc::new(move |step| {
+            let (Some(layout), Some(stage)) = (layout.upgrade(), stage.upgrade()) else {
+                return;
+            };
+            if step != 0 {
+                let index = (ui.hero_index.get() as isize + step).rem_euclid(n as isize);
+                ui.hero_index.set(index as usize);
+                fill(&ui, step);
+                return;
+            }
+            // Not far enough: back to where it was.
+            let words = stage.last_child();
+            let animation = adw::TimedAnimation::builder()
+                .widget(&stage)
+                .value_from(dragged.take())
+                .value_to(0.0)
+                .duration(180)
+                .easing(adw::Easing::EaseOutCubic)
+                .target(&adw::CallbackAnimationTarget::new(move |value| {
+                    layout.set_offset(value);
+                    fade_words(words.as_ref(), value);
+                }))
+                .build();
+            let stage = stage.downgrade();
+            animation.connect_done(move |_| {
+                if let Some(stage) = stage.upgrade() {
+                    drop_leaving(&stage);
+                }
+            });
+            animation.play();
+            previous.replace(Some(animation));
+        })
+    };
+    let count = items.len();
+    let (moved_layout, moved, turning) = (layout.downgrade(), dragged, turn);
+    let base: Rc<Cell<f64>> = Rc::default();
+    let ended_base = base.clone();
+    drag_sideways(
+        &stage,
+        true,
+        move |stage, dx| {
+            if count < 2 {
+                return;
+            }
+            // Caught mid-turn, it goes on from where it is.
+            if let Some(running) = turning.take() {
+                running.pause();
+                base.set(running.value());
+                if let Some(layout) = moved_layout.upgrade() {
+                    drop_leaving(stage);
+                    layout.set_first(-1);
+                }
+            }
+            let width = hero_place(stage.width(), true, 0.0).1.max(1);
+            let offset = (base.get() + dx / f64::from(width)).clamp(-1.0, 1.0);
+            moved.set(offset);
+            if let Some(layout) = moved_layout.upgrade() {
+                layout.set_words_move(true);
+                layout.set_offset(offset);
+            }
+            fade_words(stage.last_child().as_ref(), offset);
+        },
+        move |dx| {
+            ended_base.set(0.0);
+            if count > 1 {
+                drag_turn(drag_step(dx));
+            }
+        },
+    );
     let column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(10)
@@ -247,6 +423,97 @@ pub(crate) fn hero(ui: &Ui, page: &gtk::Box, items: Vec<Feature>) {
     column.append(&stage);
     column.append(&controls);
     page.append(&column);
+}
+
+/// The titles a turn has taken off the stage.
+fn drop_leaving(stage: &impl IsA<gtk::Widget>) {
+    let mut child = stage.as_ref().first_child();
+    while let Some(c) = child {
+        child = c.next_sibling();
+        if c.has_css_class("hero-leaving") {
+            c.unparent();
+        }
+    }
+}
+
+/// The centre's words fade as it is dragged off.
+fn fade_words(words: Option<&gtk::Widget>, offset: f64) {
+    if let Some(words) = words.filter(|w| w.has_css_class("hero-caption")) {
+        words.set_opacity(1.0 - offset.abs().min(1.0));
+    }
+}
+
+/// Which way a drag this long turns the hero.
+fn drag_step(dx: f64) -> isize {
+    match dx {
+        dx if dx <= -60.0 => 1,
+        dx if dx >= 60.0 => -1,
+        _ => 0,
+    }
+}
+
+fn by_finger(drag: &gtk::GestureDrag) -> bool {
+    drag.current_event()
+        .and_then(|event| event.device())
+        .is_some_and(|device| device.source() == gdk::InputSource::Touchscreen)
+}
+
+/// Follow a sideways drag over `widget`, which then presses nothing in it.
+/// With `touch` false a finger is left to the widget's own scrolling.
+fn drag_sideways(
+    widget: &impl IsA<gtk::Widget>,
+    touch: bool,
+    moved: impl Fn(&gtk::Widget, f64) + 'static,
+    ended: impl Fn(f64) + 'static,
+) {
+    const THRESHOLD: f64 = 8.0;
+    let drag = gtk::GestureDrag::new();
+    drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let dragging: Rc<Cell<bool>> = Rc::default();
+    let began = dragging.clone();
+    drag.connect_drag_begin(move |drag, _, _| {
+        began.set(false);
+        if by_finger(drag) && !touch {
+            drag.set_state(gtk::EventSequenceState::Denied);
+        }
+    });
+    let going = dragging.clone();
+    drag.connect_drag_update(move |drag, dx, dy| {
+        if !going.get() {
+            if dx.abs().max(dy.abs()) < THRESHOLD {
+                return;
+            }
+            if dy.abs() > dx.abs() {
+                // A finger scrolls the page; a mouse only lets go.
+                let state = if by_finger(drag) {
+                    gtk::EventSequenceState::Denied
+                } else {
+                    gtk::EventSequenceState::Claimed
+                };
+                drag.set_state(state);
+                return;
+            }
+            going.set(true);
+            // What was pressed lets go of the press.
+            drag.set_state(gtk::EventSequenceState::Claimed);
+        }
+        if let Some(widget) = drag.widget() {
+            moved(&widget, dx);
+        }
+    });
+    let ended = Rc::new(ended);
+    let (cancelled, stopped) = (ended.clone(), dragging.clone());
+    drag.connect_cancel(move |_, _| {
+        if stopped.replace(false) {
+            cancelled(0.0);
+        }
+    });
+    drag.connect_drag_end(move |_, dx, _| {
+        if dragging.replace(false) {
+            ended(dx);
+        }
+    });
+    widget.add_controller(drag);
 }
 
 fn art_picture(path: Option<&Path>, fallback: Option<&Path>, size: textures::Size) -> gtk::Picture {
@@ -274,7 +541,14 @@ mod hero_layout {
     use gtk::{glib, prelude::*, subclass::prelude::*};
 
     #[derive(Default)]
-    pub struct Imp;
+    pub struct Imp {
+        /// Where the first child stands: 0 the centre, -1 left of it, -2 gone.
+        pub first: std::cell::Cell<i32>,
+        /// How far a turn still has to go, in places.
+        pub offset: std::cell::Cell<f64>,
+        /// Whether the words go along.
+        pub words_move: std::cell::Cell<bool>,
+    }
 
     #[glib::object_subclass]
     impl ObjectSubclass for Imp {
@@ -290,11 +564,18 @@ mod hero_layout {
         let mut child = widget.first_child();
         while let Some(c) = child {
             child = c.next_sibling();
-            if c.should_layout() {
+            if c.should_layout() && !c.has_css_class("hero-caption") {
                 out.push(c);
             }
         }
         out
+    }
+
+    /// The centre's words, which stay where the centre rests.
+    fn caption(widget: &gtk::Widget) -> Option<gtk::Widget> {
+        widget
+            .last_child()
+            .filter(|c| c.has_css_class("hero-caption"))
     }
 
     impl LayoutManagerImpl for Imp {
@@ -312,11 +593,14 @@ mod hero_layout {
             let peeks = kids.len() > 1;
             match orientation {
                 gtk::Orientation::Horizontal => {
+                    // A title leaving during a turn asks for no room.
+                    let kept = kids.len().min(3);
                     let min = kids
                         .iter()
+                        .filter(|c| !c.has_css_class("hero-leaving"))
                         .map(|c| c.measure(orientation, -1).0)
                         .sum::<i32>()
-                        + super::HERO_GAP * (kids.len().max(1) as i32 - 1);
+                        + super::HERO_GAP * (kept.max(1) as i32 - 1);
                     let (_, _, natural) = super::hero_geometry(i32::MAX, peeks);
                     (min, natural.max(min), -1, -1)
                 }
@@ -337,18 +621,24 @@ mod hero_layout {
 
         fn allocate(&self, widget: &gtk::Widget, width: i32, height: i32, _baseline: i32) {
             let kids = children(widget);
-            let (centre, peek, total) = super::hero_geometry(width, kids.len() > 1);
-            let mut x = ((width - total) / 2).max(0);
+            let peeks = kids.len() > 1;
+            let (first, offset) = (f64::from(self.first.get()), self.offset.get());
             for (i, child) in kids.iter().enumerate() {
-                let wanted = if kids.len() > 1 && i != 1 {
-                    peek
-                } else {
-                    centre
-                };
+                let (x, wanted) = super::hero_place(width, peeks, first + i as f64 + offset);
                 let w = wanted.max(child.measure(gtk::Orientation::Horizontal, height).0);
                 let h = height.max(child.measure(gtk::Orientation::Vertical, w).0);
                 child.size_allocate(&gtk::Allocation::new(x, 0, w, h), -1);
-                x += w + super::HERO_GAP;
+            }
+            if let Some(caption) = caption(widget) {
+                let (x, wanted) = super::hero_place(width, peeks, 0.0);
+                let w = wanted.max(caption.measure(gtk::Orientation::Horizontal, -1).0);
+                // Moved, never narrowed: the words keep their lines.
+                let x = match self.words_move.get() {
+                    true => x + (offset * f64::from(wanted)).round() as i32,
+                    false => x,
+                };
+                let h = caption.measure(gtk::Orientation::Vertical, w).1.min(height);
+                caption.size_allocate(&gtk::Allocation::new(x, height - h, w, h), -1);
             }
         }
     }
@@ -364,6 +654,27 @@ impl Default for HeroLayout {
     }
 }
 
+impl HeroLayout {
+    fn set_first(&self, first: i32) {
+        use gtk::subclass::prelude::ObjectSubclassIsExt;
+        self.imp().first.set(first);
+        self.layout_changed();
+    }
+
+    fn set_words_move(&self, on: bool) {
+        use gtk::subclass::prelude::ObjectSubclassIsExt;
+        self.imp().words_move.set(on);
+    }
+
+    fn set_offset(&self, offset: f64) {
+        use gtk::subclass::prelude::ObjectSubclassIsExt;
+        self.imp().offset.set(offset);
+        self.layout_changed();
+    }
+}
+
+/// How long a turn of the hero takes.
+const HERO_TURN_MS: u32 = 380;
 const HERO_MAX: i32 = 1400;
 const HERO_GAP: i32 = 16;
 /// Each neighbour is this share of the centre banner's width.
@@ -390,6 +701,31 @@ fn hero_geometry(width: i32, peeks: bool) -> (i32, i32, i32) {
     )
 }
 
+/// Left edge and width at `place`: 0 the centre, 1 its right neighbour, 2 past
+/// that and half as wide, inside the stage's edge; between them, in between.
+fn hero_place(width: i32, peeks: bool, place: f64) -> (i32, i32) {
+    let (centre, peek, total) = hero_geometry(width, peeks);
+    let left = f64::from(((width - total) / 2).max(0));
+    let (centre, peek, total) = (f64::from(centre), f64::from(peek), f64::from(total));
+    let gap = f64::from(HERO_GAP);
+    if !peeks {
+        return (left as i32, centre as i32);
+    }
+    let half = (peek / 2.0).floor();
+    let stops = [
+        (left, half),
+        (left, peek),
+        (left + peek + gap, centre),
+        (left + total - peek, peek),
+        (left + total - half, half),
+    ];
+    let at = (place + 2.0).clamp(0.0, 4.0);
+    let (low, part) = (at.floor() as usize, at.fract());
+    let (a, b) = (stops[low], stops[(low + 1).min(4)]);
+    let mix = |a: f64, b: f64| (a + (b - a) * part).round() as i32;
+    (mix(a.0, b.0), mix(a.1, b.1))
+}
+
 /// A wide banner, between 220 and 440 px tall.
 fn hero_height(centre: i32) -> i32 {
     (f64::from(centre) / 2.6).clamp(220.0, 440.0) as i32
@@ -410,16 +746,39 @@ fn centre(ui: &Ui, feature: &Feature, first: bool) -> gtk::Widget {
     );
     let overlay = gtk::Overlay::builder().css_classes(["hero-art"]).build();
     overlay.set_child(Some(&art));
+    let shade = gtk::Box::builder()
+        .height_request(190)
+        .valign(gtk::Align::End)
+        .css_classes(["hero-shade"])
+        .can_target(false)
+        .accessible_role(gtk::AccessibleRole::Presentation)
+        .build();
+    overlay.add_overlay(&shade);
+    let button = feature_button(ui, row, &overlay);
+    button.set_overflow(gtk::Overflow::Hidden);
+    button.add_css_class("hero-centre");
+    // A card's action is centred in its row; the banner fills the stage, also
+    // while a turn has it narrow.
+    button.set_valign(gtk::Align::Fill);
+    button.set_halign(gtk::Align::Fill);
+    if first {
+        button.add_css_class("hero-first");
+    }
+    button.upcast()
+}
+
+/// The centre's name and tagline.
+fn caption(feature: &Feature) -> gtk::Box {
     let caption = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(6)
         .valign(gtk::Align::End)
-        .halign(gtk::Align::Fill)
+        .can_target(false)
         .css_classes(["hero-caption"])
         .build();
     caption.append(
         &gtk::Label::builder()
-            .label(&row.name)
+            .label(&feature.row.name)
             .xalign(0.0)
             .wrap(true)
             .lines(2)
@@ -435,14 +794,7 @@ fn centre(ui: &Ui, feature: &Feature, first: bool) -> gtk::Widget {
             .css_classes(["hero-tagline"])
             .build(),
     );
-    overlay.add_overlay(&caption);
-    let button = feature_button(ui, row, &overlay);
-    button.set_overflow(gtk::Overflow::Hidden);
-    button.add_css_class("hero-centre");
-    if first {
-        button.add_css_class("hero-first");
-    }
-    button.upcast()
+    caption
 }
 
 /// A dimmed neighbour; clicking it turns the carousel. Never focused: the
@@ -458,7 +810,6 @@ fn peek(ui: &Ui, feature: &Feature, next: bool) -> gtk::Widget {
         .can_focus(false)
         .overflow(gtk::Overflow::Hidden)
         .css_classes(["hero-peek"])
-        .tooltip_text(&feature.row.name)
         .build();
     button.update_property(&[gtk::accessible::Property::Label(&format!(
         "{}: {}",
@@ -483,43 +834,28 @@ fn peek(ui: &Ui, feature: &Feature, next: bool) -> gtk::Widget {
 
 /// A title's primary action as a big art button, named `feature-<id>-primary`.
 fn feature_button(ui: &Ui, row: &LibraryRow, child: &impl IsA<gtk::Widget>) -> gtk::Button {
-    let (description, actions) = library_components(ui, row, false);
-    let button = actions
-        .last_child()
-        .and_then(|w| w.downcast::<gtk::Button>().ok());
-    let button = match button {
-        Some(button) if row.action != Action::Stop => {
-            actions.remove(&button);
-            button
-        }
-        // A running title's card carries Resume and Stop; its banner opens
-        // the library where they are.
-        _ => {
-            let button = gtk::Button::new();
-            let ui = ui.clone();
-            button.connect_clicked(move |_| select_section(&ui, Section::Installed));
-            button
-        }
-    };
+    let (description, _, show_details) = library_components(ui, row, false);
+    // Its details, with what there is to do in them: a banner is for looking.
+    let button = gtk::Button::new();
+    button.connect_clicked(move |_| show_details());
     button.set_widget_name(&format!("feature-{}-primary", row.product_id));
-    button.set_child(Some(child));
-    button.remove_css_class("suggested-action");
-    button.remove_css_class("destructive-action");
+    let surface = gtk::Overlay::builder().child(child).build();
+    effects::shimmer(&button, &surface);
+    button.set_child(Some(&surface));
     button.add_css_class("art-button");
-    button.reset_relation(gtk::AccessibleRelation::LabelledBy);
     let action = if row.action == Action::Stop {
         "Running"
     } else {
         row.action.label()
     };
     button.update_property(&[
-        gtk::accessible::Property::Label(&format!("{} · {action}", row.name)),
+        gtk::accessible::Property::Label(&format!("{} · Details", row.name)),
         gtk::accessible::Property::Description(&format!(
             "{action} · {}",
             description.subtitle().unwrap_or_default()
         )),
     ]);
-    button.set_tooltip_text(Some(&row.name));
+    effects::no_tooltips(&button);
     button
 }
 
@@ -527,10 +863,7 @@ fn feature_button(ui: &Ui, row: &LibraryRow, child: &impl IsA<gtk::Widget>) -> g
 /// it is in. Named like a card (`game-<id>-primary`), because it is the
 /// title's one card on Home.
 fn landscape(ui: &Ui, row: &LibraryRow) -> gtk::Widget {
-    if row.action == Action::Stop {
-        // Resume and Stop are two controls; the portrait card draws them.
-        return game_card(ui, row).upcast();
-    }
+    let running = row.action == Action::Stop;
     let key = row.product_id.to_ascii_uppercase();
     // Only a banner on disk. A path to one never fetched (only featured
     // titles' are) was a blank tile in Jump back in, waiting on a slot
@@ -549,17 +882,21 @@ fn landscape(ui: &Ui, row: &LibraryRow) -> gtk::Widget {
     }
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&sized(&art, Some(320), 180)));
-    let (state, class) = if row.has_update() {
+    let (state, class) = if running {
+        let part = |p: &str| row.subtitle.split("  ·  ").any(|s| s == p);
+        if part("starting") {
+            ("Starting…", "ok")
+        } else if part("stopping") {
+            ("Stopping…", "ok")
+        } else {
+            ("● Running", "ok")
+        }
+    } else if row.has_update() {
         ("Update available", "update")
     } else if row.unavailable.is_some() {
         ("Unavailable", "warning")
     } else {
-        match row.badge.map(|b| b.0) {
-            Some("Issues") => ("Playable with issues", "warning"),
-            Some("Menus only") => ("Menus only", "warning"),
-            Some("Does not run") => ("Does not run", "error"),
-            _ => ("Installed", "ok"),
-        }
+        ui.model.borrow().compatibility(row).badge()
     };
     let caption = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -585,12 +922,15 @@ fn landscape(ui: &Ui, row: &LibraryRow) -> gtk::Widget {
             .build(),
     );
     overlay.add_overlay(&caption);
-    let (description, actions) = library_components(ui, row, false);
+    let (description, actions, _) = library_components(ui, row, false);
+    if running {
+        return running_landscape(row, &overlay, &actions);
+    }
     let Some(primary) = actions
         .last_child()
         .and_then(|w| w.downcast::<gtk::Button>().ok())
     else {
-        return game_card(ui, row).upcast();
+        return game_card(ui, row, page_fit::shelf_tile(ui)).upcast();
     };
     actions.remove(&primary);
     primary.set_child(Some(&overlay));
@@ -608,7 +948,6 @@ fn landscape(ui: &Ui, row: &LibraryRow) -> gtk::Widget {
             description.subtitle().unwrap_or_default()
         )),
     ]);
-    primary.set_tooltip_text(description.tooltip_text().as_deref());
     let holder = gtk::Overlay::new();
     holder.set_child(Some(&primary));
     if let Some(more) = actions.first_child() {
@@ -620,6 +959,63 @@ fn landscape(ui: &Ui, row: &LibraryRow) -> gtk::Widget {
         more.add_css_class("game-more");
         holder.add_overlay(&more);
     }
+    effects::no_tooltips(&holder);
+    holder.upcast()
+}
+
+/// A running title's landscape tile: the banner with its Resume and Stop
+/// laid over it, as separate controls (never buttons inside a button), and
+/// its menu in the corner.
+fn running_landscape(row: &LibraryRow, art: &gtk::Overlay, actions: &gtk::Box) -> gtk::Widget {
+    let controls = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
+    let mut more = None;
+    let mut control = actions.first_child();
+    while let Some(widget) = control {
+        control = widget.next_sibling();
+        if widget.is::<gtk::MenuButton>() {
+            actions.remove(&widget);
+            more = Some(widget);
+        } else if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+            actions.remove(&widget);
+            widget.set_size_request(112, 40);
+            widget.add_css_class("pill");
+            widget.reset_relation(gtk::AccessibleRelation::LabelledBy);
+            widget.update_property(&[gtk::accessible::Property::Label(&format!(
+                "{} · {}",
+                row.name,
+                button.label().unwrap_or_default()
+            ))]);
+            controls.append(&widget);
+        }
+    }
+    let layer = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["game-launch-overlay"])
+        .build();
+    layer.set_accessible_role(gtk::AccessibleRole::Group);
+    layer.update_property(&[gtk::accessible::Property::Label("Running overlay")]);
+    controls.set_vexpand(true);
+    layer.append(&controls);
+    art.add_overlay(&layer);
+    let holder = gtk::Overlay::new();
+    holder.add_css_class("landscape-tile");
+    holder.set_overflow(gtk::Overflow::Hidden);
+    holder.set_widget_name(&format!("game-{}-primary", row.product_id));
+    holder.set_child(Some(art));
+    if let Some(more) = more {
+        more.set_halign(gtk::Align::End);
+        more.set_valign(gtk::Align::Start);
+        more.set_margin_top(8);
+        more.set_margin_end(8);
+        more.add_css_class("game-more");
+        holder.add_overlay(&more);
+    }
+    effects::no_tooltips(&holder);
     holder.upcast()
 }
 
@@ -695,6 +1091,18 @@ pub(crate) fn shelf(
         glib::Propagation::Stop
     });
     scroller.add_controller(wheel);
+    let (start, adjustment) = (Rc::new(Cell::new(None)), scroller.hadjustment());
+    let begun = start.clone();
+    drag_sideways(
+        &scroller,
+        false,
+        move |_, dx| {
+            let from: f64 = begun.get().unwrap_or(adjustment.value());
+            begun.set(Some(from));
+            adjustment.set_value(from - dx);
+        },
+        move |_| start.set(None),
+    );
     for (icon, label, step) in [
         ("go-previous-symbolic", "left", -1.0),
         ("go-next-symbolic", "right", 1.0),
@@ -836,9 +1244,9 @@ fn featured(ui: &Ui, page: &gtk::Box, rows: &[Feature]) {
 }
 
 /// Draw Home. False when Home should be the plain grid instead: a search is
-/// running, or the window is fullscreen (the handheld layout).
+/// running, or the tabs are in a top bar (the handheld layout).
 pub(crate) fn render_home(ui: &Ui, page: &gtk::Box) -> bool {
-    if ui.window.is_fullscreen() || !ui.model.borrow().query.trim().is_empty() {
+    if handheld::top_bar(ui) || !ui.model.borrow().query.trim().is_empty() {
         return false;
     }
     let downloading = ui
@@ -882,8 +1290,9 @@ pub(crate) fn render_home(ui: &Ui, page: &gtk::Box) -> bool {
         return true;
     }
     let mut seen = std::collections::HashSet::new();
-    artwork::request_heroes(ui, hero_candidates(&library.rows, &gamepass.rows));
-    let hero_items = features(&ui.model.borrow(), &library.rows, &gamepass.rows);
+    let popular = ui.model.borrow().by_popularity(&gamepass.rows);
+    artwork::request_heroes(ui, hero_candidates(&library.rows, &popular));
+    let hero_items = features(&ui.model.borrow(), &library.rows, &popular);
     for f in &hero_items {
         seen.insert(f.row.product_id.to_ascii_uppercase());
     }
@@ -916,7 +1325,7 @@ pub(crate) fn render_home(ui: &Ui, page: &gtk::Box) -> bool {
     }
     let jump = take(installed, &mut shown);
     let pass = take(
-        gamepass.rows.iter().filter(|r| !r.installed).collect(),
+        popular.iter().copied().filter(|r| !r.installed).collect(),
         &mut shown,
     );
     let owned = take(
@@ -935,22 +1344,29 @@ pub(crate) fn render_home(ui: &Ui, page: &gtk::Box) -> bool {
         page,
         "From PC Game Pass",
         Some(Section::GamePass),
-        pass.iter().map(|r| game_card(ui, r).upcast()).collect(),
+        pass.iter()
+            .map(|r| game_card(ui, r, page_fit::shelf_tile(ui)).upcast())
+            .collect(),
     );
     shelf(
         ui,
         page,
         "Your library",
         Some(Section::Library),
-        owned.iter().map(|r| game_card(ui, r).upcast()).collect(),
+        owned
+            .iter()
+            .map(|r| game_card(ui, r, page_fit::shelf_tile(ui)).upcast())
+            .collect(),
     );
     // Featured: Game Pass titles with banners that the hero is not showing.
     let featured_rows: Vec<Feature> = {
         let model = ui.model.borrow();
         let cache = model.catalog_cache();
-        gamepass
-            .rows
+        popular
             .iter()
+            .copied()
+            // Playing it already is not what a feature is for.
+            .filter(|r| !r.installed)
             .filter(|r| !seen.contains(&r.product_id.to_ascii_uppercase()))
             .filter_map(|r| {
                 let art = cache.as_ref().and_then(|c| c.hero_path(&r.product_id))?;
@@ -1011,7 +1427,7 @@ pub(crate) fn empty(ui: &Ui, page: &gtk::Box, title: &str, description: &str) {
 pub(crate) fn gamepass_hero(ui: &Ui, page: &gtk::Box) {
     {
         let model = ui.model.borrow();
-        if ui.window.is_fullscreen() || !model.query.trim().is_empty() || model.page != 0 {
+        if handheld::top_bar(ui) || !model.query.trim().is_empty() {
             return;
         }
     }
@@ -1035,7 +1451,40 @@ pub(crate) fn gamepass_hero(ui: &Ui, page: &gtk::Box) {
         Listing::All,
     )
     .rows;
-    artwork::request_heroes(ui, hero_candidates(&[], &rows));
-    let items = features(&ui.model.borrow(), &[], &rows);
+    let popular = ui.model.borrow().by_popularity(&rows);
+    artwork::request_heroes(ui, hero_candidates(&[], &popular));
+    let items = features(&ui.model.borrow(), &[], &popular);
     hero(ui, page, items);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_short_drag_does_not_turn_the_hero() {
+        assert_eq!(super::drag_step(-20.0), 0);
+        assert_eq!(super::drag_step(-80.0), 1);
+        assert_eq!(super::drag_step(80.0), -1);
+    }
+
+    #[test]
+    fn a_hero_turn_starts_and_ends_on_the_resting_places() {
+        let (centre, peek, total) = hero_geometry(1000, true);
+        let left = (1000 - total) / 2;
+        assert_eq!(hero_place(1000, true, -1.0), (left, peek));
+        assert_eq!(
+            hero_place(1000, true, 0.0),
+            (left + peek + HERO_GAP, centre)
+        );
+        assert_eq!(hero_place(1000, true, 1.0), (left + total - peek, peek));
+        // Halfway it is between them, and nothing ever leaves the stage.
+        let (x, w) = hero_place(1000, true, 0.5);
+        assert!(x > left + peek + HERO_GAP && w < centre && w > peek);
+        for place in -30..=30 {
+            let (x, w) = hero_place(1000, true, f64::from(place) / 10.0);
+            assert!(x >= left && x + w <= left + total + 1, "{place}");
+        }
+        assert_eq!(hero_place(1000, false, 0.0), (0, 1000));
+    }
 }

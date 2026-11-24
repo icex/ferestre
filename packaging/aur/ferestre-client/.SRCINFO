@@ -1,6 +1,6 @@
 pkgbase = ferestre-client
 	pkgdesc = Xodus client for Microsoft Store titles, with the Ferestre fixes (sign-in, licences, MSIXVC download and decrypt)
-	pkgver = 0.1.0.r165.g536871b
+	pkgver = 0.1.0.r166.ga31215b
 	pkgrel = 1
 	url = https://github.com/icex/xodus
 	arch = x86_64
@@ -26,7 +26,7 @@ pkgbase = ferestre-client
 	provides = xodus-service
 	conflicts = xodus-cli
 	conflicts = xodus-cli-git
-	source = xodus::git+https://github.com/icex/xodus.git#commit=536871bf0939dce66ae1fc6906290949fc629aa0
+	source = xodus::git+https://github.com/icex/xodus.git#commit=a31215ba075350a723baec870647901f5ff915cd
 	sha256sums = SKIP
 
 pkgname = ferestre-client

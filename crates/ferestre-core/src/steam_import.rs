@@ -18,7 +18,7 @@ use crate::anticheat::{self, Detection};
 use crate::paths::Paths;
 use crate::recipe::{Recipe, TitleKind};
 use crate::steam::{self, ArtworkFiles, Value};
-use crate::{local, runtime};
+use crate::{local, runtime, steam_games};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -395,7 +395,14 @@ pub fn plan(paths: &Paths, user: Option<&str>) -> Result<Vec<Candidate>> {
                 }
                 let exe = unquote(&raw_exe).to_owned();
                 let lower = exe.to_ascii_lowercase();
-                if !(lower.ends_with(".exe") || lower.ends_with(".bat")) {
+                // Anything else, a script of the person's own say, is Steam's
+                // to start, as it is. An installed app (a launcher in /usr,
+                // a Flatpak) is not a game.
+                let windows = lower.ends_with(".exe") || lower.ends_with(".bat");
+                let system = ["/usr/", "/bin/", "/sbin/", "/app/", "/snap/"]
+                    .iter()
+                    .any(|dir| exe.starts_with(dir));
+                if !windows && (!Path::new(&exe).is_absolute() || system) {
                     candidates.push(skip(candidate, "not a Windows program".into()));
                     continue;
                 }
@@ -415,6 +422,23 @@ pub fn plan(paths: &Paths, user: Option<&str>) -> Result<Vec<Candidate>> {
                 };
                 if let Some(why) = local::too_broad(paths, Path::new(&dir)) {
                     candidates.push(skip(candidate, why));
+                    continue;
+                }
+                if !windows {
+                    candidate.recipe = steam_started_shortcut(&mut candidate, &dir, &executable);
+                    if let Err(e) = candidate.recipe.as_ref().map_or(Ok(()), |r| {
+                        r.to_toml().and_then(|text| Recipe::parse(&text)).map(drop)
+                    }) {
+                        candidate.recipe = None;
+                        candidates.push(skip(candidate, format!("{e}")));
+                        continue;
+                    }
+                    candidate.artwork =
+                        shortcut_artwork(&config.join("grid"), app_id, &text("icon"));
+                    if user_titles.join(format!("{}.toml", candidate.id)).exists() {
+                        candidate.status = ImportStatus::Kept;
+                    }
+                    candidates.push(candidate);
                     continue;
                 }
 
@@ -507,7 +531,91 @@ pub fn plan(paths: &Paths, user: Option<&str>) -> Result<Vec<Candidate>> {
             }
         }
     }
+    candidates.extend(installed_games(paths, &roots));
     Ok(candidates)
+}
+
+const STEAM_SUMMARY: &str = "Installed by Steam; Play starts it through Steam";
+const SCRIPT_SUMMARY: &str = "A Steam shortcut to a Linux program; Play starts it through Steam";
+
+/// A shortcut to a script or other Linux program, as a local game Steam
+/// starts: Ferestre cannot run it under Proton, and Steam runs it as it
+/// always has. Which Windows program it starts, and in which prefix, only
+/// the script knows, so neural rendering waits for the person to say.
+fn steam_started_shortcut(
+    candidate: &mut Candidate,
+    dir: &str,
+    executable: &str,
+) -> Option<Recipe> {
+    let mut recipe = Recipe::blank(&candidate.id, &candidate.name);
+    recipe.title.kind = TitleKind::Local;
+    recipe.title.slug = candidate.id.to_ascii_lowercase();
+    recipe.install.dir = Some(dir.to_owned());
+    recipe.launch.executable = executable.to_owned();
+    recipe.launch.steam_app_id = Some(candidate.app_id);
+    recipe.status.summary = SCRIPT_SUMMARY.into();
+    candidate.warnings.push(format!(
+        "{}: Steam starts {executable} as it is; for neural rendering, set the Windows program \
+         it runs and its Wine prefix in Edit launch settings",
+        candidate.name
+    ));
+    Some(recipe)
+}
+
+/// Every game Steam installed, as a local game Steam starts.
+fn installed_games(paths: &Paths, roots: &[PathBuf]) -> Vec<Candidate> {
+    let user_titles = paths.user_titles_dir();
+    // Art someone chose in Steam's library for the app, from any user.
+    let grids: Vec<PathBuf> = roots
+        .iter()
+        .flat_map(|root| steam::shortcut_files(root))
+        .filter_map(|file| file.parent().map(|config| config.join("grid")))
+        .collect();
+    steam_games::installed(roots)
+        .into_iter()
+        .map(|app| {
+            let mut candidate = Candidate {
+                id: local::steam_app_id(app.app_id),
+                app_id: app.app_id,
+                name: app.name.clone(),
+                user: String::new(),
+                status: ImportStatus::New,
+                recipe: None,
+                runtime: RuntimeFound::Unset,
+                artwork: ArtworkFiles::default(),
+                anticheat: Vec::new(),
+                warnings: Vec::new(),
+            };
+            let Some(executable) = steam_games::main_executable(&app.dir) else {
+                candidate.status = ImportStatus::Skipped("no Windows program in its folder".into());
+                return candidate;
+            };
+            let mut recipe = Recipe::blank(&candidate.id, &candidate.name);
+            recipe.title.kind = TitleKind::Local;
+            recipe.title.slug = candidate.id.to_ascii_lowercase();
+            recipe.install.dir = Some(app.dir.display().to_string());
+            recipe.install.prefix = Some(app.compatdata.display().to_string());
+            recipe.launch.executable = executable.clone();
+            recipe.launch.steam_app_id = Some(app.app_id);
+            recipe.status.summary = STEAM_SUMMARY.into();
+            if let Err(e) = recipe.to_toml().and_then(|text| Recipe::parse(&text)) {
+                candidate.status = ImportStatus::Skipped(format!("{e}"));
+                return candidate;
+            }
+            let mut art = ArtworkFiles::default();
+            for grid in &grids {
+                fill_missing_art(&mut art, shortcut_artwork(grid, app.app_id, ""));
+            }
+            fill_missing_art(&mut art, steam_games::library_artwork(roots, app.app_id));
+            candidate.artwork = art;
+            candidate.anticheat = anticheat::detect(&app.dir, &executable);
+            if user_titles.join(format!("{}.toml", candidate.id)).exists() {
+                candidate.status = ImportStatus::Kept;
+            }
+            candidate.recipe = Some(recipe);
+            candidate
+        })
+        .collect()
 }
 
 /// Write what [`plan`] found: a user recipe, its art and its runtime choice
@@ -630,6 +738,7 @@ mod tests {
         touch(&games.join("COD/sp26/sp26-cod.exe"));
         touch(&games.join("COD/Randgrid.sys"));
         touch(&games.join("Witcher/witcher3.exe"));
+        touch(&games.join("Offline/launch.sh"));
 
         let ge = steam.join("compatibilitytools.d/GE-Proton10-25");
         touch(&ge.join("proton"));
@@ -692,6 +801,15 @@ mod tests {
             0,
         );
         let heroic = entry(&[("AppName", "Heroic"), ("Exe", "\"/usr/bin/heroic\"")], 0);
+        let offline = entry(
+            &[
+                ("AppName", "Offline Campaign"),
+                ("Exe", &format!("\"{}/Offline/launch.sh\"", games.display())),
+                ("StartDir", &format!("\"{}/Offline/\"", games.display())),
+                ("LaunchOptions", "VARIANT=steam %command%"),
+            ],
+            0,
+        );
         let witcher = entry(
             &[
                 ("AppName", "Witcher 3"),
@@ -706,7 +824,7 @@ mod tests {
         let user = steam.join("userdata/12345678/config");
         write_shortcuts(
             &user.join("shortcuts.vdf"),
-            vec![cyberpunk.clone(), cod, ferestre, heroic, witcher],
+            vec![cyberpunk.clone(), cod, ferestre, heroic, offline, witcher],
         );
         touch(&user.join(format!("grid/{CYBERPUNK_APP_ID}p.png")));
         touch(&user.join(format!("grid/{CYBERPUNK_APP_ID}_hero.jpg")));
@@ -795,6 +913,33 @@ mod tests {
         assert!(
             matches!(&heroic.status, ImportStatus::Skipped(why) if why == "not a Windows program")
         );
+    }
+
+    #[test]
+    fn a_shortcut_to_a_script_is_a_game_steam_starts() {
+        let h = steam_home();
+        let found = plan(&h.paths, None).unwrap();
+        let offline = found.iter().find(|c| c.name == "Offline Campaign").unwrap();
+        assert!(
+            matches!(offline.status, ImportStatus::New),
+            "{:?}",
+            offline.status
+        );
+        assert!(steam_games::is_shortcut(offline.app_id));
+        assert_eq!(offline.id, local::steam_id(offline.app_id));
+        let r = offline.recipe.as_ref().unwrap();
+        assert_eq!(r.launch.steam_app_id, Some(offline.app_id));
+        assert_eq!(r.launch.executable, "launch.sh");
+        let dir = h.paths.home().join("Games/Offline");
+        assert_eq!(r.install.dir.as_deref(), dir.to_str());
+        // Its launch options are Steam's to pass; its prefix is the script's.
+        assert!(r.launch.env.is_empty() && r.launch.args.is_empty());
+        assert_eq!(r.install.prefix, None);
+        assert!(offline
+            .warnings
+            .iter()
+            .any(|w| w.contains("Edit launch settings")));
+        Recipe::parse(&r.to_toml().unwrap()).unwrap();
     }
 
     #[test]

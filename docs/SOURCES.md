@@ -8,9 +8,10 @@ Ferestre builds the components it modifies directly from forks. Fixes live as co
 | Proton | [icex/Proton-UWP](https://github.com/icex/Proton-UWP/tree/ferestre) | Runtime wrapper and pinned runtime dependencies |
 | Wine | [icex/wine](https://github.com/icex/wine/tree/ferestre) | GDK title loading, Windows APIs and game input |
 | xgameruntime | [icex/xgameruntime](https://github.com/icex/xgameruntime/tree/ferestre) | Xbox GDK runtime implementation |
-| vkd3d-proton | [icex/vkd3d-proton](https://github.com/icex/vkd3d-proton/tree/ferestre) | Direct3D 12 fixes |
+| vkd3d-proton | [icex/vkd3d-proton](https://github.com/icex/vkd3d-proton/tree/ferestre) | Direct3D 12 fixes, and small aligned heaps that no longer reserve a 4 MiB slot each (from MW4-Proton) |
+| DXVK | [icex/dxvk](https://github.com/icex/dxvk/tree/ferestre) | GE-Proton11-11's DXGI fixes (fullscreen on focus loss, HDR detection and output state, D3D12 fullscreen resizes, swap chain backpressure, the layered overlay), one ported to this DXVK, and MW4-Proton's DXGI memory-budget cap |
 
-[`sources.lock.json`](../sources.lock.json) records full commit hashes, upstream bases and the source files changed relative to those bases. The launcher submodules pin Xodus and Proton. Proton in turn pins Wine and vkd3d-proton; Wine pins xgameruntime. Other, unmodified runtime dependencies retain their existing upstream submodule pins.
+[`sources.lock.json`](../sources.lock.json) records full commit hashes, upstream bases and the source files changed relative to those bases. The launcher submodules pin Xodus and Proton. Proton in turn pins Wine, vkd3d-proton and DXVK; Wine pins xgameruntime. Other, unmodified runtime dependencies retain their existing upstream submodule pins.
 
 `sources.lock.json` also pins, under `packages`, the unmodified upstream commit of [DLSSNR-AMD](https://github.com/TheAutomatic/DLSSNR-AMD) that `scripts/build-dlssnr.sh` builds into the neural rendering package (see [Neural rendering](NEURAL-RENDERING.md)). It is not a fork: Ferestre builds it as released, and `.github/workflows/dlssnr.yml` publishes the result on a `dlssnr-<version>` tag.
 

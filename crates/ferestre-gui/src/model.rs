@@ -321,6 +321,14 @@ fn action_for(inputs: &Inputs, recipe: &Recipe) -> (Action, Option<String>) {
             program.display()
         ));
     }
+    // Steam starts a game it installed, with its own Proton: no runtime of
+    // Ferestre's takes part.
+    if local && recipe.launch.steam_app_id.is_some() {
+        if let Some(found) = ferestre_core::anticheat::describe(&(inputs.anticheat)(recipe)) {
+            caution = Some(join(caution, &found));
+        }
+        return (Action::Play, caution);
+    }
     let inferred;
     let (judged, runtimes) = if local {
         (recipe, inputs.local_runtimes)
@@ -395,7 +403,7 @@ pub fn launch_runtime<'a>(
         if !runtimes.iter().any(|rt| rt.path == path) {
             return Err(format!(
                 "the runtime chosen for this title is no longer installed ({}); choose another \
-                 with Choose runtime",
+                 in Edit launch settings, Proton",
                 path.display()
             ));
         }
@@ -611,8 +619,43 @@ pub fn gamepass(
             }
         })
         .collect();
-    rows.sort_by(sort_key);
+    let here: HashMap<String, LibraryRow> = library(inputs)
+        .into_iter()
+        .filter(|row| !row.local && (row.installed || row.action == Action::Resume))
+        .filter(|row| row.action != Action::Content)
+        .map(|row| (row.product_id.to_ascii_uppercase(), row))
+        .collect();
+    let mut listed = BTreeSet::new();
+    rows.retain_mut(|row| {
+        if let Some(own) = on_disk_row(inputs, &here, &row.product_id) {
+            *row = own.clone();
+        }
+        // A bundle and the title in it can both be listed.
+        listed.insert(row.product_id.to_ascii_uppercase())
+    });
+    rows.sort_by_cached_key(sort_key);
     rows
+}
+
+/// The library's row for a listed title that is on disk: its own, or for a
+/// bundle, the one of the title in it. The bundle's id is never what is
+/// installed, launched or removed.
+fn on_disk_row<'a>(
+    inputs: &Inputs,
+    here: &'a HashMap<String, LibraryRow>,
+    product_id: &str,
+) -> Option<&'a LibraryRow> {
+    let key = product_id.to_ascii_uppercase();
+    here.get(&key).or_else(|| {
+        let children = &inputs.catalog.get(&key)?.bundled_ids;
+        let found = |installed: bool| {
+            children
+                .iter()
+                .filter_map(|id| here.get(&id.to_ascii_uppercase()))
+                .find(|row| row.installed || !installed)
+        };
+        found(true).or_else(|| found(false))
+    })
 }
 
 /// `1 title`, `3 titles`. English only, like the rest of the window.
@@ -1110,7 +1153,7 @@ pub fn library(inputs: &Inputs) -> Vec<LibraryRow> {
         }
     }
     let mut rows: Vec<LibraryRow> = rows.into_values().collect();
-    rows.sort_by(sort_key);
+    rows.sort_by_cached_key(sort_key);
     rows
 }
 
@@ -1118,12 +1161,12 @@ pub fn library(inputs: &Inputs) -> Vec<LibraryRow> {
 ///
 /// Sorting them together would scatter unnamed rows through the list purely
 /// because a Store id happens to start with a digit.
-fn sort_key(a: &LibraryRow, b: &LibraryRow) -> std::cmp::Ordering {
-    a.is_named()
-        .cmp(&b.is_named())
-        .reverse()
-        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        .then_with(|| a.product_id.cmp(&b.product_id))
+fn sort_key(row: &LibraryRow) -> (bool, String, String) {
+    (
+        !row.is_named(),
+        row.name.to_lowercase(),
+        row.product_id.clone(),
+    )
 }
 
 fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
@@ -1190,19 +1233,26 @@ fn described_row(inputs: &Inputs, recipe: &Recipe, key: &str) -> LibraryRow {
 /// A local game's row: its own name and badge, no Store art, no update check.
 fn local_row(inputs: &Inputs, recipe: &Recipe, view: TitleView) -> LibraryRow {
     let installed = (inputs.installed)(recipe);
+    let steam = recipe.launch.steam_app_id;
+    let kind = match steam {
+        Some(id) if ferestre_core::steam_games::is_shortcut(id) => "Steam shortcut",
+        Some(_) => "Steam game",
+        None => "Local game",
+    };
+    let steam = steam.is_some();
     let subtitle = match &view.action {
         Action::Blocked(reason) => reason.clone(),
-        Action::Stop => "Local game  ·  running".to_string(),
+        Action::Stop => format!("{kind}  ·  running"),
         _ => match &view.caution {
-            Some(caution) => format!("Local game  ·  {caution}"),
-            None => "Local game".to_string(),
+            Some(caution) => format!("{kind}  ·  {caution}"),
+            None => kind.to_string(),
         },
     };
     LibraryRow {
         product_id: recipe.title.product_id.clone(),
         name: recipe.title.name.clone(),
         subtitle,
-        badge: Some(("Local", "dim-label")),
+        badge: Some((if steam { "Steam" } else { "Local" }, "dim-label")),
         image: None,
         owned: false,
         has_recipe: true,
@@ -1459,55 +1509,6 @@ pub fn search<'a>(rows: &'a [LibraryRow], query: &str) -> Vec<&'a LibraryRow> {
                 .all(|term| name.contains(term) || id.contains(term))
         })
         .collect()
-}
-
-/// One page of rows, and enough to describe the pager.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Page<'a> {
-    pub rows: Vec<&'a LibraryRow>,
-    /// Zero-based, and always within range: a page number that no longer exists
-    /// -- because a search shortened the list -- is clamped rather than shown
-    /// empty.
-    pub page: usize,
-    pub pages: usize,
-    pub total: usize,
-    /// One-based, inclusive, for "showing 21-40 of 108". Both zero when empty.
-    pub first: usize,
-    pub last: usize,
-}
-
-impl Page<'_> {
-    pub fn has_previous(&self) -> bool {
-        self.page > 0
-    }
-
-    pub fn has_next(&self) -> bool {
-        self.page + 1 < self.pages
-    }
-
-    pub fn label(&self) -> String {
-        if self.total == 0 {
-            return "Nothing to show".into();
-        }
-        format!("{}-{} of {}", self.first, self.last, self.total)
-    }
-}
-
-pub fn paginate<'a>(rows: &[&'a LibraryRow], page: usize, per_page: usize) -> Page<'a> {
-    let per_page = per_page.max(1);
-    let total = rows.len();
-    let pages = total.div_ceil(per_page).max(1);
-    let page = page.min(pages - 1);
-    let start = page * per_page;
-    let end = (start + per_page).min(total);
-    Page {
-        rows: rows[start..end].to_vec(),
-        page,
-        pages,
-        total,
-        first: if total == 0 { 0 } else { start + 1 },
-        last: end,
-    }
 }
 
 /// A concise runtime status for Settings; compatibility stays in the launch gates.
@@ -2941,6 +2942,35 @@ HTTP 401 Unauthorized",
         );
     }
 
+    /// Installed, a Game Pass bundle is the title on disk, as in the library:
+    /// once, and with nothing to install.
+    #[test]
+    fn a_gamepass_bundle_whose_title_is_installed_is_that_title() {
+        let mut bundle = product("9ZZTESTBNDL", "The Bundle", &[]);
+        bundle.bundled_ids = vec!["9zztestadd1".into(), "9zztestchld".into()];
+        let cat = catalog(vec![
+            bundle,
+            product("9ZZTESTCHLD", "The Playable One", &["cid"]),
+        ]);
+        let own = Ownership::Known(vec![]);
+        let recipes = [recipe("9ZZTESTCHLD", "playable", &[])];
+        let rt = runtime_with(&[], CapabilitySource::Manifest);
+        let listed = ["9ZZTESTBNDL".to_string(), "9ZZTESTCHLD".to_string()];
+        let mut fixture = inputs(&recipes, Some(&rt), &own, ALL_INSTALLED);
+        fixture.catalog = &cat;
+        for ids in [&listed[..1], &listed[..]] {
+            let rows = gamepass(&fixture, ids, None, &Default::default(), &[]);
+            assert_eq!(rows, library(&fixture));
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].installed && rows[0].install_as.is_none());
+            assert_eq!(rows[0].action, Action::Play);
+        }
+        fixture.installed = NOTHING_INSTALLED;
+        let rows = gamepass(&fixture, &listed[..1], None, &Default::default(), &[]);
+        assert_eq!(rows[0].product_id, "9ZZTESTBNDL");
+        assert_eq!(rows[0].action, Action::Install);
+    }
+
     /// And says only what it knows. Before the children are fetched there is no
     /// name and no size to give, and inventing either would be worse than the
     /// count on its own.
@@ -3649,7 +3679,7 @@ HTTP 401 Unauthorized",
         assert!(rows[0].subtitle.contains("running"), "{}", rows[0].subtitle);
     }
 
-    // --- search and pagination --------------------------------------------
+    // --- search -----------------------------------------------------------
 
     fn rows_named(names: &[(&str, &str)]) -> Vec<LibraryRow> {
         names
@@ -3711,56 +3741,6 @@ HTTP 401 Unauthorized",
             assert_eq!(search(&rows, query).len(), 1, "{query}");
         }
         assert!(search(&rows, "forza 5").is_empty());
-    }
-
-    #[test]
-    fn pages_describe_themselves_the_way_the_pager_reads() {
-        let rows = rows_named(
-            &(0..45)
-                .map(|i| {
-                    (
-                        "9ZZTEST00000",
-                        Box::leak(format!("Title {i:02}").into_boxed_str()) as &str,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        );
-        let all: Vec<&LibraryRow> = rows.iter().collect();
-
-        let first = paginate(&all, 0, 20);
-        assert_eq!(first.rows.len(), 20);
-        assert_eq!((first.pages, first.total), (3, 45));
-        assert_eq!(first.label(), "1-20 of 45");
-        assert!(!first.has_previous() && first.has_next());
-
-        let last = paginate(&all, 2, 20);
-        assert_eq!(last.rows.len(), 5);
-        assert_eq!(last.label(), "41-45 of 45");
-        assert!(last.has_previous() && !last.has_next());
-    }
-
-    /// Typing in the search box shortens the list under whatever page someone
-    /// was on. Showing them an empty page instead of results would read as
-    /// "no matches".
-    #[test]
-    fn a_page_past_the_end_is_clamped_not_shown_empty() {
-        let rows = rows_named(&[("9ZZTESTGAME1", "Only One")]);
-        let all: Vec<&LibraryRow> = rows.iter().collect();
-        let page = paginate(&all, 7, 20);
-        assert_eq!(page.page, 0);
-        assert_eq!(page.rows.len(), 1);
-        assert_eq!(page.label(), "1-1 of 1");
-    }
-
-    #[test]
-    fn an_empty_library_still_produces_a_sane_page() {
-        let page = paginate(&[], 0, 20);
-        assert_eq!(
-            (page.pages, page.total, page.first, page.last),
-            (1, 0, 0, 0)
-        );
-        assert!(!page.has_previous() && !page.has_next());
-        assert_eq!(page.label(), "Nothing to show");
     }
 
     #[test]

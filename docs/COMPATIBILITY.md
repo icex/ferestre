@@ -35,7 +35,7 @@ real contribution even — especially — when the answer is that it does not ru
 **Before you paste anything: a session log contains your gamertag, your XUID and
 your save-folder ids.** See [Reporting a title](#reporting-a-title) below.
 
-Current launcher: [0.1.26](RELEASE-0.1.26.md), using runtime **11.0.20261122.2**. The [0.1.26 notes](RELEASE-0.1.26.md) describe the runtime fixes behind Hogwarts Legacy, Batman: Arkham Knight, Dead by Daylight and Death Stranding Director's Cut; the detailed [0.1.16 qualification](RELEASE-0.1.16.md) describes earlier launcher and controller fixture coverage. The title-specific results and dates below come from the recipes; they are not refreshed merely because the launcher changes.
+Current launcher: [0.1.27](RELEASE-0.1.27.md), using runtime **11.0.20261124.1**. The launcher shows these states on its tiles and in Game details. The [0.1.27 notes](RELEASE-0.1.27.md) say what was and was not tested on that runtime; the [0.1.26 notes](RELEASE-0.1.26.md) describe the runtime fixes behind Hogwarts Legacy, Batman: Arkham Knight, Dead by Daylight and Death Stranding Director's Cut; the detailed [0.1.16 qualification](RELEASE-0.1.16.md) describes earlier launcher and controller fixture coverage. The title-specific results and dates below come from the recipes; they are not refreshed merely because the launcher changes.
 
 ## The matrix
 
@@ -53,20 +53,20 @@ Current launcher: [0.1.26](RELEASE-0.1.26.md), using runtime **11.0.20261122.2**
 | Dead by Daylight Windows | `9NMS4SFNBGBH` | Playable | Signs in, loads its Store content and plays; checked by a person. Real-money purchases are not supported. | 2026-11-22 |
 | Dune: Awakening | `9PJ6FV3130QZ` | Playable | Gameplay confirmed by the player. | 2026-10-13 |
 | Forza Horizon 5 | `9NNX1VVR3KNQ` | Playable | Plays with a restored Windows career; title services and the live Festival Playlist load after generic authentication and endpoint-discovery fixes. Player confirmed the online fix. | 2026-09-07 |
-| Forza Horizon 6 | `9NR1R1XWLCNB` | Playable | Gameplay and Continue with saved progress confirmed by the player. Also plays with separate Store and Player accounts: the Store account's Game Pass licence, the Player account's gamertag, profile and saves. The in-game marketplace is currently unavailable. | 2026-10-17 |
+| Forza Horizon 6 | `9NR1R1XWLCNB` | Playable | Gameplay and Continue with saved progress confirmed by the player. Also plays with separate Store and Player accounts: the Store account's Game Pass licence, the Player account's gamertag, profile and saves. The in-game store lists its content; purchases are unsupported. Online races and cloud saves after a crash are untested. | 2026-11-24 |
 | Gears 5 | `C2KDNLT2H7DM` | Playable | Campaign and multiplayer play with Easy Anti-Cheat; the launcher supplies EAC's Linux library, which the Xbox PC package lacks. | 2026-11-21 |
+| Gears of War: E-Day | `9N4PT8HGCDHQ` | Playable | Xbox sign-in and tutorial gameplay verified with HTTP/2. Online deployment was observed. An earlier intermittent lobby crash was reported resolved by the player on 2026-11-24. | 2026-11-21 |
 | Goat Simulator 3: Windows Edition | `9PDS2N82QNXG` | Playable | Playable, confirmed by the player offline and online. New games save and resume across relaunches, and Quit Game exits. Peer joining and voice are untested. | 2026-10-11 |
-| Halo Infinite | `9PP5G1F0C2B6` | Playable | Campaign, Academy training and multiplayer run; campaign save restoration was confirmed locally. Intermittent offline display remains under investigation. | 2026-10-10 |
+| Halo Infinite | `9PP5G1F0C2B6` | Playable | Campaign, Academy training and multiplayer run; campaign save restoration was confirmed locally. The earlier intermittent offline display was reported resolved by the player on 2026-11-24. | 2026-10-10 |
 | Halo: The Master Chief Collection | `9N6VPDLQDVT5` | Playable | Halo CE and Reach campaign content is detected and loads with the official Anti-Cheat Disabled executable. Local Save/Quit and clean game exit tested. | 2026-10-23 |
-| Hogwarts Legacy | `9MT5NJ5W7B8Z` | Playable | Xbox sign-in and two hours of play confirmed by the player with callback waits enabled. A first launch can close while it prepares shaders; see the issues below. | 2026-11-22 |
 | Hollow Knight: Silksong | `9N116V0599HB` | Playable | Playable, confirmed by the player on the local Game Pass installation. | 2026-10-10 |
-| Minecraft Dungeons II | `9P5786PJB9RP` | Playable | Account sign-in, Store licence verification and Squid Coast gameplay work with the matching updated runtime. A DualShock 4 over USB or Bluetooth drives it without Steam, and Steam Input pads work from a Steam shortcut. Long-session, multiplayer and cloud-save behavior are untested. | 2026-10-18 |
+| Minecraft Dungeons II | `9P5786PJB9RP` | Playable | Account sign-in, Store licence verification and Squid Coast gameplay work with the matching updated runtime. A DualShock 4 over USB or Bluetooth drives it without Steam, and Steam Input pads work from a Steam shortcut. With separate Store and Player accounts, an online hero gets a party code and an online session. A second player joining, long sessions and cloud saves are untested. | 2026-11-24 |
 | Minecraft for Windows | `9NBLGGH2JHXJ` | Playable | Signs in to Xbox Live, loads the profile, plays, and joins third-party servers from the in-game list. Also signs in as a separate Player account using the Store account's licence. | 2026-10-17 |
 | Overthrown | `9MT5KSV3RCWD` | Playable | Plays. | 2026-09-06 |
 | Retro Classics | `9MTVJ3HHTQGS` | Playable | Playable, confirmed by the player. Signs in, loads the catalogue and streams Tennis; broader game, controller and save-restore coverage is not separately qualified. | 2026-10-10 |
 | Stardew Valley | `9MWR1NC6VQ6L` | Playable | Plays. From a Steam shortcut, the shortcut's Steam Input controller layout applies, and Steam sees the game exit. | 2026-10-18 |
-| DEATH STRANDING DIRECTOR'S CUT | `9NQGN8TGNT8P` | Playable, with issues | Reaches the title menu, starts a New Game and plays the opening into the world; online features fall back to Offline Mode. | 2026-11-22 |
-| Gears of War: E-Day | `9N4PT8HGCDHQ` | Playable, with issues | Xbox sign-in and tutorial gameplay verified with HTTP/2. Online deployment was observed. An intermittent crash occurred on an earlier lobby entry. | 2026-11-21 |
+| DEATH STRANDING DIRECTOR'S CUT | `9NQGN8TGNT8P` | Playable, with issues | Reaches the title menu, starts a New Game and plays the opening into the world; online features fall back to Offline Mode. | 2026-11-24 |
+| Hogwarts Legacy | `9MT5NJ5W7B8Z` | Playable, with issues | Xbox sign-in and two hours of play confirmed by the player with callback waits enabled. A first launch can close while it prepares shaders; see the issues below. | 2026-11-22 |
 
 Generated from `titles/*.toml`. Each row's recipe is the file named after its Store id, and `titles/SCHEMA.md` says what is in one.
 

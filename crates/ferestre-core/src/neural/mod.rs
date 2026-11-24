@@ -272,6 +272,8 @@ impl Context {
 #[derive(Debug, Clone)]
 pub struct Overview {
     pub entry: Option<state::Entry>,
+    /// The route and network last installed, kept while it is off.
+    pub choice: Option<state::Choice>,
     pub detected: detect::Detected,
     pub anticheat: Vec<Detection>,
     pub gate: apply::Gate,
@@ -316,6 +318,7 @@ pub fn overview(
         .ok()
         .is_some_and(|p| package::installed(&ctx.root, &p).is_some());
     Overview {
+        choice: state::choice(&ctx.config_dir, key).ok().flatten(),
         entry,
         detected,
         anticheat,

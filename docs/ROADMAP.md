@@ -6,6 +6,15 @@ for Bedrock on Android, for Microsoft Store titles on Linux.
 
 ## Current qualification
 
+Release 0.1.27 pairs with runtime 11.0.20261124.1. Games Steam installed join
+the library and start through Steam, with experimental neural rendering; every
+tile and game details page shows how well the title runs; launch settings and
+details are tabs, and handhelds get their own layout. The client service
+matches endpoint paths with or without a leading slash. The runtime builds DXVK from a
+fork with GE-Proton's DXGI fixes, caps the reported video memory budget, and
+keeps a Wayland top-level surface its client surface still needs. See
+[release qualification](RELEASE-0.1.27.md).
+
 Release 0.1.26 pairs with runtime 11.0.20261122.2, the first release that
 publishes it; 0.1.24 was never published and its changes shipped in 0.1.25.
 0.1.25 added local games (added by hand or imported from Steam's non-Steam

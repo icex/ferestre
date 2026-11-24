@@ -6,23 +6,29 @@ Play compatible **Xbox PC and Microsoft Store games on Linux** using your Micros
 
 <br clear="left">
 
-**[Download the AppImage](https://github.com/icex/ferestre/releases/download/v0.1.26/ferestre-0.1.26-x86_64.AppImage)** · [Compatible games](docs/COMPATIBILITY.md#the-matrix) · [Quick start](#quick-start) · [Report a problem](https://github.com/icex/ferestre/issues)
+**[Download the AppImage](https://github.com/icex/ferestre/releases/download/v0.1.27/ferestre-0.1.27-x86_64.AppImage)** · [Compatible games](docs/COMPATIBILITY.md#the-matrix) · [Quick start](#quick-start) · [Report a problem](https://github.com/icex/ferestre/issues)
 
-![Ferestre's Home: a featured-game carousel, quick links and a Jump back in shelf, with installed games and their status in the sidebar](docs/screenshots/home.png)
+![Ferestre's Home: a featured-game carousel, quick links and a Jump back in shelf, with recent games and their status in the sidebar](docs/screenshots/home.png)
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/library-handheld.png" alt="My Library in the fullscreen handheld layout, with Xbox controller hints and an Update available badge"><br><strong>Play from the couch with a controller</strong></td>
+    <td width="50%"><img src="docs/screenshots/library-handheld.png" alt="My games in the fullscreen handheld layout, with a top bar of tabs, compatibility labels, an Update badge and Xbox controller hints"><br><strong>Play from the couch with a controller</strong></td>
     <td width="50%"><img src="docs/screenshots/running-game.png" alt="A running game's card with Resume and Stop"><br><strong>Switch between running games</strong></td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/screenshots/install-game.png" alt="The install dialog with the download size, library folder and free space, over the blurred library"><br><strong>Choose where each game installs</strong></td>
-    <td width="50%"><img src="docs/screenshots/notifications.png" alt="Three notifications stacked in the corner of the window"><br><strong>See every result at once</strong></td>
+    <td width="50%"><img src="docs/screenshots/install-game.png" alt="The install dialog with the download size, library folder and free space"><br><strong>Choose where each game installs</strong></td>
+    <td width="50%"><img src="docs/screenshots/notifications.png" alt="My Library with three games starting and notifications stacked in the corner of the window"><br><strong>See every result at once</strong></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/library.png" alt="My Library with a compatibility label on every game: Playable, Playable with issues or Untested"><br><strong>See how well each game runs</strong></td>
+    <td width="50%"><img src="docs/screenshots/game-details.png" alt="A game's details with its compatibility label and its known issues as a warning"><br><strong>Know the issues before you install</strong></td>
   </tr>
 </table>
 
 <details>
-<summary>More screenshots: Stop confirmation, compact sidebar, a game already running, ultrawide</summary>
+<summary>More screenshots: launch settings, Stop confirmation, compact sidebar, a game already running, ultrawide</summary>
+
+![The launch settings editor and its tabs](docs/screenshots/launch-settings.png)
 
 ![In-app Stop confirmation with Cancel selected by the controller](docs/screenshots/stop-confirmation.png)
 
@@ -71,7 +77,7 @@ In **Accounts**, choose the Microsoft account supplying purchases/Game Pass (**S
 2. Choose a game, select **Install**, choose a library folder and confirm.
 3. Follow progress in **My Library → Install queue**, or with the **Downloads** button in the sidebar. Choose **Play** when installation finishes.
 
-Check the [compatibility list](docs/COMPATIBILITY.md#the-matrix) before a large download. Ferestre supports compatible **GDK/MSIXVC** games; many other Store apps use UWP/Appx/Msix formats that are currently unsupported. Game Pass access depends on your subscription, region and the title still being included. Microsoft checks the licence when installing or launching.
+Check the label on the game's tile (**Playable**, **Playable with issues**, **Untested** or **Not playable**) before a large download; **Game details** says what was tested and lists known issues. The [compatibility list](docs/COMPATIBILITY.md#the-matrix) has every tested game. Ferestre supports compatible **GDK/MSIXVC** games; many other Store apps use UWP/Appx/Msix formats that are currently unsupported. Game Pass access depends on your subscription, region and the title still being included. Microsoft checks the licence when installing or launching.
 
 ## Quick guides
 
@@ -79,7 +85,7 @@ Check the [compatibility list](docs/COMPATIBILITY.md#the-matrix) before a large 
 
 **Home** opens with a carousel of what is running, what you played last, games with updates and Game Pass titles. Below it are quick links, **Jump back in** with your installed games, and shelves of Game Pass and your library; **See all** opens the full list. The search at the top looks through your library and Game Pass.
 
-The sidebar lists every installed game, last played first, with its state: Running, Update ready, Queued, Downloading and so on. To turn it into a narrow rail of icons, switch on **Compact sidebar** in **Settings → Appearance** or in the account menu. Ferestre remembers the choice.
+The sidebar lists the games you played recently, last played first, with their state: Running, Update ready, Queued, Downloading and so on. To turn it into a narrow rail of icons, switch on **Compact sidebar** in **Settings → Appearance** or in the account menu. Ferestre remembers the choice.
 
 Results such as "Starting…" or a finished install appear together in the bottom-right corner, newest at the bottom. The bell beside your account keeps this session's notifications for any you missed. Behind a dialog the window blurs; it only dims instead when your desktop turns animations off or the graphics are too slow for blur.
 
@@ -119,7 +125,7 @@ Text entry, destination selection, installation, queues and confirmation dialogs
 
 Open **Settings → Check for Updates**, then use the **Update** banner. Downloads are signature-checked; a writable AppImage is replaced with a backup kept for recovery. New runtimes install alongside previous versions, and a restart waits for current work to finish.
 
-Existing per-game runtime choices remain selected. To change one, use the game's **More actions → Choose runtime**. **Settings → Choose default runtime** sets the default; **Use default runtime** clears a game's override. Changes apply to the next launch.
+Existing per-game runtime choices remain selected. To change one, use the game's **More actions → Edit launch settings → Proton**. **Settings → Choose default runtime** sets the default; **Use default runtime** clears a game's override. Changes apply to the next launch.
 
 See [signed updates and rollback](docs/UPDATES.md) for supported installations. Update package-managed installations through your package manager.
 
@@ -131,12 +137,12 @@ Choose a suitable rendering resolution in the game. The runtime includes 4K and 
 
 ### Change a game's launch settings
 
-Open the game's **More actions → Edit launch settings**. Settings such as native Wayland, Gamescope, HDR, the performance profile and the runtime's compatibility switches appear as switches and menus, each with a line saying what it does; other environment variables can be added below them. Your changes are saved as your own copy of the game's recipe. **Reset to defaults** sets that copy aside as a `.toml.bak` file and returns the game to the settings Ferestre ships or detects.
+Open the game's **More actions → Edit launch settings**. The tabs hold native Wayland, Gamescope, HDR, the performance profile, compatibility and upscaling switches and the runtime, each with a line saying what it does; other environment variables can be added below them. Your changes are saved as your own copy of the game's recipe. **Reset to defaults** sets that copy aside as a `.toml.bak` file and returns the game to the settings Ferestre ships or detects.
 
 ### Move a game or add it to Steam
 
 - **Move:** open the game's **More actions → Move location**, choose an existing library folder and confirm after the space check. Ferestre verifies the move, and keeps the original if it fails or is cancelled. Saves and prefixes retain their existing locations.
-- **Steam:** close Steam, then choose **Add to Steam** in the game's menu. **Add All to Steam** in the Installed list adds all installed games. Shortcuts include available artwork and retain their identity when updated.
+- **Steam:** close Steam, then choose **Add to Steam** in the game's menu. **Add all games to Steam**, in My Library's menu, adds all installed games. Shortcuts include available artwork and retain their identity when updated.
 
 ### Play games you already have
 
@@ -144,12 +150,13 @@ Windows games Ferestre did not install (GOG, other stores, Steam non-Steam short
 
 - **Add a game:** choose **+ → Add game…** in the library and pick its `.exe`; the name and folder are filled in and can be edited. Or `./ferestre.AppImage add /path/to/Game.exe`.
 - **Import from Steam:** choose **+ → Import from Steam**, or `./ferestre.AppImage import-steam --dry-run` to see what would come in, then without `--dry-run`. Each non-Steam shortcut keeps its executable, launch options (environment, wrappers such as `gamemoderun`, arguments), Wine prefix, Proton build and grid art. Steam's files are only read; Ferestre's own shortcuts are skipped.
+- **Games Steam installed** come in with the same import, marked **Steam game**. **Play** asks Steam to start them, so Steam's Proton, launch options, DRM and cloud saves stay as they are. A shortcut to a script or other Linux program of your own is imported the same way, as a **Steam shortcut**; for neural rendering, set the Windows program it runs and its Wine prefix in **Edit launch settings**.
 
-Local games start through Ferestre's Proton shim without any Xbox service, licence or account. **Remove from library** only forgets a local game: its folder and its Wine prefix are never deleted. Games with anti-cheat files are flagged in the library. See [local games in recipes](titles/SCHEMA.md#local-games-user-recipes-only).
+Other local games start through Ferestre's Proton shim without any Xbox service, licence or account. **Remove from library** only forgets a local game: its folder and its Wine prefix are never deleted. A local game has no **Reset to defaults**: its settings are the game. Games with anti-cheat files are flagged in the library. See [local games in recipes](titles/SCHEMA.md#local-games-user-recipes-only).
 
 ### Try neural rendering (experimental)
 
-On an AMD Radeon RX 9000 card, a game can run NVIDIA's DLSS 5 neural rendering network through [DLSSNR-AMD](https://github.com/TheAutomatic/DLSSNR-AMD). Choose **Neural rendering…** in a game's menu, or `./ferestre.AppImage neural enable <id>`. It needs your own `nvngx_dlssnr.dll` (Ferestre ships no NVIDIA file), and in game the game's upscaler set to DLSS. **Ctrl+Y** opens the NR Control menu. Turning it off puts every replaced file back. See [Neural rendering](docs/NEURAL-RENDERING.md) for requirements, anti-cheat and troubleshooting.
+On an AMD Radeon RX 9000 card, a game can run NVIDIA's DLSS 5 neural rendering network through [DLSSNR-AMD](https://github.com/TheAutomatic/DLSSNR-AMD). Open **Edit launch settings → Neural rendering**, or `./ferestre.AppImage neural enable <id>`. It needs your own `nvngx_dlssnr.dll` (Ferestre ships no NVIDIA file), and in game the game's upscaler set to DLSS. **Ctrl+Y** opens the NR Control menu. Turning it off puts every replaced file back. See [Neural rendering](docs/NEURAL-RENDERING.md) for requirements, anti-cheat and troubleshooting.
 
 ### Refresh your library
 
@@ -207,7 +214,7 @@ Use `./ferestre.AppImage --help` for all commands. `run` refuses to start a game
 | [Releasing](docs/RELEASING.md) | Release builds and signing |
 | [Debugging notes](notes/) | Technical investigations |
 
-Current releases: **[Ferestre 0.1.26](https://github.com/icex/ferestre/releases/tag/v0.1.26)** and **[runtime 11.0.20261122.2](https://github.com/icex/ferestre/releases/tag/runtime-11.0.20261122.2)**. Read the [0.1.26](docs/RELEASE-0.1.26.md) and [0.1.25](docs/RELEASE-0.1.25.md) release notes for tested scope.
+Current releases: **[Ferestre 0.1.27](https://github.com/icex/ferestre/releases/tag/v0.1.27)** and **[runtime 11.0.20261124.1](https://github.com/icex/ferestre/releases/tag/runtime-11.0.20261124.1)**. Read the [0.1.27](docs/RELEASE-0.1.27.md) and [0.1.26](docs/RELEASE-0.1.26.md) release notes for tested scope.
 
 ## About the project
 

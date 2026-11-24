@@ -220,6 +220,166 @@ pub(crate) fn duration(ms: u32) -> u32 {
     }
 }
 
+/// How long the light takes over a tile (the CSS has the same), and how soon
+/// after being left a tile is the same one still: a redraw replaces it.
+const SHIMMER_MS: u64 = 850;
+const SAME_TILE: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long a tile stays selected before the light runs: passing over tiles
+/// on the way to another lights none of them, also one press at a time and
+/// in the wait before a held direction repeats.
+const SETTLED: std::time::Duration = std::time::Duration::from_millis(650);
+
+thread_local! {
+    /// The tile selected last, and when it was left.
+    static SELECTED: RefCell<Option<(String, Option<std::time::Instant>)>> =
+        const { RefCell::new(None) };
+    /// The tile waiting to settle, and which wait it is.
+    static SETTLING: RefCell<(u64, String)> = const { RefCell::new((0, String::new())) };
+}
+
+/// Start waiting for `name` to settle, instead of whichever was.
+fn settle(name: &str) -> u64 {
+    SETTLING.with(|s| {
+        let mut s = s.borrow_mut();
+        *s = (s.0.wrapping_add(1), name.to_string());
+        s.0
+    })
+}
+
+/// `name` was left: it does not settle.
+fn unsettle(name: &str) {
+    SETTLING.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.1 == name {
+            *s = (s.0.wrapping_add(1), String::new());
+        }
+    });
+}
+
+fn settled(wait: u64) -> bool {
+    SETTLING.with(|s| s.borrow().0 == wait)
+}
+
+thread_local! {
+    static STEERED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether a controller or the keyboard moves the selection, until the mouse
+/// itself moves.
+pub(crate) fn set_steered(steered: bool) {
+    STEERED.with(|s| s.set(steered));
+}
+
+/// Whether selecting `name` is news, for the last one selected.
+fn newly_selected(last: &Option<(String, Option<std::time::Instant>)>, name: &str) -> bool {
+    match last {
+        Some((last, left)) if last == name => left.is_some_and(|at| at.elapsed() >= SAME_TILE),
+        _ => true,
+    }
+}
+
+/// A band of light over `surface` when `button` is selected: by the pointer,
+/// the keyboard or a controller.
+pub(crate) fn shimmer(button: &impl IsA<gtk::Widget>, surface: &gtk::Overlay) {
+    let light = gtk::Box::builder()
+        .can_target(false)
+        .can_focus(false)
+        .css_classes(["tile-shimmer"])
+        .accessible_role(gtk::AccessibleRole::Presentation)
+        .build();
+    surface.add_overlay(&light);
+    let button = button.upcast_ref::<gtk::Widget>();
+    let select = {
+        let (button, light) = (button.downgrade(), light.downgrade());
+        move || {
+            let (Some(button), Some(light)) = (button.upgrade(), light.upgrade()) else {
+                return;
+            };
+            let name = button.widget_name().to_string();
+            if !SELECTED.with(|s| newly_selected(&s.borrow(), &name)) {
+                SELECTED.with(|s| s.replace(Some((name, None))));
+                return;
+            }
+            let wait = settle(&name);
+            let light = light.downgrade();
+            glib::timeout_add_local_once(SETTLED, move || {
+                let Some(light) = light.upgrade() else { return };
+                if !settled(wait) || !light.is_mapped() {
+                    return;
+                }
+                SELECTED.with(|s| s.replace(Some((name, None))));
+                if !animations_enabled() || light.has_css_class("run") {
+                    return;
+                }
+                light.add_css_class("run");
+                let light = light.downgrade();
+                let length = std::time::Duration::from_millis(SHIMMER_MS + 50);
+                glib::timeout_add_local_once(length, move || {
+                    if let Some(light) = light.upgrade() {
+                        light.remove_css_class("run");
+                    }
+                });
+            });
+        }
+    };
+    let leave = {
+        let (button, light) = (button.downgrade(), light.downgrade());
+        move || {
+            let Some(button) = button.upgrade() else {
+                return;
+            };
+            // It does not play on behind the next one.
+            if let Some(light) = light.upgrade() {
+                light.remove_css_class("run");
+            }
+            let name = button.widget_name();
+            unsettle(&name);
+            SELECTED.with(|s| {
+                if let Some((last, left)) = s.borrow_mut().as_mut() {
+                    if *last == name {
+                        *left = Some(std::time::Instant::now());
+                    }
+                }
+            });
+        }
+    };
+    let focus = gtk::EventControllerFocus::new();
+    let on = select.clone();
+    focus.connect_enter(move |_| on());
+    let off = leave.clone();
+    focus.connect_leave(move |_| off());
+    button.add_controller(focus);
+    let pointer = gtk::EventControllerMotion::new();
+    // Motion, not entering: a tile also comes under a mouse that lies still
+    // while a controller scrolls, and that one is not selected.
+    let over = Rc::new(Cell::new(false));
+    let is_over = over.clone();
+    pointer.connect_motion(move |_, _, _| {
+        if !STEERED.with(Cell::get) && !is_over.replace(true) {
+            select();
+        }
+    });
+    let off = leave.clone();
+    pointer.connect_leave(move |_| {
+        if over.replace(false) {
+            off();
+        }
+    });
+    button.add_controller(pointer);
+    button.connect_unmap(move |_| leave());
+}
+
+/// No tooltips on a tile or anything in it: it says what matters itself.
+pub(crate) fn no_tooltips(tile: &impl IsA<gtk::Widget>) {
+    let tile = tile.upcast_ref::<gtk::Widget>();
+    tile.set_has_tooltip(false);
+    let mut child = tile.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        no_tooltips(&widget);
+    }
+}
+
 /// Frosted glass on surfaces drawn inside the window, where GTK can do it:
 /// `backdrop-filter` arrived in GTK 4.22, and an older GTK would only print a
 /// parse warning for it, so this is a second stylesheet loaded on 4.22 and
@@ -239,8 +399,23 @@ pub(crate) fn load_glass(display: &gdk::Display) {
 
 const GLASS: &str = "
 window.blur-ok .notification, window.blur-ok .notification-more {
-  background-color: alpha(#24272d, 0.68);
-  backdrop-filter: blur(18px);
+  background-color: alpha(#24272d, 0.56);
+  backdrop-filter: blur(22px) saturate(1.35);
+  box-shadow: 0 8px 28px alpha(black, 0.45), inset 0 0 0 1px alpha(white, 0.10);
+}
+/* The shell behind a dialog is blurred already, once: a second blur here would
+   be drawn again for every change on the glass. */
+window.blur-ok floating-sheet > sheet, window.blur-ok bottom-sheet > sheet {
+  background-color: alpha(#22252b, 0.66);
+  box-shadow: 0 18px 60px alpha(black, 0.55), inset 0 0 0 1px alpha(white, 0.11);
+}
+/* What stands on the glass must not paint over it. */
+window.blur-ok floating-sheet > sheet toolbarview, window.blur-ok floating-sheet > sheet scrolledwindow,
+window.blur-ok floating-sheet > sheet preferencespage, window.blur-ok floating-sheet > sheet headerbar {
+  background-color: transparent;
+}
+window.blur-ok.dialog-open floating-sheet > dimming, window.blur-ok.dialog-open bottom-sheet > dimming {
+  background-color: alpha(black, 0.30);
 }
 window.blur-ok .search-pill {
   background-color: alpha(#2a2d33, 0.7);
@@ -263,5 +438,18 @@ mod tests {
     fn a_software_frame_decides_at_once() {
         assert_eq!(slow_verdict(16_700, HOPELESS_FRAME, 0), Some(true));
         assert_eq!(slow_verdict(900_000, 900_000, 0), Some(true));
+    }
+
+    #[test]
+    fn a_redrawn_tile_is_not_a_new_selection() {
+        let now = std::time::Instant::now();
+        assert!(newly_selected(&None, "a"));
+        assert!(!newly_selected(&Some(("a".into(), None)), "a"));
+        assert!(!newly_selected(&Some(("a".into(), Some(now))), "a"));
+        assert!(newly_selected(
+            &Some(("a".into(), Some(now - 2 * SAME_TILE))),
+            "a"
+        ));
+        assert!(newly_selected(&Some(("a".into(), None)), "b"));
     }
 }

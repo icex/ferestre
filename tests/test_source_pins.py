@@ -39,7 +39,7 @@ class SourcePinsTests(unittest.TestCase):
                 if change=='missing':del data['packages']
                 path=Path(tmp)/'lock.json';path.write_text(json.dumps(data))
                 with self.assertRaises(ValueError):pins_module.load_packages(path)
-    def test_components_still_require_exactly_the_five_forks(self):
+    def test_components_still_require_exactly_the_six_forks(self):
         self.assertEqual(set(pins_module.load()),pins_module.NAMES)
     def test_the_package_command_prints_one_field(self):
         out=subprocess.check_output(['python3','scripts/source-pins.py','package','dlssnr-amd','commit'],cwd=ROOT,text=True)
@@ -49,14 +49,18 @@ class SourcePinsTests(unittest.TestCase):
             repo=Path(tmp)
             def git(*args):return subprocess.check_output(['git','-C',str(repo),*args],text=True).strip()
             git('init','--quiet');git('config','user.name','Test');git('config','user.email','test@example.invalid')
-            (repo/'.gitmodules').write_text('[submodule "wine"]\npath = wine\nurl = https://github.com/icex/wine.git\n[submodule "vkd3d-proton"]\npath = vkd3d-proton\nurl = https://github.com/icex/vkd3d-proton.git\n')
+            (repo/'.gitmodules').write_text('[submodule "wine"]\npath = wine\nurl = https://github.com/icex/wine.git\n[submodule "vkd3d-proton"]\npath = vkd3d-proton\nurl = https://github.com/icex/vkd3d-proton.git\n[submodule "dxvk"]\npath = dxvk\nurl = https://github.com/icex/dxvk.git\n')
             git('add','.gitmodules')
             git('update-index','--add','--cacheinfo','160000,'+'a'*40+',wine')
             git('update-index','--add','--cacheinfo','160000,'+'b'*40+',vkd3d-proton')
+            git('update-index','--add','--cacheinfo','160000,'+'e'*40+',dxvk')
             git('commit','--quiet','-m','fixture')
             pins=pins_module.load();pins=copy.deepcopy(pins)
-            pins['proton']['commit']=git('rev-parse','HEAD');pins['wine']['commit']='a'*40;pins['vkd3d-proton']['commit']='b'*40
+            pins['proton']['commit']=git('rev-parse','HEAD');pins['wine']['commit']='a'*40;pins['vkd3d-proton']['commit']='b'*40;pins['dxvk']['commit']='e'*40
             pins_module.verify_graph(pins,{'proton':repo})
+            pins['dxvk']['repository']='https://github.com/icex/other.git'
+            with self.assertRaisesRegex(ValueError,'dxvk repository'):pins_module.verify_graph(pins,{'proton':repo})
+            pins['dxvk']['repository']='https://github.com/icex/dxvk.git'
             pins['wine']['commit']='c'*40
             with self.assertRaisesRegex(ValueError,'gitlink'):pins_module.verify_graph(pins,{'proton':repo})
             pins['proton']['commit']='d'*40

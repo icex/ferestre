@@ -43,7 +43,7 @@ ferestre neural status [<title>]
 ferestre neural disable <title>
 ```
 
-In the window, open a game's menu and choose **Neural rendering…**. The
+In the window, open a game's **Edit launch settings** and its **Neural rendering** tab. The
 download address field is under Settings, in **Neural rendering
 (experimental)**.
 
@@ -92,7 +92,10 @@ hooks in:
 | `reshade-feeder-vulkan` | Vulkan |
 | `reshade-feeder-dx9` | Direct3D 9 |
 
-`--route` picks one yourself. An executable Ferestre cannot read is refused
+`--route` picks one yourself. The route and network a game last had are kept
+for it, also after turning it off: enabling again without `--route` or
+`--model` (or with **Automatic** in the window) uses them, and the window opens
+on them. Detection decides only for a game that never had one. An executable Ferestre cannot read is refused
 with "pass --route", except an Xbox install's, which is kept encrypted and is
 assumed to be x86-64 Direct3D 12.
 
@@ -117,6 +120,9 @@ ferestre neural menu-key F7          # or End; --reset goes back to Ctrl+Y
 It is kept as `[dlssnr] menu-key` in `~/.config/ferestre/settings.toml` and
 written into each game's `dlssnr-amd.ini` at install and at every launch.
 
+OptiScaler's own menu opens with **Home** instead of Insert, unless another key
+was chosen in it. OptiScaler takes a single key there, without Ctrl.
+
 ### A game that crashes with OptiScaler as dxgi.dll
 
 On the `optiscaler` route OptiScaler goes in as `dxgi.dll`. Some games crash
@@ -131,6 +137,27 @@ ferestre neural enable <title> --proxy winmm
 The choice is kept per game, also after turning neural rendering off, and the
 launch's `WINEDLLOVERRIDES` follows it. `--proxy dxgi` goes back to the
 default at the next launch.
+
+## Games Steam starts
+
+A game Steam installed, or a Steam shortcut to a script, gets no environment
+from Ferestre: Steam starts it. Before **Play** asks Steam, Ferestre checks the
+mod is in place and writes the DLL override into the game's own Wine prefix,
+`pfx/user.reg`, under
+`Software\Wine\AppDefaults\<program>\DllOverrides`, for that program
+alone. Steam's own files are never written. A value you had there is recorded
+and put back when neural rendering is turned off. Because the override lives
+in the prefix, the mod also loads when you start the game from Steam itself.
+
+- The prefix must exist: start the game from Steam once first.
+- For a shortcut to a script, set the Windows program it runs and its prefix
+  in **Edit launch settings**; neural rendering refuses to go beside a script.
+  The route is detected from that program's folder, so when the game's DLSS
+  files live elsewhere (an overlay over the game folder, say), choose the
+  `optiscaler` route yourself.
+- `CC_SILVER_AARDWOLD_OPTIMIZED` on a ReShade route needs a Vulkan layer that
+  a game Steam starts cannot be given; choose another network.
+- While the game runs, its prefix is left alone.
 
 ## Anti-cheat
 

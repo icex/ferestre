@@ -25,8 +25,8 @@ wants = ["appmodel.package-identity"]
 [status]
 state = "playable-with-issues"
 summary = "Reaches the title menu, starts a New Game and plays the opening into the world; online features fall back to Offline Mode."
-last-verified = 2026-11-22
-verified-with = "Xbox PC package 1.4.1961.0 (game version 1.004), headless at 1280x720 with scripted input through New Game, the HDR and brightness screens and the opening; not yet played by a person."
+last-verified = 2026-11-24
+verified-with = "Xbox PC package 1.4.1961.0 (game version 1.004), headless at 1280x720 with scripted input through New Game, the HDR and brightness screens and the opening; and loading a save with the 2026-11-24 service."
 
 [[issues]]
 symptom = "\"Internal system error occured\" a few seconds after launch, before any frame; error.txt in the install folder reports an access violation at 0x141AF37C5 in a Background thread"
@@ -35,5 +35,10 @@ fix = "Use a runtime advertising xgameruntime.package-chunk-availability."
 
 [[issues]]
 symptom = "\"Network features cannot be used. Launching in Offline Mode... Error Code: 10000\" when the game reaches the world, and \"A network error has occurred\" while checking for additional content"
-cause = "The token request for the game's own server (https://prod-pc-15.wws-gs2.com/auth/ds) gets no token from xodus-service (E_GAMEUSER_NO_AUTH_USER); Xbox Live tokens for the same account succeed. Not yet investigated further."
+cause = "The token request for the game's own server (https://prod-pc-15.wws-gs2.com/auth/ds) gets no token from xodus-service (E_GAMEUSER_NO_AUTH_USER); Xbox Live tokens for the same account succeed. The title lists that path without its leading slash (auth/ds), and the service did not match it. The same with the Store account or another as Player."
+fix = "Update Ferestre: the service then issues the token and the server signs in."
+
+[[issues]]
+symptom = "\"Unable to log in to Death Stranding game server. Launching in Offline Mode... Error Code: 50000\" when a save loads"
+cause = "Not established. The game server accepts the sign-in (200) and answers /ds/e/getVersion (200), which the game asks for three times before giving up."
 fix = "None yet; the game plays offline, without the shared online structures."

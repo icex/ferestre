@@ -32,6 +32,7 @@ pub const INSTALL_MANIFEST: &str = "dlssnr-amd-install.txt";
 const BACKUP_MANIFEST: &str = "manifest.json";
 const BACKUP_SCHEMA: u32 = 1;
 const INI: &str = "dlssnr-amd.ini";
+const OPTISCALER_INI: &str = "OptiScaler.ini";
 /// The person's `dlssnr-amd.ini`, kept across a reinstall (which writes a
 /// fresh one).
 const KEPT_INI: &str = "dlssnr-amd.ini.user";
@@ -708,7 +709,8 @@ fn install(
     kept_back?;
     use_proxy(exe_dir, entry)?;
     apply_menu_key(ctx, exe_dir)?;
-    record_installed(exe_dir, &files)
+    record_installed(exe_dir, &files)?;
+    apply_optiscaler_key(exe_dir, entry.route)
 }
 
 /// The files an entry's install writes, OptiScaler under its DLL name.
@@ -774,6 +776,44 @@ fn apply_menu_key(ctx: &Context, exe_dir: &Path) -> Result<()> {
 /// `text` with `MenuKey` in `[NRControl]` set to `key`, or `None` when it is
 /// already or the ini has no such line.
 fn with_menu_key(text: &str, key: &str) -> Option<String> {
+    with_ini_line(text, "NRControl", "MenuKey", |value| {
+        (value != key).then(|| format!("MenuKey = {key}"))
+    })
+}
+
+/// OptiScaler's menu opens with Home where nobody chose a key: its own
+/// default, Insert, is missing from many keyboards, and it takes a single
+/// key, without Ctrl.
+fn apply_optiscaler_key(exe_dir: &Path, route: Route) -> Result<()> {
+    if route != Route::Optiscaler {
+        return Ok(());
+    }
+    let ini = exe_dir.join(OPTISCALER_INI);
+    let Ok(text) = std::fs::read_to_string(&ini) else {
+        return Ok(());
+    };
+    if let Some(changed) = with_optiscaler_key(&text) {
+        crate::cache::write(&ini, changed.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn with_optiscaler_key(text: &str) -> Option<String> {
+    with_ini_line(text, "Menu", "ShortcutKey", |value| {
+        value
+            .eq_ignore_ascii_case("auto")
+            .then(|| "ShortcutKey=0x24".to_string())
+    })
+}
+
+/// `text` with the line setting `key` in `[section]` replaced by what `replace`
+/// makes of its value, keeping line endings; `None` when nothing changed.
+fn with_ini_line(
+    text: &str,
+    wanted: &str,
+    key: &str,
+    replace: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
     let mut section = String::new();
     let mut changed = false;
     let out: String = text
@@ -782,12 +822,14 @@ fn with_menu_key(text: &str, key: &str) -> Option<String> {
             let body = line.trim_end_matches(['\r', '\n']);
             let trimmed = body.trim();
             if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                section = trimmed[1..trimmed.len() - 1].trim().to_ascii_lowercase();
-            } else if section == "nrcontrol" {
+                section = trimmed[1..trimmed.len() - 1].trim().to_string();
+            } else if section.eq_ignore_ascii_case(wanted) {
                 if let Some((name, value)) = trimmed.split_once('=') {
-                    if name.trim().eq_ignore_ascii_case("MenuKey") && value.trim() != key {
-                        changed = true;
-                        return format!("MenuKey = {key}{}", &line[body.len()..]);
+                    if name.trim().eq_ignore_ascii_case(key) {
+                        if let Some(new) = replace(value.trim()) {
+                            changed = true;
+                            return format!("{new}{}", &line[body.len()..]);
+                        }
                     }
                 }
             }
@@ -839,6 +881,16 @@ pub fn enable(ctx: &Context, req: &EnableRequest) -> Result<Enabled> {
 fn enable_with(ctx: &Context, req: &EnableRequest, found: &[Detection]) -> Result<Enabled> {
     if let Some(reason) = hardware::gate(&ctx.drm) {
         bail!("{reason}");
+    }
+    // A game started by a script names the script: the mod would land beside
+    // it, not beside the program the script runs.
+    let lower = req.executable.to_ascii_lowercase();
+    if !(lower.ends_with(".exe") || lower.ends_with(".bat")) {
+        bail!(
+            "{}: neural rendering goes beside the game's Windows program; choose the .exe it \
+             runs in Edit launch settings",
+            req.executable
+        );
     }
     let _lock = lock(ctx, req.key)?;
     let name = game_name(req.game_dir, req.key);
@@ -896,7 +948,14 @@ fn enable_with(ctx: &Context, req: &EnableRequest, found: &[Detection]) -> Resul
     }
     let executable = PathBuf::from(req.executable.replace('\\', "/"));
     let detected = detect::detect(req.game_dir, &executable);
-    let route = match req.route.or(detected.route) {
+    // What was installed for this game before, on or off, stays chosen
+    // unless the person picks again: "Automatic" detects for a new game.
+    let kept = state::choice(&ctx.config_dir, req.key)?;
+    let route = match req
+        .route
+        .or(kept.as_ref().map(|e| e.route))
+        .or(detected.route)
+    {
         Some(route) => route,
         None => bail!(
             "cannot tell which DLSSNR-AMD route suits {} ({}); pass --route with one of {}",
@@ -962,6 +1021,10 @@ fn enable_with(ctx: &Context, req: &EnableRequest, found: &[Detection]) -> Resul
              run: ferestre neural setup --dll <its path>",
             needs(model, &ctx.expect).file
         ),
+        None if kept.as_ref().is_some_and(|e| has(e.model)) => kept
+            .as_ref()
+            .map(|e| e.model)
+            .unwrap_or(Network::SilverAardwold),
         None if has(Network::SmallFp8) => Network::SmallFp8,
         None => Network::SilverAardwold,
     };
@@ -1169,6 +1232,9 @@ fn ensure_with(
         if let Err(e) = apply_menu_key(ctx, &dir) {
             eprintln!("-- neural rendering: the menu key was not set: {e:#}");
         }
+        if let Err(e) = apply_optiscaler_key(&dir, entry.route) {
+            eprintln!("-- neural rendering: OptiScaler's menu key was not set: {e:#}");
+        }
         return Ensured::Present(entry);
     }
     // Another DLL name: the old install comes out whole first, so a file of
@@ -1260,6 +1326,29 @@ pub fn dll_overrides(route: Route) -> &'static [(&'static str, &'static str)] {
     }
 }
 
+/// The DLLs an installed entry needs loaded native first: the route's, or
+/// the proxy name OptiScaler went in as.
+pub fn override_dlls(entry: &Entry) -> Vec<String> {
+    let proxy_file = package::proxy_file(entry.route, entry.proxy.as_deref());
+    if proxy_file == "dxgi.dll" {
+        dll_overrides(entry.route)
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect()
+    } else {
+        vec![proxy_file.trim_end_matches(".dll").to_string()]
+    }
+}
+
+/// Whether an installed entry also needs launch environment beyond DLL
+/// overrides (the INT4 network's Vulkan layer), which a game Steam starts
+/// cannot be given.
+pub fn needs_layer_env(entry: &Entry, exe_dir: &Path) -> bool {
+    entry.route != Route::Optiscaler
+        && entry.model == Network::SilverAardwoldOptimized
+        && exe_dir.join(INT4_MODEL).is_file()
+}
+
 fn dll_name(name: &str) -> String {
     let name = name.trim().to_ascii_lowercase();
     name.strip_suffix(".dll").unwrap_or(&name).to_string()
@@ -1315,24 +1404,16 @@ pub fn launch_env(
 ) -> LaunchEnv {
     let mut env = LaunchEnv::default();
     let existing = current("WINEDLLOVERRIDES");
-    let proxy_file = package::proxy_file(entry.route, entry.proxy.as_deref());
-    let proxied = [(proxy_file.trim_end_matches(".dll"), "n,b")];
-    let ours = if proxy_file == "dxgi.dll" {
-        dll_overrides(entry.route)
-    } else {
-        &proxied[..]
-    };
-    let (merged, theirs) = merge_dll_overrides(existing.as_deref(), ours);
+    let names = override_dlls(entry);
+    let ours: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "n,b")).collect();
+    let (merged, theirs) = merge_dll_overrides(existing.as_deref(), &ours);
     env.set.push(("WINEDLLOVERRIDES".to_string(), merged));
     for name in theirs {
         env.notes.push(format!(
             "-- neural rendering: your WINEDLLOVERRIDES sets {name} itself, so DLSSNR-AMD may not load"
         ));
     }
-    if entry.route != Route::Optiscaler
-        && entry.model == Network::SilverAardwoldOptimized
-        && exe_dir.join(INT4_MODEL).is_file()
-    {
+    if needs_layer_env(entry, exe_dir) {
         let layer = exe_dir.join(INT4_LAYER_DIR).display().to_string();
         env.set.push((
             "VK_ADD_LAYER_PATH".to_string(),
@@ -1589,6 +1670,36 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
             gate(&[det("BattlEye", true, true)], &acknowledged),
             Gate::Allowed
         );
+    }
+
+    #[test]
+    fn a_chosen_route_stays_chosen_through_off_and_on() {
+        let w = World::new();
+        // Detected: reshade-feeder. Chosen: the Vulkan one.
+        w.enable(Route::ReshadeFeederVulkan);
+        disable(&w.ctx, "local-game", &w.game, "Game.exe").unwrap();
+        assert_eq!(w.entry(), None);
+        let again = enable_with(&w.ctx, &w.req(None, false), &[]).unwrap();
+        assert_eq!(again.entry.route, Route::ReshadeFeederVulkan);
+        assert_eq!(
+            state::choice(&w.ctx.config_dir, "local-game")
+                .unwrap()
+                .map(|c| c.route),
+            Some(Route::ReshadeFeederVulkan)
+        );
+    }
+
+    #[test]
+    fn a_script_is_no_place_for_the_mod() {
+        let w = World::new();
+        std::fs::write(w.game.join("launch.sh"), b"#!/bin/sh\n").unwrap();
+        let before = listing(&w.game);
+        let mut req = w.req(Some(Route::ReshadeFeeder), true);
+        req.executable = "launch.sh";
+        let text = format!("{:#}", enable_with(&w.ctx, &req, &[]).unwrap_err());
+        assert!(text.contains("choose the .exe it runs"), "{text}");
+        assert_eq!(listing(&w.game), before);
+        assert_eq!(w.entry(), None);
     }
 
     #[test]
@@ -2065,6 +2176,26 @@ exit "$(cat "$pkg/fail-with" 2>/dev/null || echo 0)"
         crate::settings::set_dlssnr_menu_key(&w.ctx.config_dir, Some("F7")).unwrap();
         assert!(matches!(w.ensure(&[]), Ensured::Present(_)));
         assert_eq!(read(&w.game.join(INI)), b"[NRControl]\nMenuKey = F7\n");
+    }
+
+    #[test]
+    fn optiscalers_menu_opens_with_home_unless_a_key_was_chosen() {
+        let ini =
+            "[FG]\r\nShortcutKey=auto\r\n[Menu]\r\nShortcutKey=auto\r\nFpsShortcutKey=auto\r\n";
+        let changed = with_optiscaler_key(ini).unwrap();
+        assert_eq!(
+            changed,
+            "[FG]\r\nShortcutKey=auto\r\n[Menu]\r\nShortcutKey=0x24\r\nFpsShortcutKey=auto\r\n"
+        );
+        assert_eq!(with_optiscaler_key(&changed), None);
+        assert_eq!(with_optiscaler_key("[Menu]\nShortcutKey=0x23\n"), None);
+
+        let w = World::new();
+        w.enable(Route::Optiscaler);
+        let ini = w.game.join(OPTISCALER_INI);
+        write(&ini, b"[Menu]\nShortcutKey=auto\n");
+        assert!(matches!(w.ensure(&[]), Ensured::Present(_)));
+        assert_eq!(read(&ini), b"[Menu]\nShortcutKey=0x24\n");
     }
 
     #[test]

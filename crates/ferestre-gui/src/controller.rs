@@ -156,10 +156,51 @@ fn reveal_on_frame(ui: &Ui) {
 
 /// Rebuilt tabs must retain the selected section, rather than GTK's fallback
 /// focus on a neighbouring button after the previous tab widget is removed.
+/// The one `by` places on from `current`, round the ends.
+fn beside(sections: &[Section], current: Section, by: isize) -> Section {
+    let at = sections.iter().position(|s| *s == current).unwrap_or(0);
+    sections[(at as isize + by).rem_euclid(sections.len() as isize) as usize]
+}
+
+/// The tabs shown in a dialog, if it has any to choose from.
+fn tabs_in(root: &gtk::Widget) -> Option<adw::ViewStack> {
+    if let Some(stack) = root.downcast_ref::<adw::ViewStack>() {
+        if stack.is_mapped() && stack.pages().n_items() > 1 {
+            return Some(stack.clone());
+        }
+    }
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        if let Some(found) = tabs_in(&widget) {
+            return Some(found);
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
+
+fn turn_tab(stack: &adw::ViewStack, by: isize) {
+    let pages: Vec<gtk::Widget> = stack
+        .pages()
+        .iter::<adw::ViewStackPage>()
+        .filter_map(Result::ok)
+        .filter(|page| page.is_visible())
+        .map(|page| page.child())
+        .collect();
+    let shown = stack.visible_child();
+    let at = pages.iter().position(|p| Some(p) == shown.as_ref());
+    if let Some(at) = at {
+        let to = (at as isize + by).rem_euclid(pages.len() as isize) as usize;
+        stack.set_visible_child(&pages[to]);
+    }
+}
+
 pub(super) fn focus_after_render(name: &str, section: Section) -> Option<String> {
     if name.starts_with("section-") {
         Some(format!("section-{}", section.title()))
-    } else if name.starts_with("game-") || name.starts_with("queue-") || name.starts_with("recent-")
+    } else if ["game-", "queue-", "recent-", "feature-", "hero-"]
+        .iter()
+        .any(|kind| name.starts_with(kind))
     {
         Some(name.into())
     } else {
@@ -310,6 +351,17 @@ fn activate_navigation(ui: &Ui) {
     let Some(focus) = GtkWindowExt::focus(&ui.window) else {
         return;
     };
+    // Into the section already shown: back to the tab it is on.
+    let shown = ui.sidebar.selected_row().is_some_and(|row| {
+        row == focus
+            && Section::NAV.get(row.index() as usize) == Some(&ui.model.borrow().section.nav())
+    });
+    if shown {
+        ui.split.set_show_content(true);
+        let ui = ui.clone();
+        glib::idle_add_local_once(move || focus_content(&ui));
+        return;
+    }
     let enter_games =
         focus.is_ancestor(&ui.sidebar) || focus.widget_name() == "navigation-settings";
     activate(ui, &focus);
@@ -395,6 +447,9 @@ fn is_control(root: &gtk::Widget) -> bool {
         || root.is::<gtk::Switch>()
         || root.is::<gtk::CheckButton>()
         || root.is::<gtk::TextView>()
+        // The row takes the focus; the switch or list inside it does not.
+        || root.is::<adw::SwitchRow>()
+        || root.is::<adw::ComboRow>()
 }
 fn move_surface(root: &gtk::Widget, focus: Option<gtk::Widget>, action: Action) {
     fn collect(root: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
@@ -434,9 +489,46 @@ fn move_surface(root: &gtk::Widget, focus: Option<gtk::Widget>, action: Action) 
             })
         })
         .collect();
-    if let Some(next) = bounds.and_then(|rects| spatial_target(&rects, index, action)) {
-        controls[next].grab_focus();
+    let next = bounds.and_then(|rects| spatial_target(&rects, index, action));
+    let page = long_page(root);
+    // Above a scrolled page, Up brings the page back before leaving it.
+    let rewind = action == Action::Up
+        && page
+            .as_ref()
+            .is_some_and(|p| !focus.is_ancestor(p) && p.vadjustment().value() > 0.0);
+    match (next, page) {
+        (Some(next), _) if !rewind => {
+            controls[next].grab_focus();
+        }
+        // A page with nothing more to focus that way is read by scrolling.
+        (_, Some(page)) if matches!(action, Action::Up | Action::Down) => {
+            let adjustment = page.vadjustment();
+            let step = adjustment.page_size() * 0.6;
+            let step = if action == Action::Up { -step } else { step };
+            adjustment.set_value(adjustment.value() + step);
+        }
+        _ => (),
     }
+}
+/// The page in `root` that is longer than what is shown of it.
+fn long_page(root: &gtk::Widget) -> Option<gtk::ScrolledWindow> {
+    if !root.is_mapped() {
+        return None;
+    }
+    if let Some(page) = root.downcast_ref::<gtk::ScrolledWindow>() {
+        let adjustment = page.vadjustment();
+        if adjustment.upper() - adjustment.lower() > adjustment.page_size() + 1.0 {
+            return Some(page.clone());
+        }
+    }
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        if let Some(page) = long_page(&widget) {
+            return Some(page);
+        }
+        child = widget.next_sibling();
+    }
+    None
 }
 fn move_dialog(dialog: &adw::Dialog, action: Action) {
     move_surface(dialog.upcast_ref(), dialog.focus(), action);
@@ -495,7 +587,24 @@ fn move_main(ui: &Ui, action: Action) -> bool {
             return true;
         }
     }
-    let buttons = main_controls(ui);
+    endless::around(ui, &focus);
+    let mut buttons = main_controls(ui);
+    // A tile's menu has a button of its own on a controller and a key on a
+    // keyboard; in the way of the next tile it only slows moving through them.
+    // It stays where a tile has nothing else to go to.
+    let games: std::collections::BTreeSet<String> = buttons
+        .iter()
+        .filter(|w| !w.widget_name().ends_with("-more"))
+        .filter_map(game_name)
+        .collect();
+    buttons.retain(|w| {
+        *w == focus
+            || focus.is_ancestor(w)
+            || !std::iter::successors(Some(w.clone()), |w| w.parent())
+                .take(2)
+                .filter(|w| w.widget_name().ends_with("-more"))
+                .any(|w| game_name(&w).is_some_and(|id| games.contains(&id)))
+    });
     let Some(index) = buttons
         .iter()
         .position(|w| *w == focus || focus.is_ancestor(w))
@@ -575,9 +684,12 @@ pub(super) fn update_hints(ui: &Ui) {
             "#f2d16b"
         },
     );
+    let banner =
+        GtkWindowExt::focus(&ui.window).is_some_and(|f| f.widget_name().starts_with("feature-"));
     let action = focused_game(ui)
+        .filter(|_| !banner)
         .and_then(|id| ui.game_actions.borrow().get(&id).cloned())
-        .unwrap_or_else(|| "Select".into());
+        .unwrap_or_else(|| if banner { "Details" } else { "Select" }.into());
     let action =
         if GtkWindowExt::focus(&ui.window).is_some_and(|f| f.widget_name().ends_with("-stop")) {
             "Stop".into()
@@ -589,31 +701,32 @@ pub(super) fn update_hints(ui: &Ui) {
     } else {
         "PS"
     };
-    let markup = if ui.window.visible_dialog().is_some() || focused_popup(ui).is_some() {
-        format!("D-pad  Choose   ·   {a} Select   ·   {b} Back / Close")
+    let dialog = ui.window.visible_dialog();
+    let markup = if dialog.is_some() || focused_popup(ui).is_some() {
+        let tabs = match dialog.and_then(|d| tabs_in(d.upcast_ref())) {
+            Some(_) => format!("   ·   {shoulders} Tabs"),
+            None => String::new(),
+        };
+        format!("D-pad  Choose   ·   {a} Select   ·   {b} Back / Close{tabs}")
     } else if navigation_focus(ui) {
         format!("↑ / ↓  Choose section   ·   →  Games   ·   {a} Open   ·   {b} Return to games   ·   {view} Navigation")
     } else {
-        format!("D-pad / Left stick  Move   ·   {a} {}   ·   {b} Back   ·   {y} Search   ·   {view} Navigation   ·   {menu} More   ·   {shoulders} Sections", glib::markup_escape_text(&action))
+        let tabs = handheld::top_bar(ui) || ui.model.borrow().section.nav() == Section::Library;
+        let turns = if tabs { "Tabs" } else { "Sections" };
+        format!("D-pad / Left stick  Move   ·   {a} {}   ·   {b} Back   ·   {y} Search   ·   {view} Navigation   ·   {menu} More   ·   {shoulders} {turns}", glib::markup_escape_text(&action))
     };
     let markup = format!("{markup}   ·   {home} Ferestre");
     if ui.controller_hints.label().as_str() != markup {
         ui.controller_hints.set_markup(&markup);
     }
-    ui.navigation_hint.set_markup(&format!(
-        "↑ / ↓ Choose   ·   → Games
-{a} Open   ·   {b} Return"
-    ));
-    ui.navigation_hint.set_visible(
-        ui.controller_connected.get()
-            || ui.window.is_fullscreen()
-            || ui.window.has_css_class("controller-navigation"),
-    );
-    ui.controller_hints.set_visible(
-        ui.controller_connected.get()
-            || ui.window.is_fullscreen()
-            || ui.window.has_css_class("controller-navigation"),
-    );
+    ui.controller_hints
+        .set_visible(ui.controller_connected.get() && ui.controller_in_use.get());
+}
+/// The mouse or the keyboard is in use: its help is not a controller's.
+fn controller_put_down(ui: &Ui) {
+    if ui.controller_in_use.replace(false) {
+        update_hints(ui);
+    }
 }
 pub(super) fn show_help(ui: &Ui) {
     let (a, b, y, view, menu, shoulders) = ui.controller_family.get().controls();
@@ -622,7 +735,7 @@ pub(super) fn show_help(ui: &Ui) {
     } else {
         "PS"
     };
-    let text = format!("{home}: bring Ferestre to the front while a game is running.\n\nD-pad or left stick: move between games.\n\n{a}: select or launch the highlighted game.\n{b}: go back or close a menu.\n{y}: search.\n{view}: open or close navigation.\n{menu}: options for the highlighted game.\n{shoulders}: change sections.\n\nIn navigation, ↑/↓ chooses a section; → or {a} opens its games. ← from the first game returns to navigation.\n\nFullscreen is available in the window header (keyboard F11).");
+    let text = format!("{home}: bring Ferestre to the front while a game is running.\n\nD-pad or left stick: move between games.\n\n{a}: select or launch the highlighted game.\n{b}: go back or close a menu.\n{y}: search.\n{view}: open or close navigation.\n{menu}: options for the highlighted game.\n{shoulders}: change tabs, or sections where there are none.\nTriggers: a page up or down a list.\n\nIn navigation, ↑/↓ chooses a section; → or {a} opens its games. ← from the first game returns to navigation.\n\nFullscreen is available in the window header (keyboard F11).");
     let dialog = adw::AlertDialog::new(Some("Controller controls"), Some(&text));
     dialog.add_response("close", "Close");
     dialog.set_close_response("close");
@@ -759,6 +872,8 @@ impl Pad {
                             buttons,
                             x: (self.axis)(*handle, 0),
                             y: (self.axis)(*handle, 1),
+                            left: (self.axis)(*handle, 4),
+                            right: (self.axis)(*handle, 5),
                         },
                     }
                 })
@@ -839,6 +954,9 @@ struct Input {
     buttons: u16,
     x: i16,
     y: i16,
+    /// The triggers.
+    left: i16,
+    right: i16,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
@@ -854,6 +972,8 @@ enum Action {
     Fullscreen,
     Navigation,
     Options,
+    PageUp,
+    PageDown,
 }
 /// A newly attached or already-held Guide button must be released first.
 #[derive(Default)]
@@ -875,6 +995,7 @@ struct Mapper {
     previous: u16,
     direction: Option<Action>,
     repeat: Option<Instant>,
+    repeats: u32,
 }
 impl Mapper {
     fn actions(&mut self, input: Input, now: Instant) -> Vec<Action> {
@@ -901,6 +1022,10 @@ impl Mapper {
             Some(Action::Left)
         } else if held(14) || input.x > 18000 {
             Some(Action::Right)
+        } else if input.left > 16000 {
+            Some(Action::PageUp)
+        } else if input.right > 16000 {
+            Some(Action::PageDown)
         } else {
             None
         };
@@ -909,10 +1034,18 @@ impl Mapper {
                 result.push(direction);
             }
             self.repeat = direction.map(|_| now + Duration::from_millis(400));
+            self.repeats = 0;
         } else if self.repeat.is_some_and(|at| now >= at) {
             if let Some(direction) = direction {
                 result.push(direction);
-                self.repeat = Some(now + Duration::from_millis(120));
+                self.repeats += 1;
+                // Faster the longer it is held: lists are long.
+                let next = match (direction, self.repeats) {
+                    (Action::PageUp | Action::PageDown, _) => 260,
+                    (_, ..10) => 120,
+                    _ => 75,
+                };
+                self.repeat = Some(now + Duration::from_millis(next));
             }
         }
         self.previous = input.buttons;
@@ -976,7 +1109,45 @@ fn dropdown_for(focus: &gtk::Widget) -> Option<gtk::DropDown> {
     }
     None
 }
-fn choose_option(dropdown: &gtk::DropDown, parent: &gtk::Window) -> bool {
+/// A list of options: a dropdown, or a row that is one.
+#[derive(Clone)]
+enum Options {
+    DropDown(gtk::DropDown),
+    Row(adw::ComboRow),
+}
+impl Options {
+    fn model(&self) -> Option<gio::ListModel> {
+        match self {
+            Self::DropDown(w) => w.model(),
+            Self::Row(w) => w.model(),
+        }
+    }
+    fn selected(&self) -> u32 {
+        match self {
+            Self::DropDown(w) => w.selected(),
+            Self::Row(w) => w.selected(),
+        }
+    }
+    fn select(&self, index: u32) {
+        match self {
+            Self::DropDown(w) => w.set_selected(index),
+            Self::Row(w) => w.set_selected(index),
+        }
+    }
+    fn is_mapped(&self) -> bool {
+        match self {
+            Self::DropDown(w) => w.is_mapped(),
+            Self::Row(w) => w.is_mapped(),
+        }
+    }
+    fn title(&self) -> Option<glib::GString> {
+        match self {
+            Self::DropDown(w) => w.tooltip_text(),
+            Self::Row(w) => Some(w.title()),
+        }
+    }
+}
+fn choose_option(dropdown: &Options, parent: &gtk::Window) -> bool {
     let Some(model) = dropdown.model() else {
         return false;
     };
@@ -993,12 +1164,7 @@ fn choose_option(dropdown: &gtk::DropDown, parent: &gtk::Window) -> bool {
         return false;
     };
     let dialog = adw::Dialog::builder()
-        .title(
-            dropdown
-                .tooltip_text()
-                .as_deref()
-                .unwrap_or("Choose an option"),
-        )
+        .title(dropdown.title().as_deref().unwrap_or("Choose an option"))
         .content_width(480)
         .content_height(360)
         .build();
@@ -1036,7 +1202,7 @@ fn choose_option(dropdown: &gtk::DropDown, parent: &gtk::Window) -> bool {
                 .and_then(|v| v.downcast::<gtk::StringObject>().ok())
                 .is_some_and(|v| v.string() == label);
             if dropdown.is_mapped() && same {
-                dropdown.set_selected(index as u32);
+                dropdown.select(index as u32);
             }
             if let Some(dialog) = dialog.upgrade() {
                 dialog.close();
@@ -1071,9 +1237,18 @@ fn activate(ui: &Ui, focus: &gtk::Widget) {
         .and_downcast::<gtk::Window>()
         .unwrap_or_else(|| ui.window.clone().upcast());
     if let Some(dropdown) = dropdown_for(focus) {
-        if choose_option(&dropdown, &parent) {
+        if choose_option(&Options::DropDown(dropdown), &parent) {
             return;
         }
+    }
+    if let Some(row) = focus.downcast_ref::<adw::ComboRow>() {
+        if choose_option(&Options::Row(row.clone()), &parent) {
+            return;
+        }
+    }
+    if let Some(row) = focus.downcast_ref::<adw::SwitchRow>() {
+        row.set_active(!row.is_active());
+        return;
     }
     if let Some(view) = focus.downcast_ref::<gtk::TextView>() {
         if view.is_editable() {
@@ -1268,24 +1443,39 @@ fn dispatch(ui: &Ui, action: Action) {
             ui.split.set_show_content(true);
             ui.search.grab_focus();
         }
-        Action::Previous | Action::Next if dialog.is_none() => {
-            let fullscreen_sections = handheld::SECTIONS.map(|(_, section)| section);
-            let sections = if ui.window.is_fullscreen() {
-                &fullscreen_sections[..]
+        Action::Previous | Action::Next => {
+            let by = if action == Action::Next { 1 } else { -1 };
+            if let Some(dialog) = dialog {
+                if let Some(stack) = tabs_in(dialog.upcast_ref()) {
+                    turn_tab(&stack, by);
+                    if dialog.focus().is_none_or(|f| !f.is_mapped()) {
+                        dialog.child_focus(gtk::DirectionType::TabForward);
+                    }
+                }
             } else {
-                &Section::NAV[..]
-            };
-            let current = sections
-                .iter()
-                .position(|s| *s == ui.model.borrow().section)
-                .unwrap_or(0);
-            let index = if action == Action::Next {
-                (current + 1) % sections.len()
-            } else {
-                (current + sections.len() - 1) % sections.len()
-            };
-            select_section(ui, sections[index]);
-            focus_content(ui);
+                // The tabs in view, or else the sidebar's sections.
+                let current = ui.model.borrow().section;
+                let section = if handheld::top_bar(ui) {
+                    beside(&handheld::SECTIONS, current, by)
+                } else if current.nav() == Section::Library {
+                    beside(&Section::LIBRARY_TABS, current, by)
+                } else {
+                    beside(&Section::NAV, current, by).landing()
+                };
+                select_section(ui, section);
+                focus_content(ui);
+            }
+        }
+        Action::PageUp | Action::PageDown if dialog.is_none() && focused_popup(ui).is_none() => {
+            let down = action == Action::PageDown;
+            let focus = GtkWindowExt::focus(&ui.window);
+            if !focus.is_some_and(|focus| endless::jump(ui, &focus, down)) {
+                let adjustment = ui.scroll.vadjustment();
+                let step = adjustment.page_size() * 0.8;
+                adjustment.set_value(adjustment.value() + if down { step } else { -step });
+                update_hints(ui);
+                return;
+            }
         }
         Action::Fullscreen if dialog.is_none() => {
             if ui.window.is_fullscreen() {
@@ -1305,6 +1495,8 @@ pub(super) fn install(ui: &Ui) {
     let key_ui = ui.clone();
     keys.connect_key_pressed(move |_, key, _, modifiers| {
         key_ui.pending_tab_focus.set(None);
+        controller_put_down(&key_ui);
+        effects::set_steered(true);
         if key == gdk::Key::F11 {
             dispatch(&key_ui, Action::Fullscreen);
             return glib::Propagation::Stop;
@@ -1342,6 +1534,8 @@ pub(super) fn install(ui: &Ui) {
                 gdk::Key::Down => Some(Action::Down),
                 gdk::Key::Left => Some(Action::Left),
                 gdk::Key::Right => Some(Action::Right),
+                gdk::Key::Page_Up => Some(Action::PageUp),
+                gdk::Key::Page_Down => Some(Action::PageDown),
                 gdk::Key::Return | gdk::Key::space if navigation_focus(&key_ui) => {
                     Some(Action::Accept)
                 }
@@ -1382,13 +1576,31 @@ pub(super) fn install(ui: &Ui) {
     let pointer = gtk::GestureClick::new();
     pointer.set_button(0);
     pointer.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let pointer_ui = ui.clone();
     let pointer_window = ui.window.clone();
     let pointer_pending = ui.pending_tab_focus.clone();
     pointer.connect_pressed(move |_, _, _, _| {
         pointer_pending.set(None);
-        pointer_window.remove_css_class("controller-navigation")
+        pointer_window.remove_css_class("controller-navigation");
+        controller_put_down(&pointer_ui);
+        effects::set_steered(false);
     });
     ui.window.add_controller(pointer);
+    // GTK also reports motion when widgets move under a pointer that is still.
+    let motion = gtk::EventControllerMotion::new();
+    motion.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let motion_ui = ui.clone();
+    let at = Cell::new(None::<(f64, f64)>);
+    motion.connect_motion(move |_, x, y| {
+        let moved = at
+            .replace(Some((x, y)))
+            .is_some_and(|(was_x, was_y)| (x - was_x).abs() + (y - was_y).abs() > 1.0);
+        if moved {
+            controller_put_down(&motion_ui);
+            effects::set_steered(false);
+        }
+    });
+    ui.window.add_controller(motion);
     let Some(mut pad) = Pad::load() else {
         return;
     };
@@ -1437,11 +1649,14 @@ pub(super) fn install(ui: &Ui) {
             && ui.window.visible_dialog().is_none()
             && GtkWindowExt::focus(&ui.window).is_none()
             && ui.pending_tab_focus.get().is_none()
+            && !ui.refocus_pending.get()
         {
             focus_content(&ui);
         }
         for (family, action) in controllers.actions(&samples, Instant::now()) {
             ui.controller_family.set(family);
+            ui.controller_in_use.set(true);
+            effects::set_steered(true);
             dispatch(&ui, action);
         }
         glib::ControlFlow::Continue
@@ -1467,6 +1682,10 @@ mod tests {
         assert_eq!(
             focus_after_render("queue-9ZZTESTGAME1-resume", Section::Downloads).as_deref(),
             Some("queue-9ZZTESTGAME1-resume")
+        );
+        assert_eq!(
+            focus_after_render("feature-9ZZTESTGAME1-primary", Section::Home).as_deref(),
+            Some("feature-9ZZTESTGAME1-primary")
         );
         assert_eq!(focus_after_render("GtkButton", Section::Downloads), None);
     }
@@ -1629,7 +1848,15 @@ mod tests {
         );
     }
     #[test]
-    fn spatial_navigation_visits_tabs_cards_and_pagination() {
+    fn the_shoulders_turn_the_tabs_in_view() {
+        let tabs = Section::LIBRARY_TABS;
+        assert_eq!(beside(&tabs, Section::Installed, 1), Section::Library);
+        assert_eq!(beside(&tabs, Section::Installed, -1), Section::Downloads);
+        assert_eq!(beside(&tabs, Section::Downloads, 1), Section::Installed);
+    }
+
+    #[test]
+    fn spatial_navigation_visits_tabs_and_cards() {
         let rectangles = [
             Rect {
                 x: 0.,
@@ -1716,7 +1943,7 @@ mod tests {
         let input = Input {
             buttons: 1,
             x: 30000,
-            y: 0,
+            ..Default::default()
         };
         assert_eq!(
             mapper.actions(input, now),
