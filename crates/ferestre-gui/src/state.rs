@@ -86,8 +86,8 @@ impl Section {
     pub fn icon(self) -> &'static str {
         match self {
             Section::Home => "go-home-symbolic",
-            Section::Library => "view-grid-symbolic",
-            Section::GamePass => "emblem-shared-symbolic",
+            Section::Library => "my-library-symbolic",
+            Section::GamePass => "game-pass-symbolic",
             Section::Installed => "drive-harddisk-symbolic",
             Section::Elsewhere => "applications-games-symbolic",
             Section::Updates => "software-update-available-symbolic",

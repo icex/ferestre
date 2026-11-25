@@ -15,7 +15,7 @@ What it does
         install-game.png       the install dialog over the blurred library
         stop-confirmation.png  the Stop confirmation, Cancel selected by the controller
         notifications.png      three stacked "Starting ..." notifications
-        compact-sidebar.png    the icon rail with the account menu open
+        compact-sidebar.png    the icon rail with counts and recent games
         home-ultrawide.png     Home at 3440x1000 (a 32:9-style wide window)
         already-running.png    the "<title> is already running" dialog
         library.png            My Library with each game's compatibility label
@@ -718,16 +718,9 @@ class Scene:
         return found
 
     def scene_compact_sidebar(self):
-        s = self.s
-        time.sleep(4)
-        names = [x.get_name() or "" for x, _ in s.walk(self.frame)]
-        account = next((n for n in names if ACCOUNT["gamertag"] in n), None)
-        if self.config.get("debug"):
-            print("NAMES", sorted(set(n for n in names if n)), flush=True)
-        if account is None:
-            raise s.Failure("no account control in the rail")
-        s.click_named(self.frame, account)
-        self.capture(2)
+        self.wait(lambda root: self.s.find_all(root, role="button", name=self.names[RUNNING]),
+                  "recent game in the compact rail")
+        self.scene_home()
 
     def scene_already_running(self):
         s, name = self.s, self.names[RUNNING]

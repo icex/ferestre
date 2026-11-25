@@ -6,7 +6,7 @@ Play compatible **Xbox PC and Microsoft Store games on Linux** using your Micros
 
 <br clear="left">
 
-**[Download the AppImage](https://github.com/icex/ferestre/releases/download/v0.1.27/ferestre-0.1.27-x86_64.AppImage)** · [Compatible games](docs/COMPATIBILITY.md#the-matrix) · [Quick start](#quick-start) · [Report a problem](https://github.com/icex/ferestre/issues)
+**[Download the AppImage](https://github.com/icex/ferestre/releases/latest)** · [Compatible games](docs/COMPATIBILITY.md#the-matrix) · [Quick start](#quick-start) · [Report a problem](https://github.com/icex/ferestre/issues)
 
 ![Ferestre's Home: a featured-game carousel, quick links and a Jump back in shelf, with recent games and their status in the sidebar](docs/screenshots/home.png)
 
@@ -32,7 +32,7 @@ Play compatible **Xbox PC and Microsoft Store games on Linux** using your Micros
 
 ![In-app Stop confirmation with Cancel selected by the controller](docs/screenshots/stop-confirmation.png)
 
-![Compact icon sidebar with the account menu open](docs/screenshots/compact-sidebar.png)
+![Compact sidebar with Game Pass and My Library counts and square recent-game artwork](docs/screenshots/compact-sidebar.png)
 
 ![A dialog offering to leave a game running, close it, or close it and start it again](docs/screenshots/already-running.png)
 
@@ -85,7 +85,7 @@ Check the label on the game's tile (**Playable**, **Playable with issues**, **Un
 
 **Home** opens with a carousel of what is running, what you played last, games with updates and Game Pass titles. Below it are quick links, **Jump back in** with your installed games, and shelves of Game Pass and your library; **See all** opens the full list. The search at the top looks through your library and Game Pass.
 
-The sidebar lists the games you played recently, last played first, with their state: Running, Update ready, Queued, Downloading and so on. To turn it into a narrow rail of icons, switch on **Compact sidebar** in **Settings → Appearance** or in the account menu. Ferestre remembers the choice.
+The sidebar lists recently played games and their status. Turn on **Compact sidebar** in **Settings → Appearance** or the account menu for a narrow rail with count badges and square game artwork. Games running through Ferestre appear first with a green bar beside their cover. Ferestre remembers the choice.
 
 Results such as "Starting…" or a finished install appear together in the bottom-right corner, newest at the bottom. The bell beside your account keeps this session's notifications for any you missed. Behind a dialog the window blurs; it only dims instead when your desktop turns animations off or the graphics are too slow for blur.
 

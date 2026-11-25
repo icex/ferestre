@@ -65,7 +65,8 @@ as well as with stable, so a change that needs a newer compiler fails there.
 If updating the lock raises the minimum, raise `rust-version` and the `msrv`
 job's toolchain in `.github/workflows/rust.yml` in the same commit;
 `tests/test_workflows.py` checks that the two agree. The GUI crate also needs
-the GTK 4 and libadwaita development files.
+the GTK 4 and libadwaita development files and GLib's
+`glib-compile-resources` for its bundled icons.
 
 ## Running the tests
 

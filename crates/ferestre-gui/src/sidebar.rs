@@ -14,6 +14,22 @@ type Status = (String, &'static str);
 /// What one installed title's line says, most urgent first.
 fn status(ui: &Ui, row: &LibraryRow, downloading: Option<&str>) -> Option<Status> {
     let key = row.product_id.to_ascii_uppercase();
+    if ui.compact.get() && row.action == Action::Stop {
+        let running = ui.running.borrow();
+        if let Some(launch) = running.get(&key).or_else(|| {
+            row.install_as
+                .as_ref()
+                .and_then(|(id, _)| running.get(&id.to_ascii_uppercase()))
+        }) {
+            return Some(if launch.asked.is_some() {
+                ("Stopping".into(), "media-playback-stop-symbolic")
+            } else if launch.ready {
+                ("Running".into(), "media-playback-start-symbolic")
+            } else {
+                ("Starting".into(), "content-loading-symbolic")
+            });
+        }
+    }
     if downloading.is_some_and(|d| d.eq_ignore_ascii_case(&key)) {
         let paused = ui
             .download_control
@@ -67,15 +83,24 @@ fn percent(ui: &Ui) -> u32 {
     (ui.download.bar.fraction().clamp(0.0, 1.0) * 100.0).round() as u32
 }
 
-/// A count at the end of a section's row, hidden until there is one.
-pub(crate) fn count_badge(section: Section) -> gtk::Label {
+/// A count beside the row label or over the compact rail's icon.
+pub(crate) fn count_badge(section: Section, compact: bool) -> gtk::Label {
     let badge = gtk::Label::builder()
         .css_classes(["nav-count"])
         .valign(gtk::Align::Center)
+        .can_target(false)
         .accessible_role(gtk::AccessibleRole::Presentation)
         .visible(false)
         .build();
-    badge.set_widget_name(&format!("nav-count-{}", section.title()));
+    let prefix = if compact {
+        badge.set_halign(gtk::Align::End);
+        badge.set_valign(gtk::Align::Start);
+        badge.add_css_class("nav-rail-count");
+        "nav-rail-count"
+    } else {
+        "nav-count"
+    };
+    badge.set_widget_name(&format!("{prefix}-{}", section.title()));
     badge
 }
 
@@ -208,17 +233,25 @@ fn render_counts(ui: &Ui) {
             format!("{mine} {} installed", games(mine)),
         ),
     ] {
-        let name = format!("nav-count-{}", section.title());
-        let Some(badge) = named_widget(ui.sidebar.upcast_ref(), &name) else {
+        let Some(row) = named_widget(
+            ui.sidebar.upcast_ref(),
+            &format!("navigation-{}", section.title()),
+        ) else {
             continue;
         };
-        if let Some(badge) = badge.downcast_ref::<gtk::Label>() {
-            badge.set_label(&count.to_string());
+        for (prefix, compact) in [("nav-count", false), ("nav-rail-count", true)] {
+            if let Some(badge) = named_widget(&row, &format!("{prefix}-{}", section.title()))
+                .and_then(|widget| widget.downcast::<gtk::Label>().ok())
+            {
+                let label = if compact && count > 99 {
+                    "99+".to_string()
+                } else {
+                    count.to_string()
+                };
+                badge.set_label(&label);
+                badge.set_visible(count > 0 && compact == ui.compact.get());
+            }
         }
-        badge.set_visible(count > 0 && !ui.compact.get());
-        let Some(row) = badge.ancestor(gtk::ListBoxRow::static_type()) else {
-            continue;
-        };
         if count > 0 {
             row.set_tooltip_text(Some(&format!("{} · {about}", section.title())));
             row.update_property(&[gtk::accessible::Property::Description(&about)]);
@@ -234,6 +267,7 @@ const RECENT: usize = 10;
 
 /// Redraw Recently played, if anything it shows changed.
 pub(crate) fn render_recent(ui: &Ui) {
+    let compact = ui.compact.get();
     let downloading = ui
         .download
         .current
@@ -251,27 +285,34 @@ pub(crate) fn render_recent(ui: &Ui) {
             fetching: ui.fetching_names.get(),
         },
         Section::Installed,
-        |row| row.installed,
+        |row| row.installed || (compact && row.action == Action::Stop),
         Listing::All,
     );
-    let mut titles: Vec<(std::time::SystemTime, LibraryRow)> = {
+    let mut titles: Vec<_> = {
         let model = ui.model.borrow();
+        let running = ui.running.borrow();
         drawn
             .rows
             .into_iter()
-            .filter_map(|row| Some((model.last_played(&row.product_id)?, row)))
+            .filter_map(|row| {
+                let last_played = model.last_played(&row.product_id);
+                let pinned = compact && running.contains_key(&row.product_id.to_ascii_uppercase());
+                (pinned || last_played.is_some()).then_some((pinned, last_played, row))
+            })
             .collect()
     };
     titles.sort_by(|a, b| {
         b.0.cmp(&a.0)
-            .then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.2.name.to_lowercase().cmp(&b.2.name.to_lowercase()))
     });
-    titles.truncate(RECENT);
+    let running_count = titles.iter().take_while(|(running, _, _)| *running).count();
+    titles.truncate(RECENT.max(running_count));
     let lines: Vec<(LibraryRow, Option<Status>, bool)> = {
         let model = ui.model.borrow();
         titles
             .into_iter()
-            .map(|(_, row)| {
+            .map(|(_, _, row)| {
                 let line = status(ui, &row, downloading.as_deref());
                 let icon = model
                     .icons
@@ -280,7 +321,6 @@ pub(crate) fn render_recent(ui: &Ui) {
             })
             .collect()
     };
-    let compact = ui.compact.get();
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     compact.hash(&mut hash);
     for (row, line, icon) in &lines {
@@ -334,20 +374,24 @@ pub(crate) fn render_recent(ui: &Ui) {
     for (row, line, _) in lines {
         let id = row.product_id.to_ascii_uppercase();
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        let image = gtk::Image::builder()
-            .icon_name("applications-games-symbolic")
-            .pixel_size(40)
-            .width_request(40)
-            .height_request(40)
-            .css_classes(["sidebar-icon"])
-            .build();
-        if let Some(path) = ui.model.borrow().icons.get(&id) {
-            textures::set_image(&image, path, textures::Size::Icon);
+        if compact {
+            content.append(&rail_art(ui, &id));
+        } else {
+            let image = gtk::Image::builder()
+                .icon_name("applications-games-symbolic")
+                .pixel_size(40)
+                .width_request(40)
+                .height_request(40)
+                .css_classes(["sidebar-icon"])
+                .build();
+            if let Some(path) = ui.model.borrow().icons.get(&id) {
+                textures::set_image(&image, path, textures::Size::Icon);
+            }
+            ui.art_slots
+                .borrow_mut()
+                .add_image(id.clone(), &image, textures::Size::Icon);
+            content.append(&image);
         }
-        ui.art_slots
-            .borrow_mut()
-            .add_image(id.clone(), &image, textures::Size::Icon);
-        content.append(&image);
         let text = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(2)
@@ -399,6 +443,9 @@ pub(crate) fn render_recent(ui: &Ui) {
             .child(&content)
             .tooltip_text(&description)
             .build();
+        if compact && line.as_ref().is_some_and(|(state, _)| state == "Running") {
+            button.add_css_class("running");
+        }
         button.set_widget_name(&format!("recent-{id}"));
         button.update_property(&[
             gtk::accessible::Property::Label(&row.name),
@@ -408,6 +455,35 @@ pub(crate) fn render_recent(ui: &Ui) {
         button.connect_clicked(move |_| spawn_title(&recent_ui, &id, &name));
         ui.recent_games.append(&button);
     }
+}
+
+fn rail_art(ui: &Ui, id: &str) -> gtk::Overlay {
+    // The fallback determines the square's size. The picture fills it and
+    // crops to it even when the Store supplies rectangular artwork.
+    let fallback = gtk::Image::builder()
+        .icon_name("applications-games-symbolic")
+        .pixel_size(20)
+        .width_request(42)
+        .height_request(42)
+        .build();
+    let art = gtk::Overlay::builder()
+        .child(&fallback)
+        .valign(gtk::Align::Center)
+        .overflow(gtk::Overflow::Hidden)
+        .css_classes(["sidebar-rail-art"])
+        .build();
+    let picture = gtk::Picture::builder()
+        .content_fit(gtk::ContentFit::Cover)
+        .can_target(false)
+        .build();
+    art.add_overlay(&picture);
+    if let Some(path) = ui.model.borrow().icons.get(id) {
+        textures::set_picture(&picture, path, textures::Size::Icon);
+    }
+    ui.art_slots
+        .borrow_mut()
+        .add_picture(id.to_string(), &picture, textures::Size::Icon);
+    art
 }
 
 /// The downloads button in the sidebar footer: shown while the queue has
@@ -516,7 +592,7 @@ pub(crate) fn render_downloads(ui: &Ui) {
 pub(crate) fn set_compact(ui: &Ui, compact: bool) {
     ui.compact.set(compact);
     let (min, max) = if compact {
-        (72.0, 72.0)
+        (64.0, 64.0)
     } else {
         (250.0, 270.0)
     };
@@ -529,15 +605,18 @@ pub(crate) fn set_compact(ui: &Ui, compact: bool) {
     }
     let mut row = ui.sidebar.first_child();
     while let Some(widget) = row {
-        if let Some(label) = widget
+        if let Some(content) = widget
             .first_child()
-            .and_then(|content| content.first_child())
-            .and_then(|icon| icon.next_sibling())
-            .filter(|w| w.has_css_class("nav-label"))
+            .and_downcast::<gtk::Overlay>()
+            .and_then(|face| face.child())
         {
-            label.set_visible(!compact);
-        }
-        if let Some(content) = widget.first_child() {
+            if let Some(label) = content
+                .first_child()
+                .and_then(|icon| icon.next_sibling())
+                .filter(|w| w.has_css_class("nav-label"))
+            {
+                label.set_visible(!compact);
+            }
             content.set_halign(if compact {
                 gtk::Align::Center
             } else {
@@ -559,6 +638,13 @@ pub(crate) fn set_compact(ui: &Ui, compact: bool) {
     for name in ["navigation-settings", "navigation-downloads"] {
         if let Some(button) = named_widget(ui.window.upcast_ref(), name) {
             hide_labels(&button, compact);
+            if let Some(content) = button.first_child() {
+                content.set_halign(if compact {
+                    gtk::Align::Center
+                } else {
+                    gtk::Align::Fill
+                });
+            }
         }
     }
     ui.recents_fingerprint.set(0);
