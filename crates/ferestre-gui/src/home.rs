@@ -1337,7 +1337,15 @@ pub(crate) fn render_home(ui: &Ui, page: &gtk::Box) -> bool {
         page,
         "Jump back in",
         Some(Section::Installed),
-        jump.iter().map(|r| landscape(ui, r)).collect(),
+        jump.iter()
+            .map(|row| {
+                let card = landscape(ui, row);
+                let target = gtk::Box::builder().css_classes(["jump-back-tile"]).build();
+                // Keep the hover area still while the card scales inside it.
+                target.append(&card);
+                target.upcast()
+            })
+            .collect(),
     );
     shelf(
         ui,

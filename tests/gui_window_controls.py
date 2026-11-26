@@ -7,7 +7,7 @@ import tempfile
 import time
 
 import gui_smoke as s
-from gui_launch import prepare
+from gui_launch import prepare, write
 from controller_driver import start_window_manager
 
 
@@ -33,9 +33,10 @@ def main():
         for layout, left, right in layouts:
             with tempfile.TemporaryDirectory(prefix='ferestre-window-controls-') as directory:
                 home = Path(directory)
-                _, _, pad, env = prepare(home, args.binary)
+                ids, _, pad, env = prepare(home, args.binary)
+                write(home / f'state/ferestre/launches/{ids[0]}.stderr', '')
                 settings = home / 'config/gtk-4.0/settings.ini'
-                settings.write_text('[Settings]\ngtk-decoration-layout=' + layout + '\n')
+                settings.write_text('[Settings]\ngtk-enable-animations=false\ngtk-decoration-layout=' + layout + '\n')
                 process = app = None
                 try:
                     with (home / 'gui.log').open('wb') as log:
@@ -50,17 +51,24 @@ def main():
                     def ready():
                         found = controls()
                         return all(len(found[name]) == int(name in left + right) for name in found)
-                    def positions():
+                    def positions(left_edge=0):
                         wait(lambda _: ready(), 'exactly the configured decoration buttons')
                         width = frame.get_component_iface().get_extents(s.Atspi.CoordType.WINDOW).width
+                        fullscreen = next((node for node in s.find_all(
+                            frame, role='button', name='Enter fullscreen') if visible(node)), None)
+                        right_edge = width
+                        if fullscreen is not None:
+                            button = fullscreen.get_component_iface().get_extents(s.Atspi.CoordType.WINDOW)
+                            s.check(-4 <= width - button.x - button.width <= 24,
+                                    'fullscreen is at the far right of the header')
+                            right_edge = button.x
                         for names, edge in [(left, 'left'), (right, 'right')]:
                             boxes = [controls()[name][0].get_component_iface().get_extents(s.Atspi.CoordType.WINDOW) for name in names]
                             coordinates = [box.x for box in boxes]
                             s.check(coordinates == sorted(coordinates), f'{layout} preserves {edge} button order')
-                            # Touch targets can make the group wider than 170px.
-                            # Measure its outside inset and contiguous spacing,
-                            # rather than the first button against a fixed band.
-                            inset = (boxes[0].x if edge == 'left' else width - boxes[-1].x - boxes[-1].width) if boxes else 0
+                            # Measure the group's inset from the edge or fullscreen button.
+                            inset = (boxes[0].x - left_edge if edge == 'left'
+                                     else right_edge - boxes[-1].x - boxes[-1].width) if boxes else 0
                             s.check(all(box.width > 0 for box in boxes)
                                     and all(0 <= b.x - a.x - a.width <= 16 for a, b in zip(boxes, boxes[1:]))
                                     and -4 <= inset <= 24,
@@ -86,6 +94,23 @@ def main():
                     if args.narrow:
                         s.click_named(frame, 'Show navigation')
                     s.select_in_list(frame, 'Settings')
+                    if not args.narrow:
+                        # Measure the list's allocation. Child minimum sizes
+                        # can make the rail wider than the split's width setting.
+                        home_row = next(node for node in s.find_all(frame, role='list item', name='Home')
+                                        if visible(node))
+                        rail = home_row.get_parent().get_component_iface()
+                        def rail_width():
+                            return rail.get_extents(s.Atspi.CoordType.WINDOW).width
+                        wait(lambda root: any(visible(node) for node in s.find_all(
+                            root, role='button', name='Launch Game 0')), 'recent game in the sidebar')
+                        expanded_width = rail_width()
+                        s.click_named(frame, 'Compact sidebar')
+                        wait(lambda _: rail_width() == 64, 'a 64 px compact rail')
+                        positions(left_edge=rail_width())
+                        s.click_named(frame, 'Compact sidebar')
+                        wait(lambda _: rail_width() == expanded_width, 'full sidebar width restored')
+                        positions()
                     s.click_named(frame, 'Quit Ferestre')
                     s.check(process.wait(timeout=10) == 0, 'isolated window closes cleanly')
                     s.check('panicked at' not in (home / 'gui.log').read_text(), 'no decoration or fullscreen panic')

@@ -27,10 +27,11 @@ The sidebar has Home, Game Pass and My Library, then the titles played recently,
 last played first, with a status line: Downloading N%, Paused, Queued, Update
 ready, Running, Playable with issues, Menus only, Does not run, or Unavailable
 to this account. While the install queue has work, a Downloads button with a
-thin progress bar appears in it. Compact sidebar (in Settings → Appearance,
-or in the account menu) turns the sidebar into a rail of icons with tooltips;
-names and controller order stay the same, and the choice is remembered with
-fullscreen. The account button opens a menu: a card with your name and
+thin progress bar appears in it. **Compact sidebar** in **Settings → Appearance**
+or the account menu turns the sidebar into a 64-pixel rail with count badges,
+square game artwork and tooltips. Games started by this window appear first
+while active, and a green bar marks running games. Ferestre remembers the
+compact and fullscreen settings. The account button opens a menu: a card with your name and
 role, Show me online, Accounts, Reload library, links to your profile and the
 Microsoft Store, Settings, a Compact sidebar switch and Sign out. On narrow windows, Show navigation
 opens the sidebar. Touch controls have at least 44 logical pixels; scrolling uses GTK's touch and

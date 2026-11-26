@@ -102,11 +102,10 @@ pub(super) fn install(
     view: &adw::ToolbarView,
     header: &adw::HeaderBar,
     back: &gtk::Button,
+    button: &gtk::Button,
 ) {
-    let button = gtk::Button::from_icon_name("view-fullscreen-symbolic");
     button.set_tooltip_text(Some("Enter fullscreen (F11)"));
     button.update_property(&[gtk::accessible::Property::Label("Enter fullscreen")]);
-    header.pack_end(&button);
     let window = ui.window.clone();
     button.connect_clicked(move |_| {
         if window.is_fullscreen() {
@@ -163,6 +162,7 @@ pub(super) fn install(
     // The screen's size may be known only once the window is on it.
     ui.window.connect_css_classes_notify(move |_| sized());
     let update_ui = ui.clone();
+    let button = button.clone();
     ui.window.connect_fullscreened_notify(move |window| {
         let ui = &update_ui;
         let fullscreen = window.is_fullscreen();

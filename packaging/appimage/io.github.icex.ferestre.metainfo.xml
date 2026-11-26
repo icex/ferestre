@@ -74,6 +74,13 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.1.28" date="2026-11-26">
+      <description>
+        <p>The compact sidebar shows square game artwork, count badges and a green marker beside running games.</p>
+        <p>Ferestre includes its own interface icons and a new green two-pane app icon.</p>
+        <p>The fullscreen toggle is at the end of the header, and Jump back in cards scale on hover.</p>
+      </description>
+    </release>
     <release version="0.1.27" date="2026-11-24">
       <description>
         <p>Games Steam installed join the library and start through Steam, with experimental neural rendering.</p>

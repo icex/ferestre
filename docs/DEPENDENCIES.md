@@ -142,7 +142,10 @@ PlayStation pads** when the 64-bit library resolves, and a launch prints a
 warning when it does not.
 
 A title that reads Sony HID itself, for haptics, adaptive triggers or
-PlayStation button prompts, can have raw HID back: set `PROTON_ENABLE_HIDRAW=1`
+PlayStation button prompts, can have raw HID back. Turn on **Raw HID for
+PlayStation controllers** under **Edit launch settings → Compatibility →
+Controllers**, save and relaunch. See the [launch options
+reference](LAUNCH-OPTIONS.md#controllers). For a manual setup, set `PROTON_ENABLE_HIDRAW=1`
 (or `PROTON_DISABLE_HIDRAW=0`) in the environment, in the recipe's
 `[launch.env]`, or in Proton's `user_settings.py`. Ferestre then leaves the
 choice to Proton.

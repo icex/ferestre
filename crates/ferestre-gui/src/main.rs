@@ -24,6 +24,7 @@ mod endless;
 mod folder_picker;
 mod handheld;
 mod home;
+mod icons;
 mod install_drives;
 mod launch_show;
 mod launch_state;
@@ -230,7 +231,7 @@ window.fullscreen-browser button, window.fullscreen-browser menubutton > button 
 .sidebar-footer button { border-radius: 8px; padding: 6px 10px; }
 progressbar.sidebar-progress > trough { min-height: 3px; min-width: 22px; border-radius: 2px; background-color: alpha(#ffffff, 0.15); }
 progressbar.sidebar-progress > trough > progress { min-height: 3px; border-radius: 2px; background-color: #8bd77b; }
-button.bell { min-width: 40px; min-height: 40px; border-radius: 999px; }
+button.bell { min-width: 40px; min-height: 40px; border-radius: 8px; }
 window.ferestre-window entry.search-pill, window.ferestre-window searchentry.search-pill {
   min-height: 40px; border-radius: 999px; background-color: #2a2d33; border: 1px solid alpha(#ffffff, 0.08); padding: 0 14px;
 }
@@ -288,6 +289,9 @@ window.ferestre-window button.pill-outline:hover { background-color: alpha(#ffff
 .shelf { margin-top: 4px; }
 .shelf-title { font-size: 22px; font-weight: 700; }
 .shelf-row { padding: 6px 4px 10px; }
+.jump-back-tile > * { transform: scale(1); transition: transform 180ms ease-in-out; }
+.jump-back-tile:hover > * { transform: scale(0.9); }
+window.reduced-motion .jump-back-tile > * { transition: none; }
 window.ferestre-window button.shelf-arrow, window.ferestre-window button.see-all { min-height: 36px; min-width: 36px; border-radius: 999px; }
 button.see-all { padding: 0 14px; font-weight: 600; color: #c9ccd2; }
 .tile-caption { padding: 40px 14px 12px; background-image: linear-gradient(to bottom, alpha(black, 0), alpha(black, 0.85)); }
@@ -318,10 +322,32 @@ window.reduced-motion button.game-tile, window.reduced-motion button.art-button,
 .gamepass-strip { border-radius: 14px; }
 .nav-count { font-size: 12px; font-weight: 700; padding: 1px 8px; border-radius: 999px; background-color: alpha(white, 0.12); color: alpha(white, 0.85); }
 statuspage.compact > scrolledwindow > viewport > box { margin: 24px 0; }
-window.compact-sidebar .navigation-sidebar row { margin: 2px 10px; padding: 0; }
-window.compact-sidebar .sidebar-recents { margin-left: 4px; margin-right: 4px; }
-window.compact-sidebar .sidebar-recents button { padding: 6px 4px; }
-window.compact-sidebar .sidebar-footer { margin-left: 4px; margin-right: 4px; }
+.sidebar-body { margin-top: 18px; }
+.sidebar-navigation { min-height: 190px; }
+.sidebar-recents, .sidebar-footer { margin: 0 12px; }
+#navigation-account { margin: 0 6px 6px; }
+window.compact-sidebar .sidebar-body { margin-top: 6px; }
+window.compact-sidebar .sidebar-navigation { min-height: 0; }
+window.compact-sidebar .navigation-sidebar row { min-height: 44px; margin: 2px 5px; padding: 0; }
+window.compact-sidebar .nav-rail-count {
+  margin: 2px 2px 0 0; padding: 0 3px; font-size: 10px;
+  background-color: #484d56; color: #f4f4f5;
+}
+/* Leave room for the controller's 4px outline and 3px offset within the scroller. */
+window.compact-sidebar .sidebar-recents { margin: 0 7px; padding: 7px 0; }
+window.compact-sidebar .sidebar-footer { margin: 0 5px; }
+window.compact-sidebar #sidebar-top > button,
+window.compact-sidebar .sidebar-footer > button { min-height: 44px; padding: 0; border-radius: 8px; }
+window.compact-sidebar #sidebar-top > button { margin: 0 5px; }
+window.compact-sidebar .sidebar-recents > button { min-height: 48px; padding: 0; }
+.sidebar-rail-art { background-color: #30343b; border-radius: 5px; }
+window.compact-sidebar .sidebar-recents > button.running {
+  background-image: linear-gradient(to bottom, #8bd77b, #8bd77b);
+  background-size: 3px 20px;
+  background-position: left center;
+  background-repeat: no-repeat;
+}
+window.compact-sidebar .sidebar-recents > button.running:dir(rtl) { background-position: right center; }
 .account-card { padding: 10px 12px 12px; margin-bottom: 4px; border-radius: 12px; background-image: linear-gradient(120deg, alpha(#8bd77b, 0.16), alpha(#5d8df0, 0.16)); }
 popover.account-menu button.flat { min-height: 40px; border-radius: 8px; padding: 0 12px; }
 popover.account-menu > contents { padding: 8px; min-width: 280px; }
@@ -545,36 +571,14 @@ fn main() -> glib::ExitCode {
     let app = adw::Application::builder()
         .application_id(&application_id)
         .build();
+    app.connect_startup(|_| {
+        if let Some(display) = gdk::Display::default() {
+            icons::install(&display);
+        }
+        gtk::Window::set_default_icon_name(APP_ID);
+    });
     app.connect_activate(build_ui);
     app.run()
-}
-
-/// Let a window run from a source checkout find its own icon.
-///
-/// An installed copy gets it from the icon theme, because the package puts it
-/// there. A `cargo run` gets nothing, and the shell draws a letter tile -- for
-/// a project whose icon is the thing its name is a joke about, that is a poor
-/// first impression and it took someone reporting it to notice.
-///
-/// Adds the checkout's icon directory to the theme's search path when the
-/// binary is sitting in a `target/` directory with one above it. Silent when
-/// there is nothing there, which is every installed run.
-fn add_source_icon_path(display: &gdk::Display) {
-    let Some(exe) = std::env::current_exe().ok() else {
-        return;
-    };
-    // target/debug/ferestre-gui -> the checkout root.
-    let Some(root) = exe
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-    else {
-        return;
-    };
-    let icons = root.join("packaging/icons");
-    if icons.join("hicolor/scalable/apps").is_dir() {
-        gtk::IconTheme::for_display(display).add_search_path(&icons);
-    }
 }
 
 fn build_ui(app: &adw::Application) {
@@ -582,7 +586,6 @@ fn build_ui(app: &adw::Application) {
     let model = Rc::new(RefCell::new(Model::load()));
 
     if let Some(display) = gdk::Display::default() {
-        add_source_icon_path(&display);
         let css = gtk::CssProvider::new();
         css.load_from_data(STYLE);
         gtk::style_context_add_provider_for_display(
@@ -592,12 +595,6 @@ fn build_ui(app: &adw::Application) {
         );
         effects::load_glass(&display);
     }
-    // Without this the shell has no icon to draw and falls back to a generated
-    // letter tile. The name is the application id, which is what the packaging
-    // installs the SVG as. Set here rather than in `main`, because it goes
-    // through GTK and GTK is not initialised until the application activates.
-    gtk::Window::set_default_icon_name(APP_ID);
-
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Ferestre")
@@ -629,9 +626,12 @@ fn build_ui(app: &adw::Application) {
                 .build(),
         );
         // Its name is the section's alone; the count is its description.
-        content.append(&sidebar::count_badge(section));
+        content.append(&sidebar::count_badge(section, false));
+        let face = gtk::Overlay::new();
+        face.set_child(Some(&content));
+        face.add_overlay(&sidebar::count_badge(section, true));
         let row = gtk::ListBoxRow::builder()
-            .child(&content)
+            .child(&face)
             .tooltip_text(section.title())
             .build();
         row.update_property(&[gtk::accessible::Property::Label(section.title())]);
@@ -640,17 +640,12 @@ fn build_ui(app: &adw::Application) {
     }
     sidebar.select_row(sidebar.row_at_index(0).as_ref());
 
-    let account_button = gtk::Button::builder()
-        .css_classes(["flat"])
-        .margin_start(6)
-        .margin_end(6)
-        .margin_bottom(6)
-        .build();
+    let account_button = gtk::Button::builder().css_classes(["flat"]).build();
 
     account_button.set_widget_name("navigation-account");
     account_button.set_hexpand(true);
     let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    sidebar_box.set_margin_top(18);
+    sidebar_box.add_css_class("sidebar-body");
     // The account, and beside it the notification history.
     let sidebar_top = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     sidebar_top.set_widget_name("sidebar-top");
@@ -661,7 +656,7 @@ fn build_ui(app: &adw::Application) {
     sidebar_box.append(
         &gtk::ScrolledWindow::builder()
             .vexpand(false)
-            .min_content_height(190)
+            .css_classes(["sidebar-navigation"])
             .propagate_natural_height(true)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .child(&sidebar)
@@ -671,8 +666,6 @@ fn build_ui(app: &adw::Application) {
     let recent_games = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(4)
-        .margin_start(12)
-        .margin_end(12)
         .css_classes(["sidebar-recents"])
         .build();
     let recent_scroll = gtk::ScrolledWindow::builder()
@@ -684,8 +677,6 @@ fn build_ui(app: &adw::Application) {
     let footer = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(4)
-        .margin_start(12)
-        .margin_end(12)
         .margin_bottom(12)
         .css_classes(["sidebar-footer"])
         .build();
@@ -736,13 +727,12 @@ fn build_ui(app: &adw::Application) {
 
     let content_header = adw::HeaderBar::new();
     content_header.set_title_widget(Some(&search_slot));
+    let fullscreen = gtk::Button::from_icon_name("view-fullscreen-symbolic");
+    content_header.pack_end(&fullscreen);
     let back = gtk::Button::from_icon_name("go-previous-symbolic");
     back.set_tooltip_text(Some("Back to Home"));
     // Shown away from Home only: on Home it would lead nowhere.
     back.set_widget_name("content-back");
-    content_header.pack_start(&back);
-    content_header.pack_end(&refresh);
-    content_header.pack_end(&spinner);
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let scroll = gtk::ScrolledWindow::builder()
@@ -851,7 +841,6 @@ fn build_ui(app: &adw::Application) {
         .build();
     let split_back = split.clone();
     navigation.connect_clicked(move |_| split_back.set_show_content(false));
-    content_header.pack_start(&navigation);
     scroll.set_kinetic_scrolling(true);
     window.set_size_request(360, 480);
     let launch_show = launch_show::Show::new();
@@ -860,6 +849,10 @@ fn build_ui(app: &adw::Application) {
     window.set_content(Some(&shell));
     effects::install(&window, &split);
     window_controls::install(&window, &split, &sidebar_header, &content_header);
+    content_header.pack_start(&back);
+    content_header.pack_start(&navigation);
+    content_header.pack_end(&refresh);
+    content_header.pack_end(&spinner);
 
     let queue = model
         .borrow()
@@ -1171,7 +1164,7 @@ fn build_ui(app: &adw::Application) {
     }
 
     window_size::install(&ui);
-    handheld::install(&ui, &content_view, &content_header, &back);
+    handheld::install(&ui, &content_view, &content_header, &back, &fullscreen);
     if handheld::read_preference(&ui, "compact") == Some(true) {
         sidebar::set_compact(&ui, true);
     }
@@ -1228,6 +1221,9 @@ fn notification_bell(ui: &Ui) -> gtk::Button {
         .visible(false)
         .build();
     let face = gtk::Overlay::new();
+    face.set_size_request(24, 24);
+    face.set_halign(gtk::Align::Center);
+    face.set_valign(gtk::Align::Center);
     face.set_child(Some(&icon));
     face.add_overlay(&dot);
     let bell = gtk::Button::builder()
@@ -2619,7 +2615,7 @@ fn section_tab(section: Section) -> gtk::Button {
         Section::Downloads => "Install queue",
         section => section.title(),
     };
-    let badge = sidebar::count_badge(section);
+    let badge = sidebar::count_badge(section, false);
     badge.set_widget_name(&format!("tab-count-{}", section.title()));
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     content.append(&gtk::Label::new(Some(label)));
@@ -3974,6 +3970,7 @@ fn render_account_button(ui: &Ui) {
     if ui.compact.get() {
         // Only the face; the name stays with the button.
         labels.set_visible(false);
+        content.set_halign(gtk::Align::Center);
         ui.account_button
             .update_property(&[gtk::accessible::Property::Label(&name)]);
     } else {
