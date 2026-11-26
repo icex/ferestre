@@ -137,7 +137,7 @@ Choose a suitable rendering resolution in the game. The runtime includes 4K and 
 
 ### Change a game's launch settings
 
-Open the game's **More actions → Edit launch settings**. The tabs hold native Wayland, Gamescope, HDR, the performance profile, compatibility and upscaling switches and the runtime, each with a line saying what it does; other environment variables can be added below them. Your changes are saved as your own copy of the game's recipe. **Reset to defaults** sets that copy aside as a `.toml.bak` file and returns the game to the settings Ferestre ships or detects.
+Open the game's **More actions → Edit launch settings**. See the [launch options reference](docs/LAUNCH-OPTIONS.md) for every tab and setting. Your changes are saved as your own copy of the game's recipe. **Reset to defaults** sets that copy aside as a `.toml.bak` file and returns the game to the settings Ferestre ships or detects.
 
 ### Move a game or add it to Steam
 
@@ -170,9 +170,9 @@ Use the top-right **Refresh** button, or **Reload library** in the profile menu,
 |---|---|
 | Sign-in will not open | Install the WebKitGTK package offered by Ferestre; see [host dependencies](docs/DEPENDENCIES.md#webkitgtk-for-sign-in). |
 | A game is missing or access is refused | Refresh the library, check the selected Store account and current Game Pass coverage. A previous subscription download does not grant permanent ownership. |
-| A game will not start | Run `./ferestre.AppImage doctor`, check the game's [compatibility notes](docs/COMPATIBILITY.md#the-matrix), and select a suitable runtime in game options. |
+| A game will not start | Check the game's **More actions → Edit launch settings**, especially compatibility overrides and the runtime under **Proton**. See the [launch options reference](docs/LAUNCH-OPTIONS.md) and the game's [compatibility notes](docs/COMPATIBILITY.md#the-matrix), and run `./ferestre.AppImage doctor`. |
 | Videos are black or silent | Check [video-playback dependencies](docs/DEPENDENCIES.md#video-playback-with-current-runtimes). |
-| Controller input is missing | Check [SDL2 dependencies](docs/DEPENDENCIES.md#sdl2-for-playstation-controllers). Steam shortcuts can use Steam Input. |
+| Controller input is missing or PlayStation prompts are wrong | Check [SDL2 dependencies](docs/DEPENDENCIES.md#sdl2-for-playstation-controllers). For a PS4 DualShock 4 or PS5 DualSense, try **More actions → Edit launch settings → Compatibility → Controllers → Raw HID for PlayStation controllers**. Save and relaunch the game. If input stops working, turn the option off and relaunch again. Steam shortcuts can use Steam Input. |
 | An update needs recovery | See [update backups and rollback](docs/UPDATES.md). |
 
 When [reporting a problem](https://github.com/icex/ferestre/issues), include the game, Ferestre/runtime versions, Linux distribution and what happened. Review logs for personal information before sharing them.
@@ -201,6 +201,7 @@ Use `./ferestre.AppImage --help` for all commands. `run` refuses to start a game
 |---|---|
 | [Game compatibility](docs/COMPATIBILITY.md) | Tested titles, limitations and verification dates |
 | [Dependencies](docs/DEPENDENCIES.md) | Distribution-specific sign-in, graphics, video and controller libraries |
+| [Launch options](docs/LAUNCH-OPTIONS.md) | Every per-game launch setting, its purpose and corresponding environment variable |
 | [Downloads](docs/DOWNLOADS.md) | Install queues, pause/resume and progress |
 | [Updates](docs/UPDATES.md) | Signed application/runtime updates and recovery |
 | [Desktop integration](docs/DESKTOP-INTEGRATION.md) | HDR, scaling, refresh rate, window controls and performance helpers |
